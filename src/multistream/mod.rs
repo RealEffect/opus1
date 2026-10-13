@@ -1,14 +1,48 @@
-//! Multistream Opus decode (channel mapping family 1 — RFC 7845 §5.1.1).
-//! Decode only. Every elementary stream is a plain 1- or 2-channel
-//! `OpusDecoder`; this module just demuxes and re-routes, mirroring
-//! libopus's `opus_multistream_decoder.c` (a wrapper, not a codec change).
+//! Multistream Opus: several Opus streams in one packet, for audio with more
+//! than two channels (RFC 7845 section 5.1.1, libopus `opus_multistream_*`).
+//!
+//! A multistream packet holds one ordinary Opus packet per stream. The first
+//! streams are stereo ("coupled" streams), the others are mono. Every stream
+//! has its own [`OpusDecoder`](crate::OpusDecoder), so the codec itself never
+//! sees more than 2 channels. A channel layout says which decoded channel
+//! each channel of the application uses.
+//!
+//! What is here:
+//!
+//! - [`MultistreamDecoder`](crate::multistream::MultistreamDecoder), in the
+//!   module `decoder`: decodes a multistream packet into interleaved
+//!   samples. A port of libopus `opus_multistream_decoder.c`.
+//! - [`ChannelLayout`](crate::multistream::ChannelLayout), in the module
+//!   `layout`: the layout, its checks, and the layouts of the mapping
+//!   families of the Ogg Opus header.
+//! - the module `rate_alloc`: how an encoder divides a bitrate among the
+//!   streams.
+//! - the modules `encoder` and `surround` belong to the multistream encoder.
+//! - [`ChannelMappingTable`](crate::multistream::ChannelMappingTable): the
+//!   channel mapping table as it is stored in an Ogg Opus header.
+//! - [`split_self_delimited`](crate::multistream::split_self_delimited):
+//!   cuts one stream out of a multistream packet, for code that wants to
+//!   look at the streams itself. The decoder does not need it.
+//!
+//! The module needs the `std` feature. The number of streams is known only at
+//! run time (up to 255), so the stream decoders live in a `Vec`. Memory is
+//! allocated when a decoder is built. Decoding allocates nothing.
 
+// The links in the text above are written with their full path on purpose.
+// `src/lib.rs` puts a line of documentation in front of that text, and
+// rustdoc then resolves the links of both from the crate root.
+
+pub mod decoder;
 pub mod encoder;
 pub mod layout;
 pub mod rate_alloc;
 pub mod surround;
 
-use crate::{parse_frame_size, OpusDecoder};
+pub use decoder::MultistreamDecoder;
+pub use encoder::{Bitrate, MultistreamEncoder};
+pub use layout::{ChannelLayout, MappingType, SILENT_CHANNEL};
+
+use crate::packet;
 
 /// Source of the input samples of one frame, by input channel.
 /// libopus calls this `opus_copy_channel_in_func`.
@@ -21,7 +55,6 @@ pub(crate) trait ChannelSource {
 
 /// Destination of the decoded samples of one frame, by output channel.
 /// libopus calls this `opus_copy_channel_out_func`.
-#[allow(dead_code)] // used once the multistream decoder is rewritten
 pub(crate) trait ChannelSink {
     /// Writes `frame_size` samples to output channel `dst_channel`.
     /// `src` is `Some((samples, stride))`: sample `i` is `samples[i * stride]`.
@@ -29,26 +62,34 @@ pub(crate) trait ChannelSink {
     fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize)>, frame_size: usize);
 }
 
-/// `channel_mapping[]` sentinel: output silence on this channel.
-const SILENT_CHANNEL: u8 = 255;
-
-/// RFC 7845 §5.1.1 channel mapping table (the bytes following OpusHead's
-/// fixed 19-byte prefix, present when `mapping_family != 0`).
+/// The channel mapping table of an Ogg Opus header (RFC 7845 section 5.1.1):
+/// the bytes that follow the fixed 19-byte part of `OpusHead` when the
+/// mapping family is not 0.
+///
+/// A table read from a file is not checked.
+/// [`MultistreamDecoder::new`] checks it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelMappingTable {
+    /// Number of output channels.
     pub channels: u8,
+    /// Number of streams in one packet.
     pub stream_count: u8,
-    /// First `coupled_count` streams are stereo; the rest are mono.
+    /// Number of stereo streams. They are the first streams of a packet; the
+    /// others are mono.
     pub coupled_count: u8,
-    /// One entry per output channel, indexing the concatenated per-stream
-    /// decode buffer (coupled streams first, 2 channels each, then mono
-    /// streams). `SILENT_CHANNEL` = output silence.
+    /// One entry per output channel: the decoded channel it uses, or
+    /// [`SILENT_CHANNEL`] for silence. Decoded channels are numbered as
+    /// [`layout`] describes: 2 per stereo stream first, then 1 per mono
+    /// stream.
     pub mapping: Vec<u8>,
 }
 
 impl ChannelMappingTable {
-    /// `tail` starts right after `output_gain` (OpusHead byte 19).
-    /// `None` for `mapping_family == 0` or a truncated tail.
+    /// Reads the table. `tail` starts right after the output gain of
+    /// `OpusHead`, at byte 19 of the header.
+    ///
+    /// Returns `None` for mapping family 0, which has no table, and when
+    /// `tail` is too short.
     pub fn parse(mapping_family: u8, channels: u8, tail: &[u8]) -> Option<Self> {
         if mapping_family == 0 || tail.len() < 2 + channels as usize {
             return None;
@@ -60,217 +101,41 @@ impl ChannelMappingTable {
             mapping: tail[2..2 + channels as usize].to_vec(),
         })
     }
-
-    fn decoded_channel_count(&self) -> usize {
-        self.coupled_count as usize * 2 + (self.stream_count - self.coupled_count) as usize
-    }
 }
 
-/// Splits one leading self-delimited packet (RFC 6716 Appendix B) off
-/// `data`, returning `(packet, bytes_consumed)`. `packet` is a normal
-/// (non-self-delimited) Opus packet — decodable as-is by a standard
-/// decoder — reconstructed by excising the extra length field(s)
-/// Appendix B framing injects versus normal framing (code 0/1/CBR-3:
-/// length is otherwise absent/implicit; code 2/VBR-3: the final frame's
-/// length is otherwise implicit). `bytes_consumed` counts the original
-/// self-delimited bytes, for advancing through the outer buffer.
-/// `scratch` is cleared and reused for the reconstructed packet, so a
-/// caller decoding many sub-streams per call (e.g. `MultistreamDecoder`)
-/// need not allocate on every one.
+/// Cuts the first stream out of a multistream packet.
+///
+/// Every stream of a multistream packet but the last is "self-delimited"
+/// (RFC 6716 appendix B): it carries one size field more than an ordinary
+/// packet, for its last frame, so that a reader knows where the stream ends.
+///
+/// `data` starts with a self-delimited packet. The function copies it into
+/// `scratch` without the extra size field. The result is an ordinary Opus
+/// packet that any decoder accepts. Returns that packet and the number of
+/// bytes the stream takes in `data`, which is where the next stream starts.
+///
+/// `scratch` is cleared first. Its memory is reused, so a caller that splits
+/// many packets allocates once.
+///
+/// The framing is checked with [`packet::parse`], which follows libopus. A
+/// packet that libopus rejects is an error.
 pub fn split_self_delimited<'a>(
     data: &[u8],
     scratch: &'a mut Vec<u8>,
 ) -> Result<(&'a [u8], usize), &'static str> {
-    let toc = *data.first().ok_or("empty multistream packet")?;
-    let code = toc & 0x03;
-    let mut cursor = 1usize;
+    const INVALID: &str = "Invalid packet";
+    let parsed = packet::parse(data, true)?;
+    // The extra field is the last thing before the first frame. It holds the
+    // size of the last frame. A size below 252 takes 1 byte, any other 2.
+    let last_size = parsed.sizes[parsed.count - 1];
+    let field_len = if last_size < 252 { 1 } else { 2 };
+    let header_end = parsed.payload_offset.checked_sub(field_len).ok_or(INVALID)?;
+    let header = data.get(..header_end).ok_or(INVALID)?;
+    let frames_and_padding = data.get(parsed.payload_offset..parsed.packet_offset).ok_or(INVALID)?;
     scratch.clear();
-    scratch.push(toc);
-
-    match code {
-        0 => {
-            let (n1, len_bytes) = parse_frame_size(&data[cursor..])?;
-            cursor += len_bytes; // excised: normal code 0 has no length field
-            cursor = push_frame(data, cursor, n1, scratch)?;
-        }
-        1 => {
-            let (n1, len_bytes) = parse_frame_size(&data[cursor..])?;
-            cursor += len_bytes; // excised: normal code 1 has no length field
-            cursor = push_frame(data, cursor, n1, scratch)?;
-            cursor = push_frame(data, cursor, n1, scratch)?;
-        }
-        2 => {
-            let (n1, len1_bytes) = parse_frame_size(&data[cursor..])?;
-            scratch.extend_from_slice(&data[cursor..cursor + len1_bytes]); // kept: normal code 2 has this one
-            cursor += len1_bytes;
-            let (n2, len2_bytes) = parse_frame_size(&data[cursor..])?;
-            cursor += len2_bytes; // excised: Appendix B's extra length for frame 2
-            cursor = push_frame(data, cursor, n1, scratch)?;
-            cursor = push_frame(data, cursor, n2, scratch)?;
-        }
-        _ => {
-            let fc = *data.get(cursor).ok_or("truncated code-3 frame-count byte")?;
-            scratch.push(fc);
-            cursor += 1;
-            let vbr = fc & 0x80 != 0;
-            let has_padding = fc & 0x40 != 0;
-            let m = (fc & 0x3F) as usize;
-            if m == 0 {
-                return Err("code-3 packet declares zero frames");
-            }
-
-            let mut padding_bytes = 0usize;
-            if has_padding {
-                loop {
-                    let b = *data.get(cursor).ok_or("truncated padding length chain")?;
-                    scratch.push(b);
-                    cursor += 1;
-                    if b == 255 {
-                        padding_bytes += 254;
-                    } else {
-                        padding_bytes += b as usize;
-                        break;
-                    }
-                }
-            }
-
-            let mut sizes = Vec::with_capacity(m);
-            if vbr {
-                for _ in 0..m - 1 {
-                    let (n, len_bytes) = parse_frame_size(&data[cursor..])?;
-                    scratch.extend_from_slice(&data[cursor..cursor + len_bytes]); // kept: normal VBR has these
-                    cursor += len_bytes;
-                    sizes.push(n);
-                }
-                let (n_last, len_bytes) = parse_frame_size(&data[cursor..])?;
-                cursor += len_bytes; // excised: Appendix B's extra length for the final frame
-                sizes.push(n_last);
-            } else {
-                let (n, len_bytes) = parse_frame_size(&data[cursor..])?;
-                cursor += len_bytes; // excised: normal CBR code 3 has no length field at all
-                sizes.extend(std::iter::repeat_n(n, m));
-            }
-
-            for n in sizes {
-                cursor = push_frame(data, cursor, n, scratch)?;
-            }
-            if data.len() < cursor + padding_bytes {
-                return Err("truncated code-3 padding");
-            }
-            scratch.extend_from_slice(&data[cursor..cursor + padding_bytes]);
-            cursor += padding_bytes;
-        }
-    }
-
-    Ok((scratch.as_slice(), cursor))
-}
-
-#[inline]
-fn push_frame(data: &[u8], cursor: usize, n: usize, out: &mut Vec<u8>) -> Result<usize, &'static str> {
-    let end = cursor.checked_add(n).ok_or("frame length overflow")?;
-    if end > data.len() {
-        return Err("truncated frame in self-delimited packet");
-    }
-    out.extend_from_slice(&data[cursor..end]);
-    Ok(end)
-}
-
-/// One [`OpusDecoder`] per elementary stream, fanned out per
-/// [`ChannelMappingTable`]. CELT/SILK still only ever see 1–2 channels.
-pub struct MultistreamDecoder {
-    decoders: Vec<OpusDecoder>,
-    table: ChannelMappingTable,
-    stream_scratch: Vec<f32>,
-    packet_scratch: Vec<u8>,
-}
-
-impl MultistreamDecoder {
-    pub fn new(sampling_rate: i32, table: ChannelMappingTable) -> Result<Self, &'static str> {
-        if table.mapping.len() != table.channels as usize {
-            return Err("channel mapping table length does not match declared channel count");
-        }
-        if table.coupled_count > table.stream_count {
-            return Err("coupled_count exceeds stream_count");
-        }
-
-        let mut decoders = Vec::with_capacity(table.stream_count as usize);
-        for i in 0..table.stream_count {
-            let ch = if i < table.coupled_count { 2 } else { 1 };
-            decoders.push(OpusDecoder::new(sampling_rate, ch)?);
-        }
-
-        Ok(Self {
-            decoders,
-            table,
-            stream_scratch: Vec::new(),
-            packet_scratch: Vec::with_capacity(1500),
-        })
-    }
-
-    /// `frame_size` is per-channel capacity; `out` must hold at least
-    /// `frame_size * table.channels`. Returns frames decoded (per channel).
-    pub fn decode(
-        &mut self,
-        packet: &[u8],
-        frame_size: usize,
-        out: &mut [f32],
-    ) -> Result<usize, &'static str> {
-        let out_channels = self.table.channels as usize;
-        if out.len() < frame_size * out_channels {
-            return Err("output buffer too small for frame_size * channels");
-        }
-
-        let decoded_channels = self.table.decoded_channel_count();
-        let mut decoded = vec![0.0f32; frame_size * decoded_channels];
-        let mut decoded_offset_channels = 0usize;
-        let mut frames_decoded = 0usize;
-
-        let mut rest = packet;
-        let num_streams = self.decoders.len();
-        for (i, decoder) in self.decoders.iter_mut().enumerate() {
-            let ch = if (i as u8) < self.table.coupled_count { 2 } else { 1 };
-            self.stream_scratch.clear();
-            self.stream_scratch.resize(frame_size * ch, 0.0);
-
-            // RFC 6716 Appendix B: only the last sub-packet is unframed —
-            // decode it directly. Every other sub-packet must first be
-            // reconstructed into a normal packet (split_self_delimited
-            // strips the injected Appendix B length field(s)).
-            let n = if i + 1 == num_streams {
-                decoder.decode(rest, frame_size, &mut self.stream_scratch)?
-            } else {
-                let (pkt, consumed) = split_self_delimited(rest, &mut self.packet_scratch)?;
-                let n = decoder.decode(pkt, frame_size, &mut self.stream_scratch)?;
-                rest = &rest[consumed..];
-                n
-            };
-            if i == 0 {
-                frames_decoded = n;
-            } else if n != frames_decoded {
-                return Err("elementary streams decoded to different frame counts");
-            }
-
-            for f in 0..n {
-                for c in 0..ch {
-                    decoded[f * decoded_channels + decoded_offset_channels + c] =
-                        self.stream_scratch[f * ch + c];
-                }
-            }
-            decoded_offset_channels += ch;
-        }
-
-        for f in 0..frames_decoded {
-            for (out_c, &src) in self.table.mapping.iter().enumerate() {
-                out[f * out_channels + out_c] = if src == SILENT_CHANNEL {
-                    0.0
-                } else {
-                    decoded[f * decoded_channels + src as usize]
-                };
-            }
-        }
-
-        Ok(frames_decoded)
-    }
+    scratch.extend_from_slice(header);
+    scratch.extend_from_slice(frames_and_padding);
+    Ok((scratch.as_slice(), parsed.packet_offset))
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -288,7 +153,6 @@ mod tests {
         assert_eq!(table.stream_count, 4);
         assert_eq!(table.coupled_count, 2);
         assert_eq!(table.mapping, vec![0, 1, 4, 5, 2, 3]);
-        assert_eq!(table.decoded_channel_count(), 6);
     }
 
     #[test]
@@ -408,25 +272,62 @@ mod tests {
     }
 
     #[test]
-    fn multistream_decoder_rejects_bad_coupled_count() {
-        let table = ChannelMappingTable {
-            channels: 2,
-            stream_count: 1,
-            coupled_count: 2,
-            mapping: vec![0, 1],
-        };
-        assert!(MultistreamDecoder::new(48000, table).is_err());
+    fn split_gives_the_packet_that_packet_write_gives() {
+        // Write the same frames as a self-delimited and as an ordinary
+        // packet. Splitting the first must give the second.
+        let big = [0x5Au8; 600];
+        let cases: [(&[&[u8]], bool); 9] = [
+            (&[&big[..0]], false),
+            (&[&big[..1]], false),
+            (&[&big[..251]], false),
+            (&[&big[..252]], false),
+            (&[&big[..600]], false),
+            (&[&big[..300], &big[..300]], false),
+            (&[&big[..7], &big[..300]], false),
+            (&[&big[..3], &big[..3], &big[..3]], true),
+            (&[&big[..10], &big[..253], &big[..0], &big[..40]], true),
+        ];
+        // SILK narrowband 10 ms, so that 4 frames stay below 120 ms.
+        let toc = toc_byte(0, false, 0);
+        for (frames, pad) in cases {
+            let mut delimited = [0u8; 2000];
+            let mut ordinary = [0u8; 2000];
+            let (len_d, len_o) = if pad {
+                // Padding fills the whole buffer that is given.
+                let total: usize = frames.iter().map(|f| f.len()).sum();
+                (total + 40, total + 37)
+            } else {
+                (2000, 2000)
+            };
+            let n_d = packet::write(toc, frames, &mut delimited[..len_d], true, pad).unwrap();
+            let n_o = packet::write(toc, frames, &mut ordinary[..len_o], false, pad).unwrap();
+            // Bytes of another stream follow the self-delimited packet.
+            delimited[n_d..n_d + 3].copy_from_slice(&[0xEE; 3]);
+            let mut scratch = vec![1, 2, 3];
+            let (pkt, consumed) = split_self_delimited(&delimited[..n_d + 3], &mut scratch).unwrap();
+            assert_eq!(consumed, n_d, "{} frames", frames.len());
+            let parsed = packet::parse(pkt, false).unwrap();
+            assert_eq!(parsed.count, frames.len());
+            for (i, frame) in frames.iter().enumerate() {
+                assert_eq!(parsed.frame(pkt, i), *frame, "frame {i}");
+            }
+            if !pad {
+                assert_eq!(pkt, &ordinary[..n_o], "{} frames", frames.len());
+            }
+        }
     }
 
     #[test]
-    fn multistream_decoder_builds_expected_stream_shape() {
-        let table = ChannelMappingTable {
-            channels: 6,
-            stream_count: 4,
-            coupled_count: 2,
-            mapping: vec![0, 1, 4, 5, 2, 3],
-        };
-        let ms = MultistreamDecoder::new(48000, table).unwrap();
-        assert_eq!(ms.decoders.len(), 4);
+    fn split_rejects_what_libopus_rejects() {
+        let mut scratch = Vec::new();
+        // No byte at all, and a TOC byte without its size field.
+        assert!(split_self_delimited(&[], &mut scratch).is_err());
+        assert!(split_self_delimited(&[toc_byte(0, false, 0)], &mut scratch).is_err());
+        // A 2-byte size field cut after its first byte.
+        assert!(split_self_delimited(&[toc_byte(0, false, 0), 252], &mut scratch).is_err());
+        // 13 SILK 10 ms frames are more than 120 ms.
+        let mut long = vec![toc_byte(0, false, 3), 13, 1];
+        long.extend_from_slice(&[0u8; 13]);
+        assert!(split_self_delimited(&long, &mut scratch).is_err());
     }
 }

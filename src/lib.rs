@@ -13,9 +13,9 @@ pub mod hp_cutoff;
 pub mod kiss_fft;
 pub mod mdct;
 pub mod modes;
-/// Multistream decode uses `Vec`-based plumbing, so it is only available
-/// with the `std` (default) feature set; the core codec stays `no_std`
-/// + no-`alloc` capable (see `split_self_delimited` docs).
+/// Multichannel encoding and decoding (several Opus streams in one packet).
+/// It allocates in its constructors, so it needs the `std` feature (on by
+/// default). The single-stream codec stays `no_std` without `alloc`.
 #[cfg(feature = "std")]
 pub mod multistream;
 pub mod packet;
@@ -4204,27 +4204,6 @@ fn smooth_fade(
             let w = window[wi] * window[wi];
             out[i * channels + c] = w * in2[i * channels + c] + (1.0 - w) * in1[i * channels + c];
         }
-    }
-}
-
-/// Parse an Opus frame length per RFC 6716 §3.2.1, identical to libopus
-/// `parse_size()`:
-///   - `0`: no frame (DTX / lost packet)
-///   - `1..=251`: length of the frame in bytes (one byte consumed)
-///   - `252..=255`: a second byte is read; length = `second*4 + first`
-///
-/// Returns `(length, bytes_consumed)`.
-///
-/// Only `multistream::split_self_delimited` still uses this; the decoder
-/// reads packets with `packet::parse`.
-#[cfg(feature = "std")]
-pub(crate) fn parse_frame_size(data: &[u8]) -> Result<(usize, usize), &'static str> {
-    let first = *data.first().ok_or("truncated frame length")? as usize;
-    if first < 252 {
-        Ok((first, 1))
-    } else {
-        let second = *data.get(1).ok_or("truncated frame length")? as usize;
-        Ok((second * 4 + first, 2))
     }
 }
 
