@@ -3,6 +3,11 @@
 //! `OpusDecoder`; this module just demuxes and re-routes, mirroring
 //! libopus's `opus_multistream_decoder.c` (a wrapper, not a codec change).
 
+pub mod encoder;
+pub mod layout;
+pub mod rate_alloc;
+pub mod surround;
+
 use crate::{parse_frame_size, OpusDecoder};
 
 /// `channel_mapping[]` sentinel: output silence on this channel.
