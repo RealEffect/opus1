@@ -3,27 +3,37 @@ pub fn silk_rshift64(a: i64, shift: i32) -> i64 {
     a >> shift
 }
 
+/// libopus `silk_LSHIFT_SAT32` (silk/SigProc_FIX.h): limit `a` to the values
+/// that survive the shift, then shift.
+///
+/// The largest result is `(i32::MAX >> shift) << shift`, which is
+/// `0x7FFF_FFF0` for a shift of 4. It is not `i32::MAX`. The smallest result
+/// is `i32::MIN`.
+///
+/// libopus allows shifts from 0 to 31. A shift outside that range is taken
+/// as the nearest one inside it, so that no input can panic.
 #[inline(always)]
 pub fn silk_lshift_sat32(a: i32, shift: i32) -> i32 {
-    let result = (a as i64) << shift;
-    if result > i32::MAX as i64 {
-        i32::MAX
-    } else if result < i32::MIN as i64 {
-        i32::MIN
-    } else {
-        result as i32
-    }
+    let shift = shift.clamp(0, 31);
+    silk_lshift(
+        silk_limit_32(a, i32::MIN >> shift, i32::MAX >> shift),
+        shift,
+    )
 }
 
+/// libopus `silk_ADD_POS_SAT32` (silk/SigProc_FIX.h): add two values that
+/// are not negative. A sum beyond `i32::MAX` gives `i32::MAX`.
+///
+/// The macro tests the sign bit of the 32-bit sum. For inputs that are not
+/// negative that is the overflow test. With a negative input, any sum below
+/// zero also gives `i32::MAX`, as in libopus.
 #[inline(always)]
 pub fn silk_add_pos_sat32(a: i32, b: i32) -> i32 {
-    let res = (a as i64) + (b as i64);
-    if res > i32::MAX as i64 {
+    let sum = (a as u32).wrapping_add(b as u32);
+    if sum & 0x8000_0000 != 0 {
         i32::MAX
-    } else if res < i32::MIN as i64 {
-        i32::MIN
     } else {
-        res as i32
+        sum as i32
     }
 }
 
@@ -42,17 +52,27 @@ pub fn silk_smlaww(a: i32, b: i32, c: i32) -> i32 {
     a.wrapping_add(silk_smulww(b, c))
 }
 
+/// libopus `silk_RSHIFT_ROUND` (silk/SigProc_FIX.h): `a / 2^shift`, rounded
+/// to the nearest integer, halfway cases towards plus infinity.
+///
+/// libopus requires `0 < shift < 32`. For a shift of 31 the result is -1, 0
+/// or 1. Outside the range of libopus this function shifts left for a shift
+/// of zero or less, and returns 0 for a shift of 32 or more.
 #[inline(always)]
 pub fn silk_rshift_round(a: i32, shift: i32) -> i32 {
     if shift <= 0 {
         return a << -shift;
     }
-    if shift >= 31 {
+    if shift >= 32 {
         return 0;
     }
+    // The same value as the C expression
+    // `shift == 1 ? (a >> 1) + (a & 1) : ((a >> (shift - 1)) + 1) >> 1`.
     (a >> shift) + ((a >> (shift - 1)) & 1)
 }
 
+/// libopus `silk_RSHIFT_ROUND64`: [`silk_rshift_round`] for 64-bit values,
+/// with `0 < shift < 64`. A shift of zero or less shifts left.
 #[inline(always)]
 pub fn silk_rshift_round64(a: i64, shift: i32) -> i64 {
     if shift <= 0 {
@@ -370,12 +390,22 @@ pub fn silk_sub_lshift32(a: i32, b: i32, shift: i32) -> i32 {
     a.wrapping_sub(b << shift)
 }
 
+/// libopus `silk_LIMIT` (silk/SigProc_FIX.h): bring `a` into the range
+/// between the two limits. The limits may be given in either order.
 #[inline(always)]
-pub fn silk_limit_32(a: i32, low: i32, high: i32) -> i32 {
-    if a < low {
-        low
-    } else if a > high {
-        high
+pub fn silk_limit_32(a: i32, limit1: i32, limit2: i32) -> i32 {
+    if limit1 > limit2 {
+        if a > limit1 {
+            limit1
+        } else if a < limit2 {
+            limit2
+        } else {
+            a
+        }
+    } else if a > limit2 {
+        limit2
+    } else if a < limit1 {
+        limit1
     } else {
         a
     }
@@ -396,16 +426,24 @@ pub fn silk_add_rshift32(a: i32, b: i32, shift: i32) -> i32 {
     a.wrapping_add(b >> shift)
 }
 
+/// libopus `silk_lin2log` (silk/lin2log.c): approximately
+/// `128 * log2(in_lin)`.
+///
+/// The input is meant to be positive. libopus does not check it, and
+/// neither does this function: 0 gives -128, and a negative value is read
+/// as a number with no leading zero bit.
 #[inline(always)]
-pub fn silk_lin2log(gain_q16: i32) -> i32 {
-    if gain_q16 <= 0 {
-        return 0;
-    }
+pub fn silk_lin2log(in_lin: i32) -> i32 {
     let mut lz = 0;
     let mut frac_q7 = 0;
-    silk_clz_frac(gain_q16, &mut lz, &mut frac_q7);
+    silk_clz_frac(in_lin, &mut lz, &mut frac_q7);
 
-    silk_smlawb(frac_q7, silk_mul(frac_q7, 128 - frac_q7), 179) + silk_lshift(31 - lz, 7)
+    // Piece-wise parabolic approximation.
+    silk_add_lshift32(
+        silk_smlawb(frac_q7, silk_mul(frac_q7, 128 - frac_q7), 179),
+        31 - lz,
+        7,
+    )
 }
 
 #[inline(always)]

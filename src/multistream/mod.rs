@@ -10,6 +10,25 @@ pub mod surround;
 
 use crate::{parse_frame_size, OpusDecoder};
 
+/// Source of the input samples of one frame, by input channel.
+/// libopus calls this `opus_copy_channel_in_func`.
+#[allow(dead_code)] // used once the multistream encoder is in
+pub(crate) trait ChannelSource {
+    /// Writes `frame_size` samples of input channel `src_channel` to
+    /// `dst[0]`, `dst[dst_stride]`, `dst[2 * dst_stride]` and so on.
+    fn copy(&self, dst: &mut [f32], dst_stride: usize, src_channel: usize, frame_size: usize);
+}
+
+/// Destination of the decoded samples of one frame, by output channel.
+/// libopus calls this `opus_copy_channel_out_func`.
+#[allow(dead_code)] // used once the multistream decoder is rewritten
+pub(crate) trait ChannelSink {
+    /// Writes `frame_size` samples to output channel `dst_channel`.
+    /// `src` is `Some((samples, stride))`: sample `i` is `samples[i * stride]`.
+    /// `None` writes silence.
+    fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize)>, frame_size: usize);
+}
+
 /// `channel_mapping[]` sentinel: output silence on this channel.
 const SILENT_CHANNEL: u8 = 255;
 

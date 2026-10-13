@@ -26,6 +26,128 @@ static SILK_NB_CBK_SEARCHS_STAGE3: [usize; SILK_PE_MAX_COMPLEX + 1] = [
     PE_NB_CBKS_STAGE3_MAX,
 ];
 
+/// `out[i] = silk_div32_varq(a[i], b[i], qres)` for every `i`: the
+/// approximate quotient `a / b` in the fixed-point format `qres`.
+///
+/// The three slices have the same length. No element of `b` may be zero
+/// (`silk_div32_varq` divides by it). `qres` is at most 24.
+///
+/// On aarch64 four quotients are computed at a time; the result is the same
+/// (see `div_neon::div32_varq_x4`).
+pub(crate) fn silk_div32_varq_batch(out: &mut [i32], a: &[i32], b: &[i32], qres: i32) {
+    debug_assert!(out.len() == a.len() && a.len() == b.len());
+    debug_assert!((0..=24).contains(&qres));
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    let done = {
+        let (out4, _) = out.as_chunks_mut::<4>();
+        let (a4, _) = a.as_chunks::<4>();
+        let (b4, _) = b.as_chunks::<4>();
+        for ((out, a), b) in out4.iter_mut().zip(a4).zip(b4) {
+            if b.contains(&0) {
+                // Leave the division by zero to the scalar function.
+                for i in 0..4 {
+                    out[i] = silk_div32_varq(a[i], b[i], qres);
+                }
+            } else {
+                // SAFETY: this code is only compiled when NEON is enabled
+                // for the whole build (`cfg(target_feature = "neon")`).
+                *out = unsafe { div_neon::div32_varq_x4(a, b, qres) };
+            }
+        }
+        4 * out4.len()
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    let done = 0;
+
+    for ((out, &a), &b) in out[done..].iter_mut().zip(&a[done..]).zip(&b[done..]) {
+        *out = silk_div32_varq(a, b, qres);
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod div_neon {
+    use core::arch::aarch64::*;
+
+    /// 2^29 - 1 divided by each of two 16-bit values, rounded towards zero,
+    /// as an integer division does it.
+    ///
+    /// The quotient is computed in double precision. It is exact: the
+    /// quotient of two integers below 2^30 that is not a whole number is at
+    /// least 2^-15 away from the next one, far more than the rounding error
+    /// of the division (below 2^-37 here).
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn reciprocal(divisor: int32x2_t) -> int32x2_t {
+        let numerator = vdupq_n_f64((i32::MAX >> 2) as f64);
+        let quotient = vdivq_f64(numerator, vcvtq_f64_s64(vmovl_s32(divisor)));
+        vmovn_s64(vcvtq_s64_f64(quotient))
+    }
+
+    /// `silk_div32_varq(a[i], b[i], qres)` in the four lanes of a vector.
+    /// No `b[i]` is zero and `qres` is at most 24.
+    ///
+    /// The steps are those of the scalar function, in the same order:
+    /// normalise both numbers, take the reciprocal of the upper 16 bits of
+    /// the divisor, multiply, correct once with the remainder, shift into
+    /// the result format. `(x * y) >> 16` with a 16-bit `y` is the upper
+    /// half of `2 * x * (y << 15)`; `(x * y) >> 32` is half of the upper
+    /// half of `2 * x * y`.
+    #[target_feature(enable = "neon")]
+    pub(super) fn div32_varq_x4(a: &[i32; 4], b: &[i32; 4], qres: i32) -> [i32; 4] {
+        // SAFETY: each pointer comes from a `[i32; 4]`, which is what
+        // `vld1q_s32` reads and `vst1q_s32` writes.
+        let (a32, b32) = unsafe { (vld1q_s32(a.as_ptr()), vld1q_s32(b.as_ptr())) };
+
+        // Shift both numbers so that the highest bit below the sign is
+        // used. The count is -1 for the most negative number: a shift count
+        // below zero shifts right.
+        let one = vdupq_n_s32(1);
+        let a_headrm = vsubq_s32(vclzq_s32(vabsq_s32(a32)), one);
+        let b_headrm = vsubq_s32(vclzq_s32(vabsq_s32(b32)), one);
+        let a32_nrm = vshlq_s32(a32, a_headrm);
+        let b32_nrm = vshlq_s32(b32, b_headrm);
+
+        // Reciprocal of the upper 16 bits of the divisor. It fits in 16
+        // bits.
+        let b_high = vshrq_n_s32::<16>(b32_nrm);
+        let b32_inv = vcombine_s32(
+            reciprocal(vget_low_s32(b_high)),
+            reciprocal(vget_high_s32(b_high)),
+        );
+        let b32_inv = vshlq_n_s32::<15>(b32_inv);
+
+        // First estimate, then one correction with the remainder.
+        let result = vqdmulhq_s32(a32_nrm, b32_inv);
+        let product = vshrq_n_s32::<1>(vqdmulhq_s32(b32_nrm, result));
+        let a32_nrm = vsubq_s32(a32_nrm, vshlq_n_s32::<3>(product));
+        let result = vaddq_s32(result, vqdmulhq_s32(a32_nrm, b32_inv));
+
+        // Into the result format: a left shift that saturates, or a right
+        // shift, or zero when the right shift is 32 bits or more.
+        //
+        // The scalar function shifts left with `silk_lshift_sat32` (libopus
+        // `silk_LSHIFT_SAT32`), which limits the value first and shifts
+        // afterwards. The bits below the shift count are therefore zero in
+        // every result, also in the largest one. The saturating shift of
+        // NEON gives `i32::MAX` there, so those bits are cleared here.
+        let lshift = vsubq_s32(vaddq_s32(vdupq_n_s32(29 - qres), a_headrm), b_headrm);
+        let left = vnegq_s32(lshift);
+        let shifted = vqshlq_s32(result, left);
+        let keep = vshlq_s32(vdupq_n_s32(-1), vmaxq_s32(left, vdupq_n_s32(0)));
+        let shifted = vandq_s32(shifted, keep);
+        let shifted = vbicq_s32(
+            shifted,
+            vreinterpretq_s32_u32(vcgtq_s32(lshift, vdupq_n_s32(31))),
+        );
+
+        let mut out = [0i32; 4];
+        // SAFETY: see above.
+        unsafe { vst1q_s32(out.as_mut_ptr(), shifted) };
+        out
+    }
+}
+
 pub fn silk_find_pitch_lags_fix(
     ps_enc: &mut SilkEncoderState,
     ps_enc_ctrl: &mut SilkEncoderControl,
@@ -219,7 +341,6 @@ pub fn silk_pitch_analysis_core(
             MAX_LAG_4KHZ - MIN_LAG_4KHZ + 1,
         );
 
-        let mut cross_corr = xcorr32[MAX_LAG_4KHZ - MIN_LAG_4KHZ];
         let mut normalizer = silk_inner_prod_aligned(
             &frame_4khz[target_ptr_idx..],
             &frame_4khz[target_ptr_idx..],
@@ -232,12 +353,16 @@ pub fn silk_pitch_analysis_core(
         ));
         normalizer = normalizer.wrapping_add(silk_smulbb(SF_LENGTH_8KHZ as i32, 4000));
 
-        c[k * CSTRIDE_4KHZ] = silk_div32_varq(cross_corr, normalizer, 14) as i16;
-
+        // The normaliser of every lag: each one follows from the one of
+        // the lag before by adding one squared sample and taking one away.
+        // The correlations come out of `silk_pitch_xcorr` with the longest
+        // lag first. All quotients are then computed in one batch.
+        let mut normalizers = [0i32; CSTRIDE_4KHZ];
+        let mut cross_corrs = [0i32; CSTRIDE_4KHZ];
         let mut current_basis_ptr_idx = basis_ptr_idx;
-        for d in (MIN_LAG_4KHZ + 1)..=MAX_LAG_4KHZ {
+        normalizers[0] = normalizer;
+        for slot in normalizers[1..].iter_mut() {
             current_basis_ptr_idx -= 1;
-            cross_corr = xcorr32[MAX_LAG_4KHZ - d];
             normalizer = normalizer.wrapping_add(
                 silk_smulbb(
                     frame_4khz[current_basis_ptr_idx] as i32,
@@ -247,8 +372,18 @@ pub fn silk_pitch_analysis_core(
                     frame_4khz[current_basis_ptr_idx + SF_LENGTH_8KHZ] as i32,
                 ),
             );
-            c[k * CSTRIDE_4KHZ + (d - MIN_LAG_4KHZ)] =
-                silk_div32_varq(cross_corr, normalizer, 14) as i16;
+            *slot = normalizer;
+        }
+        for (cross_corr, &from_xcorr) in cross_corrs.iter_mut().zip(xcorr32.iter().rev()) {
+            *cross_corr = from_xcorr;
+        }
+        let mut quotients = [0i32; CSTRIDE_4KHZ];
+        silk_div32_varq_batch(&mut quotients, &cross_corrs, &normalizers, 14);
+        for (c, &quotient) in c[k * CSTRIDE_4KHZ..][..CSTRIDE_4KHZ]
+            .iter_mut()
+            .zip(&quotients)
+        {
+            *c = quotient as i16;
         }
         target_ptr_idx += SF_LENGTH_8KHZ;
     }
@@ -346,6 +481,11 @@ pub fn silk_pitch_analysis_core(
                 SF_LENGTH_8KHZ,
             );
 
+            // Correlation and energy of every lag first, then all
+            // quotients in one batch. A lag whose correlation is not
+            // positive gets 0: it is entered as 0 / 1.
+            let mut cross_corrs = [0i32; D_COMP_STRIDE];
+            let mut energies = [1i32; D_COMP_STRIDE];
             for j in 0..length_d_comp {
                 let d = d_comp_indices[j] as usize;
                 while cur_d < d {
@@ -362,14 +502,21 @@ pub fn silk_pitch_analysis_core(
                 }
 
                 let cross_corr = xcorr_comp[max_d - d];
-                let out_idx = d - (MIN_LAG_8KHZ - 2);
                 if cross_corr > 0 {
-                    c_8khz[k * CSTRIDE_8KHZ + out_idx] =
-                        silk_div32_varq(cross_corr, energy_target.wrapping_add(energy_basis), 14)
-                            as i16;
-                } else {
-                    c_8khz[k * CSTRIDE_8KHZ + out_idx] = 0;
+                    cross_corrs[j] = cross_corr;
+                    energies[j] = energy_target.wrapping_add(energy_basis);
                 }
+            }
+            let mut quotients = [0i32; D_COMP_STRIDE];
+            silk_div32_varq_batch(
+                &mut quotients[..length_d_comp],
+                &cross_corrs[..length_d_comp],
+                &energies[..length_d_comp],
+                14,
+            );
+            for j in 0..length_d_comp {
+                let out_idx = d_comp_indices[j] as usize - (MIN_LAG_8KHZ - 2);
+                c_8khz[k * CSTRIDE_8KHZ + out_idx] = quotients[j] as i16;
             }
         }
         target_ptr_8khz_idx += SF_LENGTH_8KHZ;
@@ -512,11 +659,10 @@ pub fn silk_pitch_analysis_core(
             PE_NB_CBKS_STAGE3_10MS
         };
 
-        let mut energies_st3 =
-            [[[0i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX]; PE_MAX_NB_SUBFR];
-        let mut cross_corr_st3 =
-            [[[0i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX]; PE_MAX_NB_SUBFR];
-
+        // Cross-correlation and energy of every subframe for each lag of
+        // its search range, the lowest lag first.
+        let mut cross_corr_st3 = [[0i32; SCRATCH_SIZE]; PE_MAX_NB_SUBFR];
+        let mut energies_st3 = [[0i32; SCRATCH_SIZE]; PE_MAX_NB_SUBFR];
         silk_p_ana_calc_corr_st3(
             &mut cross_corr_st3,
             frame,
@@ -544,24 +690,63 @@ pub fn silk_pitch_analysis_core(
             nb_subfr * sf_length,
         )
         .wrapping_add(1);
+
+        // For every codebook vector and each of the lags from `start_lag`
+        // to `end_lag` (at most five): the sums of the cross-correlations
+        // and of the energies over the subframes. A codebook vector gives
+        // every subframe its own lag offset; its five values are five
+        // neighbours in the arrays above. The sums saturate, in the order
+        // of the subframes.
+        let nb_lags = (end_lag - start_lag + 1).clamp(0, PE_NB_STAGE3_LAGS as i32) as usize;
+        let mut cross_corrs = [[0i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX];
+        let mut energies = [[0i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX];
+        for j in 0..nb_cbk_search_st3 {
+            let mut cross_corr = [0i32; PE_NB_STAGE3_LAGS];
+            let mut energy = [energy_target; PE_NB_STAGE3_LAGS];
+            for k in 0..nb_subfr {
+                let (lag_cb, lag_range) = stage3_tables(nb_subfr, complexity, k);
+                let first = (lag_cb[j] - lag_range[0]) as usize;
+                let cross_corr_k: &[i32; PE_NB_STAGE3_LAGS] = cross_corr_st3[k][first..]
+                    .first_chunk()
+                    .expect("five lags inside the search range");
+                let energy_k: &[i32; PE_NB_STAGE3_LAGS] = energies_st3[k][first..]
+                    .first_chunk()
+                    .expect("five lags inside the search range");
+                for lag_counter in 0..PE_NB_STAGE3_LAGS {
+                    cross_corr[lag_counter] =
+                        cross_corr[lag_counter].saturating_add(cross_corr_k[lag_counter]);
+                    energy[lag_counter] = energy[lag_counter].saturating_add(energy_k[lag_counter]);
+                }
+            }
+            // A vector whose correlation is not positive is skipped in the
+            // search below. It is entered as 0 / 1 for the division, and so
+            // is every lag after `end_lag`.
+            for lag_counter in 0..PE_NB_STAGE3_LAGS {
+                if cross_corr[lag_counter] <= 0 || lag_counter >= nb_lags {
+                    cross_corr[lag_counter] = 0;
+                    energy[lag_counter] = 1;
+                }
+            }
+            cross_corrs[j] = cross_corr;
+            energies[j] = energy;
+        }
+        // All quotients in one batch.
+        let mut quotients = [[0i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX];
+        silk_div32_varq_batch(
+            quotients[..nb_cbk_search_st3].as_flattened_mut(),
+            cross_corrs[..nb_cbk_search_st3].as_flattened(),
+            energies[..nb_cbk_search_st3].as_flattened(),
+            14,
+        );
+
+        let (lag_cb_first_subfr, _) = stage3_tables(nb_subfr, complexity, 0);
         for (lag_counter, d) in (start_lag..=end_lag).enumerate() {
             for j in 0..nb_cbk_search_st3 {
-                let mut cross_corr = 0i32;
-                let mut energy = energy_target;
-                for k in 0..nb_subfr {
-                    cross_corr = silk_add_sat32(cross_corr, cross_corr_st3[k][j][lag_counter]);
-                    energy = silk_add_sat32(energy, energies_st3[k][j][lag_counter]);
-                }
-                if cross_corr > 0 {
-                    let mut cc_max_new = silk_div32_varq(cross_corr, energy, 14);
+                if cross_corrs[j][lag_counter] > 0 {
+                    let mut cc_max_new = quotients[j][lag_counter];
                     let diff = i16::MAX as i32 - silk_mul(contour_bias_q15, j as i32);
                     cc_max_new = silk_smulwb(cc_max_new, diff);
-                    let lag_cb_ptr_st3_0: &[i8] = if nb_subfr == PE_MAX_NB_SUBFR {
-                        &SILK_CB_LAGS_STAGE3[0]
-                    } else {
-                        &SILK_CB_LAGS_STAGE3_10_MS[0]
-                    };
-                    if cc_max_new > cc_max && (d + lag_cb_ptr_st3_0[j] as i32) <= max_lag as i32 {
+                    if cc_max_new > cc_max && (d + lag_cb_first_subfr[j] as i32) <= max_lag as i32 {
                         cc_max = cc_max_new;
                         lag_new = d;
                         cb_i_max = j;
@@ -606,8 +791,34 @@ pub fn silk_pitch_analysis_core(
     0
 }
 
+/// For subframe `k` of the last search stage: the lag offset that each
+/// codebook vector gives the subframe, and the lowest and the highest lag
+/// offset that is searched.
+#[inline(always)]
+fn stage3_tables(
+    nb_subfr: usize,
+    complexity: usize,
+    k: usize,
+) -> (&'static [i8], &'static [i8; 2]) {
+    if nb_subfr == PE_MAX_NB_SUBFR {
+        (
+            &SILK_CB_LAGS_STAGE3[k],
+            &SILK_LAG_RANGE_STAGE3[complexity][k],
+        )
+    } else {
+        (
+            &SILK_CB_LAGS_STAGE3_10_MS[k],
+            &SILK_LAG_RANGE_STAGE3_10_MS[k],
+        )
+    }
+}
+
+/// Cross-correlation of every subframe with the signal one lag earlier, for
+/// each lag of the search range of the subframe: `cross_corr_st3[k][i]`
+/// belongs to the lag `start_lag` plus the lowest offset of subframe `k`
+/// plus `i`.
 fn silk_p_ana_calc_corr_st3(
-    cross_corr_st3: &mut [[[i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX]; PE_MAX_NB_SUBFR],
+    cross_corr_st3: &mut [[i32; SCRATCH_SIZE]; PE_MAX_NB_SUBFR],
     frame: &[i16],
     start_lag: usize,
     sf_length: usize,
@@ -616,28 +827,12 @@ fn silk_p_ana_calc_corr_st3(
     fs_khz: usize,
 ) {
     let mut xcorr32 = [0i32; SCRATCH_SIZE];
-    let mut scratch_mem = [0i32; SCRATCH_SIZE];
 
     let mut target_ptr_idx = PE_LTP_MEM_LENGTH_MS * (if fs_khz > 8 { fs_khz } else { 8 });
     for k in 0..nb_subfr {
-        let (lag_cb_ptr_curr, lag_range_ptr_curr, nb_cbk_search): (&[i8], &[i8; 2], usize) =
-            if nb_subfr == PE_MAX_NB_SUBFR {
-                (
-                    &SILK_CB_LAGS_STAGE3[k],
-                    &SILK_LAG_RANGE_STAGE3[complexity][k],
-                    SILK_NB_CBK_SEARCHS_STAGE3[complexity],
-                )
-            } else {
-                static LAG_RANGE_10MS: [[i8; 2]; 2] = [[-3, 7], [-2, 7]];
-                (
-                    &SILK_CB_LAGS_STAGE3_10_MS[k],
-                    &LAG_RANGE_10MS[k],
-                    PE_NB_CBKS_STAGE3_10MS,
-                )
-            };
-
-        let lag_low = lag_range_ptr_curr[0] as i32;
-        let lag_high = lag_range_ptr_curr[1] as i32;
+        let (_, lag_range) = stage3_tables(nb_subfr, complexity, k);
+        let lag_low = lag_range[0] as i32;
+        let lag_high = lag_range[1] as i32;
         let lag_counter_total = (lag_high - lag_low + 1) as usize;
         assert!(lag_counter_total <= SCRATCH_SIZE);
         silk_pitch_xcorr(
@@ -647,22 +842,22 @@ fn silk_p_ana_calc_corr_st3(
             sf_length,
             lag_counter_total,
         );
-        for j in 0..lag_counter_total {
-            scratch_mem[j] = xcorr32[lag_counter_total - 1 - j];
-        }
-
-        let delta = lag_range_ptr_curr[0];
-        for i in 0..nb_cbk_search {
-            let idx = (lag_cb_ptr_curr[i] - delta) as usize;
-            cross_corr_st3[k][i][..PE_NB_STAGE3_LAGS]
-                .copy_from_slice(&scratch_mem[idx..(PE_NB_STAGE3_LAGS + idx)]);
+        // `silk_pitch_xcorr` returns the highest lag first.
+        for (lowest_first, &highest_first) in cross_corr_st3[k][..lag_counter_total]
+            .iter_mut()
+            .zip(xcorr32[..lag_counter_total].iter().rev())
+        {
+            *lowest_first = highest_first;
         }
         target_ptr_idx += sf_length;
     }
 }
 
+/// Energy of the signal that every subframe is compared with, for each lag
+/// of the search range of the subframe, in the layout of
+/// `silk_p_ana_calc_corr_st3`.
 fn silk_p_ana_calc_energy_st3(
-    energies_st3: &mut [[[i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX]; PE_MAX_NB_SUBFR],
+    energies_st3: &mut [[i32; SCRATCH_SIZE]; PE_MAX_NB_SUBFR],
     frame: &[i16],
     start_lag: usize,
     sf_length: usize,
@@ -670,33 +865,17 @@ fn silk_p_ana_calc_energy_st3(
     complexity: usize,
     fs_khz: usize,
 ) {
-    let mut scratch_mem = [0i32; SCRATCH_SIZE];
-
     let mut target_ptr_idx = PE_LTP_MEM_LENGTH_MS * (if fs_khz > 8 { fs_khz } else { 8 });
     for k in 0..nb_subfr {
-        let (lag_cb_ptr_curr, lag_range_ptr_curr, nb_cbk_search): (&[i8], &[i8; 2], usize) =
-            if nb_subfr == PE_MAX_NB_SUBFR {
-                (
-                    &SILK_CB_LAGS_STAGE3[k],
-                    &SILK_LAG_RANGE_STAGE3[complexity][k],
-                    SILK_NB_CBK_SEARCHS_STAGE3[complexity],
-                )
-            } else {
-                static LAG_RANGE_10MS: [[i8; 2]; 2] = [[-3, 7], [-2, 7]];
-                (
-                    &SILK_CB_LAGS_STAGE3_10_MS[k],
-                    &LAG_RANGE_10MS[k],
-                    PE_NB_CBKS_STAGE3_10MS,
-                )
-            };
+        let (_, lag_range) = stage3_tables(nb_subfr, complexity, k);
 
         let basis_ptr_idx =
-            (target_ptr_idx as i32 - (start_lag as i32 + lag_range_ptr_curr[0] as i32)) as usize;
+            (target_ptr_idx as i32 - (start_lag as i32 + lag_range[0] as i32)) as usize;
         let mut energy =
             silk_inner_prod_aligned(&frame[basis_ptr_idx..], &frame[basis_ptr_idx..], sf_length);
-        scratch_mem[0] = energy;
+        energies_st3[k][0] = energy;
 
-        let lag_diff = (lag_range_ptr_curr[1] - lag_range_ptr_curr[0] + 1) as usize;
+        let lag_diff = (lag_range[1] - lag_range[0] + 1) as usize;
         for i in 1..lag_diff {
             energy = energy.wrapping_sub(silk_smulbb(
                 frame[basis_ptr_idx + sf_length - i] as i32,
@@ -707,15 +886,179 @@ fn silk_p_ana_calc_energy_st3(
                 energy,
                 silk_smulbb(frame[back_idx] as i32, frame[back_idx] as i32),
             );
-            scratch_mem[i] = energy;
-        }
-
-        let delta = lag_range_ptr_curr[0];
-        for i in 0..nb_cbk_search {
-            let idx = (lag_cb_ptr_curr[i] - delta) as usize;
-            energies_st3[k][i][..PE_NB_STAGE3_LAGS]
-                .copy_from_slice(&scratch_mem[idx..(PE_NB_STAGE3_LAGS + idx)]);
+            energies_st3[k][i] = energy;
         }
         target_ptr_idx += sf_length;
+    }
+}
+
+#[cfg(test)]
+mod stage3_table_tests {
+    use super::*;
+
+    /// The last search stage reads five neighbouring lags per codebook
+    /// vector from the values of a subframe. They must all lie inside the
+    /// search range of the subframe.
+    #[test]
+    fn five_lags_of_every_vector_are_inside_the_search_range() {
+        let shapes = [
+            (PE_MAX_NB_SUBFR, SILK_PE_MIN_COMPLEX),
+            (PE_MAX_NB_SUBFR, SILK_PE_MID_COMPLEX),
+            (PE_MAX_NB_SUBFR, SILK_PE_MAX_COMPLEX),
+            (PE_MAX_NB_SUBFR / 2, SILK_PE_MIN_COMPLEX),
+            (PE_MAX_NB_SUBFR / 2, SILK_PE_MID_COMPLEX),
+            (PE_MAX_NB_SUBFR / 2, SILK_PE_MAX_COMPLEX),
+        ];
+        for (nb_subfr, complexity) in shapes {
+            let nb_vectors = if nb_subfr == PE_MAX_NB_SUBFR {
+                SILK_NB_CBK_SEARCHS_STAGE3[complexity]
+            } else {
+                PE_NB_CBKS_STAGE3_10MS
+            };
+            for k in 0..nb_subfr {
+                let (lag_cb, lag_range) = stage3_tables(nb_subfr, complexity, k);
+                let nb_lags = (lag_range[1] - lag_range[0] + 1) as usize;
+                assert!(nb_lags <= SCRATCH_SIZE);
+                for &offset in &lag_cb[..nb_vectors] {
+                    assert!(lag_range[0] <= offset, "subframe {k}, offset {offset}");
+                    assert!(
+                        offset as i32 + PE_NB_STAGE3_LAGS as i32 - 1 <= lag_range[1] as i32,
+                        "subframe {k}, offset {offset}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod div_tests {
+    use super::silk_div32_varq_batch;
+    use crate::silk::macros::silk_div32_varq;
+
+    /// xorshift64 generator with a fixed seed, so the test data never
+    /// changes.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// Compare the batch function with one scalar call per element.
+    fn check(a: &[i32], b: &[i32], qres: i32) {
+        let expected: Vec<i32> = a
+            .iter()
+            .zip(b)
+            .map(|(&a, &b)| silk_div32_varq(a, b, qres))
+            .collect();
+        let mut out = vec![0x5a5a_5a5ai32; a.len()];
+        silk_div32_varq_batch(&mut out, a, b, qres);
+        assert_eq!(out, expected, "qres {qres}, a {a:?}, b {b:?}");
+    }
+
+    /// Powers of two and their neighbours with both signs, and the ends of
+    /// the 32-bit range: every count of leading zeros occurs.
+    fn special_values() -> Vec<i32> {
+        let mut values = vec![0, i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1];
+        for bit in 0..31 {
+            let power = 1i32 << bit;
+            for value in [power - 1, power, power + 1] {
+                values.push(value);
+                values.push(-value);
+            }
+        }
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+
+    #[test]
+    fn special_values_match_scalar() {
+        let values = special_values();
+        let divisors: Vec<i32> = values.iter().copied().filter(|&v| v != 0).collect();
+        for qres in [0, 1, 13, 14, 15, 16, 21, 24] {
+            // Every dividend with every divisor, four at a time.
+            for &divisor in &divisors {
+                let b = vec![divisor; values.len()];
+                check(&values, &b, qres);
+            }
+        }
+    }
+
+    #[test]
+    fn random_values_match_scalar() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for round in 0..200_000 {
+            // Any magnitude: a random number of leading bits is cleared.
+            let any = |rng: &mut XorShift| (rng.next() as i32) >> (rng.next() % 32);
+            let len = round % 10;
+            let a: Vec<i32> = (0..len).map(|_| any(&mut rng)).collect();
+            let b: Vec<i32> = (0..len)
+                .map(|_| {
+                    let value = any(&mut rng);
+                    if value == 0 { 1 } else { value }
+                })
+                .collect();
+            check(&a, &b, (round % 25) as i32);
+        }
+    }
+
+    #[test]
+    fn pitch_like_values_match_scalar() {
+        // A correlation divided by a larger energy, format Q14: the use in
+        // the pitch analysis.
+        let mut rng = XorShift(0x0123_4567_89AB_CDEF);
+        for _ in 0..50_000 {
+            let energy: Vec<i32> = (0..8)
+                .map(|_| 1 + (rng.next() % (1 << 30)) as i32)
+                .collect();
+            let corr: Vec<i32> = energy
+                .iter()
+                .map(|&e| ((rng.next() % (2 * e as u64 + 1)) as i64 - e as i64) as i32)
+                .collect();
+            check(&corr, &energy, 14);
+        }
+    }
+
+    #[test]
+    fn nlsf_weight_values_match_scalar() {
+        // A 16-bit weight divided by the square of a 16-bit weight, format
+        // Q21: the use in `silk_nlsf_encode`, for 10 and 16 coefficients.
+        let mut rng = XorShift(0x0F1E_2D3C_4B5A_6978);
+        let edges = [1i32, 2, 255, 256, 32767];
+        for round in 0..50_000 {
+            let len = if round % 2 == 0 { 10 } else { 16 };
+            let pick = |rng: &mut XorShift| {
+                if round % 5 == 0 {
+                    edges[(rng.next() % edges.len() as u64) as usize]
+                } else {
+                    1 + (rng.next() % 32767) as i32
+                }
+            };
+            let weight: Vec<i32> = (0..len).map(|_| pick(&mut rng)).collect();
+            let squared: Vec<i32> = (0..len)
+                .map(|_| {
+                    let w = pick(&mut rng);
+                    w * w
+                })
+                .collect();
+            check(&weight, &squared, 21);
+        }
+    }
+
+    /// A zero divisor is an error in `silk_div32_varq`. The batch function
+    /// must not hide it.
+    #[test]
+    #[should_panic]
+    fn zero_divisor_panics_like_scalar() {
+        let mut out = [0i32; 4];
+        silk_div32_varq_batch(&mut out, &[1, 2, 3, 4], &[5, 0, 7, 8], 14);
     }
 }

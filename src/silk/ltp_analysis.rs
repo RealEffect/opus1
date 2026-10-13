@@ -79,6 +79,49 @@ pub fn silk_find_ltp_fix(
     }
 }
 
+/// One output sample of the LTP analysis filter.
+///
+/// `cur` is the input sample. `taps[j]` is the earlier input sample that
+/// coefficient `b_q14[j]` multiplies: the sample one pitch lag before `cur`
+/// is `taps[2]`, and `taps[0]` is two samples later than that.
+#[inline(always)]
+fn ltp_residual(
+    cur: i16,
+    taps: [i16; LTP_ORDER],
+    b_q14: &[i16; LTP_ORDER],
+    inv_gain_q16: i32,
+) -> i16 {
+    let mut ltp_est: i32 = silk_smulbb(taps[0] as i32, b_q14[0] as i32);
+    ltp_est = silk_smlabb(ltp_est, taps[1] as i32, b_q14[1] as i32);
+    ltp_est = silk_smlabb(ltp_est, taps[2] as i32, b_q14[2] as i32);
+    ltp_est = silk_smlabb(ltp_est, taps[3] as i32, b_q14[3] as i32);
+    ltp_est = silk_smlabb(ltp_est, taps[4] as i32, b_q14[4] as i32);
+
+    let ltp_est_q0 = ltp_est.wrapping_add(8192) >> 14;
+
+    let res_q0 = silk_sat16(cur as i32 - ltp_est_q0);
+
+    // silk_smulwb(inv_gain_q16, res_q0), which is
+    // (inv_gain_q16 * res_q0) >> 16 with a 64-bit product, written with
+    // 32-bit products so that the compiler can keep the whole loop in vector
+    // code. With inv_gain_q16 = high * 65536 + low (0 <= low < 65536) the
+    // product is high * res_q0 * 65536 + low * res_q0, and the first term
+    // is a multiple of 65536. `res_q0` is a 16-bit value, so both products
+    // fit in 32 bits.
+    let high = inv_gain_q16 >> 16;
+    let low = inv_gain_q16 & 0xffff;
+    (high * res_q0 + ((low * res_q0) >> 16)) as i16
+}
+
+/// LTP analysis filter (libopus `silk_LTP_analysis_filter_FIX`): for every
+/// subframe, subtract the long-term prediction from the input and scale the
+/// result with the inverse gain of the subframe.
+///
+/// Subframe `k` reads `subfr_length + pre_length` samples of `x` from
+/// `x_base_idx + k * subfr_length`, and the samples `pitch_l[k]` (at least
+/// 2) before them, two more on either side. A sample outside `x` counts as
+/// zero. The output of the subframes is written to `ltp_res` one after the
+/// other.
 pub fn silk_ltp_analysis_filter_fix(
     ltp_res: &mut [i16],
     x: &[i16],
@@ -90,6 +133,7 @@ pub fn silk_ltp_analysis_filter_fix(
     nb_subfr: usize,
     pre_length: usize,
 ) {
+    let n = subfr_length + pre_length;
     let mut x_ptr_idx = x_base_idx;
     let mut ltp_res_ptr_idx = 0;
 
@@ -97,40 +141,62 @@ pub fn silk_ltp_analysis_filter_fix(
         let valid_pitch = pitch_l[k].max(2);
         let x_lag_ptr_idx = x_ptr_idx as isize - valid_pitch as isize;
 
-        let btmp_q14 = [
-            b_q14[k * LTP_ORDER],
-            b_q14[k * LTP_ORDER + 1],
-            b_q14[k * LTP_ORDER + 2],
-            b_q14[k * LTP_ORDER + 3],
-            b_q14[k * LTP_ORDER + 4],
-        ];
+        let btmp_q14: &[i16; LTP_ORDER] = b_q14[k * LTP_ORDER..]
+            .first_chunk()
+            .expect("5 coefficients per subframe");
+        let inv_gain_q16 = inv_gain_q16[k];
 
-        for i in 0..(subfr_length + pre_length) {
-            let idx = x_ptr_idx + i;
-            let res_val = if idx < x.len() { x[idx] } else { 0 };
+        // First sample that the filter reads around the lag: two before the
+        // lagged position of output 0.
+        let lag_start = x_lag_ptr_idx - (LTP_ORDER as isize / 2);
+        let all_inside = lag_start >= 0
+            && lag_start as usize + n + (LTP_ORDER - 1) <= x.len()
+            && x_ptr_idx + n <= x.len();
+        if all_inside {
+            // The usual case: every sample is inside `x`. The slices all have
+            // length `n`, so the loop has no bounds checks and the compiler
+            // turns it into vector code.
+            let lag_start = lag_start as usize;
+            let cur = &x[x_ptr_idx..x_ptr_idx + n];
+            let (t0, t1, t2, t3, t4) = (
+                &x[lag_start + 4..lag_start + 4 + n],
+                &x[lag_start + 3..lag_start + 3 + n],
+                &x[lag_start + 2..lag_start + 2 + n],
+                &x[lag_start + 1..lag_start + 1 + n],
+                &x[lag_start..lag_start + n],
+            );
+            let out = &mut ltp_res[ltp_res_ptr_idx..ltp_res_ptr_idx + n];
+            for i in 0..n {
+                out[i] = ltp_residual(
+                    cur[i],
+                    [t0[i], t1[i], t2[i], t3[i], t4[i]],
+                    btmp_q14,
+                    inv_gain_q16,
+                );
+            }
+        } else {
+            for i in 0..n {
+                let idx = x_ptr_idx + i;
+                let cur = if idx < x.len() { x[idx] } else { 0 };
 
-            let get_x = |offset: isize| -> i16 {
-                let idx = x_lag_ptr_idx + i as isize + offset;
-                if idx >= 0 && (idx as usize) < x.len() {
-                    x[idx as usize]
-                } else {
-                    0
-                }
-            };
-            let mut ltp_est: i32 = silk_smulbb(get_x(2) as i32, btmp_q14[0] as i32);
-            ltp_est = silk_smlabb(ltp_est, get_x(1) as i32, btmp_q14[1] as i32);
-            ltp_est = silk_smlabb(ltp_est, get_x(0) as i32, btmp_q14[2] as i32);
-            ltp_est = silk_smlabb(ltp_est, get_x(-1) as i32, btmp_q14[3] as i32);
-            ltp_est = silk_smlabb(ltp_est, get_x(-2) as i32, btmp_q14[4] as i32);
-
-            let ltp_est_q0 = (ltp_est + 8192) >> 14;
-
-            let res_q0 = silk_sat16(res_val as i32 - ltp_est_q0) as i16;
-
-            ltp_res[ltp_res_ptr_idx + i] = silk_smulwb(inv_gain_q16[k], res_q0 as i32) as i16;
+                let get_x = |offset: isize| -> i16 {
+                    let idx = x_lag_ptr_idx + i as isize + offset;
+                    if idx >= 0 && (idx as usize) < x.len() {
+                        x[idx as usize]
+                    } else {
+                        0
+                    }
+                };
+                ltp_res[ltp_res_ptr_idx + i] = ltp_residual(
+                    cur,
+                    [get_x(2), get_x(1), get_x(0), get_x(-1), get_x(-2)],
+                    btmp_q14,
+                    inv_gain_q16,
+                );
+            }
         }
 
-        ltp_res_ptr_idx += subfr_length + pre_length;
+        ltp_res_ptr_idx += n;
         x_ptr_idx += subfr_length;
     }
 }

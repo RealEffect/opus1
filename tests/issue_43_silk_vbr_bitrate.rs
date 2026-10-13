@@ -18,7 +18,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus_rs::{Application, OpusEncoder};
+use opus_rs::{Application, ForcedMode, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Packets per stream, and how many leading packets are warm-up.
@@ -101,6 +101,11 @@ fn rs_packets(setup: Setup, cbr: bool, buf_len: usize) -> Vec<Vec<u8>> {
     let frame = setup.frame();
     let input = voiced(setup.sr, frame * PACKETS);
     let mut enc = OpusEncoder::new(setup.sr as i32, 1, Application::Voip).unwrap();
+    // These tests are about SILK-only packets. Left to itself the encoder
+    // takes CELT-only at 64 kb/s, as libopus does when it has no speech
+    // detector to say otherwise (opus_encoder.c: `equiv_rate >= threshold`).
+    // The libopus side below is kept in SILK with the voice signal hint.
+    enc.set_force_mode(Some(ForcedMode::SilkOnly));
     enc.bitrate_bps = setup.bitrate;
     enc.use_cbr = cbr;
     let mut out = vec![0u8; buf_len];

@@ -1,4 +1,5 @@
 use crate::silk::macros::*;
+use core::mem::MaybeUninit;
 
 pub const SILK_RESAMPLER_1_3_COEFS: [i16; 20] = [
     16102, -15162, -13, 0, 20, 26, 5, -31, -43, -4, 65, 90, 7, -157, -248, -44, 593, 1583, 2612,
@@ -149,6 +150,33 @@ const SILK_RESAMPLER_FRAC_FIR_12: [[i16; 4]; 12] = [
 
 const RESAMPLER_MAX_BATCH_SIZE_MS: i32 = 10;
 const RESAMPLER_ORDER_FIR_12: usize = 8;
+
+/// The 8 taps of each of the 12 interpolation phases of the fractional
+/// up-sampler, in the order of the input samples: the 4 taps of phase `t`
+/// from `SILK_RESAMPLER_FRAC_FIR_12`, then the 4 taps of phase `11 - t` in
+/// reverse.
+///
+/// Rows 12 to 15 are never used. They make the table 16 rows long, so that
+/// a phase masked with 15 is a valid index without a bounds check.
+const SILK_RESAMPLER_FRAC_FIR_12_TAPS: [[i16; RESAMPLER_ORDER_FIR_12]; 16] = {
+    let mut taps = [[0i16; RESAMPLER_ORDER_FIR_12]; 16];
+    let mut phase = 0;
+    while phase < 12 {
+        let mut j = 0;
+        while j < 4 {
+            taps[phase][j] = SILK_RESAMPLER_FRAC_FIR_12[phase][j];
+            taps[phase][7 - j] = SILK_RESAMPLER_FRAC_FIR_12[11 - phase][j];
+            j += 1;
+        }
+        phase += 1;
+    }
+    taps
+};
+
+/// Longest input batch of the fractional up-sampler, in samples.
+const IIR_FIR_MAX_BATCH_IN: usize = 480;
+/// Its work buffer: the FIR history and two samples per input sample.
+const IIR_FIR_BUF_LEN: usize = 2 * IIR_FIR_MAX_BATCH_IN + RESAMPLER_ORDER_FIR_12;
 
 const DELAY_MATRIX_DEC: [[i8; 6]; 3] =
     [[4, 0, 2, 0, 0, 0], [0, 9, 4, 7, 4, 4], [0, 3, 12, 7, 7, 7]];
@@ -418,21 +446,36 @@ impl SilkResampler {
                 }
             }
             ResamplerMode::IirFir => {
-                self.iir_fir_resample(
+                // The first millisecond comes from the delay buffer, the
+                // rest from the input.
+                let rest_len = (in_len - self.fs_in_khz) as usize;
+                iir_fir_resample(
+                    &mut self.s_iir,
+                    &mut self.s_fir,
+                    self.batch_size as usize,
+                    self.inv_ratio_q16,
                     out,
-                    &self.delay_buf.clone(),
-                    self.fs_in_khz,
-                    &input[n_samples as usize..],
-                    in_len - self.fs_in_khz,
+                    [
+                        &self.delay_buf[..self.fs_in_khz as usize],
+                        &input[n_samples as usize..n_samples as usize + rest_len],
+                    ],
                 );
             }
             ResamplerMode::DownFir => {
-                self.down_fir_resample(
+                let rest_len = (in_len - self.fs_in_khz) as usize;
+                down_fir_resample(
+                    &mut self.s_iir,
+                    &mut self.s_down_fir,
+                    self.batch_size as usize,
+                    self.inv_ratio_q16,
+                    self.down_order,
+                    self.fir_fracs,
+                    self.down_coefs,
                     out,
-                    &self.delay_buf.clone(),
-                    self.fs_in_khz,
-                    &input[n_samples as usize..],
-                    in_len - self.fs_in_khz,
+                    [
+                        &self.delay_buf[..self.fs_in_khz as usize],
+                        &input[n_samples as usize..n_samples as usize + rest_len],
+                    ],
                 );
             }
         }
@@ -445,354 +488,752 @@ impl SilkResampler {
 
         0
     }
+}
 
-    /// Port of `silk_resampler_private_down_FIR` (resampler_private_down_FIR.c):
-    /// a second-order AR filter followed by a fractionally-interpolated
-    /// symmetric FIR decimator. `first_block`/`first_len` is the resampler's
-    /// 1-ms delay buffer block, `rest` the remainder of the call's input.
-    fn down_fir_resample(
-        &mut self,
-        out: &mut [i16],
-        first_block: &[i16],
-        first_len: i32,
-        rest: &[i16],
-        rest_len: i32,
-    ) {
-        let order = self.down_order;
-        let fracs = self.fir_fracs;
-        let coefs = self.down_coefs;
-        let fir_coefs = &coefs[2..];
-        let index_increment_q16 = self.inv_ratio_q16;
-        let mut out_idx = 0usize;
-        let mut buf = [0i32; 480 + RESAMPLER_DOWN_ORDER_FIR2];
+/// Longest input batch of the down-sampler, in samples (10 ms at 48 kHz).
+const DOWN_FIR_MAX_BATCH_IN: usize = 480;
+/// Its work buffer: the FIR history and one sample per input sample.
+const DOWN_FIR_BUF_LEN: usize = DOWN_FIR_MAX_BATCH_IN + RESAMPLER_DOWN_ORDER_FIR2;
 
-        // First block comes from the delay buffer, the rest from the input,
-        // mirroring how `silk_resampler` feeds the private decimator.
-        let phases = [
-            (&first_block[..first_len as usize],),
-            (&rest[..rest_len.max(0) as usize],),
-        ];
-        for (phase,) in phases.iter() {
-            let input = *phase;
-            let mut in_pos = 0usize;
-            while in_pos < input.len() {
-                let n = (input.len() - in_pos).min(self.batch_size as usize);
+/// The taps of an interpolating down-FIR (ratios 3/4 and 2/3): 18 taps for
+/// each fractional position.
+struct DownFirTaps {
+    /// The taps in the order of the input samples: the 9 coefficients of
+    /// position `i` from the libopus table, then the 9 of position
+    /// `fracs - 1 - i` in reverse.
+    ///
+    /// Rows from `fracs` on are never used. They make the table 4 rows
+    /// long, so that a position masked with 3 is a valid index without a
+    /// bounds check.
+    taps: [[i16; RESAMPLER_DOWN_ORDER_FIR0]; 4],
+    /// The same taps as operands of the vector kernel, shifted left by 15:
+    /// vqdmulhq_s32(x, t << 15) is (x * t) >> 16. Each row holds taps 0 to
+    /// 15 and then taps 14 to 17 with the first two set to zero. A fifth
+    /// vector, loaded at sample 14, then covers the last two taps without
+    /// reading past the 18 samples.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    wide: [[i32; 20]; 4],
+}
 
-                // Copy the FIR history to the start of the buffer.
-                buf[..order].copy_from_slice(&self.s_down_fir[..order]);
+const fn down_fir_taps(coefs: &[i16], fracs: usize) -> DownFirTaps {
+    const HALF: usize = RESAMPLER_DOWN_ORDER_FIR0 / 2;
+    let mut taps = [[0i16; RESAMPLER_DOWN_ORDER_FIR0]; 4];
+    let mut wide = [[0i32; 20]; 4];
+    let mut i = 0;
+    while i < fracs {
+        let mut k = 0;
+        while k < HALF {
+            taps[i][k] = coefs[2 + HALF * i + k];
+            taps[i][RESAMPLER_DOWN_ORDER_FIR0 - 1 - k] = coefs[2 + HALF * (fracs - 1 - i) + k];
+            k += 1;
+        }
+        let mut k = 0;
+        while k < 16 {
+            wide[i][k] = (taps[i][k] as i32) << 15;
+            k += 1;
+        }
+        wide[i][18] = (taps[i][16] as i32) << 15;
+        wide[i][19] = (taps[i][17] as i32) << 15;
+        i += 1;
+    }
+    DownFirTaps { taps, wide }
+}
 
-                // Second-order AR filter, output in Q8
-                // (resampler_private_AR2.c: the state update uses the Q10
-                // version of the output).
-                for k in 0..n {
-                    let out32 = self.s_iir[0].wrapping_add((input[in_pos + k] as i32) << 8);
-                    buf[order + k] = out32;
-                    let out_q10 = out32.wrapping_shl(2);
-                    self.s_iir[0] = self.s_iir[1]
-                        .wrapping_add(silk_smulwb(out_q10, coefs[0] as i32));
-                    self.s_iir[1] = silk_smulwb(out_q10, coefs[1] as i32);
-                }
+static SILK_RESAMPLER_3_4_TAPS: DownFirTaps = down_fir_taps(&SILK_RESAMPLER_3_4_COEFS, 3);
+static SILK_RESAMPLER_2_3_TAPS: DownFirTaps = down_fir_taps(&SILK_RESAMPLER_2_3_COEFS, 2);
 
-                // Fractionally-interpolated symmetric FIR decimation.
-                let max_index_q16 = (n as i32) << 16;
-                let mut index_q16 = 0i32;
-                while index_q16 < max_index_q16 {
-                    let p = (index_q16 >> 16) as usize;
-                    let res_q6 = match order {
-                        RESAMPLER_DOWN_ORDER_FIR0 => {
-                            let ind = silk_smulwb(index_q16 & 0xFFFF, fracs) as usize;
-                            let mut r = silk_smulwb(buf[p], fir_coefs[9 * ind] as i32);
-                            for k in 1..9 {
-                                r = silk_smlawb(r, buf[p + k], fir_coefs[9 * ind + k] as i32);
-                            }
-                            let mir = &fir_coefs[9 * (fracs as usize - 1 - ind)..];
-                            for k in 0..9 {
-                                r = silk_smlawb(r, buf[p + 17 - k], mir[k] as i32);
-                            }
-                            r
-                        }
-                        RESAMPLER_DOWN_ORDER_FIR1 => {
-                            let mut r = 0i32;
-                            for k in 0..12 {
-                                r = silk_smlawb(
-                                    r,
-                                    buf[p + k].wrapping_add(buf[p + 23 - k]),
-                                    fir_coefs[k] as i32,
-                                );
-                            }
-                            r
-                        }
-                        _ => {
-                            let mut r = 0i32;
-                            for k in 0..18 {
-                                r = silk_smlawb(
-                                    r,
-                                    buf[p + k].wrapping_add(buf[p + 35 - k]),
-                                    fir_coefs[k] as i32,
-                                );
-                            }
-                            r
-                        }
+/// Port of `silk_resampler_private_down_FIR` (resampler_private_down_FIR.c):
+/// down-sampling. Each batch of the input runs through a second-order AR
+/// filter into a work buffer, and the output samples are computed from that
+/// buffer with a FIR filter.
+#[allow(clippy::too_many_arguments)]
+fn down_fir_resample(
+    s_iir: &mut [i32; 6],
+    s_fir: &mut [i32; RESAMPLER_DOWN_ORDER_FIR2],
+    batch_size: usize,
+    index_increment_q16: i32,
+    order: usize,
+    fracs: i32,
+    coefs: &'static [i16],
+    mut out: &mut [i16],
+    blocks: [&[i16]; 2],
+) {
+    // libopus leaves this buffer uninitialized as well. Every batch writes
+    // the part it reads.
+    let mut buf_storage = [MaybeUninit::<i32>::uninit(); DOWN_FIR_BUF_LEN];
+
+    for block in blocks {
+        for input in block.chunks(batch_size.max(1)) {
+            let n = input.len();
+            let buf_len = order + n;
+            assert!(order <= RESAMPLER_DOWN_ORDER_FIR2 && buf_len <= DOWN_FIR_BUF_LEN);
+            // SAFETY: the pointer covers `DOWN_FIR_BUF_LEN` elements of the
+            // local array and `buf_len` is at most that (checked above).
+            // All `buf_len` elements are written before any is read: the
+            // first `order` by the copy of the FIR history, the other `n`
+            // by the AR filter, which writes one sample per input sample.
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(buf_storage.as_mut_ptr() as *mut i32, buf_len)
+            };
+
+            buf[..order].copy_from_slice(&s_fir[..order]);
+            down_fir_ar2(s_iir, &mut buf[order..], input, coefs[0] as i32, coefs[1] as i32);
+
+            // One output sample per step of the index while it is below
+            // the batch length, but no more than fit into `out`.
+            let written = if index_increment_q16 > 0 {
+                let steps = (n << 16).div_ceil(index_increment_q16 as usize);
+                steps.min(out.len())
+            } else {
+                0
+            };
+            let (batch_out, rest) = core::mem::take(&mut out).split_at_mut(written);
+            out = rest;
+            match order {
+                RESAMPLER_DOWN_ORDER_FIR0 => {
+                    let taps = if fracs == 3 {
+                        &SILK_RESAMPLER_3_4_TAPS
+                    } else {
+                        &SILK_RESAMPLER_2_3_TAPS
                     };
-
-                    if out_idx < out.len() {
-                        out[out_idx] = silk_sat16(silk_rshift_round(res_q6, 6)) as i16;
-                        out_idx += 1;
-                    }
-                    index_q16 += index_increment_q16;
+                    down_fir_interpolated(batch_out, buf, index_increment_q16, fracs, taps);
                 }
-
-                in_pos += n;
-
-                // Carry the FIR history over to the next block.
-                self.s_down_fir[..order].copy_from_slice(&buf[n..n + order]);
-            }
-        }
-    }
-
-    fn iir_fir_resample(        &mut self,
-        out: &mut [i16],
-        first_block: &[i16],
-        first_len: i32,
-        rest: &[i16],
-        rest_len: i32,
-    ) {
-        const MAX_BATCH_IN: usize = 480;
-        const MAX_BUF: usize = 2 * MAX_BATCH_IN + RESAMPLER_ORDER_FIR_12;
-
-        let mut out_idx = 0usize;
-
-        let mut in_idx = 0usize;
-        let mut remaining = first_len;
-
-        while remaining > 0 {
-            let n_samples_in = remaining.min(self.batch_size) as usize;
-
-            let buf_len = 2 * n_samples_in + RESAMPLER_ORDER_FIR_12;
-            let mut buf_arr = [0i16; MAX_BUF];
-            let buf = &mut buf_arr[..buf_len];
-
-            buf[..RESAMPLER_ORDER_FIR_12].copy_from_slice(&self.s_fir);
-
-            silk_resampler_private_up2_hq(
-                &mut self.s_iir,
-                &mut buf[RESAMPLER_ORDER_FIR_12..],
-                &first_block[in_idx..in_idx + n_samples_in],
-                n_samples_in as i32,
-            );
-
-            let max_index_q16 = (n_samples_in as i32) << 17;
-            let index_increment_q16 = self.inv_ratio_q16;
-
-            let mut index_q16 = 0i32;
-            while index_q16 < max_index_q16 {
-                let table_index = silk_smulwb(index_q16 & 0xFFFF, 12) as usize;
-                let buf_idx = (index_q16 >> 16) as usize;
-
-                let mut res_q15 = silk_smulbb(
-                    buf[buf_idx] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][0] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 1] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][1] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 2] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][2] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 3] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][3] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 4] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][3] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 5] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][2] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 6] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][1] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 7] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][0] as i32,
-                );
-
-                if out_idx < out.len() {
-                    out[out_idx] = silk_sat16(silk_rshift_round(res_q15, 15)) as i16;
-                    out_idx += 1;
+                RESAMPLER_DOWN_ORDER_FIR1 => {
+                    let half: &[i16; RESAMPLER_DOWN_ORDER_FIR1 / 2] =
+                        coefs[2..].try_into().unwrap();
+                    down_fir_symmetric(batch_out, buf, index_increment_q16, half);
                 }
-                index_q16 += index_increment_q16;
+                _ => {
+                    let half: &[i16; RESAMPLER_DOWN_ORDER_FIR2 / 2] =
+                        coefs[2..].try_into().unwrap();
+                    down_fir_symmetric(batch_out, buf, index_increment_q16, half);
+                }
             }
 
-            in_idx += n_samples_in;
-            remaining -= n_samples_in as i32;
-
-            self.s_fir
-                .copy_from_slice(&buf[2 * n_samples_in..2 * n_samples_in + RESAMPLER_ORDER_FIR_12]);
-        }
-
-        let mut in_idx = 0usize;
-        let mut remaining = rest_len;
-
-        while remaining > 0 {
-            let n_samples_in = remaining.min(self.batch_size) as usize;
-
-            let buf_len = 2 * n_samples_in + RESAMPLER_ORDER_FIR_12;
-            let mut buf_arr = [0i16; MAX_BUF];
-            let buf = &mut buf_arr[..buf_len];
-
-            buf[..RESAMPLER_ORDER_FIR_12].copy_from_slice(&self.s_fir);
-
-            silk_resampler_private_up2_hq(
-                &mut self.s_iir,
-                &mut buf[RESAMPLER_ORDER_FIR_12..],
-                &rest[in_idx..in_idx + n_samples_in],
-                n_samples_in as i32,
-            );
-
-            let max_index_q16 = (n_samples_in as i32) << 17;
-            let index_increment_q16 = self.inv_ratio_q16;
-
-            let mut index_q16 = 0i32;
-            while index_q16 < max_index_q16 {
-                let table_index = silk_smulwb(index_q16 & 0xFFFF, 12) as usize;
-                let buf_idx = (index_q16 >> 16) as usize;
-
-                let mut res_q15 = silk_smulbb(
-                    buf[buf_idx] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][0] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 1] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][1] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 2] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][2] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 3] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[table_index][3] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 4] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][3] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 5] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][2] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 6] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][1] as i32,
-                );
-                res_q15 = silk_smlabb(
-                    res_q15,
-                    buf[buf_idx + 7] as i32,
-                    SILK_RESAMPLER_FRAC_FIR_12[11 - table_index][0] as i32,
-                );
-
-                if out_idx < out.len() {
-                    out[out_idx] = silk_sat16(silk_rshift_round(res_q15, 15)) as i16;
-                    out_idx += 1;
-                }
-                index_q16 += index_increment_q16;
-            }
-
-            in_idx += n_samples_in;
-            remaining -= n_samples_in as i32;
-
-            self.s_fir
-                .copy_from_slice(&buf[2 * n_samples_in..2 * n_samples_in + RESAMPLER_ORDER_FIR_12]);
+            s_fir[..order].copy_from_slice(&buf[n..]);
         }
     }
 }
 
+/// Second-order AR filter of the down-sampler (libopus
+/// `silk_resampler_private_AR2`): one output in Q8 per input sample. `s`
+/// holds the two states in its first two elements.
+///
+/// The states are kept in local variables during the loop, so that they are
+/// not stored and read back for every sample.
+#[inline(always)]
+fn down_fir_ar2(s: &mut [i32; 6], out_q8: &mut [i32], input: &[i16], a0_q14: i32, a1_q14: i32) {
+    let (mut s0, mut s1) = (s[0], s[1]);
+    for (o, &x) in out_q8.iter_mut().zip(input) {
+        let out32 = s0.wrapping_add((x as i32) << 8);
+        *o = out32;
+        // The state update uses the output in Q10.
+        let out_q10 = out32.wrapping_shl(2);
+        s0 = s1.wrapping_add(silk_smulwb(out_q10, a0_q14));
+        s1 = silk_smulwb(out_q10, a1_q14);
+    }
+    s[0] = s0;
+    s[1] = s1;
+}
+
+/// FIR decimation with 18 taps that depend on the fractional part of the
+/// position (ratios 3/4 and 2/3). One output sample per element of `out`:
+/// sample `i` is computed at the position `i * index_increment_q16` in
+/// `buf`.
+#[inline(always)]
+fn down_fir_interpolated(
+    out: &mut [i16],
+    buf: &[i32],
+    index_increment_q16: i32,
+    fracs: i32,
+    taps: &DownFirTaps,
+) {
+    #[cfg(target_arch = "aarch64")]
+    down_fir_interpolated_neon(out, buf, index_increment_q16, fracs, taps);
+    #[cfg(not(target_arch = "aarch64"))]
+    down_fir_interpolated_scalar(out, buf, 0, index_increment_q16, fracs, taps);
+}
+
+/// The row of the tap tables for the fractional part of `index_q16`.
+#[inline(always)]
+fn down_fir_phase(index_q16: i32, fracs: i32) -> usize {
+    // The fractional position is below `fracs`, which is 2 or 3. The mask
+    // only tells the compiler that it is inside the tables.
+    (silk_smulwb(index_q16 & 0xFFFF, fracs) & 3) as usize
+}
+
+/// `down_fir_interpolated` for the samples from `index_q16` on.
+#[inline(always)]
+fn down_fir_interpolated_scalar(
+    out: &mut [i16],
+    buf: &[i32],
+    mut index_q16: i32,
+    index_increment_q16: i32,
+    fracs: i32,
+    taps: &DownFirTaps,
+) {
+    for o in out.iter_mut() {
+        let pos = (index_q16 >> 16) as usize;
+        let x: &[i32; RESAMPLER_DOWN_ORDER_FIR0] =
+            buf[pos..pos + RESAMPLER_DOWN_ORDER_FIR0].try_into().unwrap();
+        let t = &taps.taps[down_fir_phase(index_q16, fracs)];
+
+        let mut res_q6 = 0i32;
+        for k in 0..RESAMPLER_DOWN_ORDER_FIR0 {
+            res_q6 = silk_smlawb(res_q6, x[k], t[k] as i32);
+        }
+        *o = silk_sat16(silk_rshift_round(res_q6, 6)) as i16;
+        index_q16 = index_q16.wrapping_add(index_increment_q16);
+    }
+}
+
+/// `down_fir_interpolated_scalar` with four output samples per step.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn down_fir_interpolated_neon(
+    out: &mut [i16],
+    buf: &[i32],
+    index_increment_q16: i32,
+    fracs: i32,
+    taps: &DownFirTaps,
+) {
+    use core::arch::aarch64::*;
+
+    let mut index_q16 = 0i32;
+    let n4 = down_fir_vector_len(
+        out.len(),
+        buf.len(),
+        RESAMPLER_DOWN_ORDER_FIR0,
+        index_increment_q16,
+    );
+
+    // SAFETY: NEON is part of the aarch64 baseline. `down_fir_vector_len`
+    // has checked that every one of the `n4` samples reads 18 samples of
+    // `buf` that lie inside it; the loads below read `x[0..16]` and
+    // `x[14..18]` of those. The rows of `taps.wide` have 20 elements. A
+    // step at `i` has `i + 4 <= n4 <= out.len()` and writes `out[i..i + 4]`.
+    unsafe {
+        let products = |index_q16: i32| -> int32x4_t {
+            let x = buf.as_ptr().add((index_q16 >> 16) as usize);
+            let w = taps.wide[down_fir_phase(index_q16, fracs)].as_ptr();
+            let p0 = vqdmulhq_s32(vld1q_s32(x), vld1q_s32(w));
+            let p1 = vqdmulhq_s32(vld1q_s32(x.add(4)), vld1q_s32(w.add(4)));
+            let p2 = vqdmulhq_s32(vld1q_s32(x.add(8)), vld1q_s32(w.add(8)));
+            let p3 = vqdmulhq_s32(vld1q_s32(x.add(12)), vld1q_s32(w.add(12)));
+            let p4 = vqdmulhq_s32(vld1q_s32(x.add(14)), vld1q_s32(w.add(16)));
+            vaddq_s32(vaddq_s32(vaddq_s32(p0, p1), vaddq_s32(p2, p3)), p4)
+        };
+        let mut i = 0;
+        while i < n4 {
+            let p0 = products(index_q16);
+            let p1 = products(index_q16.wrapping_add(index_increment_q16));
+            let p2 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(2)));
+            let p3 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(3)));
+            down_fir_store4(out.as_mut_ptr().add(i), p0, p1, p2, p3);
+            index_q16 = index_q16.wrapping_add(index_increment_q16.wrapping_mul(4));
+            i += 4;
+        }
+    }
+    down_fir_interpolated_scalar(&mut out[n4..], buf, index_q16, index_increment_q16, fracs, taps);
+}
+
+/// How many of `n_out` output samples a vector kernel may compute: a
+/// multiple of four, all with their `window` input samples inside the
+/// `buf_len` samples of the buffer. With valid arguments this is `n_out`
+/// rounded down to a multiple of four; the scalar kernel computes the rest
+/// (and panics on an argument that is not valid).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn down_fir_vector_len(
+    n_out: usize,
+    buf_len: usize,
+    window: usize,
+    index_increment_q16: i32,
+) -> usize {
+    let n4 = n_out & !3;
+    if n4 == 0 || index_increment_q16 <= 0 {
+        return 0;
+    }
+    // The position never decreases, so the last sample has the largest one.
+    let last_pos = ((n4 as u64 - 1) * index_increment_q16 as u64) >> 16;
+    if last_pos + window as u64 <= buf_len as u64 { n4 } else { 0 }
+}
+
+/// Store four output samples: the lanes of each `p` add up to one sample
+/// in Q6, which is rounded to Q0 and saturated to 16 bits.
+///
+/// # Safety
+/// `out` must be valid for writing four samples.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn down_fir_store4(
+    out: *mut i16,
+    p0: core::arch::aarch64::int32x4_t,
+    p1: core::arch::aarch64::int32x4_t,
+    p2: core::arch::aarch64::int32x4_t,
+    p3: core::arch::aarch64::int32x4_t,
+) {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON is part of the aarch64 baseline; the caller guarantees
+    // that `out` is valid for four samples.
+    unsafe {
+        let res_q6 = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+        vst1_s16(out, vqmovn_s32(vrshrq_n_s32::<6>(res_q6)));
+    }
+}
+
+/// FIR decimation with `2 * HALF` symmetric taps (ratios 1/2, 1/3, 1/4 and
+/// 1/6): `coefs` holds one half, and each coefficient multiplies the sum of
+/// the two samples at equal distance from the middle. One output sample per
+/// element of `out`: sample `i` is computed at the position
+/// `i * index_increment_q16` in `buf`.
+#[inline(always)]
+fn down_fir_symmetric<const HALF: usize>(
+    out: &mut [i16],
+    buf: &[i32],
+    index_increment_q16: i32,
+    coefs: &[i16; HALF],
+) {
+    #[cfg(target_arch = "aarch64")]
+    down_fir_symmetric_neon(out, buf, index_increment_q16, coefs);
+    #[cfg(not(target_arch = "aarch64"))]
+    down_fir_symmetric_scalar(out, buf, 0, index_increment_q16, coefs);
+}
+
+/// `down_fir_symmetric` for the samples from `index_q16` on.
+#[inline(always)]
+fn down_fir_symmetric_scalar<const HALF: usize>(
+    out: &mut [i16],
+    buf: &[i32],
+    mut index_q16: i32,
+    index_increment_q16: i32,
+    coefs: &[i16; HALF],
+) {
+    for o in out.iter_mut() {
+        let pos = (index_q16 >> 16) as usize;
+        let (first, second) = buf[pos..pos + 2 * HALF].split_at(HALF);
+        let first: &[i32; HALF] = first.try_into().unwrap();
+        let second: &[i32; HALF] = second.try_into().unwrap();
+
+        let mut res_q6 = 0i32;
+        for k in 0..HALF {
+            let pair = first[k].wrapping_add(second[HALF - 1 - k]);
+            res_q6 = silk_smlawb(res_q6, pair, coefs[k] as i32);
+        }
+        *o = silk_sat16(silk_rshift_round(res_q6, 6)) as i16;
+        index_q16 = index_q16.wrapping_add(index_increment_q16);
+    }
+}
+
+/// `down_fir_symmetric_scalar` with four output samples per step.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn down_fir_symmetric_neon<const HALF: usize>(
+    out: &mut [i16],
+    buf: &[i32],
+    index_increment_q16: i32,
+    coefs: &[i16; HALF],
+) {
+    use core::arch::aarch64::*;
+
+    // Four pairs per vector. With 18 pairs the fifth vector starts at pair
+    // 16; its last two coefficients are zero.
+    const MAX_VECTORS: usize = 5;
+    let vectors = HALF.div_ceil(4);
+    assert!(vectors <= MAX_VECTORS && 4 * vectors <= 2 * HALF);
+    // vqdmulhq_s32(x, c << 15) is (x * c) >> 16.
+    let mut wide = [0i32; 4 * MAX_VECTORS];
+    for (w, &c) in wide.iter_mut().zip(coefs.iter()) {
+        *w = (c as i32) << 15;
+    }
+
+    let mut index_q16 = 0i32;
+    let n4 = down_fir_vector_len(out.len(), buf.len(), 2 * HALF, index_increment_q16);
+
+    // SAFETY: NEON is part of the aarch64 baseline. `down_fir_vector_len`
+    // has checked that every one of the `n4` samples reads `2 * HALF`
+    // samples of `buf` that lie inside it. Vector `v` reads
+    // `x[4 * v..4 * v + 4]` and `x[2 * HALF - 4 - 4 * v..2 * HALF - 4 * v]`
+    // of those; both are inside because `4 * vectors <= 2 * HALF` (checked
+    // above). `wide` has `4 * MAX_VECTORS` elements. A step at `i` has
+    // `i + 4 <= n4 <= out.len()` and writes `out[i..i + 4]`.
+    unsafe {
+        let products = |index_q16: i32| -> int32x4_t {
+            let x = buf.as_ptr().add((index_q16 >> 16) as usize);
+            let mut sum = vdupq_n_s32(0);
+            for v in 0..vectors {
+                let first = vld1q_s32(x.add(4 * v));
+                // The mirrored samples, in reverse order.
+                let second = vld1q_s32(x.add(2 * HALF - 4 - 4 * v));
+                let second = vrev64q_s32(second);
+                let second = vextq_s32::<2>(second, second);
+                let pairs = vaddq_s32(first, second);
+                sum = vaddq_s32(sum, vqdmulhq_s32(pairs, vld1q_s32(wide.as_ptr().add(4 * v))));
+            }
+            sum
+        };
+        let mut i = 0;
+        while i < n4 {
+            let p0 = products(index_q16);
+            let p1 = products(index_q16.wrapping_add(index_increment_q16));
+            let p2 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(2)));
+            let p3 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(3)));
+            down_fir_store4(out.as_mut_ptr().add(i), p0, p1, p2, p3);
+            index_q16 = index_q16.wrapping_add(index_increment_q16.wrapping_mul(4));
+            i += 4;
+        }
+    }
+    down_fir_symmetric_scalar(&mut out[n4..], buf, index_q16, index_increment_q16, coefs);
+}
+
+/// Port of `silk_resampler_private_IIR_FIR` (resampler_private_IIR_FIR.c):
+/// up-sampling by any ratio other than 2. Each batch of the input is
+/// up-sampled by 2 into a work buffer, and the output samples are
+/// interpolated from that buffer with an 8-tap FIR filter.
+fn iir_fir_resample(
+    s_iir: &mut [i32; 6],
+    s_fir: &mut [i16; RESAMPLER_ORDER_FIR_12],
+    batch_size: usize,
+    index_increment_q16: i32,
+    mut out: &mut [i16],
+    blocks: [&[i16]; 2],
+) {
+    // libopus leaves this buffer uninitialized as well. Every batch writes
+    // the part it reads.
+    let mut buf_storage = [MaybeUninit::<i16>::uninit(); IIR_FIR_BUF_LEN];
+
+    for block in blocks {
+        for input in block.chunks(batch_size.max(1)) {
+            let n = input.len();
+            let buf_len = 2 * n + RESAMPLER_ORDER_FIR_12;
+            assert!(buf_len <= IIR_FIR_BUF_LEN);
+            // SAFETY: the pointer covers `IIR_FIR_BUF_LEN` elements of the
+            // local array and `buf_len` is at most that (checked above).
+            // All `buf_len` elements are written before any is read: the
+            // first 8 by the copy of the FIR history, the other `2 * n` by
+            // the 2x up-sampler, which writes two samples per input sample.
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(buf_storage.as_mut_ptr() as *mut i16, buf_len)
+            };
+
+            buf[..RESAMPLER_ORDER_FIR_12].copy_from_slice(s_fir);
+            silk_resampler_private_up2_hq(
+                s_iir,
+                &mut buf[RESAMPLER_ORDER_FIR_12..],
+                input,
+                n as i32,
+            );
+
+            let written = iir_fir_interpol(out, buf, (n as i32) << 17, index_increment_q16);
+            out = &mut core::mem::take(&mut out)[written..];
+
+            s_fir.copy_from_slice(&buf[2 * n..]);
+        }
+    }
+}
+
+/// The interpolation of `iir_fir_resample`: one output sample per step of
+/// `index_increment_q16` while the index is below `max_index_q16`. The
+/// integer part of the index is the position in `buf`, the fractional part
+/// selects one of 12 sets of filter taps. Returns the number of samples
+/// written; samples that do not fit into `out` are dropped.
+#[inline(always)]
+fn iir_fir_interpol(
+    out: &mut [i16],
+    buf: &[i16],
+    max_index_q16: i32,
+    index_increment_q16: i32,
+) -> usize {
+    if max_index_q16 <= 0 || index_increment_q16 <= 0 {
+        return 0;
+    }
+    let steps = (max_index_q16 as usize).div_ceil(index_increment_q16 as usize);
+    let n = steps.min(out.len());
+
+    #[cfg(target_arch = "aarch64")]
+    iir_fir_interpol_neon(&mut out[..n], buf, 0, index_increment_q16);
+    #[cfg(not(target_arch = "aarch64"))]
+    iir_fir_interpol_scalar(&mut out[..n], buf, 0, index_increment_q16);
+    n
+}
+
+/// The filter taps for the fractional part of `index_q16`.
+#[inline(always)]
+fn iir_fir_taps(index_q16: i32) -> &'static [i16; RESAMPLER_ORDER_FIR_12] {
+    // The phase is below 12. The mask only tells the compiler that it is
+    // inside the table.
+    let phase = (silk_smulwb(index_q16 & 0xFFFF, 12) & 15) as usize;
+    &SILK_RESAMPLER_FRAC_FIR_12_TAPS[phase]
+}
+
+/// One output sample per element of `out`, the first at `index_q16`.
+#[inline(always)]
+fn iir_fir_interpol_scalar(
+    out: &mut [i16],
+    buf: &[i16],
+    mut index_q16: i32,
+    index_increment_q16: i32,
+) {
+    for o in out.iter_mut() {
+        let taps = iir_fir_taps(index_q16);
+        let pos = (index_q16 >> 16) as usize;
+        let x: &[i16; RESAMPLER_ORDER_FIR_12] =
+            buf[pos..pos + RESAMPLER_ORDER_FIR_12].try_into().unwrap();
+
+        let mut res_q15 = 0i32;
+        for j in 0..RESAMPLER_ORDER_FIR_12 {
+            res_q15 = silk_smlabb(res_q15, x[j] as i32, taps[j] as i32);
+        }
+        *o = silk_sat16(silk_rshift_round(res_q15, 15)) as i16;
+        index_q16 = index_q16.wrapping_add(index_increment_q16);
+    }
+}
+
+/// `iir_fir_interpol_scalar` with four output samples per step.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn iir_fir_interpol_neon(
+    out: &mut [i16],
+    buf: &[i16],
+    mut index_q16: i32,
+    index_increment_q16: i32,
+) {
+    use core::arch::aarch64::*;
+
+    let n = out.len();
+    let n4 = n & !3;
+    if n4 > 0 {
+        // The position in `buf` never decreases, so the last sample of the
+        // vector part has the largest one.
+        debug_assert!(index_q16 >= 0 && index_increment_q16 > 0);
+        let last_index_q16 = index_q16 as i64 + (n4 as i64 - 1) * index_increment_q16 as i64;
+        assert!(
+            index_q16 >= 0
+                && index_increment_q16 > 0
+                && (last_index_q16 >> 16) as usize + RESAMPLER_ORDER_FIR_12 <= buf.len()
+        );
+
+        // SAFETY: NEON is part of the aarch64 baseline. Every load from
+        // `buf` reads 8 samples at a position from 0 to that of the last
+        // sample, which ends inside `buf` (checked above). The taps are
+        // 8-element arrays. A step at `i` has `i + 4 <= n` and writes
+        // `out[i..i + 4]`.
+        unsafe {
+            // The 8 products of one output sample, added in pairs.
+            let products = |index_q16: i32| -> int32x4_t {
+                let x = vld1q_s16(buf.as_ptr().add((index_q16 >> 16) as usize));
+                let taps = vld1q_s16(iir_fir_taps(index_q16).as_ptr());
+                vmlal_high_s16(vmull_s16(vget_low_s16(x), vget_low_s16(taps)), x, taps)
+            };
+            let mut i = 0;
+            while i < n4 {
+                let p0 = products(index_q16);
+                let p1 = products(index_q16.wrapping_add(index_increment_q16));
+                let p2 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(2)));
+                let p3 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(3)));
+                // One sum per output sample in each lane.
+                let res_q15 = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+                // Round to Q0 and saturate to 16 bits.
+                vst1_s16(
+                    out.as_mut_ptr().add(i),
+                    vqmovn_s32(vrshrq_n_s32::<15>(res_q15)),
+                );
+                index_q16 = index_q16.wrapping_add(index_increment_q16.wrapping_mul(4));
+                i += 4;
+            }
+        }
+    }
+    iir_fir_interpol_scalar(&mut out[n4..], buf, index_q16, index_increment_q16);
+}
+
+/// One first-order all-pass section of the 2x up-sampler: returns its
+/// output and updates its state. `coef_q16` is positive and below 65536.
+///
+/// libopus stores the larger coefficients minus 65536, so that they fit in
+/// 16 bits, and computes `y + ((y * c) >> 16)` (`silk_SMLAWB`). That is
+/// `(y * (c + 65536)) >> 16` exactly, because `y * 65536` has no bits below
+/// bit 16. One form for all sections keeps the path from one state to the
+/// next equally short for all of them.
+#[inline(always)]
+fn up2_allpass(input: i32, state: &mut i32, coef_q16: i32) -> i32 {
+    let y = input.wrapping_sub(*state);
+    let x = ((y as i64 * coef_q16 as i64) >> 16) as i32;
+    let output = state.wrapping_add(x);
+    *state = input.wrapping_add(x);
+    output
+}
+
+/// Coefficients of the two all-pass chains of the 2x up-sampler in Q16:
+/// `UP2_HQ_COEFS[stage]` is the pair for the even and the odd output.
+const UP2_HQ_COEFS: [[i32; 2]; 3] = [
+    [
+        SILK_RESAMPLER_UP2_HQ_0[0] as i32,
+        SILK_RESAMPLER_UP2_HQ_1[0] as i32,
+    ],
+    [
+        SILK_RESAMPLER_UP2_HQ_0[1] as i32,
+        SILK_RESAMPLER_UP2_HQ_1[1] as i32,
+    ],
+    [
+        SILK_RESAMPLER_UP2_HQ_0[2] as i32 + 65536,
+        SILK_RESAMPLER_UP2_HQ_1[2] as i32 + 65536,
+    ],
+];
+
+/// Port of `silk_resampler_private_up2_HQ`: up-sampling by 2. Each input
+/// sample runs through two chains of three all-pass sections; one chain
+/// gives the even output sample, the other the odd one. `s` holds the six
+/// states.
 pub fn silk_resampler_private_up2_hq(s: &mut [i32], out: &mut [i16], input: &[i16], len: i32) {
-    for k in 0..len as usize {
-        let in32 = (input[k] as i32) << 10;
-
-        let y = in32 - s[0];
-        let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_0[0] as i32);
-        let out32_1 = s[0] + x;
-        s[0] = in32 + x;
-
-        let y = out32_1 - s[1];
-        let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_0[1] as i32);
-        let out32_2 = s[1] + x;
-        s[1] = out32_1 + x;
-
-        let y = out32_2 - s[2];
-        let x = silk_smlawb(y, y, SILK_RESAMPLER_UP2_HQ_0[2] as i32);
-        let out32_1 = s[2] + x;
-        s[2] = out32_2 + x;
-
-        out[2 * k] = silk_sat16(silk_rshift_round(out32_1, 10)) as i16;
-
-        let y = in32 - s[3];
-        let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_1[0] as i32);
-        let out32_1 = s[3] + x;
-        s[3] = in32 + x;
-
-        let y = out32_1 - s[4];
-        let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_1[1] as i32);
-        let out32_2 = s[4] + x;
-        s[4] = out32_1 + x;
-
-        let y = out32_2 - s[5];
-        let x = silk_smlawb(y, y, SILK_RESAMPLER_UP2_HQ_1[2] as i32);
-        let out32_1 = s[5] + x;
-        s[5] = out32_2 + x;
-
-        out[2 * k + 1] = silk_sat16(silk_rshift_round(out32_1, 10)) as i16;
+    let len = len as usize;
+    if len == 0 {
+        return;
     }
+    let input = &input[..len];
+    let out = &mut out[..2 * len];
+    let state: &mut [i32; 6] = (&mut s[..6]).try_into().unwrap();
+
+    #[cfg(target_arch = "aarch64")]
+    up2_hq_neon(state, out, input);
+    #[cfg(not(target_arch = "aarch64"))]
+    up2_hq_scalar(state, out, input);
 }
 
+/// The states are kept in local variables during the loop. Stored in the
+/// slice they would be written to memory and read back for every sample,
+/// with a bounds check on each access.
+#[inline(always)]
+fn up2_hq_scalar(s: &mut [i32; 6], out: &mut [i16], input: &[i16]) {
+    assert!(out.len() == 2 * input.len());
+    let [mut s0, mut s1, mut s2, mut s3, mut s4, mut s5] = *s;
+
+    for (o, &x) in out.as_chunks_mut::<2>().0.iter_mut().zip(input) {
+        let in32 = (x as i32) << 10;
+
+        let out32 = up2_allpass(in32, &mut s0, UP2_HQ_COEFS[0][0]);
+        let out32 = up2_allpass(out32, &mut s1, UP2_HQ_COEFS[1][0]);
+        let out32 = up2_allpass(out32, &mut s2, UP2_HQ_COEFS[2][0]);
+        o[0] = silk_sat16(silk_rshift_round(out32, 10)) as i16;
+
+        let out32 = up2_allpass(in32, &mut s3, UP2_HQ_COEFS[0][1]);
+        let out32 = up2_allpass(out32, &mut s4, UP2_HQ_COEFS[1][1]);
+        let out32 = up2_allpass(out32, &mut s5, UP2_HQ_COEFS[2][1]);
+        o[1] = silk_sat16(silk_rshift_round(out32, 10)) as i16;
+    }
+
+    *s = [s0, s1, s2, s3, s4, s5];
+}
+
+/// The two chains side by side: lane 0 of each vector belongs to the even
+/// output sample, lane 1 to the odd one. One multiplication serves both
+/// chains.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn up2_hq_neon(s: &mut [i32; 6], out: &mut [i16], input: &[i16]) {
+    use core::arch::aarch64::*;
+
+    assert!(out.len() == 2 * input.len());
+    // Two input samples per step, so that a step stores four output samples.
+    let (in_pairs, in_rest) = input.as_chunks::<2>();
+    let (out_quads, out_rest) = out.as_chunks_mut::<4>();
+
+    // SAFETY: NEON is part of the aarch64 baseline. The loads read 2
+    // elements of 2-element arrays, the first store writes the 4 elements
+    // of a 4-element array, and the last one the first 2 of the 6 states.
+    unsafe {
+        // vqdmulh_s32(y, c << 15) is (y * c) >> 16.
+        let c0 = vshl_n_s32::<15>(vld1_s32(UP2_HQ_COEFS[0].as_ptr()));
+        let c1 = vshl_n_s32::<15>(vld1_s32(UP2_HQ_COEFS[1].as_ptr()));
+        let c2 = vshl_n_s32::<15>(vld1_s32(UP2_HQ_COEFS[2].as_ptr()));
+        let mut st0 = vld1_s32([s[0], s[3]].as_ptr());
+        let mut st1 = vld1_s32([s[1], s[4]].as_ptr());
+        let mut st2 = vld1_s32([s[2], s[5]].as_ptr());
+
+        // The three all-pass sections for one input sample.
+        let mut step = |x: i16| -> int32x2_t {
+            let in32 = vdup_n_s32((x as i32) << 10);
+
+            let x0 = vqdmulh_s32(vsub_s32(in32, st0), c0);
+            let out0 = vadd_s32(st0, x0);
+            st0 = vadd_s32(in32, x0);
+
+            let x1 = vqdmulh_s32(vsub_s32(out0, st1), c1);
+            let out1 = vadd_s32(st1, x1);
+            st1 = vadd_s32(out0, x1);
+
+            let x2 = vqdmulh_s32(vsub_s32(out1, st2), c2);
+            let out2 = vadd_s32(st2, x2);
+            st2 = vadd_s32(out1, x2);
+            out2
+        };
+
+        for (o, x) in out_quads.iter_mut().zip(in_pairs) {
+            let first = step(x[0]);
+            let second = step(x[1]);
+            // Round to Q0 and saturate to 16 bits.
+            let res = vqrshrn_n_s32::<10>(vcombine_s32(first, second));
+            vst1_s16(o.as_mut_ptr(), res);
+        }
+
+        vst1_s32(s.as_mut_ptr(), vzip1_s32(st0, st1));
+        s[2] = vget_lane_s32::<0>(st2);
+        s[3] = vget_lane_s32::<1>(st0);
+        s[4] = vget_lane_s32::<1>(st1);
+        s[5] = vget_lane_s32::<1>(st2);
+    }
+    // The last sample of an odd number of input samples.
+    up2_hq_scalar(s, out_rest, in_rest);
+}
+
+/// Port of `silk_resampler_down2`: down-sampling by 2. The even input
+/// samples run through one first-order all-pass section and the odd ones
+/// through another; an output sample is the sum of the two section outputs.
+/// `s` holds the two states.
+///
+/// The states are kept in local variables during the loop, so that they are
+/// not stored and read back, with a bounds check, for every sample.
 pub fn silk_resampler_down2(s: &mut [i32], out: &mut [i16], input: &[i16], in_len: i32) {
-    let len2 = in_len >> 1;
-    let mut in32: i32;
-    let mut out32: i32;
-    let mut y: i32;
-    let mut x: i32;
+    // libopus stores this coefficient minus 65536, so that it fits in 16
+    // bits, and computes `y + ((y * c) >> 16)` (`silk_SMLAWB`). That is
+    // `(y * (c + 65536)) >> 16` exactly, because `y * 65536` has no bits
+    // below bit 16. This form is one multiplication and one shift, like the
+    // other section.
+    const DOWN2_1_Q16: i32 = SILK_RESAMPLER_DOWN2_1 + 65536;
 
-    for k in 0..len2 as usize {
-        in32 = (input[2 * k] as i32) << 10;
-
-        y = in32.wrapping_sub(s[0]);
-        x = silk_smlawb(y, y, SILK_RESAMPLER_DOWN2_1);
-        out32 = s[0].wrapping_add(x);
-        s[0] = in32.wrapping_add(x);
-
-        in32 = (input[2 * k + 1] as i32) << 10;
-
-        y = in32.wrapping_sub(s[1]);
-        x = silk_smulwb(y, SILK_RESAMPLER_DOWN2_0);
-        out32 = out32.wrapping_add(s[1]);
-        out32 = out32.wrapping_add(x);
-        s[1] = in32.wrapping_add(x);
-
-        out[k] = silk_sat16(silk_rshift_round(out32, 11)) as i16;
+    let len2 = (in_len >> 1) as usize;
+    if len2 == 0 {
+        return;
     }
+    let input = &input[..2 * len2];
+    let out = &mut out[..len2];
+    let (mut s0, mut s1) = (s[0], s[1]);
+
+    for (o, pair) in out.iter_mut().zip(input.as_chunks::<2>().0) {
+        // All-pass section for the even input sample, in Q10.
+        let in32 = (pair[0] as i32) << 10;
+        let y = in32.wrapping_sub(s0);
+        let x = ((y as i64 * DOWN2_1_Q16 as i64) >> 16) as i32;
+        let mut out32 = s0.wrapping_add(x);
+        s0 = in32.wrapping_add(x);
+
+        // All-pass section for the odd input sample, added to the output
+        // of the first section.
+        let in32 = (pair[1] as i32) << 10;
+        let y = in32.wrapping_sub(s1);
+        let x = silk_smulwb(y, SILK_RESAMPLER_DOWN2_0);
+        out32 = out32.wrapping_add(s1);
+        out32 = out32.wrapping_add(x);
+        s1 = in32.wrapping_add(x);
+
+        *o = silk_sat16(silk_rshift_round(out32, 11)) as i16;
+    }
+
+    s[0] = s0;
+    s[1] = s1;
 }
 
+/// The second-order AR filter in front of `silk_resampler_down2_3`. `s`
+/// holds the two states; they are kept in local variables during the loop.
 pub fn silk_resampler_private_ar2(
     s: &mut [i32],
     out_q8: &mut [i32],
@@ -800,98 +1241,599 @@ pub fn silk_resampler_private_ar2(
     a_q14: &[i16],
     len: i32,
 ) {
-    let mut out32: i32;
-    for k in 0..len as usize {
-        out32 = s[0].wrapping_add((input[k] as i32) << 10);
-        out_q8[k] = out32;
-        s[0] = s[1].wrapping_add(silk_smulwb(out32, a_q14[0] as i32));
-        s[1] = silk_smulwb(out32, a_q14[1] as i32);
+    let len = len as usize;
+    if len == 0 {
+        return;
     }
+    let (a0, a1) = (a_q14[0] as i32, a_q14[1] as i32);
+    let (mut s0, mut s1) = (s[0], s[1]);
+    for (o, &x) in out_q8[..len].iter_mut().zip(&input[..len]) {
+        let out32 = s0.wrapping_add((x as i32) << 10);
+        *o = out32;
+        s0 = s1.wrapping_add(silk_smulwb(out32, a0));
+        s1 = silk_smulwb(out32, a1);
+    }
+    s[0] = s0;
+    s[1] = s1;
 }
 
 const RESAMPLER_MAX_BATCH_SIZE_IN: i32 = 480;
 const ORDER_FIR: usize = 4;
 
+/// Down-sampling by 2/3: a second-order AR filter into a work buffer, then
+/// two output samples for every three samples of that buffer. `s` holds the
+/// four samples of FIR history and the two AR states.
 pub fn silk_resampler_down2_3(s: &mut [i32], out: &mut [i16], input: &[i16], in_len: i32) {
-    let mut n_samples_in: i32;
-    let mut counter: i32;
-    let mut res_q6: i32;
-    let mut buf = [0i32; (RESAMPLER_MAX_BATCH_SIZE_IN as usize) + ORDER_FIR];
+    const BUF_LEN: usize = RESAMPLER_MAX_BATCH_SIZE_IN as usize + ORDER_FIR;
+    const C: [i32; 4] = [
+        SILK_RESAMPLER_2_3_COEFS_LQ[2] as i32,
+        SILK_RESAMPLER_2_3_COEFS_LQ[3] as i32,
+        SILK_RESAMPLER_2_3_COEFS_LQ[4] as i32,
+        SILK_RESAMPLER_2_3_COEFS_LQ[5] as i32,
+    ];
+
+    // libopus leaves this buffer uninitialized as well.
+    let mut buf_storage = [MaybeUninit::<i32>::uninit(); BUF_LEN];
+    // SAFETY: the slice covers exactly the local array. Elements are only
+    // read after they were written: the first `ORDER_FIR` are written right
+    // below, and each batch writes the next `n` with the AR filter before
+    // it reads anything below `ORDER_FIR + n`.
+    let buf =
+        unsafe { core::slice::from_raw_parts_mut(buf_storage.as_mut_ptr() as *mut i32, BUF_LEN) };
     let mut in_idx = 0;
     let mut out_idx = 0;
     let mut remaining_len = in_len;
 
-    buf[0..ORDER_FIR].copy_from_slice(&s[0..ORDER_FIR]);
+    buf[..ORDER_FIR].copy_from_slice(&s[..ORDER_FIR]);
 
     while remaining_len > 0 {
-        n_samples_in = remaining_len.min(RESAMPLER_MAX_BATCH_SIZE_IN);
+        let n = remaining_len.min(RESAMPLER_MAX_BATCH_SIZE_IN) as usize;
 
         silk_resampler_private_ar2(
             &mut s[ORDER_FIR..ORDER_FIR + 2],
-            &mut buf[ORDER_FIR..ORDER_FIR + n_samples_in as usize],
-            &input[in_idx..in_idx + n_samples_in as usize],
+            &mut buf[ORDER_FIR..ORDER_FIR + n],
+            &input[in_idx..in_idx + n],
             &SILK_RESAMPLER_2_3_COEFS_LQ,
-            n_samples_in,
+            n as i32,
         );
 
-        let mut buf_ptr = 0;
-        counter = n_samples_in;
-        while counter > 2 {
-            res_q6 = silk_smulwb(buf[buf_ptr], SILK_RESAMPLER_2_3_COEFS_LQ[2] as i32);
-            res_q6 = silk_smlawb(
-                res_q6,
-                buf[buf_ptr + 1],
-                SILK_RESAMPLER_2_3_COEFS_LQ[3] as i32,
-            );
-            res_q6 = silk_smlawb(
-                res_q6,
-                buf[buf_ptr + 2],
-                SILK_RESAMPLER_2_3_COEFS_LQ[5] as i32,
-            );
-            res_q6 = silk_smlawb(
-                res_q6,
-                buf[buf_ptr + 3],
-                SILK_RESAMPLER_2_3_COEFS_LQ[4] as i32,
-            );
+        // Two output samples per three input samples; an incomplete group
+        // at the end of the batch gives none.
+        let groups = n / 3;
+        let (pairs, _) = out[out_idx..out_idx + 2 * groups].as_chunks_mut::<2>();
+        for (o, group) in pairs.iter_mut().zip(0..groups) {
+            let x: &[i32; 5] = buf[3 * group..3 * group + 5].try_into().unwrap();
 
-            out[out_idx] = silk_sat16(silk_rshift_round(res_q6, 9)) as i16;
-            out_idx += 1;
+            let mut res_q6 = silk_smulwb(x[0], C[0]);
+            res_q6 = silk_smlawb(res_q6, x[1], C[1]);
+            res_q6 = silk_smlawb(res_q6, x[2], C[3]);
+            res_q6 = silk_smlawb(res_q6, x[3], C[2]);
+            o[0] = silk_sat16(silk_rshift_round(res_q6, 9)) as i16;
 
-            res_q6 = silk_smulwb(buf[buf_ptr + 1], SILK_RESAMPLER_2_3_COEFS_LQ[4] as i32);
-            res_q6 = silk_smlawb(
-                res_q6,
-                buf[buf_ptr + 2],
-                SILK_RESAMPLER_2_3_COEFS_LQ[5] as i32,
-            );
-            res_q6 = silk_smlawb(
-                res_q6,
-                buf[buf_ptr + 3],
-                SILK_RESAMPLER_2_3_COEFS_LQ[3] as i32,
-            );
-            res_q6 = silk_smlawb(
-                res_q6,
-                buf[buf_ptr + 4],
-                SILK_RESAMPLER_2_3_COEFS_LQ[2] as i32,
-            );
-
-            out[out_idx] = silk_sat16(silk_rshift_round(res_q6, 8)) as i16;
-            out_idx += 1;
-
-            buf_ptr += 3;
-            counter -= 3;
+            let mut res_q6 = silk_smulwb(x[1], C[2]);
+            res_q6 = silk_smlawb(res_q6, x[2], C[3]);
+            res_q6 = silk_smlawb(res_q6, x[3], C[1]);
+            res_q6 = silk_smlawb(res_q6, x[4], C[0]);
+            o[1] = silk_sat16(silk_rshift_round(res_q6, 8)) as i16;
         }
+        out_idx += 2 * groups;
 
-        in_idx += n_samples_in as usize;
-        remaining_len -= n_samples_in;
+        in_idx += n;
+        remaining_len -= n as i32;
 
         if remaining_len > 0 {
-            for i in 0..ORDER_FIR {
-                buf[i] = buf[n_samples_in as usize + i];
-            }
+            buf.copy_within(n..n + ORDER_FIR, 0);
         } else {
-            s[0..ORDER_FIR]
-                .copy_from_slice(&buf[n_samples_in as usize..n_samples_in as usize + ORDER_FIR]);
+            s[..ORDER_FIR].copy_from_slice(&buf[n..n + ORDER_FIR]);
             break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small deterministic pseudo-random generator.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn range(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() as u64 % (hi as i64 - lo as i64 + 1) as u64) as i32
+        }
+        /// A value that is often at a limit of `i16`.
+        fn i16_edgy(&mut self) -> i16 {
+            match self.next() % 8 {
+                0 => i16::MAX,
+                1 => i16::MIN,
+                2 => 0,
+                _ => self.next() as i16,
+            }
+        }
+        /// A value that is often at a limit of `i32`.
+        fn i32_edgy(&mut self) -> i32 {
+            match self.next() % 8 {
+                0 => i32::MAX,
+                1 => i32::MIN,
+                2 => 0,
+                _ => self.next() as i32,
+            }
+        }
+        /// Speech-like samples for even trials, samples at the limits for
+        /// odd ones.
+        fn signal(&mut self, n: usize, trial: usize) -> Vec<i16> {
+            (0..n)
+                .map(|_| if trial % 2 == 0 { self.range(-12000, 12000) as i16 } else { self.i16_edgy() })
+                .collect()
+        }
+        /// Filter states: of the size real signals produce for even trials,
+        /// anything for odd ones.
+        fn states<const N: usize>(&mut self, trial: usize) -> [i32; N] {
+            core::array::from_fn(|_| {
+                if trial % 2 == 0 { self.range(-(1 << 26), 1 << 26) } else { self.i32_edgy() }
+            })
+        }
+    }
+
+    /// Output lengths every kernel test runs: empty, one sample, every tail
+    /// length of the 2- and 4-sample steps, and frame-sized ones.
+    const LENGTHS: [usize; 20] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 16, 17, 31, 80, 81, 159, 160];
+
+    /// The Q16 index increment of every rate pair that uses the fractional
+    /// up-sampler or the down-sampler, and two arbitrary ones.
+    fn increments(up: bool) -> Vec<i32> {
+        let mut found = Vec::new();
+        for fs_in in [8000, 12000, 16000, 24000, 48000] {
+            for fs_out in [8000, 12000, 16000, 24000, 48000] {
+                let mut rs = SilkResampler::default();
+                let ok = if fs_in <= 16000 {
+                    rs.init(fs_in, fs_out) == 0
+                } else {
+                    fs_out <= 16000 && rs.init_for_enc(fs_in, fs_out) == 0
+                };
+                let wanted = if up { ResamplerMode::IirFir } else { ResamplerMode::DownFir };
+                if ok && rs.mode == wanted && !found.contains(&rs.inv_ratio_q16) {
+                    found.push(rs.inv_ratio_q16);
+                }
+            }
+        }
+        assert!(found.len() >= 4);
+        found.extend(if up { [1, 131071] } else { [65536, 400000] });
+        found
+    }
+
+    // -- 2x up-sampler ---------------------------------------------------------
+
+    /// `silk_resampler_private_up2_HQ` as libopus writes it, with the states
+    /// in the slice.
+    fn up2_hq_reference(s: &mut [i32; 6], out: &mut [i16], input: &[i16]) {
+        for k in 0..input.len() {
+            let in32 = (input[k] as i32) << 10;
+
+            let y = in32.wrapping_sub(s[0]);
+            let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_0[0] as i32);
+            let out32_1 = s[0].wrapping_add(x);
+            s[0] = in32.wrapping_add(x);
+            let y = out32_1.wrapping_sub(s[1]);
+            let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_0[1] as i32);
+            let out32_2 = s[1].wrapping_add(x);
+            s[1] = out32_1.wrapping_add(x);
+            let y = out32_2.wrapping_sub(s[2]);
+            let x = silk_smlawb(y, y, SILK_RESAMPLER_UP2_HQ_0[2] as i32);
+            let out32_1 = s[2].wrapping_add(x);
+            s[2] = out32_2.wrapping_add(x);
+            out[2 * k] = silk_sat16(silk_rshift_round(out32_1, 10)) as i16;
+
+            let y = in32.wrapping_sub(s[3]);
+            let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_1[0] as i32);
+            let out32_1 = s[3].wrapping_add(x);
+            s[3] = in32.wrapping_add(x);
+            let y = out32_1.wrapping_sub(s[4]);
+            let x = silk_smulwb(y, SILK_RESAMPLER_UP2_HQ_1[1] as i32);
+            let out32_2 = s[4].wrapping_add(x);
+            s[4] = out32_1.wrapping_add(x);
+            let y = out32_2.wrapping_sub(s[5]);
+            let x = silk_smlawb(y, y, SILK_RESAMPLER_UP2_HQ_1[2] as i32);
+            let out32_1 = s[5].wrapping_add(x);
+            s[5] = out32_2.wrapping_add(x);
+            out[2 * k + 1] = silk_sat16(silk_rshift_round(out32_1, 10)) as i16;
+        }
+    }
+
+    #[test]
+    fn up2_hq_kernels_match_the_reference() {
+        let mut rng = Lcg(21);
+        for &n in &LENGTHS {
+            for trial in 0..16 {
+                let input = rng.signal(n, trial);
+                let state: [i32; 6] = rng.states(trial / 2);
+
+                let mut expect_state = state;
+                let mut expect = vec![0i16; 2 * n];
+                up2_hq_reference(&mut expect_state, &mut expect, &input);
+
+                let mut s = state;
+                let mut out = vec![0x5555i16; 2 * n];
+                up2_hq_scalar(&mut s, &mut out, &input);
+                assert_eq!((&out, s), (&expect, expect_state), "scalar: n={n} trial={trial}");
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut s = state;
+                    let mut out = vec![0x5555i16; 2 * n];
+                    up2_hq_neon(&mut s, &mut out, &input);
+                    assert_eq!((&out, s), (&expect, expect_state), "NEON: n={n} trial={trial}");
+                }
+                // The public function, with slices longer than it needs.
+                let mut s = state;
+                let mut out = vec![0x5555i16; 2 * n + 3];
+                let mut longer = input.clone();
+                longer.push(77);
+                silk_resampler_private_up2_hq(&mut s, &mut out, &longer, n as i32);
+                assert_eq!((&out[..2 * n], s), (&expect[..], expect_state), "public: n={n} trial={trial}");
+                assert_eq!(out[2 * n..], [0x5555; 3], "public wrote past its output: n={n}");
+            }
+        }
+    }
+
+    // -- fractional up-sampler -------------------------------------------------
+
+    /// The interpolation loop of `silk_resampler_private_IIR_FIR` with the
+    /// libopus table of 4 taps per phase.
+    fn iir_fir_interpol_reference(out: &mut [i16], buf: &[i16], inc: i32) {
+        let mut index_q16 = 0i32;
+        for o in out.iter_mut() {
+            let t = silk_smulwb(index_q16 & 0xFFFF, 12) as usize;
+            let b = &buf[(index_q16 >> 16) as usize..];
+            let fir = &SILK_RESAMPLER_FRAC_FIR_12;
+            let mut res = silk_smulbb(b[0] as i32, fir[t][0] as i32);
+            res = silk_smlabb(res, b[1] as i32, fir[t][1] as i32);
+            res = silk_smlabb(res, b[2] as i32, fir[t][2] as i32);
+            res = silk_smlabb(res, b[3] as i32, fir[t][3] as i32);
+            res = silk_smlabb(res, b[4] as i32, fir[11 - t][3] as i32);
+            res = silk_smlabb(res, b[5] as i32, fir[11 - t][2] as i32);
+            res = silk_smlabb(res, b[6] as i32, fir[11 - t][1] as i32);
+            res = silk_smlabb(res, b[7] as i32, fir[11 - t][0] as i32);
+            *o = silk_sat16(silk_rshift_round(res, 15)) as i16;
+            index_q16 += inc;
+        }
+    }
+
+    #[test]
+    fn iir_fir_interpol_kernels_match_the_reference() {
+        let mut rng = Lcg(22);
+        for inc in increments(true) {
+            for &n in &LENGTHS {
+                for trial in 0..6 {
+                    // Exactly as long as the last output sample needs.
+                    let last_pos = if n == 0 { 0 } else { ((n as i64 - 1) * inc as i64 >> 16) as usize };
+                    let buf = rng.signal(last_pos + RESAMPLER_ORDER_FIR_12, trial);
+                    let mut expect = vec![0i16; n];
+                    iir_fir_interpol_reference(&mut expect, &buf, inc);
+
+                    let mut out = vec![0x5555i16; n];
+                    iir_fir_interpol_scalar(&mut out, &buf, 0, inc);
+                    assert_eq!(out, expect, "scalar: inc={inc} n={n} trial={trial}");
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let mut out = vec![0x5555i16; n];
+                        iir_fir_interpol_neon(&mut out, &buf, 0, inc);
+                        assert_eq!(out, expect, "NEON: inc={inc} n={n} trial={trial}");
+                    }
+                    // The dispatching function: it stops at `max_index_q16`
+                    // or at the end of `out`, whichever comes first.
+                    let max_index_q16 = (n as i64 * inc as i64) as i32;
+                    let mut out = vec![0x5555i16; n + 2];
+                    assert_eq!(iir_fir_interpol(&mut out, &buf, max_index_q16, inc), n);
+                    assert_eq!(out[..n], expect[..], "dispatch: inc={inc} n={n} trial={trial}");
+                    assert_eq!(out[n..], [0x5555; 2]);
+                    let short = n / 2;
+                    let mut out = vec![0x5555i16; short];
+                    assert_eq!(iir_fir_interpol(&mut out, &buf, max_index_q16, inc), short);
+                    assert_eq!(out[..], expect[..short], "short output: inc={inc} n={n}");
+                }
+            }
+        }
+    }
+
+    /// The 8-tap table against the libopus table it is built from.
+    #[test]
+    fn frac_fir_tap_table_matches_the_libopus_table() {
+        for phase in 0..12 {
+            let taps = &SILK_RESAMPLER_FRAC_FIR_12_TAPS[phase];
+            for j in 0..4 {
+                assert_eq!(taps[j], SILK_RESAMPLER_FRAC_FIR_12[phase][j]);
+                assert_eq!(taps[4 + j], SILK_RESAMPLER_FRAC_FIR_12[11 - phase][3 - j]);
+            }
+        }
+    }
+
+    // -- down-sampler ------------------------------------------------------------
+
+    /// The loop of `silk_resampler_private_AR2` as libopus writes it.
+    fn down_fir_ar2_reference(s: &mut [i32; 6], out_q8: &mut [i32], input: &[i16], a0: i32, a1: i32) {
+        for k in 0..input.len() {
+            let out32 = s[0].wrapping_add((input[k] as i32) << 8);
+            out_q8[k] = out32;
+            let out_q10 = out32.wrapping_shl(2);
+            s[0] = s[1].wrapping_add(silk_smulwb(out_q10, a0));
+            s[1] = silk_smulwb(out_q10, a1);
+        }
+    }
+
+    #[test]
+    fn down_fir_ar2_matches_the_reference() {
+        let mut rng = Lcg(23);
+        for coefs in [&SILK_RESAMPLER_3_4_COEFS[..], &SILK_RESAMPLER_1_2_COEFS, &SILK_RESAMPLER_1_6_COEFS] {
+            for &n in &LENGTHS {
+                for trial in 0..8 {
+                    let input = rng.signal(n, trial);
+                    let state: [i32; 6] = rng.states(trial / 2);
+                    let (a0, a1) = (coefs[0] as i32, coefs[1] as i32);
+                    let (mut s_ref, mut s_new) = (state, state);
+                    let mut expect = vec![0i32; n];
+                    down_fir_ar2_reference(&mut s_ref, &mut expect, &input, a0, a1);
+                    let mut out = vec![0x5555_5555i32; n];
+                    down_fir_ar2(&mut s_new, &mut out, &input, a0, a1);
+                    assert_eq!((&out, s_new), (&expect, s_ref), "n={n} trial={trial}");
+                }
+            }
+        }
+    }
+
+    /// The three interpolation loops of `silk_resampler_private_down_FIR`,
+    /// reading the libopus coefficient tables.
+    fn down_fir_reference(out: &mut [i16], buf: &[i32], inc: i32, order: usize, fracs: i32, coefs: &[i16]) {
+        let fir = &coefs[2..];
+        let mut index_q16 = 0i32;
+        for o in out.iter_mut() {
+            let p = (index_q16 >> 16) as usize;
+            let res_q6 = match order {
+                RESAMPLER_DOWN_ORDER_FIR0 => {
+                    let ind = silk_smulwb(index_q16 & 0xFFFF, fracs) as usize;
+                    let mut r = silk_smulwb(buf[p], fir[9 * ind] as i32);
+                    for k in 1..9 {
+                        r = silk_smlawb(r, buf[p + k], fir[9 * ind + k] as i32);
+                    }
+                    let mirror = &fir[9 * (fracs as usize - 1 - ind)..];
+                    for k in 0..9 {
+                        r = silk_smlawb(r, buf[p + 17 - k], mirror[k] as i32);
+                    }
+                    r
+                }
+                _ => {
+                    let mut r = 0i32;
+                    for k in 0..order / 2 {
+                        let pair = buf[p + k].wrapping_add(buf[p + order - 1 - k]);
+                        r = silk_smlawb(r, pair, fir[k] as i32);
+                    }
+                    r
+                }
+            };
+            *o = silk_sat16(silk_rshift_round(res_q6, 6)) as i16;
+            index_q16 += inc;
+        }
+    }
+
+    /// A work buffer for `n` output samples: exactly as long as the last
+    /// one needs.
+    fn down_fir_buf(rng: &mut Lcg, n: usize, inc: i32, order: usize, trial: usize) -> Vec<i32> {
+        let last_pos = if n == 0 { 0 } else { ((n as i64 - 1) * inc as i64 >> 16) as usize };
+        (0..last_pos + order)
+            .map(|_| match trial % 3 {
+                0 => rng.range(-(1 << 23), 1 << 23),
+                1 => rng.range(-(1 << 30), 1 << 30),
+                _ => rng.i32_edgy(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn down_fir_interpolated_kernels_match_the_reference() {
+        let mut rng = Lcg(24);
+        for (fracs, coefs, taps) in [
+            (3, &SILK_RESAMPLER_3_4_COEFS[..], &SILK_RESAMPLER_3_4_TAPS),
+            (2, &SILK_RESAMPLER_2_3_COEFS[..], &SILK_RESAMPLER_2_3_TAPS),
+        ] {
+            for inc in increments(false) {
+                for &n in &LENGTHS {
+                    for trial in 0..6 {
+                        let buf = down_fir_buf(&mut rng, n, inc, RESAMPLER_DOWN_ORDER_FIR0, trial);
+                        let mut expect = vec![0i16; n];
+                        down_fir_reference(&mut expect, &buf, inc, RESAMPLER_DOWN_ORDER_FIR0, fracs, coefs);
+
+                        let mut out = vec![0x5555i16; n];
+                        down_fir_interpolated_scalar(&mut out, &buf, 0, inc, fracs, taps);
+                        assert_eq!(out, expect, "scalar: fracs={fracs} inc={inc} n={n} trial={trial}");
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let mut out = vec![0x5555i16; n];
+                            down_fir_interpolated_neon(&mut out, &buf, inc, fracs, taps);
+                            assert_eq!(out, expect, "NEON: fracs={fracs} inc={inc} n={n} trial={trial}");
+                        }
+                        let mut out = vec![0x5555i16; n];
+                        down_fir_interpolated(&mut out, &buf, inc, fracs, taps);
+                        assert_eq!(out, expect, "dispatch: fracs={fracs} inc={inc} n={n} trial={trial}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_down_fir_symmetric<const HALF: usize>(rng: &mut Lcg, coefs: &[i16]) {
+        let half: &[i16; HALF] = coefs[2..].try_into().unwrap();
+        for inc in increments(false) {
+            for &n in &LENGTHS {
+                for trial in 0..6 {
+                    let buf = down_fir_buf(rng, n, inc, 2 * HALF, trial);
+                    let mut expect = vec![0i16; n];
+                    down_fir_reference(&mut expect, &buf, inc, 2 * HALF, 1, coefs);
+
+                    let mut out = vec![0x5555i16; n];
+                    down_fir_symmetric_scalar(&mut out, &buf, 0, inc, half);
+                    assert_eq!(out, expect, "scalar: taps={} inc={inc} n={n} trial={trial}", 2 * HALF);
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let mut out = vec![0x5555i16; n];
+                        down_fir_symmetric_neon(&mut out, &buf, inc, half);
+                        assert_eq!(out, expect, "NEON: taps={} inc={inc} n={n} trial={trial}", 2 * HALF);
+                    }
+                    let mut out = vec![0x5555i16; n];
+                    down_fir_symmetric(&mut out, &buf, inc, half);
+                    assert_eq!(out, expect, "dispatch: taps={} inc={inc} n={n} trial={trial}", 2 * HALF);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn down_fir_symmetric_kernels_match_the_reference() {
+        let mut rng = Lcg(25);
+        check_down_fir_symmetric::<12>(&mut rng, &SILK_RESAMPLER_1_2_COEFS);
+        check_down_fir_symmetric::<18>(&mut rng, &SILK_RESAMPLER_1_3_COEFS);
+        check_down_fir_symmetric::<18>(&mut rng, &SILK_RESAMPLER_1_4_COEFS);
+        check_down_fir_symmetric::<18>(&mut rng, &SILK_RESAMPLER_1_6_COEFS);
+    }
+
+    /// The tap tables of the interpolating down-FIR against the libopus
+    /// coefficient tables they are built from.
+    #[test]
+    fn down_fir_tap_tables_match_the_libopus_tables() {
+        for (fracs, coefs, table) in [
+            (3usize, &SILK_RESAMPLER_3_4_COEFS[..], &SILK_RESAMPLER_3_4_TAPS),
+            (2, &SILK_RESAMPLER_2_3_COEFS[..], &SILK_RESAMPLER_2_3_TAPS),
+        ] {
+            for i in 0..fracs {
+                for k in 0..9 {
+                    assert_eq!(table.taps[i][k], coefs[2 + 9 * i + k]);
+                    assert_eq!(table.taps[i][17 - k], coefs[2 + 9 * (fracs - 1 - i) + k]);
+                }
+                for k in 0..16 {
+                    assert_eq!(table.wide[i][k], (table.taps[i][k] as i32) << 15);
+                }
+                assert_eq!(table.wide[i][16..18], [0, 0]);
+                assert_eq!(table.wide[i][18], (table.taps[i][16] as i32) << 15);
+                assert_eq!(table.wide[i][19], (table.taps[i][17] as i32) << 15);
+            }
+        }
+    }
+
+    // -- the down-samplers of the pitch analysis ---------------------------------
+
+    /// `silk_resampler_down2` as libopus writes it.
+    fn down2_reference(s: &mut [i32; 2], out: &mut [i16], input: &[i16]) {
+        for k in 0..input.len() / 2 {
+            let in32 = (input[2 * k] as i32) << 10;
+            let y = in32.wrapping_sub(s[0]);
+            let x = silk_smlawb(y, y, SILK_RESAMPLER_DOWN2_1);
+            let mut out32 = s[0].wrapping_add(x);
+            s[0] = in32.wrapping_add(x);
+
+            let in32 = (input[2 * k + 1] as i32) << 10;
+            let y = in32.wrapping_sub(s[1]);
+            let x = silk_smulwb(y, SILK_RESAMPLER_DOWN2_0);
+            out32 = out32.wrapping_add(s[1]);
+            out32 = out32.wrapping_add(x);
+            s[1] = in32.wrapping_add(x);
+
+            out[k] = silk_sat16(silk_rshift_round(out32, 11)) as i16;
+        }
+    }
+
+    #[test]
+    fn down2_matches_the_reference() {
+        let mut rng = Lcg(26);
+        for &n in &LENGTHS {
+            for trial in 0..16 {
+                let input = rng.signal(n, trial);
+                let state: [i32; 2] = rng.states(trial / 2);
+                let (mut s_ref, mut s_new) = (state, state);
+                let mut expect = vec![0i16; n / 2];
+                down2_reference(&mut s_ref, &mut expect, &input);
+                let mut out = vec![0x5555i16; n / 2 + 1];
+                silk_resampler_down2(&mut s_new, &mut out, &input, n as i32);
+                assert_eq!((&out[..n / 2], s_new), (&expect[..], s_ref), "n={n} trial={trial}");
+                assert_eq!(out[n / 2], 0x5555);
+            }
+        }
+    }
+
+    /// `silk_resampler_private_ar2` and `silk_resampler_down2_3` as this
+    /// file had them, with the states in the slice and a cleared buffer.
+    fn ar2_reference(s: &mut [i32], out_q8: &mut [i32], input: &[i16], a_q14: &[i16]) {
+        for k in 0..input.len() {
+            let out32 = s[0].wrapping_add((input[k] as i32) << 10);
+            out_q8[k] = out32;
+            s[0] = s[1].wrapping_add(silk_smulwb(out32, a_q14[0] as i32));
+            s[1] = silk_smulwb(out32, a_q14[1] as i32);
+        }
+    }
+
+    fn down2_3_reference(s: &mut [i32; 6], out: &mut Vec<i16>, input: &[i16]) {
+        let c = &SILK_RESAMPLER_2_3_COEFS_LQ;
+        let mut buf = [0i32; RESAMPLER_MAX_BATCH_SIZE_IN as usize + ORDER_FIR];
+        buf[..ORDER_FIR].copy_from_slice(&s[..ORDER_FIR]);
+        let mut in_idx = 0;
+        let mut remaining = input.len();
+        while remaining > 0 {
+            let n = remaining.min(RESAMPLER_MAX_BATCH_SIZE_IN as usize);
+            ar2_reference(&mut s[ORDER_FIR..], &mut buf[ORDER_FIR..ORDER_FIR + n], &input[in_idx..in_idx + n], c);
+            let mut p = 0;
+            let mut counter = n as i32;
+            while counter > 2 {
+                let mut r = silk_smulwb(buf[p], c[2] as i32);
+                r = silk_smlawb(r, buf[p + 1], c[3] as i32);
+                r = silk_smlawb(r, buf[p + 2], c[5] as i32);
+                r = silk_smlawb(r, buf[p + 3], c[4] as i32);
+                out.push(silk_sat16(silk_rshift_round(r, 9)) as i16);
+                let mut r = silk_smulwb(buf[p + 1], c[4] as i32);
+                r = silk_smlawb(r, buf[p + 2], c[5] as i32);
+                r = silk_smlawb(r, buf[p + 3], c[3] as i32);
+                r = silk_smlawb(r, buf[p + 4], c[2] as i32);
+                out.push(silk_sat16(silk_rshift_round(r, 8)) as i16);
+                p += 3;
+                counter -= 3;
+            }
+            in_idx += n;
+            remaining -= n;
+            if remaining > 0 {
+                buf.copy_within(n..n + ORDER_FIR, 0);
+            } else {
+                s[..ORDER_FIR].copy_from_slice(&buf[n..n + ORDER_FIR]);
+            }
+        }
+    }
+
+    #[test]
+    fn down2_3_and_ar2_match_the_reference() {
+        let mut rng = Lcg(27);
+        // Up to more than one batch of 480 samples.
+        for n in LENGTHS.into_iter().chain([240, 479, 480, 481, 483, 960, 1000]) {
+            for trial in 0..8 {
+                let input = rng.signal(n, trial);
+                let state: [i32; 6] = rng.states(trial / 2);
+
+                let mut s_ref = state;
+                let mut expect = Vec::new();
+                down2_3_reference(&mut s_ref, &mut expect, &input);
+                let mut s_new = state;
+                let mut out = vec![0x5555i16; expect.len() + 1];
+                silk_resampler_down2_3(&mut s_new, &mut out, &input, n as i32);
+                assert_eq!((&out[..expect.len()], s_new), (&expect[..], s_ref), "n={n} trial={trial}");
+                assert_eq!(out[expect.len()], 0x5555);
+
+                let (mut s_ref, mut s_new) = ([state[0], state[1]], [state[0], state[1]]);
+                let mut expect = vec![0i32; n];
+                ar2_reference(&mut s_ref, &mut expect, &input, &SILK_RESAMPLER_2_3_COEFS_LQ);
+                let mut out_q8 = vec![0x5555_5555i32; n];
+                silk_resampler_private_ar2(&mut s_new, &mut out_q8, &input, &SILK_RESAMPLER_2_3_COEFS_LQ, n as i32);
+                assert_eq!((&out_q8, s_new), (&expect, s_ref), "AR2: n={n} trial={trial}");
+            }
         }
     }
 }

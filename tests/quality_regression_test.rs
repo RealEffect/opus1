@@ -171,11 +171,17 @@ fn test_mode_voip_48k_is_hybrid_fb() {
     );
 }
 
-/// Audio + 16 kHz → SilkOnly
+/// Audio + 16 kHz → SilkOnly at a bitrate that is low for music.
+///
+/// 16 kb/s is below the rate from which libopus takes CELT-only for an
+/// `Audio` encoder that has no speech detector (opus_encoder.c:
+/// `equiv_rate >= threshold`, about 17.6 kb/s for mono). At 24 kb/s the
+/// same rule gives CELT-only; tests/core_encoder.rs compares that choice
+/// with libopus.
 #[test]
 fn test_mode_audio_16k_is_silk_only() {
     let mut enc = OpusEncoder::new(16000, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = 24000;
+    enc.bitrate_bps = 16000;
     enc.use_cbr = true;
 
     let input = make_sine(16000, 440.0, 320);

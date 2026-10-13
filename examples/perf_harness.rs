@@ -21,10 +21,13 @@
 //!   tones.
 //! * `spread` compares several `bench --json` files.
 //!
-//! The C side is libopus, linked through `audiopus_sys`. opus-rs chooses its
-//! coding mode from the sample rate and the bit rate only, so the C encoder
-//! is always forced to the mode, the audio bandwidth and the channel count
-//! that the scenario names. Both sides then do the same kind of work.
+//! The C side is libopus, linked through `audiopus_sys`. Both encoders are
+//! forced to the coding mode and the audio bandwidth that the scenario names
+//! (`OPUS_SET_FORCE_MODE` and `OPUS_SET_BANDWIDTH`; in opus-rs
+//! `set_force_mode` and `set_bandwidth`), and the C encoder to its channel
+//! count. opus-rs always codes as many channels as it is given. Both sides
+//! then do the same kind of work. The mode-switching streams of `golden`
+//! and `modes` are the exception: there nothing is forced.
 //!
 //! The two encoders still do not do identical work. Their packets are almost
 //! never byte-identical, and:
@@ -55,7 +58,7 @@ use audiopus_sys as ffi;
 use opus_rs::range_coder::RangeCoder;
 use opus_rs::silk::dec_api::SilkDecoder;
 use opus_rs::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus_rs::{Application, ForcedMode, OpusDecoder, OpusEncoder};
 
 /// Output buffer handed to both encoders. It is larger than any packet, so
 /// it never limits the bit rate.
@@ -160,7 +163,8 @@ enum Signal {
     Music,
 }
 
-/// Audio bandwidth. opus-rs derives it from the input sample rate alone.
+/// Audio bandwidth. A scenario codes the widest one its input sample rate
+/// can carry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Bandwidth {
     Narrow,
@@ -181,12 +185,22 @@ impl Bandwidth {
             Bandwidth::Full => ffi::OPUS_BANDWIDTH_FULLBAND,
         }
     }
+
+    /// The opus-rs value for this bandwidth.
+    fn rust_value(self) -> opus_rs::Bandwidth {
+        match self {
+            Bandwidth::Narrow => opus_rs::Bandwidth::Narrowband,
+            Bandwidth::Medium => opus_rs::Bandwidth::Mediumband,
+            Bandwidth::Wide => opus_rs::Bandwidth::Wideband,
+            Bandwidth::SuperWide => opus_rs::Bandwidth::Superwideband,
+            Bandwidth::Full => opus_rs::Bandwidth::Fullband,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct Scenario {
-    /// Coding mode that opus-rs is expected to pick for these settings. The
-    /// C encoder is forced to it.
+    /// Coding mode. Both encoders are forced to it.
     mode: Mode,
     /// Encoder input sample rate in Hz.
     rate: u32,
@@ -455,11 +469,9 @@ fn frame_label(frame_us: u32) -> String {
 /// Every scenario. Those marked `.bench()` form the bench set; all of them
 /// together form the golden set.
 ///
-/// The bit rates are chosen so that opus-rs picks the named mode by itself:
-/// * 8, 12 and 16 kHz input always gives SILK.
-/// * 24 and 48 kHz input gives CELT from about 18 kb/s (application Audio)
-///   or about 62 kb/s mono and 45 kb/s stereo (application Voip). Below
-///   that it gives Hybrid.
+/// Both encoders are forced to the mode a scenario names, so the bit rate
+/// need not be one at which an encoder would pick that mode by itself. Most
+/// are: SILK and Hybrid at speech rates, CELT at music rates.
 fn scenarios() -> Vec<Scenario> {
     use Mode::{Celt, Hybrid, Silk};
     let s = Scenario::new;
@@ -1239,7 +1251,10 @@ impl Fnv {
 // The two codecs
 // ---------------------------------------------------------------------------
 
-fn rust_encoder(sc: &Scenario) -> Result<OpusEncoder, String> {
+/// `forced` pins the coding mode and the bandwidth to what the scenario
+/// names, as `CEncoder::new` does for libopus. Without it opus-rs decides by
+/// itself.
+fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
     let application = match sc.app {
         App::Voip => Application::Voip,
         App::Audio => Application::Audio,
@@ -1252,10 +1267,13 @@ fn rust_encoder(sc: &Scenario) -> Result<OpusEncoder, String> {
     encoder.use_cbr = sc.cbr;
     encoder.use_inband_fec = sc.fec;
     encoder.packet_loss_perc = sc.loss_perc;
-    if sc.mode == Mode::Hybrid {
-        encoder
-            .enable_hybrid_mode()
-            .map_err(|e| format!("enable_hybrid_mode: {e}"))?;
+    if forced {
+        encoder.set_force_mode(Some(match sc.mode {
+            Mode::Silk => ForcedMode::SilkOnly,
+            Mode::Hybrid => ForcedMode::Hybrid,
+            Mode::Celt => ForcedMode::CeltOnly,
+        }));
+        encoder.set_bandwidth(sc.bandwidth().rust_value());
     }
     Ok(encoder)
 }
@@ -1555,7 +1573,7 @@ fn rust_encode_all_with_settings(
     sc: &Scenario,
     clip: &Clip,
 ) -> Result<(Packets, RustSettings), String> {
-    let mut encoder = rust_encoder(sc)?;
+    let mut encoder = rust_encoder(sc, true)?;
     let mut out = [0u8; MAX_PACKET];
     let mut packets = Packets::default();
     for (index, frame) in clip.pcm.chunks_exact(clip.step).enumerate() {
@@ -1569,7 +1587,7 @@ fn rust_encode_all_with_settings(
 
 /// Same as `rust_encode_all`, through the 16-bit integer entry point.
 fn rust_encode_all_i16(sc: &Scenario, clip: &Clip) -> Result<Packets, String> {
-    let mut encoder = rust_encoder(sc)?;
+    let mut encoder = rust_encoder(sc, true)?;
     let mut out = [0u8; MAX_PACKET];
     let mut packets = Packets::default();
     for (index, frame) in clip.pcm_i16.chunks_exact(clip.step).enumerate() {
@@ -1739,17 +1757,19 @@ fn first_frame(packet: &[u8]) -> Option<&[u8]> {
     packet.get(offset..offset + sizes[0] as usize)
 }
 
-/// Decode a mono SILK stream with one packet in `LOSS_PERIOD` lost, and
-/// recover each lost packet from the redundancy data (LBRR, "low bit rate
-/// redundancy") carried by the packet after it.
+/// Decode a SILK stream, mono or stereo, with one packet in `LOSS_PERIOD`
+/// lost, and recover each lost packet from the redundancy data (LBRR, "low
+/// bit rate redundancy") carried by the packet after it.
 ///
-/// `OpusDecoder` has no entry point for this, so the SILK decoder of the
-/// crate is driven directly. Its output is at the SILK internal rate.
-/// Returns the output hash and the number of frames recovered from
-/// redundancy data. `None` when the scenario is not mono SILK with forward
+/// The SILK decoder of the crate is driven directly, which also shows how
+/// many frames had redundancy data. Its output is at the SILK internal
+/// rate, one channel after the other. (`OpusDecoder::decode_fec` is the
+/// public entry point for the same thing.) Returns the output hash and the
+/// number of frames recovered from redundancy data: for stereo, frames of
+/// the first channel. `None` when the scenario is not SILK with forward
 /// error correction.
 fn silk_fec_decode(sc: &Scenario, packets: &Packets) -> Option<(u64, usize)> {
-    if !(sc.fec && sc.mode == Mode::Silk && sc.channels == 1) {
+    if !(sc.fec && sc.mode == Mode::Silk) {
         return None;
     }
     let internal_rate = match sc.bandwidth() {
@@ -1760,10 +1780,11 @@ fn silk_fec_decode(sc: &Scenario, packets: &Packets) -> Option<(u64, usize)> {
     let frame_ms = (sc.frame_us / 1000) as i32;
     let silk_frames = if frame_ms > 20 { (frame_ms / 20) as usize } else { 1 };
     let mut decoder = SilkDecoder::new();
-    decoder.init(internal_rate, 1);
+    decoder.init(internal_rate, sc.channels as i32);
     decoder.channel_state[0].fs_api_hz = internal_rate;
 
-    let mut pcm = [0i16; 320];
+    // One SILK frame: 20 ms at 16 kHz, for two channels.
+    let mut pcm = [0i16; 2 * 320];
     let mut hash = Fnv::new();
     let mut recovered = 0usize;
     for index in 0..packets.len() {
@@ -1791,7 +1812,7 @@ fn silk_fec_decode(sc: &Scenario, packets: &Packets) -> Option<(u64, usize)> {
             );
             hash.u32(samples as u32);
             if samples > 0 {
-                hash.i16s(&pcm[..(samples as usize).min(pcm.len())]);
+                hash.i16s(&pcm[..(samples as usize * sc.channels).min(pcm.len())]);
             }
             if flag == FLAG_DECODE_LBRR && decoder.channel_state[0].lbrr_flags[silk_frame] == 1 {
                 recovered += 1;
@@ -1832,7 +1853,7 @@ fn raise_thread_priority() -> bool {
 
 #[inline(never)]
 fn time_rust_encode(sc: &Scenario, clip: &Clip) -> Duration {
-    let mut encoder = rust_encoder(sc).expect("Rust encoder");
+    let mut encoder = rust_encoder(sc, true).expect("Rust encoder");
     let mut out = [0u8; MAX_PACKET];
     let (mut bytes, mut failures) = (0usize, 0usize);
     let start = Instant::now();
@@ -2640,7 +2661,7 @@ fn cmd_run(opts: &Opts) -> Result<i32, String> {
 
     let (frames, elapsed) = match (op, implementation) {
         ("enc", "rust") => {
-            let mut encoder = rust_encoder(&sc)?;
+            let mut encoder = rust_encoder(&sc, true)?;
             run_loop(
                 || {
                     for frame in clip.pcm.chunks_exact(clip.step) {
@@ -2801,14 +2822,13 @@ fn golden_line(sc: &Scenario, clip: &Clip) -> String {
 //
 // * libopus then moves between SILK, Hybrid and CELT and between the
 //   bandwidths. The Rust decoder decodes that stream.
-// * opus-rs moves between Hybrid and CELT for 24 and 48 kHz input. It keeps
-//   SILK for 16 kHz input.
+// * opus-rs moves between SILK or Hybrid and CELT as well. It has no
+//   speech/music detection, so it does not switch on the same packets.
 //
 // For stereo input libopus also changes between stereo and mono packets.
-// The opus-rs decoder rejects a mono packet when it was created for stereo,
-// so the stereo streams have the C encoder forced to stereo. One stream,
-// named `..._free`, leaves that open; its `errs` field counts the rejected
-// packets.
+// The stereo streams have the C encoder forced to stereo, except the one
+// named `..._free`, in which the Rust decoder gets mono packets in a stereo
+// stream.
 
 /// Bit rates in bits per second, one per 200 ms, repeated.
 const SWITCH_BITRATES: [i32; 10] = [
@@ -2864,7 +2884,7 @@ fn switch_bitrate(sc: &Scenario, index: usize) -> i32 {
 }
 
 fn rust_encode_switching(sc: &Scenario, clip: &Clip) -> Result<Packets, String> {
-    let mut encoder = rust_encoder(sc)?;
+    let mut encoder = rust_encoder(sc, false)?;
     let mut out = [0u8; MAX_PACKET];
     let mut packets = Packets::default();
     for (index, frame) in clip.pcm.chunks_exact(clip.step).enumerate() {

@@ -197,29 +197,34 @@ pub fn spreading_decision(
     }
 }
 
+/// Scale factor of one Haar step, `1 / sqrt(2)`.
+const HAAR_SCALE: f32 = core::f32::consts::FRAC_1_SQRT_2;
+
+/// One step of the Haar transform, in place.
+///
+/// `x` is read as `n0` rows of `stride` values. Rows `2j` and `2j + 1` are
+/// replaced by their sum and their difference, both scaled by `1 / sqrt(2)`.
+/// A last row without a partner (odd `n0`) is left alone.
 pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
+    // The only bounds check. Every kernel below works on this slice, whose
+    // length is a multiple of `2 * stride`.
+    let x = &mut x[..2 * (n0 >> 1) * stride];
     #[cfg(target_arch = "aarch64")]
-    {
-        if stride == 1 && n0 >= 64 {
-            haar1_neon(x, n0);
-        } else {
-            haar1_scalar(x, n0, stride);
-        }
-    }
+    haar1_neon(x, stride);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         // NOTE: the previous AVX1 kernel loaded its second vector at +4
         // (overlapping the first) and deinterleaved into quartet-swapped
         // order, corrupting every other 8-sample block. The corrected kernel
         // needs a 64-bit lane permute, which is AVX2-only; pre-AVX2 CPUs use
-        // the scalar path.
+        // the portable path.
         if stride == 1 && n0 >= 16 && crate::compat::x86_has_avx2() {
             haar1_avx2(x, n0);
             return;
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
-    haar1_scalar(x, n0, stride);
+    haar1_scalar(x, stride);
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -272,54 +277,129 @@ unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
     }
 }
 
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-#[inline]
-fn haar1_scalar(x: &mut [f32], n0: usize, stride: usize) {
-    let n = n0 >> 1;
-    let scale = core::f32::consts::FRAC_1_SQRT_2;
-    for i in 0..stride {
-        for j in 0..n {
-            let idx1 = stride * 2 * j + i;
-            let idx2 = stride * (2 * j + 1) + i;
-            let tmp1 = scale * x[idx1];
-            let tmp2 = scale * x[idx2];
-            x[idx1] = tmp1 + tmp2;
-            x[idx2] = tmp1 - tmp2;
+/// Haar step for rows of `S` values. `x.len()` must be a multiple of
+/// `2 * S`; a remainder would be left alone.
+///
+/// The row width is a constant so that the compiler turns the inner loop
+/// into vector instructions on every target.
+#[inline(always)]
+fn haar1_rows<const S: usize>(x: &mut [f32]) {
+    let (rows, _) = x.as_chunks_mut::<S>();
+    let (row_pairs, _) = rows.as_chunks_mut::<2>();
+    for [a, b] in row_pairs {
+        for k in 0..S {
+            let tmp1 = HAAR_SCALE * a[k];
+            let tmp2 = HAAR_SCALE * b[k];
+            a[k] = tmp1 + tmp2;
+            b[k] = tmp1 - tmp2;
         }
     }
 }
 
+/// Portable Haar step. `x.len()` must be a multiple of `2 * stride`.
+///
+/// This is the fallback on targets without a hand-written kernel and the
+/// reference for the unit tests. Each value is computed as in libopus:
+/// both inputs are scaled first, then added and subtracted.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline]
+fn haar1_scalar(x: &mut [f32], stride: usize) {
+    debug_assert!(stride > 0 && x.len().is_multiple_of(2 * stride));
+    match stride {
+        // The codec uses the widths 1, 2, 4 and 8 (one row per short block).
+        1 => haar1_rows::<1>(x),
+        2 => haar1_rows::<2>(x),
+        4 => haar1_rows::<4>(x),
+        _ => haar1_wide(x, stride),
+    }
+}
+
+/// Portable Haar step for rows of 8 values, and for any other width.
+/// `x.len()` must be a multiple of `2 * stride`.
+#[inline]
+fn haar1_wide(x: &mut [f32], stride: usize) {
+    if stride == 8 {
+        return haar1_rows::<8>(x);
+    }
+    for row_pair in x.chunks_exact_mut(2 * stride) {
+        let (a, b) = row_pair.split_at_mut(stride);
+        for (p, q) in a.iter_mut().zip(b.iter_mut()) {
+            let tmp1 = HAAR_SCALE * *p;
+            let tmp2 = HAAR_SCALE * *q;
+            *p = tmp1 + tmp2;
+            *q = tmp1 - tmp2;
+        }
+    }
+}
+
+/// NEON Haar step. `x.len()` must be a multiple of `2 * stride`.
+///
+/// Row widths 1, 2 and 4 have their own loops. Wider rows use the portable
+/// `haar1_wide`, which the compiler already turns into full vectors. The values are
+/// bit-identical to `haar1_scalar`: the same multiply, add and subtract per
+/// value, with no fused multiply-add.
 #[cfg(target_arch = "aarch64")]
-fn haar1_neon(x: &mut [f32], n0: usize) {
+#[inline]
+fn haar1_neon(x: &mut [f32], stride: usize) {
     use core::arch::aarch64::*;
 
-    let n = n0 >> 1;
-    let scale = core::f32::consts::FRAC_1_SQRT_2;
-
-    unsafe {
-        let vscale = vdupq_n_f32(scale);
-
-        let mut j = 0usize;
-        while j + 4 <= n {
-            let idx = 2 * j;
-            let pairs = vld2q_f32(x.as_ptr().add(idx));
-            let even = vmulq_f32(pairs.0, vscale);
-            let odd = vmulq_f32(pairs.1, vscale);
-
-            let out = float32x4x2_t(vaddq_f32(even, odd), vsubq_f32(even, odd));
-            vst2q_f32(x.as_mut_ptr().add(idx), out);
-            j += 4;
+    debug_assert!(stride > 0 && x.len().is_multiple_of(2 * stride));
+    match stride {
+        1 => {
+            // Four pairs per pass: split even and odd positions.
+            let (blocks, tail) = x.as_chunks_mut::<8>();
+            for block in blocks {
+                // SAFETY: `block` is a `[f32; 8]`. The load and the store
+                // each cover exactly these 8 values.
+                unsafe {
+                    let scale = vdupq_n_f32(HAAR_SCALE);
+                    let pairs = vld2q_f32(block.as_ptr());
+                    let even = vmulq_f32(pairs.0, scale);
+                    let odd = vmulq_f32(pairs.1, scale);
+                    let out = float32x4x2_t(vaddq_f32(even, odd), vsubq_f32(even, odd));
+                    vst2q_f32(block.as_mut_ptr(), out);
+                }
+            }
+            // At most three pairs are left.
+            for pair in tail.as_chunks_mut::<2>().0.iter_mut().take(3) {
+                let tmp1 = HAAR_SCALE * pair[0];
+                let tmp2 = HAAR_SCALE * pair[1];
+                pair[0] = tmp1 + tmp2;
+                pair[1] = tmp1 - tmp2;
+            }
         }
-
-        while j < n {
-            let idx1 = 2 * j;
-            let idx2 = idx1 + 1;
-            let tmp1 = scale * x[idx1];
-            let tmp2 = scale * x[idx2];
-            x[idx1] = tmp1 + tmp2;
-            x[idx2] = tmp1 - tmp2;
-            j += 1;
+        2 => {
+            // One row pair per vector: the low half is row `2j`, the high
+            // half is row `2j + 1`.
+            let (blocks, _) = x.as_chunks_mut::<4>();
+            for block in blocks {
+                // SAFETY: `block` is a `[f32; 4]`. The load and the store
+                // each cover exactly these 4 values.
+                unsafe {
+                    let v = vmulq_f32(vld1q_f32(block.as_ptr()), vdupq_n_f32(HAAR_SCALE));
+                    let a = vget_low_f32(v);
+                    let b = vget_high_f32(v);
+                    vst1q_f32(block.as_mut_ptr(), vcombine_f32(vadd_f32(a, b), vsub_f32(a, b)));
+                }
+            }
         }
+        4 => {
+            let (blocks, _) = x.as_chunks_mut::<8>();
+            for block in blocks {
+                // SAFETY: `block` is a `[f32; 8]`. Row `2j` is values 0..4,
+                // row `2j + 1` is values 4..8; each load and store covers
+                // one of these halves.
+                unsafe {
+                    let scale = vdupq_n_f32(HAAR_SCALE);
+                    let ptr = block.as_mut_ptr();
+                    let a = vmulq_f32(vld1q_f32(ptr), scale);
+                    let b = vmulq_f32(vld1q_f32(ptr.add(4)), scale);
+                    vst1q_f32(ptr, vaddq_f32(a, b));
+                    vst1q_f32(ptr.add(4), vsubq_f32(a, b));
+                }
+            }
+        }
+        _ => haar1_wide(x, stride),
     }
 }
 
@@ -348,187 +428,218 @@ pub fn compute_qn(n: usize, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+/// Turns the two energies of a band into the angle `atan2(side, mid)`,
+/// scaled so that a quarter turn is 16384.
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
-    use core::arch::aarch64::*;
-
-    let mut emid = 1e-15f32;
-    let mut eside = 1e-15f32;
-
-    if stereo {
-        let mut sum_mid = vdupq_n_f32(0.0);
-        let mut sum_side = vdupq_n_f32(0.0);
-        let mut i = 0;
-
-        while i + 16 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-            let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-            let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-            let y3 = vld1q_f32(y.as_ptr().add(i + 12));
-
-            let m0 = vaddq_f32(x0, y0);
-            let m1 = vaddq_f32(x1, y1);
-            let m2 = vaddq_f32(x2, y2);
-            let m3 = vaddq_f32(x3, y3);
-            let s0 = vsubq_f32(x0, y0);
-            let s1 = vsubq_f32(x1, y1);
-            let s2 = vsubq_f32(x2, y2);
-            let s3 = vsubq_f32(x3, y3);
-
-            sum_mid = vfmaq_f32(sum_mid, m0, m0);
-            sum_mid = vfmaq_f32(sum_mid, m1, m1);
-            sum_mid = vfmaq_f32(sum_mid, m2, m2);
-            sum_mid = vfmaq_f32(sum_mid, m3, m3);
-            sum_side = vfmaq_f32(sum_side, s0, s0);
-            sum_side = vfmaq_f32(sum_side, s1, s1);
-            sum_side = vfmaq_f32(sum_side, s2, s2);
-            sum_side = vfmaq_f32(sum_side, s3, s3);
-
-            i += 16;
-        }
-
-        while i + 8 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-
-            let m0 = vaddq_f32(x0, y0);
-            let m1 = vaddq_f32(x1, y1);
-            let s0 = vsubq_f32(x0, y0);
-            let s1 = vsubq_f32(x1, y1);
-
-            sum_mid = vfmaq_f32(sum_mid, m0, m0);
-            sum_mid = vfmaq_f32(sum_mid, m1, m1);
-            sum_side = vfmaq_f32(sum_side, s0, s0);
-            sum_side = vfmaq_f32(sum_side, s1, s1);
-
-            i += 8;
-        }
-
-        while i + 4 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let m0 = vaddq_f32(x0, y0);
-            let s0 = vsubq_f32(x0, y0);
-            sum_mid = vfmaq_f32(sum_mid, m0, m0);
-            sum_side = vfmaq_f32(sum_side, s0, s0);
-            i += 4;
-        }
-
-        emid += vaddvq_f32(sum_mid);
-        eside += vaddvq_f32(sum_side);
-
-        for j in i..n {
-            let m = x[j] + y[j];
-            let s = x[j] - y[j];
-            emid += m * m;
-            eside += s * s;
-        }
-    } else {
-        let mut sum_mid = vdupq_n_f32(0.0);
-        let mut sum_side = vdupq_n_f32(0.0);
-        let mut i = 0;
-
-        while i + 16 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-            let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-            let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-            let y3 = vld1q_f32(y.as_ptr().add(i + 12));
-
-            sum_mid = vfmaq_f32(sum_mid, x0, x0);
-            sum_mid = vfmaq_f32(sum_mid, x1, x1);
-            sum_mid = vfmaq_f32(sum_mid, x2, x2);
-            sum_mid = vfmaq_f32(sum_mid, x3, x3);
-            sum_side = vfmaq_f32(sum_side, y0, y0);
-            sum_side = vfmaq_f32(sum_side, y1, y1);
-            sum_side = vfmaq_f32(sum_side, y2, y2);
-            sum_side = vfmaq_f32(sum_side, y3, y3);
-
-            i += 16;
-        }
-
-        while i + 8 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-
-            sum_mid = vfmaq_f32(sum_mid, x0, x0);
-            sum_mid = vfmaq_f32(sum_mid, x1, x1);
-            sum_side = vfmaq_f32(sum_side, y0, y0);
-            sum_side = vfmaq_f32(sum_side, y1, y1);
-
-            i += 8;
-        }
-
-        while i + 4 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            sum_mid = vfmaq_f32(sum_mid, x0, x0);
-            sum_side = vfmaq_f32(sum_side, y0, y0);
-            i += 4;
-        }
-
-        emid += vaddvq_f32(sum_mid);
-        eside += vaddvq_f32(sum_side);
-
-        for j in i..n {
-            emid += x[j] * x[j];
-            eside += y[j] * y[j];
-        }
-    }
-
+fn itheta_from_energies(emid: f32, eside: f32) -> i32 {
     let mid = emid.sqrt();
     let side = eside.sqrt();
     let theta_norm = celt_atan2p_norm(side, mid);
     (0.5 + 16384.0 * theta_norm) as i32
 }
 
-#[inline(always)]
-#[cfg(target_arch = "aarch64")]
-pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
-    unsafe { stereo_itheta_neon(x, y, stereo, n) }
+/// Portable angle between `x` and `y`, which must have the same length.
+///
+/// With `stereo`, the angle is between the sum and the difference of the
+/// two channels; otherwise between `x` and `y` themselves. The energies are
+/// summed one value at a time, as in libopus without vector code.
+///
+/// This is what every target except aarch64 runs. The NEON kernel sums in
+/// four lanes with fused multiply-add, so its angle can differ by one step.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline]
+fn stereo_itheta_scalar(x: &[f32], y: &[f32], stereo: bool) -> i32 {
+    debug_assert_eq!(x.len(), y.len());
+    let mut emid = 1e-15f32;
+    let mut eside = 1e-15f32;
+    if stereo {
+        for (&xv, &yv) in x.iter().zip(y) {
+            let m = xv + yv;
+            let s = xv - yv;
+            emid += m * m;
+            eside += s * s;
+        }
+    } else {
+        for (&xv, &yv) in x.iter().zip(y) {
+            emid += xv * xv;
+            eside += yv * yv;
+        }
+    }
+    itheta_from_energies(emid, eside)
 }
 
+/// NEON angle between `x` and `y`, which must have the same length.
+///
+/// The energies are summed in four lanes with fused multiply-add, the lanes
+/// are added in pairs, and the last one to three values are added one at a
+/// time without fusing. The unit test checks this order against a scalar
+/// model, because the encoder output depends on it.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-#[cfg(not(target_arch = "aarch64"))]
-pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        return stereo_itheta_neon(x, y, stereo, n);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
+fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool) -> i32 {
+    debug_assert_eq!(x.len(), y.len());
+    let n = x.len();
+    // One bounds check; the loads below rely on it.
+    let y = &y[..n];
+    // SAFETY: every vector load reads `x[i..i + 4]` or `y[i..i + 4]` with
+    // `i + 4 <= n`, because each loop tests `i + 16`, `i + 8` or `i + 4`
+    // against `n` before its loads. Both slices hold exactly `n` values.
+    let (emid, eside) = unsafe {
+        use core::arch::aarch64::*;
+
         let mut emid = 1e-15f32;
         let mut eside = 1e-15f32;
+
         if stereo {
-            for i in 0..n {
-                let m = x[i] + y[i];
-                let s = x[i] - y[i];
+            let mut sum_mid = vdupq_n_f32(0.0);
+            let mut sum_side = vdupq_n_f32(0.0);
+            let mut i = 0;
+
+            while i + 16 <= n {
+                let x0 = vld1q_f32(x.as_ptr().add(i));
+                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
+                let x2 = vld1q_f32(x.as_ptr().add(i + 8));
+                let x3 = vld1q_f32(x.as_ptr().add(i + 12));
+                let y0 = vld1q_f32(y.as_ptr().add(i));
+                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
+                let y2 = vld1q_f32(y.as_ptr().add(i + 8));
+                let y3 = vld1q_f32(y.as_ptr().add(i + 12));
+
+                let m0 = vaddq_f32(x0, y0);
+                let m1 = vaddq_f32(x1, y1);
+                let m2 = vaddq_f32(x2, y2);
+                let m3 = vaddq_f32(x3, y3);
+                let s0 = vsubq_f32(x0, y0);
+                let s1 = vsubq_f32(x1, y1);
+                let s2 = vsubq_f32(x2, y2);
+                let s3 = vsubq_f32(x3, y3);
+
+                sum_mid = vfmaq_f32(sum_mid, m0, m0);
+                sum_mid = vfmaq_f32(sum_mid, m1, m1);
+                sum_mid = vfmaq_f32(sum_mid, m2, m2);
+                sum_mid = vfmaq_f32(sum_mid, m3, m3);
+                sum_side = vfmaq_f32(sum_side, s0, s0);
+                sum_side = vfmaq_f32(sum_side, s1, s1);
+                sum_side = vfmaq_f32(sum_side, s2, s2);
+                sum_side = vfmaq_f32(sum_side, s3, s3);
+
+                i += 16;
+            }
+
+            while i + 8 <= n {
+                let x0 = vld1q_f32(x.as_ptr().add(i));
+                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
+                let y0 = vld1q_f32(y.as_ptr().add(i));
+                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
+
+                let m0 = vaddq_f32(x0, y0);
+                let m1 = vaddq_f32(x1, y1);
+                let s0 = vsubq_f32(x0, y0);
+                let s1 = vsubq_f32(x1, y1);
+
+                sum_mid = vfmaq_f32(sum_mid, m0, m0);
+                sum_mid = vfmaq_f32(sum_mid, m1, m1);
+                sum_side = vfmaq_f32(sum_side, s0, s0);
+                sum_side = vfmaq_f32(sum_side, s1, s1);
+
+                i += 8;
+            }
+
+            while i + 4 <= n {
+                let x0 = vld1q_f32(x.as_ptr().add(i));
+                let y0 = vld1q_f32(y.as_ptr().add(i));
+                let m0 = vaddq_f32(x0, y0);
+                let s0 = vsubq_f32(x0, y0);
+                sum_mid = vfmaq_f32(sum_mid, m0, m0);
+                sum_side = vfmaq_f32(sum_side, s0, s0);
+                i += 4;
+            }
+
+            emid += vaddvq_f32(sum_mid);
+            eside += vaddvq_f32(sum_side);
+
+            for j in i..n {
+                let m = x[j] + y[j];
+                let s = x[j] - y[j];
                 emid += m * m;
                 eside += s * s;
             }
         } else {
-            for i in 0..n {
-                emid += x[i] * x[i];
-                eside += y[i] * y[i];
+            let mut sum_mid = vdupq_n_f32(0.0);
+            let mut sum_side = vdupq_n_f32(0.0);
+            let mut i = 0;
+
+            while i + 16 <= n {
+                let x0 = vld1q_f32(x.as_ptr().add(i));
+                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
+                let x2 = vld1q_f32(x.as_ptr().add(i + 8));
+                let x3 = vld1q_f32(x.as_ptr().add(i + 12));
+                let y0 = vld1q_f32(y.as_ptr().add(i));
+                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
+                let y2 = vld1q_f32(y.as_ptr().add(i + 8));
+                let y3 = vld1q_f32(y.as_ptr().add(i + 12));
+
+                sum_mid = vfmaq_f32(sum_mid, x0, x0);
+                sum_mid = vfmaq_f32(sum_mid, x1, x1);
+                sum_mid = vfmaq_f32(sum_mid, x2, x2);
+                sum_mid = vfmaq_f32(sum_mid, x3, x3);
+                sum_side = vfmaq_f32(sum_side, y0, y0);
+                sum_side = vfmaq_f32(sum_side, y1, y1);
+                sum_side = vfmaq_f32(sum_side, y2, y2);
+                sum_side = vfmaq_f32(sum_side, y3, y3);
+
+                i += 16;
+            }
+
+            while i + 8 <= n {
+                let x0 = vld1q_f32(x.as_ptr().add(i));
+                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
+                let y0 = vld1q_f32(y.as_ptr().add(i));
+                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
+
+                sum_mid = vfmaq_f32(sum_mid, x0, x0);
+                sum_mid = vfmaq_f32(sum_mid, x1, x1);
+                sum_side = vfmaq_f32(sum_side, y0, y0);
+                sum_side = vfmaq_f32(sum_side, y1, y1);
+
+                i += 8;
+            }
+
+            while i + 4 <= n {
+                let x0 = vld1q_f32(x.as_ptr().add(i));
+                let y0 = vld1q_f32(y.as_ptr().add(i));
+                sum_mid = vfmaq_f32(sum_mid, x0, x0);
+                sum_side = vfmaq_f32(sum_side, y0, y0);
+                i += 4;
+            }
+
+            emid += vaddvq_f32(sum_mid);
+            eside += vaddvq_f32(sum_side);
+
+            for j in i..n {
+                emid += x[j] * x[j];
+                eside += y[j] * y[j];
             }
         }
-        let mid = emid.sqrt();
-        let side = eside.sqrt();
-        let theta_norm = celt_atan2p_norm(side, mid);
-        (0.5 + 16384.0 * theta_norm) as i32
+
+        (emid, eside)
+    };
+    itheta_from_energies(emid, eside)
+}
+
+/// Angle between `x[..n]` and `y[..n]`, see `stereo_itheta_scalar`.
+#[inline(always)]
+pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
+    // The only bounds checks. The kernels get slices of exactly `n` values.
+    let x = &x[..n];
+    let y = &y[..n];
+    #[cfg(target_arch = "aarch64")]
+    {
+        stereo_itheta_neon(x, y, stereo)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        stereo_itheta_scalar(x, y, stereo)
     }
 }
 
@@ -570,13 +681,22 @@ pub struct SplitCtx {
     pub qalloc: i32,
 }
 
+/// Computes and codes the angle between `x` and `y`: the two halves of a
+/// mono band (`stereo == false`) or the two channels of a stereo band.
+///
+/// The stereo encoder also changes the band in place, as libopus does. After
+/// the call `x` holds the mid signal and `y` the side signal, or `x` holds
+/// the intensity-stereo mix. This is why both slices are `&mut`. They were
+/// `&[f32]` before, and the function wrote through pointers taken from them.
+/// That is undefined behaviour: the compiler is allowed to remove such
+/// writes, and it did remove some of them, depending on what was inlined.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub fn compute_theta(
     ctx: &mut BandCtx,
     sctx: &mut SplitCtx,
-    x: &[f32],
-    y: &[f32],
+    x: &mut [f32],
+    y: &mut [f32],
     n: usize,
     b: &mut i32,
     b_blocks: i32,
@@ -704,35 +824,23 @@ pub fn compute_theta(
         }
         itheta = (itheta as u32 * 16384 / qn as u32) as i32;
         if ctx.encode && stereo {
-            let (bx, by) = (x.as_ptr() as *mut f32, y.as_ptr() as *mut f32);
-            let (sx, sy) = unsafe {
-                (
-                    core::slice::from_raw_parts_mut(bx, n),
-                    core::slice::from_raw_parts_mut(by, n),
-                )
-            };
             if itheta == 0 {
-                intensity_stereo(ctx.m, sx, sy, ctx.band_e, ctx.i, n);
+                intensity_stereo(ctx.m, x, y, ctx.band_e, ctx.i, n);
             } else {
-                stereo_split(sx, sy, n);
+                stereo_split(x, y, n);
             }
         }
     } else if stereo {
         if ctx.encode {
             let inv = itheta > 8192 && !ctx.disable_inv;
-            let (bx, by) = (x.as_ptr() as *mut f32, y.as_ptr() as *mut f32);
-            let (sx, sy) = unsafe {
-                (
-                    core::slice::from_raw_parts_mut(bx, n),
-                    core::slice::from_raw_parts_mut(by, n),
-                )
-            };
-            if inv {
-                for yv in sy.iter_mut() {
-                    *yv = -*yv;
-                }
-            }
-            intensity_stereo(ctx.m, sx, sy, ctx.band_e, ctx.i, n);
+            // libopus negates `y` at this point when `inv` is set, so that
+            // the mix below adds two channels of the same sign. The loop
+            // that did this here wrote through a pointer taken from a
+            // shared slice, and the compiler removed it from every release
+            // build. It is left out on purpose in this commit, so that the
+            // encoder output stays exactly as it was. The commit "negate the
+            // right channel of a phase-inverted intensity band" restores it.
+            intensity_stereo(ctx.m, x, y, ctx.band_e, ctx.i, n);
             if *b > (2 << BITRES) && ctx.remaining_bits > (2 << BITRES) {
                 ctx.rc.encode_bit_logp(inv, 2);
             }
@@ -918,6 +1026,40 @@ fn quant_partition_direct_encode(
     }
 }
 
+/// Whether a band part of `n` values with `b` bits (in 1/8 bit) is split in
+/// two. It is when `b` exceeds, by more than 12, the cost of the largest
+/// pulse count the mode's table has for this band size (libopus:
+/// `b > cache[cache[0]] + 12` in quant_partition).
+#[inline(always)]
+fn band_should_split(m: &CeltMode, band: usize, lm: i32, n: usize, b: i32) -> bool {
+    if lm < 0 || n <= 2 {
+        return false;
+    }
+    let cache_idx = (lm + 1) as usize * m.nb_ebands + band;
+    debug_assert!(cache_idx < m.cache.index.len());
+    // SAFETY: `cache.index` has one entry per pair of band size and band,
+    // `(max_lm + 2) * nb_ebands` entries in all. `lm` is at most `max_lm`
+    // and `band` is below `nb_ebands` for every caller (quant_all_bands
+    // walks the bands of the mode).
+    let cache_base = unsafe { *m.cache.index.get_unchecked(cache_idx) };
+    if cache_base < 0 {
+        return false;
+    }
+    let cache_base = cache_base as usize;
+    debug_assert!(cache_base < m.cache.bits.len());
+    // SAFETY: a non-negative entry of `cache.index` is the start of one
+    // record in `cache.bits`. The first byte of a record is its largest
+    // pulse count `max_q`, and the record holds the bytes `0..=max_q`. The
+    // tables in modes.rs are the cache tables of libopus and have this
+    // layout.
+    unsafe {
+        let cache_ptr = m.cache.bits.as_ptr().add(cache_base);
+        let max_q = *cache_ptr as usize;
+        debug_assert!(cache_base + max_q < m.cache.bits.len());
+        b > (*cache_ptr.add(max_q) as i32) + 12
+    }
+}
+
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn quant_partition_encode(
@@ -937,20 +1079,7 @@ fn quant_partition_encode(
     }
 
     // Check split condition FIRST (matching C's quant_partition which checks this before dispatch)
-    let should_split = if lm >= 0 && n > 2 {
-        let cache_idx = (lm + 1) as usize * ctx.m.nb_ebands + ctx.i;
-        let cache_base = unsafe { *ctx.m.cache.index.get_unchecked(cache_idx) };
-        if cache_base >= 0 {
-            let cache_base = cache_base as usize;
-            let cache_ptr = ctx.m.cache.bits.as_ptr().wrapping_add(cache_base);
-            let max_q = unsafe { *cache_ptr } as usize;
-            b > (unsafe { *cache_ptr.add(max_q) } as i32) + 12
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let should_split = band_should_split(ctx.m, ctx.i, lm, n, b);
 
     if should_split {
         let mut sctx = SplitCtx {
@@ -1151,20 +1280,7 @@ pub fn quant_partition(
 ) -> u32 {
     /* Check split condition FIRST, before dispatching to specialized handlers.
     This matches the C code which checks this at the top of quant_partition. */
-    let should_split = if lm >= 0 && n > 2 {
-        let cache_idx = (lm + 1) as usize * ctx.m.nb_ebands + ctx.i;
-        let cache_base = unsafe { *ctx.m.cache.index.get_unchecked(cache_idx) };
-        if cache_base >= 0 {
-            let cache_base = cache_base as usize;
-            let cache_ptr = ctx.m.cache.bits.as_ptr().wrapping_add(cache_base);
-            let max_q = unsafe { *cache_ptr } as usize;
-            b > (unsafe { *cache_ptr.add(max_q) } as i32) + 12
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let should_split = band_should_split(ctx.m, ctx.i, lm, n, b);
     if should_split {
         let mut sctx = SplitCtx {
             inv: false,
@@ -1367,6 +1483,12 @@ pub fn quant_partition(
                 if fill_masked == 0 {
                     x[..n].fill(0.0);
                 } else if let Some(lb) = lowband {
+                    // One bounds check per slice for the loops below.
+                    let x = &mut x[..n];
+                    let lb = &lb[..n];
+                    // SAFETY: the vector loop reads `lb[i..i + 8]` and writes
+                    // `x[i..i + 8]` with `i + 8 <= n8 <= n`, and both slices
+                    // hold exactly `n` values. `vals` is a local array of 8.
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
                         use core::arch::aarch64::*;
@@ -1430,112 +1552,80 @@ pub fn quant_partition(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+/// Hadamard row order for `stride` rows. `ORDERY_TABLE` holds the orders
+/// for 2, 4, 8 and 16 rows, one after the other.
 #[inline(always)]
-unsafe fn deinterleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
-    let n = n0 * stride;
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
-
-    for i in 0..stride {
-        let src_offset = i;
-        let dst_offset = i * n0;
-        for j in 0..n0 {
-            tmp[dst_offset + j] = x[j * stride + src_offset];
-        }
-    }
-
-    x[..n].copy_from_slice(tmp);
+fn hadamard_order(stride: usize) -> &'static [i32] {
+    let offset = match stride {
+        2 => 0,
+        4 => 2,
+        8 => 6,
+        16 => 14,
+        _ => 0,
+    };
+    &ORDERY_TABLE[offset..offset + stride]
 }
 
+/// Scratch buffer of the two functions below, as a slice of `n` values that
+/// are not initialised yet. The caller must write every value before it
+/// reads one.
+#[inline(always)]
+fn hadamard_scratch(buf: &mut [core::mem::MaybeUninit<f32>; MAX_PVQ_N], n: usize) -> &mut [f32] {
+    // A band never has more than MAX_PVQ_N values. This is checked in
+    // release builds too, because the slice below must fit in the buffer.
+    assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
+    // SAFETY: `n` values fit in the buffer (checked above). The callers
+    // write all `n` values, `stride` rows of `n0` values, before they read
+    // any of them.
+    unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, n) }
+}
+
+/// Reorders `x` from `n0` groups of `stride` values (one value per short
+/// block) to `stride` rows of `n0` values (one row per short block). With
+/// `hadamard`, the rows are stored in the order of the Hadamard transform.
 pub fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
-
+    let x = &mut x[..n];
     let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-
-    let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
+    let tmp = hadamard_scratch(&mut tmp_buf, n);
     if hadamard {
-        let offset = match stride {
-            2 => 0,
-            4 => 2,
-            8 => 6,
-            16 => 14,
-            _ => 0,
-        };
-        let ordery = &ORDERY_TABLE[offset..offset + stride];
+        let ordery = hadamard_order(stride);
         for i in 0..stride {
             for j in 0..n0 {
                 tmp[ordery[i] as usize * n0 + j] = x[j * stride + i];
             }
         }
     } else {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            if n0 >= 4 {
-                deinterleave_hadamard_neon(x, n0, stride);
-                return;
-            }
-        }
         for i in 0..stride {
             for j in 0..n0 {
                 tmp[i * n0 + j] = x[j * stride + i];
             }
         }
     }
-    x[..n].copy_from_slice(tmp);
+    x.copy_from_slice(tmp);
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn interleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
-    let n = n0 * stride;
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
-
-    for i in 0..stride {
-        let src_offset = i * n0;
-        let dst_offset = i;
-        for j in 0..n0 {
-            tmp[j * stride + dst_offset] = x[src_offset + j];
-        }
-    }
-
-    x[..n].copy_from_slice(tmp);
-}
-
+/// The reverse of `deinterleave_hadamard`.
 pub fn interleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
+    let x = &mut x[..n];
     let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
+    let tmp = hadamard_scratch(&mut tmp_buf, n);
     if hadamard {
-        let offset = match stride {
-            2 => 0,
-            4 => 2,
-            8 => 6,
-            16 => 14,
-            _ => 0,
-        };
-        let ordery = &ORDERY_TABLE[offset..offset + stride];
+        let ordery = hadamard_order(stride);
         for i in 0..stride {
             for j in 0..n0 {
                 tmp[j * stride + i] = x[ordery[i] as usize * n0 + j];
             }
         }
     } else {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            if n0 >= 4 {
-                interleave_hadamard_neon(x, n0, stride);
-                return;
-            }
-        }
         for i in 0..stride {
             for j in 0..n0 {
                 tmp[j * stride + i] = x[i * n0 + j];
             }
         }
     }
-    x[..n].copy_from_slice(tmp);
+    x.copy_from_slice(tmp);
 }
 
 const ORDERY_TABLE: [i32; 30] = [
@@ -1712,8 +1802,8 @@ pub fn quant_band(
 
         if let Some(lb_out) = lowband_out {
             let scale = (n0 as f32).sqrt();
-            for j in 0..n0 {
-                lb_out[j] = scale * x[j];
+            for (out, &xv) in lb_out[..n0].iter_mut().zip(&x[..n0]) {
+                *out = scale * xv;
             }
         }
         cm &= (1u32 << b_final) - 1;
@@ -1723,12 +1813,20 @@ pub fn quant_band(
     cm
 }
 
+/// Turns the mid signal in `x` and the side signal in `y` back into the left
+/// and the right channel, each with unit energy (libopus: stereo_merge).
 pub fn stereo_merge(x: &mut [f32], y: &mut [f32], mid: f32, _side: f32, n: usize) {
+    // One bounds check per slice; the loops below need none.
+    let x = &mut x[..n];
+    let y = &mut y[..n];
+
+    // The two sums are added one value at a time, in this order. Any other
+    // order would round differently and change the decoder output.
     let mut xp = 0.0f32;
     let mut side_e = 0.0f32;
-    for i in 0..n {
-        xp += y[i] * x[i];
-        side_e += y[i] * y[i];
+    for (&xv, &yv) in x.iter().zip(y.iter()) {
+        xp += yv * xv;
+        side_e += yv * yv;
     }
 
     xp *= mid;
@@ -1736,29 +1834,29 @@ pub fn stereo_merge(x: &mut [f32], y: &mut [f32], mid: f32, _side: f32, n: usize
     let er = mid * mid + side_e + 2.0 * xp;
 
     if er < 6e-4f32 || el < 6e-4f32 {
-        y[..n].copy_from_slice(&x[..n]);
+        y.copy_from_slice(x);
         return;
     }
 
     let lgain = 1.0 / el.sqrt();
     let rgain = 1.0 / er.sqrt();
 
-    for i in 0..n {
-        let l = mid * x[i];
-        let r = y[i];
-        x[i] = lgain * (l - r);
-        y[i] = rgain * (l + r);
+    for (xv, yv) in x.iter_mut().zip(y.iter_mut()) {
+        let l = mid * *xv;
+        let r = *yv;
+        *xv = lgain * (l - r);
+        *yv = rgain * (l + r);
     }
 }
 
 #[inline(always)]
 fn stereo_split(x: &mut [f32], y: &mut [f32], n: usize) {
     let scale = core::f32::consts::FRAC_1_SQRT_2;
-    for i in 0..n {
-        let l = scale * x[i];
-        let r = scale * y[i];
-        x[i] = l + r;
-        y[i] = r - l;
+    for (xv, yv) in x[..n].iter_mut().zip(y[..n].iter_mut()) {
+        let l = scale * *xv;
+        let r = scale * *yv;
+        *xv = l + r;
+        *yv = r - l;
     }
 }
 
@@ -1776,8 +1874,8 @@ fn intensity_stereo(
     let norm = (left * left + right * right).sqrt().max(MIN_STEREO_ENERGY);
     let a1 = left / norm;
     let a2 = right / norm;
-    for i in 0..n {
-        x[i] = a1 * x[i] + a2 * y[i];
+    for (xv, &yv) in x[..n].iter_mut().zip(&y[..n]) {
+        *xv = a1 * *xv + a2 * yv;
     }
 }
 
@@ -1829,6 +1927,14 @@ fn prepare_lowband_views(
     }
 
     if allow_lowband_scratch {
+        // The scratch buffer of quant_all_bands holds MAX_PVQ_N values.
+        // Checked in release builds too, because the copy below is unchecked.
+        assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
+        // SAFETY: the source is `norm[lb_start..lb_end]`, in bounds because
+        // `lb_end <= len` was checked above. The destination is the scratch
+        // buffer, which holds `n` values (checked above) and is a separate
+        // local array, so the two do not overlap. The slice built from it is
+        // used for one band only, before the buffer is used again.
         unsafe {
             core::ptr::copy_nonoverlapping(norm.as_ptr().add(lb_start), lowband_scratch_ptr, n)
         };
@@ -2251,12 +2357,20 @@ pub fn quant_all_bands(
     let norm_size = m_val * (m.e_bands[m.nb_ebands - 1] as usize) - norm_offset;
 
     const MAX_NORM_SIZE: usize = 800;
-    debug_assert!(norm_size <= MAX_NORM_SIZE);
+    // Checked in release builds too: the two slices below must fit in their
+    // buffers. The 48 kHz mode needs 624 values at most.
+    assert!(norm_size <= MAX_NORM_SIZE, "norm buffer too small for this mode");
 
+    // `norm` and `norm2` hold the decoded bands of the frame so far, for
+    // folding. They start without values. A band is written (as
+    // `lowband_out`) before a later band reads it as its `lowband`: the
+    // read range always ends at or before the start of the current band.
     let mut norm_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+    // SAFETY: `norm_size` values fit in the buffer (checked above).
     let norm =
         unsafe { core::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, norm_size) };
     let mut norm2_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+    // SAFETY: as for `norm`.
     let norm2 =
         unsafe { core::slice::from_raw_parts_mut(norm2_buf.as_mut_ptr() as *mut f32, norm_size) };
 
@@ -2480,6 +2594,12 @@ pub fn quant_all_bands(
     *seed = ctx_seed;
 }
 
+/// Square root of the energy of one band, plus a tiny offset.
+///
+/// The sum uses four accumulators of four lanes for the first multiple of
+/// 16 values, one accumulator for the next multiple of 4, and plain adds
+/// for the rest, all with fused multiply-add in the vector part. The unit
+/// test checks this order against a scalar model.
 #[cfg(target_arch = "aarch64")]
 fn compute_band_energy_neon(band: &[f32]) -> f32 {
     use core::arch::aarch64::*;
@@ -2487,6 +2607,9 @@ fn compute_band_energy_neon(band: &[f32]) -> f32 {
     let n = band.len();
     let mut sum = 1e-27f32;
 
+    // SAFETY: every load reads `band[i..i + 4]` with `i + 4 <= n`: the first
+    // loop stops at `n16`, the largest multiple of 16 up to `n`, and the
+    // second at `n16 + n4`, the largest multiple of 4 up to `n`.
     unsafe {
         let n16 = n & !15;
         if n16 > 0 {
@@ -2672,6 +2795,7 @@ pub fn normalise_bands(
             }
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
+                // SAFETY: `src` and `dst` were sliced to `n` values above.
                 unsafe { scale_slice_neon(src, dst, norm, n) };
                 continue;
             }
@@ -2709,11 +2833,18 @@ unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
     }
 }
 
+/// `dst[i] = src[i] * scale` for `i < n`.
+///
+/// # Safety
+///
+/// `src` and `dst` must each hold at least `n` values. Every load and store
+/// covers `[i..i + 4]` with `i + 4 <= n`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn scale_slice_neon(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
     use core::arch::aarch64::*;
+    debug_assert!(src.len() >= n && dst.len() >= n);
     let vscale = vdupq_n_f32(scale);
     let mut i = 0;
 
@@ -2778,6 +2909,7 @@ pub fn denormalise_bands(
             }
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
+                // SAFETY: `src` and `dst` were sliced to `n` values above.
                 unsafe { scale_slice_neon(src, dst, g, n) };
                 continue;
             }
@@ -2792,11 +2924,19 @@ pub fn celt_lcg_rand(seed: u32) -> u32 {
     seed.wrapping_mul(1664525).wrapping_add(1013904223)
 }
 
+/// NEON kernel of `renormalise_vector`.
+///
+/// # Safety
+///
+/// `x` must hold at least `n` values. Every load and store covers
+/// `x[i..i + 4]` with `i + 4 <= n`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
     use core::arch::aarch64::*;
+
+    debug_assert!(x.len() >= n);
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
@@ -2929,40 +3069,42 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     }
 }
 
+/// Portable kernel of `renormalise_vector`: the energy is summed one value
+/// at a time. This is what every target without a vector kernel runs.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline]
+fn renormalise_vector_scalar(x: &mut [f32], gain: f32) {
+    let mut e = 1e-15f32;
+    for &xv in x.iter() {
+        e += xv * xv;
+    }
+    let norm = gain / e.sqrt();
+    for xv in x.iter_mut() {
+        *xv *= norm;
+    }
+}
+
+/// Scales `x[..n]` so that its energy becomes `gain * gain`.
 pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
+    // The only bounds check. The vector kernels read and write `n` values
+    // through pointers.
+    let x = &mut x[..n];
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        renormalise_vector_neon(x, n, gain);
+    {
+        // SAFETY: `x` holds exactly `n` values.
+        unsafe { renormalise_vector_neon(x, n, gain) };
     }
     #[cfg(target_arch = "x86_64")]
-    unsafe {
+    {
         if n >= 16 && crate::compat::x86_has_avx2_fma() {
-            renormalise_vector_avx2(x, n, gain);
+            // SAFETY: `x` holds exactly `n` values, and the CPU has the
+            // features the kernel is compiled for.
+            unsafe { renormalise_vector_avx2(x, n, gain) };
             return;
         }
     }
-    #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
-    {
-        let mut e = 1e-15f32;
-        for &xv in x[..n].iter() {
-            e += xv * xv;
-        }
-        let norm = gain / e.sqrt();
-        for xv in x[..n].iter_mut() {
-            *xv *= norm;
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut e = 1e-15f32;
-        for &xv in x[..n].iter() {
-            e += xv * xv;
-        }
-        let norm = gain / e.sqrt();
-        for xv in x[..n].iter_mut() {
-            *xv *= norm;
-        }
-    }
+    #[cfg(not(target_arch = "aarch64"))]
+    renormalise_vector_scalar(x, gain);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3048,5 +3190,435 @@ mod tests {
         assert_eq!(bitexact_log2tan(30274, 12540), 2611);
         assert_eq!(bitexact_log2tan(23171, 23171), 0);
         assert_eq!(bitexact_log2tan(200, 32767), -15059);
+    }
+
+    /// Values that stress float kernels: both zeros, the smallest and the
+    /// largest magnitudes, and infinities.
+    const EXTREMES: [f32; 10] = [
+        0.0,
+        -0.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        1.0e-45,
+        f32::MAX,
+        -f32::MAX,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        1.0,
+    ];
+
+    /// `len` values in -1..1 from a fixed generator. With `extremes`, about
+    /// every seventh value is replaced by one of `EXTREMES`.
+    fn test_values(len: usize, seed: &mut u32, extremes: bool) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                *seed = celt_lcg_rand(*seed);
+                let pick = (*seed >> 8) as usize;
+                if extremes && pick % 7 == 0 {
+                    EXTREMES[(pick / 7) % EXTREMES.len()]
+                } else {
+                    (*seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+                }
+            })
+            .collect()
+    }
+
+    /// Bit-for-bit equality. Two NaN values count as equal: which NaN an
+    /// operation returns is not part of what the kernels promise.
+    fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+                "{what}: value {i} is {g:e} ({:#010x}), expected {w:e} ({:#010x})",
+                g.to_bits(),
+                w.to_bits()
+            );
+        }
+    }
+
+    /// The Haar step as libopus writes it (celt/bands.c, haar1).
+    fn haar1_reference(x: &mut [f32], n0: usize, stride: usize) {
+        let n = n0 >> 1;
+        for i in 0..stride {
+            for j in 0..n {
+                let tmp1 = core::f32::consts::FRAC_1_SQRT_2 * x[stride * 2 * j + i];
+                let tmp2 = core::f32::consts::FRAC_1_SQRT_2 * x[stride * (2 * j + 1) + i];
+                x[stride * 2 * j + i] = tmp1 + tmp2;
+                x[stride * (2 * j + 1) + i] = tmp1 - tmp2;
+            }
+        }
+    }
+
+    #[test]
+    fn haar1_kernels_match_reference() {
+        let mut seed = 0x0bad_5eedu32;
+        let row_counts = (0..=41).chain([64, 65, 88, 127, 176]);
+        for n0 in row_counts {
+            for stride in [1usize, 2, 3, 4, 5, 8, 16] {
+                for extremes in [false, true] {
+                    // Three values more than the kernel may touch. They
+                    // must come back unchanged.
+                    let input = test_values(n0 * stride + 3, &mut seed, extremes);
+                    let what = format!("n0 {n0} stride {stride} extremes {extremes}");
+                    let mut want = input.clone();
+                    haar1_reference(&mut want, n0, stride);
+
+                    let mut got = input.clone();
+                    haar1(&mut got, n0, stride);
+                    assert_same_bits(&got, &want, &format!("haar1, {what}"));
+
+                    let used = 2 * (n0 >> 1) * stride;
+                    let mut got = input.clone();
+                    haar1_scalar(&mut got[..used], stride);
+                    assert_same_bits(&got, &want, &format!("haar1_scalar, {what}"));
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let mut got = input.clone();
+                        haar1_neon(&mut got[..used], stride);
+                        assert_same_bits(&got, &want, &format!("haar1_neon, {what}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// stereo_merge with one indexed loop per step, as libopus writes it
+    /// (celt/bands.c, stereo_merge, with the scalar inner products).
+    fn stereo_merge_reference(x: &mut [f32], y: &mut [f32], mid: f32, n: usize) {
+        let mut xp = 0.0f32;
+        let mut side_e = 0.0f32;
+        for i in 0..n {
+            xp += y[i] * x[i];
+            side_e += y[i] * y[i];
+        }
+        xp *= mid;
+        let el = mid * mid + side_e - 2.0 * xp;
+        let er = mid * mid + side_e + 2.0 * xp;
+        if er < 6e-4f32 || el < 6e-4f32 {
+            y[..n].copy_from_slice(&x[..n]);
+            return;
+        }
+        let lgain = 1.0 / el.sqrt();
+        let rgain = 1.0 / er.sqrt();
+        for i in 0..n {
+            let l = mid * x[i];
+            let r = y[i];
+            x[i] = lgain * (l - r);
+            y[i] = rgain * (l + r);
+        }
+    }
+
+    #[test]
+    fn stereo_helpers_match_indexed_loops() {
+        let mode = crate::modes::default_mode();
+        let mut seed = 0x5eed_0001u32;
+        for n in (0..=40).chain([64, 88, 96, 144, 176]) {
+            for extremes in [false, true] {
+                for mid in [0.0f32, 1.0e-3, 0.3, 0.8, 1.0] {
+                    // Two values more than `n`: they must stay unchanged.
+                    let x0 = test_values(n + 2, &mut seed, extremes);
+                    let y0 = test_values(n + 2, &mut seed, extremes);
+                    let what = format!("n {n} extremes {extremes} mid {mid}");
+
+                    let (mut x, mut y) = (x0.clone(), y0.clone());
+                    let (mut xr, mut yr) = (x0.clone(), y0.clone());
+                    stereo_merge(&mut x, &mut y, mid, 0.0, n);
+                    stereo_merge_reference(&mut xr, &mut yr, mid, n);
+                    assert_same_bits(&x, &xr, &format!("stereo_merge x, {what}"));
+                    assert_same_bits(&y, &yr, &format!("stereo_merge y, {what}"));
+
+                    let (mut x, mut y) = (x0.clone(), y0.clone());
+                    let (mut xr, mut yr) = (x0.clone(), y0.clone());
+                    stereo_split(&mut x, &mut y, n);
+                    let scale = core::f32::consts::FRAC_1_SQRT_2;
+                    for i in 0..n {
+                        let l = scale * xr[i];
+                        let r = scale * yr[i];
+                        xr[i] = l + r;
+                        yr[i] = r - l;
+                    }
+                    assert_same_bits(&x, &xr, &format!("stereo_split x, {what}"));
+                    assert_same_bits(&y, &yr, &format!("stereo_split y, {what}"));
+
+                    // Band energies for intensity_stereo: left then right.
+                    let mut band_e = vec![0.0f32; 2 * mode.nb_ebands];
+                    band_e[3] = mid + 0.25;
+                    band_e[mode.nb_ebands + 3] = 0.5;
+                    let (mut x, mut y) = (x0.clone(), y0.clone());
+                    let mut xr = x0.clone();
+                    intensity_stereo(mode, &mut x, &mut y, &band_e, 3, n);
+                    let left = band_e[3].max(MIN_STEREO_ENERGY);
+                    let right = band_e[mode.nb_ebands + 3].max(MIN_STEREO_ENERGY);
+                    let norm = (left * left + right * right).sqrt().max(MIN_STEREO_ENERGY);
+                    let (a1, a2) = (left / norm, right / norm);
+                    for i in 0..n {
+                        xr[i] = a1 * xr[i] + a2 * y0[i];
+                    }
+                    assert_same_bits(&x, &xr, &format!("intensity_stereo x, {what}"));
+                    assert_same_bits(&y, &y0, &format!("intensity_stereo y, {what}"));
+                }
+            }
+        }
+    }
+
+    /// Lengths that cover every tail of the 16, 8 and 4 wide loops.
+    fn kernel_lengths() -> impl Iterator<Item = usize> {
+        (0..=41).chain([63, 64, 65, 88, 127, 176])
+    }
+
+    /// Scalar model of a NEON sum of squares: four lanes, each updated with
+    /// a fused multiply-add, over the complete groups of four of `values`.
+    fn fused_lanes(values: &[f32]) -> [f32; 4] {
+        let mut lanes = [0.0f32; 4];
+        for group in values.chunks_exact(4) {
+            for k in 0..4 {
+                lanes[k] = group[k].mul_add(group[k], lanes[k]);
+            }
+        }
+        lanes
+    }
+
+    /// Scalar model of `vaddvq_f32`: the lanes are added in pairs.
+    fn add_lanes(lanes: [f32; 4]) -> f32 {
+        (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+    }
+
+    /// Scalar model of `stereo_itheta_neon`.
+    #[cfg(target_arch = "aarch64")]
+    fn stereo_itheta_model(x: &[f32], y: &[f32], stereo: bool) -> i32 {
+        let n = x.len();
+        let (a, b): (Vec<f32>, Vec<f32>) = if stereo {
+            (0..n).map(|i| (x[i] + y[i], x[i] - y[i])).unzip()
+        } else {
+            (x.to_vec(), y.to_vec())
+        };
+        let mut emid = 1e-15f32 + add_lanes(fused_lanes(&a));
+        let mut eside = 1e-15f32 + add_lanes(fused_lanes(&b));
+        for i in (n & !3)..n {
+            emid += a[i] * a[i];
+            eside += b[i] * b[i];
+        }
+        itheta_from_energies(emid, eside)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn stereo_itheta_neon_matches_its_scalar_model() {
+        let mut seed = 0x17e7_a001u32;
+        for n in kernel_lengths() {
+            for extremes in [false, true] {
+                for stereo in [false, true] {
+                    for round in 0..8 {
+                        let x = test_values(n, &mut seed, extremes);
+                        let mut y = test_values(n, &mut seed, extremes);
+                        // Some rounds with a much weaker second signal, so
+                        // that small and large angles are both covered.
+                        if round % 2 == 1 {
+                            y.iter_mut().for_each(|v| *v *= 1.0e-3);
+                        }
+                        let want = stereo_itheta_model(&x, &y, stereo);
+                        let what = format!("n {n} stereo {stereo} extremes {extremes}");
+                        assert_eq!(stereo_itheta_neon(&x, &y, stereo), want, "{what}");
+                        assert_eq!(stereo_itheta(&x, &y, stereo, n), want, "{what}");
+                        if !extremes {
+                            assert!((0..=16384).contains(&want), "{what}: angle {want}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stereo_itheta_scalar_matches_indexed_loop() {
+        let mut seed = 0x17e7_a002u32;
+        for n in kernel_lengths() {
+            for stereo in [false, true] {
+                let x = test_values(n, &mut seed, false);
+                let y = test_values(n, &mut seed, false);
+                let mut emid = 1e-15f32;
+                let mut eside = 1e-15f32;
+                for i in 0..n {
+                    let (m, s) = if stereo { (x[i] + y[i], x[i] - y[i]) } else { (x[i], y[i]) };
+                    emid += m * m;
+                    eside += s * s;
+                }
+                let want = itheta_from_energies(emid, eside);
+                assert_eq!(stereo_itheta_scalar(&x, &y, stereo), want, "n {n} stereo {stereo}");
+                // The vector kernel may round the sums differently. One
+                // step of the angle is the most that can change.
+                let other = stereo_itheta(&x, &y, stereo, n);
+                assert!((other - want).abs() <= 1, "n {n} stereo {stereo}: {other} and {want}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn stereo_itheta_rejects_a_slice_that_is_too_short() {
+        let x = [0.5f32; 16];
+        let y = [0.25f32; 15];
+        stereo_itheta(&x, &y, true, 16);
+    }
+
+    /// Scalar model of `compute_band_energy_neon`.
+    #[cfg(target_arch = "aarch64")]
+    fn band_energy_model(band: &[f32]) -> f32 {
+        let n = band.len();
+        let n16 = n & !15;
+        let n4 = n & !3;
+        let mut sum = 1e-27f32;
+        if n16 > 0 {
+            // Four accumulators: values 0..4 of each group of 16 go to the
+            // first, values 4..8 to the second, and so on.
+            let mut acc = [[0.0f32; 4]; 4];
+            for group in band[..n16].chunks_exact(16) {
+                for a in 0..4 {
+                    for k in 0..4 {
+                        let v = group[4 * a + k];
+                        acc[a][k] = v.mul_add(v, acc[a][k]);
+                    }
+                }
+            }
+            let mut lanes = [0.0f32; 4];
+            for k in 0..4 {
+                lanes[k] = (acc[0][k] + acc[1][k]) + (acc[2][k] + acc[3][k]);
+            }
+            sum += add_lanes(lanes);
+        }
+        if n4 > n16 {
+            sum += add_lanes(fused_lanes(&band[n16..n4]));
+        }
+        for &v in &band[n4..] {
+            sum += v * v;
+        }
+        sum.sqrt()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn compute_band_energy_neon_matches_its_scalar_model() {
+        let mut seed = 0xe4e2_0001u32;
+        for n in kernel_lengths() {
+            for extremes in [false, true] {
+                let band = test_values(n, &mut seed, extremes);
+                let got = compute_band_energy_neon(&band);
+                let want = band_energy_model(&band);
+                assert_same_bits(&[got], &[want], &format!("n {n} extremes {extremes}"));
+            }
+        }
+    }
+
+    #[test]
+    fn renormalise_vector_kernels_match_their_models() {
+        let mut seed = 0x4e04_0001u32;
+        for n in kernel_lengths() {
+            for extremes in [false, true] {
+                for gain in [1.0f32, 0.37, 0.0] {
+                    // Two values more than `n`: they must stay unchanged.
+                    let input = test_values(n + 2, &mut seed, extremes);
+                    let what = format!("n {n} extremes {extremes} gain {gain}");
+
+                    // Portable kernel against the indexed loop.
+                    let mut want = input.clone();
+                    let mut e = 1e-15f32;
+                    for i in 0..n {
+                        e += want[i] * want[i];
+                    }
+                    let norm = gain / e.sqrt();
+                    for i in 0..n {
+                        want[i] *= norm;
+                    }
+                    let mut got = input.clone();
+                    renormalise_vector_scalar(&mut got[..n], gain);
+                    assert_same_bits(&got, &want, &format!("scalar, {what}"));
+
+                    // NEON kernel against the model of its summation order.
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let mut want = input.clone();
+                        let mut e = 1e-15f32 + add_lanes(fused_lanes(&want[..n]));
+                        for i in (n & !3)..n {
+                            e += want[i] * want[i];
+                        }
+                        let norm = gain / e.sqrt();
+                        for i in 0..n {
+                            want[i] *= norm;
+                        }
+                        let mut got = input.clone();
+                        renormalise_vector(&mut got, n, gain);
+                        assert_same_bits(&got, &want, &format!("neon, {what}"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn scale_slice_neon_matches_scalar_multiply() {
+        let mut seed = 0x5ca1_e001u32;
+        for n in kernel_lengths() {
+            for extremes in [false, true] {
+                let src = test_values(n, &mut seed, extremes);
+                let scale = 1.0 + test_values(1, &mut seed, false)[0];
+                // Two values more than `n`: they must stay unchanged.
+                let mut dst = vec![7.0f32; n + 2];
+                // SAFETY: `src` holds `n` values and `dst` holds `n + 2`.
+                unsafe { scale_slice_neon(&src, &mut dst, scale, n) };
+                let mut want: Vec<f32> = src.iter().map(|&v| v * scale).collect();
+                want.extend([7.0, 7.0]);
+                assert_same_bits(&dst, &want, &format!("n {n} extremes {extremes}"));
+            }
+        }
+    }
+
+    #[test]
+    fn hadamard_reorder_matches_its_definition_and_round_trips() {
+        for stride in [2usize, 3, 4, 5, 8, 16] {
+            for n0 in 1..=22 {
+                // The Hadamard order exists for 2, 4, 8 and 16 rows only.
+                let orders: &[bool] = if stride.is_power_of_two() { &[false, true] } else { &[false] };
+                for &hadamard in orders {
+                    let n = n0 * stride;
+                    // Two values more than `n`: they must stay unchanged.
+                    let input: Vec<f32> = (0..n + 2).map(|i| i as f32 + 0.5).collect();
+                    let what = format!("n0 {n0} stride {stride} hadamard {hadamard}");
+
+                    // Row of the reordered layout that takes column `i`.
+                    let row = |i: usize| -> usize {
+                        if hadamard { hadamard_order(stride)[i] as usize } else { i }
+                    };
+                    let mut want = input.clone();
+                    for i in 0..stride {
+                        for j in 0..n0 {
+                            want[row(i) * n0 + j] = input[j * stride + i];
+                        }
+                    }
+                    let mut got = input.clone();
+                    deinterleave_hadamard(&mut got, n0, stride, hadamard);
+                    assert_same_bits(&got, &want, &format!("deinterleave, {what}"));
+
+                    interleave_hadamard(&mut got, n0, stride, hadamard);
+                    assert_same_bits(&got, &input, &format!("round trip, {what}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn hadamard_reorder_rejects_a_band_that_is_too_long() {
+        let mut x = vec![0.0f32; 2 * MAX_PVQ_N];
+        deinterleave_hadamard(&mut x, MAX_PVQ_N, 2, false);
+    }
+
+    #[test]
+    #[should_panic]
+    fn haar1_rejects_a_slice_that_is_too_short() {
+        let mut x = [0.0f32; 15];
+        haar1(&mut x, 16, 1);
     }
 }

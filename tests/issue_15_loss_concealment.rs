@@ -90,10 +90,9 @@ fn marker_samples(toc: u8, rate: i32) -> usize {
 
 fn assert_sane(label: &str, pcm: &[f32]) {
     for (i, &v) in pcm.iter().enumerate() {
-        assert!(
-            v.is_finite() && (-1.0..=1.0).contains(&v),
-            "{label}: sample {i} out of range: {v}"
-        );
+        // Float output is not clipped, as in libopus's opus_decode_float, so
+        // a sample may lie outside [-1, 1]. It must still be finite.
+        assert!(v.is_finite(), "{label}: sample {i} is not finite: {v}");
     }
 }
 

@@ -1,7 +1,8 @@
-//! Decoder behaviour that still differs from libopus. Every test here
-//! states what libopus does, fails on the current code, and is ignored
-//! with the reason. None of them is specific to 24 kHz. Run them with
-//! `cargo test --release --test k24_known_gaps -- --ignored --nocapture`
+//! Decoder behaviour that used to differ from libopus. Every test here
+//! states what libopus does. Each one failed, and was ignored with the
+//! reason, until the gap it describes was closed; all of them run now.
+//! None of them is specific to 24 kHz. Run them with
+//! `cargo test --release --test k24_known_gaps -- --nocapture`
 //! to see the measured numbers.
 
 mod k24_common;
@@ -60,15 +61,10 @@ fn loss_run(mode: i32, bw: i32, bitrate: i32) -> (f64, f64, f64, f64, f64) {
 /// (or with shaped noise after 100 ms), and leaves the band energies in
 /// place, so the next good frame decodes at the right level.
 ///
-/// opus-rs `OpusDecoder::conceal_celt` (src/lib.rs) decodes an empty CELT
-/// frame instead. That takes the decoder's silence branch, which outputs
-/// only the fading tail of the previous frame and sets every band energy
-/// to -28 (src/celt.rs, `if silence`). The concealed frame is about 10 dB
-/// quieter than libopus's, and because CELT predicts each frame's energies
-/// from the previous frame's, the following good frames come out at the
-/// wrong level for roughly 100 ms.
+/// This was a gap until `CeltDecoder::decode_lost` (src/celt.rs) ported
+/// that function. The test stays here as the first check of it;
+/// tests/celtdec_plc.rs covers the concealment in depth.
 #[test]
-#[ignore = "CELT loss concealment (libopus celt_decode_lost) is not ported: concealed frames fade to silence and the following ~5 good frames decode at the wrong level"]
 fn celt_only_loss_is_concealed_like_libopus() {
     let (level_c, level_r, in_loss, after1, after5) = loss_run(MODE_CELT, BW_SWB, 48000);
     println!("CELT-SWB: concealed-frame level libopus {level_c:.1} dBFS, opus-rs {level_r:.1} dBFS; against libopus: concealed {in_loss:.1} dB, first good frame {after1:.1} dB, fifth {after5:.1} dB");
@@ -77,9 +73,9 @@ fn celt_only_loss_is_concealed_like_libopus() {
 }
 
 /// Hybrid stream, one frame in ten lost. The SILK layer is concealed
-/// bit-exactly; the CELT layer (above 8 kHz) has the fault described above.
+/// bit-exactly. The CELT layer (above 8 kHz) is concealed with noise drawn
+/// from the decoder's random seed, which libopus and opus-rs share.
 #[test]
-#[ignore = "the CELT layer of a lost Hybrid frame is not concealed like libopus (celt_decode_lost is not ported)"]
 fn hybrid_loss_is_concealed_like_libopus() {
     let (level_c, level_r, in_loss, after1, after5) = loss_run(MODE_HYBRID, BW_SWB, 32000);
     println!("Hybrid-SWB: concealed-frame level libopus {level_c:.1} dBFS, opus-rs {level_r:.1} dBFS; against libopus: concealed {in_loss:.1} dB, first good frame {after1:.1} dB, fifth {after5:.1} dB");
@@ -93,10 +89,11 @@ fn hybrid_loss_is_concealed_like_libopus() {
 /// codes stereo input as mono at low bitrates, so a stereo decoder meets
 /// mono packets in ordinary streams.
 ///
-/// opus-rs `OpusDecoder::decode` (src/lib.rs) returns
-/// "Channel count mismatch between packet and decoder".
+/// This was a gap until `OpusDecoder` (src/lib.rs) passed the packet's
+/// channel count down to both layers; before, it returned "Channel count
+/// mismatch between packet and decoder". tests/core_channels.rs covers the
+/// conversion in depth.
 #[test]
-#[ignore = "a decoder whose channel count differs from the packet's returns an error; libopus converts"]
 fn decoder_channel_count_may_differ_from_the_stream() {
     let mono = speech_fullband(24000, 0.5);
     let stereo = to_stereo(&mono, 24000);
@@ -126,13 +123,11 @@ fn decoder_channel_count_may_differ_from_the_stream() {
 /// low-bitrate copy of the previous frame. `opus_decode(..., decode_fec=1)`
 /// on the packet that follows a lost one returns that copy.
 ///
-/// opus-rs has no such call: `OpusDecoder::decode` takes no FEC flag, and
-/// the redundant copy is skipped (src/silk/dec_api.rs, "Skip LBRR data").
-/// A lost frame can only be concealed. This test measures both against the
-/// loss-free decode: libopus recovers the lost frames from the FEC data,
-/// opus-rs conceals them.
+/// This was a gap until `OpusDecoder::decode_fec` existed: a lost frame
+/// could only be concealed. The test measures both decoders against the
+/// loss-free decode, and against each other. tests/core_fec.rs covers FEC
+/// decoding in depth.
 #[test]
-#[ignore = "no FEC decode path: OpusDecoder has no decode_fec, lost frames can only be concealed"]
 fn lost_frames_are_recovered_from_in_band_fec() {
     let pcm = speech_fullband(24000, 3.0);
     let mut enc = CEnc::voip(24000, 1);
@@ -147,9 +142,9 @@ fn lost_frames_are_recovered_from_in_band_fec() {
     let mut buf = vec![0f32; 480];
     for (i, p) in packets.iter().enumerate() {
         if lost[i] {
-            // libopus: recover frame i from the FEC data in packet i + 1.
+            // Recover frame i from the FEC data in packet i + 1.
             c.extend(c_dec.decode(Some(&packets[i + 1]), 480, true).unwrap());
-            rs_dec.decode(&[], 480, &mut buf).unwrap();
+            assert_eq!(rs_dec.decode_fec(&packets[i + 1], 480, &mut buf), Ok(480));
         } else {
             c.extend(c_dec.decode(Some(p), 480, false).unwrap());
             rs_dec.decode(p, 480, &mut buf).unwrap();
@@ -166,17 +161,17 @@ fn lost_frames_are_recovered_from_in_band_fec() {
         }
         snr_db(sig, err)
     };
-    let (fec, plc) = (lost_snr(&c), lost_snr(&r));
-    println!("lost frames against the loss-free decode: libopus with FEC {fec:.1} dB, opus-rs with concealment {plc:.1} dB");
-    assert!(plc > fec - 1.0, "opus-rs {plc:.1} dB, libopus with FEC {fec:.1} dB");
+    let (fec, ours) = (lost_snr(&c), lost_snr(&r));
+    let against_c = compare(&c, &r, 1, 480, 24000);
+    println!("lost frames against the loss-free decode: libopus with FEC {fec:.1} dB, opus-rs with FEC {ours:.1} dB; opus-rs against libopus: {against_c}");
+    assert!(ours > fec - 0.1, "opus-rs {ours:.1} dB, libopus with FEC {fec:.1} dB");
+    assert!(against_c.worst_frame_snr_db > 80.0, "{against_c}");
 }
 
 /// libopus `opus_decode_float` does not clip: a full-scale signal comes
-/// back with peaks above 1.0. opus-rs clamps every output sample to
-/// [-1, 1] (src/lib.rs, `decode_frame`). This is the only difference left
-/// in good-packet decoding, and it only shows on signals near full scale.
+/// back with peaks above 1.0. This was a gap while opus-rs limited every
+/// output sample to [-1, 1]. It only showed on signals near full scale.
 #[test]
-#[ignore = "opus-rs clamps float output to [-1, 1]; libopus opus_decode_float does not clip"]
 fn float_output_is_not_clipped() {
     let pcm = full_scale(24000, 24000);
     let mut enc = CEnc::audio(24000, 1);
@@ -196,20 +191,13 @@ fn float_output_is_not_clipped() {
 /// one frame every 400 ms, and the decoder conceals the missing frames. In
 /// a SILK-only stream opus-rs does that bit-exactly, comfort noise
 /// included (k24_silk_loss_cng.rs). In a CELT-only or Hybrid stream the
-/// missing frames go through the CELT concealment that is not ported (see
-/// `celt_only_loss_is_concealed_like_libopus` above):
+/// missing frames go through the CELT concealment
+/// (`CeltDecoder::decode_lost`), which keeps the background noise going
+/// during the pause as libopus does.
 ///
-/// - CELT-only: libopus keeps the background noise going during the pause;
-///   opus-rs outputs digital silence, and the frame that arrives every
-///   400 ms comes out up to 15 dB too quiet.
-/// - Hybrid: the level is right (the SILK layer supplies the noise), but
-///   the samples differ from libopus's in the pause and in the first frame
-///   after it.
-///
-/// `dtx_in_hybrid_and_celt_streams` in k24_decoder_coverage.rs passes
-/// because its pause is digital silence, where there is no noise to keep.
+/// `dtx_in_hybrid_and_celt_streams` in k24_decoder_coverage.rs covers a
+/// pause of digital silence, where there is no noise to keep.
 #[test]
-#[ignore = "DTX pauses with background noise: CELT-only streams go silent and Hybrid streams differ from libopus (CELT loss concealment is not ported)"]
 fn dtx_pause_with_background_noise_is_concealed_like_libopus() {
     let mut pcm = speech_fullband(24000, 1.0);
     let mut seed = 9u32;

@@ -101,36 +101,37 @@ pub fn silk_vad_get_sa_q8(ps_enc: &mut SilkEncoderState, p_in: &[i16], _n_in: us
     let mut x_buf = [0i16; MAX_VAD_X_SIZE];
     let x = &mut x_buf[..alloc_size];
 
-    let (x_low, x_high) = x.split_at_mut(x_offset_3);
+    // Three band splits, each on the lower half of the one before. `x`
+    // receives the four bands that remain: the lowest at 0, the others at
+    // `x_offset[1..]`. The lower halves that are split again go through two
+    // small buffers of their own.
+    let mut low1_buf = [0i16; MAX_FRAME_LENGTH / 2];
+    let mut low2_buf = [0i16; MAX_FRAME_LENGTH / 4];
+    let low1 = &mut low1_buf[..decimated_framelength1];
+    let low2 = &mut low2_buf[..decimated_framelength2];
+
     silk_ana_filt_bank_1(
         p_in,
         &mut ps_silk_vad.ana_state,
-        x_low,
-        x_high,
+        low1,
+        &mut x[x_offset_3..],
         frame_length,
     );
 
-    let (x_part1, x_part2) = x.split_at_mut(x_offset_2);
-
-    let mut x_in_buf1 = [0i16; MAX_FRAME_LENGTH / 2];
-    x_in_buf1[..decimated_framelength1].copy_from_slice(&x_part1[..decimated_framelength1]);
     silk_ana_filt_bank_1(
-        &x_in_buf1[..decimated_framelength1],
+        low1,
         &mut ps_silk_vad.ana_state1,
-        x_part1,
-        x_part2,
+        low2,
+        &mut x[x_offset_2..x_offset_3],
         decimated_framelength1,
     );
 
-    let (x_part1, x_part2) = x.split_at_mut(x_offset_1);
-
-    let mut x_in_buf2 = [0i16; MAX_FRAME_LENGTH / 4];
-    x_in_buf2[..decimated_framelength2].copy_from_slice(&x_part1[..decimated_framelength2]);
+    let (x_band0, x_band1) = x[..x_offset_2].split_at_mut(x_offset_1);
     silk_ana_filt_bank_1(
-        &x_in_buf2[..decimated_framelength2],
+        low2,
         &mut ps_silk_vad.ana_state2,
-        x_part1,
-        x_part2,
+        x_band0,
+        x_band1,
         decimated_framelength2,
     );
 
@@ -147,15 +148,17 @@ pub fn silk_vad_get_sa_q8(ps_enc: &mut SilkEncoderState, p_in: &[i16], _n_in: us
         let dec_framelength_band = frame_length >> min(VAD_N_BANDS - b, VAD_N_BANDS - 1);
 
         let dec_subframe_length = dec_framelength_band >> VAD_INTERNAL_SUBFRAMES_LOG2;
-        let mut dec_subframe_offset = 0;
 
         x_nrg[b] = ps_silk_vad.xnrg_subfr[b];
 
+        // The band is read as one slice per subframe, so that the sum has
+        // no bounds check per sample.
+        let band = &x[x_offset[b]..x_offset[b] + VAD_INTERNAL_SUBFRAMES * dec_subframe_length];
         let mut sum_squared: i32 = 0;
-        for s in 0..VAD_INTERNAL_SUBFRAMES {
+        for (s, subframe) in band.chunks_exact(dec_subframe_length).enumerate() {
             sum_squared = 0;
-            for i in 0..dec_subframe_length {
-                let x_tmp = (x[x_offset[b] + i + dec_subframe_offset] >> 3) as i32;
+            for &sample in subframe {
+                let x_tmp = (sample >> 3) as i32;
                 sum_squared = silk_smlabb(sum_squared, x_tmp, x_tmp);
             }
 
@@ -164,8 +167,6 @@ pub fn silk_vad_get_sa_q8(ps_enc: &mut SilkEncoderState, p_in: &[i16], _n_in: us
             } else {
                 x_nrg[b] = silk_add_pos_sat32(x_nrg[b], sum_squared >> 1);
             }
-
-            dec_subframe_offset += dec_subframe_length;
         }
         ps_silk_vad.xnrg_subfr[b] = sum_squared;
     }

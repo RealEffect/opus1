@@ -109,6 +109,47 @@ const CELT_PVQ_U_CMAX: [usize; 15] = [
     176, 176, 176, 176, 176, 176, 96, 54, 37, 28, 24, 19, 18, 16, 14,
 ];
 
+// The table reads without range checks below rely on these two facts.
+const _: () = {
+    let mut r = 0;
+    while r < CELT_PVQ_U_ROW.len() {
+        // The last entry of row `r` is inside the data.
+        assert!(CELT_PVQ_U_ROW[r] as usize + CELT_PVQ_U_CMAX[r] < CELT_PVQ_U_DATA.len());
+        // A row is never longer than the row before it.
+        assert!(r == 0 || CELT_PVQ_U_CMAX[r] <= CELT_PVQ_U_CMAX[r - 1]);
+        r += 1;
+    }
+};
+
+/// True when `U(n, k + 1)` is stored in `CELT_PVQ_U_DATA`.
+///
+/// A row is never longer than the row before it. So when this entry exists,
+/// every `U(a, b)` with `min(a, b) <= min(n, k + 1)` and
+/// `max(a, b) <= max(n, k + 1)` exists as well. These are all the entries
+/// that `cwrsi`, `icwrs` and `celt_pvq_v` read for `n` dimensions and `k`
+/// pulses.
+#[inline(always)]
+fn pvq_table_covers(n: u32, k: u32) -> bool {
+    let k1 = k as u64 + 1;
+    let r = (n as u64).min(k1);
+    let c = (n as u64).max(k1);
+    r < CELT_PVQ_U_ROW.len() as u64 && c <= CELT_PVQ_U_CMAX[r as usize] as u64
+}
+
+/// `U(r, c)` for `r <= c`, read from the table without range checks.
+///
+/// # Safety
+/// `r < 15` and `c <= CELT_PVQ_U_CMAX[r]`. `pvq_table_covers` proves this
+/// for all reads of one call.
+#[inline(always)]
+unsafe fn pvq_u_unchecked(r: usize, c: usize) -> u32 {
+    debug_assert!(r < CELT_PVQ_U_ROW.len() && r <= c && c <= CELT_PVQ_U_CMAX[r]);
+    // SAFETY: `r` is a valid row. The index is at most
+    // `CELT_PVQ_U_ROW[r] + CELT_PVQ_U_CMAX[r]`, which the check above
+    // `pvq_table_covers` shows to be inside the data.
+    unsafe { *CELT_PVQ_U_DATA.get_unchecked(*CELT_PVQ_U_ROW.get_unchecked(r) as usize + c) }
+}
+
 /// Maximum number of pulses per band (`CELT_MAX_PULSES` in libopus).
 pub const MAX_PVQ_K: usize = 128;
 const MAX_PVQ_U: usize = MAX_PVQ_K + 2;
@@ -210,12 +251,67 @@ fn unext(u: &mut [u32], len: usize, mut u0: u32) {
     u[j - 1] = u0;
 }
 
+/// The index of the pulse vector `y[..n]` among the vectors with `n`
+/// dimensions and as many pulses as `y` has (`icwrs` in libopus
+/// `celt/cwrs.c`).
+///
+/// `k` is the expected number of pulses. It selects the fast path only; the
+/// result does not depend on it.
 #[inline(always)]
-pub fn icwrs(n: u32, _k: u32, y: &[i32]) -> u32 {
+pub fn icwrs(n: u32, k: u32, y: &[i32]) -> u32 {
     if n == 1 {
         return if y[0] < 0 { 1 } else { 0 };
     }
     debug_assert!(n >= 2, "icwrs: n must be >= 2");
+    if n >= 2 && y.len() >= n as usize && pvq_table_covers(n, k) {
+        // SAFETY: the table covers `(n, k)`.
+        if let Some(i) = unsafe { icwrs_table(k, &y[..n as usize]) } {
+            return i;
+        }
+    }
+    icwrs_checked(n, y)
+}
+
+/// `icwrs` with table reads that are not range checked. Returns `None` when
+/// `y` has more than `k_max` pulses; the caller then uses `icwrs_checked`.
+///
+/// # Safety
+/// `pvq_table_covers(y.len(), k_max)` must hold and `y` must have at least
+/// two entries. Every read is `U(m, k)` or `U(m, k + 1)` with `m <= y.len()`
+/// and `k <= k_max`, which `pvq_table_covers` names.
+#[inline(always)]
+unsafe fn icwrs_table(k_max: u32, y: &[i32]) -> Option<u32> {
+    debug_assert!(y.len() >= 2 && pvq_table_covers(y.len() as u32, k_max));
+    let (last, head) = y.split_last()?;
+    let mut i = (*last < 0) as u32;
+    let mut k = last.unsigned_abs();
+    if k > k_max {
+        return None;
+    }
+    // `m` counts the dimensions from the current entry to the end.
+    for (&yj, m) in head.iter().rev().zip(2usize..) {
+        let ku = k as usize;
+        // SAFETY: `m <= y.len()` and `k <= k_max`.
+        i = i.wrapping_add(unsafe { pvq_u_unchecked(m.min(ku), m.max(ku)) });
+        // No overflow: `k <= k_max <= 175` and the magnitude is at most 2^31.
+        k += yj.unsigned_abs();
+        if k > k_max {
+            return None;
+        }
+        let ku = k as usize + 1;
+        // SAFETY: `m <= y.len()` and `k <= k_max`.
+        let u = unsafe { pvq_u_unchecked(m.min(ku), m.max(ku)) };
+        // The second term counts only for a negative entry.
+        i = i.wrapping_add(((yj >> 31) as u32) & u);
+    }
+    Some(i)
+}
+
+/// `icwrs` with a range check on every table lookup. It runs when the vector
+/// may need values from outside the table.
+#[cold]
+#[inline(never)]
+fn icwrs_checked(n: u32, y: &[i32]) -> u32 {
     let mut j = (n - 1) as usize;
 
     let mut i: u32 = if y[j] < 0 { 1 } else { 0 };
@@ -235,8 +331,10 @@ pub fn icwrs(n: u32, _k: u32, y: &[i32]) -> u32 {
     i
 }
 
+/// Decodes the pulse vector with index `i` among the vectors of `n`
+/// dimensions and `k` pulses (`cwrsi` in libopus `celt/cwrs.c`).
 #[inline(always)]
-pub fn cwrsi(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
+pub fn cwrsi(n: u32, k: u32, i: u32, y: &mut [i32]) {
     debug_assert!(k > 0, "cwrsi: k must be > 0");
 
     if n == 1 {
@@ -244,7 +342,148 @@ pub fn cwrsi(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
         y[0] = ((k as i32) + s) ^ s;
         return;
     }
+    if n >= 2 && y.len() >= n as usize && pvq_table_covers(n, k) {
+        // SAFETY: the table covers `(n, k)`.
+        let v = unsafe { pvq_v_unchecked(n, k) };
+        if (i as u64) < v {
+            // SAFETY: the table covers `(n, k)` and `i` is a valid index.
+            unsafe { cwrsi_table(n as usize, k as usize, i, &mut y[..n as usize]) };
+            return;
+        }
+    }
+    cwrsi_checked(n, k, i, y);
+}
 
+/// `V(n, k) = U(n, k) + U(n, k + 1)`, the number of pulse vectors, without
+/// saturation and without range checks.
+///
+/// # Safety
+/// `pvq_table_covers(n, k)` must hold.
+#[inline(always)]
+unsafe fn pvq_v_unchecked(n: u32, k: u32) -> u64 {
+    // SAFETY: both entries are among those named at `pvq_table_covers`.
+    unsafe {
+        pvq_u_unchecked(n.min(k) as usize, n.max(k) as usize) as u64
+            + pvq_u_unchecked(n.min(k + 1) as usize, n.max(k + 1) as usize) as u64
+    }
+}
+
+/// `cwrsi` as a port of the libopus loop: one table read and one compare per
+/// search step.
+///
+/// # Safety
+/// `pvq_table_covers(n, k)` must hold and `i` must be below `V(n, k)`, the
+/// number of pulse vectors. Then `k` never drops below 0 and every read is
+/// one of the entries named at `pvq_table_covers`.
+#[inline(always)]
+unsafe fn cwrsi_table(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) {
+    use core::hint::select_unpredictable as select;
+
+    debug_assert!(n >= 2 && y.len() == n);
+    debug_assert!(pvq_table_covers(n as u32, k as u32));
+    let (head, tail) = y.split_at_mut(n - 2);
+    // SAFETY: see the function comment. `U(0, n) = 0 <= i` ends every search
+    // at `k = 0` at the latest.
+    unsafe {
+        for yj in head {
+            let s;
+            let k0 = k;
+            let p;
+            if k >= n {
+                // Many pulses: the values are in row `n`.
+                let q = pvq_u_unchecked(n, k + 1);
+                // Are the pulses in this dimension negative?
+                s = -((i >= q) as i32);
+                i -= q & (s as u32);
+                // Count how many pulses were placed in this dimension: the
+                // search goes down from `k` to the first value that is not
+                // above `i`.
+                p = 'search: {
+                    // With many pulses the number of steps is hard to
+                    // predict, and a wrong guess costs more than the search.
+                    // So take up to three steps at once without a branch:
+                    // the values grow with `k`, so the number of values
+                    // above `i` among four neighbours is the number of
+                    // steps. All four above `i`: go on four values lower.
+                    while k >= n + 3 {
+                        let u0 = pvq_u_unchecked(n, k);
+                        let u1 = pvq_u_unchecked(n, k - 1);
+                        let u2 = pvq_u_unchecked(n, k - 2);
+                        let u3 = pvq_u_unchecked(n, k - 3);
+                        let (c0, c1, c2, c3) = (u0 > i, u1 > i, u2 > i, u3 > i);
+                        let steps = c0 as usize + c1 as usize + c2 as usize + c3 as usize;
+                        if steps < 4 {
+                            k -= steps;
+                            break 'search select(c0, select(c1, select(c2, u3, u2), u1), u0);
+                        }
+                        k -= 4;
+                    }
+                    // Fewer than four values are left in row `n`. Here `k`
+                    // can be `n - 1`; then `U(n, n)` was above `i` and the
+                    // first branch below is taken.
+                    if pvq_u_unchecked(n, n) > i {
+                        k = n;
+                        loop {
+                            k -= 1;
+                            let p = pvq_u_unchecked(k, n);
+                            if p <= i {
+                                break p;
+                            }
+                        }
+                    } else {
+                        let mut pk = pvq_u_unchecked(n, k);
+                        while pk > i {
+                            k -= 1;
+                            pk = pvq_u_unchecked(n, k);
+                        }
+                        pk
+                    }
+                };
+            } else {
+                // Many dimensions: the values are in column `n`.
+                let p0 = pvq_u_unchecked(k, n);
+                let q = pvq_u_unchecked(k + 1, n);
+                if p0 <= i && i < q {
+                    // No pulse in this dimension.
+                    s = 0;
+                    p = p0;
+                } else {
+                    s = -((i >= q) as i32);
+                    i -= q & (s as u32);
+                    p = loop {
+                        k -= 1;
+                        let p = pvq_u_unchecked(k, n);
+                        if p <= i {
+                            break p;
+                        }
+                    };
+                }
+            }
+            i -= p;
+            *yj = ((k0 - k) as i32 + s) ^ s;
+            n -= 1;
+        }
+    }
+    // n == 2
+    let p = 2 * k as u32 + 1;
+    let s = -((i >= p) as i32);
+    i -= p & (s as u32);
+    let k0 = k;
+    k = ((i + 1) >> 1) as usize;
+    if k != 0 {
+        i -= 2 * k as u32 - 1;
+    }
+    tail[0] = ((k0 - k) as i32 + s) ^ s;
+    // n == 1
+    let s = -(i as i32);
+    tail[1] = (k as i32 + s) ^ s;
+}
+
+/// `cwrsi` with a range check on every table lookup. It runs when `(n, k)`
+/// is outside the table or `i` is not a valid index.
+#[cold]
+#[inline(never)]
+fn cwrsi_checked(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
     let mut curr_n = n;
 
     let mut curr_k = k as i32;
@@ -339,6 +578,17 @@ pub fn encode_pulses(y: &[i32], n: u32, k: u32, rc: &mut RangeCoder) {
     if k == 0 {
         return;
     }
+    if n >= 2 && y.len() >= n as usize && pvq_table_covers(n, k) {
+        // SAFETY: the table covers `(n, k)`.
+        if let Some(fl) = unsafe { icwrs_table(k, &y[..n as usize]) } {
+            // The same value as `celt_pvq_v(n, k)`.
+            // SAFETY: the table covers `(n, k)`.
+            let ft = unsafe { pvq_v_unchecked(n, k) }.min(u32::MAX as u64) as u32;
+            debug_assert!(fl < ft, "encode_pulses: fl={fl} >= ft={ft}, n={n}, k={k}");
+            rc.enc_uint(fl, ft);
+            return;
+        }
+    }
     let fl = icwrs(n, k, y);
     let ft = celt_pvq_v(n, k);
     debug_assert!(fl < ft, "encode_pulses: fl={fl} >= ft={ft}, n={n}, k={k}");
@@ -351,6 +601,15 @@ pub fn decode_pulses(y: &mut [i32], n: u32, k: u32, rc: &mut RangeCoder) {
         for i in 0..n as usize {
             y[i] = 0;
         }
+        return;
+    }
+    if n >= 2 && y.len() >= n as usize && pvq_table_covers(n, k) {
+        // The same value as `celt_pvq_v(n, k)`. It is at least 2 here.
+        // SAFETY: the table covers `(n, k)`.
+        let ft = unsafe { pvq_v_unchecked(n, k) }.min(u32::MAX as u64) as u32;
+        let fl = rc.dec_uint(ft).min(ft - 1);
+        // SAFETY: the table covers `(n, k)` and `fl < ft <= V(n, k)`.
+        unsafe { cwrsi_table(n as usize, k as usize, fl, &mut y[..n as usize]) };
         return;
     }
     let ft = celt_pvq_v(n, k);
@@ -751,6 +1010,10 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         n,
         MAX_PVQ_N
     );
+    // Without a dimension there is nowhere to put a pulse.
+    if n == 0 {
+        return;
+    }
     if k == 1 {
         let mut best_i = 0;
         let mut best_abs = x[0].abs();
@@ -1217,6 +1480,129 @@ unsafe fn pvq_search_scalar_init_neon(
     sum
 }
 
+/// Marks the code path that calls it as rarely taken. The compiler then
+/// keeps the test in front of it as a branch instead of a conditional select.
+#[cold]
+#[inline]
+fn rarely_taken() {}
+
+/// One step of the pulse search: the position where the next pulse goes.
+///
+/// Position `i` has the numerator `xy + abs_x[i]` (squared when `SQUARE` is
+/// set) and the denominator `yy + y2f[i]`. The positions are tried in order.
+/// A position replaces the best one so far when its ratio is larger, tested
+/// as `best_den * num > den * best_num`. `abs_x` must not be empty and `y2f`
+/// must be at least as long.
+///
+/// This form is portable. It is the reference for `pvq_best_position_neon`.
+/// A new best position is rare, so the test is kept as a branch, as in
+/// libopus (`opus_unlikely` in `op_pvq_search_c`). As conditional selects
+/// the loop would wait at every position for the one before it.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline(always)]
+fn pvq_best_position_scalar<const SQUARE: bool>(
+    abs_x: &[f32],
+    y2f: &[f32],
+    xy: f32,
+    yy: f32,
+) -> usize {
+    let y2f = &y2f[..abs_x.len()];
+    let rxy = xy + abs_x[0];
+    let mut best_id = 0;
+    let mut best_num = if SQUARE { rxy * rxy } else { rxy };
+    let mut best_den = yy + y2f[0];
+    for (i, (&ax, &ay)) in abs_x.iter().zip(y2f.iter()).enumerate().skip(1) {
+        let rxy = xy + ax;
+        let num = if SQUARE { rxy * rxy } else { rxy };
+        let den = yy + ay;
+        if best_den * num > den * best_num {
+            rarely_taken();
+            best_num = num;
+            best_den = den;
+            best_id = i;
+        }
+    }
+    best_id
+}
+
+/// `pvq_best_position_scalar` for aarch64, four positions at a time.
+///
+/// The four positions of a group are tested against the best position known
+/// when the group starts. If none of them is better, the scalar loop would
+/// not have changed the best position either, and the group is done. If one
+/// is better, the group is redone in order with the scalar test. So the
+/// result is always the one of the scalar loop.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn pvq_best_position_neon<const SQUARE: bool>(
+    abs_x: &[f32],
+    y2f: &[f32],
+    xy: f32,
+    yy: f32,
+) -> usize {
+    use core::arch::aarch64::*;
+
+    let y2f = &y2f[..abs_x.len()];
+    let rxy = xy + abs_x[0];
+    let mut best_id = 0;
+    let mut best_num = if SQUARE { rxy * rxy } else { rxy };
+    let mut best_den = yy + y2f[0];
+
+    let vxy = vdupq_n_f32(xy);
+    let vyy = vdupq_n_f32(yy);
+    let (x4, x_tail) = abs_x.as_chunks::<4>();
+    let (y4, y_tail) = y2f.as_chunks::<4>();
+    for (g, (xa, ya)) in x4.iter().zip(y4.iter()).enumerate() {
+        // SAFETY: `xa` and `ya` are references to four values each.
+        let (vx, vy) = unsafe { (vld1q_f32(xa.as_ptr()), vld1q_f32(ya.as_ptr())) };
+        let vrxy = vaddq_f32(vxy, vx);
+        let vnum = if SQUARE { vmulq_f32(vrxy, vrxy) } else { vrxy };
+        let vden = vaddq_f32(vyy, vy);
+        let better = vcgtq_f32(vmulq_n_f32(vnum, best_den), vmulq_n_f32(vden, best_num));
+        if vmaxvq_u32(better) != 0 {
+            rarely_taken();
+            // Position 0 is the starting point; tested against itself it is
+            // not better, so it needs no special case.
+            for l in 0..4 {
+                let rxy = xy + xa[l];
+                let num = if SQUARE { rxy * rxy } else { rxy };
+                let den = yy + ya[l];
+                if best_den * num > den * best_num {
+                    best_num = num;
+                    best_den = den;
+                    best_id = 4 * g + l;
+                }
+            }
+        }
+    }
+    let done = 4 * x4.len();
+    for (l, (&ax, &ay)) in x_tail.iter().zip(y_tail.iter()).enumerate() {
+        let rxy = xy + ax;
+        let num = if SQUARE { rxy * rxy } else { rxy };
+        let den = yy + ay;
+        if best_den * num > den * best_num {
+            rarely_taken();
+            best_num = num;
+            best_den = den;
+            best_id = done + l;
+        }
+    }
+    best_id
+}
+
+/// The position where the next pulse goes. See `pvq_best_position_scalar`.
+#[inline(always)]
+fn pvq_best_position<const SQUARE: bool>(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        pvq_best_position_neon::<SQUARE>(abs_x, y2f, xy, yy)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    pvq_best_position_scalar::<SQUARE>(abs_x, y2f, xy, yy)
+}
+
 #[inline(always)]
 fn pvq_search_small_k(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     debug_assert!(k <= 4 && k > 0);
@@ -1226,78 +1612,31 @@ fn pvq_search_small_k(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     let mut y2f = [0.0f32; 32];
     let mut sign_x = [0i32; 32];
 
-    unsafe {
-        let x_ptr = x.as_ptr();
-        let abs_x_ptr = abs_x.as_mut_ptr();
-        let sign_ptr = sign_x.as_mut_ptr();
-        for i in 0..n {
-            let xi = *x_ptr.add(i);
-            *abs_x_ptr.add(i) = xi.abs();
-            *sign_ptr.add(i) = (xi < 0.0) as i32;
-        }
+    let x = &x[..n];
+    let y = &mut y[..n];
+    for ((&xi, a), sg) in x.iter().zip(abs_x.iter_mut()).zip(sign_x.iter_mut()) {
+        *a = xi.abs();
+        *sg = (xi < 0.0) as i32;
     }
+    let abs_x = &abs_x[..n];
+    let y2f = &mut y2f[..n];
 
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
-
-    let abs_x_ptr = abs_x.as_ptr();
-    let y2f_ptr = y2f.as_mut_ptr();
-    let y_ptr = y.as_mut_ptr();
-    unsafe {
-        for _ in 0..k {
-            yy += 1.0;
-
-            let rxy0 = xy + *abs_x_ptr;
-            let mut best_id = 0usize;
-            let mut best_num = rxy0 * rxy0;
-            let mut best_den = yy + *y2f_ptr;
-
-            let mut i = 1;
-            while i + 1 < n {
-                let rxy1 = xy + *abs_x_ptr.add(i);
-                let rxy2 = xy + *abs_x_ptr.add(i + 1);
-                let den1 = yy + *y2f_ptr.add(i);
-                let den2 = yy + *y2f_ptr.add(i + 1);
-                let rxy1_sq = rxy1 * rxy1;
-                let rxy2_sq = rxy2 * rxy2;
-
-                if best_den * rxy1_sq > den1 * best_num {
-                    best_id = i;
-                    best_num = rxy1_sq;
-                    best_den = den1;
-                }
-                if best_den * rxy2_sq > den2 * best_num {
-                    best_id = i + 1;
-                    best_num = rxy2_sq;
-                    best_den = den2;
-                }
-                i += 2;
-            }
-            if i < n {
-                let rxy = xy + *abs_x_ptr.add(i);
-                let rxy_sq = rxy * rxy;
-                let den = yy + *y2f_ptr.add(i);
-                if best_den * rxy_sq > den * best_num {
-                    best_id = i;
-                }
-            }
-
-            xy += *abs_x_ptr.add(best_id);
-            yy += *y2f_ptr.add(best_id);
-            *y2f_ptr.add(best_id) += 2.0;
-            *y_ptr.add(best_id) += 1;
-        }
+    for _ in 0..k {
+        yy += 1.0;
+        let best_id = pvq_best_position::<true>(abs_x, y2f, xy, yy);
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
     }
 
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        let sign_ptr = sign_x.as_ptr();
-        for i in 0..n {
-            let s = *sign_ptr.add(i);
-            *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
-        }
+    for (yi, &sg) in y.iter_mut().zip(sign_x.iter()) {
+        *yi = (*yi ^ -sg) + sg;
     }
 }
+
 #[inline]
 fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     debug_assert!(n <= 31);
@@ -1379,36 +1718,17 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         }
     }
 
-    let abs_x_ptr = abs_x.as_ptr();
-    let y2f_ptr = y2f.as_mut_ptr();
-    let y_ptr = y.as_mut_ptr();
-    unsafe {
+    {
+        let abs_x = &abs_x[..n];
+        let y2f = &mut y2f[..n];
+        let y = &mut y[..n];
         while k > 0 {
             yy += 1.0;
-
-            let rxy0 = xy + *abs_x_ptr;
-            let mut best_id = 0usize;
-            let mut best_num = rxy0 * rxy0;
-            let mut best_den = yy + *y2f_ptr;
-
-            let mut i = 1;
-            while i < n {
-                let rxy = xy + *abs_x_ptr.add(i);
-                let ryy = yy + *y2f_ptr.add(i);
-                let rxy_sq = rxy * rxy;
-
-                if best_den * rxy_sq > ryy * best_num {
-                    best_num = rxy_sq;
-                    best_den = ryy;
-                    best_id = i;
-                }
-                i += 1;
-            }
-
-            xy += *abs_x_ptr.add(best_id);
-            yy += *y2f_ptr.add(best_id);
-            *y2f_ptr.add(best_id) += 2.0;
-            *y_ptr.add(best_id) += 1;
+            let best_id = pvq_best_position::<true>(abs_x, y2f, xy, yy);
+            xy += abs_x[best_id];
+            yy += y2f[best_id];
+            y2f[best_id] += 2.0;
+            y[best_id] += 1;
             k -= 1;
         }
     }
@@ -1465,41 +1785,21 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         let mut yy_local = 0.0f32;
         let mut xy_local = 0.0f32;
 
-        let abs_x_ptr = abs_x_arr.as_ptr();
-        let y2f_ptr = y2f_arr.as_mut_ptr();
-        let y_ptr = y.as_mut_ptr();
-        unsafe {
-            for _ in 0..k {
-                yy_local += 1.0;
-                let mut best_num = xy_local + *abs_x_ptr;
-                let mut best_den = yy_local + *y2f_ptr;
-                let mut best_id = 0;
-
-                let mut j = 1;
-                while j < n {
-                    let rxy = xy_local + *abs_x_ptr.add(j);
-                    let ryy = yy_local + *y2f_ptr.add(j);
-                    if best_den * rxy > best_num * ryy {
-                        best_den = ryy;
-                        best_num = rxy;
-                        best_id = j;
-                    }
-                    j += 1;
-                }
-
-                xy_local += *abs_x_ptr.add(best_id);
-                yy_local += *y2f_ptr.add(best_id);
-                *y2f_ptr.add(best_id) += 2.0;
-                *y_ptr.add(best_id) += 1;
-            }
+        // This path compares the numerators without squaring them.
+        let abs_x = &abs_x_arr[..n];
+        let y2f = &mut y2f_arr[..n];
+        let y = &mut y[..n];
+        for _ in 0..k {
+            yy_local += 1.0;
+            let best_id = pvq_best_position::<false>(abs_x, y2f, xy_local, yy_local);
+            xy_local += abs_x[best_id];
+            yy_local += y2f[best_id];
+            y2f[best_id] += 2.0;
+            y[best_id] += 1;
         }
 
-        unsafe {
-            let sign_ptr = sign_x_arr.as_ptr();
-            for i in 0..n {
-                let s = *sign_ptr.add(i);
-                *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
-            }
+        for (yi, &sg) in y.iter_mut().zip(sign_x_arr.iter()) {
+            *yi = (*yi ^ -sg) + sg;
         }
         return;
     }
@@ -1838,81 +2138,209 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     }
 }
 
+/// One pass of the spreading rotation over `x[..len]` (`exp_rotation1` in
+/// libopus `celt/vq.c`). A forward sweep and then a backward sweep rotate the
+/// pairs `(x[i], x[i + stride])` by the angle given through `c` and `s`.
+///
+/// `stride` must be at least 1. The work is done by one of three functions,
+/// chosen here, once per pass.
 #[inline]
 fn exp_rotation1(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        exp_rotation1_neon(x, len, stride, c, s);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        exp_rotation1_scalar(x, len, stride, c, s);
+    debug_assert!(stride >= 1);
+    match stride {
+        1 => exp_rotation1_carry::<1>(x, len, c, s),
+        2 => exp_rotation1_carry::<2>(x, len, c, s),
+        3 => exp_rotation1_carry::<3>(x, len, c, s),
+        _ => {
+            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                exp_rotation1_neon(x, len, stride, c, s);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            exp_rotation1_scalar(x, len, stride, c, s);
+        }
     }
 }
 
+/// The plain form of the rotation pass. It is the reference for the other
+/// two forms, and it runs for strides of 4 and more on targets other than
+/// aarch64. Like the C code it does nothing when `len <= stride`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 fn exp_rotation1_scalar(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
-    let ms = -s;
+    let x = &mut x[..len];
+    if len <= stride {
+        return;
+    }
     for i in 0..(len - stride) {
         let x1 = x[i];
         let x2 = x[i + stride];
         x[i + stride] = c * x2 + s * x1;
-        x[i] = c * x1 + ms * x2;
+        x[i] = c * x1 - s * x2;
     }
     if len >= 2 * stride {
         for i in (0..(len - 2 * stride)).rev() {
             let x1 = x[i];
             let x2 = x[i + stride];
             x[i + stride] = c * x2 + s * x1;
-            x[i] = c * x1 + ms * x2;
+            x[i] = c * x1 - s * x2;
         }
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+/// The rotation pass for a small stride `S` (1, 2 or 3), on every target.
+///
+/// In the plain form each step reads a value that an earlier step stored
+/// `S` positions back, so every step waits for a store and a reload. Here
+/// those `S` values stay in local variables. Each element is computed with
+/// the same operations in the same order as in `exp_rotation1_scalar`, so
+/// the results are identical.
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
-    if stride < 4 {
-        exp_rotation1_scalar(x, len, stride, c, s);
+fn exp_rotation1_carry<const S: usize>(x: &mut [f32], len: usize, c: f32, s: f32) {
+    debug_assert!(S >= 1);
+    let x = &mut x[..len];
+    if len <= S {
         return;
     }
+    // Cells allow reading `x[i + S]` and writing `x[i]` through two slices
+    // that overlap, without index checks in the loops.
+    let x = core::cell::Cell::from_mut(x).as_slice_of_cells();
 
+    // Forward sweep: step `i` rotates `(x[i], x[i + S])` for `i` in
+    // `0..steps`. `carry[j]` holds the current value of the next element
+    // that a step with `i % S == j` reads as `x[i]`.
+    let steps = len - S;
+    let mut carry = [0.0f32; S];
+    for (v, cell) in carry.iter_mut().zip(x.iter()) {
+        *v = cell.get();
+    }
+    let (lo, lo_rest) = x[..steps].as_chunks::<S>();
+    let (hi, hi_rest) = x[S..].as_chunks::<S>();
+    for (lo, hi) in lo.iter().zip(hi.iter()) {
+        for j in 0..S {
+            let x1 = carry[j];
+            let x2 = hi[j].get();
+            carry[j] = c * x2 + s * x1;
+            lo[j].set(c * x1 - s * x2);
+        }
+    }
+    // Fewer than `S` steps are left. Put the carried values back, then finish
+    // in the plain way.
+    let done = steps - lo_rest.len();
+    for (v, cell) in carry.iter().zip(x[done..].iter()) {
+        cell.set(*v);
+    }
+    for (lo, hi) in lo_rest.iter().zip(hi_rest.iter()) {
+        let x1 = lo.get();
+        let x2 = hi.get();
+        hi.set(c * x2 + s * x1);
+        lo.set(c * x1 - s * x2);
+    }
+
+    // Backward sweep: step `i` rotates `(x[i], x[i + S])` for `i` from
+    // `steps - 1` down to 0. `carry[j]` holds the current value of the next
+    // element that a step with `i % S == j` reads as `x[i + S]`. The steps
+    // of one group of `S` do not depend on each other.
+    if len < 2 * S {
+        return;
+    }
+    let steps = len - 2 * S;
+    for (v, cell) in carry.iter_mut().zip(x[steps..].iter()) {
+        *v = cell.get();
+    }
+    let (lo_rest, lo) = x[..steps].as_rchunks::<S>();
+    let (hi_rest, hi) = x[S..S + steps].as_rchunks::<S>();
+    for (lo, hi) in lo.iter().zip(hi.iter()).rev() {
+        for j in 0..S {
+            let x1 = lo[j].get();
+            let x2 = carry[j];
+            hi[j].set(c * x2 + s * x1);
+            carry[j] = c * x1 - s * x2;
+        }
+    }
+    let left = lo_rest.len();
+    for (v, cell) in carry.iter().zip(x[left..].iter()) {
+        cell.set(*v);
+    }
+    for (lo, hi) in lo_rest.iter().zip(hi_rest.iter()).rev() {
+        let x1 = lo.get();
+        let x2 = hi.get();
+        hi.set(c * x2 + s * x1);
+        lo.set(c * x1 - s * x2);
+    }
+}
+
+/// The rotation pass for a stride of 4 or more on aarch64, four elements at
+/// a time. With such a stride the four steps of a group do not depend on each
+/// other.
+///
+/// The forward sweep uses a fused multiply-add for the groups of four and
+/// separate multiply and add for the last `(len - stride) % 4` steps. The
+/// backward sweep uses separate multiply and add everywhere. The codec output
+/// depends on this, so it must stay as it is.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
     use core::arch::aarch64::*;
 
+    debug_assert!(stride >= 4);
+    let x = &mut x[..len];
+    if len <= stride {
+        return;
+    }
+    let p = x.as_mut_ptr();
     let vc = vdupq_n_f32(c);
     let vs = vdupq_n_f32(s);
 
-    // Forward pass: SIMD when we can load 4 contiguous elements
+    // Forward sweep.
+    let steps = len - stride;
     let mut i = 0;
-    while i + 4 <= len - stride {
-        let vx1 = vld1q_f32(x.as_ptr().add(i));
-        let vx2 = vld1q_f32(x.as_ptr().add(i + stride));
-
-        // y1 = c*x1 - s*x2
-        let vy1 = vfmsq_f32(vmulq_f32(vx1, vc), vs, vx2);
-        // y2 = c*x2 + s*x1
-        let vy2 = vfmaq_f32(vmulq_f32(vx2, vc), vs, vx1);
-
-        vst1q_f32(x.as_mut_ptr().add(i), vy1);
-        vst1q_f32(x.as_mut_ptr().add(i + stride), vy2);
-
+    while i + 4 <= steps {
+        // SAFETY: `i + 4 <= steps = len - stride`, so both `p[i..i + 4]` and
+        // `p[i + stride..i + stride + 4]` are inside `x[..len]`.
+        unsafe {
+            let vx1 = vld1q_f32(p.add(i));
+            let vx2 = vld1q_f32(p.add(i + stride));
+            // x[i] = c*x1 - s*x2 and x[i + stride] = c*x2 + s*x1
+            let vy1 = vfmsq_f32(vmulq_f32(vx1, vc), vs, vx2);
+            let vy2 = vfmaq_f32(vmulq_f32(vx2, vc), vs, vx1);
+            vst1q_f32(p.add(i), vy1);
+            vst1q_f32(p.add(i + stride), vy2);
+        }
         i += 4;
     }
-    for j in i..(len - stride) {
+    for j in i..steps {
         let x1 = x[j];
         let x2 = x[j + stride];
         x[j + stride] = c * x2 + s * x1;
         x[j] = c * x1 - s * x2;
     }
 
-    if len >= 2 * stride {
-        for j in (0..(len - 2 * stride)).rev() {
-            let x1 = x[j];
-            let x2 = x[j + stride];
-            x[j + stride] = c * x2 + s * x1;
-            x[j] = c * x1 - s * x2;
+    // Backward sweep, groups of four from the top down.
+    if len < 2 * stride {
+        return;
+    }
+    let mut j = len - 2 * stride;
+    while j >= 4 {
+        j -= 4;
+        // SAFETY: `j + 4 <= len - 2 * stride`, so both `p[j..j + 4]` and
+        // `p[j + stride..j + stride + 4]` are inside `x[..len]`.
+        unsafe {
+            let vx1 = vld1q_f32(p.add(j));
+            let vx2 = vld1q_f32(p.add(j + stride));
+            let vy2 = vaddq_f32(vmulq_f32(vc, vx2), vmulq_f32(vs, vx1));
+            let vy1 = vsubq_f32(vmulq_f32(vc, vx1), vmulq_f32(vs, vx2));
+            vst1q_f32(p.add(j + stride), vy2);
+            vst1q_f32(p.add(j), vy1);
         }
+    }
+    for j in (0..j).rev() {
+        let x1 = x[j];
+        let x2 = x[j + stride];
+        x[j + stride] = c * x2 + s * x1;
+        x[j] = c * x1 - s * x2;
     }
 }
 
@@ -2570,4 +2998,447 @@ pub fn alg_unquant(
     exp_rotation(x, n, -1, stride, k, spread);
 
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small deterministic generator, so that the tests need no dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+
+        /// A value in [-1, 1).
+        fn unit(&mut self) -> f32 {
+            (self.next_u32() >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        }
+    }
+
+    fn bits(x: &[f32]) -> Vec<u32> {
+        x.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Input vectors of `total` values for the rotation tests: random values
+    /// and a few patterns with zeros, large, tiny and alternating values.
+    fn rotation_inputs(rng: &mut Lcg, total: usize) -> Vec<Vec<f32>> {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.push((0..total).map(|_| rng.unit()).collect());
+        }
+        v.push(vec![0.0; total]);
+        v.push(
+            (0..total)
+                .map(|i| if i % 2 == 0 { 1.0e30 } else { -1.0e30 })
+                .collect(),
+        );
+        v.push(
+            (0..total)
+                .map(|i| if i % 3 == 0 { -0.0 } else { 1.0e-40 })
+                .collect(),
+        );
+        v.push((0..total).map(|i| (i as f32 - 7.0) * 1.0e-20).collect());
+        v
+    }
+
+    /// Indices to try for a codebook of `v` vectors: all of them when there
+    /// are few, else both ends, the table values near them and random ones.
+    fn indices(rng: &mut Lcg, v: u64) -> Vec<u32> {
+        let v = v.min(1 << 32);
+        if v <= 600 {
+            return (0..v as u32).collect();
+        }
+        let mut out = vec![0, 1, 2, (v / 2) as u32, (v - 2) as u32, (v - 1) as u32];
+        for _ in 0..40 {
+            out.push((rng.next_u32() as u64 % v) as u32);
+        }
+        // Small indices decode to vectors with most pulses at the end.
+        for _ in 0..10 {
+            out.push((rng.next_u32() as u64 % v.min(4096)) as u32);
+        }
+        out
+    }
+
+    #[test]
+    fn pvq_table_covers_matches_the_lookup_domain() {
+        // `pvq_table_covers(n, k)` must hold exactly when the checked lookup
+        // finds U(n, k + 1) in the table, for the whole table and beyond it.
+        for n in 0..=400u32 {
+            for k in 0..=400u32 {
+                let r = n.min(k + 1) as usize;
+                let c = n.max(k + 1) as usize;
+                let in_table = r < CELT_PVQ_U_ROW.len() && c <= CELT_PVQ_U_CMAX[r];
+                assert_eq!(pvq_table_covers(n, k), in_table, "n {n} k {k}");
+            }
+        }
+        assert!(!pvq_table_covers(2, u32::MAX));
+        assert!(!pvq_table_covers(u32::MAX, 1));
+        assert!(!pvq_table_covers(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn cwrsi_table_matches_checked_lookups() {
+        let mut rng = Lcg(4);
+        let mut pairs = 0;
+        for n in 2..=176u32 {
+            for k in 1..=176u32 {
+                if !pvq_table_covers(n, k) {
+                    continue;
+                }
+                pairs += 1;
+                // SAFETY: the table covers `(n, k)`.
+                let v = unsafe { pvq_v_unchecked(n, k) };
+                assert_eq!(v.min(u32::MAX as u64) as u32, celt_pvq_v(n, k));
+                for i in indices(&mut rng, v) {
+                    let mut want = vec![7i32; n as usize + 2];
+                    cwrsi_checked(n, k, i, &mut want);
+                    let mut got = vec![7i32; n as usize + 2];
+                    // SAFETY: the table covers `(n, k)` and `i < v`.
+                    unsafe { cwrsi_table(n as usize, k as usize, i, &mut got[..n as usize]) };
+                    assert_eq!(got, want, "n {n} k {k} i {i}");
+                    let pulses: u32 = got[..n as usize].iter().map(|v| v.unsigned_abs()).sum();
+                    assert_eq!(pulses, k, "n {n} k {k} i {i}");
+                    // The public function takes the same path.
+                    let mut public = vec![7i32; n as usize + 2];
+                    cwrsi(n, k, i, &mut public);
+                    assert_eq!(public, want);
+                }
+            }
+        }
+        // Rows 0 to 5 reach column 176; the higher rows are shorter.
+        assert!(pairs > 1500, "only {pairs} pairs tested");
+    }
+
+    /// The search step written as the loop it replaces, with a plain `if`.
+    fn best_position_plain(square: bool, abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
+        let num = |i: usize| {
+            let rxy = xy + abs_x[i];
+            if square { rxy * rxy } else { rxy }
+        };
+        let mut best_id = 0;
+        let mut best_num = num(0);
+        let mut best_den = yy + y2f[0];
+        for i in 1..abs_x.len() {
+            let den = yy + y2f[i];
+            if best_den * num(i) > den * best_num {
+                best_num = num(i);
+                best_den = den;
+                best_id = i;
+            }
+        }
+        best_id
+    }
+
+    fn check_best_position(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) {
+        for square in [true, false] {
+            let want = best_position_plain(square, abs_x, y2f, xy, yy);
+            let (scalar, dispatched) = if square {
+                (
+                    pvq_best_position_scalar::<true>(abs_x, y2f, xy, yy),
+                    pvq_best_position::<true>(abs_x, y2f, xy, yy),
+                )
+            } else {
+                (
+                    pvq_best_position_scalar::<false>(abs_x, y2f, xy, yy),
+                    pvq_best_position::<false>(abs_x, y2f, xy, yy),
+                )
+            };
+            assert_eq!(scalar, want, "scalar: {abs_x:?} {y2f:?} xy {xy} yy {yy}");
+            assert_eq!(dispatched, want, "vector: {abs_x:?} {y2f:?} xy {xy} yy {yy}");
+        }
+    }
+
+    #[test]
+    fn pvq_best_position_forms_agree() {
+        let mut rng = Lcg(6);
+        // Lengths 1..=33: every number of groups of four and every tail.
+        for n in 1..=33usize {
+            for round in 0..300 {
+                // Magnitudes as in a band, pulse counts as during a search.
+                let mut abs_x: Vec<f32> = (0..n).map(|_| rng.unit().abs()).collect();
+                let mut y2f: Vec<f32> =
+                    (0..n).map(|_| 2.0 * (rng.next_u32() % 4) as f32).collect();
+                let xy = rng.unit().abs() * 4.0;
+                let yy = 1.0 + (rng.next_u32() % 40) as f32;
+                match round % 6 {
+                    // Many equal candidates: the first one must win.
+                    1 => {
+                        let v = abs_x[0];
+                        abs_x.fill(v);
+                        y2f.fill(2.0);
+                    }
+                    // Two values only, so that ties are common.
+                    2 => {
+                        for v in abs_x.iter_mut() {
+                            *v = if *v > 0.5 { 0.75 } else { 0.25 };
+                        }
+                    }
+                    // The best position is the last one, or the first one.
+                    3 => abs_x[n - 1] = 3.0,
+                    4 => abs_x[0] = 3.0,
+                    // The longer buffer of the callers: extra values after n.
+                    5 => y2f.push(123.0),
+                    _ => {}
+                }
+                check_best_position(&abs_x, &y2f, xy, yy);
+            }
+            // Edge values: all zero, huge values whose products overflow,
+            // and values that are not numbers.
+            let zeros = vec![0.0f32; n];
+            check_best_position(&zeros, &zeros, 0.0, 1.0);
+            let huge: Vec<f32> = (0..n).map(|i| 1.0e30 * (1 + i % 3) as f32).collect();
+            check_best_position(&huge, &zeros, 1.0e30, 1.0e30);
+            check_best_position(&zeros, &huge, 1.0e-30, 1.0e-30);
+            for at in [0, n / 2, n - 1] {
+                let mut bad: Vec<f32> = (0..n).map(|_| rng.unit().abs()).collect();
+                bad[at] = f32::NAN;
+                check_best_position(&bad, &zeros, 0.5, 2.0);
+                bad[at] = f32::INFINITY;
+                check_best_position(&bad, &zeros, 0.5, 2.0);
+            }
+        }
+    }
+
+    /// A vector of `n` entries with `k` pulses in a few random positions.
+    fn random_pulses(rng: &mut Lcg, n: usize, k: u32) -> Vec<i32> {
+        let mut y = vec![0i32; n];
+        let spots = 1 + rng.next_u32() as usize % n.min(5);
+        for _ in 0..k {
+            y[rng.next_u32() as usize % spots * (n / spots)] += 1;
+        }
+        for v in y.iter_mut() {
+            if rng.next_u32() & 1 == 1 {
+                *v = -*v;
+            }
+        }
+        y
+    }
+
+    #[test]
+    fn icwrs_table_matches_checked_lookups() {
+        let mut rng = Lcg(5);
+        let mut pairs = 0;
+        for n in 2..=176u32 {
+            for k in 0..=176u32 {
+                if !pvq_table_covers(n, k) {
+                    continue;
+                }
+                pairs += 1;
+                // As many pulses as announced, and fewer.
+                for pulses in [k, k / 2, k.saturating_sub(1), 0] {
+                    for _ in 0..3 {
+                        let y = random_pulses(&mut rng, n as usize, pulses);
+                        let want = icwrs_checked(n, &y);
+                        // SAFETY: the table covers `(n, k)`.
+                        let got = unsafe { icwrs_table(k, &y) };
+                        assert_eq!(got, Some(want), "n {n} k {k} y {y:?}");
+                        assert_eq!(icwrs(n, k, &y), want);
+                    }
+                }
+                // More pulses than announced: the table path must give up
+                // before it reads, and the public function must still give
+                // the checked result.
+                for extra in [1u32, 2, 40] {
+                    let mut y = random_pulses(&mut rng, n as usize, k);
+                    let at = rng.next_u32() as usize % n as usize;
+                    y[at] += if y[at] < 0 { -(extra as i32) } else { extra as i32 };
+                    // SAFETY: the table covers `(n, k)`.
+                    assert_eq!(unsafe { icwrs_table(k, &y) }, None, "n {n} k {k} y {y:?}");
+                    if n <= 40 {
+                        assert_eq!(icwrs(n, k, &y), icwrs_checked(n, &y));
+                    }
+                }
+            }
+        }
+        assert!(pairs > 1500, "only {pairs} pairs tested");
+
+        // Extreme entries. One of them alone is beyond any table row.
+        for at in 0..4 {
+            for big in [i32::MIN, i32::MAX, -i32::MAX] {
+                let mut y = [1i32, -2, 0, 3];
+                y[at] = big;
+                // SAFETY: the table covers `(4, 6)`.
+                assert_eq!(unsafe { icwrs_table(6, &y) }, None);
+                assert_eq!(icwrs(4, 6, &y), icwrs_checked(4, &y));
+            }
+        }
+    }
+
+    #[test]
+    fn cwrsi_falls_back_outside_the_table_and_for_invalid_indices() {
+        // (n, k) outside the table: U(n, k + 1) is computed, not read. These
+        // three have fewer than 2^32 vectors, so the computed values are
+        // exact.
+        for (n, k) in [(100u32, 5u32), (60, 6), (40, 7)] {
+            assert!(!pvq_table_covers(n, k));
+            let v = celt_pvq_v(n, k);
+            assert!(v < u32::MAX);
+            for i in [0, 1, v / 3, v - 1] {
+                let mut want = vec![0i32; n as usize];
+                cwrsi_checked(n, k, i, &mut want);
+                let mut got = vec![0i32; n as usize];
+                cwrsi(n, k, i, &mut got);
+                assert_eq!(got, want, "n {n} k {k} i {i}");
+                assert_eq!(icwrs(n, k, &got), i, "n {n} k {k} i {i}");
+            }
+        }
+        // An index that is not below V(n, k) must not reach the table path.
+        // The checked function defines the result. Only two and three
+        // dimensions are tried: with more, the checked function can take
+        // minutes for such an index.
+        for (n, k) in [(3u32, 1u32), (3, 5), (3, 40), (2, 9)] {
+            let v = celt_pvq_v(n, k);
+            for i in [v, v + 1, 2 * v, v + 12345] {
+                let mut want = vec![0i32; n as usize];
+                cwrsi_checked(n, k, i, &mut want);
+                let mut got = vec![0i32; n as usize];
+                cwrsi(n, k, i, &mut got);
+                assert_eq!(got, want, "n {n} k {k} i {i}");
+            }
+        }
+    }
+
+    /// Pairs `(c, s)`: real rotation angles in both directions and extremes.
+    const ROTATION_CS: [(f32, f32); 8] = [
+        (0.92387953, 0.38268343),
+        (0.92387953, -0.38268343),
+        (0.38268343, -0.92387953),
+        (0.70710677, 0.70710677),
+        (1.0, 0.0),
+        (0.0, -1.0),
+        (-0.0, 1.0),
+        (1.0e-30, 1.0e20),
+    ];
+
+    #[test]
+    fn exp_rotation1_carry_matches_plain_form() {
+        let mut rng = Lcg(1);
+        // Lengths 0..=40 cover `len < S`, `len == S`, `len < 2 * S` and every
+        // number of steps left over after the groups of `S`.
+        for len in 0..=40usize {
+            // Three more values than `len`: they must stay untouched.
+            for input in rotation_inputs(&mut rng, len + 3) {
+                for (c, s) in ROTATION_CS {
+                    for stride in 1..=3usize {
+                        let mut want = input.clone();
+                        exp_rotation1_scalar(&mut want, len, stride, c, s);
+                        let mut got = input.clone();
+                        match stride {
+                            1 => exp_rotation1_carry::<1>(&mut got, len, c, s),
+                            2 => exp_rotation1_carry::<2>(&mut got, len, c, s),
+                            _ => exp_rotation1_carry::<3>(&mut got, len, c, s),
+                        }
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "len {len} stride {stride} c {c} s {s}"
+                        );
+                        assert_eq!(bits(&got[len..]), bits(&input[len..]));
+                        // The dispatching function gives the same result.
+                        let mut via = input.clone();
+                        exp_rotation1(&mut via, len, stride, c, s);
+                        assert_eq!(bits(&via), bits(&want));
+                    }
+                }
+            }
+        }
+    }
+
+    /// What `exp_rotation1_neon` computes, written with scalar operations.
+    /// The groups of four of the forward sweep use a fused multiply-add; the
+    /// rest is the plain form.
+    #[cfg(target_arch = "aarch64")]
+    fn exp_rotation1_neon_model(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
+        if len <= stride {
+            return;
+        }
+        let steps = len - stride;
+        let fused = steps / 4 * 4;
+        for i in 0..steps {
+            let x1 = x[i];
+            let x2 = x[i + stride];
+            if i < fused {
+                x[i + stride] = s.mul_add(x1, x2 * c);
+                x[i] = (-s).mul_add(x2, x1 * c);
+            } else {
+                x[i + stride] = c * x2 + s * x1;
+                x[i] = c * x1 - s * x2;
+            }
+        }
+        if len >= 2 * stride {
+            for i in (0..(len - 2 * stride)).rev() {
+                let x1 = x[i];
+                let x2 = x[i + stride];
+                x[i + stride] = c * x2 + s * x1;
+                x[i] = c * x1 - s * x2;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn exp_rotation1_neon_matches_scalar_model() {
+        let mut rng = Lcg(2);
+        for stride in 4..=13usize {
+            // Up to `4 * stride + 7` covers every tail length of both sweeps.
+            for len in 0..=(4 * stride + 7) {
+                for input in rotation_inputs(&mut rng, len + 3) {
+                    for (c, s) in ROTATION_CS {
+                        let mut want = input.clone();
+                        exp_rotation1_neon_model(&mut want, len, stride, c, s);
+                        let mut got = input.clone();
+                        // SAFETY: NEON is part of the aarch64 baseline.
+                        unsafe { exp_rotation1_neon(&mut got, len, stride, c, s) };
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "len {len} stride {stride} c {c} s {s}"
+                        );
+                        assert_eq!(bits(&got[len..]), bits(&input[len..]));
+
+                        // Without a group of four in the forward sweep there
+                        // is no fused multiply-add, so the plain form gives
+                        // the same bits.
+                        if len < stride + 4 {
+                            let mut plain = input.clone();
+                            exp_rotation1_scalar(&mut plain, len, stride, c, s);
+                            assert_eq!(bits(&got), bits(&plain));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The vector form and the plain form differ only by the rounding of the
+    /// fused multiply-add.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn exp_rotation1_neon_is_close_to_plain_form() {
+        let mut rng = Lcg(3);
+        for stride in 4..=9usize {
+            for len in [8usize, 16, 22, 36, 48, 88, 176] {
+                let input: Vec<f32> = (0..len).map(|_| rng.unit()).collect();
+                let (c, s) = ROTATION_CS[0];
+                let mut plain = input.clone();
+                exp_rotation1_scalar(&mut plain, len, stride, c, s);
+                let mut got = input.clone();
+                // SAFETY: NEON is part of the aarch64 baseline.
+                unsafe { exp_rotation1_neon(&mut got, len, stride, c, s) };
+                for (a, b) in got.iter().zip(plain.iter()) {
+                    assert!(
+                        (a - b).abs() <= 4.0e-6,
+                        "len {len} stride {stride}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
 }

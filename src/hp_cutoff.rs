@@ -77,27 +77,56 @@ pub fn hp_cutoff(
     }
     let (b_q28, a_q28) = compute_hp_coeffs(cutoff_hz, fs);
 
-    const MAX_HP_INPUT: usize = 11520;
-    debug_assert!(input.len() <= MAX_HP_INPUT);
-    let mut input_i16_buf = [0i16; MAX_HP_INPUT];
-    let input_i16 = &mut input_i16_buf[..input.len()];
-    for i in 0..input.len() {
-        let sample = (input[i] * 32768.0 + 0.5).floor().clamp(-32768.0, 32767.0);
-        input_i16[i] = sample as i16;
-    }
+    // The input is converted to 16-bit and filtered in blocks of HP_BLOCK
+    // samples. The filter state carries over from block to block, so the
+    // output is the same as for one pass over the whole input. The block
+    // buffer is 960 bytes; one buffer for the largest input would be 23 KB
+    // that has to be cleared on every call.
+    let mut block = [0i16; HP_BLOCK];
 
     if channels == 1 {
+        let n = input.len().min(output.len());
         let s = &mut [hp_mem[0], hp_mem[1]];
-        silk_biquad_alt_stride1(input_i16, &b_q28, &a_q28, s, output);
+        for (inp, out) in input[..n]
+            .chunks(HP_BLOCK)
+            .zip(output[..n].chunks_mut(HP_BLOCK))
+        {
+            let block = &mut block[..inp.len()];
+            float_to_i16_round(inp, block);
+            silk_biquad_alt_stride1(block, &b_q28, &a_q28, s, out);
+        }
         hp_mem[0] = s[0];
         hp_mem[1] = s[1];
     } else {
+        // `len` counts sample pairs; the input and the output are interleaved.
+        let n = 2 * len;
         let s = &mut [hp_mem[0], hp_mem[1], hp_mem[2], hp_mem[3]];
-        silk_biquad_alt_stride2(input_i16, &b_q28, &a_q28, s, output, len);
+        for (inp, out) in input[..n]
+            .chunks(HP_BLOCK)
+            .zip(output[..n].chunks_mut(HP_BLOCK))
+        {
+            let block = &mut block[..inp.len()];
+            float_to_i16_round(inp, block);
+            silk_biquad_alt_stride2(block, &b_q28, &a_q28, s, out, inp.len() / 2);
+        }
         hp_mem[0] = s[0];
         hp_mem[1] = s[1];
         hp_mem[2] = s[2];
         hp_mem[3] = s[3];
+    }
+}
+
+/// Samples that `hp_cutoff` converts and filters per pass. The number is even,
+/// so a block never splits a stereo sample pair.
+const HP_BLOCK: usize = 480;
+
+/// Convert float samples (1.0 = 32768) to 16-bit: round half up, then limit
+/// to the 16-bit range. `output` must be as long as `input`.
+#[inline]
+fn float_to_i16_round(input: &[f32], output: &mut [i16]) {
+    debug_assert_eq!(input.len(), output.len());
+    for (dst, &src) in output.iter_mut().zip(input) {
+        *dst = (src * 32768.0 + 0.5).floor().clamp(-32768.0, 32767.0) as i16;
     }
 }
 

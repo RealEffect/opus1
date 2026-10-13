@@ -227,7 +227,6 @@ fn silk_nsq_noise_shape_feedback_loop(
         *data1.get_unchecked_mut(0) = tmp2;
 
         let mut out = (order as i32) >> 1;
-        out = silk_smlawb(out, tmp2, *coef.get_unchecked(0) as i32);
 
         let mut j = 2;
         while j < order {
@@ -241,6 +240,8 @@ fn silk_nsq_noise_shape_feedback_loop(
         }
         *data1.get_unchecked_mut(order - 1) = tmp1;
         out = silk_smlawb(out, tmp1, *coef.get_unchecked(order - 1) as i32);
+        // The newest value last: it is the one the caller has just computed.
+        out = silk_smlawb(out, data0_val, *coef.get_unchecked(0) as i32);
 
         out <<= 1;
         out
@@ -281,7 +282,6 @@ fn silk_nsq_noise_shape_feedback_loop_order12(
         *data1.get_unchecked_mut(11) = d11;
 
         let mut out = 6i32;
-        out = silk_smlawb(out, d0, *coef.get_unchecked(0) as i32);
         out = silk_smlawb(out, d1, *coef.get_unchecked(1) as i32);
         out = silk_smlawb(out, d2, *coef.get_unchecked(2) as i32);
         out = silk_smlawb(out, d3, *coef.get_unchecked(3) as i32);
@@ -293,6 +293,8 @@ fn silk_nsq_noise_shape_feedback_loop_order12(
         out = silk_smlawb(out, d9, *coef.get_unchecked(9) as i32);
         out = silk_smlawb(out, d10, *coef.get_unchecked(10) as i32);
         out = silk_smlawb(out, d11, *coef.get_unchecked(11) as i32);
+        // The newest value last: it is the one the caller has just computed.
+        out = silk_smlawb(out, d0, *coef.get_unchecked(0) as i32);
 
         out <<= 1;
         out
@@ -374,15 +376,10 @@ fn silk_noise_shape_quantizer(
 }
 
 #[inline(always)]
-fn lpc_pred_order6(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
+fn lpc_pred_order6(s_lpc: &[i32], a_q12: &[i16], idx: usize, newest: i32) -> i32 {
     let mut pred = 3i32;
 
     unsafe {
-        pred = silk_smlawb(
-            pred,
-            *s_lpc.get_unchecked(idx),
-            *a_q12.get_unchecked(0) as i32,
-        );
         pred = silk_smlawb(
             pred,
             *s_lpc.get_unchecked(idx - 1),
@@ -408,20 +405,15 @@ fn lpc_pred_order6(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
             *s_lpc.get_unchecked(idx - 5),
             *a_q12.get_unchecked(5) as i32,
         );
+        silk_smlawb(pred, newest, *a_q12.get_unchecked(0) as i32)
     }
-    pred
 }
 
 #[inline(always)]
-fn lpc_pred_order10(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
+fn lpc_pred_order10(s_lpc: &[i32], a_q12: &[i16], idx: usize, newest: i32) -> i32 {
     let mut pred = 5i32;
 
     unsafe {
-        pred = silk_smlawb(
-            pred,
-            *s_lpc.get_unchecked(idx),
-            *a_q12.get_unchecked(0) as i32,
-        );
         pred = silk_smlawb(
             pred,
             *s_lpc.get_unchecked(idx - 1),
@@ -467,20 +459,15 @@ fn lpc_pred_order10(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
             *s_lpc.get_unchecked(idx - 9),
             *a_q12.get_unchecked(9) as i32,
         );
+        silk_smlawb(pred, newest, *a_q12.get_unchecked(0) as i32)
     }
-    pred
 }
 
 #[inline(always)]
-fn lpc_pred_order16(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
+fn lpc_pred_order16(s_lpc: &[i32], a_q12: &[i16], idx: usize, newest: i32) -> i32 {
     let mut pred = 8i32;
 
     unsafe {
-        pred = silk_smlawb(
-            pred,
-            *s_lpc.get_unchecked(idx),
-            *a_q12.get_unchecked(0) as i32,
-        );
         pred = silk_smlawb(
             pred,
             *s_lpc.get_unchecked(idx - 1),
@@ -556,14 +543,14 @@ fn lpc_pred_order16(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
             *s_lpc.get_unchecked(idx - 15),
             *a_q12.get_unchecked(15) as i32,
         );
+        silk_smlawb(pred, newest, *a_q12.get_unchecked(0) as i32)
     }
-    pred
 }
 
 #[inline(always)]
-fn lpc_pred_generic(s_lpc: &[i32], a_q12: &[i16], idx: usize, order: usize) -> i32 {
+fn lpc_pred_generic(s_lpc: &[i32], a_q12: &[i16], idx: usize, order: usize, newest: i32) -> i32 {
     let mut pred = (order as i32) >> 1;
-    for j in 0..order {
+    for j in 1..order {
         pred = unsafe {
             silk_smlawb(
                 pred,
@@ -571,6 +558,9 @@ fn lpc_pred_generic(s_lpc: &[i32], a_q12: &[i16], idx: usize, order: usize) -> i
                 *a_q12.get_unchecked(j) as i32,
             )
         };
+    }
+    if order > 0 {
+        pred = silk_smlawb(pred, newest, a_q12[0] as i32);
     }
     pred
 }
@@ -622,19 +612,39 @@ fn silk_noise_shape_quantizer_voiced(
     let mut s_ltp_buf_idx = nsq.s_ltp_buf_idx as usize;
     let mut s_lf_ar_q14 = nsq.s_lf_ar_q14;
     let mut s_diff_shp_q14 = nsq.s_diff_shp_q14;
+    // Copies of the two values the next sample needs first. The sample loop
+    // is one long chain of dependent operations from each sample to the
+    // next. Reading these two back from the arrays they were just stored to
+    // would put a store and a load on that chain.
+    let mut newest_xq_q14 = if subfr_length > 0 {
+        nsq.s_lpc_q14[NSQ_LPC_BUF_LENGTH - 1]
+    } else {
+        0
+    };
+    let mut newest_shp_q14 = if subfr_length > 0 {
+        nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx - 1]
+    } else {
+        0
+    };
 
     for i in 0..subfr_length {
         rand_seed = silk_rand(rand_seed);
 
         let ps_lpc_idx = NSQ_LPC_BUF_LENGTH - 1 + i;
         lpc_pred_q10 = if predict_lpc_order == 16 {
-            lpc_pred_order16(&nsq.s_lpc_q14, a_q12, ps_lpc_idx)
+            lpc_pred_order16(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, newest_xq_q14)
         } else if predict_lpc_order == 10 {
-            lpc_pred_order10(&nsq.s_lpc_q14, a_q12, ps_lpc_idx)
+            lpc_pred_order10(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, newest_xq_q14)
         } else if predict_lpc_order == 6 {
-            lpc_pred_order6(&nsq.s_lpc_q14, a_q12, ps_lpc_idx)
+            lpc_pred_order6(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, newest_xq_q14)
         } else {
-            lpc_pred_generic(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, predict_lpc_order)
+            lpc_pred_generic(
+                &nsq.s_lpc_q14,
+                a_q12,
+                ps_lpc_idx,
+                predict_lpc_order,
+                newest_xq_q14,
+            )
         };
 
         ltp_pred_q13 = 2;
@@ -668,7 +678,7 @@ fn silk_noise_shape_quantizer_voiced(
         );
         n_ar_q12 = silk_smlawb(n_ar_q12, s_lf_ar_q14, tilt_q14);
 
-        n_lf_q12 = silk_smulwb(nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx - 1], lf_shp_q14);
+        n_lf_q12 = silk_smulwb(newest_shp_q14, lf_shp_q14);
         n_lf_q12 = silk_smlawt(n_lf_q12, s_lf_ar_q14, lf_shp_q14);
 
         tmp1 = (lpc_pred_q10 << 2).wrapping_sub(n_ar_q12);
@@ -742,7 +752,8 @@ fn silk_noise_shape_quantizer_voiced(
             q1_q10 = q2_q10;
         }
 
-        pulses[i] = silk_rshift_round(q1_q10, 10) as i8;
+        let pulse = silk_rshift_round(q1_q10, 10) as i8;
+        pulses[i] = pulse;
 
         exc_q14 = q1_q10 << 4;
         if rand_seed < 0 {
@@ -756,16 +767,18 @@ fn silk_noise_shape_quantizer_voiced(
             silk_sat16(silk_rshift_round(silk_smulww(xq_q14, gain_q10), 8)) as i16;
 
         nsq.s_lpc_q14[NSQ_LPC_BUF_LENGTH + i] = xq_q14;
+        newest_xq_q14 = xq_q14;
         s_diff_shp_q14 = xq_q14.wrapping_sub(x_sc_q10[i] << 4);
         s_lf_ar_shp_q14 = s_diff_shp_q14.wrapping_sub(n_ar_q12 << 2);
         s_lf_ar_q14 = s_lf_ar_shp_q14;
 
-        nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx] = s_lf_ar_shp_q14.wrapping_sub(n_lf_q12 << 2);
+        newest_shp_q14 = s_lf_ar_shp_q14.wrapping_sub(n_lf_q12 << 2);
+        nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx] = newest_shp_q14;
         s_ltp_q15[s_ltp_buf_idx] = lpc_exc_q14 << 1;
         s_ltp_shp_buf_idx += 1;
         s_ltp_buf_idx += 1;
 
-        rand_seed = rand_seed.wrapping_add(pulses[i] as i32);
+        rand_seed = rand_seed.wrapping_add(pulse as i32);
     }
 
     nsq.rand_seed = rand_seed;
@@ -814,19 +827,39 @@ fn silk_noise_shape_quantizer_unvoiced(
     let mut s_ltp_buf_idx = nsq.s_ltp_buf_idx as usize;
     let mut s_lf_ar_q14 = nsq.s_lf_ar_q14;
     let mut s_diff_shp_q14 = nsq.s_diff_shp_q14;
+    // Copies of the two values the next sample needs first. The sample loop
+    // is one long chain of dependent operations from each sample to the
+    // next. Reading these two back from the arrays they were just stored to
+    // would put a store and a load on that chain.
+    let mut newest_xq_q14 = if subfr_length > 0 {
+        nsq.s_lpc_q14[NSQ_LPC_BUF_LENGTH - 1]
+    } else {
+        0
+    };
+    let mut newest_shp_q14 = if subfr_length > 0 {
+        nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx - 1]
+    } else {
+        0
+    };
 
     for i in 0..subfr_length {
         rand_seed = silk_rand(rand_seed);
 
         let ps_lpc_idx = NSQ_LPC_BUF_LENGTH - 1 + i;
         lpc_pred_q10 = if predict_lpc_order == 16 {
-            lpc_pred_order16(&nsq.s_lpc_q14, a_q12, ps_lpc_idx)
+            lpc_pred_order16(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, newest_xq_q14)
         } else if predict_lpc_order == 10 {
-            lpc_pred_order10(&nsq.s_lpc_q14, a_q12, ps_lpc_idx)
+            lpc_pred_order10(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, newest_xq_q14)
         } else if predict_lpc_order == 6 {
-            lpc_pred_order6(&nsq.s_lpc_q14, a_q12, ps_lpc_idx)
+            lpc_pred_order6(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, newest_xq_q14)
         } else {
-            lpc_pred_generic(&nsq.s_lpc_q14, a_q12, ps_lpc_idx, predict_lpc_order)
+            lpc_pred_generic(
+                &nsq.s_lpc_q14,
+                a_q12,
+                ps_lpc_idx,
+                predict_lpc_order,
+                newest_xq_q14,
+            )
         };
 
         let ltp_pred_q13: i32 = 0;
@@ -839,7 +872,7 @@ fn silk_noise_shape_quantizer_unvoiced(
         );
         n_ar_q12 = silk_smlawb(n_ar_q12, s_lf_ar_q14, tilt_q14);
 
-        n_lf_q12 = silk_smulwb(nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx - 1], lf_shp_q14);
+        n_lf_q12 = silk_smulwb(newest_shp_q14, lf_shp_q14);
         n_lf_q12 = silk_smlawt(n_lf_q12, s_lf_ar_q14, lf_shp_q14);
 
         tmp1 = (lpc_pred_q10 << 2).wrapping_sub(n_ar_q12);
@@ -899,7 +932,8 @@ fn silk_noise_shape_quantizer_unvoiced(
             q1_q10 = q2_q10;
         }
 
-        pulses[i] = silk_rshift_round(q1_q10, 10) as i8;
+        let pulse = silk_rshift_round(q1_q10, 10) as i8;
+        pulses[i] = pulse;
 
         exc_q14 = q1_q10 << 4;
         if rand_seed < 0 {
@@ -913,16 +947,18 @@ fn silk_noise_shape_quantizer_unvoiced(
             silk_sat16(silk_rshift_round(silk_smulww(xq_q14, gain_q10), 8)) as i16;
 
         nsq.s_lpc_q14[NSQ_LPC_BUF_LENGTH + i] = xq_q14;
+        newest_xq_q14 = xq_q14;
         s_diff_shp_q14 = xq_q14.wrapping_sub(x_sc_q10[i] << 4);
         s_lf_ar_shp_q14 = s_diff_shp_q14.wrapping_sub(n_ar_q12 << 2);
         s_lf_ar_q14 = s_lf_ar_shp_q14;
 
-        nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx] = s_lf_ar_shp_q14.wrapping_sub(n_lf_q12 << 2);
+        newest_shp_q14 = s_lf_ar_shp_q14.wrapping_sub(n_lf_q12 << 2);
+        nsq.s_ltp_shp_q14[s_ltp_shp_buf_idx] = newest_shp_q14;
         s_ltp_q15[s_ltp_buf_idx] = lpc_exc_q14 << 1;
         s_ltp_shp_buf_idx += 1;
         s_ltp_buf_idx += 1;
 
-        rand_seed = rand_seed.wrapping_add(pulses[i] as i32);
+        rand_seed = rand_seed.wrapping_add(pulse as i32);
     }
 
     nsq.rand_seed = rand_seed;

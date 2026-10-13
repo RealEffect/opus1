@@ -1,4 +1,5 @@
 use crate::fixedvec::FixedVec;
+use core::mem::MaybeUninit;
 
 pub const EC_SYM_BITS: u32 = 8;
 pub const EC_CODE_BITS: u32 = 32;
@@ -46,7 +47,155 @@ pub struct RangeCoder {
     pub error: i32,
 }
 
+/// The words of a [`RangeCoder`] without its byte buffer (44 bytes).
+///
+/// An encoder that codes the same symbols in two ways and keeps the better
+/// result does not need a copy of the whole coder for that. The words and
+/// the bytes written in between are enough: range coder bytes below `offs`
+/// never change once written. `quant_coarse_energy_advanced` works this way
+/// (libopus: the `ec_enc` copies in `quant_coarse_energy`).
+#[derive(Clone, Copy)]
+pub struct RangeCoderState {
+    storage: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    offs: u32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    error: i32,
+}
+
 impl RangeCoder {
+    /// Writes every field of a coder to `this`, which may be uninitialized
+    /// memory: the buffer gets `bytes`, the words get `state`.
+    ///
+    /// Panics if `bytes.len() > RANGE_BUF_MAX`, before anything is written.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    #[inline(always)]
+    unsafe fn write_parts(this: *mut Self, bytes: &[u8], state: &RangeCoderState) {
+        // Every word of the state is named here. A word that is not written
+        // below is reported by the compiler as an unused variable.
+        let RangeCoderState {
+            storage,
+            end_offs,
+            end_window,
+            nend_bits,
+            nbits_total,
+            offs,
+            rng,
+            val,
+            ext,
+            rem,
+            error,
+        } = *state;
+        // SAFETY: the caller guarantees that `this` is valid for writes. Each
+        // field is written exactly once; none is read. The fields are the
+        // buffer and the words of `RangeCoderState`; `save_state` fails to
+        // compile when `RangeCoder` gets a field that is neither.
+        unsafe {
+            FixedVec::write_from_slice(&raw mut (*this).buf, bytes);
+            (&raw mut (*this).storage).write(storage);
+            (&raw mut (*this).end_offs).write(end_offs);
+            (&raw mut (*this).end_window).write(end_window);
+            (&raw mut (*this).nend_bits).write(nend_bits);
+            (&raw mut (*this).nbits_total).write(nbits_total);
+            (&raw mut (*this).offs).write(offs);
+            (&raw mut (*this).rng).write(rng);
+            (&raw mut (*this).val).write(val);
+            (&raw mut (*this).ext).write(ext);
+            (&raw mut (*this).rem).write(rem);
+            (&raw mut (*this).error).write(error);
+        }
+    }
+
+    /// Copies the words of the coder. The byte buffer is not copied.
+    #[inline]
+    pub fn save_state(&self) -> RangeCoderState {
+        // The pattern names every field of the coder and has no `..`. A
+        // field added to `RangeCoder` does not compile here until it is
+        // added to `RangeCoderState` as well. `write_parts` relies on this:
+        // it builds a coder from the buffer and these words alone.
+        let RangeCoder {
+            buf: _,
+            storage,
+            end_offs,
+            end_window,
+            nend_bits,
+            nbits_total,
+            offs,
+            rng,
+            val,
+            ext,
+            rem,
+            error,
+        } = *self;
+        RangeCoderState {
+            storage,
+            end_offs,
+            end_window,
+            nend_bits,
+            nbits_total,
+            offs,
+            rng,
+            val,
+            ext,
+            rem,
+            error,
+        }
+    }
+
+    /// Puts back words saved with [`RangeCoder::save_state`].
+    ///
+    /// The byte buffer is not touched. Going back to an earlier state of an
+    /// encoder is complete when only range coder symbols were coded since
+    /// then: those write at and above the saved `offs`, and the encoder
+    /// overwrites them from there. To return to a later state, the caller
+    /// also puts back the bytes between the two `offs` values.
+    ///
+    /// Panics if the saved `storage` is larger than this coder's buffer,
+    /// which means the state was saved from another coder. The encoder
+    /// writes bytes below `storage` without an index check, so such a state
+    /// must not get in.
+    #[inline]
+    pub fn restore_state(&mut self, state: &RangeCoderState) {
+        // As in `write_parts`: a word that is not put back is reported as an
+        // unused variable.
+        let RangeCoderState {
+            storage,
+            end_offs,
+            end_window,
+            nend_bits,
+            nbits_total,
+            offs,
+            rng,
+            val,
+            ext,
+            rem,
+            error,
+        } = *state;
+        assert!(
+            storage as usize <= self.buf.len(),
+            "restore_state: the state belongs to a coder with a larger buffer"
+        );
+        self.storage = storage;
+        self.end_offs = end_offs;
+        self.end_window = end_window;
+        self.nend_bits = nend_bits;
+        self.nbits_total = nbits_total;
+        self.offs = offs;
+        self.rng = rng;
+        self.val = val;
+        self.ext = ext;
+        self.rem = rem;
+        self.error = error;
+    }
+
     pub fn new_encoder(size: u32) -> Self {
         let size = (size as usize).clamp(1, RANGE_BUF_MAX);
         let buf = FixedVec::from_value(0u8, size);
@@ -83,13 +232,37 @@ impl RangeCoder {
         self.error = 0;
     }
 
+    /// Starts decoding `data`. At most `RANGE_BUF_MAX` bytes are used.
+    ///
+    /// The coder keeps its own copy of the packet. Only the packet bytes are
+    /// copied: the coder is built in the caller's variable (see
+    /// `init_decoder`), not in a local that is then moved.
+    #[inline]
     pub fn new_decoder(data: &[u8]) -> Self {
+        let mut rc = MaybeUninit::<Self>::uninit();
+        // SAFETY: `rc` is valid for writes. `init_decoder` writes every field.
+        unsafe {
+            Self::init_decoder(rc.as_mut_ptr(), data);
+            rc.assume_init()
+        }
+    }
+
+    /// Writes a decoder for `data` to `this`.
+    ///
+    /// This is a separate call on purpose. A function that builds the coder
+    /// in a local and returns it copies all 2104 bytes to the caller (twice,
+    /// before this function existed), however short the packet is. A call
+    /// that fills memory through a pointer, followed by one move of the
+    /// result, is a pattern the compiler turns into "fill the caller's
+    /// variable directly".
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    #[inline(never)]
+    unsafe fn init_decoder(this: *mut Self, data: &[u8]) {
         let n = data.len().min(RANGE_BUF_MAX);
-        let storage = n as u32;
-        let buf = FixedVec::from_slice(&data[..n]);
-        let mut rc = RangeCoder {
-            buf,
-            storage,
+        let start = RangeCoderState {
+            storage: n as u32,
             end_offs: 0,
             end_window: 0,
             nend_bits: 0,
@@ -103,6 +276,14 @@ impl RangeCoder {
             rem: 0,
             error: 0,
         };
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // `write_parts` writes every field (it cannot panic here, because
+        // `n <= RANGE_BUF_MAX`), so the reference made afterwards points to
+        // an initialized coder.
+        let rc = unsafe {
+            Self::write_parts(this, &data[..n], &start);
+            &mut *this
+        };
 
         rc.rem = rc.read_byte() as i32;
         rc.val = rc
@@ -111,7 +292,6 @@ impl RangeCoder {
             .wrapping_sub(rc.rem as u32 >> (EC_SYM_BITS - EC_CODE_EXTRA));
 
         rc.normalize_decoder();
-        rc
     }
 
     #[inline(always)]
@@ -541,6 +721,15 @@ impl RangeCoder {
         ((ft as i32 * (16384 - decay)) >> 15) as u32
     }
 
+    /// `#[inline]`: the coarse energy decoder calls this once per band and
+    /// channel from another module. Without the attribute the default
+    /// release build (16 code-generation units) inlines it in some builds
+    /// and not in others, depending on how the crate happens to be split,
+    /// and the 2.5 ms decode rows move by 1 to 2 % with it.
+    ///
+    /// `laplace_encode` is left without the attribute on purpose: inlined
+    /// into the coarse energy encoder it measured 12 to 19 % slower there.
+    #[inline]
     pub fn laplace_decode(&mut self, fs: u32, decay: i32) -> i32 {
         let fm = self.decode(1 << 15);
         let mut fl = 0;
@@ -635,8 +824,13 @@ impl RangeCoder {
         }
 
         if self.error == 0 {
-            for i in self.offs..(self.storage - self.end_offs) {
-                self.buf[i as usize] = 0;
+            // Clear the unused bytes between the range coder bytes and the
+            // raw bits. One slice fill instead of a store per byte: the gap
+            // is about 1.2 kB in a SILK frame coded into a 1275-byte buffer.
+            let gap_start = self.offs as usize;
+            let gap_end = (self.storage - self.end_offs) as usize;
+            if gap_start < gap_end {
+                self.buf[gap_start..gap_end].fill(0);
             }
 
             if used > 0 {

@@ -1,5 +1,5 @@
 use crate::modes::CeltMode;
-use crate::range_coder::{BITRES, RangeCoder};
+use crate::range_coder::{BITRES, RANGE_BUF_MAX, RangeCoder};
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -227,15 +227,46 @@ pub fn quant_coarse_energy_advanced(
         max_decay = 3.0;
     }
 
-    let enc_start_state = enc.clone();
-    let mut old_e_bands_intra: FixedVec<f32, 42> = FixedVec::from_slice(old_e_bands);
-    let mut error_intra: FixedVec<f32, 42> = FixedVec::from_slice(error);
-    let mut badness1 = 0i32;
-    let mut tell_intra = 0i32;
-    let intra_prob = &E_PROB_MODEL[lm][1];
+    if intra || !two_pass {
+        // Only one pass runs, so it codes straight into the caller's arrays
+        // and into `enc`. Nothing has to be saved.
+        quant_coarse_energy_impl(
+            m,
+            start,
+            end,
+            e_bands,
+            old_e_bands,
+            budget,
+            tell,
+            &E_PROB_MODEL[lm][intra as usize],
+            error,
+            enc,
+            channels,
+            lm,
+            intra,
+            max_decay,
+            lfe,
+        );
+    } else {
+        // Two passes: the intra pass first, then the inter pass from the same
+        // coder state. The better one stays (C: quant_bands.c:295-341).
+        //
+        // The coder is not cloned for this, because a clone copies the byte
+        // buffer too. Both passes only add range coder bytes from
+        // `start_offs` on. So it is enough to save the 44 bytes of coder
+        // words and, for the intra pass, the bytes it wrote.
+        //
+        // Compared with full copies, the coder ends with the same words and
+        // the same bytes below `offs`. Above `offs` the buffer may still hold
+        // bytes of the pass that lost. Later symbols overwrite them and
+        // `done()` clears the rest. `done()` skips that only when the coder
+        // has an error, and then the packet is not valid anyway.
+        let start_state = enc.save_state();
+        let start_offs = enc.offs as usize;
+        let mut old_e_bands_intra: FixedVec<f32, 42> = FixedVec::from_slice(old_e_bands);
+        let mut error_intra: FixedVec<f32, 42> = FixedVec::from_slice(error);
 
-    if two_pass || intra {
-        badness1 = quant_coarse_energy_impl(
+        let badness1 = quant_coarse_energy_impl(
             m,
             start,
             end,
@@ -243,7 +274,7 @@ pub fn quant_coarse_energy_advanced(
             &mut old_e_bands_intra,
             budget,
             tell,
-            intra_prob,
+            &E_PROB_MODEL[lm][1],
             &mut error_intra,
             enc,
             channels,
@@ -252,14 +283,14 @@ pub fn quant_coarse_energy_advanced(
             max_decay,
             lfe,
         );
-        tell_intra = crate::tell_frac_inline!(enc);
-    }
+        let tell_intra = crate::tell_frac_inline!(enc);
 
-    if !intra {
-        let enc_intra_state = enc.clone();
+        let intra_state = enc.save_state();
+        let intra_offs = enc.offs as usize;
+        let mut intra_bytes: FixedVec<u8, RANGE_BUF_MAX> = FixedVec::new();
+        intra_bytes.extend_from_slice(&enc.buf[start_offs..intra_offs]);
 
-        *enc = enc_start_state.clone();
-        let inter_prob = &E_PROB_MODEL[lm][0];
+        enc.restore_state(&start_state);
         let badness2 = quant_coarse_energy_impl(
             m,
             start,
@@ -268,7 +299,7 @@ pub fn quant_coarse_energy_advanced(
             old_e_bands,
             budget,
             tell,
-            inter_prob,
+            &E_PROB_MODEL[lm][0],
             error,
             enc,
             channels,
@@ -278,19 +309,15 @@ pub fn quant_coarse_energy_advanced(
             lfe,
         );
 
-        if two_pass
-            && (badness1 < badness2
-                || (badness1 == badness2
-                    && crate::tell_frac_inline!(enc) + intra_bias > tell_intra))
+        if badness1 < badness2
+            || (badness1 == badness2 && crate::tell_frac_inline!(enc) + intra_bias > tell_intra)
         {
-            *enc = enc_intra_state;
+            enc.restore_state(&intra_state);
+            enc.buf[start_offs..intra_offs].copy_from_slice(&intra_bytes);
             old_e_bands.copy_from_slice(&old_e_bands_intra);
             error.copy_from_slice(&error_intra);
             intra = true;
         }
-    } else {
-        old_e_bands.copy_from_slice(&old_e_bands_intra);
-        error.copy_from_slice(&error_intra);
     }
 
     if intra {
@@ -632,6 +659,331 @@ mod tests {
             }
             assert!((decoded_old_e_bands[i] - old_e_bands[i]).abs() < 1e-5);
         }
+    }
+
+    /// `quant_coarse_energy_advanced` as it was before it stopped cloning the
+    /// coder: every pass works on a full copy of the coder and of the arrays.
+    /// The reference for `coarse_energy_matches_full_copy_reference`.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_quant_coarse_energy_advanced(
+        m: &CeltMode,
+        start: usize,
+        end: usize,
+        eff_end: usize,
+        e_bands: &[f32],
+        old_e_bands: &mut [f32],
+        budget: u32,
+        error: &mut [f32],
+        enc: &mut RangeCoder,
+        channels: usize,
+        lm: usize,
+        nb_available_bytes: usize,
+        force_intra: bool,
+        delayed_intra: &mut f32,
+        mut two_pass: bool,
+        loss_rate: i32,
+        lfe: bool,
+    ) {
+        let mut intra = force_intra
+            || (!two_pass
+                && *delayed_intra > 2.0 * channels as f32 * (end.saturating_sub(start)) as f32
+                && nb_available_bytes > (end.saturating_sub(start)) * channels);
+        let intra_bias = ((budget as f32) * (*delayed_intra) * (loss_rate as f32)
+            / ((channels as f32) * 512.0)) as i32;
+        let new_distortion =
+            loss_distortion(e_bands, old_e_bands, start, eff_end, m.nb_ebands, channels);
+        let tell = enc.tell();
+        if tell + 3 > budget as i32 {
+            two_pass = false;
+            intra = false;
+        }
+        let mut max_decay = if end - start > 10 {
+            16.0f32.min(0.125 * nb_available_bytes as f32)
+        } else {
+            16.0f32
+        };
+        if lfe {
+            max_decay = 3.0;
+        }
+
+        let enc_start_state = enc.clone();
+        let mut old_e_bands_intra = old_e_bands.to_vec();
+        let mut error_intra = error.to_vec();
+        let mut badness1 = 0i32;
+        let mut tell_intra = 0i32;
+        if two_pass || intra {
+            badness1 = quant_coarse_energy_impl(
+                m,
+                start,
+                end,
+                e_bands,
+                &mut old_e_bands_intra,
+                budget,
+                tell,
+                &E_PROB_MODEL[lm][1],
+                &mut error_intra,
+                enc,
+                channels,
+                lm,
+                true,
+                max_decay,
+                lfe,
+            );
+            tell_intra = enc.tell_frac();
+        }
+        if !intra {
+            let enc_intra_state = enc.clone();
+            *enc = enc_start_state.clone();
+            let badness2 = quant_coarse_energy_impl(
+                m,
+                start,
+                end,
+                e_bands,
+                old_e_bands,
+                budget,
+                tell,
+                &E_PROB_MODEL[lm][0],
+                error,
+                enc,
+                channels,
+                lm,
+                false,
+                max_decay,
+                lfe,
+            );
+            if two_pass
+                && (badness1 < badness2
+                    || (badness1 == badness2 && enc.tell_frac() + intra_bias > tell_intra))
+            {
+                *enc = enc_intra_state;
+                old_e_bands.copy_from_slice(&old_e_bands_intra);
+                error.copy_from_slice(&error_intra);
+                intra = true;
+            }
+        } else {
+            old_e_bands.copy_from_slice(&old_e_bands_intra);
+            error.copy_from_slice(&error_intra);
+        }
+        if intra {
+            *delayed_intra = new_distortion;
+        } else {
+            let pred2 = PRED_COEF[lm] * PRED_COEF[lm];
+            *delayed_intra = pred2 * *delayed_intra + new_distortion;
+        }
+    }
+
+    /// Small deterministic generator (xorshift64*).
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        }
+        /// Uniform in [-1, 1).
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        }
+    }
+
+    /// The words of a coder, for comparing two coders.
+    fn coder_words(rc: &RangeCoder) -> [i64; 11] {
+        [
+            rc.storage as i64,
+            rc.end_offs as i64,
+            rc.end_window as i64,
+            rc.nend_bits as i64,
+            rc.nbits_total as i64,
+            rc.offs as i64,
+            rc.rng as i64,
+            rc.val as i64,
+            rc.ext as i64,
+            rc.rem as i64,
+            rc.error as i64,
+        ]
+    }
+
+    /// The coarse energy coder saves the coder words and the bytes of the
+    /// intra pass instead of cloning the coder. It must leave the same coder
+    /// words, the same range coder bytes, the same arrays and the same packet
+    /// as the version that clones.
+    ///
+    /// The cases cover mono and stereo, all four frame sizes, one and two
+    /// passes, forced intra, the low-frequency channel, a band range that
+    /// starts at band 17, budgets from "no room for the intra flag" to
+    /// "everything fits", and band energies from steady to jumping by 20
+    /// steps. The coder already holds symbols when the coarse energy starts;
+    /// in variant 2 it also holds raw bits and a run of 0xFF bytes whose
+    /// carry is still open. The buffer starts with bytes of an earlier frame.
+    /// Six frames run in a row, so the prediction state and `delayed_intra`
+    /// of one frame feed the next.
+    #[test]
+    fn coarse_energy_matches_full_copy_reference() {
+        let mode = crate::modes::default_mode();
+        let nb = mode.nb_ebands;
+        let mut rng = TestRng(0x1234_5678_9ABC_DEF1);
+        // How often each pass won where both ran, read back from the packet.
+        let mut intra_wins = 0;
+        let mut inter_wins = 0;
+
+        for channels in 1..=2usize {
+            for lm in 0..4usize {
+                for &two_pass in &[true, false] {
+                    for &(storage, budget_bits) in &[
+                        (1275u32, 1275 * 8u32),
+                        (160, 160 * 8),
+                        (40, 40 * 8),
+                        (12, 12 * 8),
+                        (6, 40),
+                        (3, 24),
+                        (2, 10),
+                        (160, 2),
+                    ] {
+                        for variant in 0..6u32 {
+                            let force_intra = variant == 4;
+                            let lfe = variant == 5;
+                            let (start, end) = if variant == 3 { (17, nb) } else { (0, nb) };
+                            let open_carry = variant == 2 && storage >= 40;
+                            let n = channels * nb;
+
+                            let mut enc_new = RangeCoder::new_encoder(storage);
+                            enc_new.buf.fill(0x5A);
+                            let mut old_new = [0f32; 42];
+                            let mut old_ref = [0f32; 42];
+                            let mut err_new = [0f32; 42];
+                            let mut err_ref = [0f32; 42];
+                            let mut delayed_new = 0f32;
+                            let mut delayed_ref = 0f32;
+                            let mut level = [0f32; 42];
+                            for (i, l) in level.iter_mut().enumerate() {
+                                *l = 8.0 - 0.3 * (i % nb) as f32 + 2.0 * rng.unit();
+                            }
+
+                            for frame in 0..6 {
+                                let step = if frame == 3 { 20.0 } else { 0.7 };
+                                let mut e_bands = [0f32; 42];
+                                for i in 0..n {
+                                    level[i] = (level[i] + step * rng.unit()).clamp(-28.0, 30.0);
+                                    e_bands[i] = level[i];
+                                }
+                                let loss_rate = if frame == 4 { 20 } else { 0 };
+
+                                // What the frame codes before the coarse energy.
+                                enc_new.reset_for_encode(storage);
+                                enc_new.encode_bit_logp(false, 15);
+                                enc_new.encode_bit_logp(frame & 1 == 1, 1);
+                                if open_carry {
+                                    for _ in 0..12 {
+                                        enc_new.encode(255, 256, 256);
+                                    }
+                                    enc_new.enc_bits(0x2B, 6);
+                                    assert!(enc_new.ext > 0, "no open carry");
+                                }
+                                let mut enc_ref = enc_new.clone();
+                                let flag_coded = enc_ref.tell() + 3 <= budget_bits as i32;
+
+                                quant_coarse_energy_advanced(
+                                    mode,
+                                    start,
+                                    end,
+                                    end,
+                                    &e_bands[..n],
+                                    &mut old_new[..n],
+                                    budget_bits,
+                                    &mut err_new[..n],
+                                    &mut enc_new,
+                                    channels,
+                                    lm,
+                                    storage as usize,
+                                    force_intra,
+                                    &mut delayed_new,
+                                    two_pass,
+                                    loss_rate,
+                                    lfe,
+                                );
+                                reference_quant_coarse_energy_advanced(
+                                    mode,
+                                    start,
+                                    end,
+                                    end,
+                                    &e_bands[..n],
+                                    &mut old_ref[..n],
+                                    budget_bits,
+                                    &mut err_ref[..n],
+                                    &mut enc_ref,
+                                    channels,
+                                    lm,
+                                    storage as usize,
+                                    force_intra,
+                                    &mut delayed_ref,
+                                    two_pass,
+                                    loss_rate,
+                                    lfe,
+                                );
+
+                                let what = format!(
+                                    "channels {channels} lm {lm} two_pass {two_pass} storage \
+                                     {storage} budget {budget_bits} variant {variant} frame {frame}"
+                                );
+                                assert_eq!(coder_words(&enc_new), coder_words(&enc_ref), "{what}");
+                                let offs = enc_ref.offs as usize;
+                                assert_eq!(enc_new.buf[..offs], enc_ref.buf[..offs], "{what}");
+                                let raw = (enc_ref.storage - enc_ref.end_offs) as usize;
+                                assert_eq!(enc_new.buf[raw..], enc_ref.buf[raw..], "{what}");
+                                assert_eq!(
+                                    old_new.map(f32::to_bits),
+                                    old_ref.map(f32::to_bits),
+                                    "{what}"
+                                );
+                                assert_eq!(
+                                    err_new.map(f32::to_bits),
+                                    err_ref.map(f32::to_bits),
+                                    "{what}"
+                                );
+                                assert_eq!(delayed_new.to_bits(), delayed_ref.to_bits(), "{what}");
+
+                                // The finished packets are the same as well.
+                                // `enc_new` itself is finished, so that the
+                                // next frame starts on the bytes of this one.
+                                enc_new.done();
+                                enc_ref.done();
+                                assert_eq!(enc_new.error, enc_ref.error, "{what}");
+                                if enc_ref.error != 0 {
+                                    continue;
+                                }
+                                let s = enc_ref.storage as usize;
+                                assert_eq!(enc_new.buf[..s], enc_ref.buf[..s], "{what}");
+
+                                // Read the intra flag back from the packet.
+                                if two_pass && !force_intra && flag_coded {
+                                    let mut dec = RangeCoder::new_decoder(&enc_new.buf[..s]);
+                                    assert!(!dec.decode_bit_logp(15), "{what}");
+                                    assert_eq!(dec.decode_bit_logp(1), frame & 1 == 1, "{what}");
+                                    if open_carry {
+                                        for _ in 0..12 {
+                                            assert_eq!(dec.decode(256), 255, "{what}");
+                                            dec.update(255, 256, 256);
+                                        }
+                                        assert_eq!(dec.dec_bits(6), 0x2B, "{what}");
+                                    }
+                                    if dec.decode_bit_logp(3) {
+                                        intra_wins += 1;
+                                    } else {
+                                        inter_wins += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Both outcomes of the two-pass decision must have been exercised,
+        // because they restore the coder in different ways.
+        assert!(intra_wins > 100, "intra chosen in only {intra_wins} cases");
+        assert!(inter_wins > 100, "inter chosen in only {inter_wins} cases");
     }
 
     /// Regression test: extreme/corrupt energy values must not cause an

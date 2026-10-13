@@ -30,14 +30,141 @@ fn silk_a2nlsf_trans_poly(p: &mut [i32], dd: usize) {
     }
 }
 
-fn silk_a2nlsf_eval_poly(p: &[i32], x: i32, dd: usize) -> i32 {
-    let mut y32 = p[dd];
-    let x_q16 = x << 4;
+/// Number of table points for which the value of a polynomial is computed
+/// in one pass.
+const A2NLSF_BLOCK: usize = 8;
 
-    for n in (0..dd).rev() {
-        y32 = silk_smlaww(p[n], y32, x_q16);
+/// Length of the cosine table, rounded up to whole blocks.
+const A2NLSF_TABLE_LEN: usize = (LSF_COS_TAB_SZ_FIX + 1).next_multiple_of(A2NLSF_BLOCK);
+
+/// `SILK_LSF_COS_TAB_FIX_Q12` in the format the polynomial evaluation
+/// multiplies with (Q16). The entries after the table are zero.
+const A2NLSF_COS_Q16: [i32; A2NLSF_TABLE_LEN] = {
+    let mut table = [0i32; A2NLSF_TABLE_LEN];
+    let mut k = 0;
+    while k <= LSF_COS_TAB_SZ_FIX {
+        table[k] = (SILK_LSF_COS_TAB_FIX_Q12[k] as i32) << 4;
+        k += 1;
+    }
+    table
+};
+
+/// Value of the polynomial `p` of degree `dd` at each of the points `x_q16`
+/// (Horner's rule, as libopus `silk_A2NLSF_eval_poly`).
+///
+/// The points do not depend on each other, so the processor works on all
+/// of them at the same time.
+#[inline(always)]
+fn silk_a2nlsf_eval_poly_block<const N: usize>(
+    p: &[i32; MAX_LPC_ORDER / 2 + 1],
+    x_q16: &[i32; N],
+    dd: usize,
+) -> [i32; N] {
+    let mut y32 = [p[dd]; N];
+    for &coefficient in p[..dd].iter().rev() {
+        for (y, &x) in y32.iter_mut().zip(x_q16) {
+            *y = silk_smlaww(coefficient, *y, x);
+        }
     }
     y32
+}
+
+/// Value of the polynomial `p` at every point of the cosine table. Portable
+/// version: the code for targets without a vector version, and the reference
+/// in the tests. On aarch64 only the tests call it.
+#[cfg_attr(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    allow(dead_code)
+)]
+fn silk_a2nlsf_eval_table_scalar(
+    y: &mut [i32; A2NLSF_TABLE_LEN],
+    p: &[i32; MAX_LPC_ORDER / 2 + 1],
+    dd: usize,
+) {
+    let (y_blocks, _) = y.as_chunks_mut::<A2NLSF_BLOCK>();
+    let (x_blocks, _) = A2NLSF_COS_Q16.as_chunks::<A2NLSF_BLOCK>();
+    for (y_block, x_block) in y_blocks.iter_mut().zip(x_blocks) {
+        *y_block = silk_a2nlsf_eval_poly_block(p, x_block, dd);
+    }
+}
+
+/// Value of the polynomial `p` at every point of the cosine table.
+#[inline]
+fn silk_a2nlsf_eval_table(
+    y: &mut [i32; A2NLSF_TABLE_LEN],
+    p: &[i32; MAX_LPC_ORDER / 2 + 1],
+    dd: usize,
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        // SAFETY: this code is only compiled when NEON is enabled for the
+        // whole build (`cfg(target_feature = "neon")`).
+        unsafe { a2nlsf_neon::eval_table(y, p, dd) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    silk_a2nlsf_eval_table_scalar(y, p, dd);
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod a2nlsf_neon {
+    use super::{A2NLSF_BLOCK, A2NLSF_COS_Q16, A2NLSF_TABLE_LEN};
+    use crate::silk::define::MAX_LPC_ORDER;
+    use core::arch::aarch64::*;
+
+    /// One step of Horner's rule in four lanes: `c + ((y * x) >> 16)`,
+    /// computed with 64-bit products and cut to 32 bits, as `silk_smlaww`
+    /// does it. `c_wide` is `c` shifted left by 16 bits, so the shift after
+    /// the addition gives the same bits as the shift before it.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn step(c_wide: int64x2_t, y: int32x4_t, x: int32x4_t) -> int32x4_t {
+        let low = vmlal_s32(c_wide, vget_low_s32(y), vget_low_s32(x));
+        let high = vmlal_high_s32(c_wide, y, x);
+        vshrn_high_n_s64::<16>(vshrn_n_s64::<16>(low), high)
+    }
+
+    /// Same result as `silk_a2nlsf_eval_table_scalar`, eight table points
+    /// per pass in two vectors.
+    #[target_feature(enable = "neon")]
+    pub(super) fn eval_table(
+        y: &mut [i32; A2NLSF_TABLE_LEN],
+        p: &[i32; MAX_LPC_ORDER / 2 + 1],
+        dd: usize,
+    ) {
+        const { assert!(A2NLSF_BLOCK == 8) };
+        // The coefficients in the format of the 64-bit products.
+        let mut p_wide = [0i64; MAX_LPC_ORDER / 2 + 1];
+        for (wide, &coefficient) in p_wide.iter_mut().zip(p) {
+            *wide = (coefficient as i64) << 16;
+        }
+        let top = vdupq_n_s32(p[dd]);
+
+        let (y_blocks, _) = y.as_chunks_mut::<A2NLSF_BLOCK>();
+        let (x_blocks, _) = A2NLSF_COS_Q16.as_chunks::<A2NLSF_BLOCK>();
+        for (y_block, x_block) in y_blocks.iter_mut().zip(x_blocks) {
+            // SAFETY: `x_block` is a `[i32; 8]`. The two loads read its
+            // elements 0 to 3 and 4 to 7.
+            let (x0, x1) = unsafe {
+                (
+                    vld1q_s32(x_block.as_ptr()),
+                    vld1q_s32(x_block.as_ptr().add(4)),
+                )
+            };
+            let mut y0 = top;
+            let mut y1 = top;
+            for &coefficient in p_wide[..dd].iter().rev() {
+                let c_wide = vdupq_n_s64(coefficient);
+                y0 = step(c_wide, y0, x0);
+                y1 = step(c_wide, y1, x1);
+            }
+            // SAFETY: `y_block` is a `[i32; 8]`. The two stores write its
+            // elements 0 to 3 and 4 to 7.
+            unsafe {
+                vst1q_s32(y_block.as_mut_ptr(), y0);
+                vst1q_s32(y_block.as_mut_ptr().add(4), y1);
+            }
+        }
+    }
 }
 
 fn silk_a2nlsf_init(a_q16: &[i32], p: &mut [i32], q: &mut [i32], dd: usize) {
@@ -57,120 +184,154 @@ fn silk_a2nlsf_init(a_q16: &[i32], p: &mut [i32], q: &mut [i32], dd: usize) {
     silk_a2nlsf_trans_poly(q, dd);
 }
 
+/// Middle of two points of the cosine table, as the root search halves an
+/// interval.
+#[inline(always)]
+fn silk_a2nlsf_mid(x0: i32, x1: i32) -> i32 {
+    (x0 + x1 + 1) >> 1
+}
+
+/// LPC coefficients to normalised line spectral frequencies (libopus
+/// `silk_A2NLSF`).
+///
+/// The roots are found by walking along the cosine table until one of the
+/// two polynomials changes its sign, and by halving that interval three
+/// times. libopus evaluates the polynomial one point after the other.
+/// Here the values at all table points are computed first, and the three
+/// halving steps use the values at all seven points they can reach. Every
+/// value is computed by the same operations as before, so the result is
+/// the same.
 pub fn silk_a2nlsf(nlsf: &mut [i16], a_q16: &mut [i32], d: usize) {
-    let mut p = [0i32; MAX_LPC_ORDER / 2 + 1];
-    let mut q = [0i32; MAX_LPC_ORDER / 2 + 1];
+    let mut polys = [[0i32; MAX_LPC_ORDER / 2 + 1]; 2];
+    // Values of the two polynomials at every point of the cosine table.
+    let mut y_table = [[0i32; A2NLSF_TABLE_LEN]; 2];
     let dd = d >> 1;
-
-    silk_a2nlsf_init(a_q16, &mut p, &mut q, dd);
-
-    let mut xlo = SILK_LSF_COS_TAB_FIX_Q12[0] as i32;
-    let mut ylo = silk_a2nlsf_eval_poly(&p, xlo, dd);
-
-    let mut root_ix: usize;
-    let mut poly_idx: usize;
-    if ylo < 0 {
-        nlsf[0] = 0;
-        poly_idx = 1;
-        ylo = silk_a2nlsf_eval_poly(&q, xlo, dd);
-        root_ix = 1;
-    } else {
-        poly_idx = 0;
-        root_ix = 0;
-    }
-
-    let mut k = 1;
-    let mut i = 0;
-    let mut thr = 0;
 
     const BIN_DIV_STEPS_A2NLSF_FIX: i32 = 3;
     const MAX_ITERATIONS_A2NLSF_FIX: i32 = 16;
 
-    loop {
-        let p_ptr = if poly_idx == 0 { &p } else { &q };
-        let xhi = SILK_LSF_COS_TAB_FIX_Q12[k] as i32;
-        let yhi = silk_a2nlsf_eval_poly(p_ptr, xhi, dd);
+    let mut i = 0;
+    'search: loop {
+        let [p, q] = &mut polys;
+        silk_a2nlsf_init(a_q16, p, q, dd);
+        silk_a2nlsf_eval_table(&mut y_table[0], p, dd);
+        silk_a2nlsf_eval_table(&mut y_table[1], q, dd);
 
-        if (ylo <= 0 && yhi >= thr) || (ylo >= 0 && yhi <= -thr) {
-            if yhi == 0 {
-                thr = 1;
-            } else {
-                thr = 0;
-            }
+        let mut xlo = SILK_LSF_COS_TAB_FIX_Q12[0] as i32;
+        let mut ylo = y_table[0][0];
 
-            let mut ffrac = -256;
-            let mut xlo_div = xlo;
-            let mut xhi_div = xhi;
-            let mut ylo_div = ylo;
-            let mut yhi_div = yhi;
-
-            for m in 0..BIN_DIV_STEPS_A2NLSF_FIX {
-                let xmid = (xlo_div + xhi_div + 1) >> 1;
-                let ymid = silk_a2nlsf_eval_poly(p_ptr, xmid, dd);
-
-                if (ylo_div <= 0 && ymid >= 0) || (ylo_div >= 0 && ymid <= 0) {
-                    xhi_div = xmid;
-                    yhi_div = ymid;
-                } else {
-                    xlo_div = xmid;
-                    ylo_div = ymid;
-                    ffrac = silk_add_rshift(ffrac, 128, m);
-                }
-            }
-
-            let den: i32;
-            let nom: i32;
-            if ylo_div.abs() < 65536 {
-                den = ylo_div - yhi_div;
-                nom = (ylo_div << (8 - BIN_DIV_STEPS_A2NLSF_FIX)) + (den >> 1);
-                if den != 0 {
-                    ffrac += nom / den;
-                }
-            } else {
-                ffrac += ylo_div / ((ylo_div - yhi_div) >> (8 - BIN_DIV_STEPS_A2NLSF_FIX));
-            }
-
-            nlsf[root_ix] = ((k as i32) << 8).wrapping_add(ffrac).min(i16::MAX as i32) as i16;
-
-            root_ix += 1;
-            if root_ix >= d {
-                break;
-            }
-
-            poly_idx = root_ix & 1;
-            xlo = SILK_LSF_COS_TAB_FIX_Q12[k - 1] as i32;
-            ylo = (1 - (root_ix as i32 & 2)) << 12;
+        let mut root_ix: usize;
+        let mut poly_idx: usize;
+        if ylo < 0 {
+            nlsf[0] = 0;
+            poly_idx = 1;
+            ylo = y_table[1][0];
+            root_ix = 1;
         } else {
-            k += 1;
-            xlo = xhi;
-            ylo = yhi;
-            thr = 0;
+            poly_idx = 0;
+            root_ix = 0;
+        }
 
-            if k > LSF_COS_TAB_SZ_FIX {
-                i += 1;
-                if i > MAX_ITERATIONS_A2NLSF_FIX {
-                    let val = (1i32 << 15) / (d as i32 + 1);
-                    nlsf[0] = val as i16;
-                    for j in 1..d {
-                        nlsf[j] = nlsf[j - 1].wrapping_add(val as i16);
-                    }
-                    return;
-                }
+        let mut k = 1;
+        let mut thr = 0;
 
-                silk_bwexpander_32(a_q16, d, 65536 - (1 << i));
-                silk_a2nlsf_init(a_q16, &mut p, &mut q, dd);
-                xlo = SILK_LSF_COS_TAB_FIX_Q12[0] as i32;
-                ylo = silk_a2nlsf_eval_poly(&p, xlo, dd);
-                if ylo < 0 {
-                    nlsf[0] = 0;
-                    poly_idx = 1;
-                    ylo = silk_a2nlsf_eval_poly(&q, xlo, dd);
-                    root_ix = 1;
+        loop {
+            let xhi = SILK_LSF_COS_TAB_FIX_Q12[k] as i32;
+            let yhi = y_table[poly_idx][k];
+
+            if (ylo <= 0 && yhi >= thr) || (ylo >= 0 && yhi <= -thr) {
+                if yhi == 0 {
+                    thr = 1;
                 } else {
-                    poly_idx = 0;
-                    root_ix = 0;
+                    thr = 0;
                 }
-                k = 1;
+
+                // The points the three halving steps can reach: the middle
+                // of the interval, the middles of its two halves and the
+                // middles of its four quarters.
+                let x1 = silk_a2nlsf_mid(xlo, xhi);
+                let x2 = [silk_a2nlsf_mid(xlo, x1), silk_a2nlsf_mid(x1, xhi)];
+                let xmids = [
+                    x1,
+                    x2[0],
+                    x2[1],
+                    silk_a2nlsf_mid(xlo, x2[0]),
+                    silk_a2nlsf_mid(x2[0], x1),
+                    silk_a2nlsf_mid(x1, x2[1]),
+                    silk_a2nlsf_mid(x2[1], xhi),
+                ];
+                let xmids_q16 = xmids.map(|x| x << 4);
+                let ymids = silk_a2nlsf_eval_poly_block(&polys[poly_idx], &xmids_q16, dd);
+                // Position of the first point of each step in `xmids`.
+                const STEP_START: [usize; BIN_DIV_STEPS_A2NLSF_FIX as usize] = [0, 1, 3];
+
+                let mut ffrac = -256;
+                let mut ylo_div = ylo;
+                let mut yhi_div = yhi;
+                // Which of the points of the current step lies in the middle
+                // of the current interval.
+                let mut branch = 0;
+
+                for m in 0..BIN_DIV_STEPS_A2NLSF_FIX {
+                    let ymid = ymids[STEP_START[m as usize] + branch];
+
+                    // The root is in the first half when the sign changes
+                    // between the lower end and the middle. Which half it is
+                    // cannot be predicted, so the values are selected
+                    // without a jump.
+                    let first_half =
+                        ((ylo_div <= 0) & (ymid >= 0)) | ((ylo_div >= 0) & (ymid <= 0));
+                    let second_half = !first_half as i32;
+                    yhi_div = core::hint::select_unpredictable(first_half, ymid, yhi_div);
+                    ylo_div = core::hint::select_unpredictable(first_half, ylo_div, ymid);
+                    ffrac = silk_add_rshift(ffrac, 128 * second_half, m);
+                    branch = 2 * branch + second_half as usize;
+                }
+
+                let den: i32;
+                let nom: i32;
+                if ylo_div.abs() < 65536 {
+                    den = ylo_div - yhi_div;
+                    nom = (ylo_div << (8 - BIN_DIV_STEPS_A2NLSF_FIX)) + (den >> 1);
+                    if den != 0 {
+                        ffrac += nom / den;
+                    }
+                } else {
+                    ffrac += ylo_div / ((ylo_div - yhi_div) >> (8 - BIN_DIV_STEPS_A2NLSF_FIX));
+                }
+
+                nlsf[root_ix] = ((k as i32) << 8).wrapping_add(ffrac).min(i16::MAX as i32) as i16;
+
+                root_ix += 1;
+                if root_ix >= d {
+                    break 'search;
+                }
+
+                poly_idx = root_ix & 1;
+                xlo = SILK_LSF_COS_TAB_FIX_Q12[k - 1] as i32;
+                ylo = (1 - (root_ix as i32 & 2)) << 12;
+            } else {
+                k += 1;
+                xlo = xhi;
+                ylo = yhi;
+                thr = 0;
+
+                if k > LSF_COS_TAB_SZ_FIX {
+                    i += 1;
+                    if i > MAX_ITERATIONS_A2NLSF_FIX {
+                        let val = (1i32 << 15) / (d as i32 + 1);
+                        nlsf[0] = val as i16;
+                        for j in 1..d {
+                            nlsf[j] = nlsf[j - 1].wrapping_add(val as i16);
+                        }
+                        return;
+                    }
+
+                    // Not all roots were found. Widen the bandwidth of the
+                    // filter and search again.
+                    silk_bwexpander_32(a_q16, d, 65536 - (1 << i));
+                    continue 'search;
+                }
             }
         }
     }
@@ -248,7 +409,79 @@ pub fn silk_nlsf_stabilize(nlsf_q15: &mut [i16], n_delta_min_q15: &[i16], l: usi
     }
 }
 
+/// Weighted error (Q24) of one codebook vector for `silk_nlsf_vq`, for an
+/// even LPC order of at most 16.
+///
+/// libopus walks from the last coefficient to the first and carries the
+/// weighted difference of the coefficient before as `pred`:
+/// `sum += |diffw - (pred >> 1)|; pred = diffw`. So the term of coefficient
+/// `m` needs the weighted difference of coefficient `m + 1`, and nothing
+/// else. This function first computes all weighted differences and then the
+/// sum of the terms. Both loops have a fixed number of independent steps,
+/// which the compiler turns into vector code. The sum wraps around, as in
+/// libopus, so the order of the additions does not matter.
+///
+/// Not inlined on purpose: inside the loop over the codebook vectors the
+/// compiler makes vectors across four codebook vectors instead, and has to
+/// collect every lane with a load of its own.
+#[inline(never)]
+fn nlsf_vq_error_q24<const ORDER: usize>(
+    in_q15: &[i16; ORDER],
+    cb_q8: &[u8; ORDER],
+    wght_q9: &[i16; ORDER],
+) -> i32 {
+    // One more entry than coefficients: the one after the last is 0.
+    let mut diffw_q24 = [0i32; MAX_LPC_ORDER + 1];
+    for m in 0..ORDER {
+        let diff_q15 = (in_q15[m] as i32) - ((cb_q8[m] as i32) << 7);
+        diffw_q24[m] = silk_smulbb(diff_q15, wght_q9[m] as i32);
+    }
+    let mut sum_error_q24 = 0i32;
+    for m in 0..ORDER {
+        sum_error_q24 = sum_error_q24.wrapping_add((diffw_q24[m] - (diffw_q24[m + 1] >> 1)).abs());
+    }
+    sum_error_q24
+}
+
+/// First stage of the NLSF quantiser (libopus `silk_NLSF_VQ`): the weighted
+/// error of each of the `k` codebook vectors of `lpc_order` coefficients.
 pub fn silk_nlsf_vq(
+    err_q24: &mut [i32],
+    in_q15: &[i16],
+    pcb_q8: &[u8],
+    pwght_q9: &[i16],
+    k: usize,
+    lpc_order: usize,
+) {
+    if k == 0 {
+        return;
+    }
+    // The two orders of the codec get loops of fixed length.
+    match lpc_order {
+        16 => nlsf_vq_fixed_order::<16>(err_q24, in_q15, pcb_q8, pwght_q9, k),
+        10 => nlsf_vq_fixed_order::<10>(err_q24, in_q15, pcb_q8, pwght_q9, k),
+        _ => nlsf_vq_any_order(err_q24, in_q15, pcb_q8, pwght_q9, k, lpc_order),
+    }
+}
+
+fn nlsf_vq_fixed_order<const ORDER: usize>(
+    err_q24: &mut [i32],
+    in_q15: &[i16],
+    pcb_q8: &[u8],
+    pwght_q9: &[i16],
+    k: usize,
+) {
+    let in_q15: &[i16; ORDER] = in_q15.first_chunk().expect("one value per coefficient");
+    let (cb_q8, _) = pcb_q8.as_chunks::<ORDER>();
+    let (wght_q9, _) = pwght_q9.as_chunks::<ORDER>();
+    for ((err, cb), wght) in err_q24[..k].iter_mut().zip(&cb_q8[..k]).zip(&wght_q9[..k]) {
+        *err = nlsf_vq_error_q24(in_q15, cb, wght);
+    }
+}
+
+/// `silk_nlsf_vq` as libopus writes it, for any even order. The reference
+/// for `nlsf_vq_fixed_order` in the tests.
+fn nlsf_vq_any_order(
     err_q24: &mut [i32],
     in_q15: &[i16],
     pcb_q8: &[u8],
@@ -440,4 +673,93 @@ pub fn silk_process_nlsfs(
     }
 
     ps_enc.s_cmn.prev_nlsf_q15[..order].copy_from_slice(&nlsf_q15[..order]);
+}
+
+#[cfg(test)]
+mod a2nlsf_tests {
+    use super::*;
+
+    /// xorshift64 generator with a fixed seed, so the test data never
+    /// changes.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// libopus `silk_A2NLSF_eval_poly`: one point, one step after the other.
+    fn eval_poly_reference(p: &[i32], x: i32, dd: usize) -> i32 {
+        let mut y32 = p[dd];
+        let x_q16 = x << 4;
+        for n in (0..dd).rev() {
+            y32 = silk_smlaww(p[n], y32, x_q16);
+        }
+        y32
+    }
+
+    /// Polynomials with coefficients of every magnitude, and the largest
+    /// and smallest 32-bit values.
+    fn polynomials() -> Vec<[i32; MAX_LPC_ORDER / 2 + 1]> {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut list = Vec::new();
+        for round in 0..3_000 {
+            let mut p = [0i32; MAX_LPC_ORDER / 2 + 1];
+            for coefficient in p.iter_mut() {
+                *coefficient = match round % 4 {
+                    // Any magnitude: a random number of leading bits is
+                    // cleared.
+                    0 => (rng.next() as i32) >> (rng.next() % 32),
+                    // The size of real polynomials (the top one is 65536).
+                    1 => (rng.next() % (1 << 21)) as i32 - (1 << 20),
+                    2 => rng.next() as i32,
+                    _ => [i32::MIN, i32::MAX, -1, 0, 1, 65536][(rng.next() % 6) as usize],
+                };
+            }
+            list.push(p);
+        }
+        list
+    }
+
+    #[test]
+    fn table_matches_point_by_point_evaluation() {
+        for p in polynomials() {
+            for dd in 0..=MAX_LPC_ORDER / 2 {
+                let mut table = [0x5a5a_5a5ai32; A2NLSF_TABLE_LEN];
+                silk_a2nlsf_eval_table(&mut table, &p, dd);
+                let mut portable = [0x5a5a_5a5ai32; A2NLSF_TABLE_LEN];
+                silk_a2nlsf_eval_table_scalar(&mut portable, &p, dd);
+                assert_eq!(table, portable, "degree {dd}, {p:?}");
+                for k in 0..=LSF_COS_TAB_SZ_FIX {
+                    let expected = eval_poly_reference(&p, SILK_LSF_COS_TAB_FIX_Q12[k] as i32, dd);
+                    assert_eq!(table[k], expected, "degree {dd}, point {k}, {p:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_matches_point_by_point_evaluation() {
+        let mut rng = XorShift(0x0123_4567_89AB_CDEF);
+        for p in polynomials() {
+            for dd in [0, 1, 5, 8] {
+                // Any point between the ends of the cosine table.
+                let x: [i32; 7] = core::array::from_fn(|_| (rng.next() % 16385) as i32 - 8192);
+                let y = silk_a2nlsf_eval_poly_block(&p, &x.map(|x| x << 4), dd);
+                for (lane, &point) in x.iter().enumerate() {
+                    assert_eq!(
+                        y[lane],
+                        eval_poly_reference(&p, point, dd),
+                        "degree {dd}, point {point}, {p:?}"
+                    );
+                }
+            }
+        }
+    }
 }

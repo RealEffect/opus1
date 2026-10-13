@@ -1,4 +1,5 @@
 use crate::silk::define::*;
+use crate::silk::resampler::SilkResampler;
 use crate::silk::structs::{NLSFCodebook, SideInfoIndices};
 
 #[derive(Clone)]
@@ -68,6 +69,16 @@ pub struct SilkDecoderState {
     pub vad_flags: [i32; MAX_FRAMES_PER_PACKET],
     pub lbrr_flag: i32,
     pub lbrr_flags: [i32; MAX_FRAMES_PER_PACKET],
+    /// Resampler from the SILK internal rate (`fs_khz`) to the output rate,
+    /// libopus `resampler_state`. `silk_decoder_set_fs` sets it up. Only
+    /// `SilkDecoder::decode_with_control` runs it.
+    pub resampler_state: SilkResampler,
+    /// The output rate `resampler_state` was set up for, 0 if it was not
+    /// set up. In libopus this is `fs_API_hz` itself. It is kept apart here
+    /// because callers of `SilkDecoder::decode` write the rate they want
+    /// into `fs_api_hz` directly, and the resampler must not miss a change
+    /// of rate that was made that way.
+    pub resampler_api_hz: i32,
     pub ps_nlsf_cb: Option<&'static NLSFCodebook>,
     pub indices: SideInfoIndices,
     pub s_cng: SilkCNGState,
@@ -103,6 +114,8 @@ impl Default for SilkDecoderState {
             vad_flags: [0; MAX_FRAMES_PER_PACKET],
             lbrr_flag: 0,
             lbrr_flags: [0; MAX_FRAMES_PER_PACKET],
+            resampler_state: SilkResampler::default(),
+            resampler_api_hz: 0,
             // Default to the WB codebook so that decoding before an explicit
             // `silk_decoder_set_fs` cannot panic on `unwrap` (issue #27
             // deep-scan). `set_fs` always overrides this on the normal path.
@@ -114,6 +127,29 @@ impl Default for SilkDecoderState {
             s_plc: SilkPLCState::default(),
         }
     }
+}
+
+/// What the caller tells `SilkDecoder::decode_with_control` about the
+/// frame to decode (libopus `silk_DecControlStruct`).
+///
+/// The two channel counts are separate because a packet does not have to
+/// code as many channels as the caller wants: a stereo decoder also gets
+/// mono packets, and a mono decoder also gets stereo packets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SilkDecControl {
+    /// Channels in the output buffer: 1 or 2 (`nChannelsAPI`).
+    pub n_channels_api: i32,
+    /// Channels coded in the packet: 1 or 2 (`nChannelsInternal`).
+    pub n_channels_internal: i32,
+    /// Output sampling rate in Hz: 8000, 12000, 16000, 24000 or 48000
+    /// (`API_sampleRate`).
+    pub api_sample_rate: i32,
+    /// SILK sampling rate of the packet in Hz: 8000, 12000 or 16000
+    /// (`internalSampleRate`).
+    pub internal_sample_rate: i32,
+    /// Duration of the Opus frame in ms: 10, 20, 40 or 60. 0 counts as 10,
+    /// as in libopus (`payloadSize_ms`).
+    pub payload_size_ms: i32,
 }
 
 #[derive(Clone, Default)]

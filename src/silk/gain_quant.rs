@@ -4,7 +4,7 @@ use crate::silk::log2lin::silk_log2lin;
 use crate::silk::macros::*;
 use crate::silk::tables::*;
 use crate::silk::tuning_parameters::MAX_SUM_LOG_GAIN_dB;
-use crate::silk::vq_wmat_ec::silk_vq_wmat_ec;
+use crate::silk::vq_wmat_ec::silk_vq_wmat_ec_codebook;
 
 pub const OFFSET: i32 = (MIN_QGAIN_DB * 128) / 6 + 16 * 128;
 pub const SCALE_Q16: i32 =
@@ -117,11 +117,9 @@ pub fn silk_quant_ltp_gains(
     _arch: i32,
 ) {
     let mut temp_idx = [0i8; MAX_NB_SUBFR];
-    let mut res_nrg_q15: i32 = 0;
     let mut res_nrg_total_q15: i32;
     let mut best_res_nrg_total_q15: i32 = 0;
     let mut rate_dist_total_q7: i32;
-    let mut rate_dist_subfr_q7: i32 = 0;
     let mut min_rate_dist_q7: i32;
     let mut sum_log_gain_tmp_q7: i32;
     let mut best_sum_log_gain_q7: i32 = 0;
@@ -132,11 +130,6 @@ pub fn silk_quant_ltp_gains(
     for k in 0..3 {
         let gain_safety = 51;
 
-        let cl_ptr = SILK_LTP_GAIN_BITS_Q5_PTRS[k];
-        let cbk_ptr = SILK_LTP_VQ_PTRS_Q7[k];
-        let cbk_gain_ptr = SILK_LTP_VQ_GAIN_PTRS_Q7[k];
-        let cbk_size = SILK_LTP_VQ_SIZES[k];
-
         res_nrg_total_q15 = 0;
         rate_dist_total_q7 = 0;
         sum_log_gain_tmp_q7 = *sum_log_gain_q7;
@@ -145,25 +138,24 @@ pub fn silk_quant_ltp_gains(
                 (silk_float_to_fixed_q7(MAX_SUM_LOG_GAIN_dB / 6.0) - sum_log_gain_tmp_q7) + 896,
             ) - gain_safety;
 
-            silk_vq_wmat_ec(
-                &mut temp_idx[j],
-                &mut res_nrg_q15,
-                &mut rate_dist_subfr_q7,
-                &mut gain_q7,
-                xx_q17,
-                j * LTP_ORDER * LTP_ORDER,
-                xx_in_q17,
-                j * LTP_ORDER,
-                cbk_ptr,
-                cbk_gain_ptr,
-                cl_ptr,
-                subfr_len,
-                max_gain_q7,
-                cbk_size,
-            );
+            // Correlation matrix and vector of subframe `j`.
+            let xx_subfr_q17 = xx_q17[j * LTP_ORDER * LTP_ORDER..]
+                .first_chunk()
+                .expect("25 values per subframe");
+            let xx_in_subfr_q17 = xx_in_q17[j * LTP_ORDER..]
+                .first_chunk()
+                .expect("5 values per subframe");
+            let choice =
+                silk_vq_wmat_ec_codebook(k, xx_subfr_q17, xx_in_subfr_q17, subfr_len, max_gain_q7);
+            temp_idx[j] = choice.ind;
+            // When no codebook vector qualified, the gain of the search
+            // before stays in use (as in libopus).
+            if let Some(found_gain_q7) = choice.gain_q7 {
+                gain_q7 = found_gain_q7;
+            }
 
-            res_nrg_total_q15 = silk_add_pos_sat32(res_nrg_total_q15, res_nrg_q15);
-            rate_dist_total_q7 = silk_add_pos_sat32(rate_dist_total_q7, rate_dist_subfr_q7);
+            res_nrg_total_q15 = silk_add_pos_sat32(res_nrg_total_q15, choice.res_nrg_q15);
+            rate_dist_total_q7 = silk_add_pos_sat32(rate_dist_total_q7, choice.rate_dist_q7);
             sum_log_gain_tmp_q7 =
                 0.max(sum_log_gain_tmp_q7 + silk_lin2log(gain_q7 + gain_safety) - 896);
         }
