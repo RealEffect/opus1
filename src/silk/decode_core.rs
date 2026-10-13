@@ -5,7 +5,7 @@ use crate::silk::tables::SILK_QUANTIZATION_OFFSETS_Q10;
 
 pub fn silk_decode_core(
     ps_dec: &mut SilkDecoderState,
-    ps_dec_ctrl: &SilkDecoderControl,
+    ps_dec_ctrl: &mut SilkDecoderControl,
     xq: &mut [i16],
     pulses: &[i16],
 ) {
@@ -55,9 +55,8 @@ pub fn silk_decode_core(
     let s_ltp = &mut s_ltp_buf[..s_ltp_len];
 
     for k in 0..ps_dec.nb_subfr as usize {
-        let a_q12 = &ps_dec_ctrl.pred_coef_q12[k >> 1];
-        let b_q14 = &ps_dec_ctrl.ltp_coef_q14[k * LTP_ORDER..];
-        let signal_type = ps_dec.indices.signal_type;
+        let a_q12: [i16; MAX_LPC_ORDER] = ps_dec_ctrl.pred_coef_q12[k >> 1];
+        let a_q12 = &a_q12;
 
         let mut inv_gain_q31 = silk_inverse32_varq(ps_dec_ctrl.gains_q16[k], 47);
 
@@ -74,15 +73,26 @@ pub fn silk_decode_core(
 
         ps_dec.prev_gain_q16 = ps_dec_ctrl.gains_q16[k];
 
-        let (eff_signal_type, eff_pitch_l) = if ps_dec.loss_cnt > 0
+        // libopus: "Avoid abrupt transition from voiced PLC to unvoiced
+        // normal decoding". The first two subframes after a concealed
+        // voiced frame are decoded as voiced, with one prediction tap of
+        // 0.25 at the concealment's pitch lag. libopus writes both into the
+        // control structure, so the pitch lag is also what the frame leaves
+        // behind as `lag_prev` when it has only two subframes.
+        let mut eff_signal_type = ps_dec.indices.signal_type as i32;
+        if ps_dec.loss_cnt > 0
             && ps_dec.prev_signal_type == TYPE_VOICED
             && ps_dec.indices.signal_type as i32 != TYPE_VOICED
             && k < MAX_NB_SUBFR / 2
         {
-            (TYPE_VOICED, ps_dec.lag_prev)
-        } else {
-            (signal_type as i32, ps_dec_ctrl.pitch_l[k])
-        };
+            ps_dec_ctrl.ltp_coef_q14[k * LTP_ORDER..(k + 1) * LTP_ORDER]
+                .copy_from_slice(&[0, 0, 1 << 12, 0, 0]);
+            ps_dec_ctrl.pitch_l[k] = ps_dec.lag_prev;
+            eff_signal_type = TYPE_VOICED;
+        }
+        let eff_pitch_l = ps_dec_ctrl.pitch_l[k];
+        let mut b_q14 = [0i16; LTP_ORDER];
+        b_q14.copy_from_slice(&ps_dec_ctrl.ltp_coef_q14[k * LTP_ORDER..(k + 1) * LTP_ORDER]);
 
         let mut lag = 0;
         if eff_signal_type == TYPE_VOICED {

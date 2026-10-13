@@ -324,7 +324,10 @@ fn silk_plc_conceal(
         &s_ltp_q14[lpc_mem_start + frame_length..lpc_mem_start + frame_length + MAX_LPC_ORDER],
     );
 
-    // Update states.
+    // Update states. libopus attenuates the LTP coefficients in the PLC
+    // state itself (`B_Q14` points into it), so a second lost frame goes on
+    // from the attenuated values.
+    ps_plc.ltp_coef_q14 = b_q14;
     ps_plc.rand_seed = rand_seed;
     ps_plc.rand_scale_q14 = rand_scale_q14 as i16;
     for i in 0..MAX_NB_SUBFR {

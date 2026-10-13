@@ -629,7 +629,10 @@ pub fn silk_burg_modified_flp(
 }
 
 const QA_INV: i32 = 24;
-const A_LIMIT: i32 = 16773043;
+/// Largest reflection coefficient accepted as stable: 0.99975 in Q24
+/// (libopus LPC_inv_pred_gain.c, `A_LIMIT = SILK_FIX_CONST(0.99975, QA)`,
+/// which is `(int)(0.99975 * 2^24 + 0.5)`).
+const A_LIMIT: i32 = 16773022;
 
 fn lpc_inverse_pred_gain_qa(a_qa_in: &mut [i32], order: usize) -> i32 {
     let mut inv_gain_q30 = 1 << 30;

@@ -80,11 +80,16 @@ impl Setup {
     }
 }
 
+/// The packet must be SILK-only with the setup's frame duration. The audio
+/// bandwidth is the encoder's rate-dependent choice, as in libopus: at
+/// 16 kHz it is wideband, except that 13 kb/s CBR in 10 ms frames is worth
+/// under 9 kb/s once the overhead of short frames and CBR is taken off, and
+/// libopus codes that narrowband.
 fn assert_silk_toc(setup: Setup, pkt: &[u8], who: &str, p: usize) {
-    assert_eq!(
-        pkt[0] >> 3,
-        setup.silk_config(),
-        "{who} packet {p}: expected SILK-only config {} at {} Hz / {} ms",
+    let config = pkt[0] >> 3;
+    assert!(
+        config < 12 && config % 4 == setup.silk_config() % 4,
+        "{who} packet {p}: expected a SILK-only config like {} at {} Hz / {} ms, got {config}",
         setup.silk_config(),
         setup.sr,
         setup.ms

@@ -1577,7 +1577,11 @@ fn quant_band_n1(
         }
     }
     if let Some(l_out) = lowband_out {
-        l_out[0] = x[0] / 16.0;
+        // libopus: `lowband_out[0] = SHR32(X[0], 4)`. `SHR32` shifts only in
+        // the fixed-point build; in the floating-point build, which this
+        // port follows, it leaves the value alone. Dividing by 16 here gave
+        // one-bin bands 1/16 of their weight as folding source material.
+        l_out[0] = x[0];
     }
     1
 }
@@ -2123,6 +2127,14 @@ pub fn quant_band_stereo(
             x[1] = mx1 - sy1;
             y[0] = mx0 + sy0;
             y[1] = mx1 + sy1;
+            // libopus applies the phase-inversion flag to two-bin bands
+            // too (the `if (inv)` at the end of quant_band_stereo is
+            // outside the `N != 2` test). Returning before it left the
+            // right channel of such a band with the wrong sign.
+            if sctx.inv {
+                y[0] = -y[0];
+                y[1] = -y[1];
+            }
         }
         return cm;
     }

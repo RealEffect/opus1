@@ -110,14 +110,13 @@ impl SilkDecoder {
             }
             let api_sample_rate = self.channel_state[0].fs_api_hz;
             for n in 0..n_channels {
+                // `nb_subfr` was set from the packet duration just above;
+                // the frame length and the pitch contour table follow from
+                // it inside silk_decoder_set_fs (libopus dec_API.c).
                 let ret =
                     silk_decoder_set_fs(&mut self.channel_state[n], fs_khz_dec, api_sample_rate);
                 if ret < 0 {
                     return ret;
-                }
-                if payload_size_ms == 10 {
-                    self.channel_state[n].nb_subfr = 2;
-                    self.channel_state[n].frame_length = self.channel_state[n].subfr_length * 2;
                 }
             }
         }
@@ -319,9 +318,19 @@ impl SilkDecoder {
             output[..fl].copy_from_slice(&self.w_silk_buf[0][1..1 + fl]);
         }
 
-        // A lost frame carries no mid-only flag; keep the last good one
-        // (dec_API.c).
-        if lost_flag != FLAG_PACKET_LOST {
+        if lost_flag == FLAG_PACKET_LOST {
+            // libopus dec_API.c: "On packet loss, remove the gain clamping
+            // to prevent having the energy bounce back if we lose packets
+            // when the energy is going down". The first gain of the next
+            // good frame may not be more than 16 steps below the previous
+            // gain index; after a loss that index is stale, so it is put
+            // back to its start value.
+            for n in 0..self.n_channels_internal as usize {
+                self.channel_state[n].last_gain_index = 10;
+            }
+        } else {
+            // A lost frame carries no mid-only flag; keep the last good one
+            // (dec_API.c).
             self.prev_decode_only_middle = decode_only_middle;
         }
 

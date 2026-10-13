@@ -40,6 +40,11 @@ libm = { version = "0.2", optional = true, default-features = false }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1"
 opus = { version = "0.3", default-features = false }
+# Raw C API of the same libopus (opus_encoder_ctl, opus_decode_float with the
+# FEC flag, the repacketizer, the multistream functions). The `opus` crate
+# above already links it; examples/perf_harness.rs and the k24_* tests need
+# controls that crate does not expose, such as forcing the coding mode.
+audiopus_sys = "0.2"
 [[bench]]
 name = "opus_bench"
 harness = false

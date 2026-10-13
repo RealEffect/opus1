@@ -398,6 +398,12 @@ fn transient_analysis(
         is_transient = false;
         mask_metric = 0.0;
     }
+    // C 454-459: at low bitrates, a "weak transient" is coded with long
+    // blocks and a finer time resolution instead, to avoid a partial collapse.
+    if allow_weak_transients && is_transient && mask_metric < 600.0 {
+        is_transient = false;
+        *weak_transient = true;
+    }
 
     // C (celt_encoder.c:460-461): tf_max = max(0, sqrt(27*mask_metric) - 42);
     // tf_estimate = sqrt(max(0, 0.0069*min(163, tf_max) - 0.139))  [float build]
@@ -1688,6 +1694,12 @@ pub struct CeltEncoder {
 
     analysis: AnalysisInfo,
     loss_rate: i32,
+    /// Hybrid only (libopus `silk_info.offset`): the quantization offset of
+    /// the SILK frame coded before this CELT frame, in Q10. 100 is neutral.
+    silk_offset: i32,
+    /// Hybrid only (libopus `silk_info.signalType`): 0 no voice activity,
+    /// 1 unvoiced, 2 voiced.
+    silk_signal_type: i32,
 }
 
 const INTEN_THRESHOLDS: [i32; 21] = [
@@ -2211,6 +2223,8 @@ impl CeltEncoder {
 
             analysis: AnalysisInfo::default(),
             loss_rate: 0,
+            silk_offset: 100,
+            silk_signal_type: 0,
         }
     }
 
@@ -2272,6 +2286,13 @@ impl CeltEncoder {
     }
     pub fn set_constrained_vbr(&mut self, cvbr: bool) {
         self.constrained_vbr = cvbr;
+    }
+    /// Hybrid only (libopus `CELT_SET_SILK_INFO`): the signal type (0 no
+    /// voice activity, 1 unvoiced, 2 voiced) and the quantization offset
+    /// (Q10) of the SILK frame coded before this CELT frame.
+    pub fn set_silk_info(&mut self, signal_type: i32, offset_q10: i32) {
+        self.silk_signal_type = signal_type;
+        self.silk_offset = offset_q10;
     }
 
     fn encode_impl(
@@ -2374,14 +2395,32 @@ impl CeltEncoder {
         let mut tf_chan = 0;
         let mut weak_transient = false;
 
-        let is_transient = if self.complexity >= 1 {
+        // C 1904-1927: the bytes this frame is expected to take. Under VBR
+        // that is the target rate (`vbr_rate`), not the largest packet the
+        // caller allows; under CBR it is what the packet has left. Using the
+        // packet limit here doubled the figure for CELT-only VBR and, in
+        // Hybrid VBR, made it the caller's whole buffer: the dynamic
+        // allocation then boosted the two Hybrid bands until a 16 kb/s
+        // stream came out at 24 kb/s.
+        let hybrid = start_band != 0;
+        let packet_bytes =
+            (explicit_total_bits.unwrap_or_else(|| (rc.buf.len() * 8) as i32) / 8).max(0) as usize;
+        let effective_bytes = if self.vbr && self.bitrate != OPUS_BITRATE_MAX {
+            (bitrate_to_bits(self.bitrate, mode.fs, frame_size as i32) >> 3).max(0) as usize
+        } else {
+            packet_bytes.saturating_sub(((rc.tell() + 4) >> 3).max(0) as usize)
+        };
+        // C 2032: Hybrid at a low CELT rate, on anything but voiced speech.
+        let hybrid_low_rate = hybrid && effective_bytes < 15 && self.silk_signal_type != 2;
+
+        let mut is_transient = if self.complexity >= 1 {
             transient_analysis(
                 in_buf,
                 buf_stride,
                 channels,
                 &mut tf_estimate,
                 &mut tf_chan,
-                false,
+                hybrid_low_rate,
                 &mut weak_transient,
                 tone_freq,
                 toneishness,
@@ -2413,6 +2452,10 @@ impl CeltEncoder {
         // analysis_toneishness kept for prefilter gating; tone_freq/toneishness from tone_detect used for dynalloc
         let pf_enabled =
             start_band == 0 && self.complexity >= 5 && analysis_toneishness < 0.99 && channels == 1;
+        // C 2043: the tapset this frame's comb filter uses and signals. The
+        // spreading decision further down picks `tapset_decision` for the
+        // *next* frame, so the value is taken here.
+        let prefilter_tapset = self.tapset_decision;
         let (pf_on, gain1, pitch_index) = if pf_enabled {
             let tell = rc.tell();
             let nb_filled = ((tell + 4) >> 3).max(0) as usize;
@@ -2424,7 +2467,7 @@ impl CeltEncoder {
                 self.prefilter_period,
                 self.prefilter_gain,
                 self.prefilter_tapset,
-                self.tapset_decision,
+                prefilter_tapset,
                 mode.window,
                 channels,
                 frame_size,
@@ -2548,7 +2591,14 @@ impl CeltEncoder {
                     rc.shrink(nb_compressed_bytes as u32);
                 }
             }
-            // effectiveBytes would be vbr_rate>>(3+BITRES) for later lambda, but total_bits already reflects bound
+        }
+        // C `nbAvailableBytes`: what the packet has left, after the VBR bound.
+        let nb_available_bytes = nb_compressed_bytes.saturating_sub(nb_filled_bytes_initial);
+        // C 1928-1930: the rate the allocation decisions go by.
+        let frame_overhead = (40 * channels as i32 + 20) * ((400 >> lm) - 50);
+        let mut equiv_rate = ((packet_bytes as i32 * 8 * 50) << (3 - lm)) - frame_overhead;
+        if self.bitrate != OPUS_BITRATE_MAX {
+            equiv_rate = equiv_rate.min(self.bitrate - frame_overhead);
         }
 
         if start_band == 0 && !silence && rc.tell() + 16 <= total_bits {
@@ -2562,7 +2612,7 @@ impl CeltEncoder {
                 rc.enc_uint(octave, 6);
                 rc.enc_bits(pi - (16 << octave), 4 + octave);
                 rc.enc_bits(qg as u32, 3);
-                rc.encode_icdf(self.tapset_decision, &TAPSET_ICDF, 2);
+                rc.encode_icdf(prefilter_tapset, &TAPSET_ICDF, 2);
             }
         }
 
@@ -2572,6 +2622,12 @@ impl CeltEncoder {
             if is_transient {
                 short_blocks = true;
             }
+        } else {
+            // C 2071-2074: a frame that cannot signal a transient is not one.
+            // 2.5 ms frames have no transient flag, and a packet that is
+            // already full has no room for it. The decoder reads every later
+            // symbol of such a frame as non-transient.
+            is_transient = false;
         }
         let second_mdct = short_blocks && self.complexity >= 8;
         if second_mdct {
@@ -2669,7 +2725,7 @@ impl CeltEncoder {
             rc,
             channels,
             lm,
-            (total_bits / 8) as usize,
+            nb_available_bytes,
             false, // force_intra: C st->force_intra (CTL flag, 0 by default)
             &mut self.delayed_intra,
             self.complexity >= 4,
@@ -2678,8 +2734,7 @@ impl CeltEncoder {
         );
         self.w_tf_res[..nb_ebands].fill(0);
         let tf_res = &mut self.w_tf_res[..nb_ebands];
-        let effective_bytes = ((total_bits / 8) as usize).max(1);
-        let lambda = 80.max(20480 / effective_bytes + 2) as i32;
+        let lambda = 80.max(20480 / effective_bytes.max(1) + 2) as i32;
 
         // C runs dynalloc_analysis before tf_analysis: it produces `importance`
         // (used by the tf Viterbi) and `offsets` (encoded later, after spread).
@@ -2726,7 +2781,11 @@ impl CeltEncoder {
             &mut importance,
         );
 
-        let tf_select = if self.complexity >= 2 && effective_bytes >= 15 * channels {
+        // C 2245-2281: the time-frequency resolution of each band. Hybrid
+        // and very low bitrates skip the analysis.
+        let enable_tf_analysis =
+            effective_bytes >= 15 * channels && !hybrid && self.complexity >= 2 && toneishness < 0.98;
+        let tf_select = if enable_tf_analysis {
             tf_analysis(
                 mode,
                 end,
@@ -2740,7 +2799,16 @@ impl CeltEncoder {
                 tf_chan,
                 &importance,
             )
+        } else if hybrid && weak_transient {
+            // A weak transient: long blocks with the better time resolution.
+            tf_res[..end].fill(1);
+            0
+        } else if hybrid_low_rate {
+            // Low-bitrate Hybrid: 5 ms time resolution rather than 2.5 ms.
+            tf_res[..end].fill(0);
+            is_transient as i32
         } else {
+            tf_res[..end].fill(is_transient as i32);
             0
         };
         tf_encode(
@@ -2760,7 +2828,6 @@ impl CeltEncoder {
         };
 
         let mut stereo_saving = 0.0f32;
-        let equiv_rate = (total_bits * 48000) / frame_size as i32;
         if channels == 2 {
             self.intensity = hysteresis_decision(
                 equiv_rate / 1000,
@@ -2777,10 +2844,21 @@ impl CeltEncoder {
                 rc.encode_icdf(self.spread_decision, &SPREAD_ICDF, 5);
             }
         } else if rc.tell() + 4 <= total_bits {
-            if is_transient || self.complexity < 3 || effective_bytes < 10 * channels {
+            if hybrid {
+                // C 2311-2318: Hybrid spreads its two or four bands hard,
+                // except on transients.
+                self.spread_decision = if is_transient {
+                    SPREAD_NORMAL
+                } else {
+                    crate::bands::SPREAD_AGGRESSIVE
+                };
+            } else if is_transient || self.complexity < 3 || nb_available_bytes < 10 * channels {
                 self.spread_decision = SPREAD_NORMAL;
             } else {
-                let update_hf = lm == mode.max_lm;
+                // C 2343: the high-frequency average behind the tapset
+                // decision is only updated on long blocks that use the
+                // comb filter.
+                let update_hf = pf_on && !short_blocks;
                 let spread_weights = [32i32; 21];
                 self.spread_decision = spreading_decision(
                     mode,
@@ -2835,21 +2913,26 @@ impl CeltEncoder {
             offsets[i] = boost;
         }
 
-        let alloc_trim = alloc_trim_analysis(
-            mode,
-            x,
-            band_log_e,
-            end,
-            lm as i32,
-            channels,
-            frame_size,
-            &mut stereo_saving,
-            tf_estimate,
-            self.intensity,
-            0.0,
-            equiv_rate,
-        );
+        // C 2385-2395: the allocation trim is 5 unless the packet has room to
+        // signal another value. A decoder that finds no room assumes 5, so
+        // an encoder that goes on with its own value allocates the bands
+        // differently and the rest of the frame decodes as noise.
+        let mut alloc_trim = 5;
         if rc.tell_frac() + (6 << BITRES) <= total_bits_bitres - total_boost {
+            alloc_trim = alloc_trim_analysis(
+                mode,
+                x,
+                band_log_e,
+                end,
+                lm as i32,
+                channels,
+                frame_size,
+                &mut stereo_saving,
+                tf_estimate,
+                self.intensity,
+                0.0,
+                equiv_rate,
+            );
             rc.encode_icdf(alloc_trim, &TRIM_ICDF, 7);
         }
         // Second VBR: compute target via simplified compute_vbr (libopus 2436-2534)
@@ -2914,6 +2997,14 @@ impl CeltEncoder {
                 )
             } else {
                 let mut t = base_target;
+                // C 2469-2470: tonal frames, which are harder to code, get
+                // extra bits; SILK's quantization offset tells them apart.
+                if self.silk_offset < 100 {
+                    t += (12 << BITRES) >> (3 - lm);
+                }
+                if self.silk_offset > 100 {
+                    t -= (18 << BITRES) >> (3 - lm);
+                }
                 t += ((tf_estimate - 0.25) * 50.0 * (1 << BITRES) as f32) as i32;
                 if tf_estimate > 0.7 {
                     t = t.max(50 << BITRES);
@@ -3153,15 +3244,17 @@ impl CeltEncoder {
 
         rc.pad_to_bits(total_bits);
 
+        // C 2772: remember the tapset this frame was filtered with. The
+        // decoder cross-fades from it at the start of the next frame, so it
+        // must not be the `tapset_decision` just updated for the next frame.
         if pf_on {
             self.prefilter_period = pitch_index;
             self.prefilter_gain = gain1;
-            self.prefilter_tapset = self.tapset_decision;
         } else {
             self.prefilter_period = COMBFILTER_MINPERIOD;
             self.prefilter_gain = 0.0;
-            self.prefilter_tapset = self.tapset_decision;
         }
+        self.prefilter_tapset = prefilter_tapset;
 
         if is_transient {
             self.consec_transient += 1;
@@ -3170,6 +3263,10 @@ impl CeltEncoder {
         }
     }
 }
+
+/// Log-energy a band's history starts from and returns to when the band is
+/// not coded (libopus celt_decoder.c: `-GCONST(28.f)`).
+const OLD_LOG_E_RESET: f32 = -28.0;
 
 pub struct CeltDecoder {
     mode: &'static CeltMode,
@@ -3234,8 +3331,12 @@ impl CeltDecoder {
             prefilter_gain_old: 0.0,
             prefilter_tapset: 0,
             prefilter_tapset_old: 0,
-            old_band_e2: FixedVec::from_value(0.0, nb_x_ch),
-            old_band_e3: FixedVec::from_value(0.0, nb_x_ch),
+            // libopus `oldLogE` / `oldLogE2`: the band energies of the two
+            // previous frames. They start at -28 (silence), not 0: the
+            // anti-collapse step compares a band against them, and 0 makes
+            // it inject noise into the first transient frame.
+            old_band_e2: FixedVec::from_value(OLD_LOG_E_RESET, nb_x_ch),
+            old_band_e3: FixedVec::from_value(OLD_LOG_E_RESET, nb_x_ch),
             rng: 0,
 
             w_tf_res: FixedVec::from_value(0, nb_ebands),
@@ -3271,8 +3372,8 @@ impl CeltDecoder {
         self.prefilter_gain_old = 0.0;
         self.prefilter_tapset = 0;
         self.prefilter_tapset_old = 0;
-        self.old_band_e2.fill(0.0);
-        self.old_band_e3.fill(0.0);
+        self.old_band_e2.fill(OLD_LOG_E_RESET);
+        self.old_band_e3.fill(OLD_LOG_E_RESET);
         self.rng = 0;
     }
 
@@ -3626,7 +3727,7 @@ impl CeltDecoder {
                 channels,
                 frame_size,
                 start_band,
-                nb_ebands,
+                end_band,
                 &self.old_band_e,
                 &self.old_band_e2,
                 &self.old_band_e3,
@@ -3861,6 +3962,18 @@ impl CeltDecoder {
             let nb_ebands = mode.nb_ebands;
             for i in 0..channels * nb_ebands {
                 self.old_band_e2[i] = self.old_band_e2[i].min(self.old_band_e[i]);
+            }
+        }
+        // libopus celt_decode_with_ec, "In case start or end were to
+        // change": bands this frame did not code carry no energy history.
+        // Without this, the first frame after a switch to a wider bandwidth
+        // (or from Hybrid to CELT-only) predicts its new bands from stale
+        // energies and decodes them at the wrong level.
+        for c in 0..channels {
+            for i in (0..start_band).chain(end_band..nb_ebands) {
+                self.old_band_e[c * nb_ebands + i] = 0.0;
+                self.old_band_e2[c * nb_ebands + i] = OLD_LOG_E_RESET;
+                self.old_band_e3[c * nb_ebands + i] = OLD_LOG_E_RESET;
             }
         }
 

@@ -7,7 +7,9 @@ use crate::silk::sigproc_fix::silk_bwexpander;
 use crate::silk::tables::SILK_LTP_SCALES_TABLE_Q14;
 use crate::silk::tables::SILK_LTP_VQ_PTRS_Q7;
 
-const BWE_AFTER_LOSS_Q16: i32 = 64738;
+/// Bandwidth expansion of the prediction filter in the first good frame
+/// after a loss: 0.97 in Q16 (libopus silk/define.h).
+const BWE_AFTER_LOSS_Q16: i32 = 63570;
 
 fn silk_decode_pitch(
     lag_index: i16,

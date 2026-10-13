@@ -7,10 +7,14 @@ pub fn silk_decoder_set_fs(dec: &mut SilkDecoderState, fs_khz: i32, fs_api_hz: i
         return -1;
     }
 
-    // Matches the previous behaviour of this port (and C's effective flow):
-    // nb_subfr is forced to MAX before the geometry is (re)computed; the
-    // 10 ms path in dec_api.rs overrides nb_subfr/frame_length afterwards.
-    dec.nb_subfr = MAX_NB_SUBFR as i32;
+    // libopus decoder_set_fs.c: the caller sets `nb_subfr` first (4 for a
+    // 20 ms SILK frame, 2 for a 10 ms one) and the frame length and the
+    // pitch contour table below follow from it. Forcing 4 here, as this
+    // used to, read the pitch contour of every 10 ms frame with the 20 ms
+    // table. A state whose `nb_subfr` was never set counts as 20 ms.
+    if dec.nb_subfr != (MAX_NB_SUBFR / 2) as i32 {
+        dec.nb_subfr = MAX_NB_SUBFR as i32;
+    }
     dec.subfr_length = (SUB_FRAME_LENGTH_MS as i32) * fs_khz;
     let frame_length = dec.subfr_length * dec.nb_subfr;
 

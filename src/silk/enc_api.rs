@@ -583,7 +583,7 @@ fn silk_lbrr_encode(
     /*****************************************/
     let mut pulses_lbrr = [0i8; MAX_FRAME_LENGTH];
     if ps_enc.s_cmn.n_states_delayed_decision > 1 || ps_enc.s_cmn.warping_q16 > 0 {
-        silk_nsq_del_dec(
+        let winner_seed = silk_nsq_del_dec(
             &ps_enc.s_cmn,
             &mut nsq_lbrr,
             &indices_lbrr,
@@ -600,6 +600,11 @@ fn silk_lbrr_encode(
             s_enc_ctrl.lambda_q10,
             s_enc_ctrl.ltp_scale_q14,
         );
+        // The delayed-decision quantizer picks the seed of its winning
+        // path (C NSQ_del_dec.c: `psIndices->Seed = psDD->SeedInit`). The
+        // decoder derives the excitation signs from it, so the LBRR frame
+        // must carry this seed, not the main frame's.
+        indices_lbrr.seed = winner_seed as i8;
     } else {
         silk_nsq(
             &ps_enc.s_cmn,
