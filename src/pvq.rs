@@ -174,12 +174,8 @@ pub fn celt_pvq_u_lookup(n: u32, k: u32) -> u32 {
     if c > CELT_PVQ_U_CMAX[r] {
         return compute_u(n, k);
     }
-    unsafe {
-        let row_base = *CELT_PVQ_U_ROW.get_unchecked(r);
-        let idx = row_base as usize + c;
-        debug_assert!(idx < CELT_PVQ_U_DATA.len());
-        *CELT_PVQ_U_DATA.get_unchecked(idx)
-    }
+    // SAFETY: `r < 15` and `r <= c <= CELT_PVQ_U_CMAX[r]` were checked above.
+    unsafe { pvq_u_unchecked(r, c) }
 }
 
 pub fn ncwrs(n: u32, k: u32) -> u32 {
@@ -783,7 +779,9 @@ fn pvq_search_n2(x: &[f32], y: &mut [i32], k: i32) {
 
 #[inline]
 fn pvq_search_n4(x: &[f32], y: &mut [i32], k: i32) {
-    debug_assert!(x.len() >= 4 && y.len() >= 4);
+    // The x86 code below loads `x[..4]` and stores `y[..4]` through
+    // pointers, so the lengths are checked in release builds too.
+    assert!(x.len() >= 4 && y.len() >= 4);
 
     if k == 0 {
         y[0] = 0;
@@ -793,6 +791,9 @@ fn pvq_search_n4(x: &[f32], y: &mut [i32], k: i32) {
         return;
     }
 
+    // SAFETY: SSE2 is part of the baseline of x86_64. The one load reads
+    // `x[..4]` and the one store writes `y[..4]`; both slices hold at least
+    // four values (checked at entry).
     #[cfg(target_arch = "x86_64")]
     unsafe {
         #[cfg(target_arch = "x86")]
@@ -1033,7 +1034,12 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     }
 
     if n == 2 {
-        pvq_search_n2(x, y, k);
+        // libopus has no special case for two values: the projection rounds
+        // down and the search places the pulses that are left (celt/vq.c,
+        // op_pvq_search_c). `pvq_search_n2` rounds the projection to the
+        // nearest count instead. Its vectors match the input as well, but
+        // they are not the ones libopus writes.
+        pvq_search_libopus(x, y, k, 2);
         return;
     }
 
@@ -1055,6 +1061,9 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 
     #[cfg(target_arch = "x86_64")]
     if k > 4 && crate::compat::x86_has_avx2_fma() {
+        // SAFETY: `n < 32` here (larger bands returned above), `x` and `y`
+        // hold at least `n` values (checked at entry), and the CPU has
+        // AVX2 and FMA.
         unsafe {
             pvq_search_avx2(x, y, k, n);
         }
@@ -1064,301 +1073,351 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     pvq_search_scalar(x, y, k, n);
 }
 
-#[cfg(target_arch = "aarch64")]
+/// Sum of the magnitudes in `abs_x`, for the projection step of
+/// `pvq_search_fast_select`.
+///
+/// The order of the additions is part of the result, and each target keeps
+/// the order it has always had:
+/// - aarch64: four running sums that take the values 4m, 4m+1, 4m+2 and
+///   4m+3 of the largest multiple of four values. They are added as
+///   (s0 + s1) + (s2 + s3), and the last values are added one by one. The
+///   compiler turns the first loop into vector additions.
+/// - every other target: one value after the other.
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn pvq_fast_select_init_neon(
-    x: &[f32],
-    n: usize,
-    abs_x: &mut [MaybeUninit<f32>; MAX_PVQ_N],
-    signs: &mut [MaybeUninit<i32>; MAX_PVQ_N],
-) -> f32 {
-    use core::arch::aarch64::*;
-
-    let mut sum_vec = vdupq_n_f32(0.0);
-    let mut i = 0;
-
-    while i + 16 <= n {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let vx2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let vx3 = vld1q_f32(x.as_ptr().add(i + 12));
-
-        let vabs0 = vabsq_f32(vx0);
-        let vabs1 = vabsq_f32(vx1);
-        let vabs2 = vabsq_f32(vx2);
-        let vabs3 = vabsq_f32(vx3);
-
-        vst1q_f32(abs_x.as_mut_ptr().add(i) as *mut f32, vabs0);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 4) as *mut f32, vabs1);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 8) as *mut f32, vabs2);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 12) as *mut f32, vabs3);
-
-        sum_vec = vaddq_f32(sum_vec, vabs0);
-        sum_vec = vaddq_f32(sum_vec, vabs1);
-        sum_vec = vaddq_f32(sum_vec, vabs2);
-        sum_vec = vaddq_f32(sum_vec, vabs3);
-
-        for j in 0..16 {
-            signs[i + j].write(if x[i + j] < 0.0 { -1i32 } else { 1i32 });
+fn pvq_magnitude_sum(abs_x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (quads, tail) = abs_x.as_chunks::<4>();
+        let mut lanes = [0.0f32; 4];
+        for q in quads {
+            for l in 0..4 {
+                lanes[l] += q[l];
+            }
         }
-
-        i += 16;
-    }
-
-    while i + 8 <= n {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
-
-        let vabs0 = vabsq_f32(vx0);
-        let vabs1 = vabsq_f32(vx1);
-
-        vst1q_f32(abs_x.as_mut_ptr().add(i) as *mut f32, vabs0);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 4) as *mut f32, vabs1);
-
-        sum_vec = vaddq_f32(sum_vec, vabs0);
-        sum_vec = vaddq_f32(sum_vec, vabs1);
-
-        for j in 0..8 {
-            signs[i + j].write(if x[i + j] < 0.0 { -1i32 } else { 1i32 });
+        let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        for &v in tail {
+            sum += v;
         }
-
-        i += 8;
+        sum
     }
-
-    while i + 4 <= n {
-        let vx = vld1q_f32(x.as_ptr().add(i));
-        let vabs = vabsq_f32(vx);
-        vst1q_f32(abs_x.as_mut_ptr().add(i) as *mut f32, vabs);
-        sum_vec = vaddq_f32(sum_vec, vabs);
-
-        for j in 0..4 {
-            signs[i + j].write(if x[i + j] < 0.0 { -1i32 } else { 1i32 });
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0f32;
+        for &v in abs_x {
+            sum += v;
         }
-
-        i += 4;
+        sum
     }
-
-    let mut sum = vaddvq_f32(sum_vec);
-
-    for j in i..n {
-        let abs_xi = x[j].abs();
-        abs_x[j].write(abs_xi);
-        sum += abs_xi;
-        signs[j].write(if x[j] < 0.0 { -1i32 } else { 1i32 });
-    }
-
-    sum
 }
 
+/// Position of the next pulse on aarch64 for the searches that score with
+/// an estimate of the square root.
+///
+/// Position `i` gets the score `(xy + abs_x[i]) * e`, where `e` estimates
+/// `1 / sqrt(yy + y2f[i])`. The result is the last position whose score
+/// equals the largest score. A score that is not a number ends the search:
+/// the result is then the best position of the groups of four before it.
+/// Without any score of at least zero the result is position 0.
+///
+/// For the groups of four values `e` is the estimate of the processor
+/// (`vrsqrteq_f32`, about 8 correct bits). For the last `len % 4` values it
+/// is the exact value, and such a position wins only with a larger score.
+/// The encoder output depends on these details, so they must stay.
+///
+/// This is the plain form: after every group it reduces the four lanes to
+/// one maximum and tests each lane against it. `pvq_estimate_position_neon`
+/// gives the same result and is faster for long bands. This form is the
+/// reference in the tests, `pvq_search_neon` uses it for its bands of up to
+/// 16 values, and the other form falls back to it when a score is not a
+/// number.
+///
+/// `abs_x` must not be empty and `y2f` must be at least as long.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn pvq_estimate_position_by_group_neon(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
+    use core::arch::aarch64::*;
+
+    let y2f = &y2f[..abs_x.len()];
+    let (x4, x_tail) = abs_x.as_chunks::<4>();
+    let (y4, y_tail) = y2f.as_chunks::<4>();
+
+    // SAFETY: NEON is part of the baseline of every aarch64 target. Each
+    // load reads one `[f32; 4]`.
+    unsafe {
+        let vxy = vdupq_n_f32(xy);
+        let vyy = vdupq_n_f32(yy);
+        let mut vmax = vdupq_n_f32(0.0);
+        let mut best_id: usize = 0;
+
+        for (g, (xa, ya)) in x4.iter().zip(y4).enumerate() {
+            let rxy = vaddq_f32(vld1q_f32(xa.as_ptr()), vxy);
+            let ryy = vaddq_f32(vld1q_f32(ya.as_ptr()), vyy);
+            let score = vmulq_f32(rxy, vrsqrteq_f32(ryy));
+            vmax = vmaxq_f32(vmax, score);
+            let mx = vmaxvq_f32(vmax);
+            let mut sc = [0.0f32; 4];
+            vst1q_f32(sc.as_mut_ptr(), score);
+            for (lane, &s) in sc.iter().enumerate() {
+                if s == mx {
+                    best_id = 4 * g + lane;
+                }
+            }
+        }
+
+        let done = 4 * x4.len();
+        for (l, (&ax, &ay)) in x_tail.iter().zip(y_tail).enumerate() {
+            let rxy = xy + ax;
+            let ryy = yy + ay;
+            let score = rxy * (1.0 / ryy.sqrt());
+            if score > vmaxvq_f32(vmax) {
+                best_id = done + l;
+                vmax = vsetq_lane_f32(score, vmax, 0);
+            }
+        }
+        best_id
+    }
+}
+
+/// `pvq_estimate_position_by_group_neon` as a function of its own, for the
+/// rare call from `pvq_estimate_position_neon`.
+#[cfg(target_arch = "aarch64")]
+#[cold]
+#[inline(never)]
+fn pvq_estimate_position_fallback_neon(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
+    pvq_estimate_position_by_group_neon(abs_x, y2f, xy, yy)
+}
+
+/// `pvq_estimate_position_by_group_neon` without a reduction per group.
+///
+/// Each lane keeps its own largest score and the group that had it last.
+/// After the last group the largest of the four lane maxima is the largest
+/// score, and the lanes that hold it name its last position: the largest
+/// index among them. That is the position the plain form finds, because a
+/// lane remembers the last group that reached its maximum.
+///
+/// Two cases need care. A lane that never saw a score of at least zero has
+/// no position. And a score that is not a number makes the plain form stop
+/// at that group; this form then calls the plain form.
+///
+/// The reduction after the last group costs about as much as two groups of
+/// the plain form, so this form pays off for long bands only. Measured on
+/// an Apple M4: 32 and more values 10 to 20 % faster per search, 16 values
+/// within the noise, 8 values 4 to 8 % slower. So `pvq_search_fast_select`
+/// (32 and more values) uses this form and `pvq_search_neon` (up to 16)
+/// the plain one.
+///
+/// `abs_x` must not be empty and `y2f` must be at least as long.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn pvq_estimate_position_neon(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
+    use core::arch::aarch64::*;
+
+    let y2f = &y2f[..abs_x.len()];
+    let (x4, x_tail) = abs_x.as_chunks::<4>();
+    let (y4, y_tail) = y2f.as_chunks::<4>();
+
+    // SAFETY: NEON is part of the baseline of every aarch64 target. Each
+    // load reads one `[f32; 4]`, or the four lane numbers below.
+    let (mut best_id, mut max) = unsafe {
+        let vxy = vdupq_n_f32(xy);
+        let vyy = vdupq_n_f32(yy);
+        // Per lane: the largest score so far, and the group that had it
+        // last. All bits set means that the lane has no group yet.
+        let mut vmax = vdupq_n_f32(0.0);
+        let none = vdupq_n_u32(u32::MAX);
+        let mut vgroup = none;
+        // The number of the current group, in every lane.
+        let mut vg = vdupq_n_u32(0);
+        let one = vdupq_n_u32(1);
+
+        for (xa, ya) in x4.iter().zip(y4) {
+            let rxy = vaddq_f32(vld1q_f32(xa.as_ptr()), vxy);
+            let ryy = vaddq_f32(vld1q_f32(ya.as_ptr()), vyy);
+            let score = vmulq_f32(rxy, vrsqrteq_f32(ryy));
+            // A score equal to the maximum of its lane counts: the last
+            // position wins.
+            let reached = vcgeq_f32(score, vmax);
+            vgroup = vbslq_u32(reached, vg, vgroup);
+            vmax = vmaxq_f32(vmax, score);
+            vg = vaddq_u32(vg, one);
+        }
+
+        let max = vmaxvq_f32(vmax);
+        // Position `4 * group + lane` of the lanes that hold the maximum
+        // and have a group; zero for the other lanes.
+        const LANES: [u32; 4] = [0, 1, 2, 3];
+        let position = vaddq_u32(vshlq_n_u32::<2>(vgroup), vld1q_u32(LANES.as_ptr()));
+        let holds_max = vceqq_f32(vmax, vdupq_n_f32(max));
+        let has_group = vmvnq_u32(vceqq_u32(vgroup, none));
+        let best = vmaxvq_u32(vandq_u32(position, vandq_u32(holds_max, has_group)));
+        (best as usize, max)
+    };
+    if max.is_nan() {
+        return pvq_estimate_position_fallback_neon(abs_x, y2f, xy, yy);
+    }
+
+    let done = 4 * x4.len();
+    for (l, (&ax, &ay)) in x_tail.iter().zip(y_tail).enumerate() {
+        let rxy = xy + ax;
+        let ryy = yy + ay;
+        let score = rxy * (1.0 / ryy.sqrt());
+        if score > max {
+            best_id = done + l;
+            max = score;
+        }
+    }
+    best_id
+}
+
+/// Position of the next pulse in `pvq_search_fast_select` while it places
+/// one pulse at a time. See `pvq_best_position_scalar` for the meaning of
+/// the arguments.
+///
+/// aarch64 scores the positions with an estimate of the square root, every
+/// other target compares the exact ratios as libopus does. The two can pick
+/// different positions.
+#[inline(always)]
+fn pvq_fast_select_position(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        pvq_estimate_position_neon(abs_x, y2f, xy, yy)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        pvq_best_position_scalar::<true>(abs_x, y2f, xy, yy)
+    }
+}
+
+/// Pulse search for bands of 32 and more values: finds `y[..n]` with `k`
+/// pulses that is close to `x[..n]`, and returns the energy of `y`.
+///
+/// Panics when `x` or `y` holds fewer than `n` values or `n` exceeds
+/// `MAX_PVQ_N`.
 #[inline]
 pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32 {
+    pvq_search_fast_select_with(x, y, k, n, pvq_fast_select_position)
+}
+
+/// `pvq_search_fast_select` with the function that picks the position of
+/// one pulse as an argument, so that the tests can run the portable choice
+/// on every target.
+#[inline(always)]
+fn pvq_search_fast_select_with(
+    x: &[f32],
+    y: &mut [i32],
+    k: i32,
+    n: usize,
+    position: impl Fn(&[f32], &[f32], f32, f32) -> usize,
+) -> f32 {
+    // The scratch arrays below hold MAX_PVQ_N values, so the sizes are
+    // checked here, in release builds too. `pvq_search` has checked them
+    // already, and the compiler then drops this check.
+    assert!(
+        n <= MAX_PVQ_N && x.len() >= n && y.len() >= n,
+        "pvq_search_fast_select: n={n} exceeds MAX_PVQ_N or slices too short"
+    );
+    let x = &x[..n];
+    let y = &mut y[..n];
+
     let mut k = k;
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
 
-    y[..n].fill(0);
+    y.fill(0);
 
-    if k <= 0 {
+    // Without a dimension there is nowhere to put a pulse. The code below
+    // relies on `n >= 1`: it always adds a pulse at some position.
+    if k <= 0 || n == 0 {
         return 0.0;
     }
 
+    // The magnitudes of `x`. The compiler turns this loop into vector code.
     let mut abs_x_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let mut signs_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-
-    #[cfg(target_arch = "aarch64")]
-    let sum = unsafe { pvq_fast_select_init_neon(x, n, &mut abs_x_mu, &mut signs_mu) };
-    #[cfg(not(target_arch = "aarch64"))]
-    let sum = {
-        let mut s = 0.0f32;
-        for i in 0..n {
-            abs_x_mu[i].write(x[i].abs());
-            signs_mu[i].write(if x[i] < 0.0 { -1i32 } else { 1i32 });
-            s += unsafe { abs_x_mu[i].assume_init() };
-        }
-        s
-    };
-
+    for (a, &xi) in abs_x_mu.iter_mut().zip(x) {
+        a.write(xi.abs());
+    }
+    // SAFETY: the loop above wrote the first `n` values: `x` holds `n`
+    // values and `n <= MAX_PVQ_N` (checked at entry).
     let abs_x = unsafe { core::slice::from_raw_parts(abs_x_mu.as_ptr() as *const f32, n) };
-    let signs = unsafe { core::slice::from_raw_parts(signs_mu.as_ptr() as *const i32, n) };
 
-    if k > (n >> 1) as i32 && sum > 1e-15 {
-        let rcp = (k as f32 + 0.8) / sum;
-
-        let abs_x_ptr = abs_x.as_ptr();
-        let y_ptr = y.as_mut_ptr();
-        unsafe {
-            for i in 0..n {
-                let yi = (*abs_x_ptr.add(i) * rcp) as i32;
-                *y_ptr.add(i) = yi;
+    // The projection: each position first gets its share of the pulses,
+    // rounded down. It needs more pulses than half the band size. A band of
+    // 32 or more values never has that many in the codec (its index would
+    // not fit 32 bits), so only direct callers get here, and only this step
+    // needs the sum of the magnitudes.
+    let mut projected = false;
+    if k > (n >> 1) as i32 {
+        let sum = pvq_magnitude_sum(abs_x);
+        if sum > 1e-15 {
+            projected = true;
+            let rcp = (k as f32 + 0.8) / sum;
+            for (yi_out, &ax) in y.iter_mut().zip(abs_x) {
+                let yi = (ax * rcp) as i32;
+                *yi_out = yi;
                 let yf = yi as f32;
                 yy += yf * yf;
-                xy += yf * *abs_x_ptr.add(i);
+                xy += yf * ax;
                 k -= yi;
             }
-        }
 
-        if k > n as i32 + 3 {
-            let tmp = k as f32;
-            unsafe {
-                yy += tmp * tmp + tmp * *y_ptr as f32;
-                *y_ptr += k;
+            if k > n as i32 + 3 {
+                let tmp = k as f32;
+                yy += tmp * tmp + tmp * y[0] as f32;
+                y[0] += k;
+                k = 0;
             }
-            k = 0;
         }
     }
+
+    // Twice the number of pulses at each position so far. With `yy` it gives
+    // the energy of `y` after one more pulse at that position.
+    let mut y2f_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    if projected {
+        for (d, &yi) in y2f_mu.iter_mut().zip(y.iter()) {
+            d.write(2.0 * yi as f32);
+        }
+    } else {
+        // No pulse yet.
+        for d in y2f_mu[..n].iter_mut() {
+            d.write(0.0);
+        }
+    }
+    // SAFETY: either loop above wrote the first `n` values (`y` holds `n`).
+    let y2f = unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, n) };
 
     const BATCH_SIZE: i32 = 4;
 
     if k < BATCH_SIZE * 2 || n < 16 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            use core::arch::aarch64::*;
-            let mut y2f_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-            for i in 0..n {
-                y2f_mu[i].write(2.0 * y[i] as f32);
-            }
-            let y2f = unsafe {
-                core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N)
-            };
-
-            let abs_x_ptr = abs_x.as_ptr();
-            let y2f_ptr = y2f.as_mut_ptr();
-            let y_ptr = y.as_mut_ptr();
-            unsafe {
-                let n4 = n & !3;
-                while k > 0 {
-                    yy += 1.0;
-                    let vxy = vdupq_n_f32(xy);
-                    let vyy = vdupq_n_f32(yy);
-                    let mut vmax = vdupq_n_f32(0.0);
-                    let mut best_id: usize = 0;
-
-                    let mut i = 0;
-                    while i < n4 {
-                        let vx = vld1q_f32(abs_x_ptr.add(i));
-                        let vy = vld1q_f32(y2f_ptr.add(i));
-                        let rxy = vaddq_f32(vx, vxy);
-                        let ryy = vaddq_f32(vy, vyy);
-                        let inv_sqrt = vrsqrteq_f32(ryy);
-                        let score = vmulq_f32(rxy, inv_sqrt);
-                        vmax = vmaxq_f32(vmax, score);
-                        let sc = core::slice::from_raw_parts(
-                            &score as *const float32x4_t as *const f32,
-                            4,
-                        );
-                        let mx = vmaxvq_f32(vmax);
-                        for lane in 0..4 {
-                            if sc[lane] == mx {
-                                best_id = i + lane;
-                            }
-                        }
-                        i += 4;
-                    }
-
-                    while i < n {
-                        let rxy = xy + *abs_x_ptr.add(i);
-                        let ryy = yy + *y2f_ptr.add(i);
-                        let score = rxy * (1.0 / ryy.sqrt());
-                        let current_max = vmaxvq_f32(vmax);
-                        if score > current_max {
-                            best_id = i;
-                            vmax = vsetq_lane_f32(score, vmax, 0);
-                        }
-                        i += 1;
-                    }
-
-                    xy += *abs_x_ptr.add(best_id);
-                    yy += *y2f_ptr.add(best_id);
-                    *y2f_ptr.add(best_id) += 2.0;
-                    *y_ptr.add(best_id) += 1;
-                    k -= 1;
-                }
-            }
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let mut y2f = [0.0f32; MAX_PVQ_N];
-            let abs_x_ptr = abs_x.as_ptr();
-            let y2f_ptr = y2f.as_mut_ptr();
-            let y_ptr = y.as_mut_ptr();
-            unsafe {
-                while k > 0 {
-                    yy += 1.0;
-                    let rxy0 = xy + *abs_x_ptr;
-                    let mut best_id = 0;
-                    let mut best_num = rxy0 * rxy0;
-                    let mut best_den = yy + *y2f_ptr;
-                    let mut i = 1;
-                    while i + 1 < n {
-                        let rxy1 = xy + *abs_x_ptr.add(i);
-                        let ryy1 = yy + *y2f_ptr.add(i);
-                        let rxy1_sq = rxy1 * rxy1;
-                        if best_den * rxy1_sq > ryy1 * best_num {
-                            best_id = i;
-                            best_num = rxy1_sq;
-                            best_den = ryy1;
-                        }
-                        let rxy2 = xy + *abs_x_ptr.add(i + 1);
-                        let ryy2 = yy + *y2f_ptr.add(i + 1);
-                        let rxy2_sq = rxy2 * rxy2;
-                        if best_den * rxy2_sq > ryy2 * best_num {
-                            best_id = i + 1;
-                            best_num = rxy2_sq;
-                            best_den = ryy2;
-                        }
-                        i += 2;
-                    }
-                    if i < n {
-                        let rxy = xy + *abs_x_ptr.add(i);
-                        let ryy = yy + *y2f_ptr.add(i);
-                        let rxy_sq = rxy * rxy;
-                        if best_den * rxy_sq > ryy * best_num {
-                            best_id = i;
-                        }
-                    }
-                    xy += *abs_x_ptr.add(best_id);
-                    yy += *y2f_ptr.add(best_id);
-                    *y2f_ptr.add(best_id) += 2.0;
-                    *y_ptr.add(best_id) += 1;
-                    k -= 1;
-                }
-            }
+        // One pulse at a time.
+        while k > 0 {
+            yy += 1.0;
+            let best_id = position(abs_x, y2f, xy, yy);
+            xy += abs_x[best_id];
+            yy += y2f[best_id];
+            y2f[best_id] += 2.0;
+            y[best_id] += 1;
+            k -= 1;
         }
     } else {
-        let mut y2f_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-
-        let y_ptr = y.as_mut_ptr();
-        for i in 0..n {
-            unsafe {
-                y2f_mu[i].write(2.0 * *y_ptr.add(i) as f32);
-            }
-        }
-        let y2f =
-            unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N) };
+        // Up to four pulses per pass: one each at the positions with the
+        // best scores. `n >= 16` here, so position `batch` exists.
         let mut scores_mu = [MaybeUninit::<(f32, usize)>::uninit(); MAX_PVQ_N];
-
-        let abs_x_ptr = abs_x.as_ptr();
-        let y2f_ptr = y2f.as_mut_ptr();
         while k > 0 {
-            let batch = BATCH_SIZE.min(k);
+            let batch = BATCH_SIZE.min(k) as usize;
 
-            unsafe {
-                for i in 0..n {
-                    let rxy = xy + *abs_x_ptr.add(i);
-                    let ryy = yy + *y2f_ptr.add(i) + 1.0;
-                    let score = rxy * rxy / ryy;
-                    scores_mu[i].write((score, i));
-                }
+            for (i, (s, (&ax, &ay))) in scores_mu.iter_mut().zip(abs_x.iter().zip(y2f.iter())).enumerate() {
+                let rxy = xy + ax;
+                let ryy = yy + ay + 1.0;
+                let score = rxy * rxy / ryy;
+                s.write((score, i));
             }
-
+            // SAFETY: the loop above wrote the first `n` entries
+            // (`abs_x` and `y2f` hold `n` values each).
             let scores = unsafe {
                 core::slice::from_raw_parts_mut(scores_mu.as_mut_ptr() as *mut (f32, usize), n)
             };
 
-            let pos = batch as usize;
-
-            scores.select_nth_unstable_by(pos, |a, b| {
+            scores.select_nth_unstable_by(batch, |a, b| {
                 if a.0 > b.0 {
                     core::cmp::Ordering::Less
                 } else if a.0 < b.0 {
@@ -1368,30 +1427,36 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
                 }
             });
 
-            unsafe {
-                for b in 0..batch as usize {
-                    let idx = scores[b].1;
-                    xy += *abs_x_ptr.add(idx);
-                    yy += *y2f_ptr.add(idx) + 1.0;
-                    *y2f_ptr.add(idx) += 2.0;
-                    *y_ptr.add(idx) += 1;
-                }
+            for &(_, idx) in &scores[..batch] {
+                xy += abs_x[idx];
+                yy += y2f[idx] + 1.0;
+                y2f[idx] += 2.0;
+                y[idx] += 1;
             }
 
-            k -= batch;
+            k -= batch as i32;
         }
     }
 
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        for i in 0..n {
-            *y_ptr.add(i) *= *signs.as_ptr().add(i);
-        }
+    // A pulse gets the sign of its coefficient. Written without a branch,
+    // so that the compiler makes vector code of it: `m` is all ones for a
+    // negative coefficient, and `(y ^ m) - m` is then `-y`.
+    for (yi, &xi) in y.iter_mut().zip(x) {
+        let m = -((xi < 0.0) as i32);
+        *yi = (*yi ^ m).wrapping_sub(m);
     }
 
     yy
 }
 
+/// Writes `|x[i]|` to `abs_x[i]` and the sign bit of `x[i]` (1 when
+/// negative) to `sign_x[i]` for `i < n`, and returns the sum of the `|x[i]|`
+/// in the same order as `pvq_fast_select_init_neon`.
+///
+/// # Safety
+///
+/// `x` must hold at least `n` values and `n` must not exceed 32. Every load
+/// covers `x[i..i + 4]` and every store `abs_x[i..i + 4]` with `i + 4 <= n`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1403,6 +1468,7 @@ unsafe fn pvq_search_scalar_init_neon(
 ) -> f32 {
     use core::arch::aarch64::*;
 
+    debug_assert!(n <= 32 && x.len() >= n);
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
 
@@ -1603,27 +1669,95 @@ fn pvq_best_position<const SQUARE: bool>(abs_x: &[f32], y2f: &[f32], xy: f32, yy
     pvq_best_position_scalar::<SQUARE>(abs_x, y2f, xy, yy)
 }
 
-#[inline(always)]
-fn pvq_search_small_k(x: &[f32], y: &mut [i32], k: i32, n: usize) {
-    debug_assert!(k <= 4 && k > 0);
-    debug_assert!(n <= 31);
-
-    let mut abs_x = [0.0f32; 32];
-    let mut y2f = [0.0f32; 32];
-    let mut sign_x = [0i32; 32];
-
+/// The pulse search of libopus for bands of up to 32 values: a port of
+/// `op_pvq_search_c` (celt/vq.c, float build), line by line.
+///
+/// It finds the vector `y[..n]` of `k` pulses that is close to `x[..n]`:
+/// 1. With more pulses than half the band size, each position first gets
+///    its share of the pulses, rounded down (the projection onto the
+///    pyramid, vq.c lines 240 to 282).
+/// 2. The remaining pulses are placed one at a time, each where it gives
+///    the largest `Rxy * Rxy / Ryy` (lines 299 to 360). `Rxy` is the
+///    correlation of the pulse vector with the input and `Ryy` its energy.
+///
+/// Panics when `n` is 0 or above 32, or when `x` or `y` holds fewer than `n`
+/// values.
+#[inline]
+fn pvq_search_libopus(x: &[f32], y: &mut [i32], k: i32, n: usize) {
+    assert!((1..=32).contains(&n) && x.len() >= n && y.len() >= n);
     let x = &x[..n];
     let y = &mut y[..n];
+
+    // "Get rid of the sign."
+    let mut abs_x = [0.0f32; 32];
+    let mut sign_x = [0i32; 32];
     for ((&xi, a), sg) in x.iter().zip(abs_x.iter_mut()).zip(sign_x.iter_mut()) {
         *a = xi.abs();
         *sg = (xi < 0.0) as i32;
     }
-    let abs_x = &abs_x[..n];
+    let abs_x = &mut abs_x[..n];
+    // Twice the number of pulses at each position (`y` in libopus).
+    let mut y2f = [0.0f32; 32];
     let y2f = &mut y2f[..n];
+    y.fill(0);
 
-    let mut yy = 0.0f32;
     let mut xy = 0.0f32;
-    for _ in 0..k {
+    let mut yy = 0.0f32;
+    let mut pulses_left = k;
+
+    // "Do a pre-search by projecting on the pyramid."
+    if k > (n >> 1) as i32 {
+        let mut sum = 0.0f32;
+        for &a in abs_x.iter() {
+            sum += a;
+        }
+        // "If X is too small, just replace it with a pulse at 0." The test
+        // also catches a sum that is not a number, and one of 64 or more
+        // ("an approximation of infinity").
+        if !(sum > 1e-15 && sum < 64.0) {
+            abs_x.fill(0.0);
+            abs_x[0] = 1.0;
+            sum = 1.0;
+        }
+        // "Using K+e with e < 1 guarantees we cannot get more than K pulses."
+        let rcp = (k as f32 + 0.8) * (1.0 / sum);
+        for ((yi, y2), &a) in y.iter_mut().zip(y2f.iter_mut()).zip(abs_x.iter()) {
+            let pulses = (rcp * a).floor() as i32;
+            *yi = pulses;
+            let yf = pulses as f32;
+            yy += yf * yf;
+            // C: `xy = MAC16_16(xy, X[j], y[j])`, which is `xy + X[j] * y[j]`
+            // in one expression. clang builds libopus for arm64 with product
+            // and sum rounded once (one `fmadd` instruction), and the last
+            // bit of `xy` decides ties in the search below. So aarch64 does
+            // the same. The other sums of this function are exact either
+            // way: their products are small whole numbers.
+            #[cfg(target_arch = "aarch64")]
+            {
+                xy = a.mul_add(yf, xy);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                xy += a * yf;
+            }
+            *y2 = 2.0 * yf;
+            pulses_left -= pulses;
+        }
+    }
+
+    // "This should never happen, but just in case it does (e.g. on silence)
+    // we fill the first bin with pulses."
+    if pulses_left > n as i32 + 3 {
+        let tmp = pulses_left as f32;
+        yy += tmp * tmp;
+        yy += tmp * y2f[0];
+        y[0] += pulses_left;
+        pulses_left = 0;
+    }
+
+    for _ in 0..pulses_left {
+        // "The squared magnitude term gets added anyway, so we might as well
+        // add it outside the loop."
         yy += 1.0;
         let best_id = pvq_best_position::<true>(abs_x, y2f, xy, yy);
         xy += abs_x[best_id];
@@ -1632,26 +1766,39 @@ fn pvq_search_small_k(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         y[best_id] += 1;
     }
 
+    // "Put the original sign back."
     for (yi, &sg) in y.iter_mut().zip(sign_x.iter()) {
         *yi = (*yi ^ -sg) + sg;
     }
 }
 
+/// Pulse search for bands of up to 32 values, with the exact comparison of
+/// libopus (`op_pvq_search_c`). Every target without its own kernel runs it
+/// for all such bands; aarch64 runs it for 17 to 31 values.
+///
+/// Panics when `x` or `y` holds fewer than `n` values or `n` exceeds 32.
 #[inline]
 fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
-    debug_assert!(n <= 31);
+    // The scratch arrays hold 32 values and the start-up kernels read
+    // `x[..n]` through pointers, so the sizes are checked in release builds
+    // too. `pvq_search` passes at most 31 values and has checked the slices;
+    // the compiler then drops this check.
+    assert!(n <= 32 && x.len() >= n && y.len() >= n);
+    let x = &x[..n];
+    let y = &mut y[..n];
+
     let mut k = k;
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
 
-    y[..n].fill(0);
+    y.fill(0);
 
     if k <= 0 {
         return;
     }
 
     if k <= 4 {
-        pvq_search_small_k(x, y, k, n);
+        pvq_search_libopus(x, y, k, n);
         return;
     }
 
@@ -1659,8 +1806,10 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     let mut y2f = [0.0f32; 32];
     let mut sign_x = [0i32; 32];
 
+    // SAFETY: `x` holds exactly `n` values and `n <= 32` (checked at entry).
     #[cfg(target_arch = "aarch64")]
     let sum = unsafe { pvq_search_scalar_init_neon(x, n, &mut abs_x, &mut sign_x) };
+    // SAFETY: as above; the AVX2 kernel runs only when the CPU has AVX2.
     #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
     let sum = unsafe {
         if crate::compat::x86_has_avx2() {
@@ -1690,126 +1839,100 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         s
     };
 
+    let abs_x = &abs_x[..n];
+    let y2f = &mut y2f[..n];
+    let sign_x = &sign_x[..n];
+
     if k > (n >> 1) as i32 && sum > 1e-15 {
         let rcp = (k as f32 + 0.8) / sum;
 
-        let abs_x_ptr = abs_x.as_ptr();
-        let y2f_ptr = y2f.as_mut_ptr();
-        let y_ptr = y.as_mut_ptr();
-        unsafe {
-            for i in 0..n {
-                let yi = (*abs_x_ptr.add(i) * rcp) as i32;
-                *y_ptr.add(i) = yi;
-                let yf = yi as f32;
-                yy += yf * yf;
-                xy += yf * *abs_x_ptr.add(i);
-                *y2f_ptr.add(i) = 2.0 * yf;
-                k -= yi;
-            }
+        for ((yi_out, y2), &ax) in y.iter_mut().zip(y2f.iter_mut()).zip(abs_x) {
+            let yi = (ax * rcp) as i32;
+            *yi_out = yi;
+            let yf = yi as f32;
+            yy += yf * yf;
+            xy += yf * ax;
+            *y2 = 2.0 * yf;
+            k -= yi;
+        }
 
-            if k > n as i32 + 3 {
-                let tmp = k as f32;
-                yy += tmp * tmp;
-                yy += tmp * *y_ptr as f32;
-                *y_ptr += k;
-                *y2f_ptr = 2.0 * *y_ptr as f32;
-                k = 0;
-            }
+        if k > n as i32 + 3 {
+            let tmp = k as f32;
+            yy += tmp * tmp;
+            yy += tmp * y[0] as f32;
+            y[0] += k;
+            y2f[0] = 2.0 * y[0] as f32;
+            k = 0;
         }
     }
 
-    {
-        let abs_x = &abs_x[..n];
-        let y2f = &mut y2f[..n];
-        let y = &mut y[..n];
-        while k > 0 {
-            yy += 1.0;
-            let best_id = pvq_best_position::<true>(abs_x, y2f, xy, yy);
-            xy += abs_x[best_id];
-            yy += y2f[best_id];
-            y2f[best_id] += 2.0;
-            y[best_id] += 1;
-            k -= 1;
-        }
+    while k > 0 {
+        yy += 1.0;
+        let best_id = pvq_best_position::<true>(abs_x, y2f, xy, yy);
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
+        k -= 1;
     }
 
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        let sign_ptr = sign_x.as_ptr();
-        for i in 0..n {
-            let s = *sign_ptr.add(i);
-            *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
-        }
+    for (yi, &s) in y.iter_mut().zip(sign_x) {
+        *yi = (*yi ^ -s) + s;
     }
 }
 
+/// Pulse search on aarch64 for bands of up to 16 values.
+///
+/// With more than four pulses the positions are scored with the processor's
+/// estimate of `1 / sqrt` (`vrsqrteq_f32`), and the last position with the
+/// largest score wins. That differs from the exact comparison of libopus
+/// and of `pvq_search_scalar`, and the encoder output depends on it.
+///
+/// Panics when `x` or `y` holds fewer than `n` values or `n` exceeds 16.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     use core::arch::aarch64::*;
 
-    debug_assert!(n <= 16);
+    // The scratch arrays hold 16 values and the loops below read `x[..n]`
+    // and write `y[..n]` through pointers, so the sizes are checked in
+    // release builds too. `pvq_search` passes at most 16 values and has
+    // checked the slices; the compiler then drops this check.
+    assert!(n <= 16 && x.len() >= n && y.len() >= n);
+    let x = &x[..n];
+    let y = &mut y[..n];
+
     let mut k = k;
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
 
-    y[..n].fill(0);
+    y.fill(0);
 
     if k <= 0 {
         return;
     }
 
     if k <= 4 {
-        let mut abs_x_arr = [0.0f32; 16];
-        let mut y2f_arr = [0.0f32; 16];
-        let mut sign_x_arr = [0i32; 16];
-
-        unsafe {
-            let vzero = vdupq_n_f32(0.0);
-            let n4 = n & !3;
-            for i in (0..n4).step_by(4) {
-                let vx = vld1q_f32(x.as_ptr().add(i));
-                let vabs = vabsq_f32(vx);
-                vst1q_f32(abs_x_arr.as_mut_ptr().add(i), vabs);
-                let vneg = vcltq_f32(vx, vzero);
-                let vsign = vandq_u32(vneg, vdupq_n_u32(1));
-                vst1q_s32(sign_x_arr.as_mut_ptr().add(i), vreinterpretq_s32_u32(vsign));
-            }
-            for i in n4..n {
-                let xi = x[i];
-                abs_x_arr[i] = xi.abs();
-                sign_x_arr[i] = (xi < 0.0) as i32;
-            }
-        }
-
-        let mut yy_local = 0.0f32;
-        let mut xy_local = 0.0f32;
-
-        // This path compares the numerators without squaring them.
-        let abs_x = &abs_x_arr[..n];
-        let y2f = &mut y2f_arr[..n];
-        let y = &mut y[..n];
-        for _ in 0..k {
-            yy_local += 1.0;
-            let best_id = pvq_best_position::<false>(abs_x, y2f, xy_local, yy_local);
-            xy_local += abs_x[best_id];
-            yy_local += y2f[best_id];
-            y2f[best_id] += 2.0;
-            y[best_id] += 1;
-        }
-
-        for (yi, &sg) in y.iter_mut().zip(sign_x_arr.iter()) {
-            *yi = (*yi ^ -sg) + sg;
-        }
+        // Few pulses: the search of libopus. The loop that was here chose
+        // the position with the largest `Rxy / Ryy`. libopus chooses the
+        // largest `Rxy * Rxy / Ryy`, which is what makes the pulse vector
+        // close to the input (celt/vq.c, op_pvq_search_c: "we maximise
+        // Rxy/sqrt(Ryy)"). It also skipped the projection step for bands
+        // of fewer than 8 values.
+        pvq_search_libopus(x, y, k, n);
         return;
     }
 
-    let mut abs_x_mu = [MaybeUninit::<f32>::uninit(); 20];
-    let mut y2f_mu = [MaybeUninit::<f32>::uninit(); 20];
+    let mut abs_x_mu = [MaybeUninit::<f32>::uninit(); 16];
     let mut sign_x_mu = [MaybeUninit::<i32>::uninit(); 16];
+    // Twice the number of pulses at each position so far. It starts at zero
+    // for the case that no pulse is placed before the loop at the end.
+    let mut y2f_arr = [0.0f32; 16];
     let mut sum;
 
     let n4 = n & !3;
+    // SAFETY: each pass reads `x[i..i + 4]` and writes values `i..i + 4` of
+    // the two arrays, with `i + 4 <= n4 <= n <= 16`.
     unsafe {
         let mut vsum = vdupq_n_f32(0.0);
         let vzero = vdupq_n_f32(0.0);
@@ -1836,14 +1959,18 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         sign_x_mu[i].write((xi < 0.0) as i32);
     }
 
-    let abs_x = unsafe { core::slice::from_raw_parts_mut(abs_x_mu.as_mut_ptr() as *mut f32, 20) };
-    let y2f = unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, 20) };
-    let sign_x = unsafe { core::slice::from_raw_parts_mut(sign_x_mu.as_mut_ptr() as *mut i32, 16) };
+    // SAFETY: the two loops above wrote the first `n` values of both arrays,
+    // and `n <= 16`.
+    let abs_x = unsafe { core::slice::from_raw_parts(abs_x_mu.as_ptr() as *const f32, n) };
+    let sign_x = unsafe { core::slice::from_raw_parts(sign_x_mu.as_ptr() as *const i32, n) };
+    let y2f = &mut y2f_arr[..n];
 
-    let ran_presearch = k > (n >> 1) as i32 && sum > 1e-15;
-    if ran_presearch {
+    if k > (n >> 1) as i32 && sum > 1e-15 {
         let rcp = (k as f32 + 0.8) / sum;
 
+        // SAFETY: each pass reads `abs_x[i..i + 4]` and writes
+        // `y[i..i + 4]` and `y2f[i..i + 4]`, with `i + 4 <= n4 <= n`. The
+        // three slices hold `n` values each.
         unsafe {
             let vrcp = vdupq_n_f32(rcp);
             let mut vyy = vdupq_n_f32(0.0);
@@ -1888,74 +2015,28 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
             y2f[0] = 2.0 * y[0] as f32;
             k = 0;
         }
-    } else {
-        for i in 0..n {
-            y2f[i] = 0.0;
-        }
     }
 
-    unsafe {
-        let abs_x_ptr = abs_x.as_ptr();
-        let y2f_ptr = y2f.as_mut_ptr();
-        let y_ptr = y.as_mut_ptr();
-        let n4 = n & !3;
-
-        for _ in 0..k {
-            yy += 1.0;
-
-            let vxy = vdupq_n_f32(xy);
-            let vyy = vdupq_n_f32(yy);
-            let mut vmax = vdupq_n_f32(0.0);
-            let mut best_id: usize = 0;
-
-            let mut j = 0;
-            while j < n4 {
-                let vx = vld1q_f32(abs_x_ptr.add(j));
-                let vy = vld1q_f32(y2f_ptr.add(j));
-                let rxy = vaddq_f32(vx, vxy);
-                let ryy = vaddq_f32(vy, vyy);
-                let inv_sqrt = vrsqrteq_f32(ryy);
-                let score = vmulq_f32(rxy, inv_sqrt);
-                vmax = vmaxq_f32(vmax, score);
-                let sc = core::slice::from_raw_parts(&score as *const float32x4_t as *const f32, 4);
-                let mx = vmaxvq_f32(vmax);
-                for lane in 0..4 {
-                    if sc[lane] == mx {
-                        best_id = j + lane;
-                    }
-                }
-                j += 4;
-            }
-
-            while j < n {
-                let rxy = xy + *abs_x_ptr.add(j);
-                let ryy = yy + *y2f_ptr.add(j);
-                let score = rxy * (1.0 / ryy.sqrt());
-                let current_max = vmaxvq_f32(vmax);
-                if score > current_max {
-                    best_id = j;
-                    vmax = vsetq_lane_f32(score, vmax, 0);
-                }
-                j += 1;
-            }
-
-            xy += *abs_x_ptr.add(best_id);
-            yy += *y2f_ptr.add(best_id);
-            *y2f_ptr.add(best_id) += 2.0;
-            *y_ptr.add(best_id) += 1;
-        }
+    // At most four groups of four: they are scored group by group (see
+    // `pvq_estimate_position_neon` for why).
+    for _ in 0..k {
+        yy += 1.0;
+        let best_id = pvq_estimate_position_by_group_neon(abs_x, y2f, xy, yy);
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
     }
 
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        let sign_ptr = sign_x.as_ptr();
-        for i in 0..n {
-            let s = *sign_ptr.add(i);
-            *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
-        }
+    for (yi, &s) in y.iter_mut().zip(sign_x) {
+        *yi = (*yi ^ -s) + s;
     }
 }
 
+/// # Safety
+///
+/// `n` must be at most 32, `x` and `y` must hold at least `n` values each,
+/// and the CPU must have AVX2 and FMA.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -2384,15 +2465,33 @@ pub fn exp_rotation(x: &mut [f32], length: usize, dir: i32, stride: usize, k: i3
     }
 }
 
+/// Portable form of `extract_collapse_mask` for `b >= 2`. It is the
+/// reference for the NEON form in the tests.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline(always)]
+fn extract_collapse_mask_scalar(iy: &[i32], n: usize, b: usize) -> u32 {
+    let n0 = n / b;
+    let mut collapse_mask = 0u32;
+    for i in 0..b {
+        let mut tmp = 0i32;
+        let base = i * n0;
+        for j in 0..n0 {
+            tmp |= iy[base + j];
+        }
+        if tmp != 0 {
+            collapse_mask |= 1 << i;
+        }
+    }
+    collapse_mask
+}
+
+/// NEON form of `extract_collapse_mask` for `b >= 2`: four values per test,
+/// and a block is left at its first pulse.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
+fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
     use core::arch::aarch64::*;
 
-    if b <= 1 {
-        return 1;
-    }
     let n0 = n / b;
     let mut collapse_mask = 0u32;
 
@@ -2401,28 +2500,19 @@ unsafe fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
         let slice = &iy[base..base + n0];
 
         let mut any_nonzero = false;
-        let n4 = n0 & !3;
-        let mut j = 0;
-
-        while j < n4 {
-            let v = vld1q_s32(slice.as_ptr().add(j));
-
-            let or_val = vorrq_s32(v, vextq_s32(v, v, 2));
-            let or_val = vorrq_s32(or_val, vextq_s32(or_val, or_val, 1));
-            if vgetq_lane_s32(or_val, 0) != 0 {
+        let (quads, tail) = slice.as_chunks::<4>();
+        for q in quads {
+            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // The load reads one `[i32; 4]`.
+            let any = unsafe { vmaxvq_u32(vreinterpretq_u32_s32(vld1q_s32(q.as_ptr()))) };
+            if any != 0 {
                 any_nonzero = true;
                 break;
             }
-            j += 4;
         }
 
         if !any_nonzero {
-            for j in j..n0 {
-                if slice[j] != 0 {
-                    any_nonzero = true;
-                    break;
-                }
-            }
+            any_nonzero = tail.iter().any(|&v| v != 0);
         }
 
         if any_nonzero {
@@ -2432,6 +2522,9 @@ unsafe fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
     collapse_mask
 }
 
+/// Which of the `b` blocks of the pulse vector `iy[..n]` have a pulse: bit
+/// `i` is set when one of the `n / b` values of block `i` is not zero. A
+/// single block (`b <= 1`) always counts as filled.
 #[inline(always)]
 pub fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
     if b <= 1 {
@@ -2439,27 +2532,18 @@ pub fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
+    {
         extract_collapse_mask_neon(iy, n, b)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let n0 = n / b;
-        let mut collapse_mask = 0u32;
-        for i in 0..b {
-            let mut tmp = 0i32;
-            let base = i * n0;
-            for j in 0..n0 {
-                tmp |= iy[base + j];
-            }
-            if tmp != 0 {
-                collapse_mask |= 1 << i;
-            }
-        }
-        collapse_mask
+        extract_collapse_mask_scalar(iy, n, b)
     }
 }
 
+/// # Safety
+///
+/// `x` must hold at least `n` values, and the CPU must have AVX2 and FMA.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -2517,6 +2601,10 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     }
 }
 
+/// # Safety
+///
+/// `y` and `x` must hold at least `n` values each, and the CPU must have the
+/// features this function is compiled for.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -2564,6 +2652,10 @@ unsafe fn alg_quant_resynth_avx2(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
     }
 }
 
+/// # Safety
+///
+/// `n` must be at most 32, `x` must hold at least `n` values, and the CPU must
+/// have the features this function is compiled for.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -2609,12 +2701,19 @@ unsafe fn pvq_search_scalar_init_avx2(
     sum
 }
 
+/// NEON kernel of `renormalise_vector`.
+///
+/// # Safety
+///
+/// `x` must hold at least `n` values. Every load and store covers
+/// `x[i..i + 4]` with `i + 4 <= n`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
     use core::arch::aarch64::*;
 
+    debug_assert!(x.len() >= n);
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
 
@@ -2684,11 +2783,21 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
     }
 }
 
+/// Scales `x[..n]` so that its energy becomes `gain * gain`.
+///
+/// The codec uses `bands::renormalise_vector`, which rounds the gain in a
+/// different way. Panics when `x` holds fewer than `n` values.
 pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
+    // The only bounds check. The vector kernels read and write `n` values
+    // through pointers.
+    let x = &mut x[..n];
+    // SAFETY: `x` holds exactly `n` values.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         renormalise_vector_neon(x, n, gain);
     }
+    // SAFETY: `x` holds exactly `n` values, and the kernel runs only when
+    // the CPU has the features it is compiled for.
     #[cfg(target_arch = "x86_64")]
     unsafe {
         if n >= 8 && crate::compat::x86_has_avx2_fma() {
@@ -2709,78 +2818,116 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+/// Portable form of `alg_quant_resynth`; `y` and `x` have the same length.
+/// The energy of `y` is summed one square after the other.
+///
+/// The squares and their sums are whole numbers. As long as the energy stays
+/// below 2^24 every order of summation gives the same value, so this form
+/// and the NEON form agree bit for bit. The tests check that.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
-    use core::arch::aarch64::*;
-
-    let mut sum_vec = vdupq_n_f32(0.0);
-    let n8 = n & !7;
-    let mut i = 0;
-
-    while i < n8 {
-        let yi0 = vld1q_s32(y.as_ptr().add(i));
-        let yi1 = vld1q_s32(y.as_ptr().add(i + 4));
-
-        let yf0 = vcvtq_f32_s32(yi0);
-        let yf1 = vcvtq_f32_s32(yi1);
-
-        vst1q_f32(x.as_mut_ptr().add(i), yf0);
-        vst1q_f32(x.as_mut_ptr().add(i + 4), yf1);
-
-        sum_vec = vfmaq_f32(sum_vec, yf0, yf0);
-        sum_vec = vfmaq_f32(sum_vec, yf1, yf1);
-
-        i += 8;
-    }
-
-    let mut ryy = vaddvq_f32(sum_vec);
-    for j in i..n {
-        let v = y[j] as f32;
-        x[j] = v;
+fn alg_quant_resynth_scalar(y: &[i32], x: &mut [f32], gain: f32) {
+    debug_assert_eq!(y.len(), x.len());
+    let mut ryy = 0.0f32;
+    for (xv, &yv) in x.iter_mut().zip(y) {
+        let v = yv as f32;
+        *xv = v;
         ryy += v * v;
     }
-
     let g = gain / (1e-15 + ryy).sqrt();
-    let vg = vdupq_n_f32(g);
-
-    i = 0;
-    while i < n8 {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let vr0 = vmulq_f32(vx0, vg);
-        let vr1 = vmulq_f32(vx1, vg);
-        vst1q_f32(x.as_mut_ptr().add(i), vr0);
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vr1);
-        i += 8;
-    }
-
-    for j in i..n {
-        x[j] *= g;
+    for xv in x.iter_mut() {
+        *xv *= g;
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+/// NEON form of `alg_quant_resynth`. `y` must be at least as long as `x`;
+/// the first `x.len()` values are used.
+///
+/// The energy is summed in four lanes with fused multiply-add over the
+/// largest multiple of eight values, the lanes are added in pairs, and the
+/// squares of the last values are added one by one.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn alg_quant_resynth_scalar(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
-    #[cfg(target_arch = "x86_64")]
+fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], gain: f32) {
+    use core::arch::aarch64::*;
+
+    let n = x.len();
+    // One bounds check; the loads and stores below rely on it.
+    let y = &y[..n];
+    let n8 = n & !7;
+
+    // SAFETY: NEON is part of the baseline of every aarch64 target. Both
+    // slices hold exactly `n` values. Every vector load or store covers
+    // `y[i..i + 8]` or `x[i..i + 8]` with `i + 8 <= n8 <= n`.
     unsafe {
+        let mut sum_vec = vdupq_n_f32(0.0);
+        let mut i = 0;
+
+        while i < n8 {
+            let yi0 = vld1q_s32(y.as_ptr().add(i));
+            let yi1 = vld1q_s32(y.as_ptr().add(i + 4));
+
+            let yf0 = vcvtq_f32_s32(yi0);
+            let yf1 = vcvtq_f32_s32(yi1);
+
+            vst1q_f32(x.as_mut_ptr().add(i), yf0);
+            vst1q_f32(x.as_mut_ptr().add(i + 4), yf1);
+
+            sum_vec = vfmaq_f32(sum_vec, yf0, yf0);
+            sum_vec = vfmaq_f32(sum_vec, yf1, yf1);
+
+            i += 8;
+        }
+
+        let mut ryy = vaddvq_f32(sum_vec);
+        for j in i..n {
+            let v = y[j] as f32;
+            x[j] = v;
+            ryy += v * v;
+        }
+
+        let g = gain / (1e-15 + ryy).sqrt();
+        let vg = vdupq_n_f32(g);
+
+        i = 0;
+        while i < n8 {
+            let vx0 = vld1q_f32(x.as_ptr().add(i));
+            let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
+            let vr0 = vmulq_f32(vx0, vg);
+            let vr1 = vmulq_f32(vx1, vg);
+            vst1q_f32(x.as_mut_ptr().add(i), vr0);
+            vst1q_f32(x.as_mut_ptr().add(i + 4), vr1);
+            i += 8;
+        }
+
+        for j in i..n {
+            x[j] *= g;
+        }
+    }
+}
+
+/// Turns the pulse vector `y[..n]` into the band `x[..n]` with the energy
+/// `gain * gain`: `x[i] = y[i] * gain / sqrt(1e-15 + energy of y)`.
+///
+/// Panics when `y` or `x` holds fewer than `n` values. This is the check
+/// that keeps the vector kernels inside the two slices.
+#[inline(always)]
+fn alg_quant_resynth(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
+    let y = &y[..n];
+    let x = &mut x[..n];
+    #[cfg(target_arch = "aarch64")]
+    alg_quant_resynth_neon(y, x, gain);
+    #[cfg(target_arch = "x86_64")]
+    {
         if crate::compat::x86_has_avx2_fma() {
-            alg_quant_resynth_avx2(y, x, n, gain);
+            // SAFETY: both slices hold exactly `n` values, and the CPU has
+            // the features the kernel is compiled for.
+            unsafe { alg_quant_resynth_avx2(y, x, n, gain) };
             return;
         }
     }
-    let mut ryy = 0.0f32;
-    for i in 0..n {
-        let v = y[i] as f32;
-        x[i] = v;
-        ryy += v * v;
-    }
-    let g = gain / (1e-15 + ryy).sqrt();
-    for i in 0..n {
-        x[i] *= g;
-    }
+    #[cfg(not(target_arch = "aarch64"))]
+    alg_quant_resynth_scalar(y, x, gain);
 }
 
 fn ec_enc_refine(rc: &mut RangeCoder, refine: i32, up: i32, extra_bits: i32) {
@@ -2810,6 +2957,9 @@ pub fn alg_quant(
 ) -> u32 {
     if n <= 32 {
         let mut y_buf = [MaybeUninit::<i32>::uninit(); 32];
+        // SAFETY: `n <= 32` values fit in the buffer. `pvq_search` writes
+        // all `n` values before anything reads them (it panics if `x` is
+        // shorter than `n`).
         let y = unsafe { core::slice::from_raw_parts_mut(y_buf.as_mut_ptr() as *mut i32, n) };
 
         exp_rotation(x, n, 1, stride, k, spread);
@@ -2819,32 +2969,26 @@ pub fn alg_quant(
         encode_pulses(y, n as u32, k as u32, rc);
 
         if resynth {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                alg_quant_resynth_neon(y, x, n, gain);
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            alg_quant_resynth_scalar(y, x, n, gain);
+            alg_quant_resynth(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
         }
         mask
     } else {
+        // A band never has more than MAX_PVQ_N values. Checked in release
+        // builds too, because the slice below must fit in the buffer.
+        assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
         let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-        let y =
-            unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
+        // SAFETY: `n` values fit in the buffer (checked above).
+        // `pvq_search` writes all `n` values before anything reads them.
+        let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
 
         exp_rotation(x, n, 1, stride, k, spread);
-        pvq_search(x, &mut y[..n], k, n);
-        let mask = extract_collapse_mask(&y[..n], n, stride);
-        encode_pulses(&y[..n], n as u32, k as u32, rc);
+        pvq_search(x, y, k, n);
+        let mask = extract_collapse_mask(y, n, stride);
+        encode_pulses(y, n as u32, k as u32, rc);
 
         if resynth {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                alg_quant_resynth_neon(y, x, n, gain);
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            alg_quant_resynth_scalar(y, x, n, gain);
+            alg_quant_resynth(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
         }
         mask
@@ -2889,12 +3033,7 @@ pub fn alg_quant_qext(
             }
 
             if resynth {
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    alg_quant_resynth_neon(y, x, n, gain);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                alg_quant_resynth_scalar(y, x, n, gain);
+                alg_quant_resynth(y, x, n, gain);
                 exp_rotation(x, n, -1, stride, k, spread);
             }
             return mask;
@@ -2918,12 +3057,7 @@ pub fn alg_quant_qext(
             }
 
             if resynth {
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    alg_quant_resynth_neon(&up_y, x, n, gain);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                alg_quant_resynth_scalar(&up_y, x, n, gain);
+                alg_quant_resynth(&up_y, x, n, gain);
                 exp_rotation(x, n, -1, stride, k, spread);
             }
             return mask;
@@ -2934,24 +3068,22 @@ pub fn alg_quant_qext(
         encode_pulses(y, n as u32, k as u32, rc);
 
         if resynth {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                alg_quant_resynth_neon(y, x, n, gain);
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            alg_quant_resynth_scalar(y, x, n, gain);
+            alg_quant_resynth(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
         }
         mask
     } else {
+        // As in `alg_quant`.
+        assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
         let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-        let y =
-            unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
+        // SAFETY: `n` values fit in the buffer (checked above).
+        // `pvq_search` writes all `n` values before anything reads them.
+        let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
 
         exp_rotation(x, n, 1, stride, k, spread);
-        pvq_search(x, &mut y[..n], k, n);
-        let mask = extract_collapse_mask(&y[..n], n, stride);
-        encode_pulses(&y[..n], n as u32, k as u32, rc);
+        pvq_search(x, y, k, n);
+        let mask = extract_collapse_mask(y, n, stride);
+        encode_pulses(y, n as u32, k as u32, rc);
 
         if resynth {
             let mut ryy = 0.0f32;
@@ -2980,20 +3112,21 @@ pub fn alg_unquant(
     rc: &mut RangeCoder,
     gain: f32,
 ) -> u32 {
+    // A band never has more than MAX_PVQ_N values. Checked in release
+    // builds too, because the slice below must fit in the buffer.
+    assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
     let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
-    decode_pulses(&mut y[..n], n as u32, k as u32, rc);
+    // SAFETY: `n` values fit in the buffer (checked above). `decode_pulses`
+    // writes all `n` values before anything reads them.
+    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
+    decode_pulses(y, n as u32, k as u32, rc);
 
-    let mask = extract_collapse_mask(&y[..n], n, stride);
+    let mask = extract_collapse_mask(y, n, stride);
 
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        alg_quant_resynth_neon(&y[..n], x, n, gain);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        alg_quant_resynth_scalar(&y[..n], x, n, gain);
-    }
+    // This call checks that `x` holds `n` values. Without that check the
+    // vector kernel wrote the decoded band through a pointer, past the end
+    // of a shorter `x`.
+    alg_quant_resynth(y, x, n, gain);
 
     exp_rotation(x, n, -1, stride, k, spread);
 
@@ -3438,6 +3571,480 @@ mod tests {
                         "len {len} stride {stride}: {a} vs {b}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Lengths that cover every tail of the 16, 8 and 4 wide loops, and the
+    /// largest band.
+    fn kernel_lengths() -> impl Iterator<Item = usize> {
+        (0..=41).chain([63, 64, 65, 88, 127, 176, MAX_PVQ_N])
+    }
+
+    #[test]
+    fn alg_quant_resynth_forms_agree() {
+        let mut rng = Lcg(31);
+        for n in kernel_lengths() {
+            for round in 0..40 {
+                // Pulse vectors as the codec has them, and denser ones up
+                // to an energy just below 2^24.
+                let top: i32 = match round % 4 {
+                    0 => 1,
+                    1 => 3,
+                    2 => 40,
+                    _ => 200,
+                };
+                let mut y: Vec<i32> = (0..n)
+                    .map(|_| {
+                        let v = (rng.next_u32() % (2 * top as u32 + 1)) as i32 - top;
+                        if round % 3 == 0 && rng.next_u32() % 4 != 0 { 0 } else { v }
+                    })
+                    .collect();
+                if round == 7 {
+                    y.fill(0);
+                }
+                let energy: i64 = y.iter().map(|&v| v as i64 * v as i64).sum();
+                assert!(energy < 1 << 24);
+                let gain = [1.0f32, 0.37, 0.0, 1.0e-3][round % 4];
+                let what = format!("n {n} round {round}");
+
+                // The definition, with an indexed loop.
+                let mut want = vec![0.0f32; n];
+                let mut ryy = 0.0f32;
+                for i in 0..n {
+                    want[i] = y[i] as f32;
+                    ryy += want[i] * want[i];
+                }
+                let g = gain / (1e-15 + ryy).sqrt();
+                for v in want.iter_mut() {
+                    *v *= g;
+                }
+
+                let mut got = vec![7.0f32; n];
+                alg_quant_resynth_scalar(&y, &mut got, gain);
+                assert_eq!(bits(&got), bits(&want), "scalar, {what}");
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // A longer `y`: only the first `n` values count.
+                    let mut y_long = y.clone();
+                    y_long.extend([1000, -1000, 5]);
+                    let mut got = vec![7.0f32; n];
+                    alg_quant_resynth_neon(&y_long, &mut got, gain);
+                    assert_eq!(bits(&got), bits(&want), "neon, {what}");
+                }
+
+                // The dispatching function leaves everything after `n` alone.
+                let mut got = vec![7.0f32; n + 3];
+                alg_quant_resynth(&y, &mut got, n, gain);
+                assert_eq!(bits(&got[..n]), bits(&want), "dispatch, {what}");
+                assert_eq!(&got[n..], &[7.0, 7.0, 7.0], "dispatch tail, {what}");
+            }
+        }
+    }
+
+    /// The resynthesis must not write past a band that is shorter than `n`.
+    /// Before the check in `alg_quant_resynth`, `alg_unquant` on aarch64 wrote
+    /// the decoded band through a pointer without looking at `x.len()`.
+    #[test]
+    fn resynthesis_rejects_a_band_that_is_too_short() {
+        let y = [1i32; 16];
+        let short = std::panic::catch_unwind(|| {
+            let mut x = [0.0f32; 15];
+            alg_quant_resynth(&y, &mut x, 16, 1.0);
+        });
+        assert!(short.is_err(), "alg_quant_resynth with a short x");
+        let short = std::panic::catch_unwind(|| {
+            let mut x = [0.0f32; 16];
+            alg_quant_resynth(&y[..15], &mut x, 16, 1.0);
+        });
+        assert!(short.is_err(), "alg_quant_resynth with a short y");
+
+        for n in [8usize, 16, 24, 48] {
+            let unquant = std::panic::catch_unwind(|| {
+                let packet = [0x5au8; 64];
+                let mut rc = RangeCoder::new_decoder(&packet);
+                let mut x = vec![0.0f32; n - 1];
+                alg_unquant(&mut x, n, 3, 0, 1, &mut rc, 1.0);
+            });
+            assert!(unquant.is_err(), "alg_unquant, n {n}");
+            let quant = std::panic::catch_unwind(|| {
+                let mut rc = RangeCoder::new_encoder(64);
+                let mut x = vec![0.25f32; n - 1];
+                alg_quant(&mut x, n, 3, 0, 1, &mut rc, 1.0, true);
+            });
+            assert!(quant.is_err(), "alg_quant, n {n}");
+        }
+        let renorm = std::panic::catch_unwind(|| {
+            let mut x = [0.5f32; 15];
+            renormalise_vector(&mut x, 16, 1.0);
+        });
+        assert!(renorm.is_err(), "renormalise_vector with a short x");
+    }
+
+    #[test]
+    fn extract_collapse_mask_forms_agree() {
+        let mut rng = Lcg(32);
+        for n in 0..=72usize {
+            for b in 2..=8usize {
+                let n0 = n / b;
+                // All zero, one pulse at every position in turn, and random
+                // sparse vectors.
+                let mut cases: Vec<Vec<i32>> = vec![vec![0; n]];
+                for at in 0..n {
+                    let mut y = vec![0i32; n];
+                    y[at] = if at % 2 == 0 { 1 } else { -3 };
+                    cases.push(y);
+                }
+                for _ in 0..8 {
+                    cases.push(
+                        (0..n)
+                            .map(|_| if rng.next_u32() % 9 == 0 { (rng.next_u32() % 5) as i32 - 2 } else { 0 })
+                            .collect(),
+                    );
+                }
+                for y in &cases {
+                    // The definition.
+                    let mut want = 0u32;
+                    for i in 0..b {
+                        if y[i * n0..(i + 1) * n0].iter().any(|&v| v != 0) {
+                            want |= 1 << i;
+                        }
+                    }
+                    assert_eq!(extract_collapse_mask_scalar(y, n, b), want, "scalar n {n} b {b}");
+                    #[cfg(target_arch = "aarch64")]
+                    assert_eq!(extract_collapse_mask_neon(y, n, b), want, "neon n {n} b {b}");
+                    assert_eq!(extract_collapse_mask(y, n, b), want, "dispatch n {n} b {b}");
+                }
+            }
+        }
+        // One block always counts as filled.
+        assert_eq!(extract_collapse_mask(&[0, 0, 0], 3, 1), 1);
+        assert_eq!(extract_collapse_mask(&[], 0, 0), 1);
+    }
+
+    /// `pvq_estimate_position_neon` written as plain loops: the score of
+    /// every position first, then the rule that picks one.
+    #[cfg(target_arch = "aarch64")]
+    fn estimate_position_model(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
+        use core::arch::aarch64::vrsqrtes_f32;
+        let n = abs_x.len();
+        let n4 = n & !3;
+        let mut best = 0;
+        // The groups of four: the last position with the largest score. A
+        // score that is not a number ends the search.
+        let mut max = 0.0f32;
+        'groups: for g in (0..n4).step_by(4) {
+            let mut scores = [0.0f32; 4];
+            for l in 0..4 {
+                // SAFETY: NEON is part of the baseline of every aarch64 target.
+                let estimate = unsafe { vrsqrtes_f32(yy + y2f[g + l]) };
+                scores[l] = (xy + abs_x[g + l]) * estimate;
+            }
+            if scores.iter().any(|s| s.is_nan()) {
+                max = f32::NAN;
+                break 'groups;
+            }
+            for l in 0..4 {
+                max = max.max(scores[l]);
+            }
+            for l in 0..4 {
+                if scores[l] == max {
+                    best = g + l;
+                }
+            }
+        }
+        // The last values: exact square root, and only a larger score wins.
+        for i in n4..n {
+            let score = (xy + abs_x[i]) * (1.0 / (yy + y2f[i]).sqrt());
+            if score > max {
+                max = score;
+                best = i;
+            }
+        }
+        best
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn pvq_estimate_position_neon_matches_its_model() {
+        let mut rng = Lcg(33);
+        for n in (1..=41usize).chain([63, 64, 65, 88, 127, 176, MAX_PVQ_N]) {
+            for round in 0..200 {
+                let mut abs_x: Vec<f32> = (0..n).map(|_| rng.unit().abs()).collect();
+                let mut y2f: Vec<f32> =
+                    (0..n).map(|_| 2.0 * (rng.next_u32() % 4) as f32).collect();
+                let xy = rng.unit().abs() * 4.0;
+                let yy = 1.0 + (rng.next_u32() % 40) as f32;
+                match round % 8 {
+                    // Many equal candidates: the last one of the groups wins.
+                    1 => {
+                        let v = abs_x[0];
+                        abs_x.fill(v);
+                        y2f.fill(2.0);
+                    }
+                    // Two values only, so that ties are common.
+                    2 => {
+                        for v in abs_x.iter_mut() {
+                            *v = if *v > 0.5 { 0.75 } else { 0.25 };
+                        }
+                        y2f.fill(0.0);
+                    }
+                    // The best position is the last one, or the first one.
+                    3 => abs_x[n - 1] = 3.0,
+                    4 => abs_x[0] = 3.0,
+                    // The longer buffer of a caller: extra values after n.
+                    5 => y2f.push(123.0),
+                    // All scores zero.
+                    6 => abs_x.fill(0.0),
+                    _ => {}
+                }
+                let xy = if round % 8 == 6 { 0.0 } else { xy };
+                let want = estimate_position_model(&abs_x, &y2f[..n], xy, yy);
+                let got = pvq_estimate_position_neon(&abs_x, &y2f, xy, yy);
+                assert_eq!(got, want, "n {n} round {round} xy {xy} yy {yy}");
+                assert!(got < n);
+                let plain = pvq_estimate_position_by_group_neon(&abs_x, &y2f, xy, yy);
+                assert_eq!(plain, want, "plain form, n {n} round {round} xy {xy} yy {yy}");
+                // Scores below zero do not occur in the codec. The two forms
+                // must still agree: no position, or the last score of zero.
+                for xy_neg in [-0.5f32, -5.0] {
+                    let plain = pvq_estimate_position_by_group_neon(&abs_x, &y2f, xy_neg, yy);
+                    let got = pvq_estimate_position_neon(&abs_x, &y2f, xy_neg, yy);
+                    assert_eq!(got, plain, "n {n} round {round} xy {xy_neg} yy {yy}");
+                }
+            }
+            // Values that are not numbers, and infinities, at every kind of
+            // position.
+            let zeros = vec![0.0f32; n];
+            for at in [0, n / 2, n - 1, n.saturating_sub(5)] {
+                for bad_value in [f32::NAN, f32::INFINITY] {
+                    let mut bad: Vec<f32> = (0..n).map(|_| rng.unit().abs()).collect();
+                    bad[at] = bad_value;
+                    let want = estimate_position_model(&bad, &zeros, 0.5, 2.0);
+                    let got = pvq_estimate_position_neon(&bad, &zeros, 0.5, 2.0);
+                    assert_eq!(got, want, "n {n} {bad_value} at {at}");
+                    let want = estimate_position_model(&zeros, &bad, 0.5, 2.0);
+                    let got = pvq_estimate_position_neon(&zeros, &bad, 0.5, 2.0);
+                    assert_eq!(got, want, "n {n} {bad_value} in y2f at {at}");
+                    for (a, b) in [(&bad, &zeros), (&zeros, &bad)] {
+                        let plain = pvq_estimate_position_by_group_neon(a, b, 0.5, 2.0);
+                        let got = pvq_estimate_position_neon(a, b, 0.5, 2.0);
+                        assert_eq!(got, plain, "plain form, n {n} {bad_value} at {at}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sum of magnitudes as the start-up code of the target adds it.
+    fn magnitude_sum(abs_x: &[f32]) -> f32 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let n4 = abs_x.len() & !3;
+            let mut lanes = [0.0f32; 4];
+            for group in abs_x[..n4].chunks_exact(4) {
+                for l in 0..4 {
+                    lanes[l] += group[l];
+                }
+            }
+            let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            for &v in &abs_x[n4..] {
+                sum += v;
+            }
+            sum
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            abs_x.iter().fold(0.0f32, |s, &v| s + v)
+        }
+    }
+
+    /// The search of libopus (celt/vq.c, op_pvq_search_c) with indexed
+    /// loops: the projection, then one pulse at a time with the exact
+    /// comparison. Returns `None` when more than seven pulses are left after
+    /// the projection; `pvq_search_fast_select` then places four per pass,
+    /// which is a different rule.
+    fn search_reference(x: &[f32], k: i32) -> Option<(Vec<i32>, f32)> {
+        let n = x.len();
+        let abs_x: Vec<f32> = x.iter().map(|v| v.abs()).collect();
+        let sum = magnitude_sum(&abs_x);
+        let mut y = vec![0i32; n];
+        let (mut xy, mut yy) = (0.0f32, 0.0f32);
+        let mut left = k;
+        if k > (n >> 1) as i32 && sum > 1e-15 {
+            let rcp = (k as f32 + 0.8) / sum;
+            for i in 0..n {
+                y[i] = (abs_x[i] * rcp) as i32;
+                let yf = y[i] as f32;
+                yy += yf * yf;
+                xy += yf * abs_x[i];
+                left -= y[i];
+            }
+            if left > n as i32 + 3 {
+                let tmp = left as f32;
+                yy += tmp * tmp + tmp * y[0] as f32;
+                y[0] += left;
+                left = 0;
+            }
+        }
+        if left >= 8 && n >= 16 {
+            return None;
+        }
+        for _ in 0..left {
+            yy += 1.0;
+            let mut best = 0;
+            let mut best_num = (xy + abs_x[0]) * (xy + abs_x[0]);
+            let mut best_den = yy + 2.0 * y[0] as f32;
+            for i in 1..n {
+                let num = (xy + abs_x[i]) * (xy + abs_x[i]);
+                let den = yy + 2.0 * y[i] as f32;
+                if best_den * num > den * best_num {
+                    best = i;
+                    best_num = num;
+                    best_den = den;
+                }
+            }
+            xy += abs_x[best];
+            yy += 2.0 * y[best] as f32;
+            y[best] += 1;
+        }
+        for i in 0..n {
+            if x[i] < 0.0 {
+                y[i] = -y[i];
+            }
+        }
+        Some((y, yy))
+    }
+
+    /// The portable choice of position in `pvq_search_fast_select` gives the
+    /// search of libopus. It did not on targets other than aarch64: there
+    /// the one-pulse-at-a-time stage forgot the pulses that the projection
+    /// had placed.
+    #[test]
+    fn fast_select_with_the_portable_position_is_the_libopus_search() {
+        let mut rng = Lcg(34);
+        let mut with_projection = 0;
+        let mut without_projection = 0;
+        for n in [1usize, 2, 3, 5, 8, 15, 16, 17, 31, 32, 33, 40, 48, 64, 96, 144, 176, MAX_PVQ_N] {
+            for round in 0..60 {
+                // A few large coefficients among small ones, as in a band
+                // that gets many pulses. Then the projection leaves only a
+                // few pulses for the search.
+                let peaks = 1 + (rng.next_u32() as usize % 4).min(n - 1);
+                let floor = [0.0f32, 1.0e-4, 1.0e-2, 0.2][round % 4];
+                let mut x: Vec<f32> = (0..n).map(|_| rng.unit() * floor).collect();
+                for _ in 0..peaks {
+                    let at = rng.next_u32() as usize % n;
+                    x[at] = rng.unit() * 2.0;
+                }
+                for k in [1i32, 2, 5, 7, (n / 2) as i32 + 1, n as i32, 2 * n as i32, 100] {
+                    let Some((want, want_yy)) = search_reference(&x, k) else {
+                        continue;
+                    };
+                    if k > (n >> 1) as i32 {
+                        with_projection += 1;
+                    } else {
+                        without_projection += 1;
+                    }
+                    let mut got = vec![7i32; n + 2];
+                    let yy = pvq_search_fast_select_with(
+                        &x,
+                        &mut got,
+                        k,
+                        n,
+                        pvq_best_position_scalar::<true>,
+                    );
+                    assert_eq!(&got[..n], &want[..], "n {n} k {k} round {round}");
+                    assert_eq!(&got[n..], &[7, 7], "n {n} k {k}: wrote past n");
+                    assert_eq!(yy.to_bits(), want_yy.to_bits(), "n {n} k {k}: energy");
+                }
+            }
+        }
+        // Both kinds of case must have been compared.
+        assert!(with_projection > 1000 && without_projection > 1000);
+    }
+
+    #[test]
+    fn fast_select_checks_its_sizes() {
+        // No dimension: nothing is written and nothing is read.
+        let mut y: [i32; 0] = [];
+        assert_eq!(pvq_search_fast_select(&[], &mut y, 5, 0), 0.0);
+        // No pulse: the vector is cleared.
+        let mut y = [9i32; 40];
+        assert_eq!(pvq_search_fast_select(&[0.5; 40], &mut y, 0, 40), 0.0);
+        assert_eq!(y, [0; 40]);
+
+        let short_x = std::panic::catch_unwind(|| {
+            let mut y = [0i32; 40];
+            pvq_search_fast_select(&[0.5; 39], &mut y, 3, 40);
+        });
+        assert!(short_x.is_err());
+        let short_y = std::panic::catch_unwind(|| {
+            let mut y = [0i32; 39];
+            pvq_search_fast_select(&[0.5; 40], &mut y, 3, 40);
+        });
+        assert!(short_y.is_err());
+        let too_long = std::panic::catch_unwind(|| {
+            let x = vec![0.5f32; MAX_PVQ_N + 1];
+            let mut y = vec![0i32; MAX_PVQ_N + 1];
+            pvq_search_fast_select(&x, &mut y, 3, MAX_PVQ_N + 1);
+        });
+        assert!(too_long.is_err());
+    }
+
+    /// The sum of magnitudes as the NEON start-up kernel computed it before
+    /// `pvq_magnitude_sum` replaced it: one register of four running sums
+    /// over the blocks of 16, 8 and 4 values, a pairwise reduction, and the
+    /// last values added one by one.
+    #[cfg(target_arch = "aarch64")]
+    fn magnitude_sum_old_kernel(abs_x: &[f32]) -> f32 {
+        use core::arch::aarch64::*;
+        let n = abs_x.len();
+        let mut i = 0;
+        // SAFETY: every load reads `abs_x[i..i + 4]` with `i + 4 <= n`.
+        let mut sum = unsafe {
+            let mut sum_vec = vdupq_n_f32(0.0);
+            while i + 16 <= n {
+                for block in 0..4 {
+                    sum_vec = vaddq_f32(sum_vec, vld1q_f32(abs_x.as_ptr().add(i + 4 * block)));
+                }
+                i += 16;
+            }
+            while i + 8 <= n {
+                sum_vec = vaddq_f32(sum_vec, vld1q_f32(abs_x.as_ptr().add(i)));
+                sum_vec = vaddq_f32(sum_vec, vld1q_f32(abs_x.as_ptr().add(i + 4)));
+                i += 8;
+            }
+            while i + 4 <= n {
+                sum_vec = vaddq_f32(sum_vec, vld1q_f32(abs_x.as_ptr().add(i)));
+                i += 4;
+            }
+            vaddvq_f32(sum_vec)
+        };
+        for &v in &abs_x[i..] {
+            sum += v;
+        }
+        sum
+    }
+
+    /// `pvq_magnitude_sum` adds in the order its target has always used.
+    /// The projection step rounds with this sum, so its last bit counts.
+    #[test]
+    fn pvq_magnitude_sum_keeps_the_order_of_its_target() {
+        let mut rng = Lcg(36);
+        for n in kernel_lengths() {
+            for round in 0..40 {
+                let scale = [1.0f32, 1.0e-6, 3.0e4, 1.0e-20][round % 4];
+                let abs_x: Vec<f32> = (0..n).map(|_| rng.unit().abs() * scale).collect();
+                let got = pvq_magnitude_sum(&abs_x);
+                assert_eq!(got.to_bits(), magnitude_sum(&abs_x).to_bits(), "model, n {n}");
+                #[cfg(target_arch = "aarch64")]
+                assert_eq!(
+                    got.to_bits(),
+                    magnitude_sum_old_kernel(&abs_x).to_bits(),
+                    "old kernel, n {n}"
+                );
             }
         }
     }

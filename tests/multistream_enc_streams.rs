@@ -8,10 +8,20 @@
 //! defines them, feeds it the channels of its stream, and compares bytes.
 //! It runs through changes of the bitrate and of the frame size and through
 //! a reset, so it also shows that the multistream encoder carries no state
-//! of its own from frame to frame that reaches the packets.
+//! of its own from frame to frame that reaches the packets, other than that
+//! of the surround analysis.
 //!
-//! tests/multistream_enc_quality.rs does the same for the coupled streams
-//! of one layout at one bitrate.
+//! In surround mode every stream gets an energy mask
+//! (opus_multistream_encoder.c:989-1014). The test computes it with an
+//! analysis of its own, a `SurroundProbe` that sees the same frames and the
+//! same reset, and hands each hand-made encoder the mask of the channels of
+//! its stream: left then right for a coupled stream. It does not take the
+//! mask from the multistream encoder. So the bytes also show that the
+//! analysis runs on every frame with the frame's size, that its result
+//! reaches the right streams, and that a reset clears its state.
+//!
+//! tests/multistream_enc_quality.rs does the same for the streams of the
+//! 7.1 layout at the bitrate of the quality measurements.
 #![cfg(feature = "std")]
 
 mod ms_support;
@@ -21,6 +31,7 @@ use ms_support::*;
 use multistream_enc_common::*;
 use opus_rs::multistream::encoder::MultistreamEncoder;
 use opus_rs::multistream::layout::MappingType;
+use opus_rs::multistream::surround::SurroundProbe;
 use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// A rising sine with a little noise, different on every channel.
@@ -99,6 +110,17 @@ fn stream_limit(limit: usize, used: usize, streams: usize, s: usize) -> usize {
     curr_max as usize
 }
 
+/// The energy mask of a stream: the 21 values of its left or only channel,
+/// then those of its right channel (opus_multistream_encoder.c:989-1008).
+/// `band_smr` holds 21 values per input channel.
+fn stream_mask(band_smr: &[f32], left: usize, right: Option<usize>) -> Vec<f32> {
+    let mut mask = band_smr[21 * left..21 * left + 21].to_vec();
+    if let Some(right) = right {
+        mask.extend_from_slice(&band_smr[21 * right..21 * right + 21]);
+    }
+    mask
+}
+
 /// The frames of an ordinary Opus packet, without header and padding.
 fn frames_of(part: &StreamPacket) -> &[u8] {
     let end = part.packet.len() - part.padding;
@@ -125,6 +147,12 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
         })
         .collect();
 
+    // libopus analyses the input for the surround mapping type only
+    // (opus_multistream_encoder.c:910).
+    let surround = enc.mapping_type() == MappingType::Surround;
+    let mut probe = surround.then(|| SurroundProbe::new(channels, fs));
+    let mut band_smr = vec![0f32; 21 * channels];
+
     let unit = fs as usize / 400;
     // (bitrate per channel, frame size in units of 2.5 ms, frames, reset
     // before the first of them).
@@ -148,6 +176,9 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
         enc.set_bitrate(rust_bitrate(bitrate)).unwrap();
         if reset {
             enc.reset_state();
+            if let Some(probe) = probe.as_mut() {
+                probe.reset();
+            }
             for single in &mut singles {
                 single.reset_state();
             }
@@ -163,6 +194,12 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                 .encode(frame, frame_size, &mut out)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             let parts = split_streams(&out[..n], streams).unwrap();
+            if let Some(probe) = probe.as_mut() {
+                assert!(
+                    probe.run(frame, frame_size, &mut band_smr),
+                    "{label}: the analysis gave no mask"
+                );
+            }
             // The size limit of the packet: the buffer, and under constant
             // bitrate the bytes of the bitrate (never below the smallest
             // packet).
@@ -182,6 +219,7 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                 // what was left for the last stream.
                 single.bitrate_bps = stream.bitrate_bps;
                 single.use_cbr = !vbr;
+                let (left, right) = inputs[s];
                 // What a surround or ambisonics layout sets on a stream
                 // (opus_multistream_encoder.c:939-962).
                 match enc.mapping_type() {
@@ -190,13 +228,27 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                         if s < enc.layout().coupled_streams() {
                             single.set_force_mode(Some(ForcedMode::CeltOnly));
                         }
-                        single.set_energy_mask(stream.energy_mask());
+                        // Every stream, the LFE stream too, gets the mask
+                        // of its own channels.
+                        let mask = stream_mask(&band_smr, left, right);
+                        assert_eq!(
+                            stream.energy_mask(),
+                            Some(&mask[..]),
+                            "{label}: stream {s}: energy mask"
+                        );
+                        single.set_energy_mask(Some(&mask));
                     }
                     MappingType::Ambisonics => single.set_force_mode(Some(ForcedMode::CeltOnly)),
                     MappingType::None => {}
                 }
+                if !surround {
+                    assert_eq!(
+                        stream.energy_mask(),
+                        None,
+                        "{label}: stream {s}: a mask outside surround mode"
+                    );
+                }
                 // The channels of the stream.
-                let (left, right) = inputs[s];
                 let width = if right.is_some() { 2 } else { 1 };
                 for (i, x) in frame.chunks_exact(channels).enumerate() {
                     stream_pcm[i * width] = x[left];

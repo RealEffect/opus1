@@ -148,6 +148,30 @@ mod div_neon {
     }
 }
 
+/// Threshold (Q13) that the correlation of the second search stage must
+/// exceed for a frame to count as voiced (libopus `silk_find_pitch_lags_FIX`):
+/// 0.6, lowered for a higher prediction order, for more speech activity, after
+/// a voiced frame and for more spectral tilt.
+///
+/// The constants are libopus's `SILK_FIX_CONST(-0.004, 13)`,
+/// `SILK_FIX_CONST(-0.1, 21)`, `SILK_FIX_CONST(-0.15, 13)` and
+/// `SILK_FIX_CONST(-0.1, 14)`. That macro adds 0.5 and cuts off the fraction,
+/// so a negative constant is rounded towards zero: -32.768 becomes -32.
+#[inline]
+fn pitch_threshold_q13(
+    pitch_lpc_order: i32,
+    speech_activity_q8: i32,
+    prev_signal_type: i32,
+    input_tilt_q15: i32,
+) -> i32 {
+    let mut thrhld_q13: i32 = 4915;
+    thrhld_q13 = silk_smlabb(thrhld_q13, -32, pitch_lpc_order);
+    thrhld_q13 = silk_smlawb(thrhld_q13, -209714, speech_activity_q8);
+    thrhld_q13 = silk_smlabb(thrhld_q13, -1228, prev_signal_type >> 1);
+    thrhld_q13 = silk_smlawb(thrhld_q13, -1637, input_tilt_q15);
+    silk_sat16(thrhld_q13)
+}
+
 pub fn silk_find_pitch_lags_fix(
     ps_enc: &mut SilkEncoderState,
     ps_enc_ctrl: &mut SilkEncoderControl,
@@ -212,16 +236,12 @@ pub fn silk_find_pitch_lags_fix(
     if ps_enc.s_cmn.indices.signal_type != TYPE_NO_VOICE_ACTIVITY as i8
         && ps_enc.s_cmn.first_frame_after_reset == 0
     {
-        let mut thrhld_q13: i32 = 4915;
-
-        thrhld_q13 = silk_smlabb(thrhld_q13, -33, pitch_lpc_order as i32);
-
-        thrhld_q13 = silk_smlawb(thrhld_q13, -209715, ps_enc.s_cmn.speech_activity_q8);
-
-        thrhld_q13 = silk_smlabb(thrhld_q13, -1229, ps_enc.s_cmn.prev_signal_type >> 1);
-
-        thrhld_q13 = silk_smlawb(thrhld_q13, -1638, ps_enc.s_cmn.input_tilt_q15);
-        thrhld_q13 = silk_sat16(thrhld_q13);
+        let thrhld_q13 = pitch_threshold_q13(
+            pitch_lpc_order as i32,
+            ps_enc.s_cmn.speech_activity_q8,
+            ps_enc.s_cmn.prev_signal_type,
+            ps_enc.s_cmn.input_tilt_q15,
+        );
 
         let mut ltp_corr_q15 = ps_enc.ltp_corr_q15;
         if silk_pitch_analysis_core(
@@ -276,7 +296,7 @@ pub fn silk_pitch_analysis_core(
     let frame_length_4khz = (PE_LTP_MEM_LENGTH_MS + nb_subfr * PE_SUBFR_LENGTH_MS) * 4;
     let sf_length = PE_SUBFR_LENGTH_MS * fs_khz as usize;
     let min_lag = PE_MIN_LAG_MS * fs_khz as usize;
-    let max_lag = PE_MAX_LAG_MS * fs_khz as usize;
+    let max_lag = PE_MAX_LAG_MS * fs_khz as usize - 1;
 
     let mut energy = 0i32;
     let mut shift = 0i32;
@@ -297,16 +317,13 @@ pub fn silk_pitch_analysis_core(
     let frame_8khz: &[i16];
     if fs_khz == 16 {
         filt_state[0..2].fill(0);
-        let output = unsafe {
-            core::slice::from_raw_parts_mut(frame_8khz_buf.as_mut_ptr(), frame_length_8khz)
-        };
+        // The slicing checks that the frame fits the buffer.
+        let output = &mut frame_8khz_buf[..frame_length_8khz];
         silk_resampler_down2(&mut filt_state[..2], output, frame, frame_length as i32);
         frame_8khz = output;
     } else if fs_khz == 12 {
         filt_state[0..6].fill(0);
-        let output = unsafe {
-            core::slice::from_raw_parts_mut(frame_8khz_buf.as_mut_ptr(), frame_length_8khz)
-        };
+        let output = &mut frame_8khz_buf[..frame_length_8khz];
         silk_resampler_down2_3(&mut filt_state[..6], output, frame, frame_length as i32);
         frame_8khz = output;
     } else {
@@ -314,11 +331,9 @@ pub fn silk_pitch_analysis_core(
     }
 
     filt_state[0..2].fill(0);
-    let frame_4khz_sub =
-        unsafe { core::slice::from_raw_parts_mut(frame_4khz.as_mut_ptr(), frame_length_4khz) };
     silk_resampler_down2(
         &mut filt_state[..2],
-        frame_4khz_sub,
+        &mut frame_4khz[..frame_length_4khz],
         frame_8khz,
         frame_length_8khz as i32,
     );
@@ -431,11 +446,31 @@ pub fn silk_pitch_analysis_core(
         }
     }
 
+    // `d_comp[lag - D_COMP_MIN]` marks lags at 8 kHz. First the lags the
+    // first stage found.
     let mut d_comp = [0i16; D_COMP_STRIDE];
     for i in 0..length_d_srch {
         d_comp[(d_srch[i] as isize - D_COMP_MIN) as usize] = 1;
     }
 
+    // Convolution: a mark at a lag also marks the two lags above it.
+    for i in (3..D_COMP_STRIDE).rev() {
+        d_comp[i] += d_comp[i - 1] + d_comp[i - 2];
+    }
+
+    // The lags the second stage searches: every lag of the first stage with
+    // the lag below it and the lag above it. The first stage works at half
+    // the rate, so its lags are the even ones only.
+    length_d_srch = 0;
+    for i in MIN_LAG_8KHZ..MAX_LAG_8KHZ + 1 {
+        if d_comp[i + 1 - D_COMP_MIN as usize] > 0 {
+            d_srch[length_d_srch] = i as i32;
+            length_d_srch += 1;
+        }
+    }
+
+    // Convolution: the lags whose correlation the second stage needs. Its
+    // codebook moves the lag of a subframe by a few samples either way.
     for i in (3..D_COMP_STRIDE).rev() {
         d_comp[i] += d_comp[i - 1] + d_comp[i - 2] + d_comp[i - 3];
     }
@@ -586,7 +621,7 @@ pub fn silk_pitch_analysis_core(
 
         let lag_log2_q7 = silk_lin2log(d);
         let mut cc_max_new_b =
-            cc0_max_new - silk_rshift(silk_smulbb((nb_subfr * 410) as i32, lag_log2_q7), 7);
+            cc0_max_new - silk_rshift(silk_smulbb((nb_subfr * 1638) as i32, lag_log2_q7), 7);
 
         if prev_lag_8khz > 0 {
             let mut delta_lag_log2_sqr_q7 = lag_log2_q7 - prev_lag_log2_q7;
@@ -601,14 +636,11 @@ pub fn silk_pitch_analysis_core(
             cc_max_new_b -= prev_lag_bias_q13;
         }
 
-        let lag_cb_ptr_curr_0: &[i8] = if nb_subfr == PE_MAX_NB_SUBFR {
-            &SILK_CB_LAGS_STAGE2[0]
-        } else {
-            &SILK_CB_LAGS_STAGE2_10_MS[0]
-        };
+        // The third condition is the one libopus has. It holds for every
+        // entry of the table.
         if cc_max_new_b > cc_max_b
             && cc0_max_new > silk_smulbb(nb_subfr as i32, search_thres2_q13)
-            && (d + lag_cb_ptr_curr_0[cb_i_max_new] as i32) >= MIN_LAG_8KHZ as i32
+            && SILK_CB_LAGS_STAGE2[0][cb_i_max_new] as i32 <= MIN_LAG_8KHZ as i32
         {
             cc_max_b = cc_max_new_b;
             cc_max = cc0_max_new;
@@ -695,8 +727,8 @@ pub fn silk_pitch_analysis_core(
         // to `end_lag` (at most five): the sums of the cross-correlations
         // and of the energies over the subframes. A codebook vector gives
         // every subframe its own lag offset; its five values are five
-        // neighbours in the arrays above. The sums saturate, in the order
-        // of the subframes.
+        // neighbours in the arrays above. The sums wrap around, as in
+        // libopus.
         let nb_lags = (end_lag - start_lag + 1).clamp(0, PE_NB_STAGE3_LAGS as i32) as usize;
         let mut cross_corrs = [[0i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX];
         let mut energies = [[0i32; PE_NB_STAGE3_LAGS]; PE_NB_CBKS_STAGE3_MAX];
@@ -714,11 +746,11 @@ pub fn silk_pitch_analysis_core(
                     .expect("five lags inside the search range");
                 for lag_counter in 0..PE_NB_STAGE3_LAGS {
                     cross_corr[lag_counter] =
-                        cross_corr[lag_counter].saturating_add(cross_corr_k[lag_counter]);
-                    energy[lag_counter] = energy[lag_counter].saturating_add(energy_k[lag_counter]);
+                        cross_corr[lag_counter].wrapping_add(cross_corr_k[lag_counter]);
+                    energy[lag_counter] = energy[lag_counter].wrapping_add(energy_k[lag_counter]);
                 }
             }
-            // A vector whose correlation is not positive is skipped in the
+            // A vector whose correlation is not positive counts as 0 in the
             // search below. It is entered as 0 / 1 for the division, and so
             // is every lag after `end_lag`.
             for lag_counter in 0..PE_NB_STAGE3_LAGS {
@@ -739,18 +771,21 @@ pub fn silk_pitch_analysis_core(
             14,
         );
 
-        let (lag_cb_first_subfr, _) = stage3_tables(nb_subfr, complexity, 0);
         for (lag_counter, d) in (start_lag..=end_lag).enumerate() {
             for j in 0..nb_cbk_search_st3 {
-                if cross_corrs[j][lag_counter] > 0 {
-                    let mut cc_max_new = quotients[j][lag_counter];
-                    let diff = i16::MAX as i32 - silk_mul(contour_bias_q15, j as i32);
-                    cc_max_new = silk_smulwb(cc_max_new, diff);
-                    if cc_max_new > cc_max && (d + lag_cb_first_subfr[j] as i32) <= max_lag as i32 {
-                        cc_max = cc_max_new;
-                        lag_new = d;
-                        cb_i_max = j;
-                    }
+                // 0 for a vector whose correlation is not positive. Such a
+                // vector can still be chosen: the first comparison is with
+                // the smallest number.
+                let mut cc_max_new = quotients[j][lag_counter];
+                let diff = i16::MAX as i32 - silk_mul(contour_bias_q15, j as i32);
+                cc_max_new = silk_smulwb(cc_max_new, diff);
+                // libopus reads the table of 20 ms frames here for both
+                // frame sizes.
+                if cc_max_new > cc_max && (d + SILK_CB_LAGS_STAGE3[0][j] as i32) <= max_lag as i32
+                {
+                    cc_max = cc_max_new;
+                    lag_new = d;
+                    cb_i_max = j;
                 }
             }
         }
@@ -889,6 +924,62 @@ fn silk_p_ana_calc_energy_st3(
             energies_st3[k][i] = energy;
         }
         target_ptr_idx += sf_length;
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::pitch_threshold_q13;
+
+    /// The threshold computed by the statements of libopus 1.6.1
+    /// silk/fixed/find_pitch_lags_FIX.c (compiled and run) for every
+    /// combination of the inputs in `threshold_matches_libopus`, the last
+    /// input changing fastest.
+    const LIBOPUS_THRESHOLD_Q13: [i32; 450] = [
+        5541, 5031, 4723, 4722, 4223, 3904, 5541, 5031, 4723, 4722, 4223, 3904, 4313, 3803, 3495, 3494, 2995, 2676,
+        5499, 4989, 4681, 4680, 4181, 3862, 5499, 4989, 4681, 4680, 4181, 3862, 4271, 3761, 3453, 3452, 2953, 2634,
+        5131, 4621, 4313, 4312, 3813, 3494, 5131, 4621, 4313, 4312, 3813, 3494, 3903, 3393, 3085, 3084, 2585, 2266,
+        4725, 4215, 3907, 3906, 3407, 3088, 4725, 4215, 3907, 3906, 3407, 3088, 3497, 2987, 2679, 2678, 2179, 1860,
+        4721, 4211, 3903, 3902, 3403, 3084, 4721, 4211, 3903, 3902, 3403, 3084, 3493, 2983, 2675, 2674, 2175, 1856,
+        5477, 4967, 4659, 4658, 4159, 3840, 5477, 4967, 4659, 4658, 4159, 3840, 4249, 3739, 3431, 3430, 2931, 2612,
+        5435, 4925, 4617, 4616, 4117, 3798, 5435, 4925, 4617, 4616, 4117, 3798, 4207, 3697, 3389, 3388, 2889, 2570,
+        5067, 4557, 4249, 4248, 3749, 3430, 5067, 4557, 4249, 4248, 3749, 3430, 3839, 3329, 3021, 3020, 2521, 2202,
+        4661, 4151, 3843, 3842, 3343, 3024, 4661, 4151, 3843, 3842, 3343, 3024, 3433, 2923, 2615, 2614, 2115, 1796,
+        4657, 4147, 3839, 3838, 3339, 3020, 4657, 4147, 3839, 3838, 3339, 3020, 3429, 2919, 2611, 2610, 2111, 1792,
+        5413, 4903, 4595, 4594, 4095, 3776, 5413, 4903, 4595, 4594, 4095, 3776, 4185, 3675, 3367, 3366, 2867, 2548,
+        5371, 4861, 4553, 4552, 4053, 3734, 5371, 4861, 4553, 4552, 4053, 3734, 4143, 3633, 3325, 3324, 2825, 2506,
+        5003, 4493, 4185, 4184, 3685, 3366, 5003, 4493, 4185, 4184, 3685, 3366, 3775, 3265, 2957, 2956, 2457, 2138,
+        4597, 4087, 3779, 3778, 3279, 2960, 4597, 4087, 3779, 3778, 3279, 2960, 3369, 2859, 2551, 2550, 2051, 1732,
+        4593, 4083, 3775, 3774, 3275, 2956, 4593, 4083, 3775, 3774, 3275, 2956, 3365, 2855, 2547, 2546, 2047, 1728,
+        5349, 4839, 4531, 4530, 4031, 3712, 5349, 4839, 4531, 4530, 4031, 3712, 4121, 3611, 3303, 3302, 2803, 2484,
+        5307, 4797, 4489, 4488, 3989, 3670, 5307, 4797, 4489, 4488, 3989, 3670, 4079, 3569, 3261, 3260, 2761, 2442,
+        4939, 4429, 4121, 4120, 3621, 3302, 4939, 4429, 4121, 4120, 3621, 3302, 3711, 3201, 2893, 2892, 2393, 2074,
+        4533, 4023, 3715, 3714, 3215, 2896, 4533, 4023, 3715, 3714, 3215, 2896, 3305, 2795, 2487, 2486, 1987, 1668,
+        4529, 4019, 3711, 3710, 3211, 2892, 4529, 4019, 3711, 3710, 3211, 2892, 3301, 2791, 2483, 2482, 1983, 1664,
+        5221, 4711, 4403, 4402, 3903, 3584, 5221, 4711, 4403, 4402, 3903, 3584, 3993, 3483, 3175, 3174, 2675, 2356,
+        5179, 4669, 4361, 4360, 3861, 3542, 5179, 4669, 4361, 4360, 3861, 3542, 3951, 3441, 3133, 3132, 2633, 2314,
+        4811, 4301, 3993, 3992, 3493, 3174, 4811, 4301, 3993, 3992, 3493, 3174, 3583, 3073, 2765, 2764, 2265, 1946,
+        4405, 3895, 3587, 3586, 3087, 2768, 4405, 3895, 3587, 3586, 3087, 2768, 3177, 2667, 2359, 2358, 1859, 1540,
+        4401, 3891, 3583, 3582, 3083, 2764, 4401, 3891, 3583, 3582, 3083, 2764, 3173, 2663, 2355, 2354, 1855, 1536,
+    ];
+
+    #[test]
+    fn threshold_matches_libopus() {
+        let mut expected = LIBOPUS_THRESHOLD_Q13.iter();
+        for order in [6, 8, 10, 12, 16] {
+            for speech_activity_q8 in [0, 13, 128, 255, 256] {
+                for prev_signal_type in [0, 1, 2] {
+                    for input_tilt_q15 in [-32768, -12345, 0, 1, 20000, 32767] {
+                        assert_eq!(
+                            pitch_threshold_q13(order, speech_activity_q8, prev_signal_type, input_tilt_q15),
+                            *expected.next().unwrap(),
+                            "order {order}, activity {speech_activity_q8}, previous type {prev_signal_type}, tilt {input_tilt_q15}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(expected.next().is_none());
     }
 }
 

@@ -39,17 +39,12 @@ pub fn silk_decode_core(
     // the first sample of this frame. libopus leaves this buffer
     // uninitialized as well; clearing its 2.5 kB on every frame is wasted
     // work, and unvoiced frames do not use it at all.
-    let s_ltp_q15_len = ltp_mem_length + frame_length;
-    assert!(s_ltp_q15_len <= MAX_S_LTP_Q15);
+    //
+    // The elements from `s_ltp_init_from` up to `s_ltp_buf_idx` are
+    // initialized. The code below keeps that true, and it reads no element
+    // outside that range.
     let mut s_ltp_q15_buf = [MaybeUninit::<i32>::uninit(); MAX_S_LTP_Q15];
-    // SAFETY: the pointer covers `MAX_S_LTP_Q15` elements of the local array
-    // and `s_ltp_q15_len` is at most that (checked above). Elements are only
-    // read after they were written: everything from `s_ltp_init_from` up to
-    // `s_ltp_buf_idx` is initialized, and each read below starts at or above
-    // `s_ltp_init_from` (the gap is cleared first if it does not).
-    let s_ltp_q15 = unsafe {
-        core::slice::from_raw_parts_mut(s_ltp_q15_buf.as_mut_ptr() as *mut i32, s_ltp_q15_len)
-    };
+    let s_ltp_q15 = &mut s_ltp_q15_buf[..ltp_mem_length + frame_length];
     let mut s_ltp_buf_idx = ltp_mem_length;
     let mut s_ltp_init_from = ltp_mem_length;
 
@@ -136,8 +131,9 @@ pub fn silk_decode_core(
                 // (this needs a lag that the clamp above rules out).
                 let first = ltp_mem_length - hist_len;
                 let zeros = lpc_order.saturating_sub(first).min(hist_len);
+                // Both calls together write every element of `state`.
                 let state = &mut s_ltp_q15[hist_start..s_ltp_buf_idx];
-                state[..zeros].fill(0);
+                state[..zeros].fill(MaybeUninit::new(0));
                 let in_start = k * subfr_length + first + zeros - lpc_order;
                 let input = &ps_dec.out_buf[in_start..k * subfr_length + ltp_mem_length];
                 if lpc_order == MAX_LPC_ORDER {
@@ -149,19 +145,40 @@ pub fn silk_decode_core(
                 if hist_start < s_ltp_init_from {
                     // Not reached by a valid stream: the lag grew by more
                     // than a subframe. The samples in between count as zero.
-                    s_ltp_q15[hist_start..s_ltp_init_from].fill(0);
+                    s_ltp_q15[hist_start..s_ltp_init_from].fill(MaybeUninit::new(0));
                 }
                 if gain_adj_q16 != (1 << 16) {
                     // Update the predictor state when the gain changes.
-                    for s in s_ltp_q15[hist_start..s_ltp_buf_idx].iter_mut() {
+                    // SAFETY: the elements from `s_ltp_init_from` up to
+                    // `s_ltp_buf_idx` are initialized, and so are those
+                    // from `hist_start` on if that is lower: they were
+                    // filled just above.
+                    let state =
+                        unsafe { s_ltp_q15[hist_start..s_ltp_buf_idx].assume_init_mut() };
+                    for s in state.iter_mut() {
                         *s = silk_smulww(gain_adj_q16, *s);
                     }
                 }
             }
+            // In both branches everything from `hist_start` up to
+            // `s_ltp_buf_idx` is initialized now. The re-whitening wrote all
+            // of it. The other branch found it written by the subframes
+            // before, or filled what was missing.
             s_ltp_init_from = s_ltp_init_from.min(hist_start);
 
             let res = &mut res_q14[..subfr_length];
-            ltp_synthesis(s_ltp_q15, s_ltp_buf_idx, lag, &b_q14, exc_q14, res);
+            // SAFETY: the slice starts with the `hist_len` elements from
+            // `hist_start` on, which are initialized (see above).
+            unsafe {
+                ltp_synthesis(
+                    &mut s_ltp_q15[hist_start..s_ltp_buf_idx + subfr_length],
+                    lag,
+                    &b_q14,
+                    exc_q14,
+                    res,
+                );
+            }
+            // `ltp_synthesis` has written the `subfr_length` new elements.
             s_ltp_buf_idx += subfr_length;
             res
         } else {
@@ -281,10 +298,11 @@ fn decode_excitation(exc_q14: &mut [i32], pulses: &[i16], seed: i32, offset_q10:
 ///
 /// `input` holds `ORDER` samples of filter memory followed by one sample per
 /// output. `out[m]` is the prediction residual of `input[ORDER + m]`, rounded
-/// to 16 bits and multiplied by `inv_gain_q31`.
+/// to 16 bits and multiplied by `inv_gain_q31`. Every element of `out` is
+/// written.
 #[inline(always)]
 fn rewhiten<const ORDER: usize>(
-    out: &mut [i32],
+    out: &mut [MaybeUninit<i32>],
     input: &[i16],
     a_q12: &[i16; MAX_LPC_ORDER],
     inv_gain_q31: i32,
@@ -298,7 +316,7 @@ fn rewhiten<const ORDER: usize>(
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 fn rewhiten_scalar<const ORDER: usize>(
-    out: &mut [i32],
+    out: &mut [MaybeUninit<i32>],
     input: &[i16],
     a_q12: &[i16; MAX_LPC_ORDER],
     inv_gain_q31: i32,
@@ -317,7 +335,7 @@ fn rewhiten_scalar<const ORDER: usize>(
         }
         let res_q12 = ((x[ORDER] as i32) << 12).wrapping_sub(pred_q12);
         let res = silk_sat16(silk_rshift_round(res_q12, 12));
-        *o = silk_smulwb(inv_gain_q31, res);
+        o.write(silk_smulwb(inv_gain_q31, res));
     }
 }
 
@@ -325,7 +343,7 @@ fn rewhiten_scalar<const ORDER: usize>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn rewhiten_neon<const ORDER: usize>(
-    out: &mut [i32],
+    out: &mut [MaybeUninit<i32>],
     input: &[i16],
     a_q12: &[i16; MAX_LPC_ORDER],
     inv_gain_q31: i32,
@@ -356,7 +374,7 @@ fn rewhiten_neon<const ORDER: usize>(
             let res = vqmovn_s32(vrshrq_n_s32::<12>(res_q12));
             // vqdmulhq_s32(g, r << 15) is (g * r) >> 16.
             let scaled = vqdmulhq_s32(gain, vshll_n_s16::<15>(res));
-            vst1q_s32(out.as_mut_ptr().add(m), scaled);
+            vst1q_s32(out.as_mut_ptr().add(m) as *mut i32, scaled);
             m += 4;
         }
     }
@@ -365,25 +383,32 @@ fn rewhiten_neon<const ORDER: usize>(
 
 /// Long-term prediction for one subframe.
 ///
-/// `s_ltp_q15[buf_idx..]` receives the new predictor state and `res_q14` the
-/// excitation with the prediction added. Sample `i` is predicted from the
-/// five state samples around `buf_idx + i - lag`.
+/// `state` is the part of the predictor state that the subframe uses: the
+/// `lag + LTP_ORDER / 2` samples before the subframe, then one element per
+/// sample of the subframe. Those receive the new predictor state, and
+/// `res_q14` the excitation with the prediction added. Sample `i` is
+/// predicted from the five state samples around the one `lag` samples
+/// before it, which are `state[i..i + 5]`.
 ///
 /// The newest sample a prediction reads lies `lag - 2` samples before the
 /// one it writes. The subframe is therefore processed in blocks of at most
 /// `lag - 2` samples: inside a block no sample depends on another sample of
 /// the block, so several can be computed at once.
+///
+/// # Safety
+/// The first `lag + LTP_ORDER / 2` elements of `state` must be initialized.
+/// The function initializes all others.
 #[inline(always)]
-fn ltp_synthesis(
-    s_ltp_q15: &mut [i32],
-    buf_idx: usize,
+unsafe fn ltp_synthesis(
+    state: &mut [MaybeUninit<i32>],
     lag: usize,
     b_q14: &[i16; LTP_ORDER],
     exc_q14: &[i32],
     res_q14: &mut [i32],
 ) {
     let n = exc_q14.len();
-    assert!(res_q14.len() == n);
+    let hist_len = lag + LTP_ORDER / 2;
+    assert!(res_q14.len() == n && state.len() == hist_len + n);
     // The lag is at least 2 ms, which is 16 samples or more.
     debug_assert!(lag > LTP_ORDER / 2);
     let block = lag.saturating_sub(LTP_ORDER / 2).max(1);
@@ -391,10 +416,12 @@ fn ltp_synthesis(
     let mut done = 0;
     while done < n {
         let len = block.min(n - done);
-        let (hist, new_state) = s_ltp_q15.split_at_mut(buf_idx + done);
+        let (known, new_state) = state.split_at_mut(hist_len + done);
         // Sample `i` of the block reads `taps[i..i + 5]`, newest sample last.
-        let taps_start = hist.len() - lag - LTP_ORDER / 2;
-        let taps = &hist[taps_start..taps_start + len + LTP_ORDER - 1];
+        // SAFETY: `known` holds the history, which the caller guarantees to
+        // be initialized, and behind it the `done` elements that the blocks
+        // before this one have written.
+        let taps = unsafe { known[done..done + len + LTP_ORDER - 1].assume_init_ref() };
         let exc = &exc_q14[done..done + len];
         let res = &mut res_q14[done..done + len];
         let new_state = &mut new_state[..len];
@@ -409,7 +436,8 @@ fn ltp_synthesis(
 }
 
 /// One block of `ltp_synthesis`. `taps` holds four samples more than the
-/// other slices: sample `i` is predicted from `taps[i..i + 5]`.
+/// other slices: sample `i` is predicted from `taps[i..i + 5]`. Every
+/// element of `res_q14` and of `new_state` is written.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 fn ltp_block_scalar(
@@ -417,7 +445,7 @@ fn ltp_block_scalar(
     b_q14: &[i16; LTP_ORDER],
     exc_q14: &[i32],
     res_q14: &mut [i32],
-    new_state: &mut [i32],
+    new_state: &mut [MaybeUninit<i32>],
 ) {
     let n = exc_q14.len();
     assert!(taps.len() == n + LTP_ORDER - 1 && res_q14.len() == n && new_state.len() == n);
@@ -437,7 +465,7 @@ fn ltp_block_scalar(
         pred_q13 = silk_smlawb(pred_q13, x[0], b_q14[4] as i32);
 
         *r = silk_add_lshift32(e, pred_q13, 1);
-        *s = *r << 1;
+        s.write(*r << 1);
     }
 }
 
@@ -449,7 +477,7 @@ fn ltp_block_neon(
     b_q14: &[i16; LTP_ORDER],
     exc_q14: &[i32],
     res_q14: &mut [i32],
-    new_state: &mut [i32],
+    new_state: &mut [MaybeUninit<i32>],
 ) {
     use core::arch::aarch64::*;
 
@@ -482,7 +510,7 @@ fn ltp_block_neon(
             let exc = vld1q_s32(exc_q14.as_ptr().add(i));
             let res = vaddq_s32(exc, vshlq_n_s32::<1>(pred_q13));
             vst1q_s32(res_q14.as_mut_ptr().add(i), res);
-            vst1q_s32(new_state.as_mut_ptr().add(i), vshlq_n_s32::<1>(res));
+            vst1q_s32(new_state.as_mut_ptr().add(i) as *mut i32, vshlq_n_s32::<1>(res));
             i += 4;
         }
     }
@@ -745,6 +773,13 @@ mod tests {
         }
     }
 
+    /// The view of an output slice that the kernels write to.
+    fn uninit(out: &mut [i32]) -> &mut [MaybeUninit<i32>] {
+        // SAFETY: `MaybeUninit<i32>` has the layout of `i32`, and the
+        // kernels only store initialized values.
+        unsafe { &mut *(out as *mut [i32] as *mut [MaybeUninit<i32>]) }
+    }
+
     /// The lengths every kernel test runs: empty, one sample, every tail
     /// length of the 4- and 8-sample steps, and the subframe lengths.
     const LENGTHS: [usize; 24] = [
@@ -838,16 +873,16 @@ mod tests {
                 let mut expect = vec![0i32; n];
                 rewhiten_reference(&mut expect, &input, &a_q12, inv_gain_q31, ORDER);
                 let mut scalar = vec![0x5555_5555i32; n];
-                rewhiten_scalar::<ORDER>(&mut scalar, &input, &a_q12, inv_gain_q31);
+                rewhiten_scalar::<ORDER>(uninit(&mut scalar), &input, &a_q12, inv_gain_q31);
                 assert_eq!(scalar, expect, "scalar: order={ORDER} n={n} trial={trial}");
                 #[cfg(target_arch = "aarch64")]
                 {
                     let mut neon = vec![0x5555_5555i32; n];
-                    rewhiten_neon::<ORDER>(&mut neon, &input, &a_q12, inv_gain_q31);
+                    rewhiten_neon::<ORDER>(uninit(&mut neon), &input, &a_q12, inv_gain_q31);
                     assert_eq!(neon, expect, "NEON: order={ORDER} n={n} trial={trial}");
                 }
                 let mut dispatched = vec![0x5555_5555i32; n];
-                rewhiten::<ORDER>(&mut dispatched, &input, &a_q12, inv_gain_q31);
+                rewhiten::<ORDER>(uninit(&mut dispatched), &input, &a_q12, inv_gain_q31);
                 assert_eq!(dispatched, expect, "dispatch: order={ORDER} n={n} trial={trial}");
             }
         }
@@ -911,13 +946,13 @@ mod tests {
 
                 let mut res = vec![0x5555_5555i32; n];
                 let mut new_state = vec![0x5555_5555i32; n];
-                ltp_block_scalar(&taps, &b_q14, &exc, &mut res, &mut new_state);
+                ltp_block_scalar(&taps, &b_q14, &exc, &mut res, uninit(&mut new_state));
                 assert_eq!((&res, &new_state), (&expect_res, &expect_state), "scalar: n={n} trial={trial}");
                 #[cfg(target_arch = "aarch64")]
                 {
                     let mut res = vec![0x5555_5555i32; n];
                     let mut new_state = vec![0x5555_5555i32; n];
-                    ltp_block_neon(&taps, &b_q14, &exc, &mut res, &mut new_state);
+                    ltp_block_neon(&taps, &b_q14, &exc, &mut res, uninit(&mut new_state));
                     assert_eq!((&res, &new_state), (&expect_res, &expect_state), "NEON: n={n} trial={trial}");
                 }
             }
@@ -947,7 +982,11 @@ mod tests {
                 ltp_reference(&mut expect_state, buf_idx, lag, &b_q14, &exc, &mut expect_res);
 
                 let mut res = vec![0x5555_5555i32; n];
-                ltp_synthesis(&mut state, buf_idx, lag, &b_q14, &exc, &mut res);
+                // SAFETY: the whole of `state` is initialized.
+                unsafe {
+                    let used = uninit(&mut state[buf_idx - lag - LTP_ORDER / 2..]);
+                    ltp_synthesis(used, lag, &b_q14, &exc, &mut res);
+                }
                 assert_eq!(res, expect_res, "lag={lag} n={n}");
                 assert_eq!(state, expect_state, "lag={lag} n={n}");
             }

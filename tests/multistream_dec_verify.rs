@@ -806,14 +806,13 @@ fn packets_with_damaged_frame_data_decode_like_libopus() {
 /// so both decoders accept it, and they must read the same bits: the final
 /// range is equal after every packet.
 ///
-/// Today about 1 packet in 200 ends with another final range. The cause is
-/// in the range decoder, not in the multistream code: libopus `ec_dec_uint`
-/// (entdec.c) returns `ft - 1` when the bits it read give a larger value,
-/// and `RangeCoder::dec_uint` (src/range_coder.rs) returns the larger value.
-/// An encoder never writes such a value, so encoded streams are not
-/// affected. Checked: with that limit added, this test passes.
+/// This depends on the range decoder, not on the multistream code: libopus
+/// `ec_dec_uint` (entdec.c) returns `ft - 1` and sets the error flag when
+/// the bits it read give a larger value. Until `RangeCoder::dec_uint`
+/// (src/range_coder.rs) did the same, it returned the larger value, and
+/// about 1 packet in 200 ended with another final range. An encoder never
+/// writes such a value, so encoded streams were not affected.
 #[test]
-#[ignore = "RangeCoder::dec_uint lacks the limit of libopus ec_dec_uint (src/range_coder.rs)"]
 fn random_frame_data_has_the_final_range_of_libopus() {
     // (channels, streams, coupled streams, mapping)
     let layouts: [(usize, usize, usize, &[u8]); 3] = [(6, 4, 2, &[0, 4, 1, 2, 3, 5]), (3, 3, 0, &[0, 1, 2]), (2, 1, 1, &[0, 1])];

@@ -9,6 +9,11 @@
 //! previous implementation and require equal pulses, an equal returned seed
 //! and an equal quantizer state after every frame.
 //!
+//! One part of `reference_nsq` is not the old code: its loop for subframes
+//! that are not voiced now applies harmonic noise shaping whenever there is
+//! a lag, as libopus does (silk/NSQ.c lines 263-275) and as `silk_nsq` does
+//! since that correction. See `silk_noise_shape_quantizer_unvoiced`.
+//!
 //! The frames are generated, not recorded: the generator covers every state
 //! count, filter order, sampling rate, frame length and signal type, and
 //! values far outside what the encoder produces.
@@ -842,7 +847,8 @@ mod reference_del_dec {
     }
 }
 
-/// `src/silk/nsq.rs` before the rewrite.
+/// `src/silk/nsq.rs` before the rewrite, with the libopus branch on the lag
+/// in the loop for subframes that are not voiced.
 mod reference_nsq {
     use opus_rs::silk::define::*;
     use opus_rs::silk::macros::*;
@@ -1206,6 +1212,8 @@ mod reference_nsq {
                 s_ltp_q15,
                 a_q12,
                 ar_shp_q13,
+                lag,
+                harm_shape_fir_packed_q14,
                 tilt_q14,
                 lf_shp_q14,
                 gain_q10,
@@ -1214,6 +1222,7 @@ mod reference_nsq {
                 subfr_length,
                 shaping_lpc_order,
                 predict_lpc_order,
+                shp_lag_base,
             );
         }
 
@@ -1623,6 +1632,32 @@ mod reference_nsq {
         nsq.s_diff_shp_q14 = s_diff_shp_q14;
     }
 
+    /// The sample loop of a subframe that is not voiced.
+    ///
+    /// This is the one place where this copy is not the code from before the
+    /// rewrite. The old loop left out the harmonic noise shaping here, which
+    /// was a difference from libopus, not a choice. libopus 1.6.1
+    /// silk/NSQ.c, silk_noise_shape_quantizer, tests the lag and not the
+    /// signal type (lines 263-275):
+    ///
+    /// ```c
+    /// if( lag > 0 ) {
+    ///     n_LTP_Q13 = silk_SMULWB( silk_ADD_SAT32( shp_lag_ptr[ 0 ], shp_lag_ptr[ -2 ] ), HarmShapeFIRPacked_Q14 );
+    ///     n_LTP_Q13 = silk_SMLAWT( n_LTP_Q13, shp_lag_ptr[ -1 ],                      HarmShapeFIRPacked_Q14 );
+    ///     n_LTP_Q13 = silk_LSHIFT( n_LTP_Q13, 1 );
+    ///     shp_lag_ptr++;
+    ///     tmp2 = silk_SUB32( LTP_pred_Q13, n_LTP_Q13 );
+    ///     tmp1 = silk_ADD32_ovflw( tmp2, silk_LSHIFT32( tmp1, 1 ) );
+    ///     tmp1 = silk_RSHIFT_ROUND( tmp1, 3 );
+    /// } else {
+    ///     tmp1 = silk_RSHIFT_ROUND( tmp1, 2 );
+    /// }
+    /// ```
+    ///
+    /// An unvoiced frame keeps the lag of the frame before it (silk_NSQ_c,
+    /// line 108: `lag = NSQ->lagPrev`), so the first branch also runs in
+    /// unvoiced subframes. `shp_lag_base` is the index of `shp_lag_ptr[ 0 ]`
+    /// for the first sample (line 216).
     #[inline(always)]
     fn silk_noise_shape_quantizer_unvoiced(
         nsq: &mut SilkNSQState,
@@ -1632,6 +1667,8 @@ mod reference_nsq {
         s_ltp_q15: &mut [i32],
         a_q12: &[i16],
         ar_shp_q13: &[i16],
+        lag: usize,
+        harm_shape_fir_packed_q14: i32,
         tilt_q14: i32,
         lf_shp_q14: i32,
         gain_q10: i32,
@@ -1640,10 +1677,12 @@ mod reference_nsq {
         subfr_length: usize,
         shaping_lpc_order: usize,
         predict_lpc_order: usize,
+        shp_lag_base: usize,
     ) {
         let mut lpc_pred_q10: i32;
         let mut n_ar_q12: i32;
         let mut n_lf_q12: i32;
+        let mut n_ltp_q13: i32;
         let mut r_q10: i32;
         let mut rr_q10: i32;
         let mut q1_q0: i32;
@@ -1693,7 +1732,25 @@ mod reference_nsq {
             tmp1 = (lpc_pred_q10 << 2).wrapping_sub(n_ar_q12);
             tmp1 = tmp1.wrapping_sub(n_lf_q12);
 
-            tmp1 = silk_rshift_round(tmp1, 2);
+            if lag > 0 {
+                let shp_idx = shp_lag_base + i;
+                n_ltp_q13 = silk_smulwb(
+                    silk_add_sat32(nsq.s_ltp_shp_q14[shp_idx], nsq.s_ltp_shp_q14[shp_idx - 2]),
+                    harm_shape_fir_packed_q14,
+                );
+                n_ltp_q13 = silk_smlawt(
+                    n_ltp_q13,
+                    nsq.s_ltp_shp_q14[shp_idx - 1],
+                    harm_shape_fir_packed_q14,
+                );
+                n_ltp_q13 <<= 1;
+
+                let tmp2 = ltp_pred_q13.wrapping_sub(n_ltp_q13);
+                tmp1 = tmp2.wrapping_add(tmp1 << 1);
+                tmp1 = silk_rshift_round(tmp1, 3);
+            } else {
+                tmp1 = silk_rshift_round(tmp1, 2);
+            }
 
             r_q10 = x_sc_q10[i] - tmp1;
 

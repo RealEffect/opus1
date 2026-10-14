@@ -289,8 +289,9 @@ fn encode_i16_validation_parity() {
     let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
     let mut out = vec![0u8; 4000];
 
-    // Output buffer too small mirrors encode().
-    let tiny = &mut [0u8; 1][..];
+    // Output buffer too small mirrors encode(). One byte is enough for a
+    // packet without audio, as in libopus; no byte is not.
+    let tiny = &mut [0u8; 0][..];
     assert_eq!(
         enc.encode_i16(&[0i16; 320], 320, tiny),
         Err("Output buffer too small")

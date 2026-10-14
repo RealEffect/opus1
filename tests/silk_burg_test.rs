@@ -2,6 +2,14 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
+//! `silk_burg_modified_fix` against `silk_burg_modified_c` of libopus.
+//!
+//! The linked libopus is the float build and does not contain that function.
+//! The "C reference" lines were printed by the C function itself, compiled
+//! from the fixed-point source (silk/fixed/burg_modified_FIX.c) and called
+//! with the same input and arguments. The libopus 1.6.1 source gives these
+//! values for all five inputs.
+
 #[cfg(test)]
 mod tests {
     use opus_rs::silk::define::MAX_PREDICTION_POWER_GAIN;
@@ -140,8 +148,15 @@ mod tests {
             16,
         );
 
-        // C reference: res_nrg=15780 res_nrg_Q=7
-        // A_Q16=[71536,26422,-10006,-24432,0,0,0,0,0,0,0,0,0,0,0,0]
+        // C reference (libopus 1.6.1): res_nrg=15780 res_nrg_Q=7
+        // A_Q16=[69820,26559,-7459,-23256,-2242,0,0,0,0,0,0,0,0,0,0,0]
+        //
+        // This quiet input is the one case in this file where line 72 of
+        // burg_modified_FIX.c matters: libopus 1.6 adds 1 to the frame
+        // energy ("make sure the noise corresponds to at least a unit
+        // pulse"). Without that line the same C function gives
+        // [71536,26422,-10006,-24432,0,...], the values this test held
+        // before.
         println!("TEST_LOW_AMP:");
         println!("  res_nrg={} res_nrg_q={}", res_nrg, res_nrg_q);
         print!("  A_Q16=[");
@@ -154,19 +169,11 @@ mod tests {
         println!("]");
 
         let c_a_q16 = [
-            71536, 26422, -10006, -24432, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            69820, 26559, -7459, -23256, -2242, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
-        for i in 0..16 {
-            let diff = (a_q16[i] - c_a_q16[i]).abs();
-            assert!(
-                diff <= 200,
-                "A_Q16[{}] mismatch: rust={} c={} diff={}",
-                i,
-                a_q16[i],
-                c_a_q16[i],
-                diff
-            );
-        }
+        // The results are integers and opus-rs has the C values exactly.
+        assert_eq!((res_nrg, res_nrg_q), (15780, 7));
+        assert_eq!(&a_q16[..16], &c_a_q16);
     }
 
     #[test]

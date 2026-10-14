@@ -397,11 +397,11 @@ fn damage_test_packets(
 /// frames after it would differ. The concealment's pitch search must also
 /// cope with such a history the way libopus does.
 ///
-/// A stream is left when the two decoders report different final ranges.
-/// That happens in about one damaged frame in 500, because
-/// `RangeCoder::dec_uint` lacks a limit that libopus has (see
-/// `damaged_frames_read_the_same_symbols_as_libopus`). About three of the
-/// 24 streams end that way. Once `dec_uint` has the limit, none may.
+/// The two decoders must report the same final range after every frame.
+/// Until `RangeCoder::dec_uint` got the limit that libopus has (see
+/// `damaged_frames_read_the_same_symbols_as_libopus`), about one damaged
+/// frame in 500 ended with another final range, and about three of the 24
+/// streams had to be left at that point.
 #[test]
 fn damaged_celt_frames_decode_like_libopus() {
     let mut rng = Rng(0x00C0_FFEE);
@@ -468,10 +468,7 @@ fn damaged_celt_frames_decode_like_libopus() {
         loud >= 10,
         "only {loud} loud frames: the test no longer covers them"
     );
-    assert!(
-        left_early <= 10,
-        "{left_early} streams with a final range mismatch"
-    );
+    assert_eq!(left_early, 0, "streams with a final range mismatch");
 }
 
 /// Damaged CELT-only and Hybrid packets and lost packets through
@@ -562,10 +559,8 @@ fn damaged_packets_and_losses_in_the_opus_decoder() {
                     decoded_db[n / 10],
                     decoded_db[0]
                 );
-                // A few frames may be far off: the frames after a damaged
-                // frame that hits the missing limit in `RangeCoder::dec_uint`
-                // (see `damaged_frames_read_the_same_symbols_as_libopus`),
-                // and those next to a badly matched concealed frame.
+                // A few frames may be far off: those next to a badly
+                // matched concealed frame.
                 if decoded_db[n / 2] < 125.0 || decoded_db[n / 10] < 60.0 || poor * 20 > n {
                     failures.push(case);
                 }
@@ -606,17 +601,16 @@ fn hex_bytes(lines: &[&str]) -> Vec<u8> {
 /// return _ft;
 /// ```
 ///
-/// `RangeCoder::dec_uint` (src/range_coder.rs) returns the combination as
-/// it is. The stereo angle or the pulse index decoded from it is then out
-/// of range, and the decoder reads other symbols than libopus for the rest
-/// of the frame. The frame and the five or so frames after it come out
-/// different (down to 0 dB).
+/// `RangeCoder::dec_uint` (src/range_coder.rs) used to return the
+/// combination as it was. The stereo angle or the pulse index decoded from
+/// it was then out of range, and the decoder read other symbols than
+/// libopus for the rest of the frame. The frame and the five or so frames
+/// after it came out different (down to 0 dB).
 ///
 /// Measured over 152000 frames, half of them damaged: 163 frames with
-/// another final range than libopus. With the three lines above added to
+/// another final range than libopus. With the three lines above in
 /// `dec_uint`: none.
 #[test]
-#[ignore = "RangeCoder::dec_uint (src/range_coder.rs) lacks the limit of libopus ec_dec_uint: a damaged frame can decode to an integer out of range, and the rest of the frame is then read differently from libopus"]
 fn damaged_frames_read_the_same_symbols_as_libopus() {
     // The smallest case: 257 values, the top value of the high part and a
     // raw bit of 1 give 257.
@@ -708,12 +702,11 @@ fn output_far_above_full_scale_is_not_limited() {
                 21,
             );
             assert_eq!(n, frame);
-            if dec.final_range() != c_dec.final_range() {
-                // The missing limit in `RangeCoder::dec_uint`, see
-                // `damaged_frames_read_the_same_symbols_as_libopus`.
-                println!("{channels} ch: final range differs after frame {i}");
-                break;
-            }
+            assert_eq!(
+                dec.final_range(),
+                c_dec.final_range(),
+                "{channels} ch: final range after frame {i}"
+            );
             let r = interleave(&planar, channels);
             assert!(r.iter().all(|v| v.is_finite()));
             let c_peak = c.iter().fold(0f32, |m, v| m.max(v.abs()));

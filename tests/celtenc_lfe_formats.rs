@@ -98,18 +98,16 @@ fn lfe_bit_use_and_quality_match_libopus_at_other_frame_sizes_and_rates() {
 /// Steady tones from 31 to 120 Hz, the content of a sustained bass note, at
 /// 5, 10 and 20 ms frames: on average as good as with libopus.
 ///
-/// A single tone can be up to 1.5 dB off in either direction. A steady
-/// tone gives nearly the same spectrum in every frame, so a difference
-/// between the two encoders repeats in every frame instead of averaging
-/// out. The difference is in the pulse vectors: for a band of 2
-/// coefficients opus-rs rounds a projection (`pvq_search_n2` in
-/// src/pvq.rs) where libopus searches pulse by pulse. With libopus's
-/// search in its place, tried in a scratch copy, the worst case below is
-/// within 0.03 dB (see also `celtenc_known_gaps.rs`).
+/// A steady tone gives nearly the same spectrum in every frame, so a
+/// difference between the two encoders repeats in every frame instead of
+/// averaging out. That is why the test allows 2 dB for a single tone.
 ///
-/// Measured: 50 Hz in 10 ms frames is 1.46 dB below libopus, 80 Hz in
-/// 20 ms frames 0.81 dB above. The mean over the tones is -0.18 dB at
-/// 10 ms and within 0.03 dB at 5 and 20 ms.
+/// Measured: every tone is within 0.03 dB of libopus at all three frame
+/// sizes. Before `pvq_search` searched a band of 2 coefficients pulse by
+/// pulse, as libopus does (it rounded a projection instead, see
+/// `celtenc_known_gaps.rs`), a single tone was up to 1.5 dB off in either
+/// direction: 50 Hz in 10 ms frames 1.46 dB below libopus, 80 Hz in 20 ms
+/// frames 0.81 dB above.
 #[test]
 fn lfe_steady_tones_match_libopus_on_average() {
     let tones = [

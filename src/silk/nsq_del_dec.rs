@@ -372,6 +372,10 @@ impl<const N: usize> PerState<N> {
 /// The order is the length of `ar_shp_q13`. It must be even and at most
 /// `MAX_SHAPE_LPC_ORDER`.
 ///
+/// `sum_from` splits the sum: only the taps from `sum_from` on are added
+/// here, and the caller adds those before it from the new filter state (see
+/// `neon::shaping_feedback_head`). `sum_from` is even. With 0 the return
+/// value is the complete sum.
 #[inline(always)]
 fn warped_shaping_filter<const N: usize>(
     states: &mut ShapingStates<N>,
@@ -379,9 +383,11 @@ fn warped_shaping_filter<const N: usize>(
     diff_q14: PerState<N>,
     ar_shp_q13: &[i16],
     warping_q16: i32,
+    sum_from: usize,
 ) -> PerState<N> {
     let order = ar_shp_q13.len();
     debug_assert!(order.is_multiple_of(2) && order <= MAX_SHAPE_LPC_ORDER);
+    debug_assert!(sum_from.is_multiple_of(2) && sum_from <= order);
     // Out-of-range values cannot occur; the clamp lets the compiler drop the
     // bounds checks in the loop.
     let source = source.map(|s| (s as usize).min(N - 1));
@@ -391,11 +397,34 @@ fn warped_shaping_filter<const N: usize>(
     // Two taps per pass: the compiler then needs no register moves to hand
     // `prev` and `t` to the next pass.
     let (coef_pairs, _) = ar_shp_q13.as_chunks::<2>();
-    for (p, coefs) in coef_pairs.iter().take(MAX_SHAPE_LPC_ORDER / 2).enumerate() {
-        let c0 = coefs[0] as i32;
-        let c1 = coefs[1] as i32;
+    let coef_pairs = &coef_pairs[..coef_pairs.len().min(MAX_SHAPE_LPC_ORDER / 2)];
+    let (head, tail) = coef_pairs.split_at((sum_from / 2).min(coef_pairs.len()));
+
+    // The taps whose products the caller adds. This loop has fewer values
+    // to keep in registers than the one below.
+    for p in 0..head.len() {
         // Read the old values of all states first: a state that reads from
         // another state must see them before that state overwrites them.
+        let mut a = [0i32; N];
+        let mut b = [0i32; N];
+        for k in 0..N {
+            a[k] = states[source[k]][2 * p];
+            b[k] = states[source[k]][2 * p + 1];
+        }
+        for k in 0..N {
+            let t0 = silk_smlawb(prev[k], silk_sub32_ovflw(a[k], t[k]), warping_q16);
+            let t1 = silk_smlawb(a[k], silk_sub32_ovflw(b[k], t0), warping_q16);
+            states[k][2 * p] = t0;
+            states[k][2 * p + 1] = t1;
+            prev[k] = b[k];
+            t[k] = t1;
+        }
+    }
+
+    for (p, coefs) in tail.iter().enumerate() {
+        let p = p + head.len();
+        let c0 = coefs[0] as i32;
+        let c1 = coefs[1] as i32;
         let mut a = [0i32; N];
         let mut b = [0i32; N];
         for k in 0..N {
@@ -892,6 +921,7 @@ fn quantize_subframe<const N: usize>(
             PerState::pack(diff_q14),
             setup.ar_shp_q13,
             p.warping_q16,
+            0,
         )
         .unpack();
 
@@ -1300,6 +1330,98 @@ mod neon {
         }
     }
 
+    /// The first taps of the noise shaping feedback, for
+    /// `shaping_feedback_head`.
+    ///
+    /// The feedback of one state is the sum over the taps of
+    /// `(t[m] * ar_shp_q13[m]) >> 16`, where `t` is the new filter state.
+    /// `warped_shaping_filter` computes `t` one tap after the other and can
+    /// add the products on the way. That costs two operations per tap and
+    /// state, in a loop that already runs at the number of operations the
+    /// processor executes per cycle. The products of the taps that were
+    /// written some time ago are therefore added afterwards, four taps at a
+    /// time, from the stored state.
+    ///
+    /// The last taps stay with `warped_shaping_filter`: a vector load right
+    /// after the 4-byte stores of the same values would have to wait until
+    /// the stores have reached the cache.
+    pub(super) struct FeedbackHead {
+        /// `coef_q28[j][i]` is `ar_shp_q13[4 * j + i] << 15`, the constant
+        /// for which `vqdmulhq_s32` gives `(t * coef) >> 16`. Entries of
+        /// taps that are not summed here are zero.
+        coef_q28: [[i32; 4]; MAX_SHAPE_LPC_ORDER / 4],
+        /// Number of vectors of 4 taps that are summed here.
+        vectors: usize,
+    }
+
+    impl FeedbackHead {
+        /// Taps of the feedback that the scalar loop keeps at least: the
+        /// last 4, or the last 6 when the order is not a multiple of 4.
+        const MIN_TAIL: usize = 4;
+
+        /// Sums no tap: `warped_shaping_filter` adds all of them.
+        pub(super) const NONE: Self = Self {
+            coef_q28: [[0; 4]; MAX_SHAPE_LPC_ORDER / 4],
+            vectors: 0,
+        };
+
+        pub(super) fn new(ar_shp_q13: &[i16]) -> Self {
+            let order = ar_shp_q13.len().min(MAX_SHAPE_LPC_ORDER);
+            let vectors = order.saturating_sub(Self::MIN_TAIL) / 4;
+            let mut coef_q28 = [[0i32; 4]; MAX_SHAPE_LPC_ORDER / 4];
+            for (dst, &c) in coef_q28.as_flattened_mut()[..4 * vectors]
+                .iter_mut()
+                .zip(ar_shp_q13)
+            {
+                *dst = (c as i32) << 15;
+            }
+            Self { coef_q28, vectors }
+        }
+
+        /// Number of taps summed by `shaping_feedback_head`. A multiple of 4.
+        #[inline(always)]
+        pub(super) fn head_taps(&self) -> usize {
+            4 * self.vectors
+        }
+    }
+
+    /// For every state the sum of `(states[k][m] * ar_shp_q13[m]) >> 16`
+    /// over the taps `m < head.head_taps()`, state `k` in lane `k`. Lanes
+    /// from `N` on are zero. The additions wrap around, as those of the
+    /// scalar loop do, so their order does not change the result.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(super) fn shaping_feedback_head<const N: usize>(
+        states: &ShapingStates<N>,
+        head: &FeedbackHead,
+    ) -> int32x4_t {
+        let zero = vdupq_n_s32(0);
+        let mut partial = [zero; 4];
+        let vectors = head.vectors.min(MAX_SHAPE_LPC_ORDER / 4);
+        for k in 0..N {
+            let (rows, _) = states[k].as_chunks::<4>();
+            let mut acc = zero;
+            for (row, coef) in rows[..vectors].iter().zip(&head.coef_q28) {
+                acc = vaddq_s32(acc, vqdmulhq_s32(load(row), load(coef)));
+            }
+            partial[k] = acc;
+        }
+        vpaddq_s32(
+            vpaddq_s32(partial[0], partial[1]),
+            vpaddq_s32(partial[2], partial[3]),
+        )
+    }
+
+    /// `shaping_feedback_head` as an array, for the tests.
+    #[cfg(test)]
+    pub(super) fn shaping_feedback_head_lanes<const N: usize>(
+        states: &ShapingStates<N>,
+        head: &FeedbackHead,
+    ) -> [i32; 4] {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { to_lanes(shaping_feedback_head(states, head)) }
+    }
+
     /// One subframe of the delayed-decision quantizer for `N` states, 2 to 4.
     /// Same results as `quantize_subframe`.
     ///
@@ -1325,6 +1447,15 @@ mod neon {
         };
         let decision_delay = p.decision_delay;
         let levels = LevelVectors::new(&setup.levels);
+        // With 4 states the filter loop has more values than registers.
+        // Taking the feedback sum of the first taps out of it removes the
+        // spills. With fewer states the loop has none, and the split would
+        // only add work.
+        let feedback = if N >= 4 {
+            FeedbackHead::new(setup.ar_shp_q13)
+        } else {
+            FeedbackHead::NONE
+        };
         let lpc_bias = vdupq_n_s32(setup.lpc.bias());
         let rand_multiplier = vdupq_n_s32(196314165);
         let rand_increment = vdupq_n_s32(907633515);
@@ -1346,13 +1477,22 @@ mod neon {
             // because it is the long step of the sample and only needs
             // `diff_q14`. Everything else up to the level decision does not
             // depend on it and is computed by the processor in the meantime.
-            let n_ar = warped_shaping_filter(
+            let n_ar_tail = warped_shaping_filter(
                 &mut shaping,
                 shaping_src,
                 diff_q14,
                 setup.ar_shp_q13,
                 p.warping_q16,
+                feedback.head_taps(),
             );
+            let n_ar = if N >= 4 {
+                vaddq_s32(
+                    from_packed(n_ar_tail),
+                    shaping_feedback_head(&shaping, &feedback),
+                )
+            } else {
+                from_packed(n_ar_tail)
+            };
 
             let (ltp_pred_q14, n_ltp_q14) = long_term_terms(nsq, s_ltp_q15, p, &setup, i);
 
@@ -1383,7 +1523,7 @@ mod neon {
                 x,
                 ltp_pred_q14,
                 n_ltp_q14,
-                from_packed(n_ar),
+                n_ar,
                 lpc_pred_q14,
                 lf_ar_q14,
                 load(&delay_lines.shape_q14[smpl_idx]),
@@ -2152,12 +2292,14 @@ mod tests {
                 want_states[k] = s;
             }
 
+            let start_states = states;
             let n_ar = warped_shaping_filter(
                 &mut states,
                 source,
                 PerState::pack(diff),
                 &coefs[..order],
                 warping_q16,
+                0,
             )
             .unpack();
             assert_eq!(n_ar, want_n_ar, "{N} states, order {order}, case {case}");
@@ -2165,6 +2307,59 @@ mod tests {
                 states, want_states,
                 "{N} states, order {order}, case {case}"
             );
+
+            // The sum split at every even tap: the filter adds the taps from
+            // `sum_from` on, the taps before it are added from the new state.
+            for sum_from in (0..=order).step_by(2) {
+                let mut states = start_states;
+                let tail = warped_shaping_filter(
+                    &mut states,
+                    source,
+                    PerState::pack(diff),
+                    &coefs[..order],
+                    warping_q16,
+                    sum_from,
+                )
+                .unpack();
+                assert_eq!(states, want_states, "{N} states, order {order}, split {sum_from}");
+                for k in 0..N {
+                    let mut sum = tail[k];
+                    for m in 0..sum_from {
+                        sum = silk_smlawb(sum, states[k][m], coefs[m] as i32);
+                    }
+                    assert_eq!(
+                        sum, want_n_ar[k],
+                        "{N} states, order {order}, split {sum_from}, state {k}"
+                    );
+                }
+            }
+
+            // The split the NEON loop uses, with its vector sum of the head.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let head = neon::FeedbackHead::new(&coefs[..order]);
+                assert!(head.head_taps() <= order.saturating_sub(4));
+                assert!(order < 4 || order - head.head_taps() <= 6);
+                let mut states = start_states;
+                let tail = warped_shaping_filter(
+                    &mut states,
+                    source,
+                    PerState::pack(diff),
+                    &coefs[..order],
+                    warping_q16,
+                    head.head_taps(),
+                )
+                .unpack();
+                let head_sum = neon::shaping_feedback_head_lanes(&states, &head);
+                for k in 0..N {
+                    assert_eq!(
+                        tail[k].wrapping_add(head_sum[k]),
+                        want_n_ar[k],
+                        "NEON head, {N} states, order {order}, state {k}"
+                    );
+                }
+                assert!(head_sum[N..].iter().all(|&v| v == 0));
+            }
         }
     }
 

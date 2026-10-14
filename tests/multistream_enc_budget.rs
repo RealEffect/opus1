@@ -14,8 +14,8 @@
 //!   buffer, whatever its size.
 //! - `bitrate()` after a packet that has streams without audio.
 //!
-//! Two faults of the single-stream encoder (src/lib.rs) show here. Each has
-//! an ignored test that holds the full rule.
+//! One fault of the single-stream encoder (src/lib.rs) shows here. An
+//! ignored test holds the full rule.
 #![cfg(feature = "std")]
 
 mod ms_support;
@@ -34,15 +34,16 @@ fn reported(rate: i32, fs: i32, coded_frame: usize) -> i32 {
     rate.min(cap)
 }
 
-/// Whether a constant-bitrate stream at `rate` bits per second is one the
-/// single-stream encoder of opus-rs does not code although libopus does.
+/// Whether a constant-bitrate stream at `rate` bits per second has 20 to 23
+/// bits per frame.
 ///
 /// Both encoders write a packet without audio when the bitrate is below 3
 /// bytes per frame. libopus first rounds the bitrate to the size of the
-/// constant-bitrate packet (opus_encoder.c:1331), opus-rs does not. A
-/// bitrate of 20 to 23 bits per frame rounds to 3 bytes: libopus codes the
-/// frame, opus-rs does not. `a_cbr_stream_of_three_bytes_is_coded_like_libopus`
-/// shows it on a single stream.
+/// constant-bitrate packet (opus_encoder.c:1331). A bitrate of 20 to 23
+/// bits per frame rounds to 3 bytes, so the frame is coded.
+/// `a_cbr_stream_of_three_bytes_is_coded_like_libopus` shows it on a single
+/// stream. opus-rs once tested the bitrate before rounding it and did not
+/// code such a frame.
 fn rounds_up_to_three_bytes(rate: i32, frame_size: usize, fs: i32) -> bool {
     let bits = rate as i64 * frame_size as i64 / fs as i64;
     (20..24).contains(&bits)
@@ -52,7 +53,8 @@ fn rounds_up_to_three_bytes(rate: i32, frame_size: usize, fs: i32) -> bool {
 fn low_delay_cbr_streams_have_the_sizes_and_bitrates_of_libopus() {
     let application = Application::RestrictedLowDelay;
     let mut differences = Vec::new();
-    let (mut frames, mut left_out) = (0, 0);
+    // Frames with a stream of 20 to 23 bits, which libopus still codes.
+    let (mut frames, mut three_bytes) = (0, 0);
     for fs in [48_000, 24_000, 16_000] {
         for case in CASES {
             let channels = case.channels as i32;
@@ -74,16 +76,11 @@ fn low_delay_cbr_streams_have_the_sizes_and_bitrates_of_libopus() {
                             .unwrap_or_else(|e| panic!("{label}: {e}"));
                         let c_packet = c.encode_float(frame, frame_size, out.len()).unwrap();
                         // The streams before the last keep the bitrate of
-                        // the allocation. Leave the frame out when one of
-                        // them is in the range of the known fault.
-                        let known_fault = (0..streams - 1).any(|s| {
+                        // the allocation.
+                        three_bytes += usize::from((0..streams - 1).any(|s| {
                             let rate = rust.stream_encoder(s).unwrap().bitrate_bps;
                             rounds_up_to_three_bytes(rate, frame_size, fs)
-                        });
-                        if known_fault {
-                            left_out += 1;
-                            continue;
-                        }
+                        }));
                         frames += 1;
                         assert_eq!(n, c_packet.len(), "{label}: packet size");
                         let parts = split_streams(&out[..n], streams).unwrap();
@@ -113,17 +110,19 @@ fn low_delay_cbr_streams_have_the_sizes_and_bitrates_of_libopus() {
         }
     }
     println!(
-        "{frames} frames compared, {left_out} left out, {} differences",
+        "{frames} frames compared, {three_bytes} of them with a stream of 20 to 23 bits, {} \
+         differences",
         differences.len()
     );
     for d in differences.iter().take(30) {
         println!("{d}");
     }
     assert!(differences.is_empty(), "{} differences", differences.len());
-    // The exclusion must stay an exception. Measured: 3936 and 24.
+    // Every frame is compared, and the settings reach the streams of 20
+    // to 23 bits. Measured: 3960 and 24.
     assert!(
-        frames > 3900 && left_out < 40,
-        "{frames} compared, {left_out} left out"
+        frames == 3960 && three_bytes >= 20,
+        "{frames} compared, {three_bytes} with a stream of 20 to 23 bits"
     );
 }
 
@@ -136,10 +135,12 @@ impl Drop for CEncoder {
     }
 }
 
-/// The fault behind `rounds_up_to_three_bytes`, on a plain `OpusEncoder`
-/// without any multistream code.
+/// The rule behind `rounds_up_to_three_bytes`, on a plain `OpusEncoder`
+/// without any multistream code: under constant bitrate libopus rounds the
+/// bitrate to the packet size before it decides that a frame has too few
+/// bits (opus_encoder.c:1331). The single-stream encoder does the same now;
+/// this test was ignored while it used the bitrate that was set.
 #[test]
-#[ignore = "single-stream encoder (src/lib.rs): under constant bitrate the too-few-bits rule uses the bitrate that was set; libopus first rounds it to the packet size (opus_encoder.c:1331)"]
 fn a_cbr_stream_of_three_bytes_is_coded_like_libopus() {
     let fs = 48_000;
     let mut differ = Vec::new();
@@ -271,7 +272,6 @@ fn constant_bitrate_with_the_maximum_bitrate_and_long_frames_in_a_large_buffer()
 /// `tight_output_buffers_with_40_and_60_ms_frames_like_libopus` in
 /// tests/multistream_enc_controls.rs.
 #[test]
-#[ignore = "src/lib.rs splits a 40 or 60 ms frame into 20 ms parts before it applies the too-few-bytes rule of opus_encode_native, and refuses a buffer of 1 to 4 bytes"]
 fn constant_bitrate_with_the_maximum_bitrate_and_long_frames_in_any_buffer() {
     let (packets, refused) = maximum_bitrate_cbr(&[40, 60], &BUFFERS);
     assert!(

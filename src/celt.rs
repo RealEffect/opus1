@@ -138,10 +138,8 @@ const CELT_NB_EBANDS: usize = 21;
 const CELT_NB_X_CH: usize = CELT_NB_EBANDS * CELT_MAX_CHANNELS;
 /// MDCT overlap for the default mode.
 const CELT_OVERLAP: usize = 120;
-/// CELT synthesis / decode memory window per channel.
-const CELT_CHANNEL_MEM: usize = 2048 + CELT_OVERLAP;
-/// `channels * channel_mem` worst case.
-const CELT_SYN_MEM: usize = CELT_MAX_CHANNELS * CELT_CHANNEL_MEM;
+/// Encoder `in_mem`: `channels * overlap`.
+const CELT_IN_MEM: usize = CELT_MAX_CHANNELS * CELT_OVERLAP;
 /// Prefilter comb-filter memory: `channels * COMBFILTER_MAXPERIOD`.
 const CELT_PREFILTER_MEM: usize = CELT_MAX_CHANNELS * COMBFILTER_MAXPERIOD;
 /// Encoder input buffer stride: `(MAX_FRAME_SIZE + overlap) * channels`.
@@ -156,12 +154,31 @@ const CELT_W_X_ENC: usize = CELT_FRAME_X_CH + STRIDE_ACCESS_PAD;
 const CELT_PREFILTER_PRE: usize = CELT_MAX_CHANNELS * (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE);
 /// Prefilter pitch buffer: `(COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE) >> 1`.
 const CELT_PREFILTER_PITCH: usize = (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE) >> 1;
-/// Decoder `w_x`: `DECODE_BUFFER_SIZE * channels + STRIDE_ACCESS_PAD`.
-const CELT_W_X_DEC: usize = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS + STRIDE_ACCESS_PAD;
-/// Decoder `w_freq`: `DECODE_BUFFER_SIZE * channels + 4`.
-const CELT_W_FREQ_DEC: usize = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS + 4;
-/// Decoder `decode_mem`: `channels * (DECODE_BUFFER_SIZE + overlap)`.
-const CELT_DECODE_MEM: usize = CELT_MAX_CHANNELS * (DECODE_BUFFER_SIZE + CELT_OVERLAP);
+/// Longest frame the decoder produces, in samples at 48 kHz (20 ms).
+const CELT_DEC_MAX_FRAME: usize = 960;
+/// Decoder `w_x`: the normalised spectrum of two channels and the padding
+/// that the band kernels may read past its end. The loss concealment uses
+/// the same array as working memory (`CeltDecoder::conceal`).
+const CELT_W_X_DEC: usize = {
+    let spectrum = CELT_DEC_MAX_FRAME * CELT_MAX_CHANNELS + STRIDE_ACCESS_PAD;
+    let conceal = 2 * PLC_MAX_PERIOD + PLC_LPC_ORDER;
+    if spectrum > conceal {
+        spectrum
+    } else {
+        conceal
+    }
+};
+/// Decoder `w_freq`: the spectrum of two channels, and 4 values of padding.
+const CELT_W_FREQ_DEC: usize = CELT_DEC_MAX_FRAME * CELT_MAX_CHANNELS + 4;
+/// Samples that each channel's output history can slide forward in
+/// `decode_mem` before it is moved back to the start (see
+/// `CeltDecoder::advance_history`).
+const CELT_HIST_SLACK: usize = CELT_DEC_MAX_FRAME;
+/// Samples per channel in the decoder's `decode_mem`: the history
+/// (`DECODE_BUFFER_SIZE + overlap`) and the room it slides through.
+const CELT_HIST_STRIDE: usize = DECODE_BUFFER_SIZE + CELT_OVERLAP + CELT_HIST_SLACK;
+/// Decoder `decode_mem`: `channels * CELT_HIST_STRIDE`.
+const CELT_DECODE_MEM: usize = CELT_MAX_CHANNELS * CELT_HIST_STRIDE;
 
 /// CELT internal-to-API decimation factor (port of libopus `resampling_factor`).
 /// The CELT decoder always runs at 48 kHz internally; the output is decimated
@@ -197,45 +214,33 @@ fn upsample_scale_zero(freq: &mut [f32], frame_size: usize, upsample: usize, cha
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
+/// Sum of `|x[i]|`, four partial sums side by side.
+///
+/// Partial sum `k` adds samples `k`, `k + 4`, `k + 8` and so on, in that
+/// order. The four are then added as `(s0 + s1) + (s2 + s3)`, and the last
+/// `len % 4` samples are added one by one. `sum_abs_lanes_reference` in the
+/// tests is this order written as a plain loop.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn sum_abs_neon(x: &[f32], n: usize) -> f32 {
-    let mut sum_vec = vdupq_n_f32(0.0);
+fn sum_abs_neon(x: &[f32]) -> f32 {
+    let n = x.len();
+    let p = x.as_ptr();
     let mut i = 0;
+    // SAFETY: every load reads the 4 values at `p + i .. p + i + 4`, and the
+    // loop condition keeps `i + 4 <= n == x.len()`.
+    let mut sum = unsafe {
+        let mut sum_vec = vdupq_n_f32(0.0);
+        while i + 4 <= n {
+            // A plain add. This used to be a fused multiply-add with a
+            // factor of 1.0, which gives the same bits one cycle later.
+            sum_vec = vaddq_f32(sum_vec, vabsq_f32(vld1q_f32(p.add(i))));
+            i += 4;
+        }
+        vaddvq_f32(sum_vec)
+    };
 
-    while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-
-        sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x0), vdupq_n_f32(1.0));
-        sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x1), vdupq_n_f32(1.0));
-        sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x2), vdupq_n_f32(1.0));
-        sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x3), vdupq_n_f32(1.0));
-
-        i += 16;
-    }
-
-    while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x0), vdupq_n_f32(1.0));
-        sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x1), vdupq_n_f32(1.0));
-        i += 8;
-    }
-
-    while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x0), vdupq_n_f32(1.0));
-        i += 4;
-    }
-
-    let mut sum = vaddvq_f32(sum_vec);
-
-    for j in i..n {
-        sum += x[j].abs();
+    for &v in &x[i..] {
+        sum += v.abs();
     }
 
     sum
@@ -243,6 +248,8 @@ unsafe fn sum_abs_neon(x: &[f32], n: usize) -> f32 {
 
 #[inline(always)]
 fn sum_abs(x: &[f32]) -> f32 {
+    // SAFETY: the AVX version runs only when the processor has AVX, and it
+    // reads `x.len()` values of `x`.
     #[cfg(target_arch = "x86_64")]
     unsafe {
         if crate::compat::x86_has_avx() {
@@ -250,13 +257,230 @@ fn sum_abs(x: &[f32]) -> f32 {
         }
     }
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        sum_abs_neon(x, x.len())
+    {
+        sum_abs_neon(x)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         x.iter().map(|&v| v.abs()).sum()
     }
+}
+
+/// Largest of `init` and every `|x[i]|` (libopus `celt_maxabs_res`).
+///
+/// A sample that is not a number never becomes the maximum, because the
+/// test `v > max` is false for it. This is the portable version, and the
+/// reference the vector version is tested against.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline]
+fn max_abs_scalar(x: &[f32], init: f32) -> f32 {
+    let mut m = init;
+    for &v in x {
+        let v = v.abs();
+        if v > m {
+            m = v;
+        }
+    }
+    m
+}
+
+/// `max_abs_scalar` with 16 samples per pass.
+///
+/// Each of the 16 positions keeps its own maximum with the same test
+/// `v > max`, so a sample that is not a number is skipped here too. A
+/// maximum does not depend on the order of the comparisons, so the result
+/// has the same bits as the scalar one.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn max_abs_neon(x: &[f32], init: f32) -> f32 {
+    let n = x.len();
+    let p = x.as_ptr();
+    let mut i = 0;
+    // SAFETY: every load reads the 4 values at `p + i .. p + i + 4`, and the
+    // loop conditions keep `i + 4 <= n` (`i + 16 <= n` for the four loads of
+    // the first loop).
+    let lanes: [f32; 4] = unsafe {
+        let mut m0 = vdupq_n_f32(init);
+        let mut m1 = m0;
+        let mut m2 = m0;
+        let mut m3 = m0;
+        while i + 16 <= n {
+            let v0 = vabsq_f32(vld1q_f32(p.add(i)));
+            let v1 = vabsq_f32(vld1q_f32(p.add(i + 4)));
+            let v2 = vabsq_f32(vld1q_f32(p.add(i + 8)));
+            let v3 = vabsq_f32(vld1q_f32(p.add(i + 12)));
+            m0 = vbslq_f32(vcgtq_f32(v0, m0), v0, m0);
+            m1 = vbslq_f32(vcgtq_f32(v1, m1), v1, m1);
+            m2 = vbslq_f32(vcgtq_f32(v2, m2), v2, m2);
+            m3 = vbslq_f32(vcgtq_f32(v3, m3), v3, m3);
+            i += 16;
+        }
+        while i + 4 <= n {
+            let v0 = vabsq_f32(vld1q_f32(p.add(i)));
+            m0 = vbslq_f32(vcgtq_f32(v0, m0), v0, m0);
+            i += 4;
+        }
+        m0 = vbslq_f32(vcgtq_f32(m1, m0), m1, m0);
+        m2 = vbslq_f32(vcgtq_f32(m3, m2), m3, m2);
+        m0 = vbslq_f32(vcgtq_f32(m2, m0), m2, m0);
+        core::mem::transmute::<float32x4_t, [f32; 4]>(m0)
+    };
+    let mut m = lanes[0];
+    for &v in &lanes[1..] {
+        if v > m {
+            m = v;
+        }
+    }
+    for &v in &x[i..] {
+        let v = v.abs();
+        if v > m {
+            m = v;
+        }
+    }
+    m
+}
+
+/// Largest of `init` and every `|x[i]|`; see `max_abs_scalar`.
+#[inline]
+fn max_abs(x: &[f32], init: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        max_abs_neon(x, init)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        max_abs_scalar(x, init)
+    }
+}
+
+/// Pre-emphasis of one channel (libopus `celt_preemphasis`, float build).
+///
+/// `pcm` is the input at the API rate, in the range -1 to 1. `out` gets
+/// `pcm.len() * upsample` samples at 48 kHz. Each input sample is scaled to
+/// the 16-bit range and followed by `upsample - 1` zeros. That signal `x`
+/// goes through the filter `out[i] = x[i] - coef * x[i - 1]`.
+///
+/// `mem` is `coef * x[-1]` from the previous frame. The function returns the
+/// value to pass for the next frame.
+#[inline]
+fn celt_preemphasis(pcm: &[f32], out: &mut [f32], upsample: usize, coef: f32, mem: f32) -> f32 {
+    debug_assert_eq!(out.len(), pcm.len() * upsample);
+    let mut m = mem;
+    match upsample {
+        1 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                m = preemphasis_neon(pcm, out, coef, m);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                m = preemphasis_scalar(pcm, out, coef, m);
+            }
+        }
+        // 24 kHz input. The same loop as below, with a block length the
+        // compiler knows.
+        2 => m = preemphasis_stuffed::<2>(pcm, out, coef, m),
+        _ => {
+            for (block, &p) in out.chunks_exact_mut(upsample).zip(pcm) {
+                m = preemphasis_block(block, p, coef, m);
+            }
+        }
+    }
+    m
+}
+
+/// `celt_preemphasis` for 48 kHz input (no stuffed zeros). This is the
+/// portable version, and the reference the vector version is tested against.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline]
+fn preemphasis_scalar(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
+    let mut m = mem;
+    for (d, &p) in out.iter_mut().zip(pcm) {
+        let x = p * 32768.0;
+        *d = x - m;
+        m = x * coef;
+    }
+    m
+}
+
+/// `preemphasis_scalar` with 8 samples per pass.
+///
+/// `out[i] = x[i] - coef * x[i - 1]` does not depend on `out[i - 1]`, so the
+/// samples can be computed side by side. The product and the difference
+/// stay two operations with a rounding each, as in the scalar loop, so the
+/// result has the same bits.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn preemphasis_neon(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
+    const SCALE: f32 = 32768.0;
+    let n = pcm.len();
+    // The stores below rely on this. A caller that passes a shorter `out`
+    // gets a panic, not a write past its end.
+    assert!(out.len() >= n, "celt_preemphasis: output shorter than input");
+    if n == 0 {
+        return mem;
+    }
+    out[0] = pcm[0] * SCALE - mem;
+    let mut i = 1;
+    // SAFETY: `1 <= i` and `i + 4 <= n` at every group of four (`i + 8 <= n`
+    // in the first loop, which handles two groups). A group loads
+    // `pcm[i - 1 .. i + 3]` and `pcm[i .. i + 4]` and stores
+    // `out[i .. i + 4]`. All of these are inside the slices, because
+    // `pcm.len() == n` and `out.len() >= n`.
+    unsafe {
+        let p = pcm.as_ptr();
+        let o = out.as_mut_ptr();
+        let scale = vdupq_n_f32(SCALE);
+        let coefv = vdupq_n_f32(coef);
+        while i + 8 <= n {
+            let x_a = vmulq_f32(vld1q_f32(p.add(i)), scale);
+            let x_b = vmulq_f32(vld1q_f32(p.add(i + 4)), scale);
+            let prev_a = vmulq_f32(vld1q_f32(p.add(i - 1)), scale);
+            let prev_b = vmulq_f32(vld1q_f32(p.add(i + 3)), scale);
+            vst1q_f32(o.add(i), vsubq_f32(x_a, vmulq_f32(prev_a, coefv)));
+            vst1q_f32(o.add(i + 4), vsubq_f32(x_b, vmulq_f32(prev_b, coefv)));
+            i += 8;
+        }
+        while i + 4 <= n {
+            let x_a = vmulq_f32(vld1q_f32(p.add(i)), scale);
+            let prev_a = vmulq_f32(vld1q_f32(p.add(i - 1)), scale);
+            vst1q_f32(o.add(i), vsubq_f32(x_a, vmulq_f32(prev_a, coefv)));
+            i += 4;
+        }
+    }
+    // The filter memory after sample `i - 1`, then the last samples.
+    let mut m = pcm[i - 1] * SCALE * coef;
+    for (d, &p) in out[i..n].iter_mut().zip(&pcm[i..]) {
+        let x = p * SCALE;
+        *d = x - m;
+        m = x * coef;
+    }
+    m
+}
+
+/// `celt_preemphasis` for an input with `UP - 1` zeros after every sample.
+#[inline(always)]
+fn preemphasis_stuffed<const UP: usize>(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
+    let mut m = mem;
+    for (block, &p) in out.as_chunks_mut::<UP>().0.iter_mut().zip(pcm) {
+        m = preemphasis_block(block, p, coef, m);
+    }
+    m
+}
+
+/// One input sample `p` and the zeros that follow it. `block` gets the
+/// filter output for these `block.len()` samples.
+#[inline(always)]
+fn preemphasis_block(block: &mut [f32], p: f32, coef: f32, mem: f32) -> f32 {
+    let x = p * 32768.0;
+    block[0] = x - mem;
+    let mut m = x * coef;
+    for d in block[1..].iter_mut() {
+        // The filter step for an input of zero.
+        *d = 0.0 - m;
+        m = 0.0 * coef;
+    }
+    m
 }
 
 const MAX_FRAME_SIZE: usize = 2880;
@@ -275,7 +499,12 @@ const INV_TABLE: [u8; 128] = [
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2,
 ];
 
-const MAX_TRANSIENT_LEN: usize = 3000;
+/// Scratch of the tone and transient analyses, in two halves. Each half has
+/// room for the longest frame (20 ms) and the overlap. The first half holds
+/// the mono mix `tone_detect` analyses for stereo input. The second half
+/// holds the envelopes of `transient_passes`: half as many values per
+/// channel.
+const CELT_ANALYSIS_TMP: usize = 2 * (960 + CELT_OVERLAP);
 
 #[derive(Debug, Clone, Copy)]
 pub struct AnalysisInfo {
@@ -312,9 +541,202 @@ impl Default for AnalysisInfo {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn transient_analysis(
+/// Filter state of one channel in the forward pass of `transient_passes`.
+#[derive(Clone, Copy, Default)]
+struct TransientForward {
+    /// The two memories of the high-pass filter.
+    mem0: f32,
+    mem1: f32,
+    /// Memory of the forward smoothing filter.
+    smooth: f32,
+    /// Sum of the energies so far.
+    mean: f32,
+}
+
+impl TransientForward {
+    /// One step of the forward pass: two input samples in, one value of the
+    /// smoothed energy envelope out.
+    ///
+    /// The samples go through the high-pass filter. Their energy is added to
+    /// `mean` and goes through the forward smoothing filter with the decay
+    /// `forward_decay`; `keep` is `1 - forward_decay`. `blank` is set for
+    /// the first 6 steps: libopus clears the first 12 filtered samples.
+    #[inline(always)]
+    fn step(&mut self, xa: f32, xb: f32, blank: bool, forward_decay: f32, keep: f32) -> f32 {
+        let mut ya = self.mem0 + xa;
+        let mem00 = self.mem0;
+        self.mem0 = self.mem0 - xa + 0.5 * self.mem1;
+        self.mem1 = xa - mem00;
+
+        let mut yb = self.mem0 + xb;
+        let mem00 = self.mem0;
+        self.mem0 = self.mem0 - xb + 0.5 * self.mem1;
+        self.mem1 = xb - mem00;
+
+        if blank {
+            ya = 0.0;
+            yb = 0.0;
+        }
+        let x2 = (ya * ya + yb * yb) / 16.0;
+        // C float build: PSHR32(x2, 12) is an identity, so mean += x2
+        self.mean += x2;
+        self.smooth = x2 + keep * self.smooth;
+        forward_decay * self.smooth
+    }
+}
+
+/// Number of forward steps whose filtered samples count as zero.
+const TRANSIENT_BLANK_STEPS: usize = 6;
+
+/// One step of the backward smoothing of `transient_passes`, in place.
+/// `mem` is the filter memory and `max_e` the largest output so far.
+#[inline(always)]
+fn transient_backward_step(e: &mut f32, mem: &mut f32, max_e: &mut f32) {
+    *mem = *e + 0.875 * *mem;
+    *e = 0.125 * *mem;
+    if *e > *max_e {
+        *max_e = *e;
+    }
+}
+
+/// What the two passes of the transient analysis leave for
+/// `transient_decision`, per channel, next to the envelope.
+#[derive(Clone, Copy, Default)]
+struct TransientPasses {
+    /// Sum of the energies of the high-passed samples.
+    mean: [f32; 2],
+    /// Largest value of the smoothed envelope.
+    max_e: [f32; 2],
+}
+
+/// First part of libopus `transient_analysis` (float build): the smoothed
+/// energy envelope of every channel. `transient_decision` is the second
+/// part.
+///
+/// `input` holds `len` samples per channel, one channel after the other.
+/// `envelope` gets `len / 2` values per channel. For stereo, `mix` gets the
+/// `len` samples of `tone_mix_stereo`; mono leaves it alone. Neither buffer
+/// needs to be initialized.
+///
+/// libopus runs three loops per channel: the high-pass filter, the energy
+/// with forward smoothing, and the backward smoothing. Each is a recurrence,
+/// so its speed is set by the delay of one add and one multiply per sample.
+/// Here the first two loops are one loop, and both channels of a stereo
+/// frame go through each loop side by side. The same loop also adds up the
+/// sums `tone_detect` needs for a delay of 1 (see `ToneSums`), which are
+/// three more chains of this kind. The processor then works on up to seven
+/// chains at once. Every value is computed with the same operations in the
+/// same order as in the separate loops.
+fn transient_passes(
     input: &[f32],
+    len: usize,
+    channels: usize,
+    allow_weak_transients: bool,
+    envelope: &mut [f32],
+    mix: &mut [f32],
+) -> (TransientPasses, ToneSums) {
+    let forward_decay = if allow_weak_transients {
+        0.03125f32
+    } else {
+        0.0625f32
+    };
+    let keep = 1.0 - forward_decay;
+
+    let len2 = len / 2;
+    debug_assert!((1..=2).contains(&channels));
+    let input = &input[..channels * len];
+    let envelope = &mut envelope[..channels * len2];
+
+    // Forward pass, then backward pass. `fwd[c].mean` and `max_e[c]` are
+    // the results for channel `c`, next to its part of `envelope`.
+    //
+    // A step of the forward loop takes samples `2 * i` and `2 * i + 1`. The
+    // sums for the tone detector need two samples more, so the loop runs on
+    // windows of four samples, two samples apart. These end one step
+    // early. `done` counts the steps of the loop; the code after it does
+    // what is left.
+    let mut fwd = [TransientForward::default(); 2];
+    let mut max_e = [0.0f32; 2];
+    let mut tone = ToneSums::default();
+    let mut done = 0usize;
+    if channels == 2 {
+        let (in0, in1) = input.split_at(len);
+        let (env0, env1) = envelope.split_at_mut(len2);
+        let mix = &mut mix[..len];
+        let [f0, f1] = &mut fwd;
+        let windows = in0.windows(4).step_by(2).zip(in1.windows(4).step_by(2));
+        let mix_pairs = mix.as_chunks_mut::<2>().0.iter_mut();
+        let outputs = env0.iter_mut().zip(env1.iter_mut()).zip(mix_pairs);
+        for (i, ((a, b), ((e0, e1), m))) in windows.zip(outputs).enumerate() {
+            let x0 = 0.5 * (a[0] + b[0]);
+            let x1 = 0.5 * (a[1] + b[1]);
+            let x2 = 0.5 * (a[2] + b[2]);
+            let x3 = 0.5 * (a[3] + b[3]);
+            tone.add(x0, x1, x2);
+            tone.add(x1, x2, x3);
+            m[0] = x0;
+            m[1] = x1;
+            let blank = i < TRANSIENT_BLANK_STEPS;
+            *e0 = f0.step(a[0], a[1], blank, forward_decay, keep);
+            *e1 = f1.step(b[0], b[1], blank, forward_decay, keep);
+            done = i + 1;
+        }
+        for i in done..len2 {
+            let blank = i < TRANSIENT_BLANK_STEPS;
+            env0[i] = f0.step(in0[2 * i], in0[2 * i + 1], blank, forward_decay, keep);
+            env1[i] = f1.step(in1[2 * i], in1[2 * i + 1], blank, forward_decay, keep);
+        }
+        for i in 2 * done..len {
+            mix[i] = 0.5 * (in0[i] + in1[i]);
+        }
+        for i in 2 * done..len.saturating_sub(2) {
+            tone.add(mix[i], mix[i + 1], mix[i + 2]);
+        }
+
+        let mut mem = [0.0f32; 2];
+        let [mem0, mem1] = &mut mem;
+        let [max0, max1] = &mut max_e;
+        for (e0, e1) in env0.iter_mut().rev().zip(env1.iter_mut().rev()) {
+            transient_backward_step(e0, mem0, max0);
+            transient_backward_step(e1, mem1, max1);
+        }
+    } else {
+        let f0 = &mut fwd[0];
+        for (i, (w, e0)) in input.windows(4).step_by(2).zip(envelope.iter_mut()).enumerate() {
+            tone.add(w[0], w[1], w[2]);
+            tone.add(w[1], w[2], w[3]);
+            *e0 = f0.step(w[0], w[1], i < TRANSIENT_BLANK_STEPS, forward_decay, keep);
+            done = i + 1;
+        }
+        for i in done..len2 {
+            let blank = i < TRANSIENT_BLANK_STEPS;
+            envelope[i] = f0.step(input[2 * i], input[2 * i + 1], blank, forward_decay, keep);
+        }
+        for i in 2 * done..len.saturating_sub(2) {
+            tone.add(input[i], input[i + 1], input[i + 2]);
+        }
+
+        let mut mem = 0.0f32;
+        for e0 in envelope.iter_mut().rev() {
+            transient_backward_step(e0, &mut mem, &mut max_e[0]);
+        }
+    }
+
+    let passes = TransientPasses {
+        mean: [fwd[0].mean, fwd[1].mean],
+        max_e,
+    };
+    (passes, tone)
+}
+
+/// Second part of libopus `transient_analysis` (float build): the decision.
+///
+/// `passes` and `envelope` come from `transient_passes`, called with the
+/// same `len`, `channels` and `allow_weak_transients`.
+#[allow(clippy::too_many_arguments)]
+fn transient_decision(
+    passes: &TransientPasses,
+    envelope: &[f32],
     len: usize,
     channels: usize,
     tf_estimate: &mut f32,
@@ -323,54 +745,16 @@ fn transient_analysis(
     weak_transient: &mut bool,
     _tone_freq: f32,
     toneishness: f32,
-    tmp: &mut [f32],
-    tmp2: &mut [f32],
 ) -> bool {
     let mut mask_metric = 0.0f32;
-    let mut forward_decay = 0.0625f32;
-
     *weak_transient = false;
-    if allow_weak_transients {
-        forward_decay = 0.03125f32;
-    }
-
     let len2 = len / 2;
-    debug_assert!(len <= MAX_TRANSIENT_LEN);
+    let envelope = &envelope[..channels * len2];
 
     for c in 0..channels {
-        let mut mem0 = 0.0f32;
-        let mut mem1 = 0.0f32;
-
-        for i in 0..len {
-            let x = input[c * len + i];
-            let y = mem0 + x;
-            let mem00 = mem0;
-            mem0 = mem0 - x + 0.5 * mem1;
-            mem1 = x - mem00;
-            tmp[i] = y;
-        }
-
-        tmp[..12].fill(0.0);
-
-        let mut mean = 0.0f32;
-        mem0 = 0.0f32;
-        for i in 0..len2 {
-            let x2 = (tmp[2 * i] * tmp[2 * i] + tmp[2 * i + 1] * tmp[2 * i + 1]) / 16.0;
-            // C float build: PSHR32(x2, 12) is an identity, so mean += x2
-            mean += x2;
-            mem0 = x2 + (1.0 - forward_decay) * mem0;
-            tmp2[i] = forward_decay * mem0;
-        }
-
-        mem0 = 0.0f32;
-        let mut max_e = 0.0f32;
-        for i in (0..len2).rev() {
-            mem0 = tmp2[i] + 0.875 * mem0;
-            tmp2[i] = 0.125 * mem0;
-            if tmp2[i] > max_e {
-                max_e = tmp2[i];
-            }
-        }
+        let tmp2 = &envelope[c * len2..(c + 1) * len2];
+        let max_e = passes.max_e[c];
+        let mut mean = passes.mean[c];
 
         mean = (mean * max_e * 0.5 * (len2 as f32)).sqrt();
         // C (float build): norm = len2 / (EPSILON + mean)  [EPSILON = 1e-15f]
@@ -414,6 +798,11 @@ fn transient_analysis(
 }
 
 fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
+    // The vector versions read `n` values through a pointer. This check
+    // makes a call with `n > tmp.len()` panic instead.
+    let tmp = &tmp[..n];
+    // SAFETY: the AVX version runs only when the processor has AVX, and
+    // `tmp` holds exactly `n` values (sliced above).
     #[cfg(target_arch = "x86_64")]
     unsafe {
         if n >= 16 && crate::compat::x86_has_avx() {
@@ -423,17 +812,27 @@ fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
         if n >= 16 {
+            // SAFETY: `tmp` holds exactly `n` values (sliced above), and
+            // NEON is part of every aarch64 target this crate builds for.
             return unsafe { l1_metric_neon(tmp, n, lm, bias) };
         }
     }
 
     let mut l1 = 0.0f32;
-    for &tv in tmp[..n].iter() {
+    for &tv in tmp.iter() {
         l1 += tv.abs();
     }
     l1 + (lm as f32) * bias * l1
 }
 
+/// Sum of the first `n` values of `|x[i]|`, in two groups of 8 partial sums.
+///
+/// # Safety
+///
+/// The processor must have AVX. Reads `x[..n]` through a pointer without
+/// checks, so the caller must make sure that `n <= x.len()`. Every load
+/// reads 8 values at `i .. i + 8`, and the loop conditions keep
+/// `i + 8 <= n` (`i + 16 <= n` for the two loads of the first loop).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
@@ -441,6 +840,7 @@ unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    debug_assert!(n <= x.len());
 
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
@@ -477,9 +877,14 @@ unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
     out
 }
 
+/// # Safety
+///
+/// The processor must have AVX, and `n <= tmp.len()` (see `sum_abs_avx`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn l1_metric_avx(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
+    debug_assert!(n <= tmp.len());
+    // SAFETY: the caller guarantees AVX and `n <= tmp.len()`.
     let l1 = sum_abs_avx(tmp, n);
     l1 + (lm as f32) * bias * l1
 }
@@ -487,6 +892,9 @@ unsafe fn l1_metric_avx(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn l1_metric_neon(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
+    debug_assert!(n <= tmp.len());
+    // SAFETY: the caller guarantees `n <= tmp.len()`. Every load reads the
+    // 4 values at `i .. i + 4`, and the loop conditions keep `i + 4 <= n`.
     unsafe {
         let mut sum4 = vdupq_n_f32(0.0);
         let mut i = 0;
@@ -838,10 +1246,19 @@ fn comb_filter_const(
     g11: f32,
     g12: f32,
 ) {
+    // The vector versions below read and write through pointers without
+    // further checks. They read `x[x_idx - t - 2 .. x_idx + n]` and write
+    // `y[y_idx .. y_idx + n]`. A caller with other values gets a panic here.
+    assert!(
+        t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len(),
+        "comb_filter_const: range outside its buffers"
+    );
     #[cfg(target_arch = "aarch64")]
     {
         comb_filter_const_neon(y, x, y_idx, x_idx, t, n, g10, g11, g12);
     }
+    // SAFETY: the range was checked above, and this version runs only when
+    // the processor has AVX and FMA.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         if crate::compat::x86_has_avx_fma() {
@@ -849,6 +1266,7 @@ fn comb_filter_const(
             return;
         }
     }
+    // SAFETY: the range was checked above, and SSE is part of this target.
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         comb_filter_const_sse(y, x, y_idx, x_idx, t, n, g10, g11, g12);
@@ -910,9 +1328,32 @@ fn comb_filter_const_neon(
     g11: f32,
     g12: f32,
 ) {
+    // The only caller is `comb_filter_const`, which has checked this range.
+    // The check is repeated here so that this safe function stays safe if
+    // it gets another caller.
+    assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
+    // SAFETY: the range the kernel reads and writes is inside `x` and `y`
+    // (checked above).
     unsafe { comb_filter_const_neon_impl(y, x, y_idx, x_idx, t, n, g10, g11, g12) }
 }
 
+/// `comb_filter_const` for 64-bit ARM, four samples per pass.
+///
+/// A group of four samples adds each product with a fused multiply-add,
+/// which rounds once. The last `n % 4` samples round every product first,
+/// as `comb_filter_const_scalar` does for all samples. The results can
+/// therefore differ in the last bit. `comb_filter_const_reference` in the
+/// tests writes out which sample is computed which way.
+///
+/// # Safety
+///
+/// Reads `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`
+/// without checks. The caller must make sure that `t >= 2` and that both
+/// ranges are inside their slices. With `t >= 2`, the load of the four
+/// values at `x_idx + i - t + 2` ends at or before `x_idx + i + 4`, which
+/// the loop condition keeps at or below `x_idx + n`. The first load, at
+/// `x_idx - t - 2`, also happens when `n` is 0; it ends at or before
+/// `x_idx`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -928,6 +1369,7 @@ unsafe fn comb_filter_const_neon_impl(
     g12: f32,
 ) {
     use core::arch::aarch64::*;
+    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = vdupq_n_f32(g10);
     let g11v = vdupq_n_f32(g11);
@@ -977,6 +1419,13 @@ unsafe fn comb_filter_const_neon_impl(
     }
 }
 
+/// # Safety
+///
+/// Reads `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`
+/// without checks. The caller must make sure that `t >= 2` and that both
+/// ranges are inside their slices. With `t >= 2`, the load of the four
+/// values at `x_idx + i - t + 2` ends at or before `x_idx + i + 4`, which
+/// the loop condition keeps at or below `x_idx + n`.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -995,6 +1444,7 @@ unsafe fn comb_filter_const_sse(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);
@@ -1046,6 +1496,14 @@ unsafe fn comb_filter_const_sse(
     }
 }
 
+/// # Safety
+///
+/// The processor must have AVX and FMA. Reads
+/// `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`
+/// without checks. The caller must make sure that `t >= 2` and that both
+/// ranges are inside their slices. With `t >= 2`, the load of the eight
+/// values at `x_idx + i - t + 2` ends at or before `x_idx + i + 8`, which
+/// the loop conditions keep at or below `x_idx + n`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1064,6 +1522,7 @@ unsafe fn comb_filter_const_avx(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm256_set1_ps(g10);
     let g11v = _mm256_set1_ps(g11);
@@ -1133,6 +1592,8 @@ unsafe fn comb_filter_const_avx(
     }
 
     if i + 4 <= n {
+        // SAFETY: the same ranges as this call's, without the first `i`
+        // samples: `x_idx + i >= t + 2`, and both ends stay where they were.
         comb_filter_const_sse_fma(y, x, y_idx + i, x_idx + i, t, n - i, g10, g11, g12);
         return;
     }
@@ -1152,6 +1613,10 @@ unsafe fn comb_filter_const_avx(
     }
 }
 
+/// # Safety
+///
+/// The processor must have AVX and FMA. The ranges are those of
+/// `comb_filter_const_sse`, with the same conditions for the caller.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1170,6 +1635,7 @@ unsafe fn comb_filter_const_sse_fma(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);
@@ -1322,43 +1788,20 @@ fn comb_filter_inplace(
     let g11 = g1 * PREFILTER_GAINS[tapset1 as usize][1];
     let g12 = g1 * PREFILTER_GAINS[tapset1 as usize][2];
 
-    let mut inner_overlap = overlap;
-    if g0 == g1 && t0 == t1 && tapset0 == tapset1 {
-        inner_overlap = 0;
+    // The first `overlap` samples cross-fade from the old filter to the new
+    // one, unless the two are the same filter.
+    let fade = if g0 == g1 && t0 == t1 && tapset0 == tapset1 {
+        0
+    } else {
+        overlap.min(n)
+    };
+    if fade > 0 {
+        let (old, new) = ([g00, g01, g02], [g10, g11, g12]);
+        comb_inplace_fade(buf, y_idx, t0, t1, fade, old, new, window);
     }
-
-    let mut i = 0;
-    while i < inner_overlap && i < n {
-        let idx = y_idx + i;
-        let f = window[i] * window[i];
-        let s = buf[idx]; // original input (not yet overwritten at idx)
-        let r0 = buf[idx - t0];
-        let r0p1 = buf[idx - t0 + 1];
-        let r0m1 = buf[idx - t0 - 1];
-        let r0p2 = buf[idx - t0 + 2];
-        let r0m2 = buf[idx - t0 - 2];
-        let r1 = buf[idx - t1];
-        let r1p1 = buf[idx - t1 + 1];
-        let r1m1 = buf[idx - t1 - 1];
-        let r1p2 = buf[idx - t1 + 2];
-        let r1m2 = buf[idx - t1 - 2];
-        buf[idx] = s
-            + (1.0 - f) * (g00 * r0 + g01 * (r0p1 + r0m1) + g02 * (r0p2 + r0m2))
-            + f * (g10 * r1 + g11 * (r1p1 + r1m1) + g12 * (r1p2 + r1m2));
-        i += 1;
-    }
-
-    // Constant region: only new filter (t1, g1)
-    while i < n {
-        let idx = y_idx + i;
-        let s = buf[idx];
-        let r1 = buf[idx - t1];
-        let r1p1 = buf[idx - t1 + 1];
-        let r1m1 = buf[idx - t1 - 1];
-        let r1p2 = buf[idx - t1 + 2];
-        let r1m2 = buf[idx - t1 - 2];
-        buf[idx] = s + g10 * r1 + g11 * (r1p1 + r1m1) + g12 * (r1p2 + r1m2);
-        i += 1;
+    // The rest of the frame uses the new filter alone.
+    if fade < n {
+        comb_inplace_const(buf, y_idx + fade, t1, n - fade, [g10, g11, g12]);
     }
 }
 
@@ -1640,8 +2083,10 @@ pub struct CeltEncoder {
     /// desynchronises the range coder (issue #37).
     end_band: usize,
     pub complexity: i32,
-    syn_mem: FixedVec<f32, CELT_SYN_MEM>,
-    enc_decode_mem: FixedVec<f32, CELT_SYN_MEM>,
+    /// libopus `st->in_mem`: per channel, the last `overlap` samples of the
+    /// previous frame after the pre-filter. The next frame's transform
+    /// starts with them.
+    in_mem: FixedVec<f32, CELT_IN_MEM>,
     old_band_e: FixedVec<f32, CELT_NB_X_CH>,
     preemph_mem: FixedVec<f32, CELT_MAX_CHANNELS>,
     tonal_average: i32,
@@ -1683,7 +2128,6 @@ pub struct CeltEncoder {
     w_ebits: FixedVec<i32, CELT_NB_X_CH>,
     w_fine_priority: FixedVec<i32, CELT_NB_X_CH>,
     w_collapse_masks: FixedVec<u32, CELT_NB_X_CH>,
-    w_band_amp_synth: FixedVec<f32, CELT_NB_X_CH>,
     consec_transient: i32,
 
     w_prefilter_pre: FixedVec<f32, CELT_PREFILTER_PRE>,
@@ -1691,8 +2135,7 @@ pub struct CeltEncoder {
     w_prefilter_before: FixedVec<f32, CELT_MAX_CHANNELS>,
     w_prefilter_after: FixedVec<f32, CELT_MAX_CHANNELS>,
 
-    w_transient_tmp: FixedVec<f32, MAX_TRANSIENT_LEN>,
-    w_transient_tmp2: FixedVec<f32, { MAX_TRANSIENT_LEN / 2 }>,
+    w_analysis_tmp: FixedVec<f32, CELT_ANALYSIS_TMP>,
 
     analysis: AnalysisInfo,
     loss_rate: i32,
@@ -1831,17 +2274,46 @@ fn tone_lpc(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
     if len <= 2 * delay {
         return true;
     }
-    let mut r00 = 0.0f32;
-    let mut r01 = 0.0f32;
-    let mut r02 = 0.0f32;
+    let mut sums = ToneSums::default();
+    for i in 0..len - 2 * delay {
+        sums.add(x[i], x[i + delay], x[i + 2 * delay]);
+    }
+    tone_lpc_solve(x, len, delay, sums, lpc)
+}
+
+/// The three sums that `tone_lpc` starts with, over `i < len - 2 * delay`:
+/// `x[i] * x[i]`, `x[i] * x[i + delay]` and `x[i] * x[i + 2 * delay]`.
+///
+/// Each is a long chain of additions, so the loop takes three cycles per
+/// sample whatever else the processor could do. For a delay of 1, which
+/// every frame needs, `transient_passes` computes them inside its own loop.
+#[derive(Clone, Copy, Default)]
+struct ToneSums {
+    r00: f32,
+    r01: f32,
+    r02: f32,
+}
+
+impl ToneSums {
+    /// Adds the three products of sample `x0`. `x1` and `x2` are the
+    /// samples one and two delays after it.
+    #[inline(always)]
+    fn add(&mut self, x0: f32, x1: f32, x2: f32) {
+        self.r00 += x0 * x0;
+        self.r01 += x0 * x1;
+        self.r02 += x0 * x2;
+    }
+}
+
+/// The rest of `tone_lpc`, from the sums on. Requires `len > 2 * delay`.
+/// Returns true on fail.
+fn tone_lpc_solve(x: &[f32], len: usize, delay: usize, sums: ToneSums, lpc: &mut [f32; 2]) -> bool {
+    let mut r00 = sums.r00;
+    let mut r01 = sums.r01;
+    let mut r02 = sums.r02;
     let mut r11: f32;
     let mut r12: f32;
-    
-    for i in 0..len - 2 * delay {
-        r00 += x[i] * x[i];
-        r01 += x[i] * x[i + delay];
-        r02 += x[i] * x[i + 2 * delay];
-    }
+
     let mut edges = 0.0f32;
     for i in 0..delay {
         edges += x[len + i - 2 * delay] * x[len + i - 2 * delay] - x[i] * x[i];
@@ -1885,26 +2357,32 @@ fn tone_lpc(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
     false
 }
 
-fn tone_detect(in_buf: &[f32], cc: usize, n: usize, fs: i32) -> (f32, f32) {
-    // in_buf is at least N samples per channel, we use N = n (frame+overlap)
-    // For CC==2, average channels; for float, no shift scaling.
-    // Use FixedVec to stay no_std heap-free.
-    let mut x: FixedVec<f32, 2048> = FixedVec::from_value(0.0, n);
-    if cc == 2 {
-        for i in 0..n {
-            x[i] = 0.5 * (in_buf[i] + in_buf[i + n]);
-        }
-    } else {
-        for i in 0..n {
-            x[i] = in_buf[i];
-        }
+/// The signal `tone_detect` analyses for stereo input: the average of the
+/// two channels. `in_buf` holds `mix.len()` samples per channel, one channel
+/// after the other.
+fn tone_mix_stereo(in_buf: &[f32], mix: &mut [f32]) {
+    let (left, right) = in_buf[..2 * mix.len()].split_at(mix.len());
+    for ((a, &l), &r) in mix.iter_mut().zip(left).zip(right) {
+        *a = 0.5 * (l + r);
     }
+}
+
+/// Port of libopus `tone_detect`. Returns `(tone_freq, toneishness)`.
+///
+/// `x` is one channel of overlap and frame: the input for mono, the average
+/// of the two channels for stereo (`tone_mix_stereo`). `first` holds the
+/// sums of `x` for a delay of 1 when the caller has them already.
+fn tone_detect(x: &[f32], fs: i32, first: Option<ToneSums>) -> (f32, f32) {
+    let n = x.len();
     let mut delay = 1usize;
     let mut lpc = [0.0f32; 2];
-    let mut fail = tone_lpc(&x[..n], n, delay, &mut lpc);
+    let mut fail = match first {
+        Some(sums) if n > 2 => tone_lpc_solve(x, n, delay, sums, &mut lpc),
+        _ => tone_lpc(x, n, delay, &mut lpc),
+    };
     while delay <= (fs as usize / 3000) && (fail || (lpc[0] > 1.0 && lpc[1] < 0.0)) {
         delay *= 2;
-        fail = tone_lpc(&x[..n], n, delay, &mut lpc);
+        fail = tone_lpc(x, n, delay, &mut lpc);
     }
     if !fail && lpc[0] * lpc[0] + 3.999999 * lpc[1] < 0.0 {
         let toneishness = -lpc[1];
@@ -2250,6 +2728,815 @@ fn constrained_vbr_bytes(
     nb_available.min(max_allowed as usize)
 }
 
+/// Tests of the encoder's own kernels: each fast version against the plain
+/// loop it replaces, bit for bit.
+#[cfg(test)]
+mod enc_kernel_tests {
+    use super::*;
+
+    /// Small deterministic generator, so that a failure can be repeated.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        /// Uniform in [-1, 1).
+        fn unit(&mut self) -> f32 {
+            self.next_u32() as f32 / (1u32 << 30) as f32 - 1.0
+        }
+    }
+
+    /// Kinds of test input, from ordinary samples to values that overflow.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        /// Samples in the range the API takes: -1 to 1.
+        Audio,
+        /// Random signs and magnitudes between 1e-30 and 1e15.
+        WideRange,
+        /// Zeros of both signs, subnormal numbers and the smallest normal one.
+        Tiny,
+        /// The largest finite values: products overflow to infinity.
+        Huge,
+        /// Infinities and both kinds of not-a-number among ordinary samples.
+        NonFinite,
+    }
+
+    const KINDS: [Kind; 5] = [
+        Kind::Audio,
+        Kind::WideRange,
+        Kind::Tiny,
+        Kind::Huge,
+        Kind::NonFinite,
+    ];
+
+    fn samples(rng: &mut Rng, n: usize, kind: Kind) -> Vec<f32> {
+        (0..n)
+            .map(|_| match kind {
+                Kind::Audio => rng.unit(),
+                Kind::WideRange => {
+                    let exp = (rng.next_u32() % 46) as i32 - 30;
+                    rng.unit() * 10f32.powi(exp)
+                }
+                Kind::Tiny => match rng.next_u32() % 5 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f32::MIN_POSITIVE,
+                    3 => -f32::from_bits(1 + rng.next_u32() % 1000),
+                    _ => f32::from_bits(1 + rng.next_u32() % 0x0080_0000),
+                },
+                Kind::Huge => match rng.next_u32() % 4 {
+                    0 => f32::MAX,
+                    1 => f32::MIN,
+                    _ => 1e30 * rng.unit(),
+                },
+                Kind::NonFinite => match rng.next_u32() % 16 {
+                    0 => f32::INFINITY,
+                    1 => f32::NEG_INFINITY,
+                    2 => f32::NAN,
+                    // A signaling not-a-number, of either sign.
+                    3 => f32::from_bits(0x7F80_0001 | (rng.next_u32() << 31)),
+                    _ => 100.0 * rng.unit(),
+                },
+            })
+            .collect()
+    }
+
+    /// Bit-for-bit comparison. Two not-a-number values count as equal: which
+    /// payload an operation returns is not something the codec relies on.
+    fn same_bits(a: f32, b: f32) -> bool {
+        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+    }
+
+    #[track_caller]
+    fn assert_same(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: lengths differ");
+        for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+            assert!(same_bits(x, y), "{what}: index {i}: {x:e} against {y:e}");
+        }
+    }
+
+    /// Lengths that cover the empty slice, one sample, every tail length of
+    /// the 4- and 16-sample loops, and the sizes the encoder uses.
+    fn lengths() -> impl Iterator<Item = usize> {
+        (0..=67).chain([120, 240, 360, 479, 840, 841, 960, 1080])
+    }
+
+    #[test]
+    fn max_abs_matches_the_scalar_loop() {
+        let mut rng = Rng::new(1);
+        let inits = [0.0f32, -0.0, 1e-9, 0.25, 1.0, 3e38, f32::INFINITY, -1.0];
+        for kind in KINDS {
+            for n in lengths() {
+                for round in 0..4 {
+                    let x = samples(&mut rng, n, kind);
+                    let init = inits[(n + round) % inits.len()];
+                    let want = max_abs_scalar(&x, init);
+                    let got = max_abs(&x, init);
+                    assert!(
+                        same_bits(want, got),
+                        "{kind:?} n={n} init={init:e}: {want:e} against {got:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The largest value is found wherever it is, and a sample that is not
+    /// a number at any position is skipped.
+    #[test]
+    fn max_abs_finds_a_peak_at_every_position() {
+        let not_numbers = [
+            f32::NAN,
+            f32::from_bits(0x7F80_0001),
+            f32::from_bits(0xFFC0_0000),
+        ];
+        for n in [1usize, 3, 4, 5, 16, 17, 31, 32, 33, 67, 120] {
+            for pos in 0..n {
+                for bad in not_numbers {
+                    let mut x = vec![0.125f32; n];
+                    x[pos] = -0.75;
+                    assert_eq!(max_abs(&x, 0.0), 0.75, "n={n} pos={pos}");
+                    assert_eq!(max_abs(&x, 0.875), 0.875, "n={n} pos={pos}");
+                    // A not-a-number next to the peak, then one in its place.
+                    x[(pos + 1) % n] = bad;
+                    let want = max_abs_scalar(&x, 0.0);
+                    assert!(same_bits(max_abs(&x, 0.0), want), "n={n} pos={pos}");
+                    x[pos] = bad;
+                    let want = max_abs_scalar(&x, 0.0);
+                    assert!(same_bits(max_abs(&x, 0.0), want), "n={n} pos={pos}");
+                    assert!(!max_abs(&x, 0.0).is_nan());
+                }
+            }
+        }
+        // An empty slice and a slice of only not-a-number values give `init`.
+        assert_eq!(max_abs(&[], 0.5), 0.5);
+        assert_eq!(max_abs(&[f32::NAN; 40], 0.5), 0.5);
+    }
+
+    /// The pre-emphasis loop as it was written before `celt_preemphasis`:
+    /// one pass over the 48 kHz samples, with a division to find the input
+    /// sample and a remainder to find the stuffed zeros.
+    fn preemphasis_reference(
+        pcm: &[f32],
+        out: &mut [f32],
+        upsample: usize,
+        coef: f32,
+        mem: f32,
+    ) -> f32 {
+        let mut m = mem;
+        for i in 0..pcm.len() * upsample {
+            let x = if i % upsample == 0 {
+                pcm[i / upsample] * 32768.0
+            } else {
+                0.0
+            };
+            out[i] = x - m;
+            m = x * coef;
+        }
+        m
+    }
+
+    #[test]
+    fn preemphasis_matches_the_reference_loop() {
+        let mut rng = Rng::new(2);
+        // 0.85 is the coefficient of the 48 kHz mode.
+        for coef in [0.85f32, 0.0, -0.5, 1.0] {
+            for upsample in [1usize, 2, 3, 4, 6] {
+                for kind in KINDS {
+                    for n in (0..=19).chain([20, 40, 80, 120, 160, 240, 480, 960]) {
+                        let pcm = samples(&mut rng, n, kind);
+                        let mem = samples(&mut rng, 1, kind)[0];
+                        let mut want = vec![0.0f32; n * upsample];
+                        let mut got = vec![f32::NAN; n * upsample];
+                        let want_mem = preemphasis_reference(&pcm, &mut want, upsample, coef, mem);
+                        let got_mem = celt_preemphasis(&pcm, &mut got, upsample, coef, mem);
+                        let what = format!("{kind:?} n={n} upsample={upsample} coef={coef}");
+                        assert_same(&want, &got, &what);
+                        assert!(same_bits(want_mem, got_mem), "{what}: filter memory");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The order in which `sum_abs_neon` adds, written as a plain loop.
+    #[cfg(target_arch = "aarch64")]
+    fn sum_abs_lanes_reference(x: &[f32]) -> f32 {
+        let (groups, rest) = x.as_chunks::<4>();
+        let mut s = [0.0f32; 4];
+        for group in groups {
+            for (acc, &v) in s.iter_mut().zip(group) {
+                *acc += v.abs();
+            }
+        }
+        let mut sum = (s[0] + s[1]) + (s[2] + s[3]);
+        for &v in rest {
+            sum += v.abs();
+        }
+        sum
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sum_abs_neon_matches_its_reference_order() {
+        let mut rng = Rng::new(8);
+        for kind in KINDS {
+            for n in lengths() {
+                let x = samples(&mut rng, n, kind);
+                let want = sum_abs_lanes_reference(&x);
+                let got = sum_abs(&x);
+                assert!(same_bits(want, got), "{kind:?} n={n}: {want:e} against {got:e}");
+            }
+        }
+    }
+
+    /// `l1_metric` checks its length argument before a vector kernel reads.
+    #[test]
+    #[should_panic]
+    fn l1_metric_rejects_a_length_past_the_slice() {
+        let x = [1.0f32; 24];
+        let _ = l1_metric(&x, 32, 0, 0.0);
+    }
+
+    /// `comb_filter_const` checks its ranges before a vector kernel reads
+    /// in front of `x` or writes past `y`.
+    #[test]
+    #[should_panic(expected = "range outside its buffers")]
+    fn comb_filter_const_rejects_a_period_before_the_buffer() {
+        let x = [0.0f32; 64];
+        let mut y = [0.0f32; 64];
+        comb_filter_const(&mut y, &x, 0, 16, 15, 8, 0.1, 0.1, 0.1);
+    }
+
+    #[test]
+    #[should_panic(expected = "range outside its buffers")]
+    fn comb_filter_const_rejects_an_output_range_past_the_buffer() {
+        let x = [0.0f32; 64];
+        let mut y = [0.0f32; 8];
+        comb_filter_const(&mut y, &x, 0, 32, 15, 16, 0.1, 0.1, 0.1);
+    }
+
+    #[test]
+    #[should_panic(expected = "range outside its buffers")]
+    fn comb_filter_const_rejects_an_input_range_past_the_buffer() {
+        let x = [0.0f32; 40];
+        let mut y = [0.0f32; 64];
+        comb_filter_const(&mut y, &x, 0, 32, 15, 9, 0.1, 0.1, 0.1);
+    }
+
+    /// The kernels read `x[x_idx + i - t + 2]` with an unsigned `t - 2`, so
+    /// a period below 2 is refused.
+    #[test]
+    #[should_panic(expected = "range outside its buffers")]
+    fn comb_filter_const_rejects_a_period_below_two() {
+        let x = [0.0f32; 64];
+        let mut y = [0.0f32; 64];
+        comb_filter_const(&mut y, &x, 0, 32, 1, 8, 0.1, 0.1, 0.1);
+    }
+
+    /// `l1_metric` below 16 values, where every target runs the plain loop:
+    /// one sum in index order, then the bias term. Only the first `n`
+    /// values of the slice count.
+    #[test]
+    fn l1_metric_adds_short_input_in_index_order() {
+        let mut rng = Rng::new(10);
+        for kind in KINDS {
+            for n in 0..16usize {
+                for lm in 0..=4i32 {
+                    let x = samples(&mut rng, n + 3, kind);
+                    let bias = 0.04 * rng.unit();
+                    let mut l1 = 0.0f32;
+                    for &v in &x[..n] {
+                        l1 += v.abs();
+                    }
+                    let want = l1 + (lm as f32) * bias * l1;
+                    let got = l1_metric(&x, n, lm, bias);
+                    assert!(same_bits(want, got), "{kind:?} n={n} lm={lm}: {want:e} against {got:e}");
+                }
+            }
+        }
+    }
+
+    /// `l1_metric` from 16 values on, where the NEON kernel runs. It adds in
+    /// the order of `sum_abs_lanes_reference`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn l1_metric_neon_matches_its_reference_order() {
+        let mut rng = Rng::new(11);
+        for kind in KINDS {
+            for n in lengths().filter(|&n| n >= 16) {
+                for lm in 0..=4i32 {
+                    let x = samples(&mut rng, n + 5, kind);
+                    let bias = 0.04 * rng.unit();
+                    let l1 = sum_abs_lanes_reference(&x[..n]);
+                    let want = l1 + (lm as f32) * bias * l1;
+                    let got = l1_metric(&x, n, lm, bias);
+                    assert!(same_bits(want, got), "{kind:?} n={n} lm={lm}: {want:e} against {got:e}");
+                }
+            }
+        }
+    }
+
+    /// `comb_filter_const` with one index expression per tap, as libopus
+    /// describes the filter:
+    /// `y[i] = x[i] + g10 * x[i - T] + g11 * (x[i - T + 1] + x[i - T - 1])
+    /// + g12 * (x[i - T + 2] + x[i - T - 2])`.
+    ///
+    /// The first `fused` samples take each product and the addition after
+    /// it as one fused multiply-add, the way the NEON kernel computes its
+    /// groups of four. The other samples round every product first.
+    fn comb_filter_const_reference(
+        x: &[f32],
+        x_idx: usize,
+        t: usize,
+        n: usize,
+        g: [f32; 3],
+        fused: usize,
+    ) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let at = x_idx + i;
+                let centre = x[at - t];
+                let near = x[at - t + 1] + x[at - t - 1];
+                let far = x[at - t + 2] + x[at - t - 2];
+                if i < fused {
+                    g[2].mul_add(far, g[1].mul_add(near, g[0].mul_add(centre, x[at])))
+                } else {
+                    x[at] + g[0] * centre + g[1] * near + g[2] * far
+                }
+            })
+            .collect()
+    }
+
+    /// The arguments of `comb_filter_const`: `y`, `x`, `y_idx`, `x_idx`,
+    /// `t`, `n` and the three gains.
+    type CombFilterConst = fn(&mut [f32], &[f32], usize, usize, usize, usize, f32, f32, f32);
+
+    /// Runs `kernel` on every combination of period, length and position
+    /// worth testing and compares its output with the reference. `fused`
+    /// gives, for a length, how many samples use the fused multiply-add.
+    ///
+    /// `x` is exactly as long as the kernel may read: it starts `lead`
+    /// samples before the first tap and ends with the last input sample.
+    /// `y` has four more values on each side of the output range, which
+    /// must keep the pattern they start with.
+    fn check_comb_filter_const(kernel: CombFilterConst, fused: fn(usize) -> usize) {
+        let mut rng = Rng::new(12);
+        // 2 is the smallest period the kernels accept, 15 and 1022 are the
+        // limits of the pitch pre-filter and of the post-filter. The
+        // lengths cover every tail of the 4-, 8- and 16-sample loops and
+        // what the codec passes: 0 to 960 samples.
+        for t in [2usize, 3, 4, 5, 15, 16, 17, 100, 1022] {
+            for n in (0..=21).chain([40, 119, 120, 360, 840, 960, 961]) {
+                for (lead, y_idx) in [(0usize, 4usize), (1, 5), (7, 4)] {
+                    for kind in KINDS {
+                        let x_idx = lead + t + 2;
+                        let x = samples(&mut rng, x_idx + n, kind);
+                        let g = [0.3 * rng.unit(), 0.2 * rng.unit(), 0.1 * rng.unit()];
+                        let want = comb_filter_const_reference(&x, x_idx, t, n, g, fused(n));
+
+                        let mut y = vec![-7.5f32; y_idx + n + 4];
+                        kernel(&mut y, &x, y_idx, x_idx, t, n, g[0], g[1], g[2]);
+                        let what = format!("{kind:?} t={t} n={n} lead={lead}");
+                        assert_same(&want, &y[y_idx..y_idx + n], &what);
+                        let kept = y[..y_idx].iter().chain(&y[y_idx + n..]).all(|&v| v == -7.5);
+                        assert!(kept, "{what}: wrote outside the output range");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The portable version. This machine does not run it inside the codec.
+    #[test]
+    fn comb_filter_const_scalar_matches_the_formula() {
+        check_comb_filter_const(comb_filter_const_scalar, |_| 0);
+    }
+
+    /// The version the codec runs on 64-bit ARM. Its groups of four samples
+    /// use the fused multiply-add and its last `n % 4` samples do not, so
+    /// it differs from the portable version in the last bit.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn comb_filter_const_neon_matches_its_reference_order() {
+        check_comb_filter_const(comb_filter_const, |n| n - n % 4);
+    }
+
+    /// `transient_analysis` as it was written before its loops were fused:
+    /// three loops per channel, one channel after the other, as in libopus.
+    /// Returns `(is_transient, tf_estimate, tf_chan, weak_transient)`.
+    fn transient_reference(
+        input: &[f32],
+        len: usize,
+        channels: usize,
+        allow_weak_transients: bool,
+        tone_freq: f32,
+        toneishness: f32,
+    ) -> (bool, f32, usize, bool) {
+        let mut tmp = vec![0.0f32; len];
+        let mut tmp2 = vec![0.0f32; len / 2];
+        let mut tf_chan = 0;
+        let mut weak_transient = false;
+        let mut mask_metric = 0.0f32;
+        let forward_decay = if allow_weak_transients {
+            0.03125f32
+        } else {
+            0.0625f32
+        };
+        let len2 = len / 2;
+
+        for c in 0..channels {
+            let mut mem0 = 0.0f32;
+            let mut mem1 = 0.0f32;
+            for i in 0..len {
+                let x = input[c * len + i];
+                let y = mem0 + x;
+                let mem00 = mem0;
+                mem0 = mem0 - x + 0.5 * mem1;
+                mem1 = x - mem00;
+                tmp[i] = y;
+            }
+            tmp[..12].fill(0.0);
+
+            let mut mean = 0.0f32;
+            mem0 = 0.0f32;
+            for i in 0..len2 {
+                let x2 = (tmp[2 * i] * tmp[2 * i] + tmp[2 * i + 1] * tmp[2 * i + 1]) / 16.0;
+                mean += x2;
+                mem0 = x2 + (1.0 - forward_decay) * mem0;
+                tmp2[i] = forward_decay * mem0;
+            }
+
+            mem0 = 0.0f32;
+            let mut max_e = 0.0f32;
+            for i in (0..len2).rev() {
+                mem0 = tmp2[i] + 0.875 * mem0;
+                tmp2[i] = 0.125 * mem0;
+                if tmp2[i] > max_e {
+                    max_e = tmp2[i];
+                }
+            }
+
+            mean = (mean * max_e * 0.5 * (len2 as f32)).sqrt();
+            let norm = (len2 as f32) / (1e-15 + mean);
+            let mut unmask: i32 = 0;
+            for i in (12..(len2 - 5)).step_by(4) {
+                let id = (64.0 * norm * (tmp2[i] + 1e-15)).floor() as i32;
+                unmask += INV_TABLE[id.clamp(0, 127) as usize] as i32;
+            }
+            unmask = 64 * unmask * 4 / (6 * (len2 as i32 - 17));
+            if (unmask as f32) > mask_metric {
+                tf_chan = c;
+                mask_metric = unmask as f32;
+            }
+        }
+
+        let mut is_transient = mask_metric > 200.0;
+        if toneishness > 0.98 && tone_freq < 0.026 {
+            is_transient = false;
+            mask_metric = 0.0;
+        }
+        if allow_weak_transients && is_transient && mask_metric < 600.0 {
+            is_transient = false;
+            weak_transient = true;
+        }
+        let tf_max = ((27.0 * mask_metric).sqrt() - 42.0).max(0.0);
+        let tf_estimate = (0.0069 * tf_max.min(163.0) - 0.139).max(0.0).sqrt();
+        (is_transient, tf_estimate, tf_chan, weak_transient)
+    }
+
+    /// The two parts of the transient analysis in a row, as the encoder
+    /// calls them. Also checks what the first part computes for the tone
+    /// detector: the mono mix and the sums for a delay of 1.
+    #[allow(clippy::too_many_arguments)]
+    fn transient_analysis(
+        input: &[f32],
+        len: usize,
+        channels: usize,
+        tf_estimate: &mut f32,
+        tf_chan: &mut usize,
+        allow_weak_transients: bool,
+        weak_transient: &mut bool,
+        tone_freq: f32,
+        toneishness: f32,
+        envelope: &mut [f32],
+    ) -> bool {
+        let mut mix = vec![f32::NAN; len + 2];
+        let (passes, sums) =
+            transient_passes(input, len, channels, allow_weak_transients, envelope, &mut mix);
+
+        let x: Vec<f32> = if channels == 2 {
+            let mut want_mix = vec![0.0f32; len];
+            tone_mix_stereo(input, &mut want_mix);
+            assert_same(&want_mix, &mix[..len], "mono mix");
+            want_mix
+        } else {
+            input[..len].to_vec()
+        };
+        // The mix must stay inside its `len` samples.
+        assert!(mix[len..].iter().all(|v| v.is_nan()));
+        let mut want = ToneSums::default();
+        for i in 0..len.saturating_sub(2) {
+            want.add(x[i], x[i + 1], x[i + 2]);
+        }
+        assert!(same_bits(want.r00, sums.r00), "r00 len={len} channels={channels}");
+        assert!(same_bits(want.r01, sums.r01), "r01 len={len} channels={channels}");
+        assert!(same_bits(want.r02, sums.r02), "r02 len={len} channels={channels}");
+        // With these sums the tone detector gives what it gives without.
+        let with = tone_detect(&x, 48000, Some(sums));
+        let without = tone_detect(&x, 48000, None);
+        assert!(same_bits(with.0, without.0) && same_bits(with.1, without.1));
+
+        transient_decision(
+            &passes,
+            envelope,
+            len,
+            channels,
+            tf_estimate,
+            tf_chan,
+            allow_weak_transients,
+            weak_transient,
+            tone_freq,
+            toneishness,
+        )
+    }
+
+    /// `tone_lpc` as it was written before its sums moved to `ToneSums`.
+    fn tone_lpc_reference(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
+        if len <= 2 * delay {
+            return true;
+        }
+        let mut r00 = 0.0f32;
+        let mut r01 = 0.0f32;
+        let mut r02 = 0.0f32;
+        for i in 0..len - 2 * delay {
+            r00 += x[i] * x[i];
+            r01 += x[i] * x[i + delay];
+            r02 += x[i] * x[i + 2 * delay];
+        }
+        let mut edges = 0.0f32;
+        for i in 0..delay {
+            edges += x[len + i - 2 * delay] * x[len + i - 2 * delay] - x[i] * x[i];
+        }
+        let r11 = r00 + edges;
+        edges = 0.0;
+        for i in 0..delay {
+            edges += x[len + i - delay] * x[len + i - delay] - x[i + delay] * x[i + delay];
+        }
+        let r22 = r11 + edges;
+        edges = 0.0;
+        for i in 0..delay {
+            edges += x[len + i - 2 * delay] * x[len + i - delay] - x[i] * x[i + delay];
+        }
+        let r12 = r01 + edges;
+        let (r00, r01, r11, r02, r12) = (r00 + r22, r01 + r12, 2.0 * r11, 2.0 * r02, r12 + r01);
+        let den = r00 * r11 - r01 * r01;
+        if den < 0.001 * r00 * r11 {
+            return true;
+        }
+        lpc[0] = ((r00 * r12 - r02 * r01) / den).clamp(-1.999999, 1.999999);
+        lpc[1] = ((r02 * r11 - r01 * r12) / den).clamp(-1.0, 1.0);
+        false
+    }
+
+    /// `tone_detect` as it was written before: every delay through
+    /// `tone_lpc_reference`.
+    fn tone_detect_reference(x: &[f32], fs: i32) -> (f32, f32) {
+        let n = x.len();
+        let mut delay = 1usize;
+        let mut lpc = [0.0f32; 2];
+        let mut fail = tone_lpc_reference(x, n, delay, &mut lpc);
+        while delay <= (fs as usize / 3000) && (fail || (lpc[0] > 1.0 && lpc[1] < 0.0)) {
+            delay *= 2;
+            fail = tone_lpc_reference(x, n, delay, &mut lpc);
+        }
+        if !fail && lpc[0] * lpc[0] + 3.999999 * lpc[1] < 0.0 {
+            ((0.5 * lpc[0]).acos() / delay as f32, -lpc[1])
+        } else {
+            (-1.0, 0.0)
+        }
+    }
+
+    #[test]
+    fn tone_detect_matches_the_version_before_the_split() {
+        let mut rng = Rng::new(9);
+        let mut tones = 0usize;
+        let mut later_delays = 0usize;
+        for len in [2usize, 3, 4, 5, 40, 41, 240, 360, 600, 1080] {
+            for round in 0..200u32 {
+                // Sine tones over the whole range of frequencies (where the
+                // detector reports a tone), some with noise, and the signals
+                // of the transient tests.
+                let freq = 0.002 + 3.0 * rng.unit().abs();
+                let noise = if round % 3 == 0 { 0.0 } else { 50.0 * rng.unit().abs() };
+                let x: Vec<f32> = if round % 2 == 0 {
+                    (0..len)
+                        .map(|i| 9000.0 * (freq * i as f32).sin() + noise * rng.unit())
+                        .collect()
+                } else {
+                    transient_signal(&mut rng, len, round)
+                };
+                let want = tone_detect_reference(&x, 48000);
+                let got = tone_detect(&x, 48000, None);
+                let what = format!("len={len} round={round}");
+                assert!(same_bits(want.0, got.0), "{what}: tone_freq");
+                assert!(same_bits(want.1, got.1), "{what}: toneishness");
+                tones += (got.1 > 0.9) as usize;
+
+                let mut lpc = [0.0f32; 2];
+                if !tone_lpc(&x, len, 1, &mut lpc) && lpc[0] > 1.0 && lpc[1] < 0.0 {
+                    later_delays += 1;
+                }
+                for delay in [1usize, 2, 4, 8, 16, 32] {
+                    let mut a = [7.0f32; 2];
+                    let mut b = [7.0f32; 2];
+                    let fa = tone_lpc_reference(&x, len, delay, &mut a);
+                    let fb = tone_lpc(&x, len, delay, &mut b);
+                    assert_eq!(fa, fb, "{what} delay={delay}: fail flag");
+                    assert!(same_bits(a[0], b[0]) && same_bits(a[1], b[1]), "{what} delay={delay}");
+                }
+            }
+        }
+        // The signals must reach both outcomes and the longer delays.
+        assert!(tones > 100, "{tones}");
+        assert!(later_delays > 100, "{later_delays}");
+    }
+
+    /// Test signals for the transient analysis, `len` samples at the level
+    /// of 16-bit audio. `shape` picks one of: noise, noise with a burst at
+    /// a random place, a quiet start and a loud end, a loud start and a
+    /// quiet end, a sine tone, silence, a single click.
+    fn transient_signal(rng: &mut Rng, len: usize, shape: u32) -> Vec<f32> {
+        let at = (rng.next_u32() as usize) % len;
+        let step = 0.01 + 0.5 * rng.unit().abs();
+        (0..len)
+            .map(|i| match shape % 7 {
+                0 => 3000.0 * rng.unit(),
+                1 => {
+                    let gain = if i >= at && i < at + 40 { 20000.0 } else { 200.0 };
+                    gain * rng.unit()
+                }
+                2 => (if i >= at { 15000.0 } else { 30.0 }) * rng.unit(),
+                3 => (if i < at { 15000.0 } else { 30.0 }) * rng.unit(),
+                4 => 8000.0 * (step * i as f32).sin(),
+                5 => 0.0,
+                _ => {
+                    if i == at {
+                        30000.0
+                    } else {
+                        0.0
+                    }
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transient_analysis_matches_the_three_loop_version() {
+        let mut rng = Rng::new(4);
+        let mut seen_transient = [0usize; 2];
+        let mut seen_weak = 0usize;
+        let mut seen_chan1 = 0usize;
+        // Frame sizes 2.5, 5, 10 and 20 ms plus the overlap, and four short
+        // lengths, two of them odd. The scratch starts with other values.
+        for len in [40usize, 41, 62, 63, 240, 360, 600, 1080] {
+            for channels in 1..=2usize {
+                for round in 0..120u32 {
+                    let mut input = transient_signal(&mut rng, len, round);
+                    if channels == 2 {
+                        input.extend(transient_signal(&mut rng, len, round / 7));
+                    }
+                    let allow_weak = round % 3 == 0;
+                    let (tone_freq, toneishness) = match round % 5 {
+                        0 => (0.01, 0.99),
+                        1 => (0.5, 0.99),
+                        _ => (-1.0, 0.0),
+                    };
+                    let want =
+                        transient_reference(&input, len, channels, allow_weak, tone_freq, toneishness);
+
+                    let mut envelope = vec![f32::NAN; channels * (len / 2) + 3];
+                    let mut tf_estimate = -1.0f32;
+                    let mut tf_chan = 0usize;
+                    let mut weak = true;
+                    let is_transient = transient_analysis(
+                        &input,
+                        len,
+                        channels,
+                        &mut tf_estimate,
+                        &mut tf_chan,
+                        allow_weak,
+                        &mut weak,
+                        tone_freq,
+                        toneishness,
+                        &mut envelope,
+                    );
+                    let what = format!("len={len} channels={channels} round={round}");
+                    assert_eq!(is_transient, want.0, "{what}: is_transient");
+                    assert!(same_bits(tf_estimate, want.1), "{what}: tf_estimate");
+                    assert_eq!(tf_chan, want.2, "{what}: tf_chan");
+                    assert_eq!(weak, want.3, "{what}: weak_transient");
+                    seen_transient[is_transient as usize] += 1;
+                    seen_weak += weak as usize;
+                    seen_chan1 += tf_chan;
+                }
+            }
+        }
+        // The signals must reach every outcome, or the test shows little.
+        assert!(seen_transient[0] > 100 && seen_transient[1] > 100, "{seen_transient:?}");
+        assert!(seen_weak > 10, "{seen_weak}");
+        assert!(seen_chan1 > 50, "{seen_chan1}");
+    }
+
+    /// Values that overflow or are not numbers take the same path through
+    /// both versions.
+    #[test]
+    fn transient_analysis_matches_on_extreme_input() {
+        let mut rng = Rng::new(5);
+        for kind in KINDS {
+            for channels in 1..=2usize {
+                for len in [240usize, 1080] {
+                    let input = samples(&mut rng, channels * len, kind);
+                    let want = transient_reference(&input, len, channels, false, -1.0, 0.0);
+                    let mut envelope = vec![0.0f32; channels * (len / 2)];
+                    let mut tf_estimate = 0.0f32;
+                    let mut tf_chan = 0usize;
+                    let mut weak = false;
+                    let is_transient = transient_analysis(
+                        &input,
+                        len,
+                        channels,
+                        &mut tf_estimate,
+                        &mut tf_chan,
+                        false,
+                        &mut weak,
+                        -1.0,
+                        0.0,
+                        &mut envelope,
+                    );
+                    let what = format!("{kind:?} len={len} channels={channels}");
+                    assert_eq!(is_transient, want.0, "{what}: is_transient");
+                    assert!(same_bits(tf_estimate, want.1), "{what}: tf_estimate");
+                    assert_eq!(tf_chan, want.2, "{what}: tf_chan");
+                    assert_eq!(weak, want.3, "{what}: weak_transient");
+                }
+            }
+        }
+    }
+
+    /// The 48 kHz path (the vector kernel where there is one) against the
+    /// portable loop: every length up to 40, so every tail of the 8- and
+    /// 4-sample loops, and the frame sizes.
+    #[test]
+    fn preemphasis_kernel_matches_the_scalar_loop() {
+        let mut rng = Rng::new(7);
+        for kind in KINDS {
+            for n in (0..=40).chain([120, 240, 480, 960]) {
+                for coef in [0.85f32, -0.25] {
+                    let pcm = samples(&mut rng, n, kind);
+                    let mem = samples(&mut rng, 1, kind)[0];
+                    let mut want = vec![0.0f32; n];
+                    let mut got = vec![f32::NAN; n];
+                    let want_mem = preemphasis_scalar(&pcm, &mut want, coef, mem);
+                    let got_mem = celt_preemphasis(&pcm, &mut got, 1, coef, mem);
+                    let what = format!("{kind:?} n={n} coef={coef}");
+                    assert_same(&want, &got, &what);
+                    assert!(same_bits(want_mem, got_mem), "{what}: filter memory");
+                }
+            }
+        }
+    }
+
+    /// Frame after frame with the memory carried over gives the same output
+    /// as one long frame.
+    #[test]
+    fn preemphasis_carries_its_memory_across_frames() {
+        let mut rng = Rng::new(3);
+        for upsample in [1usize, 2, 3, 4, 6] {
+            let pcm = samples(&mut rng, 480, Kind::Audio);
+            let mut whole = vec![0.0f32; 480 * upsample];
+            let whole_mem = celt_preemphasis(&pcm, &mut whole, upsample, 0.85, 0.25);
+            let mut parts = vec![0.0f32; 480 * upsample];
+            let mut mem = 0.25;
+            for (src, dst) in pcm.chunks(60).zip(parts.chunks_mut(60 * upsample)) {
+                mem = celt_preemphasis(src, dst, upsample, 0.85, mem);
+            }
+            assert_same(&whole, &parts, "frames against one block");
+            assert!(same_bits(whole_mem, mem));
+        }
+    }
+}
+
 impl CeltEncoder {
     pub fn new(mode: &'static CeltMode, channels: usize) -> Self {
         Self::with_sampling_rate(mode, channels, 48000)
@@ -2273,8 +3560,6 @@ impl CeltEncoder {
         );
         let upsample = resampling_factor(sampling_rate);
         let overlap = mode.overlap;
-        let channel_mem_size = 2048 + overlap;
-        let syn_mem_size = channels * channel_mem_size;
         let nb_ebands = mode.nb_ebands;
         let nb_x_ch = nb_ebands * channels;
         let frame_x_ch = MAX_FRAME_SIZE * channels;
@@ -2285,8 +3570,7 @@ impl CeltEncoder {
             upsample,
             end_band: mode.nb_ebands,
             complexity: 9,
-            syn_mem: FixedVec::from_value(0.0, syn_mem_size),
-            enc_decode_mem: FixedVec::from_value(0.0, syn_mem_size),
+            in_mem: FixedVec::from_value(0.0, channels * overlap),
             old_band_e: FixedVec::from_value(0.0, nb_x_ch),
             preemph_mem: FixedVec::from_value(0.0, channels),
             tonal_average: 256,
@@ -2329,7 +3613,6 @@ impl CeltEncoder {
             w_ebits: FixedVec::from_value(0, nb_x_ch),
             w_fine_priority: FixedVec::from_value(0, nb_x_ch),
             w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
-            w_band_amp_synth: FixedVec::from_value(0.0, nb_x_ch),
 
             w_prefilter_pre: FixedVec::from_value(
                 0.0,
@@ -2341,8 +3624,7 @@ impl CeltEncoder {
             ),
             w_prefilter_before: FixedVec::from_value(0.0, channels),
             w_prefilter_after: FixedVec::from_value(0.0, channels),
-            w_transient_tmp: FixedVec::from_value(0.0, MAX_TRANSIENT_LEN),
-            w_transient_tmp2: FixedVec::from_value(0.0, MAX_TRANSIENT_LEN / 2),
+            w_analysis_tmp: FixedVec::from_value(0.0, CELT_ANALYSIS_TMP),
             consec_transient: 0,
 
             analysis: AnalysisInfo::default(),
@@ -2499,59 +3781,33 @@ impl CeltEncoder {
             lm = 0;
         }
 
-        let syn_mem_size = 2048 + overlap;
-        for c in 0..channels {
-            let channel_offset = c * syn_mem_size;
-
-            self.syn_mem.copy_within(
-                channel_offset + frame_size..channel_offset + syn_mem_size,
-                channel_offset,
-            );
-
-            let mut m = self.preemph_mem[c];
-            let coef = mode.preemph[0];
-            // Zero-stuff the API-rate input to 48 kHz (libopus celt_preemphasis
-            // with `upsample`), then run the pre-emphasis filter over all N
-            // internal samples.
-            for i in 0..frame_size {
-                let x = if i % upsample == 0 {
-                    pcm[c * api_frame_size + i / upsample] * 32768.0
-                } else {
-                    0.0
-                };
-                let val = x - m;
-                self.syn_mem[channel_offset + syn_mem_size - frame_size + i] = val;
-                m = x * coef;
-            }
-            self.preemph_mem[c] = m;
-        }
-
-        let buf_stride = frame_size + overlap;
-        let in_buf = &mut self.w_in_buf[..buf_stride * channels];
-        for c in 0..channels {
-            let channel_offset = c * syn_mem_size;
-            let in_buf_offset = c * buf_stride;
-
-            let src_start = syn_mem_size - frame_size - overlap;
-            in_buf[in_buf_offset..in_buf_offset + buf_stride].copy_from_slice(
-                &self.syn_mem[channel_offset + src_start..channel_offset + syn_mem_size],
-            );
-        }
-
+        // `in_buf` holds, per channel, `overlap` samples of history and then
+        // the pre-emphasized frame (C `in`). The frame is written straight
+        // into it.
+        //
         // C 2017: tone and transient analysis see the *unfiltered* history in
-        // the overlap head (the `prefilter_mem` tail). `in_buf`'s head is the
-        // previous frame's prefiltered overlap, so analysing it as-is puts a
-        // step between head and body wherever the comb filter was active,
-        // which reads as a transient on steady pitched input (issue #38).
+        // the overlap head (the `prefilter_mem` tail). The prefiltered
+        // overlap of the previous frame (`in_mem`) is put there afterwards.
+        // Analysing that one puts a step between head and body wherever the
+        // comb filter was active, which reads as a transient on steady
+        // pitched input (issue #38).
+        let buf_stride = frame_size + overlap;
         let max_period = COMBFILTER_MAXPERIOD;
-        for c in 0..channels {
-            in_buf[c * buf_stride..c * buf_stride + overlap].copy_from_slice(
+        let in_buf = &mut self.w_in_buf[..buf_stride * channels];
+        for (c, channel) in in_buf.chunks_exact_mut(buf_stride).enumerate() {
+            let (head, body) = channel.split_at_mut(overlap);
+            head.copy_from_slice(
                 &self.prefilter_mem[(c + 1) * max_period - overlap..(c + 1) * max_period],
             );
+            self.preemph_mem[c] = celt_preemphasis(
+                &pcm[c * api_frame_size..(c + 1) * api_frame_size],
+                body,
+                upsample,
+                mode.preemph[0],
+                self.preemph_mem[c],
+            );
         }
 
-        // Tone detection (C 2022): use channel-contiguous in_buf with N+overlap, float path
-        let (tone_freq, mut toneishness) = tone_detect(&*in_buf, channels, buf_stride, mode.fs);
         let mut tf_estimate = 0.0f32;
         let mut tf_chan = 0;
         let mut weak_transient = false;
@@ -2579,10 +3835,44 @@ impl CeltEncoder {
             (self.vbr && self.constrained_vbr && self.bitrate != OPUS_BITRATE_MAX)
                 .then(|| bitrate_to_bits(self.bitrate, mode.fs, frame_size as i32) << BITRES);
 
+        // Tone detection (C 2022) and transient analysis (C 2027), both on
+        // `in_buf` with its N + overlap samples per channel. libopus detects
+        // the tone first. Here the two passes of the transient analysis come
+        // first, because their loop also adds up the sums the tone detector
+        // starts with. The decision about the transient comes last: it
+        // needs the tone.
+        //
+        // The scratch buffer holds the mono mix for the tone detector in its
+        // first half and the envelopes of the transient analysis in its
+        // second half.
+        let (mix, envelope) = self.w_analysis_tmp.split_at_mut(CELT_ANALYSIS_TMP / 2);
         // C 2027: an LFE frame is never analysed for transients.
-        let mut is_transient = if self.complexity >= 1 && !self.lfe {
-            transient_analysis(
+        let passes = if self.complexity >= 1 && !self.lfe {
+            Some(transient_passes(
                 in_buf,
+                buf_stride,
+                channels,
+                hybrid_low_rate,
+                envelope,
+                mix,
+            ))
+        } else {
+            if channels == 2 {
+                tone_mix_stereo(in_buf, &mut mix[..buf_stride]);
+            }
+            None
+        };
+        let tone_input: &[f32] = if channels == 2 {
+            &mix[..buf_stride]
+        } else {
+            &in_buf[..buf_stride]
+        };
+        let (tone_freq, mut toneishness) =
+            tone_detect(tone_input, mode.fs, passes.as_ref().map(|p| p.1));
+        let mut is_transient = match &passes {
+            Some((passes, _)) => transient_decision(
+                passes,
+                envelope,
                 buf_stride,
                 channels,
                 &mut tf_estimate,
@@ -2591,19 +3881,16 @@ impl CeltEncoder {
                 &mut weak_transient,
                 tone_freq,
                 toneishness,
-                &mut self.w_transient_tmp,
-                &mut self.w_transient_tmp2,
-            )
-        } else {
-            false
+            ),
+            None => false,
         };
         // Put the prefiltered overlap back for the prefilter and the MDCT
         // (C run_prefilter: `OPUS_COPY(in, st->in_mem, overlap)`).
-        let in_mem_start = syn_mem_size - frame_size - overlap;
-        for c in 0..channels {
-            let src = c * syn_mem_size + in_mem_start;
-            in_buf[c * buf_stride..c * buf_stride + overlap]
-                .copy_from_slice(&self.syn_mem[src..src + overlap]);
+        for (channel, saved) in in_buf
+            .chunks_exact_mut(buf_stride)
+            .zip(self.in_mem.chunks_exact(overlap))
+        {
+            channel[..overlap].copy_from_slice(saved);
         }
         // Clamp toneishness as in C 2034: toneishness = min(toneishness, 1 - tf_estimate)
         // For float, tf_estimate is log-domain; clamp to [0,1]
@@ -2684,16 +3971,14 @@ impl CeltEncoder {
             (false, 0.0f32, COMBFILTER_MINPERIOD)
         };
 
-        // Save the prefiltered overlap for the next frame.
-        // In libopus, st->in_mem stores the overlap separately and run_prefilter
-        // copies it to/from in[]. Here we emulate that by updating syn_mem with
-        // the last overlap samples of in_buf (which were prefiltered in place).
-        let syn_mem_size = 2048 + overlap;
-        for c in 0..channels {
-            let channel_offset = c * syn_mem_size;
-            let in_buf_offset = c * buf_stride;
-            self.syn_mem[channel_offset + syn_mem_size - overlap..channel_offset + syn_mem_size]
-                .copy_from_slice(&in_buf[in_buf_offset + frame_size..in_buf_offset + buf_stride]);
+        // Save the prefiltered overlap for the next frame (C run_prefilter:
+        // `OPUS_COPY(st->in_mem, in + N, overlap)`). These are the last
+        // `overlap` samples of `in_buf`, which the prefilter changed in place.
+        for (channel, saved) in in_buf
+            .chunks_exact(buf_stride)
+            .zip(self.in_mem.chunks_exact_mut(overlap))
+        {
+            saved.copy_from_slice(&channel[frame_size..]);
         }
         let freq = &mut self.w_freq[..frame_size * channels];
         let band_e = &mut self.w_band_e[..nb_ebands * channels];
@@ -2711,24 +3996,12 @@ impl CeltEncoder {
         let api_overlap = overlap / upsample;
         let mut sample_max = self.overlap_max;
         let n_nonoverlap = api_frame_size.saturating_sub(api_overlap);
-        for c in 0..channels {
-            let base = c * api_frame_size;
-            for i in 0..n_nonoverlap {
-                let v = pcm[base + i].abs();
-                if v > sample_max {
-                    sample_max = v;
-                }
-            }
-        }
         let mut new_overlap_max = 0.0f32;
         for c in 0..channels {
-            let base = c * api_frame_size;
-            for i in n_nonoverlap..api_frame_size {
-                let v = pcm[base + i].abs();
-                if v > new_overlap_max {
-                    new_overlap_max = v;
-                }
-            }
+            let (body, tail) =
+                pcm[c * api_frame_size..(c + 1) * api_frame_size].split_at(n_nonoverlap);
+            sample_max = max_abs(body, sample_max);
+            new_overlap_max = max_abs(tail, new_overlap_max);
         }
         self.overlap_max = new_overlap_max;
         if new_overlap_max > sample_max {
@@ -3043,7 +4316,13 @@ impl CeltEncoder {
                 &INTEN_HYSTERESIS,
                 self.intensity,
             );
-            self.intensity = self.intensity.clamp(0, end as i32);
+            // C 2408: `st->intensity = IMIN(end, IMAX(start, st->intensity))`.
+            // The lower limit is needed for Hybrid, where the first coded
+            // band is 17. The allocator writes the intensity band as its
+            // distance from `start`. A band below `start` would be written
+            // as a negative distance, and the decoder would read the rest
+            // of the frame as noise.
+            self.intensity = self.intensity.max(start_band as i32).min(end as i32);
         }
 
         if self.lfe {
@@ -3356,8 +4635,12 @@ impl CeltEncoder {
 
         let mut dual_stereo = dual_stereo_val != 0;
 
-        let theta_rdo = channels == 2 && !dual_stereo && self.complexity >= 8;
-        let resynth = theta_rdo;
+        // The encoder asks for no resynthesis. libopus needs the decoded
+        // bands only for its second quantization pass per stereo band
+        // (`theta_rdo`, complexity 8 and above) and for the time-domain
+        // output it builds under `#ifdef RESYNTH`. This encoder has neither,
+        // so the decoded bands would be computed and never read.
+        let resynth = false;
 
         quant_all_bands(
             true,
@@ -3412,58 +4695,6 @@ impl CeltEncoder {
             }
         }
 
-        if resynth {
-            let band_amp_synth = &mut self.w_band_amp_synth[..nb_ebands * channels];
-            log2amp(mode, end, band_amp_synth, &self.old_band_e, channels);
-            // `w_freq` is no longer needed after analysis/quant; reuse it as the
-            // synthesis scratch (avoids a separate `w_freq_synth` buffer).
-            self.w_freq[..frame_size * channels].fill(0.0);
-            let freq_synth = &mut self.w_freq[..frame_size * channels];
-            denormalise_bands(
-                mode,
-                x,
-                freq_synth,
-                band_amp_synth,
-                start_band,
-                end,
-                channels,
-                (1 << lm) as usize,
-            );
-            let (syn_shift, syn_b) = if is_transient {
-                (mode.max_lm, 1 << lm)
-            } else {
-                (mode.max_lm - lm, 1)
-            };
-            let syn_n = frame_size / syn_b;
-            let decode_buf_size = 2048;
-
-            for c in 0..channels {
-                let co = c * syn_mem_size;
-                self.enc_decode_mem
-                    .copy_within(co + frame_size..co + decode_buf_size + overlap, co);
-            }
-
-            for c in 0..channels {
-                let co = c * syn_mem_size;
-                let out_syn_idx = decode_buf_size - frame_size;
-                for bi in 0..syn_b {
-                    let syn_stride = if is_transient {
-                        mode.short_mdct_size
-                    } else {
-                        syn_n
-                    };
-                    mode.mdct.backward(
-                        &freq_synth[c * frame_size + bi..],
-                        &mut self.enc_decode_mem[co + out_syn_idx + bi * syn_stride..],
-                        mode.window,
-                        overlap,
-                        syn_shift,
-                        syn_b,
-                    );
-                }
-            }
-        }
-
         self.last_band_log_e.copy_from_slice(&self.old_band_e);
 
         if !is_transient {
@@ -3476,10 +4707,9 @@ impl CeltEncoder {
         }
 
         // C 2815-2817: room left in the packet is not written to;
-        // `RangeCoder::done` clears it. Do not pad it with
-        // `RangeCoder::pad_to_bits`: that moves raw bits that are not
-        // written out yet away from the end of the packet, and the decoder
-        // reads zeros in their place.
+        // `RangeCoder::done` clears it. Do not pad it with zero bits here:
+        // that moves raw bits that are not written out yet away from the
+        // end of the packet, and the decoder reads zeros in their place.
 
         // C 2772: remember the tapset this frame was filtered with. The
         // decoder cross-fades from it at the start of the next frame, so it
@@ -3917,6 +5147,1306 @@ fn plc_iir(buf: &mut [f32], at: usize, n: usize, den: &[f32]) {
     }
 }
 
+/// Constant part of the in-place comb filter, for `n` samples from `at`:
+/// `buf[i] += g[0] * buf[i - t] + g[1] * (buf[i - t + 1] + buf[i - t - 1])
+/// + g[2] * (buf[i - t + 2] + buf[i - t - 2])`.
+///
+/// The samples it reads at `i - t` and around it may be ones it has just
+/// written. `t` must be at least `COMBFILTER_MINPERIOD` and at most
+/// `at - 2`.
+#[inline]
+fn comb_inplace_const(buf: &mut [f32], at: usize, t: usize, n: usize, g: [f32; 3]) {
+    #[cfg(target_arch = "aarch64")]
+    comb_inplace_const_neon(buf, at, t, n, g);
+    #[cfg(not(target_arch = "aarch64"))]
+    comb_inplace_const_scalar(buf, at, t, n, g);
+}
+
+/// Portable version of `comb_inplace_const`, one sample at a time.
+fn comb_inplace_const_scalar(buf: &mut [f32], at: usize, t: usize, n: usize, g: [f32; 3]) {
+    for idx in at..at + n {
+        let s = buf[idx];
+        let r = buf[idx - t];
+        let rp1 = buf[idx - t + 1];
+        let rm1 = buf[idx - t - 1];
+        let rp2 = buf[idx - t + 2];
+        let rm2 = buf[idx - t - 2];
+        buf[idx] = s + g[0] * r + g[1] * (rp1 + rm1) + g[2] * (rp2 + rm2);
+    }
+}
+
+/// `comb_inplace_const` with vector instructions, four samples per step.
+///
+/// The newest sample a step reads is `buf[i + 3 - t + 2]`. With `t` at
+/// least 15 that is before `buf[i]`, so the four samples of a step do not
+/// depend on each other. Multiplication and addition stay separate
+/// instructions, in the order of the portable version, so both versions
+/// round the same way.
+#[cfg(target_arch = "aarch64")]
+fn comb_inplace_const_neon(buf: &mut [f32], at: usize, t: usize, n: usize, g: [f32; 3]) {
+    // `t` comes from the packet, so this is checked in every build.
+    assert!(t >= COMBFILTER_MINPERIOD && at >= t + 2 && at + n <= buf.len());
+    let vec_n = n & !3;
+    // SAFETY: every step reads `buf[i - t - 2..i - t + 6]` and reads and
+    // writes `buf[i..i + 4]`, for `i` from `at` in steps of 4 while
+    // `i + 4 <= at + vec_n`. The check above gives `i - t - 2 >= 0` and
+    // `i + 4 <= buf.len()`, and `t >= 15` puts the first range below the
+    // second. All accesses go through one pointer taken from `&mut buf`.
+    unsafe {
+        let p = buf.as_mut_ptr();
+        let g0 = vdupq_n_f32(g[0]);
+        let g1 = vdupq_n_f32(g[1]);
+        let g2 = vdupq_n_f32(g[2]);
+        let mut i = at;
+        while i < at + vec_n {
+            let y = p.add(i);
+            let r = y.sub(t);
+            let near = vaddq_f32(vld1q_f32(r.add(1)), vld1q_f32(r.sub(1)));
+            let far = vaddq_f32(vld1q_f32(r.add(2)), vld1q_f32(r.sub(2)));
+            let mut acc = vaddq_f32(vld1q_f32(y), vmulq_f32(g0, vld1q_f32(r)));
+            acc = vaddq_f32(acc, vmulq_f32(g1, near));
+            acc = vaddq_f32(acc, vmulq_f32(g2, far));
+            vst1q_f32(y, acc);
+            i += 4;
+        }
+    }
+    comb_inplace_const_scalar(buf, at + vec_n, t, n - vec_n, g);
+}
+
+/// Cross-fading part of the in-place comb filter, for `n` samples from
+/// `at`. The old filter (period `t0`, taps `g0`) is weighted with
+/// `1 - window[i]^2` and the new one (period `t1`, taps `g1`) with
+/// `window[i]^2`.
+///
+/// Both periods must be at least `COMBFILTER_MINPERIOD` and at most
+/// `at - 2`. `window` must hold `n` values.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn comb_inplace_fade(
+    buf: &mut [f32],
+    at: usize,
+    t0: usize,
+    t1: usize,
+    n: usize,
+    g0: [f32; 3],
+    g1: [f32; 3],
+    window: &[f32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    comb_inplace_fade_neon(buf, at, t0, t1, n, g0, g1, window);
+    #[cfg(not(target_arch = "aarch64"))]
+    comb_inplace_fade_scalar(buf, at, t0, t1, n, g0, g1, window);
+}
+
+/// Portable version of `comb_inplace_fade`, one sample at a time.
+#[allow(clippy::too_many_arguments)]
+fn comb_inplace_fade_scalar(
+    buf: &mut [f32],
+    at: usize,
+    t0: usize,
+    t1: usize,
+    n: usize,
+    g0: [f32; 3],
+    g1: [f32; 3],
+    window: &[f32],
+) {
+    for (i, &w) in window[..n].iter().enumerate() {
+        let idx = at + i;
+        let f = w * w;
+        let s = buf[idx];
+        let r0 = buf[idx - t0];
+        let r0p1 = buf[idx - t0 + 1];
+        let r0m1 = buf[idx - t0 - 1];
+        let r0p2 = buf[idx - t0 + 2];
+        let r0m2 = buf[idx - t0 - 2];
+        let r1 = buf[idx - t1];
+        let r1p1 = buf[idx - t1 + 1];
+        let r1m1 = buf[idx - t1 - 1];
+        let r1p2 = buf[idx - t1 + 2];
+        let r1m2 = buf[idx - t1 - 2];
+        buf[idx] = s
+            + (1.0 - f) * (g0[0] * r0 + g0[1] * (r0p1 + r0m1) + g0[2] * (r0p2 + r0m2))
+            + f * (g1[0] * r1 + g1[1] * (r1p1 + r1m1) + g1[2] * (r1p2 + r1m2));
+    }
+}
+
+/// `comb_inplace_fade` with vector instructions, four samples per step.
+/// See `comb_inplace_const_neon` for why four samples of a step are
+/// independent and why the result is the same as the portable version's.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn comb_inplace_fade_neon(
+    buf: &mut [f32],
+    at: usize,
+    t0: usize,
+    t1: usize,
+    n: usize,
+    g0: [f32; 3],
+    g1: [f32; 3],
+    window: &[f32],
+) {
+    // The periods come from the packet, so this is checked in every build.
+    assert!(t0 >= COMBFILTER_MINPERIOD && t1 >= COMBFILTER_MINPERIOD);
+    assert!(at >= t0 + 2 && at >= t1 + 2 && at + n <= buf.len() && n <= window.len());
+    let vec_n = n & !3;
+
+    /// The three taps of one filter around `r`:
+    /// `g[0] * r[0] + g[1] * (r[1] + r[-1]) + g[2] * (r[2] + r[-2])`.
+    ///
+    /// SAFETY: the caller guarantees that `r.sub(2)..r.add(6)` is readable.
+    #[inline(always)]
+    unsafe fn taps(r: *const f32, g: [float32x4_t; 3]) -> float32x4_t {
+        // SAFETY: see the function's contract.
+        unsafe {
+            let near = vaddq_f32(vld1q_f32(r.add(1)), vld1q_f32(r.sub(1)));
+            let far = vaddq_f32(vld1q_f32(r.add(2)), vld1q_f32(r.sub(2)));
+            let acc = vaddq_f32(vmulq_f32(g[0], vld1q_f32(r)), vmulq_f32(g[1], near));
+            vaddq_f32(acc, vmulq_f32(g[2], far))
+        }
+    }
+
+    // SAFETY: every step reads `window[k..k + 4]` with `k + 4 <= vec_n`,
+    // reads `buf[i - t - 2..i - t + 6]` for both periods and reads and
+    // writes `buf[i..i + 4]`, for `i` from `at` in steps of 4 while
+    // `i + 4 <= at + vec_n`. The checks above give `i - t - 2 >= 0`,
+    // `i + 4 <= buf.len()` and `vec_n <= window.len()`, and `t >= 15` puts
+    // the ranges that are read below the one that is written. All accesses
+    // to `buf` go through one pointer taken from `&mut buf`.
+    unsafe {
+        let p = buf.as_mut_ptr();
+        let w = window.as_ptr();
+        let old = [vdupq_n_f32(g0[0]), vdupq_n_f32(g0[1]), vdupq_n_f32(g0[2])];
+        let new = [vdupq_n_f32(g1[0]), vdupq_n_f32(g1[1]), vdupq_n_f32(g1[2])];
+        let one = vdupq_n_f32(1.0);
+        let mut k = 0;
+        while k < vec_n {
+            let y = p.add(at + k);
+            let wk = vld1q_f32(w.add(k));
+            let f = vmulq_f32(wk, wk);
+            let from_old = vmulq_f32(vsubq_f32(one, f), taps(y.sub(t0), old));
+            let from_new = vmulq_f32(f, taps(y.sub(t1), new));
+            vst1q_f32(y, vaddq_f32(vaddq_f32(vld1q_f32(y), from_old), from_new));
+            k += 4;
+        }
+    }
+    comb_inplace_fade_scalar(buf, at + vec_n, t0, t1, n - vec_n, g0, g1, &window[vec_n..]);
+}
+
+#[cfg(all(test, feature = "std"))]
+mod comb_inplace_tests {
+    use super::*;
+
+    pub(super) fn next(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *seed >> 8
+    }
+
+    /// `len` samples in the decoder's signal range. With `extreme`, about
+    /// one sample in eight is a value at the edge of what `f32` can hold.
+    pub(super) fn signal(len: usize, seed: &mut u32, extreme: bool) -> Vec<f32> {
+        const EDGE: [f32; 10] = [
+            0.0,
+            -0.0,
+            1e-30,
+            -1e-38,
+            1e30,
+            -1e30,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        (0..len)
+            .map(|_| {
+                let r = next(seed);
+                if extreme && r.is_multiple_of(8) {
+                    EDGE[(next(seed) % EDGE.len() as u32) as usize]
+                } else {
+                    (r as f32 / 8_388_608.0 - 1.0) * 32768.0
+                }
+            })
+            .collect()
+    }
+
+    /// Same bit patterns. Two NaN count as equal whatever their payload.
+    pub(super) fn assert_same(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert!(
+                x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+                "{what}: sample {i} is {x:e} ({:#x}), expected {y:e} ({:#x})",
+                x.to_bits(),
+                y.to_bits()
+            );
+        }
+    }
+
+    const LENGTHS: [usize; 20] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 119, 120, 121, 240, 720, 840,
+    ];
+    const PERIODS: [usize; 12] = [15, 16, 17, 18, 19, 20, 21, 22, 33, 100, 700, 1022];
+
+    /// The filter written as one loop over the frame, as it was before it
+    /// was split into a cross-fading part and a constant part.
+    #[allow(clippy::too_many_arguments)]
+    fn one_loop_filter(
+        buf: &mut [f32],
+        y_idx: usize,
+        t0: usize,
+        t1: usize,
+        n: usize,
+        g0: f32,
+        g1: f32,
+        tapset0: i32,
+        tapset1: i32,
+        window: &[f32],
+        overlap: usize,
+    ) {
+        if g0 == 0.0 && g1 == 0.0 {
+            return;
+        }
+        let t0 = t0.clamp(COMBFILTER_MINPERIOD, y_idx - 2);
+        let t1 = t1.clamp(COMBFILTER_MINPERIOD, y_idx - 2);
+        let [g00, g01, g02] = PREFILTER_GAINS[tapset0 as usize].map(|g| g0 * g);
+        let [g10, g11, g12] = PREFILTER_GAINS[tapset1 as usize].map(|g| g1 * g);
+        let same = g0 == g1 && t0 == t1 && tapset0 == tapset1;
+        let fade = if same { 0 } else { overlap };
+        for i in 0..n {
+            let idx = y_idx + i;
+            let new = g10 * buf[idx - t1]
+                + g11 * (buf[idx - t1 + 1] + buf[idx - t1 - 1])
+                + g12 * (buf[idx - t1 + 2] + buf[idx - t1 - 2]);
+            if i < fade {
+                let f = window[i] * window[i];
+                let old = g00 * buf[idx - t0]
+                    + g01 * (buf[idx - t0 + 1] + buf[idx - t0 - 1])
+                    + g02 * (buf[idx - t0 + 2] + buf[idx - t0 - 2]);
+                buf[idx] = buf[idx] + (1.0 - f) * old + f * new;
+            } else {
+                // `s + a + b + c` adds from the left, and so does the
+                // constant part of the filter.
+                buf[idx] = buf[idx]
+                    + g10 * buf[idx - t1]
+                    + g11 * (buf[idx - t1 + 1] + buf[idx - t1 - 1])
+                    + g12 * (buf[idx - t1 + 2] + buf[idx - t1 - 2]);
+            }
+        }
+    }
+
+    #[test]
+    fn whole_filter_matches_the_one_loop_form() {
+        let window = crate::modes::default_mode().window;
+        let overlap = CELT_OVERLAP;
+        let mut seed = 1u32;
+        for round in 0..400 {
+            let n = LENGTHS[(next(&mut seed) % LENGTHS.len() as u32) as usize];
+            let y_idx = 1030 + (next(&mut seed) % 60) as usize;
+            let t0 = PERIODS[(next(&mut seed) % PERIODS.len() as u32) as usize];
+            let t1 = if round % 5 == 0 {
+                t0
+            } else {
+                PERIODS[(next(&mut seed) % PERIODS.len() as u32) as usize]
+            };
+            let gain = |s: &mut u32| 0.09375 * (next(s) % 9) as f32;
+            let g0 = gain(&mut seed);
+            let g1 = if round % 5 == 0 { g0 } else { gain(&mut seed) };
+            let tapset0 = (next(&mut seed) % 3) as i32;
+            let tapset1 = if round % 5 == 0 {
+                tapset0
+            } else {
+                (next(&mut seed) % 3) as i32
+            };
+            let mut got = signal(y_idx + n + 7, &mut seed, round % 4 == 3);
+            let mut want = got.clone();
+            comb_filter_inplace(
+                &mut got, y_idx, t0, t1, n, g0, g1, tapset0, tapset1, window, overlap,
+            );
+            one_loop_filter(
+                &mut want, y_idx, t0, t1, n, g0, g1, tapset0, tapset1, window, overlap,
+            );
+            assert_same(
+                &got,
+                &want,
+                &format!("n {n} t0 {t0} t1 {t1} g0 {g0} g1 {g1}"),
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn const_part_neon_matches_portable_version() {
+        let mut seed = 7u32;
+        for extreme in [false, true] {
+            for &n in &LENGTHS {
+                for &t in &PERIODS {
+                    for tapset in 0..3 {
+                        let g = PREFILTER_GAINS[tapset].map(|g| 0.75 * g);
+                        // Start right after the history the filter reads,
+                        // and at a few other places.
+                        for at in [t + 2, t + 3, t + 9, 1100] {
+                            let mut got = signal(at + n + 5, &mut seed, extreme);
+                            let mut want = got.clone();
+                            comb_inplace_const_neon(&mut got, at, t, n, g);
+                            comb_inplace_const_scalar(&mut want, at, t, n, g);
+                            assert_same(&got, &want, &format!("n {n} t {t} at {at}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fade_part_neon_matches_portable_version() {
+        let window = crate::modes::default_mode().window;
+        let mut seed = 11u32;
+        for extreme in [false, true] {
+            for &n in LENGTHS.iter().filter(|&&n| n <= window.len()) {
+                for &t0 in &PERIODS {
+                    for &t1 in &[15, 16, 19, 100, 1022] {
+                        let g0 = PREFILTER_GAINS[t0 % 3].map(|g| 0.5625 * g);
+                        let g1 = PREFILTER_GAINS[t1 % 3].map(|g| 0.75 * g);
+                        for at in [t0.max(t1) + 2, 1100] {
+                            let mut got = signal(at + n + 5, &mut seed, extreme);
+                            let mut want = got.clone();
+                            comb_inplace_fade_neon(&mut got, at, t0, t1, n, g0, g1, window);
+                            comb_inplace_fade_scalar(&mut want, at, t0, t1, n, g0, g1, window);
+                            assert_same(&got, &want, &format!("n {n} t0 {t0} t1 {t1} at {at}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic]
+    fn const_part_neon_rejects_a_period_longer_than_the_history() {
+        let mut buf = vec![0.0f32; 64];
+        comb_inplace_const_neon(&mut buf, 20, 19, 8, [0.1, 0.1, 0.1]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic]
+    fn const_part_neon_rejects_a_frame_past_the_end() {
+        let mut buf = vec![0.0f32; 64];
+        comb_inplace_const_neon(&mut buf, 40, 15, 28, [0.1, 0.1, 0.1]);
+    }
+}
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
+mod deemph_segments_tests {
+    use super::comb_inplace_tests::{assert_same, next, signal};
+    use super::*;
+
+    /// Test signals of `len` samples. Several of them end in silence or
+    /// change level sharply: there the filters of the segments do not reach
+    /// the exact memory during their run-in, and the segments must be
+    /// computed again.
+    fn shaped_signal(kind: usize, len: usize, seed: &mut u32) -> Vec<f32> {
+        let mut x = signal(len, seed, kind == 7);
+        let cut = (next(seed) as usize) % len.max(1);
+        match kind {
+            // Noise.
+            0 | 7 => {}
+            // Silence.
+            1 => x.fill(0.0),
+            // Noise, then silence.
+            2 => x[cut..].fill(0.0),
+            // Silence, then noise.
+            3 => x[..cut].fill(0.0),
+            // Noise that falls by 90 dB at one point.
+            4 => x[cut..].iter_mut().for_each(|v| *v *= 3e-5),
+            // Values near the smallest ones `f32` holds.
+            5 => x.iter_mut().for_each(|v| *v *= 1e-36),
+            // A constant.
+            _ => x.fill(12345.0),
+        }
+        x
+    }
+
+    /// Run the segment filter on `C` channels and compare it with the
+    /// filter that takes one sample at a time.
+    fn check<const C: usize>(kind: usize, n: usize, warmup: usize, coef: f32, seed: &mut u32) {
+        let at = warmup + [0, 1, 6][(next(seed) % 3) as usize];
+        let what = format!("{C} channels, signal {kind}, n {n}, warmup {warmup}, coef {coef}");
+        let hist: [Vec<f32>; C] = core::array::from_fn(|_| shaped_signal(kind, at + n + 2, seed));
+        let mem: [f32; C] = core::array::from_fn(|c| [0.0, 1234.5, -3e-20][(c + kind) % 3]);
+
+        // Three more values than the frame: they must stay as they are.
+        let mut got: [Vec<f32>; C] = core::array::from_fn(|_| vec![7.0f32; n + 3]);
+        let got_mem = {
+            let mut it = got.iter_mut();
+            let y: [&mut [f32]; C] = core::array::from_fn(|_| &mut it.next().unwrap()[..n]);
+            let h: [&[f32]; C] = core::array::from_fn(|c| &hist[c][..]);
+            deemph_segments_neon(h, at, y, warmup, coef, mem)
+        };
+        for c in 0..C {
+            let mut want = vec![7.0f32; n + 3];
+            let want_mem = deemph_mono(
+                &hist[c][at..at + n],
+                &mut want[..n],
+                1,
+                coef,
+                mem[c],
+                |o, v| *o = v,
+            );
+            assert_same(&got[c], &want, &what);
+            assert_same(&[got_mem[c]], &[want_mem], &format!("{what}: memory"));
+        }
+    }
+
+    #[test]
+    fn segments_match_one_sample_at_a_time() {
+        let coef = crate::modes::default_mode().preemph[0];
+        let mut seed = 21u32;
+        for kind in 0..8 {
+            for n in [0usize, 32, 64, 96, 160, 480, 960] {
+                // Without a run-in, and with a short one, most segments
+                // are computed again. With the long one, few are.
+                for warmup in [0usize, 4, 32, 96, 160] {
+                    for coef in [coef, 0.0, 0.5, 0.99] {
+                        check::<1>(kind, n, warmup, coef, &mut seed);
+                        check::<2>(kind, n, warmup, coef, &mut seed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Frames of digital silence after a signal must be computed once.
+    ///
+    /// In silence the filter memory stops at a value that depends on the
+    /// sign it had when the signal ended. The filters of the segments must
+    /// reach that same value during their run-in. They did not when they
+    /// started from zero and the memory came down from a positive value:
+    /// every segment of every silent frame was then computed twice.
+    #[test]
+    fn silence_after_a_signal_is_computed_once() {
+        let coef = crate::modes::default_mode().preemph[0];
+        let mut seed = 5u32;
+        let mut settled = [0u32; 2];
+        for (k, last) in [1000.0f32, -1000.0].into_iter().enumerate() {
+            for n in [480usize, 960] {
+                // The decoder's layout: the frame at the end of the history.
+                let at = 2048 - n;
+                let mut hist = [
+                    signal(2048, &mut seed, false),
+                    signal(2048, &mut seed, false),
+                ];
+                // One run with two channels and one with the first channel
+                // alone.
+                let mut mem2 = [0.0f32; 2];
+                let mut mem1 = [0.0f32; 1];
+                let mut y = [vec![0.0f32; n], vec![0.0f32; n]];
+                for frame in 0..12 {
+                    for h in hist.iter_mut() {
+                        h.copy_within(n.., 0);
+                        // The signal ends with a constant of one sign.
+                        h[at..].fill(if frame == 0 { last } else { 0.0 });
+                    }
+                    DEEMPH_RECOMPUTED.with(|count| count.set(0));
+                    let [y0, y1] = &mut y;
+                    let h = [&hist[0][..], &hist[1][..]];
+                    mem2 = deemph_segments_neon(h, at, [y0, y1], DEEMPH_WARMUP, coef, mem2);
+                    mem1 = deemph_segments_neon([h[0]], at, [y0], DEEMPH_WARMUP, coef, mem1);
+                    // The memory takes about 570 samples to stop. Later
+                    // frames are all silence, their run-in included.
+                    if frame >= 4 {
+                        let recomputed = DEEMPH_RECOMPUTED.with(|count| count.get());
+                        assert_eq!(recomputed, 0, "last {last}, n {n}, frame {frame}");
+                    }
+                }
+                assert_eq!(mem2[0].to_bits(), mem2[1].to_bits());
+                assert_eq!(mem2[0].to_bits(), mem1[0].to_bits());
+                settled[k] = mem1[0].to_bits();
+            }
+        }
+        // The premise of this test: the two signs stop at different values.
+        assert_ne!(settled[0], settled[1]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn segments_reject_a_frame_that_is_not_a_multiple_of_32() {
+        let hist = [0.0f32; 400];
+        let mut y = [0.0f32; 48];
+        deemph_segments_neon([&hist[..]], 200, [&mut y[..]], 160, 0.85, [0.0]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn segments_reject_a_history_shorter_than_the_run_in() {
+        let hist = [0.0f32; 400];
+        let mut y = [0.0f32; 64];
+        deemph_segments_neon([&hist[..]], 100, [&mut y[..]], 160, 0.85, [0.0]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn segments_reject_a_frame_past_the_end_of_the_history() {
+        let hist = [0.0f32; 220];
+        let mut y = [0.0f32; 64];
+        deemph_segments_neon([&hist[..]], 160, [&mut y[..]], 160, 0.85, [0.0]);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod decoder_scratch_tests {
+    use super::*;
+
+    /// A test signal with a steady tone, noise bursts and pauses, so that
+    /// the frames use the post-filter, short blocks and bands without bits.
+    fn test_signal(channels: usize, samples: usize) -> Vec<f32> {
+        let mut seed = 3u32;
+        let mut pcm = vec![0.0f32; samples * channels];
+        for i in 0..samples {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (seed >> 8) as f32 / 8_388_608.0 - 1.0;
+            let t = i as f32 / 48000.0;
+            let tone = (2.0 * core::f32::consts::PI * 220.0 * t).sin()
+                + 0.5 * (2.0 * core::f32::consts::PI * 440.0 * t).sin();
+            let burst = (i / 2000) % 5 == 3;
+            let pause = (i / 7000) % 4 == 2;
+            for ch in 0..channels {
+                let side = if ch == 0 { 1.0 } else { 0.6 };
+                pcm[i * channels + ch] = if pause {
+                    0.0
+                } else if burst {
+                    0.4 * noise * side
+                } else {
+                    0.25 * tone * side + 0.01 * noise
+                };
+            }
+        }
+        pcm
+    }
+
+    /// The decoder does not clear `w_x` and `w_freq` between frames. Their
+    /// old contents must never reach the output. Decoder `b` gets both
+    /// arrays overwritten with NaN before every frame. A NaN that was read
+    /// would show in its output. Lost frames are part of the stream, so the
+    /// concealment is covered as well.
+    #[test]
+    fn old_scratch_contents_do_not_reach_the_output() {
+        let mode = crate::modes::default_mode();
+        for channels in [1usize, 2] {
+            for frame_size in [120usize, 240, 480, 960] {
+                for (start_band, bytes) in
+                    [(0usize, 12usize), (0, 40), (0, 160), (17, 10), (17, 30)]
+                {
+                    let frames = 60;
+                    let pcm = test_signal(channels, frames * frame_size);
+                    let mut enc = CeltEncoder::new(mode, channels);
+                    let mut a = CeltDecoder::new(mode, channels, 48000);
+                    let mut b = CeltDecoder::new(mode, channels, 48000);
+                    let mut out_a = vec![0.0f32; frame_size * channels];
+                    let mut out_b = vec![0.0f32; frame_size * channels];
+                    for k in 0..frames {
+                        let frame =
+                            &pcm[k * frame_size * channels..(k + 1) * frame_size * channels];
+                        let mut rc = RangeCoder::new_encoder(bytes as u32);
+                        enc.encode_with_budget(
+                            frame,
+                            frame_size,
+                            &mut rc,
+                            start_band,
+                            (bytes * 8) as i32,
+                        );
+                        rc.done();
+                        let packet = rc.buf[..bytes].to_vec();
+
+                        b.w_x.fill(f32::NAN);
+                        b.w_freq.fill(f32::NAN);
+                        // Two lost frames in every ten, and a longer loss
+                        // that takes the concealment from pitch to noise.
+                        let lost = k % 10 >= 8 || (30..42).contains(&k);
+                        if lost {
+                            a.decode_lost(frame_size, &mut out_a, start_band).unwrap();
+                            b.decode_lost(frame_size, &mut out_b, start_band).unwrap();
+                        } else {
+                            let n = a.decode_with_start_band(
+                                &packet, frame_size, &mut out_a, start_band,
+                            );
+                            assert_eq!(n, frame_size);
+                            b.decode_with_start_band(&packet, frame_size, &mut out_b, start_band);
+                        }
+                        let same = out_a
+                            .iter()
+                            .zip(&out_b)
+                            .all(|(x, y)| x.to_bits() == y.to_bits());
+                        assert!(
+                            same && out_a.iter().all(|v| v.is_finite()),
+                            "channels {channels} frame {frame_size} start {start_band} bytes {bytes}: frame {k} differs"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The output of every frame must be the de-emphasis filter, taken one
+    /// sample at a time, of the frame in the decoder's history. This holds
+    /// the faster ways of computing it (two channels in one loop, segments)
+    /// and every output layout to the plain definition.
+    #[test]
+    fn output_is_the_deemphasis_of_the_history() {
+        let mode = crate::modes::default_mode();
+        let coef = mode.preemph[0];
+        for channels in [1usize, 2] {
+            for n in [120usize, 240, 480, 960] {
+                for rate in [48000, 24000, 16000, 12000, 8000] {
+                    for layout in [
+                        PcmLayout::Planar,
+                        PcmLayout::Interleaved,
+                        PcmLayout::InterleavedAdd,
+                    ] {
+                        let ds = 48000 / rate as usize;
+                        let frame_size = n / ds;
+                        let frames = 24;
+                        let pcm = test_signal(channels, frames * n);
+                        let mut enc = CeltEncoder::new(mode, channels);
+                        let mut dec = CeltDecoder::new(mode, channels, rate);
+                        let what = format!(
+                            "{channels} channels, n {n}, {rate} Hz, layout {}",
+                            layout as u8
+                        );
+                        for k in 0..frames {
+                            let frame = &pcm[k * n * channels..(k + 1) * n * channels];
+                            let mut rc = RangeCoder::new_encoder(80);
+                            enc.encode_with_budget(frame, n, &mut rc, 0, 640);
+                            rc.done();
+                            let packet = rc.buf[..80].to_vec();
+
+                            let mem_before = [dec.preemph_mem[0], dec.preemph_mem[channels - 1]];
+                            let base = |i: usize| (i % 13) as f32 * 0.125 - 0.75;
+                            let mut out: Vec<f32> = (0..frame_size * channels).map(base).collect();
+                            let mut rc = RangeCoder::new_decoder(&packet);
+                            let got = if k % 8 == 6 {
+                                dec.decode_lost_impl(frame_size, &mut out, 0, layout)
+                                    .unwrap()
+                            } else {
+                                dec.decode_impl_from_rc(
+                                    &mut rc, 640, frame_size, &mut out, 0, 21, layout,
+                                )
+                            };
+                            assert_eq!(got, frame_size, "{what}");
+
+                            for ch in 0..channels {
+                                let at = dec.hist_start(ch) + DECODE_BUFFER_SIZE - n;
+                                let x = dec.decode_mem[at..at + n].to_vec();
+                                let mut want = vec![0.0f32; frame_size];
+                                let m =
+                                    deemph_mono(&x, &mut want, ds, coef, mem_before[ch], |o, v| {
+                                        *o = v
+                                    });
+                                assert_eq!(
+                                    m.to_bits(),
+                                    dec.preemph_mem[ch].to_bits(),
+                                    "{what}: memory"
+                                );
+                                for (i, w) in want.iter().enumerate() {
+                                    let (idx, w) = match layout {
+                                        PcmLayout::Planar => (ch * frame_size + i, *w),
+                                        PcmLayout::Interleaved => (i * channels + ch, *w),
+                                        PcmLayout::InterleavedAdd => {
+                                            (i * channels + ch, base(i * channels + ch) + *w)
+                                        }
+                                    };
+                                    assert_eq!(
+                                        out[idx].to_bits(),
+                                        w.to_bits(),
+                                        "{what}: frame {k}, sample {i}, channel {ch}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The de-emphasis as one loop over the frame that tests the position
+    /// of every sample. This is how it was written before `deemph_mono`
+    /// and `deemph_stereo` replaced it. `out[i / ds]` receives every
+    /// `ds`-th sample, stored or added.
+    fn plain_deemphasis(
+        x: &[f32],
+        out: &mut [f32],
+        ds: usize,
+        coef: f32,
+        mem: f32,
+        add: bool,
+    ) -> f32 {
+        let mut m = mem;
+        for (i, &x) in x.iter().enumerate() {
+            let val = x + 1e-30f32 + m;
+            if i % ds == 0 {
+                let v = val * (1.0 / 32768.0);
+                if add {
+                    out[i / ds] += v;
+                } else {
+                    out[i / ds] = v;
+                }
+            }
+            m = val * coef;
+        }
+        m
+    }
+
+    /// `deemph_mono` and `deemph_stereo` are the portable de-emphasis. On
+    /// 64-bit ARM the decoder uses them only for frames of 2.5 and 5 ms, on
+    /// other processors for every frame. This test holds them to the plain
+    /// loop for every output rate, for both ways of writing the result and
+    /// for both stereo layouts.
+    #[test]
+    fn portable_deemphasis_matches_the_plain_loop() {
+        use super::comb_inplace_tests::{assert_same, next, signal};
+        let coef = crate::modes::default_mode().preemph[0];
+        let store = |o: &mut f32, v: f32| *o = v;
+        let add = |o: &mut f32, v: f32| *o += v;
+        let mut seed = 31u32;
+        // Three kinds of input: the decoder's signal range, the same with
+        // values at the edge of what `f32` holds, and values as small as
+        // the offset that the filter adds to every sample. With the last
+        // kind the order of the two additions shows in the result.
+        for kind in 0..3 {
+            for ds in [1usize, 2, 3, 4, 6] {
+                for len in [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 20, 40, 120, 160] {
+                    for adding in [false, true] {
+                        let what = format!("kind {kind}, ds {ds}, {len} samples, adding {adding}");
+                        let mut x = [
+                            signal(len * ds, &mut seed, kind == 1),
+                            signal(len * ds, &mut seed, kind == 1),
+                        ];
+                        let mut mem = [1234.5f32, -0.25];
+                        if kind == 2 {
+                            x.iter_mut().flatten().for_each(|v| *v *= 1e-35);
+                            mem = [3e-30, -2e-31];
+                        }
+                        // What the output buffers hold before. One value
+                        // more than the frame: it must stay as it is.
+                        let before: [Vec<f32>; 2] = core::array::from_fn(|_| {
+                            (0..len + 1)
+                                .map(|_| next(&mut seed) as f32 / 16_777_216.0 - 0.5)
+                                .collect()
+                        });
+                        let mut want = before.clone();
+                        let want_mem: [f32; 2] = core::array::from_fn(|c| {
+                            plain_deemphasis(&x[c], &mut want[c][..len], ds, coef, mem[c], adding)
+                        });
+
+                        // One channel.
+                        let mut got = before[0].clone();
+                        let out = &mut got[..len];
+                        let m = if adding {
+                            deemph_mono(&x[0], out, ds, coef, mem[0], add)
+                        } else {
+                            deemph_mono(&x[0], out, ds, coef, mem[0], store)
+                        };
+                        assert_same(&got, &want[0], &format!("mono, {what}"));
+                        assert_same(&[m], &want_mem[..1], &format!("mono memory, {what}"));
+
+                        // Two channels, one after the other.
+                        let mut got = before.clone();
+                        let [got0, got1] = &mut got;
+                        let places = got0[..len].iter_mut().zip(got1[..len].iter_mut());
+                        let m = if adding {
+                            deemph_stereo(&x[0], &x[1], places, ds, coef, mem, add)
+                        } else {
+                            deemph_stereo(&x[0], &x[1], places, ds, coef, mem, store)
+                        };
+                        assert_same(&got[0], &want[0], &format!("planar left, {what}"));
+                        assert_same(&got[1], &want[1], &format!("planar right, {what}"));
+                        assert_same(&m, &want_mem, &format!("planar memory, {what}"));
+
+                        // Two channels, the samples of a pair together.
+                        let interleave = |v: &[Vec<f32>; 2]| -> Vec<f32> {
+                            (0..2 * (len + 1)).map(|i| v[i % 2][i / 2]).collect()
+                        };
+                        let mut got = interleave(&before);
+                        let places = stereo_pairs(&mut got[..2 * len]);
+                        let m = if adding {
+                            deemph_stereo(&x[0], &x[1], places, ds, coef, mem, add)
+                        } else {
+                            deemph_stereo(&x[0], &x[1], places, ds, coef, mem, store)
+                        };
+                        assert_same(&got, &interleave(&want), &format!("interleaved, {what}"));
+                        assert_same(&m, &want_mem, &format!("interleaved memory, {what}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The output must not depend on where the history sits in
+    /// `decode_mem`, nor on what `decode_mem` holds outside the history.
+    ///
+    /// The history slides through `decode_mem` and is moved back when it
+    /// reaches the end (`advance_history`). The samples that enter it at
+    /// its end are old values until the frame is written over them. Decoder
+    /// `b` starts with its history at another place, so it moves it back at
+    /// other frames than decoder `a`. Before every frame, everything in its
+    /// `decode_mem` outside the history is overwritten with NaN. An old
+    /// value that was read would show as a difference or as a NaN. The
+    /// stream changes its frame length and has lost frames.
+    #[test]
+    fn output_does_not_depend_on_the_place_of_the_history() {
+        let mode = crate::modes::default_mode();
+        let chan_mem = DECODE_BUFFER_SIZE + CELT_OVERLAP;
+        let sizes = [120usize, 960, 240, 480, 480, 120, 120, 960, 960, 240, 120];
+        let frames = 90;
+        let total: usize = (0..frames).map(|k| sizes[k % sizes.len()]).sum();
+        for channels in [1usize, 2] {
+            let pcm = test_signal(channels, total);
+            for start_pos in [0usize, 120, 600, 840, CELT_HIST_SLACK] {
+                let mut enc = CeltEncoder::new(mode, channels);
+                let mut a = CeltDecoder::new(mode, channels, 48000);
+                let mut b = CeltDecoder::new(mode, channels, 48000);
+                // A new decoder's history is all zero, so it can start
+                // anywhere.
+                b.hist_pos = start_pos;
+                let mut moved_back = 0;
+                let mut done = 0;
+                for k in 0..frames {
+                    let n = sizes[k % sizes.len()];
+                    let frame = &pcm[done * channels..(done + n) * channels];
+                    done += n;
+                    let mut rc = RangeCoder::new_encoder(60);
+                    enc.encode_with_budget(frame, n, &mut rc, 0, 480);
+                    rc.done();
+                    let packet = rc.buf[..60].to_vec();
+
+                    for ch in 0..channels {
+                        let part = ch * CELT_HIST_STRIDE;
+                        let hist = b.hist_start(ch);
+                        b.decode_mem[part..hist].fill(f32::NAN);
+                        b.decode_mem[hist + chan_mem..part + CELT_HIST_STRIDE].fill(f32::NAN);
+                    }
+                    let pos_before = b.hist_pos;
+                    let mut out_a = vec![0.0f32; n * channels];
+                    let mut out_b = vec![0.0f32; n * channels];
+                    // Single losses, and one long enough to go from the
+                    // pitch concealment to the noise concealment.
+                    let lost = k % 10 >= 8 || (40..58).contains(&k);
+                    if lost {
+                        a.decode_lost(n, &mut out_a, 0).unwrap();
+                        b.decode_lost(n, &mut out_b, 0).unwrap();
+                    } else {
+                        assert_eq!(a.decode_with_start_band(&packet, n, &mut out_a, 0), n);
+                        assert_eq!(b.decode_with_start_band(&packet, n, &mut out_b, 0), n);
+                    }
+                    if b.hist_pos < pos_before {
+                        moved_back += 1;
+                    }
+                    assert!(b.hist_pos <= CELT_HIST_SLACK);
+                    let same = out_a
+                        .iter()
+                        .zip(&out_b)
+                        .all(|(x, y)| x.to_bits() == y.to_bits());
+                    assert!(
+                        same && out_a.iter().all(|v| v.is_finite()),
+                        "{channels} channels, history from {start_pos}: frame {k} of {n} samples differs"
+                    );
+                }
+                // The history reached the end of its part many times.
+                assert!(moved_back >= 20, "moved back {moved_back} times");
+            }
+        }
+    }
+}
+
+/// Offset that libopus adds to every sample in the de-emphasis
+/// (`VERY_SMALL`, celt/arch.h). It keeps the filter memory away from the
+/// very small numbers that are slow to compute with.
+const DEEMPH_VERY_SMALL: f32 = 1e-30;
+/// Factor from the decoder's signal range to the output range of -1.0 to
+/// 1.0 (libopus `SIG2RES`, float build).
+const DEEMPH_SCALE: f32 = 1.0 / 32768.0;
+
+/// One sample of the de-emphasis filter `y[i] = x[i] + coef * y[i - 1]`
+/// (libopus `deemphasis`). `m` holds `coef * y[i - 1]`. Returns `y[i]`.
+///
+/// libopus writes `SATURATE(x + VERY_SMALL + m, SIG_SAT)`. In its float
+/// build `SATURATE` does nothing (celt/arch.h).
+#[inline(always)]
+fn deemph_step(x: f32, m: &mut f32, coef: f32) -> f32 {
+    let y = x + DEEMPH_VERY_SMALL + *m;
+    *m = y * coef;
+    y
+}
+
+/// How the decoder lays out the samples of a frame in the caller's buffer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PcmLayout {
+    /// One channel after the other: `pcm[ch * frame_size + i]`.
+    Planar,
+    /// The channels of each sample together: `pcm[i * channels + ch]`.
+    Interleaved,
+    /// As `Interleaved`, and the frame is added to what `pcm` holds
+    /// (libopus `accum`).
+    InterleavedAdd,
+}
+
+/// The places of the left and the right sample of each pair in an
+/// interleaved stereo buffer.
+#[inline(always)]
+fn stereo_pairs(out: &mut [f32]) -> impl Iterator<Item = (&mut f32, &mut f32)> {
+    out.as_chunks_mut::<2>().0.iter_mut().map(|pair| {
+        let [left, right] = pair;
+        (left, right)
+    })
+}
+
+/// De-emphasis of one channel. Returns the filter memory for the next
+/// frame.
+///
+/// `x` holds `ds` samples for every sample of `out`. The filter runs over
+/// all of them. The first sample of each group of `ds`, scaled to the
+/// output range, goes to `put` together with its place in `out`. `put`
+/// either stores it or adds it.
+#[inline(always)]
+fn deemph_mono(
+    x: &[f32],
+    out: &mut [f32],
+    ds: usize,
+    coef: f32,
+    mem: f32,
+    put: impl Fn(&mut f32, f32),
+) -> f32 {
+    debug_assert!(ds >= 1 && x.len() == out.len() * ds);
+    let mut m = mem;
+    if ds == 1 {
+        for (o, &x) in out.iter_mut().zip(x) {
+            put(o, deemph_step(x, &mut m, coef) * DEEMPH_SCALE);
+        }
+    } else {
+        for (o, group) in out.iter_mut().zip(x.chunks_exact(ds)) {
+            put(o, deemph_step(group[0], &mut m, coef) * DEEMPH_SCALE);
+            for &x in &group[1..] {
+                deemph_step(x, &mut m, coef);
+            }
+        }
+    }
+    m
+}
+
+/// De-emphasis of two channels in one loop (libopus
+/// `deemphasis_stereo_simple`). Returns the two filter memories.
+///
+/// Each output sample needs the one before it, so one channel alone cannot
+/// go faster than one addition and one multiplication after the other per
+/// sample. The two channels do not depend on each other. In one loop the
+/// processor works on both at once, and two channels take the time of one.
+///
+/// `out` yields the place of each output sample of the two channels. `x0`
+/// and `x1` hold `ds` samples for every item of `out`, and `put` stores or
+/// adds a sample, as in `deemph_mono`.
+#[inline(always)]
+fn deemph_stereo<'a>(
+    x0: &[f32],
+    x1: &[f32],
+    out: impl Iterator<Item = (&'a mut f32, &'a mut f32)>,
+    ds: usize,
+    coef: f32,
+    mem: [f32; 2],
+    put: impl Fn(&mut f32, f32),
+) -> [f32; 2] {
+    debug_assert!(ds >= 1 && x0.len() == x1.len());
+    let [mut m0, mut m1] = mem;
+    if ds == 1 {
+        for ((&a, &b), (o0, o1)) in x0.iter().zip(x1).zip(out) {
+            let y0 = deemph_step(a, &mut m0, coef);
+            let y1 = deemph_step(b, &mut m1, coef);
+            put(o0, y0 * DEEMPH_SCALE);
+            put(o1, y1 * DEEMPH_SCALE);
+        }
+    } else {
+        let groups = x0.chunks_exact(ds).zip(x1.chunks_exact(ds));
+        for ((g0, g1), (o0, o1)) in groups.zip(out) {
+            let y0 = deemph_step(g0[0], &mut m0, coef);
+            let y1 = deemph_step(g1[0], &mut m1, coef);
+            put(o0, y0 * DEEMPH_SCALE);
+            put(o1, y1 * DEEMPH_SCALE);
+            for (&a, &b) in g0[1..].iter().zip(&g1[1..]) {
+                deemph_step(a, &mut m0, coef);
+                deemph_step(b, &mut m1, coef);
+            }
+        }
+    }
+    [m0, m1]
+}
+
+/// Shortest frame, in samples at 48 kHz, whose de-emphasis is computed in
+/// segments (`deemph_segments_neon`). Below it the segments are too short
+/// for the run-in to pay off.
+#[cfg(target_arch = "aarch64")]
+const DEEMPH_SEGMENTS_MIN: usize = 480;
+/// Samples that the de-emphasis filter of a segment runs over before its
+/// segment starts (`deemph_segments_neon`).
+///
+/// A filter that starts from a wrong memory comes closer to the right
+/// values by the factor `coef` (0.85) per sample. After about 100 samples
+/// the difference is one unit in the last place of a `f32`. From there it
+/// disappears with a probability of about 0.15 per sample.
+///
+/// Measured on 13 decode scenarios of the test harness (music and speech,
+/// 190 000 to 1 100 000 segments each): with a run-in of 160 samples, 9
+/// scenarios computed no segment again, 2 computed one, one computed 1 in
+/// 3600 and one 1 in 2100. With 128 samples it was 1 segment in 50 to 230
+/// (6 scenarios), and with 96 samples about 3 in 4.
+#[cfg(target_arch = "aarch64")]
+const DEEMPH_WARMUP: usize = 160;
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
+std::thread_local! {
+    /// Segments that `deemph_segments_neon` computed a second time on this
+    /// thread. Only tests count them.
+    static DEEMPH_RECOMPUTED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Rows to columns: lane `j` of the result's vector `k` is lane `k` of
+/// `rows[j]`. Applying it twice gives the input back.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn transpose4(rows: [float32x4_t; 4]) -> [float32x4_t; 4] {
+    // SAFETY: these instructions are part of every 64-bit ARM processor,
+    // and they only rearrange values held in registers.
+    unsafe {
+        let t0 = vreinterpretq_f64_f32(vtrn1q_f32(rows[0], rows[1]));
+        let t1 = vreinterpretq_f64_f32(vtrn2q_f32(rows[0], rows[1]));
+        let t2 = vreinterpretq_f64_f32(vtrn1q_f32(rows[2], rows[3]));
+        let t3 = vreinterpretq_f64_f32(vtrn2q_f32(rows[2], rows[3]));
+        [
+            vreinterpretq_f32_f64(vtrn1q_f64(t0, t2)),
+            vreinterpretq_f32_f64(vtrn1q_f64(t1, t3)),
+            vreinterpretq_f32_f64(vtrn2q_f64(t0, t2)),
+            vreinterpretq_f32_f64(vtrn2q_f64(t1, t3)),
+        ]
+    }
+}
+
+/// De-emphasis of one frame of `C` channels (1 or 2), computed in eight
+/// segments at the same time. The result is the same, bit for bit, as that
+/// of `deemph_mono` on each channel.
+///
+/// `hist[c][at..at + n]` is the frame of channel `c` and `y[c]` receives
+/// its `n` output samples, scaled to the output range. `mem` holds the
+/// filter memories. The function returns them for the next frame.
+///
+/// # Why segments
+///
+/// Each output sample needs the one before it. A channel therefore takes
+/// one addition and one multiplication, one after the other, per sample,
+/// however fast the processor is otherwise. Eight filters that do not
+/// depend on each other take the same time as one.
+///
+/// # How the result stays exact
+///
+/// Each channel's frame is cut into equal segments: eight for one channel,
+/// four each for two. The filter of the first segment starts from `mem`.
+/// The filter of every other segment does not know its starting memory,
+/// because that is the result of the segment before. It starts `warmup`
+/// samples early with a guess. A wrong memory fades by the factor `coef`
+/// per sample, so at the start of its segment the filter has usually
+/// reached exactly the memory it would have had.
+///
+/// The guess is `mem`, the memory at the start of the frame, and not zero.
+/// For most signals the two do equally well. Digital silence is the
+/// exception. There the memory stops at one of several neighbouring `f32`
+/// values: a memory that comes down from a positive value stops at a
+/// higher one than a memory that rises from zero or from a negative value.
+/// A filter started from zero would then never reach the exact memory, and
+/// every segment of every silent frame would be computed twice. Started
+/// from `mem`, it already holds the value at which the memory stopped.
+///
+/// "Usually" is not enough, so every segment is checked afterwards, in
+/// order. The memory a filter had at the start of its segment is compared
+/// with the memory the filter before it ended with, which is exact. If the
+/// two are the same bits, the segment was computed from the right memory
+/// with the same operations in the same order, so its samples are exact,
+/// and so is the memory it ends with. If they differ, the segment is
+/// computed again, one sample at a time, from the exact memory. That
+/// happens when the signal drops to silence, where a wrong memory fades no
+/// faster than the signal itself.
+///
+/// `n` must be a multiple of 32, `warmup` a multiple of 4, and `hist`
+/// must hold `warmup` samples before `at`. Their values do not matter for
+/// the result.
+#[cfg(target_arch = "aarch64")]
+fn deemph_segments_neon<const C: usize>(
+    hist: [&[f32]; C],
+    at: usize,
+    y: [&mut [f32]; C],
+    warmup: usize,
+    coef: f32,
+    mem: [f32; C],
+) -> [f32; C] {
+    /// Filters that run at the same time: two vectors of four.
+    const LANES: usize = 8;
+    assert!(C == 1 || C == 2);
+    let per_ch = LANES / C;
+    let n = y[0].len();
+    let seg = n / per_ch;
+    assert!(n.is_multiple_of(32) && warmup.is_multiple_of(4) && at >= warmup);
+    for c in 0..C {
+        assert!(y[c].len() == n && at + n <= hist[c].len());
+    }
+
+    // Filter `s` handles segment `s % per_ch` of channel `s / per_ch`.
+    // `x_ptr[s]` is where its run-in starts and `y_ptr[s]` where its
+    // segment's output goes.
+    let mut x_ptr = [core::ptr::null::<f32>(); LANES];
+    let mut y_ptr = [core::ptr::null_mut::<f32>(); LANES];
+    for c in 0..C {
+        let (x_base, y_base) = (hist[c].as_ptr(), y[c].as_mut_ptr());
+        for q in 0..per_ch {
+            // SAFETY: `at - warmup + q * seg <= at + n <= hist[c].len()`
+            // and `q * seg <= n == y[c].len()` (checked above), so both
+            // pointers stay inside their slices.
+            unsafe {
+                x_ptr[c * per_ch + q] = x_base.add(at - warmup + q * seg);
+                y_ptr[c * per_ch + q] = y_base.add(q * seg);
+            }
+        }
+    }
+
+    // SAFETY: filter `s` reads `x_ptr[s][t..t + 4]` for `t` in steps of 4
+    // below `warmup + seg`. The last value read is at
+    // `at + (q + 1) * seg - 1 < at + n` in `hist[c]`. It writes
+    // `y_ptr[s][t..t + 4]` for `t` below `seg`, which is its own segment
+    // `y[c][q * seg..(q + 1) * seg]`. The segments of the filters do not
+    // overlap. `hist` and `y` cannot overlap either: one is borrowed
+    // shared and the other mutably. `warmup` and `seg` are multiples of 4.
+    let (start_mem, end_mem) = unsafe {
+        let very_small = vdupq_n_f32(DEEMPH_VERY_SMALL);
+        let coef_v = vdupq_n_f32(coef);
+        let scale = vdupq_n_f32(DEEMPH_SCALE);
+        // Four samples of each of the four filters of group `g`, as one
+        // vector per sample.
+        let load = |g: usize, t: usize| {
+            transpose4([
+                vld1q_f32(x_ptr[4 * g].add(t)),
+                vld1q_f32(x_ptr[4 * g + 1].add(t)),
+                vld1q_f32(x_ptr[4 * g + 2].add(t)),
+                vld1q_f32(x_ptr[4 * g + 3].add(t)),
+            ])
+        };
+
+        // Run-in: memories only, no output. Every filter starts from the
+        // memory of its channel at the start of the frame. With two
+        // channels the second vector holds the filters of channel 1.
+        let mut m = [vdupq_n_f32(mem[0]), vdupq_n_f32(mem[C - 1])];
+        let mut t = 0;
+        while t < warmup {
+            for (g, mg) in m.iter_mut().enumerate() {
+                for x in load(g, t) {
+                    let out = vaddq_f32(vaddq_f32(x, very_small), *mg);
+                    *mg = vmulq_f32(out, coef_v);
+                }
+            }
+            t += 4;
+        }
+
+        // The first segment of each channel continues from the frame
+        // before, with the exact memory.
+        let mut start_mem = [0.0f32; LANES];
+        vst1q_f32(start_mem.as_mut_ptr(), m[0]);
+        vst1q_f32(start_mem.as_mut_ptr().add(4), m[1]);
+        for c in 0..C {
+            start_mem[c * per_ch] = mem[c];
+        }
+        m[0] = vld1q_f32(start_mem.as_ptr());
+        m[1] = vld1q_f32(start_mem.as_ptr().add(4));
+
+        // The segments.
+        while t < warmup + seg {
+            for (g, mg) in m.iter_mut().enumerate() {
+                let mut scaled = [very_small; 4];
+                for (s, x) in scaled.iter_mut().zip(load(g, t)) {
+                    let out = vaddq_f32(vaddq_f32(x, very_small), *mg);
+                    *mg = vmulq_f32(out, coef_v);
+                    *s = vmulq_f32(out, scale);
+                }
+                // Back to one vector of four samples per filter.
+                for (j, row) in transpose4(scaled).into_iter().enumerate() {
+                    vst1q_f32(y_ptr[4 * g + j].add(t - warmup), row);
+                }
+            }
+            t += 4;
+        }
+        let mut end_mem = [0.0f32; LANES];
+        vst1q_f32(end_mem.as_mut_ptr(), m[0]);
+        vst1q_f32(end_mem.as_mut_ptr().add(4), m[1]);
+        (start_mem, end_mem)
+    };
+
+    // Check the segments of each channel in order. `exact` is the memory
+    // that the one-sample-at-a-time filter has at the start of segment `q`.
+    let mut next_mem = mem;
+    for c in 0..C {
+        let mut exact = end_mem[c * per_ch];
+        for q in 1..per_ch {
+            let s = c * per_ch + q;
+            exact = if start_mem[s].to_bits() == exact.to_bits() {
+                end_mem[s]
+            } else {
+                #[cfg(all(test, feature = "std"))]
+                DEEMPH_RECOMPUTED.with(|count| count.set(count.get() + 1));
+                let x = &hist[c][at + q * seg..at + (q + 1) * seg];
+                let out = &mut y[c][q * seg..(q + 1) * seg];
+                deemph_mono(x, out, 1, coef, exact, |o, v| *o = v)
+            };
+        }
+        next_mem[c] = exact;
+    }
+    next_mem
+}
+
+/// Store every `ds`-th value of `y` in `out`, or add it, as `put` decides.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn emit_mono(y: &[f32], out: &mut [f32], ds: usize, put: impl Fn(&mut f32, f32)) {
+    if ds == 1 {
+        for (o, &v) in out.iter_mut().zip(y) {
+            put(o, v);
+        }
+    } else {
+        for (o, group) in out.iter_mut().zip(y.chunks_exact(ds)) {
+            put(o, group[0]);
+        }
+    }
+}
+
+/// Store every `ds`-th value of `y0` and `y1` at the places `out` yields,
+/// or add it, as `put` decides.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn emit_stereo<'a>(
+    y0: &[f32],
+    y1: &[f32],
+    out: impl Iterator<Item = (&'a mut f32, &'a mut f32)>,
+    ds: usize,
+    put: impl Fn(&mut f32, f32),
+) {
+    if ds == 1 {
+        for ((&a, &b), (o0, o1)) in y0.iter().zip(y1).zip(out) {
+            put(o0, a);
+            put(o1, b);
+        }
+    } else {
+        let groups = y0.chunks_exact(ds).zip(y1.chunks_exact(ds));
+        for ((g0, g1), (o0, o1)) in groups.zip(out) {
+            put(o0, g0[0]);
+            put(o1, g1[0]);
+        }
+    }
+}
+
 pub struct CeltDecoder {
     mode: &'static CeltMode,
     /// Number of output channels (libopus `channels`).
@@ -3959,9 +6489,17 @@ pub struct CeltDecoder {
     /// `prefilter_and_fold`).
     prefilter_and_fold: bool,
     preemph_mem: FixedVec<f32, CELT_MAX_CHANNELS>,
+    /// Where each channel's history starts inside its part of `decode_mem`
+    /// (see `advance_history`).
+    hist_pos: usize,
     /// Output history per channel: `DECODE_BUFFER_SIZE` samples after the
     /// post-filter, then `overlap` samples of the inverse transform that the
     /// next frame completes (libopus `_decode_mem`).
+    ///
+    /// Channel `ch` owns `CELT_HIST_STRIDE` samples from
+    /// `ch * CELT_HIST_STRIDE`. Its history is the
+    /// `DECODE_BUFFER_SIZE + overlap` samples that start `hist_pos` samples
+    /// into that part.
     decode_mem: FixedVec<f32, CELT_DECODE_MEM>,
     /// Band log-energies of the last frame, for two channels (libopus
     /// `oldEBands`). The three arrays below have the same layout.
@@ -4000,12 +6538,16 @@ impl CeltDecoder {
             (1..=2).contains(&channels),
             "CeltDecoder::new: channels must be 1 or 2 (got {channels})"
         );
-        let overlap = mode.overlap;
+        // The buffers below are sized for the standard mode.
+        assert!(
+            mode.overlap == CELT_OVERLAP
+                && mode.short_mdct_size << mode.max_lm <= CELT_DEC_MAX_FRAME,
+            "CeltDecoder::new: mode with another overlap or a longer frame"
+        );
         let nb_ebands = mode.nb_ebands;
         // The energy arrays and the scratch buffers always have room for two
         // channels: a stereo packet can arrive in a mono decoder.
         let nb_x_ch = nb_ebands * CELT_MAX_CHANNELS;
-        let dec_frame_x_ch = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS;
         Self {
             mode,
             channels,
@@ -4027,7 +6569,8 @@ impl CeltDecoder {
             prefilter_tapset_old: 0,
             prefilter_and_fold: false,
             preemph_mem: FixedVec::from_value(0.0, channels),
-            decode_mem: FixedVec::from_value(0.0, channels * (DECODE_BUFFER_SIZE + overlap)),
+            hist_pos: 0,
+            decode_mem: FixedVec::from_value(0.0, channels * CELT_HIST_STRIDE),
             old_band_e: FixedVec::from_value(0.0, nb_x_ch),
             // libopus `oldLogE` / `oldLogE2`: the band energies of the two
             // previous frames. They start at -28 (silence), not 0: the
@@ -4045,9 +6588,9 @@ impl CeltDecoder {
             w_ebits: FixedVec::from_value(0, nb_x_ch),
             w_fine_priority: FixedVec::from_value(0, nb_x_ch),
 
-            w_x: FixedVec::from_value(0.0, dec_frame_x_ch + STRIDE_ACCESS_PAD),
+            w_x: FixedVec::from_value(0.0, CELT_W_X_DEC),
             w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
-            w_freq: FixedVec::from_value(0.0, dec_frame_x_ch + 4), // +4: NEON backward pre-rotation reads up to 3 elements past n2
+            w_freq: FixedVec::from_value(0.0, CELT_W_FREQ_DEC),
             w_band_amp: FixedVec::from_value(0.0, nb_x_ch),
         }
     }
@@ -4084,6 +6627,7 @@ impl CeltDecoder {
         self.prefilter_tapset_old = 0;
         self.prefilter_and_fold = false;
         self.preemph_mem.fill(0.0);
+        self.hist_pos = 0;
         self.decode_mem.fill(0.0);
         self.old_band_e.fill(0.0);
         self.old_band_e2.fill(OLD_LOG_E_RESET);
@@ -4150,6 +6694,7 @@ impl CeltDecoder {
             pcm,
             start_band,
             self.mode.nb_ebands,
+            PcmLayout::Planar,
         )
     }
 
@@ -4162,7 +6707,42 @@ impl CeltDecoder {
         start_band: usize,
         end_band: usize,
     ) -> usize {
-        self.decode_impl_from_rc(rc, total_bits, frame_size, pcm, start_band, end_band)
+        let layout = PcmLayout::Planar;
+        self.decode_impl_from_rc(
+            rc, total_bits, frame_size, pcm, start_band, end_band, layout,
+        )
+    }
+
+    /// As `decode_from_range_coder_with_band_range`, with interleaved
+    /// output: sample `i` of channel `ch` goes to `pcm[i * channels + ch]`.
+    ///
+    /// With `add`, the frame is added to what `pcm` holds instead of
+    /// replacing it (libopus `celt_decode_with_ec` with `accum`). A Hybrid
+    /// decoder puts the SILK output into `pcm` first and then adds the CELT
+    /// layer this way.
+    ///
+    /// The samples are the same as those of the planar functions. Writing
+    /// them where the caller needs them saves the caller a pass over the
+    /// frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_interleaved(
+        &mut self,
+        rc: &mut RangeCoder,
+        total_bits: i32,
+        frame_size: usize,
+        pcm: &mut [f32],
+        start_band: usize,
+        end_band: usize,
+        add: bool,
+    ) -> usize {
+        let layout = if add {
+            PcmLayout::InterleavedAdd
+        } else {
+            PcmLayout::Interleaved
+        };
+        self.decode_impl_from_rc(
+            rc, total_bits, frame_size, pcm, start_band, end_band, layout,
+        )
     }
 
     /// Conceal one lost frame of `frame_size` samples per channel (libopus
@@ -4183,6 +6763,34 @@ impl CeltDecoder {
         pcm: &mut [f32],
         start_band: usize,
     ) -> Result<usize, &'static str> {
+        self.decode_lost_impl(frame_size, pcm, start_band, PcmLayout::Planar)
+    }
+
+    /// As `decode_lost`, with interleaved output:
+    /// `pcm[i * channels + ch]`. With `add`, the frame is added to what
+    /// `pcm` holds (see `decode_interleaved`).
+    pub fn decode_lost_interleaved(
+        &mut self,
+        frame_size: usize,
+        pcm: &mut [f32],
+        start_band: usize,
+        add: bool,
+    ) -> Result<usize, &'static str> {
+        let layout = if add {
+            PcmLayout::InterleavedAdd
+        } else {
+            PcmLayout::Interleaved
+        };
+        self.decode_lost_impl(frame_size, pcm, start_band, layout)
+    }
+
+    fn decode_lost_impl(
+        &mut self,
+        frame_size: usize,
+        pcm: &mut [f32],
+        start_band: usize,
+        layout: PcmLayout,
+    ) -> Result<usize, &'static str> {
         let Some((n, lm)) = self.frame_geometry(frame_size) else {
             return Err("CELT: frame size is not 2.5, 5, 10 or 20 ms");
         };
@@ -4193,7 +6801,7 @@ impl CeltDecoder {
             return Err("CELT: start band out of range");
         }
         self.conceal(n, lm, start_band);
-        self.deemphasis(pcm, n, frame_size);
+        self.deemphasis(pcm, n, frame_size, layout);
         Ok(frame_size)
     }
 
@@ -4207,7 +6815,10 @@ impl CeltDecoder {
     ) -> usize {
         let total_bits = (compressed.len() * 8) as i32;
         let mut rc = RangeCoder::new_decoder(compressed);
-        self.decode_impl_from_rc(&mut rc, total_bits, frame_size, pcm, start_band, end_band)
+        let layout = PcmLayout::Planar;
+        self.decode_impl_from_rc(
+            &mut rc, total_bits, frame_size, pcm, start_band, end_band, layout,
+        )
     }
 
     /// The frame length at 48 kHz and its size exponent (`120 << lm`) for an
@@ -4223,6 +6834,41 @@ impl CeltDecoder {
             .map(|lm| (n, lm))
     }
 
+    /// Index in `decode_mem` of the first sample of channel `ch`'s history.
+    /// The history is the `DECODE_BUFFER_SIZE + overlap` samples from there.
+    #[inline(always)]
+    fn hist_start(&self, ch: usize) -> usize {
+        ch * CELT_HIST_STRIDE + self.hist_pos
+    }
+
+    /// Make room for a frame of `n` samples at the end of every channel's
+    /// history: the oldest `n` samples leave it (libopus
+    /// `OPUS_MOVE(decode_mem, decode_mem + N, ...)`).
+    ///
+    /// libopus moves the whole history down for every frame. Here the
+    /// history slides forward through its part of `decode_mem` instead,
+    /// which costs nothing. Only when it reaches the end of that part is it
+    /// moved back to the start. With 2.5 ms frames that is one move in nine
+    /// frames.
+    ///
+    /// The `n` samples that enter the history at its end, and the `overlap`
+    /// samples after them, hold old values until the caller writes them.
+    fn advance_history(&mut self, n: usize) {
+        let chan_mem = DECODE_BUFFER_SIZE + CELT_OVERLAP;
+        debug_assert!(n <= CELT_DEC_MAX_FRAME && self.hist_pos <= CELT_HIST_SLACK);
+        if self.hist_pos + n <= CELT_HIST_SLACK {
+            self.hist_pos += n;
+        } else {
+            for ch in 0..self.channels {
+                let base = ch * CELT_HIST_STRIDE;
+                let old = base + self.hist_pos;
+                self.decode_mem.copy_within(old + n..old + chan_mem, base);
+            }
+            self.hist_pos = 0;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn decode_impl_from_rc(
         &mut self,
         rc: &mut RangeCoder,
@@ -4231,6 +6877,7 @@ impl CeltDecoder {
         pcm: &mut [f32],
         start_band: usize,
         end_band: usize,
+        layout: PcmLayout,
     ) -> usize {
         let mode = self.mode;
         // `channels` is the number of output channels and `c` the number of
@@ -4239,7 +6886,6 @@ impl CeltDecoder {
         let c = self.stream_channels;
         let nb_ebands = mode.nb_ebands;
         let end_band = end_band.min(nb_ebands);
-        let overlap = mode.overlap;
 
         // The decode geometry requires frame_size == short_mdct_size << lm.
         // Any other size would decode garbage or index out of bounds, so it
@@ -4272,7 +6918,7 @@ impl CeltDecoder {
         // frame.
         if total_bits <= 8 {
             self.conceal(frame_size, lm, start_band);
-            self.deemphasis(pcm, frame_size, api_frame_size);
+            self.deemphasis(pcm, frame_size, api_frame_size, layout);
             return api_frame_size;
         }
 
@@ -4281,6 +6927,10 @@ impl CeltDecoder {
         if self.loss_duration == 0 {
             self.skip_plc = false;
         }
+
+        // Make room for the new frame at the end of each channel's history.
+        // Nothing reads the history before the frame is synthesised.
+        self.advance_history(frame_size);
 
         // A mono frame continues from the louder of the two channels of the
         // previous frame.
@@ -4483,16 +7133,9 @@ impl CeltDecoder {
             c,
         );
 
-        // Make room for the new frame at the end of each channel's history.
-        let chan_mem = DECODE_BUFFER_SIZE + overlap;
-        for ch in 0..channels {
-            let off = ch * chan_mem;
-            self.decode_mem
-                .copy_within(off + frame_size..off + chan_mem, off);
-        }
-
-        self.w_x[..frame_size * c].fill(0.0);
-
+        // `w_x` is not cleared. `quant_all_bands` writes every band from
+        // `start_band` to `end_band` before anything reads it, and nothing
+        // reads the other bands.
         let x_pad_end = (frame_size * c + STRIDE_ACCESS_PAD).min(self.w_x.len());
         let x = &mut self.w_x[..x_pad_end];
         self.w_collapse_masks[..nb_ebands * c].fill(0);
@@ -4628,7 +7271,7 @@ impl CeltDecoder {
 
         self.rng = rc.rng;
 
-        self.deemphasis(pcm, frame_size, api_frame_size);
+        self.deemphasis(pcm, frame_size, api_frame_size, layout);
         self.loss_duration = 0;
         self.plc_duration = 0;
         self.last_frame_type = FrameType::Normal;
@@ -4667,6 +7310,7 @@ impl CeltDecoder {
         };
         let chan_mem = DECODE_BUFFER_SIZE + overlap;
         let out_syn = DECODE_BUFFER_SIZE - n;
+        let hist = [self.hist_start(0), self.hist_start(1)];
 
         // Spectrum of every coded channel (libopus `denormalise_bands`):
         // zero below the first band, and from the last band or the output
@@ -4695,13 +7339,13 @@ impl CeltDecoder {
         }
 
         let mdct = &mode.mdct;
-        let mem = &mut self.decode_mem[..];
         for ch in 0..channels {
             // A mono stream in a stereo decoder gives the same spectrum to
             // both channels. So does the mix above to its one channel.
             let spectrum = if c == channels { ch * n } else { 0 };
+            let mem = &mut self.decode_mem[hist[ch]..hist[ch] + chan_mem];
             for blk in 0..b {
-                let out = ch * chan_mem + out_syn + nb * blk;
+                let out = out_syn + nb * blk;
                 mdct.backward(
                     &freq[spectrum + blk..],
                     &mut mem[out..],
@@ -4732,7 +7376,8 @@ impl CeltDecoder {
         let chan_mem = DECODE_BUFFER_SIZE + overlap;
         let at = DECODE_BUFFER_SIZE - n;
         for ch in 0..self.channels {
-            let buf = &mut self.decode_mem[ch * chan_mem..(ch + 1) * chan_mem];
+            let hist = self.hist_start(ch);
+            let buf = &mut self.decode_mem[hist..hist + chan_mem];
             comb_filter_inplace(
                 buf,
                 at,
@@ -4764,38 +7409,118 @@ impl CeltDecoder {
         }
     }
 
-    /// De-emphasis of the new frame of every channel into `pcm` (planar),
-    /// keeping one sample in `downsample` (libopus `deemphasis`).
-    fn deemphasis(&mut self, pcm: &mut [f32], n: usize, api_frame_size: usize) {
-        // libopus writes `SATURATE(x + VERY_SMALL + m, SIG_SAT)`. In its
-        // float build `SATURATE` does nothing (celt/arch.h).
-        const VERY_SMALL: f32 = 1e-30f32;
+    /// De-emphasis of the new frame of every channel into `pcm`, keeping
+    /// one sample in `downsample` (libopus `deemphasis`).
+    fn deemphasis(&mut self, pcm: &mut [f32], n: usize, api_frame_size: usize, layout: PcmLayout) {
+        // One choice of the implementation per frame. The segment filter
+        // needs a frame length that is a multiple of 32. The standard mode
+        // has one for 10 and 20 ms (480 and 960). A mode with another frame
+        // length takes the portable filter below.
+        #[cfg(target_arch = "aarch64")]
+        if n >= DEEMPH_SEGMENTS_MIN && n.is_multiple_of(32) {
+            self.deemphasis_in_segments(pcm, n, api_frame_size, layout);
+            return;
+        }
         let coef = self.mode.preemph[0];
-        let chan_mem = DECODE_BUFFER_SIZE + self.mode.overlap;
         let ds = self.downsample;
-        for ch in 0..self.channels {
-            let at = ch * chan_mem + DECODE_BUFFER_SIZE - n;
-            let frame = &self.decode_mem[at..at + n];
-            let out = &mut pcm[ch * api_frame_size..(ch + 1) * api_frame_size];
-            let mut m = self.preemph_mem[ch];
-            if ds == 1 {
-                for (o, &x) in out.iter_mut().zip(frame) {
-                    let val = x + VERY_SMALL + m;
-                    *o = val * (1.0 / 32768.0);
-                    m = val * coef;
-                }
+        let store = |o: &mut f32, v: f32| *o = v;
+        let add = |o: &mut f32, v: f32| *o += v;
+        // The new frame of each channel in `decode_mem`.
+        let at0 = self.hist_start(0) + DECODE_BUFFER_SIZE - n;
+        if self.channels == 1 {
+            // With one channel the three layouts are the same places.
+            let x = &self.decode_mem[at0..at0 + n];
+            let out = &mut pcm[..api_frame_size];
+            let m = self.preemph_mem[0];
+            self.preemph_mem[0] = if layout == PcmLayout::InterleavedAdd {
+                deemph_mono(x, out, ds, coef, m, add)
             } else {
-                // Run the filter over all internal samples, but only write
-                // every downsample-th sample.
-                for (i, &x) in frame.iter().enumerate() {
-                    let val = x + VERY_SMALL + m;
-                    if i % ds == 0 {
-                        out[i / ds] = val * (1.0 / 32768.0);
-                    }
-                    m = val * coef;
+                deemph_mono(x, out, ds, coef, m, store)
+            };
+        } else {
+            let at1 = at0 + CELT_HIST_STRIDE;
+            let x0 = &self.decode_mem[at0..at0 + n];
+            let x1 = &self.decode_mem[at1..at1 + n];
+            let m = [self.preemph_mem[0], self.preemph_mem[1]];
+            let out = &mut pcm[..2 * api_frame_size];
+            let m = match layout {
+                PcmLayout::Planar => {
+                    let (out0, out1) = out.split_at_mut(api_frame_size);
+                    let places = out0.iter_mut().zip(out1.iter_mut());
+                    deemph_stereo(x0, x1, places, ds, coef, m, store)
                 }
-            }
-            self.preemph_mem[ch] = m;
+                PcmLayout::Interleaved => {
+                    deemph_stereo(x0, x1, stereo_pairs(out), ds, coef, m, store)
+                }
+                PcmLayout::InterleavedAdd => {
+                    deemph_stereo(x0, x1, stereo_pairs(out), ds, coef, m, add)
+                }
+            };
+            self.preemph_mem[..2].copy_from_slice(&m);
+        }
+    }
+
+    /// `deemphasis` for frames of 10 and 20 ms, with the filter computed in
+    /// segments (`deemph_segments_neon`). The output is the same.
+    ///
+    /// The filter writes straight into `pcm` when `pcm` takes one channel
+    /// after the other at 48 kHz. For the other layouts and rates it writes
+    /// into `w_freq`, which is free once the frame is synthesised, and a
+    /// second pass puts the samples in their places.
+    #[cfg(target_arch = "aarch64")]
+    fn deemphasis_in_segments(
+        &mut self,
+        pcm: &mut [f32],
+        n: usize,
+        api_frame_size: usize,
+        layout: PcmLayout,
+    ) {
+        let coef = self.mode.preemph[0];
+        let ds = self.downsample;
+        let chan_mem = DECODE_BUFFER_SIZE + CELT_OVERLAP;
+        let at = DECODE_BUFFER_SIZE - n;
+        let store = |o: &mut f32, v: f32| *o = v;
+        let add = |o: &mut f32, v: f32| *o += v;
+        let (h0, h1) = (self.hist_start(0), self.hist_start(1));
+        let hist0 = &self.decode_mem[h0..h0 + chan_mem];
+        if self.channels == 1 {
+            let m = [self.preemph_mem[0]];
+            let m = if ds == 1 && layout != PcmLayout::InterleavedAdd {
+                deemph_segments_neon([hist0], at, [&mut pcm[..n]], DEEMPH_WARMUP, coef, m)
+            } else {
+                let y = &mut self.w_freq[..n];
+                let m = deemph_segments_neon([hist0], at, [&mut *y], DEEMPH_WARMUP, coef, m);
+                let out = &mut pcm[..api_frame_size];
+                if layout == PcmLayout::InterleavedAdd {
+                    emit_mono(y, out, ds, add);
+                } else {
+                    emit_mono(y, out, ds, store);
+                }
+                m
+            };
+            self.preemph_mem[0] = m[0];
+        } else {
+            let hist = [hist0, &self.decode_mem[h1..h1 + chan_mem]];
+            let m = [self.preemph_mem[0], self.preemph_mem[1]];
+            let m = if ds == 1 && layout == PcmLayout::Planar {
+                let (out0, out1) = pcm[..2 * n].split_at_mut(n);
+                deemph_segments_neon(hist, at, [out0, out1], DEEMPH_WARMUP, coef, m)
+            } else {
+                let (y0, y1) = self.w_freq[..2 * n].split_at_mut(n);
+                let m =
+                    deemph_segments_neon(hist, at, [&mut *y0, &mut *y1], DEEMPH_WARMUP, coef, m);
+                let out = &mut pcm[..2 * api_frame_size];
+                match layout {
+                    PcmLayout::Planar => {
+                        let (out0, out1) = out.split_at_mut(api_frame_size);
+                        emit_stereo(y0, y1, out0.iter_mut().zip(out1.iter_mut()), ds, store);
+                    }
+                    PcmLayout::Interleaved => emit_stereo(y0, y1, stereo_pairs(out), ds, store),
+                    PcmLayout::InterleavedAdd => emit_stereo(y0, y1, stereo_pairs(out), ds, add),
+                }
+                m
+            };
+            self.preemph_mem[..2].copy_from_slice(&m);
         }
     }
 
@@ -4817,7 +7542,8 @@ impl CeltDecoder {
         let mut etmp = [0.0f32; CELT_OVERLAP];
         let etmp = &mut etmp[..overlap];
         for ch in 0..self.channels {
-            let buf = &mut self.decode_mem[ch * chan_mem..(ch + 1) * chan_mem];
+            let hist = self.hist_start(ch);
+            let buf = &mut self.decode_mem[hist..hist + chan_mem];
             comb_filter(
                 etmp,
                 buf,
@@ -4846,11 +7572,11 @@ impl CeltDecoder {
     /// Find the pitch period of the output history for the concealment
     /// (libopus `celt_plc_pitch_search`).
     fn plc_pitch_search(&mut self) -> usize {
-        let chan_mem = DECODE_BUFFER_SIZE + self.mode.overlap;
+        let (hist0, hist1) = (self.hist_start(0), self.hist_start(1));
         let lp = &mut self.w_freq[..DECODE_BUFFER_SIZE >> 1];
-        let (ch0, rest) = self.decode_mem.split_at(chan_mem);
+        let ch0 = &self.decode_mem[hist0..hist0 + DECODE_BUFFER_SIZE];
         let ch1 = if self.channels == 2 {
-            Some(&rest[..chan_mem])
+            Some(&self.decode_mem[hist1..hist1 + DECODE_BUFFER_SIZE])
         } else {
             None
         };
@@ -4885,10 +7611,7 @@ impl CeltDecoder {
             // towards the background noise level.
             let end = self.end_band;
             let eff_end = start.max(end.min(mode.eff_ebands));
-            for ch in 0..channels {
-                let off = ch * chan_mem;
-                self.decode_mem.copy_within(off + n..off + chan_mem, off);
-            }
+            self.advance_history(n);
             if self.prefilter_and_fold {
                 self.fold_concealed_overlap(n);
             }
@@ -4950,15 +7673,18 @@ impl CeltDecoder {
             // is decaying. No more than PLC_MAX_PERIOD samples are kept.
             let exc_length = (2 * pitch_index).min(PLC_MAX_PERIOD);
             let window = mode.window;
+            // Shift the history by one frame. The last decoded sample is
+            // now just before `at`. The frame and the `overlap` samples
+            // after it are written below.
+            self.advance_history(n);
             for ch in 0..channels {
-                let buf = &mut self.decode_mem[ch * chan_mem..(ch + 1) * chan_mem];
+                let hist = self.hist_start(ch);
+                let buf = &mut self.decode_mem[hist..hist + chan_mem];
                 // `exc_all[PLC_LPC_ORDER + i]` is libopus `exc[i]`. The
                 // samples before it are the history of the analysis filter.
                 let (exc_all, tmp) = self.w_x[..2 * PLC_MAX_PERIOD + PLC_LPC_ORDER]
                     .split_at_mut(PLC_MAX_PERIOD + PLC_LPC_ORDER);
-                exc_all.copy_from_slice(
-                    &buf[DECODE_BUFFER_SIZE - PLC_MAX_PERIOD - PLC_LPC_ORDER..DECODE_BUFFER_SIZE],
-                );
+                exc_all.copy_from_slice(&buf[at - PLC_MAX_PERIOD - PLC_LPC_ORDER..at]);
                 let lpc = &mut self.plc_lpc[ch * PLC_LPC_ORDER..(ch + 1) * PLC_LPC_ORDER];
 
                 if first_loss {
@@ -5003,10 +7729,6 @@ impl CeltDecoder {
                     }
                     (e1.min(e2) / e2).sqrt()
                 };
-
-                // Shift the history by one frame. The unfinished samples
-                // past its end are dropped: they are not used.
-                buf.copy_within(n..DECODE_BUFFER_SIZE, 0);
 
                 // Repeat the excitation with a period of `pitch_index`,
                 // scaled down by `decay` on every repetition. A full

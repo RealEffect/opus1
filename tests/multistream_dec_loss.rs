@@ -43,8 +43,11 @@ struct LossResult {
     /// The same over the later packets of every burst.
     deep_level_db: f64,
     /// Largest step from one sample to the next in and right after a
-    /// concealed frame, divided by the C decoder's largest step there.
+    /// concealed frame, divided by the C decoder's largest step there, over
+    /// the first two lost packets of every burst.
     step_ratio: f64,
+    /// The same over the later packets of every burst.
+    deep_step_ratio: f64,
     /// Smallest SNR against the C decoder over the end of the signal, where
     /// nothing is lost, in dB.
     tail_snr: f64,
@@ -57,6 +60,7 @@ impl LossResult {
         level_db: 0.0,
         deep_level_db: 0.0,
         step_ratio: 0.0,
+        deep_step_ratio: 0.0,
         tail_snr: f64::INFINITY,
         lost_snr: f64::INFINITY,
     };
@@ -66,6 +70,7 @@ impl LossResult {
             level_db: self.level_db.max(other.level_db),
             deep_level_db: self.deep_level_db.max(other.deep_level_db),
             step_ratio: self.step_ratio.max(other.step_ratio),
+            deep_step_ratio: self.deep_step_ratio.max(other.deep_step_ratio),
             tail_snr: self.tail_snr.min(other.tail_snr),
             lost_snr: self.lost_snr.min(other.lost_snr),
         }
@@ -139,16 +144,18 @@ fn run_with_losses(e: &Encoded, fs: i32, frame: usize) -> LossResult {
         for &(i, place) in &lost_packets {
             let (from, to) = (i * frame_dec, (i + 1) * frame_dec);
             let level = level_difference_db(&c_ch[from..to], &r_ch[from..to]);
-            if place <= 2 {
-                result.level_db = result.level_db.max(level);
-            } else {
-                result.deep_level_db = result.deep_level_db.max(level);
-            }
             // The concealed frame and the 2.5 ms after it, where the next
             // frame joins.
             let join = to + fs as usize / 400;
             let (c_step, r_step) = (largest_step(&c_ch, from, join), largest_step(&r_ch, from, join));
-            result.step_ratio = result.step_ratio.max(r_step / (c_step + 1e-4));
+            let step = r_step / (c_step + 1e-4);
+            if place <= 2 {
+                result.level_db = result.level_db.max(level);
+                result.step_ratio = result.step_ratio.max(step);
+            } else {
+                result.deep_level_db = result.deep_level_db.max(level);
+                result.deep_step_ratio = result.deep_step_ratio.max(step);
+            }
             lost_signal += energy(&c_ch[from..to]);
             lost_noise += c_ch[from..to].iter().zip(&r_ch[from..to]).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>();
         }
@@ -198,6 +205,7 @@ fn check_voiced(layout: Layout) {
     assert!(r.level_db <= 1.5, "{layout:?}: a concealed frame is {:.2} dB off the C decoder's level", r.level_db);
     assert!(r.deep_level_db <= 1.5, "{layout:?}: a frame late in a burst is {:.2} dB off the C decoder's level", r.deep_level_db);
     assert!(r.step_ratio <= 1.3, "{layout:?}: a step {:.2} times the C decoder's largest", r.step_ratio);
+    assert!(r.deep_step_ratio <= 1.3, "{layout:?}: late in a burst, a step {:.2} times the C decoder's largest", r.deep_step_ratio);
     assert!(r.lost_snr >= 10.0, "{layout:?}: concealed frames {:.1} dB from the C decoder's", r.lost_snr);
     assert!(r.tail_snr >= 100.0, "{layout:?}: {:.1} dB from the C decoder after the losses", r.tail_snr);
 }
@@ -208,11 +216,24 @@ fn check_voiced(layout: Layout) {
 /// burst the level falls at a speed that depends on the period, so it is
 /// not compared (measured: up to 18.9 dB apart in the sixth lost frame;
 /// libopus itself differs that much between its 16 kHz and its 48 kHz
-/// output of the same packets).
+/// output of the same packets). The largest step of a tone is proportional
+/// to its level, so it is not compared late in a burst either.
 ///
-/// Measured over all layouts: level within 0.43 dB, largest step 1.12 times
-/// the C decoder's, concealed frames at least 16 dB and the end of the
-/// signal at least 91 dB from the C decoder's.
+/// How open the choice is, measured on the mono 400 Hz tone in 5 ms CELT
+/// frames at 64 kb/s: the period of that tone is exactly 120 samples, so
+/// 240, 360, 480 and 600 fit just as well. Over the 13 losses of the stream
+/// libopus takes 120, 240 and 480 in turn, and its 16 kHz and 48 kHz
+/// decoders take different periods at 3 of the 13 losses for the same
+/// packets. opus-rs differs from libopus at 5 to 7 of the 13. When the two
+/// differ at the start of the burst of 6, the sixth frame is 18.5 dB apart
+/// and its largest step 2.1 times libopus's, and the first loss after the
+/// burst 1.2 dB apart: the same numbers as between libopus's own two
+/// decoders.
+///
+/// Measured over all layouts, for the first two lost frames of every burst:
+/// level within 1.22 dB, largest step 1.09 times the C decoder's. Concealed
+/// frames are at least 16 dB and the end of the signal at least 104 dB from
+/// the C decoder's.
 fn check_tones(layout: Layout) {
     let r = loss_matrix(layout, Signal::Tones);
     assert!(r.level_db <= 1.5, "{layout:?}: a concealed frame is {:.2} dB off the C decoder's level", r.level_db);

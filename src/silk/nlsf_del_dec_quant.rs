@@ -417,113 +417,171 @@ fn prune(better: &[i64; N_STATES], worse: &[i64; N_STATES], paths: &mut Paths) -
 /// `order` residual indices to `indices`. The result is that of
 /// `silk_nlsf_del_dec_quant_reference`.
 pub(crate) fn silk_nlsf_del_dec_quant_tables(indices: &mut [i8], input: &NlsfQuantInput) -> i32 {
-    let order = input.order;
+    let mut group_indices = [[0i8; MAX_LPC_ORDER]; 1];
+    let [rd_q25] = silk_nlsf_del_dec_quant_group(&mut group_indices, core::array::from_ref(input));
+    indices[..input.order].copy_from_slice(&group_indices[0][..input.order]);
+    rd_q25
+}
+
+/// One search of a group after its first coefficients.
+struct Lane {
+    /// `state[j]` is the candidate in place `j`.
+    state: [i64; N_STATES],
+    /// The worse candidate of each state for the last coefficient done.
+    worse: [i64; N_STATES],
+    /// Index paths. Coefficients that are not done yet have a zero byte.
+    paths: Paths,
+    /// A rate-distortion value was negative: the result comes from the
+    /// reference version.
+    handed_over: bool,
+}
+
+/// `K` searches side by side: search `l` reads `inputs[l]` and writes its
+/// residual indices to `indices[l][..order]`. Returns the rate-distortion
+/// value (Q25) of each chosen path. All inputs have the same `order`. Each
+/// result is that of `silk_nlsf_del_dec_quant_reference` for its input.
+///
+/// One search is a chain of dependent steps from coefficient to coefficient:
+/// the candidates of a coefficient need the survivors of the one before. The
+/// searches of different inputs do not depend on each other. Each coefficient
+/// is therefore done for all `K` searches before the next one, so the
+/// processor works on `K` chains at the same time.
+pub(crate) fn silk_nlsf_del_dec_quant_group<const K: usize>(
+    indices: &mut [[i8; MAX_LPC_ORDER]; K],
+    inputs: &[NlsfQuantInput; K],
+) -> [i32; K] {
+    let mut result = [0i32; K];
+    let Some(first) = inputs.first() else {
+        return result;
+    };
+    let order = first.order;
     assert!(order <= MAX_LPC_ORDER);
+    assert!(inputs.iter().all(|input| input.order == order));
 
-    // Index path of each state. Entry `i` is the index of coefficient `i`.
-    let mut ind = [[0i8; MAX_LPC_ORDER]; N_STATES];
-    // Entries 0..4 belong to the states. Entries 4..8 hold the second
-    // candidate of each state.
-    let mut prev_out_q10 = [0i16; 2 * N_STATES];
-    let mut rd_q25 = [0i32; 2 * N_STATES];
+    // Number of coefficients that are left after the first part below. It
+    // is the same for every search, because it depends only on `order`.
+    let mut left = order;
+    let mut lanes: [Lane; K] = core::array::from_fn(|l| {
+        let input = &inputs[l];
+        // Index path of each state. Entry `i` is the index of coefficient `i`.
+        let mut ind = [[0i8; MAX_LPC_ORDER]; N_STATES];
+        // Entries 0..4 belong to the states. Entries 4..8 hold the second
+        // candidate of each state.
+        let mut prev_out_q10 = [0i16; 2 * N_STATES];
+        let mut rd_q25 = [0i32; 2 * N_STATES];
 
-    // The first coefficients: every state splits into two, until there are
-    // four states. This part is the reference code unchanged.
-    let mut n_states: usize = 1;
-    let mut i = order;
-    while i > 0 && n_states <= N_STATES / 2 {
-        i -= 1;
-        let coef = input.coefficient(i);
-        for j in 0..n_states {
-            let c = candidates(prev_out_q10[j] as i32, rd_q25[j], &coef);
-            ind[j][i] = c.k as i8;
-            prev_out_q10[j] = c.out0_q10 as i16;
-            prev_out_q10[j + n_states] = c.out1_q10 as i16;
-            rd_q25[j] = c.rd0_q25;
-            rd_q25[j + n_states] = c.rd1_q25;
+        // The first coefficients: every state splits into two, until there
+        // are four states. This part is the reference code unchanged.
+        let mut n_states: usize = 1;
+        let mut i = order;
+        while i > 0 && n_states <= N_STATES / 2 {
+            i -= 1;
+            let coef = input.coefficient(i);
+            for j in 0..n_states {
+                let c = candidates(prev_out_q10[j] as i32, rd_q25[j], &coef);
+                ind[j][i] = c.k as i8;
+                prev_out_q10[j] = c.out0_q10 as i16;
+                prev_out_q10[j + n_states] = c.out1_q10 as i16;
+                rd_q25[j] = c.rd0_q25;
+                rd_q25[j + n_states] = c.rd1_q25;
+            }
+            for j in 0..n_states {
+                ind[j + n_states][i] = ind[j][i] + 1;
+            }
+            n_states <<= 1;
+            for j in n_states..N_STATES {
+                ind[j][i] = ind[j - n_states][i];
+            }
         }
-        for j in 0..n_states {
-            ind[j + n_states][i] = ind[j][i] + 1;
+        left = i;
+
+        // With fewer than three coefficients there is nothing to prune: the
+        // eight values in `rd_q25` are the final ones. They go into `state`
+        // and `worse` as they are, which is where the end of this function
+        // reads them.
+        let mut paths: Paths = [[0; N_STATES]; 2];
+        for j in 0..N_STATES {
+            let mut bytes = [0u8; MAX_LPC_ORDER];
+            for (byte, &index) in bytes[i..order].iter_mut().zip(&ind[j][i..order]) {
+                *byte = (index as i32 + NLSF_QUANT_MAX_AMPLITUDE_EXT) as u8;
+            }
+            paths[0][j] = u64::from_le_bytes(*bytes.first_chunk().unwrap());
+            paths[1][j] = u64::from_le_bytes(*bytes.last_chunk().unwrap());
         }
-        n_states <<= 1;
-        for j in n_states..N_STATES {
-            ind[j][i] = ind[j - n_states][i];
+        Lane {
+            state: core::array::from_fn(|j| key(rd_q25[j], j, 0, prev_out_q10[j] as i32)),
+            worse: core::array::from_fn(|j| key(rd_q25[j + N_STATES], j, 0, 0)),
+            paths,
+            handed_over: false,
         }
-    }
-    if i == 0 {
-        // Fewer than three coefficients: there is nothing to prune.
-        let (best, min_q25) = lowest(&rd_q25);
-        indices[..order].copy_from_slice(&ind[best & (N_STATES - 1)][..order]);
-        indices[0] += (best >> NLSF_QUANT_DEL_DEC_STATES_LOG2) as i8;
-        return min_q25;
-    }
+    });
 
     // The other coefficients: four states give eight candidates, and the four
     // with the lowest rate-distortion value survive.
-    //
-    // `state[j]` is the candidate in place `j`. `worse[j]` is the worse
-    // candidate of state `j` for the last coefficient done. These and
-    // `better` are only read and written at fixed positions, so the compiler
-    // keeps them in registers; the next coefficient waits for them.
-    let mut state: [i64; N_STATES] =
-        core::array::from_fn(|j| key(rd_q25[j], j, 0, prev_out_q10[j] as i32));
-    let mut worse = [0i64; N_STATES];
-    // Coefficients that are not done yet have a zero byte.
-    let mut paths: Paths = [[0; N_STATES]; 2];
-    for j in 0..N_STATES {
-        let mut bytes = [0u8; MAX_LPC_ORDER];
-        for (byte, &index) in bytes[i..order].iter_mut().zip(&ind[j][i..order]) {
-            *byte = (index as i32 + NLSF_QUANT_MAX_AMPLITUDE_EXT) as u8;
-        }
-        paths[0][j] = u64::from_le_bytes(*bytes.first_chunk().unwrap());
-        paths[1][j] = u64::from_le_bytes(*bytes.last_chunk().unwrap());
-    }
-
+    let mut i = left;
     while i > 0 {
         i -= 1;
-        let coef = input.coefficient(i);
+        for (lane, input) in lanes.iter_mut().zip(inputs) {
+            let coef = input.coefficient(i);
 
-        let mut better = [0i64; N_STATES];
-        for j in 0..N_STATES {
-            (better[j], worse[j]) = ordered_candidates(j, state[j], &coef);
+            let mut better = [0i64; N_STATES];
+            for j in 0..N_STATES {
+                (better[j], lane.worse[j]) = ordered_candidates(j, lane.state[j], &coef);
+            }
+            // `prune` needs rate-distortion values that are not negative. A
+            // negative one can only come from a sum that overflowed, which
+            // valid encoder input does not produce. The sign bit of a key is
+            // the sign of its value. Such a search is done again by the
+            // reference version below; until then it goes on with values
+            // that mean nothing.
+            //
+            // These are two tests and not one over all four keys on purpose:
+            // with a single test the compiler merges the four candidate
+            // computations into vector instructions. Each state has to wait
+            // for its own result, and the moves into vector registers and
+            // back make that wait longer (measured: 10 % more time for the
+            // whole search).
+            if (better[0] | better[1]) < 0 || (better[2] | better[3]) < 0 {
+                lane.handed_over = true;
+            }
+            lane.state = prune(&better, &lane.worse, &mut lane.paths);
+
+            // The paths were moved without the index of this coefficient.
+            let half = &mut lane.paths[i / 8];
+            let shift = 8 * (i % 8);
+            for j in 0..N_STATES {
+                half[j] |= (key_slot(lane.state[j]) as u64) << shift;
+            }
         }
-        // `prune` needs rate-distortion values that are not negative. A
-        // negative one can only come from a sum that overflowed, which valid
-        // encoder input does not produce. The sign bit of a key is the sign
-        // of its value.
-        //
-        // These are two tests and not one over all four keys on purpose:
-        // with a single test the compiler merges the four candidate
-        // computations into vector instructions. Each state has to wait for
-        // its own result, and the moves into vector registers and back make
-        // that wait longer (measured: 10 % more time for the whole search).
-        if (better[0] | better[1]) < 0 || (better[2] | better[3]) < 0 {
+    }
+
+    for (l, lane) in lanes.iter().enumerate() {
+        if lane.handed_over {
             #[cfg(test)]
             tests::count_hand_over();
-            return silk_nlsf_del_dec_quant_reference(indices, input);
+            result[l] = silk_nlsf_del_dec_quant_reference(&mut indices[l], &inputs[l]);
+            continue;
         }
-        state = prune(&better, &worse, &mut paths);
-
-        // The paths were moved without the index of this coefficient.
-        let half = &mut paths[i / 8];
-        let shift = 8 * (i % 8);
+        let mut rd_q25 = [0i32; 2 * N_STATES];
         for j in 0..N_STATES {
-            half[j] |= (key_slot(state[j]) as u64) << shift;
+            rd_q25[j] = key_rd_q25(lane.state[j]);
+            rd_q25[j + N_STATES] = key_rd_q25(lane.worse[j]);
         }
+        let (best, min_q25) = lowest(&rd_q25);
+        let place = best & (N_STATES - 1);
+        let path = [
+            lane.paths[0][place].to_le_bytes(),
+            lane.paths[1][place].to_le_bytes(),
+        ];
+        for (index, &slot) in indices[l][..order].iter_mut().zip(path.as_flattened()) {
+            *index = (slot as i32 - NLSF_QUANT_MAX_AMPLITUDE_EXT) as i8;
+        }
+        if order > 0 {
+            indices[l][0] += (best >> NLSF_QUANT_DEL_DEC_STATES_LOG2) as i8;
+        }
+        result[l] = min_q25;
     }
-
-    for j in 0..N_STATES {
-        rd_q25[j] = key_rd_q25(state[j]);
-        rd_q25[j + N_STATES] = key_rd_q25(worse[j]);
-    }
-    let (best, min_q25) = lowest(&rd_q25);
-    let place = best & (N_STATES - 1);
-    let path = [paths[0][place].to_le_bytes(), paths[1][place].to_le_bytes()];
-    for (index, &slot) in indices[..order].iter_mut().zip(path.as_flattened()) {
-        *index = (slot as i32 - NLSF_QUANT_MAX_AMPLITUDE_EXT) as i8;
-    }
-    indices[0] += (best >> NLSF_QUANT_DEL_DEC_STATES_LOG2) as i8;
-    min_q25
+    result
 }
 
 /// Delayed-decision quantiser for the NLSF residual (libopus
@@ -989,6 +1047,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The tables of a case, one rate table per coefficient.
+    struct Tables {
+        levels: [i32; NLSF_QUANT_LEVELS],
+        rate_cost: [[i32; NLSF_QUANT_LEVELS]; MAX_LPC_ORDER],
+        rate_row: [u8; MAX_LPC_ORDER],
+    }
+
+    fn tables(case: &Case) -> Tables {
+        let mut rate_cost = [[0i32; NLSF_QUANT_LEVELS]; MAX_LPC_ORDER];
+        for i in 0..case.order {
+            let start = case.ec_ix[i] as usize;
+            let table = case.ec_rates_q5[start..start + NLSF_EC_TABLE_LEN]
+                .try_into()
+                .unwrap();
+            rate_cost[i] = silk_nlsf_rate_cost(case.mu_q20, table);
+        }
+        Tables {
+            levels: silk_nlsf_quant_levels(case.quant_step_size_q16),
+            rate_cost,
+            rate_row: core::array::from_fn(|i| i as u8),
+        }
+    }
+
+    fn input<'a>(case: &'a Case, tables: &'a Tables) -> NlsfQuantInput<'a> {
+        NlsfQuantInput {
+            x_q10: &case.x_q10,
+            w_q5: &case.w_q5,
+            pred_coef_q8: &case.pred_coef_q8,
+            rate_cost: &tables.rate_cost,
+            rate_row: &tables.rate_row,
+            levels: &tables.levels,
+            inv_quant_step_size_q6: case.inv_quant_step_size_q6,
+            order: case.order,
+        }
+    }
+
+    /// Searches that run side by side must each give the result of the
+    /// reference version for their own input, whatever the other searches
+    /// of the group do. Every order; every group size the encoder uses; and
+    /// groups in which some searches overflow and are handed over while the
+    /// others are not.
+    #[test]
+    fn groups_match_single_searches() {
+        const MARK: i8 = 0x55;
+        let mut rng = XorShift(0x1357_9BDF_0246_8ACE);
+        let mut expected_hand_overs = 0;
+        for round in 0..6000usize {
+            let wideband = round % 2 == 0;
+            let order = round % (MAX_LPC_ORDER + 1);
+            let cases: [Case; 4] = core::array::from_fn(|l| {
+                let mut case = encoder_case(&mut rng, wideband, order);
+                if round % 3 == 0 && (round / 3 + l) % 4 < 2 {
+                    // Sums that overflow.
+                    case.x_q10 = core::array::from_fn(|_| {
+                        rng.range(i16::MIN as i32, i16::MAX as i32) as i16
+                    });
+                    case.w_q5 = core::array::from_fn(|_| rng.range(20_000, 32_767) as i16);
+                    case.mu_q20 = rng.range(1 << 18, 1 << 20);
+                }
+                case
+            });
+            let tables: [Tables; 4] = core::array::from_fn(|l| tables(&cases[l]));
+
+            let mut expected = [[MARK; MAX_LPC_ORDER]; 4];
+            let mut expected_rd = [0i32; 4];
+            for l in 0..4 {
+                expected_rd[l] = silk_nlsf_del_dec_quant_reference(
+                    &mut expected[l],
+                    &input(&cases[l], &tables[l]),
+                );
+            }
+
+            let before = handed_over();
+            let mut got = [[MARK; MAX_LPC_ORDER]; 4];
+            let rd = silk_nlsf_del_dec_quant_group(
+                &mut got,
+                &core::array::from_fn::<_, 4, _>(|l| input(&cases[l], &tables[l])),
+            );
+            assert_eq!((rd, got), (expected_rd, expected), "4 side by side, order {order}");
+            expected_hand_overs += handed_over() - before;
+
+            // 2 side by side, starting at every position, and 1.
+            for from in 0..3 {
+                let mut got = [[MARK; MAX_LPC_ORDER]; 2];
+                let rd = silk_nlsf_del_dec_quant_group(
+                    &mut got,
+                    &core::array::from_fn::<_, 2, _>(|l| {
+                        input(&cases[from + l], &tables[from + l])
+                    }),
+                );
+                assert_eq!(
+                    (&rd[..], &got[..]),
+                    (&expected_rd[from..from + 2], &expected[from..from + 2]),
+                    "2 side by side from {from}, order {order}"
+                );
+            }
+            for l in 0..4 {
+                let mut got = [[MARK; MAX_LPC_ORDER]; 1];
+                let rd = silk_nlsf_del_dec_quant_group(&mut got, &[input(&cases[l], &tables[l])]);
+                assert_eq!((rd[0], got[0]), (expected_rd[l], expected[l]), "1, order {order}");
+            }
+            let none: [i32; 0] = silk_nlsf_del_dec_quant_group(&mut [], &[]);
+            assert_eq!(none, []);
+        }
+        // Both kinds of search occurred in the groups of 4: handed over and
+        // not handed over.
+        assert!(expected_hand_overs > 1000, "{expected_hand_overs} hand-overs");
+        assert!(expected_hand_overs < 4 * 6000 / 2, "{expected_hand_overs} hand-overs");
     }
 
     /// Equal rate-distortion values: the choice then depends only on the

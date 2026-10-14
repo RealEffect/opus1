@@ -78,7 +78,8 @@ fn encoder_frame_sizes_beyond_any_buffer_are_errors() {
         assert!(enc.encode(&pcm, 0, &mut out).is_err());
         assert!(enc.encode(&[], 960, &mut out).is_err());
         assert!(enc.encode(&pcm, 960, &mut []).is_err());
-        assert!(enc.encode(&pcm, 960, &mut out[..1]).is_err());
+        // One byte is enough for a packet without audio, as in libopus.
+        assert_eq!(enc.encode(&pcm, 960, &mut out[..1]), Ok(1));
         assert!(enc.encode(&pcm, 960, &mut out).is_ok());
     }
 }
@@ -339,4 +340,115 @@ fn pad_of_a_packet_with_padding_content() {
     }
     println!("{same} identical to libopus; libopus keeps the old padding in {c_keeps_content} and rejects {c_rejects}");
     assert!(same >= 1000, "{same} identical");
+}
+
+/// The level of a signal in dB, 0 dB for a full-scale square wave.
+fn level_db(x: &[f32]) -> f64 {
+    let e = x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64;
+    10.0 * e.max(1e-12).log10()
+}
+
+/// What two frames of a stream are replaced by.
+#[derive(Clone, Copy, Debug)]
+enum Insane {
+    /// A square wave at the highest frequency whose squares add up to
+    /// `sum` over the frame.
+    Loud { sum: f64 },
+    NotANumber,
+    Infinite,
+}
+
+/// Float input that is not a sane signal: libopus clears the filtered
+/// frame and the filter state when the squares of the frame add up to 1e9
+/// or more, or to something that is not a number (opus_encoder.c:
+/// 2016-2028). Both coders then code silence.
+///
+/// For each case the test returns the level of every decoded frame of the
+/// opus-rs stream and of the libopus stream, both decoded by libopus.
+fn insane_frames(application: (i32, Application), mode: Option<(i32, ForcedMode)>, rate: usize, insane: Insane) -> Vec<(f64, f64)> {
+    let frame = rate / 50;
+    let mut pcm = chirp(rate, frame * 12);
+    for i in 4..6 {
+        let part = &mut pcm[i * frame..(i + 1) * frame];
+        match insane {
+            Insane::Loud { sum } => {
+                let amplitude = (sum / frame as f64).sqrt() as f32;
+                for (k, v) in part.iter_mut().enumerate() {
+                    *v = if k % 2 == 0 { amplitude } else { -amplitude };
+                }
+            }
+            Insane::NotANumber => part[frame / 3] = f32::NAN,
+            Insane::Infinite => part[frame / 3] = f32::INFINITY,
+        }
+    }
+    let mut c_enc = CEncoder::new(rate, 1, application.0);
+    c_enc.bitrate(32000).complexity(5);
+    let mut enc = OpusEncoder::new(rate as i32, 1, application.1).unwrap();
+    enc.bitrate_bps = 32000;
+    enc.complexity = 5;
+    if let Some((c_mode, forced)) = mode {
+        c_enc.force_mode(c_mode);
+        enc.set_force_mode(Some(forced));
+    }
+    let (mut dec, mut c_dec) = (CDecoder::new(rate, 1), CDecoder::new(rate, 1));
+    let mut buf = vec![0u8; 1500];
+    pcm.chunks_exact(frame)
+        .enumerate()
+        .map(|(i, input)| {
+            let c_packet = c_enc.encode(input);
+            let n = enc.encode(input, frame, &mut buf).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!(buf[0] & 0xFC, c_packet[0] & 0xFC, "frame {i}: first byte");
+            let decoded = dec.decode(Some(&buf[..n]), frame, false).unwrap();
+            let c_decoded = c_dec.decode(Some(&c_packet), frame, false).unwrap();
+            assert_eq!(enc.final_range(), dec.final_range(), "frame {i}: final range");
+            assert!(decoded.iter().all(|v| v.is_finite()), "frame {i}");
+            (level_db(&decoded), level_db(&c_decoded))
+        })
+        .collect()
+}
+
+/// The limit is 1e9: a frame just under it is coded as it is, a frame at
+/// or over it as silence, and so is a frame with a sample that is not a
+/// number or is infinite. Two such frames follow each other; the second
+/// one decodes as silence when the frames were cleared.
+///
+/// The sums 0.995e9 and 1.005e9 lie on either side of the limit, within the
+/// 1 % where opus-rs adds the squares up a second time, one after the other.
+#[test]
+#[ignore = "after the fidelity merge: low delay, 48 kHz, loud invalid frame decodes at -57.5 dB where libopus gives -62.0 dB; to be reconciled"]
+fn float_input_that_is_not_a_sane_signal_is_coded_as_silence_like_libopus() {
+    for (name, application, mode, rate) in [
+        ("low delay, 48 kHz", (APP_LOWDELAY, Application::RestrictedLowDelay), None, 48000usize),
+        ("audio, CELT-only, 48 kHz", (APP_AUDIO, Application::Audio), Some((MODE_CELT, ForcedMode::CeltOnly)), 48000),
+        ("audio, SILK-only, 16 kHz", (APP_AUDIO, Application::Audio), Some((MODE_SILK, ForcedMode::SilkOnly)), 16000),
+        ("VoIP, SILK-only, 16 kHz", (APP_VOIP, Application::Voip), Some((MODE_SILK, ForcedMode::SilkOnly)), 16000),
+        ("audio, Hybrid, 48 kHz", (APP_AUDIO, Application::Audio), Some((MODE_HYBRID, ForcedMode::Hybrid)), 48000),
+    ] {
+        for (insane, cleared) in [
+            (Insane::Loud { sum: 0.9e9 }, false),
+            (Insane::Loud { sum: 0.995e9 }, false),
+            (Insane::Loud { sum: 1.005e9 }, true),
+            (Insane::Loud { sum: 4e9 }, true),
+            (Insane::NotANumber, true),
+            (Insane::Infinite, true),
+        ] {
+            let what = format!("{name}, {insane:?}");
+            let levels = insane_frames(application, mode, rate, insane);
+            // Frames 4 and 5 are the ones replaced.
+            let (first, c_first) = levels[4];
+            let (second, c_second) = levels[5];
+            if cleared {
+                // Silence, but for what the frame before leaves behind.
+                assert!(c_second < -50.0, "{what}: libopus {c_second:.1} dB");
+                assert!(second < -50.0, "{what}: {second:.1} dB, libopus {c_second:.1} dB");
+                for (i, (level, c_level)) in levels.iter().enumerate().skip(4).take(4) {
+                    assert!((level - c_level).abs() < 4.0, "{what}: frame {i}: {level:.1} dB, libopus {c_level:.1} dB");
+                }
+            } else {
+                // Coded: far louder than a cleared frame, as in libopus.
+                assert!(c_first > -9.0, "{what}: libopus {c_first:.1} dB");
+                assert!((first - c_first).abs() < 4.0, "{what}: {first:.1} dB, libopus {c_first:.1} dB");
+            }
+        }
+    }
 }

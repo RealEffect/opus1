@@ -36,11 +36,13 @@
 //!   multistream packet brings it down to the TOC byte. For frames up to
 //!   20 ms the packet has the size of the one libopus writes, down to the
 //!   smallest buffer of `2 * streams - 1` bytes. The TOC byte of a stream
-//!   without audio can name another mode or bandwidth than in libopus:
-//!   libopus repeats those of the stream's last coded frame, and
-//!   [`OpusEncoder`] writes what it chose for this frame. A decoder conceals
-//!   the frame either way. The design document raised the smallest buffer
-//!   to `2 * streams` bytes instead; that is not needed.
+//!   without audio is the one libopus writes: it names the mode and the
+//!   bandwidth of the last frame the stream coded, or Hybrid fullband when
+//!   it has coded none. One case differs: outside surround mode libopus
+//!   codes a stereo stream as mono at low bitrates, and the TOC byte then
+//!   says mono, where [`OpusEncoder`] always says stereo. The design
+//!   document raised the smallest buffer to `2 * streams` bytes instead;
+//!   that is not needed.
 //!   For 40 and 60 ms frames a stream that is not SILK-only needs a few
 //!   bytes more in [`OpusEncoder`] than in libopus. When it is left fewer,
 //!   this encoder returns "Output buffer too small" where libopus writes a
@@ -507,8 +509,11 @@ impl MultistreamEncoder {
         }
 
         // Surround masking: how far each band of each channel lies above
-        // what the other channels mask. Until the analysis is ported it
-        // reports that it has no mask.
+        // what the other channels mask (C 910-913). libopus runs the
+        // analysis for the surround mapping type only, and only such an
+        // encoder has one here. The analysis reads every input channel once
+        // through `src`. It gives a mask for every frame size and sampling
+        // rate this function is reached with, so `have_mask` is then true.
         let have_mask = match self.surround.as_mut() {
             Some(analysis) => analysis.run(src, frame_size, &mut self.band_smr),
             None => false,
@@ -626,11 +631,7 @@ impl MultistreamEncoder {
                     stream_channels,
                 );
             }
-            // D2: `OpusEncoder::encode` needs a buffer of 2 bytes. A stream
-            // that is left a single byte writes a packet without audio into
-            // 2 bytes, and `packet::write` below reduces it to its TOC byte
-            // where that is possible.
-            let enc_max = curr_max.max(2);
+            let enc_max = curr_max;
             let len = enc.encode(
                 &self.buf[..frame_size * stream_channels],
                 frame_size,
@@ -977,6 +978,52 @@ mod tests {
         assert_eq!(mask[0], 200.0);
         assert_eq!(mask[MASK_BANDS - 1], 220.0);
         assert!(dst[MASK_BANDS..].iter().all(|&v| v == -1.0));
+    }
+
+    #[test]
+    fn no_mask_is_set_when_the_analysis_gives_none() {
+        let mut enc = MultistreamEncoder::new_surround(48000, 6, 1, Application::Audio).unwrap();
+        let pcm: Vec<f32> = (0..960 * 6)
+            .map(|k| ((k * 7 % 97) as f32 - 48.0) / 200.0)
+            .collect();
+        let mut out = vec![0u8; 6000];
+        enc.encode(&pcm, 960, &mut out).unwrap();
+        for stream in &enc.encoders {
+            let mask = stream.energy_mask().expect("a surround stream has a mask");
+            assert_eq!(mask.len(), MASK_BANDS * stream.channels());
+        }
+        // No frame size or sampling rate that `encode` accepts leaves the
+        // analysis without a mask. To reach that branch, the encoder gets an
+        // analysis for a channel count libopus has no surround layout for.
+        // It gives no mask, and every stream must then lose the mask of
+        // the frame before.
+        enc.surround = Some(SurroundAnalysis::new(2, 48000));
+        enc.encode(&pcm, 960, &mut out).unwrap();
+        for stream in &enc.encoders {
+            assert_eq!(stream.energy_mask(), None);
+        }
+    }
+
+    #[test]
+    fn only_a_surround_layout_has_an_analysis() {
+        // libopus runs the analysis for the surround mapping type only
+        // (opus_multistream_encoder.c:910): 3 to 8 channels of family 1.
+        for channels in 1..=8 {
+            let enc =
+                MultistreamEncoder::new_surround(48000, channels, 1, Application::Audio).unwrap();
+            assert_eq!(enc.surround.is_some(), channels > 2, "{channels} channels");
+            assert_eq!(enc.band_smr.len(), if channels > 2 { MASK_BANDS * channels } else { 0 });
+        }
+        for (channels, family) in [(3, 255), (6, 255), (4, 2), (6, 2), (9, 2)] {
+            let enc = MultistreamEncoder::new_surround(48000, channels, family, Application::Audio)
+                .unwrap();
+            assert!(enc.surround.is_none(), "family {family}, {channels} channels");
+        }
+        let enc =
+            MultistreamEncoder::new(48000, 6, 4, 2, &[0, 4, 1, 2, 3, 5], Application::Audio)
+                .unwrap();
+        assert!(enc.surround.is_none(), "the generic constructor");
+        assert_eq!(enc.lfe_stream(), None);
     }
 
     #[test]

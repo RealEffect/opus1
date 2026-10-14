@@ -1,8 +1,9 @@
-//! Encoder behaviour that still differs from libopus and that the LFE tests
-//! ran into. Every test here states what libopus does, fails on the current
-//! code, and is ignored with the reason. The cause is outside
-//! `CeltEncoder`. Run them with
-//! `cargo test --release --test celtenc_known_gaps -- --ignored --nocapture`
+//! Encoder behaviour that differed from libopus and that the LFE tests ran
+//! into. Every test here states what libopus does. All three failed, and
+//! were ignored, until the pulse search in src/pvq.rs became a port of
+//! `op_pvq_search_c` for 2 to 4 pulses and for bands of two values. They
+//! pass now and stay as guards. Run them with
+//! `cargo test --release --test celtenc_known_gaps -- --nocapture`
 //! to see the measured numbers.
 
 mod celtenc_common;
@@ -82,23 +83,21 @@ fn match_quality(x: &[f32], y: &[i32]) -> f64 {
 }
 
 /// With 2, 3 or 4 pulses in a band of up to 16 coefficients, `pvq_search`
-/// finds worse pulse vectors than libopus on aarch64.
+/// finds pulse vectors that match the input as well as libopus's.
 ///
-/// Measured for 8 coefficients, where every second vector has one strong
-/// coefficient: the result is worse in 32 to 42 % of the vectors. Averaged
-/// over all vectors the match with the input drops by 0.03 to 0.045 (1 is
-/// a perfect match). With 5 and more pulses the two searches agree except
-/// for near ties.
+/// Measured now: worse than libopus in 0 of 2000 vectors for every band
+/// size and pulse count below.
 ///
-/// Cause: `pvq_search_neon` in src/pvq.rs, branch `k <= 4`. It picks the
-/// position with the largest `Rxy / Ryy`. libopus picks the largest
-/// `Rxy * Rxy / Ryy`. Squaring `best_num` and `rxy` in that loop makes the
-/// two searches agree; `pvq_search_small_k` in the same file already does.
+/// What this guards against: on aarch64 `pvq_search_neon` in src/pvq.rs,
+/// branch `k <= 4`, used to pick the position with the largest `Rxy / Ryy`.
+/// libopus picks the largest `Rxy * Rxy / Ryy`. For 8 coefficients, where
+/// every second vector has one strong coefficient, the result was worse in
+/// 32 to 42 % of the vectors, and the match with the input dropped by 0.03
+/// to 0.045 on average (1 is a perfect match).
 ///
 /// Bands with 2 to 4 pulses are the common case at low and medium
-/// bitrates, so this costs every CELT stream quality, not only LFE.
+/// bitrates, so this cost every CELT stream quality, not only LFE.
 #[test]
-#[ignore = "src/pvq.rs pvq_search_neon, k <= 4: compares Rxy/Ryy where libopus compares Rxy*Rxy/Ryy"]
 fn pulse_search_with_few_pulses_matches_libopus() {
     use opus_rs::pvq::pvq_search;
     let mut noise = Noise(5);
@@ -139,14 +138,14 @@ fn pulse_search_with_few_pulses_matches_libopus() {
     );
 }
 
-/// LFE packets of 11 to 13 bytes decode 1.5 to 2.8 dB below libopus's.
+/// LFE packets of 11 to 13 bytes decode within 1 dB of libopus's.
 ///
 /// At these sizes band 0 gets 2 to 4 pulses, which is where the pulse
-/// search above is off. At the other sizes from 8 to 41 bytes the SNR is
-/// within 0.4 dB of libopus (tests/celtenc_lfe.rs). With the two squares
-/// added in `pvq_search_neon` the gap at 11 to 13 bytes closes to 0.2 dB.
+/// search above was off: the packets decoded 1.5 to 2.8 dB below
+/// libopus's. Measured now: 6.44, 8.18 and 10.58 dB against 6.36, 8.32 and
+/// 10.58 dB for libopus. At the other sizes from 8 to 41 bytes the SNR was
+/// already within 0.4 dB of libopus (tests/celtenc_lfe.rs).
 #[test]
-#[ignore = "consequence of the pulse search with 2 to 4 pulses (src/pvq.rs pvq_search_neon)"]
 fn lfe_quality_matches_libopus_in_packets_of_11_to_13_bytes() {
     let pcm = lfe_signal(100);
     let mut largest_gap = 0f64;
@@ -167,23 +166,20 @@ fn lfe_quality_matches_libopus_in_packets_of_11_to_13_bytes() {
     );
 }
 
-/// On a steady tone the LFE packets of opus-rs are not the ones libopus
-/// writes, although both encoders make the same decisions for the frame.
+/// On a steady tone the LFE packets of opus-rs are the ones libopus writes.
 ///
 /// Measured on a 50 Hz tone in 40-byte packets: the frame headers (energy,
-/// post-filter, allocation) are the same in 99 of 100 frames, but only 5
-/// of 100 packets are identical. The pulse vectors differ.
+/// post-filter, allocation) are the same in 99 of 100 frames, and 95 of
+/// 100 packets are identical.
 ///
-/// Cause: `pvq_search_n2` in src/pvq.rs, which `pvq_search` uses for a band
+/// What this guards against: `pvq_search` used `pvq_search_n2` for a band
 /// or half band of 2 coefficients. It rounds the projection of the input
 /// onto the pyramid. libopus (`op_pvq_search_c`) rounds that projection
 /// down and places the remaining pulses one by one. The vectors of
-/// `pvq_search_n2` match the input as well or better, so this is not a loss
-/// of quality on average, but the stream is not libopus's. With
-/// `pvq_search_scalar` in its place, tried in a scratch copy, 95 of 100
-/// packets are identical.
+/// `pvq_search_n2` match the input as well or better, so this was not a
+/// loss of quality on average, but the stream was not libopus's: only 5 of
+/// 100 packets were identical.
 #[test]
-#[ignore = "src/pvq.rs pvq_search_n2: rounds a projection where libopus searches pulse by pulse"]
 fn lfe_tone_packets_are_the_ones_libopus_writes() {
     let pcm: Vec<f32> = (0..100 * FRAME)
         .map(|i| (0.4 * (std::f64::consts::TAU * 50.0 * i as f64 / FS as f64).sin()) as f32)

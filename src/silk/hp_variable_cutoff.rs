@@ -5,6 +5,9 @@ use crate::silk::macros::*;
 use crate::silk::structs::SilkEncoderStateCommon;
 use crate::silk::tuning_parameters::*;
 
+/// Port of `silk_HP_variable_cutoff` (silk/HP_variable_cutoff.c): moves the
+/// smoothed cutoff of the input high-pass filter towards the low end of the
+/// pitch frequency, after a voiced frame.
 pub fn silk_hp_variable_cutoff(ps_enc: &mut SilkEncoderStateCommon) {
     if ps_enc.prev_signal_type == TYPE_VOICED {
         let pitch_freq_hz_q16 =
@@ -41,10 +44,19 @@ pub fn silk_hp_variable_cutoff(ps_enc: &mut SilkEncoderStateCommon) {
     }
 }
 
+/// libopus `SILK_FIX_CONST( c, 16 )` (silk/SigProc_FIX.h): `c` in Q16,
+/// rounded to the nearest integer. The C macro is
+/// `(opus_int32)( c * ( 1 << 16 ) + 0.5 )`.
+///
+/// Without the 0.5 the smoothing coefficient `VARIABLE_HP_SMTH_COEF1` (0.1)
+/// came out as 6553; libopus has 6554. The cutoff then drifted away from the
+/// one libopus computes, and the input filter changed its cutoff by 1 Hz in
+/// other frames than in libopus.
 fn fix_const_q16(x: impl Into<f64>) -> i32 {
-    (x.into() * 65536.0) as i32
+    (x.into() * 65536.0 + 0.5) as i32
 }
 
+/// libopus `SILK_FIX_CONST( c, 7 )`, see `fix_const_q16`.
 fn fix_const_q7(x: impl Into<f64>) -> i32 {
-    (x.into() * 128.0) as i32
+    (x.into() * 128.0 + 0.5) as i32
 }

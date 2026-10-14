@@ -1,5 +1,3 @@
-use core::f32::consts::PI;
-
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
@@ -30,11 +28,50 @@ impl KissCpx {
     }
 }
 
+/// How the portable code computes `a * b + c`.
+///
+/// libopus writes such an expression in C. A compiler may round the product
+/// and then add (two operations), or compute product and sum with one
+/// rounding (fused multiply-add). The two give different last bits, so the
+/// portable code exists in both forms.
+///
+/// The expressions in this file and in `mdct.rs` are written the way clang
+/// reads the C source with its default setting `-ffp-contract=on`: a product
+/// is fused with a sum only when both are in one C expression, and of two
+/// products it is the one on the left; the other one is rounded first.
+/// `a * b - c * d` is therefore `mul_add(a, b, -(c * d))`.
+pub(crate) trait Arith {
+    fn mul_add(a: f32, b: f32, c: f32) -> f32;
+}
+
+/// The product is rounded, then the sum. A build of libopus without fused
+/// multiply-add computes this, for example one for x86-64.
+pub(crate) struct Separate;
+
+/// Product and sum are rounded once. clang builds libopus for arm64 this
+/// way.
+pub(crate) struct Fused;
+
+impl Arith for Separate {
+    #[inline(always)]
+    fn mul_add(a: f32, b: f32, c: f32) -> f32 {
+        a * b + c
+    }
+}
+
+impl Arith for Fused {
+    #[inline(always)]
+    fn mul_add(a: f32, b: f32, c: f32) -> f32 {
+        a.mul_add(b, c)
+    }
+}
+
+/// `a * b` as libopus writes it (`C_MUL`, celt/_kiss_fft_guts.h:112-114).
 #[inline(always)]
-fn c_mul(a: &KissCpx, b: &KissCpx) -> KissCpx {
+fn c_mul<A: Arith>(a: &KissCpx, b: &KissCpx) -> KissCpx {
     KissCpx {
-        r: a.r * b.r - a.i * b.i,
-        i: a.r * b.i + a.i * b.r,
+        r: A::mul_add(a.r, b.r, -(a.i * b.i)),
+        i: A::mul_add(a.r, b.i, a.i * b.r),
     }
 }
 
@@ -90,14 +127,17 @@ pub struct KissFftState {
     /// The butterfly passes in the order `opus_fft_impl` runs them.
     stages: [FftStage; MAXFACTORS],
     nstages: usize,
+    /// Where each input sample goes before the first stage: sample `i` is
+    /// stored at place `bitrev[i]`. A plan that `new` or `new_sub` returned
+    /// holds a permutation of `0..nfft` here.
     pub bitrev: FixedVec<i16, KISS_MAX_N>,
     /// Twiddle factors, one contiguous table per stage.
     ///
     /// A stage of radix `p` with `m` butterflies per group stores, for each
-    /// `k` in `1..p`, first the `m` real parts and then the `m` imaginary
-    /// parts of `w^(k * j)`, `j = 0..m`. `w` is the root of unity of that
-    /// stage. The values are copies of the entries the butterflies used to
-    /// read with a stride from the table of the largest FFT size.
+    /// `k` in `1..p`, the `m` values `w^(k * j)`, `j = 0..m`. `w` is the
+    /// root of unity of that stage. The values are copies of the entries the
+    /// butterflies used to read with a stride from the table of the largest
+    /// FFT size. `StreamTw` describes how the `m` values are laid out.
     stage_tw: FixedVec<f32, STAGE_TW_MAX>,
 }
 
@@ -188,12 +228,50 @@ fn compute_bitrev_table(
     }
 }
 
+/// True when `table` holds every number of `0..table.len()` exactly once.
+fn is_permutation(table: &[i16]) -> bool {
+    let n = table.len();
+    if n > KISS_MAX_N {
+        return false;
+    }
+    // One bit per number.
+    let mut seen = [0u64; KISS_MAX_N.div_ceil(64)];
+    for &v in table {
+        // A negative entry becomes a number above `n` here.
+        let v = v as usize;
+        if v >= n {
+            return false;
+        }
+        let bit = 1u64 << (v % 64);
+        if seen[v / 64] & bit != 0 {
+            return false;
+        }
+        seen[v / 64] |= bit;
+    }
+    true
+}
+
+/// The twiddle table of an FFT of `nfft` points: entry `i` is
+/// `exp(-2 * pi * i / nfft)`.
+///
+/// For 480 points it is the table libopus has for its 48 kHz mode. For any
+/// other size it is computed like libopus computes the table of a custom
+/// mode (`compute_twiddles`, celt/kiss_fft.c:427-431): phase, cosine and sine
+/// in double precision, then rounded to `f32`.
 fn compute_twiddles(nfft: usize) -> FixedVec<KissCpx, KISS_MAX_N> {
-    let two_pi_over_n = -2.0 * PI / nfft as f32;
     let mut out: FixedVec<KissCpx, KISS_MAX_N> = FixedVec::new();
+    if nfft == KISS_MAX_N {
+        for &t in FFT_TWIDDLES_480.iter() {
+            out.push(t);
+        }
+        return out;
+    }
+    // The constant of libopus, 3.14159265358979323846264338327, is this
+    // number in double precision.
+    const PI: f64 = core::f64::consts::PI;
     for i in 0..nfft {
-        let phase = two_pi_over_n * i as f32;
-        out.push(KissCpx::new(phase.cos(), phase.sin()));
+        let phase = (-2.0 * PI / nfft as f64) * i as f64;
+        out.push(KissCpx::new(phase.cos() as f32, phase.sin() as f32));
     }
     out
 }
@@ -237,6 +315,12 @@ impl KissFftState {
 
         let mut bitrev = FixedVec::from_value(0i16, nfft);
         compute_bitrev_table(0, &mut bitrev, 1, 1, &factors);
+        // The MDCT stores value `i` at place `bitrev[i]` of a buffer that it
+        // does not initialise first. Every place must get a value, so a plan
+        // exists only when the table is a permutation of `0..nfft`.
+        if !is_permutation(&bitrev) {
+            return None;
+        }
 
         // `fstride[i]` is the product of the radices before factor `i`. It is
         // the number of groups of that stage, and the step through `twiddles`.
@@ -279,11 +363,20 @@ impl KissFftState {
             }
             let step = groups << shift;
             for k in 1..p {
+                // The layout that `StreamTw` reads.
+                #[cfg(target_arch = "aarch64")]
                 for j in 0..m {
                     stage_tw.push(twiddles[k * j * step].r);
-                }
-                for j in 0..m {
                     stage_tw.push(twiddles[k * j * step].i);
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    for j in 0..m {
+                        stage_tw.push(twiddles[k * j * step].r);
+                    }
+                    for j in 0..m {
+                        stage_tw.push(twiddles[k * j * step].i);
+                    }
                 }
             }
         }
@@ -312,19 +405,75 @@ impl KissFftState {
 // ---------------------------------------------------------------------------
 // Portable butterflies.
 //
-// They run on every target without a vector version. The vector versions are
-// tested against them and must give the same bits. The order of the
-// operations is the one of libopus (kiss_fft.c, float build); no product is
-// fused with a sum.
+// They are the loops of libopus (kiss_fft.c, float build). `A` says whether a
+// product is fused with the sum it is written next to:
+// - `Separate` is the code of every target without a vector version.
+// - `Fused` is what the vector versions for aarch64 compute. They are tested
+//   against it and must give the same bits.
 // ---------------------------------------------------------------------------
 
+// libopus reads these constants from its twiddle table (kiss_fft.c:201,
+// 261-262): the imaginary part of `exp(-2 * pi * i / 3)`, then
+// `exp(-2 * pi * i / 5)` and `exp(-4 * pi * i / 5)`. They are entries 160, 96
+// and 192 of `FFT_TWIDDLES_480`; a unit test compares them.
 const EPI3_I: f32 = -0.866_025_4;
 const YA_R: f32 = 0.309_017;
 const YA_I: f32 = -0.95105652;
 const YB_R: f32 = -0.809_017;
 const YB_I: f32 = -0.58778525;
 
+/// The twiddles of one input stream of a stage: `m` complex values.
+///
+/// The stage table stores them in the layout that the kernels of the target
+/// read fastest: pairs of real and imaginary part on aarch64, the `m` real
+/// parts followed by the `m` imaginary parts elsewhere.
+#[derive(Clone, Copy)]
+struct StreamTw<'a> {
+    #[cfg(target_arch = "aarch64")]
+    pairs: &'a [[f32; 2]],
+    #[cfg(not(target_arch = "aarch64"))]
+    re: &'a [f32],
+    #[cfg(not(target_arch = "aarch64"))]
+    im: &'a [f32],
+}
+
+impl<'a> StreamTw<'a> {
+    /// Stream `k` of a stage table with `m` butterflies per group. `k` is 0
+    /// for the first stream that has twiddles.
+    #[inline(always)]
+    fn new(tw: &'a [f32], m: usize, k: usize) -> Self {
+        let stream = &tw[2 * k * m..][..2 * m];
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self {
+                pairs: stream.as_chunks::<2>().0,
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let (re, im) = stream.split_at(m);
+            Self { re, im }
+        }
+    }
+
+    /// Twiddle `j`, with `j < m`.
+    #[inline(always)]
+    fn get(&self, j: usize) -> KissCpx {
+        #[cfg(target_arch = "aarch64")]
+        {
+            KissCpx::new(self.pairs[j][0], self.pairs[j][1])
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            KissCpx::new(self.re[j], self.im[j])
+        }
+    }
+}
+
 /// One radix-2 group with `m == 4`: eight samples, fixed twiddles.
+///
+/// No product stands next to a sum in the C source (kiss_fft.c:86-102), so
+/// nothing is fused in any build.
 #[inline(always)]
 fn bfly2_m4_group(g: &mut [KissCpx; 8]) {
     let tw: f32 = core::f32::consts::FRAC_1_SQRT_2;
@@ -360,17 +509,27 @@ fn bfly4_m1_group(g: &mut [KissCpx; 4]) {
     g[3] = KissCpx::new(scratch0.r - diff13.i, scratch0.i + diff13.r);
 }
 
-/// One radix-3 butterfly. `w1` and `w2` are the twiddles of `f1` and `f2`.
+/// One radix-3 butterfly (kiss_fft.c:211-230). `w1` and `w2` are the
+/// twiddles of `f1` and `f2`.
 #[inline(always)]
-fn bfly3_one(f0: &mut KissCpx, f1: &mut KissCpx, f2: &mut KissCpx, w1: KissCpx, w2: KissCpx) {
-    let scratch1 = c_mul(f1, &w1);
-    let scratch2 = c_mul(f2, &w2);
+fn bfly3_one<A: Arith>(
+    f0: &mut KissCpx,
+    f1: &mut KissCpx,
+    f2: &mut KissCpx,
+    w1: KissCpx,
+    w2: KissCpx,
+) {
+    let scratch1 = c_mul::<A>(f1, &w1);
+    let scratch2 = c_mul::<A>(f2, &w2);
 
     let scratch3 = c_add(&scratch1, &scratch2);
     let scratch0 = c_sub(&scratch1, &scratch2);
 
-    let half_scratch3 = KissCpx::new(scratch3.r * 0.5, scratch3.i * 0.5);
-    let fout_m = KissCpx::new(f0.r - half_scratch3.r, f0.i - half_scratch3.i);
+    // Fout[m] = Fout - HALF_OF(scratch[3]): the half is a product.
+    let fout_m = KissCpx::new(
+        A::mul_add(-scratch3.r, 0.5, f0.r),
+        A::mul_add(-scratch3.i, 0.5, f0.i),
+    );
     let scratch0_scaled = KissCpx::new(scratch0.r * EPI3_I, scratch0.i * EPI3_I);
 
     *f0 = c_add(f0, &scratch3);
@@ -378,9 +537,10 @@ fn bfly3_one(f0: &mut KissCpx, f1: &mut KissCpx, f2: &mut KissCpx, w1: KissCpx, 
     *f2 = KissCpx::new(fout_m.r + scratch0_scaled.i, fout_m.i - scratch0_scaled.r);
 }
 
-/// One radix-4 butterfly. `w1`, `w2`, `w3` are the twiddles of `f1`, `f2`, `f3`.
+/// One radix-4 butterfly (kiss_fft.c:153-170). `w1`, `w2`, `w3` are the
+/// twiddles of `f1`, `f2`, `f3`.
 #[inline(always)]
-fn bfly4_one(
+fn bfly4_one<A: Arith>(
     f0: &mut KissCpx,
     f1: &mut KissCpx,
     f2: &mut KissCpx,
@@ -389,9 +549,9 @@ fn bfly4_one(
     w2: KissCpx,
     w3: KissCpx,
 ) {
-    let scratch0 = c_mul(f1, &w1);
-    let scratch1 = c_mul(f2, &w2);
-    let scratch2 = c_mul(f3, &w3);
+    let scratch0 = c_mul::<A>(f1, &w1);
+    let scratch1 = c_mul::<A>(f2, &w2);
+    let scratch2 = c_mul::<A>(f3, &w3);
 
     let scratch5 = c_sub(f0, &scratch1);
     let sum = c_add(f0, &scratch1);
@@ -406,9 +566,10 @@ fn bfly4_one(
     *f3 = KissCpx::new(scratch5.r - scratch4.i, scratch5.i + scratch4.r);
 }
 
-/// One radix-5 butterfly. `w[k - 1]` is the twiddle of `f[k]`.
+/// One radix-5 butterfly (kiss_fft.c:277-307). `w[k - 1]` is the twiddle of
+/// `f[k]`.
 #[inline(always)]
-fn bfly5_one(
+fn bfly5_one<A: Arith>(
     f0: &mut KissCpx,
     f1: &mut KissCpx,
     f2: &mut KissCpx,
@@ -418,42 +579,44 @@ fn bfly5_one(
 ) {
     let scratch0 = *f0;
 
-    let scratch1 = c_mul(f1, &w[0]);
-    let scratch2 = c_mul(f2, &w[1]);
-    let scratch3 = c_mul(f3, &w[2]);
-    let scratch4 = c_mul(f4, &w[3]);
+    let scratch1 = c_mul::<A>(f1, &w[0]);
+    let scratch2 = c_mul::<A>(f2, &w[1]);
+    let scratch3 = c_mul::<A>(f3, &w[2]);
+    let scratch4 = c_mul::<A>(f4, &w[3]);
 
     let scratch7 = c_add(&scratch1, &scratch4);
     let scratch10 = c_sub(&scratch1, &scratch4);
     let scratch8 = c_add(&scratch2, &scratch3);
     let scratch9 = c_sub(&scratch2, &scratch3);
 
+    // libopus adds the two products first and the sample last
+    // (kiss_fft.c:289-293, 301-302). The order decides the rounding.
     *f0 = KissCpx::new(
-        scratch0.r + scratch7.r + scratch8.r,
-        scratch0.i + scratch7.i + scratch8.i,
+        scratch0.r + (scratch7.r + scratch8.r),
+        scratch0.i + (scratch7.i + scratch8.i),
     );
 
     let scratch5 = KissCpx::new(
-        scratch0.r + scratch7.r * YA_R + scratch8.r * YB_R,
-        scratch0.i + scratch7.i * YA_R + scratch8.i * YB_R,
+        scratch0.r + A::mul_add(scratch7.r, YA_R, scratch8.r * YB_R),
+        scratch0.i + A::mul_add(scratch7.i, YA_R, scratch8.i * YB_R),
     );
 
     let scratch6 = KissCpx::new(
-        scratch10.i * YA_I + scratch9.i * YB_I,
-        -(scratch10.r * YA_I + scratch9.r * YB_I),
+        A::mul_add(scratch10.i, YA_I, scratch9.i * YB_I),
+        -A::mul_add(scratch10.r, YA_I, scratch9.r * YB_I),
     );
 
     *f1 = c_sub(&scratch5, &scratch6);
     *f4 = c_add(&scratch5, &scratch6);
 
     let scratch11 = KissCpx::new(
-        scratch0.r + scratch7.r * YB_R + scratch8.r * YA_R,
-        scratch0.i + scratch7.i * YB_R + scratch8.i * YA_R,
+        scratch0.r + A::mul_add(scratch7.r, YB_R, scratch8.r * YA_R),
+        scratch0.i + A::mul_add(scratch7.i, YB_R, scratch8.i * YA_R),
     );
 
     let scratch12 = KissCpx::new(
-        scratch9.i * YA_I - scratch10.i * YB_I,
-        scratch10.r * YB_I - scratch9.r * YA_I,
+        A::mul_add(scratch9.i, YA_I, -(scratch10.i * YB_I)),
+        A::mul_add(scratch10.r, YB_I, -(scratch9.r * YA_I)),
     );
 
     *f2 = c_add(&scratch11, &scratch12);
@@ -486,43 +649,32 @@ fn kf_bfly4_m1_scalar(fout: &mut [KissCpx], groups: usize) {
 
 /// Radix-3 pass. `tw` is the stage table: `2 * 2 * m` values.
 #[inline(always)]
-fn kf_bfly3_scalar(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
+fn kf_bfly3_scalar<A: Arith>(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
     if m == 0 {
         return;
     }
-    let (w1r, tw) = tw.split_at(m);
-    let (w1i, tw) = tw.split_at(m);
-    let (w2r, tw) = tw.split_at(m);
-    let w2i = &tw[..m];
+    let w1 = StreamTw::new(tw, m, 0);
+    let w2 = StreamTw::new(tw, m, 1);
 
     for group in fout.chunks_exact_mut(3 * m).take(groups) {
         let (f0, rest) = group.split_at_mut(m);
         let (f1, f2) = rest.split_at_mut(m);
         let f2 = &mut f2[..m];
         for j in 0..m {
-            bfly3_one(
-                &mut f0[j],
-                &mut f1[j],
-                &mut f2[j],
-                KissCpx::new(w1r[j], w1i[j]),
-                KissCpx::new(w2r[j], w2i[j]),
-            );
+            bfly3_one::<A>(&mut f0[j], &mut f1[j], &mut f2[j], w1.get(j), w2.get(j));
         }
     }
 }
 
 /// Radix-4 pass with `m > 1`. `tw` is the stage table: `2 * 3 * m` values.
 #[inline(always)]
-fn kf_bfly4_scalar(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
+fn kf_bfly4_scalar<A: Arith>(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
     if m == 0 {
         return;
     }
-    let (w1r, tw) = tw.split_at(m);
-    let (w1i, tw) = tw.split_at(m);
-    let (w2r, tw) = tw.split_at(m);
-    let (w2i, tw) = tw.split_at(m);
-    let (w3r, tw) = tw.split_at(m);
-    let w3i = &tw[..m];
+    let w1 = StreamTw::new(tw, m, 0);
+    let w2 = StreamTw::new(tw, m, 1);
+    let w3 = StreamTw::new(tw, m, 2);
 
     for group in fout.chunks_exact_mut(4 * m).take(groups) {
         let (f0, rest) = group.split_at_mut(m);
@@ -530,14 +682,14 @@ fn kf_bfly4_scalar(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
         let (f2, f3) = rest.split_at_mut(m);
         let f3 = &mut f3[..m];
         for j in 0..m {
-            bfly4_one(
+            bfly4_one::<A>(
                 &mut f0[j],
                 &mut f1[j],
                 &mut f2[j],
                 &mut f3[j],
-                KissCpx::new(w1r[j], w1i[j]),
-                KissCpx::new(w2r[j], w2i[j]),
-                KissCpx::new(w3r[j], w3i[j]),
+                w1.get(j),
+                w2.get(j),
+                w3.get(j),
             );
         }
     }
@@ -545,18 +697,14 @@ fn kf_bfly4_scalar(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
 
 /// Radix-5 pass. `tw` is the stage table: `2 * 4 * m` values.
 #[inline(always)]
-fn kf_bfly5_scalar(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
+fn kf_bfly5_scalar<A: Arith>(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
     if m == 0 {
         return;
     }
-    let (w1r, tw) = tw.split_at(m);
-    let (w1i, tw) = tw.split_at(m);
-    let (w2r, tw) = tw.split_at(m);
-    let (w2i, tw) = tw.split_at(m);
-    let (w3r, tw) = tw.split_at(m);
-    let (w3i, tw) = tw.split_at(m);
-    let (w4r, tw) = tw.split_at(m);
-    let w4i = &tw[..m];
+    let w1 = StreamTw::new(tw, m, 0);
+    let w2 = StreamTw::new(tw, m, 1);
+    let w3 = StreamTw::new(tw, m, 2);
+    let w4 = StreamTw::new(tw, m, 3);
 
     for group in fout.chunks_exact_mut(5 * m).take(groups) {
         let (f0, rest) = group.split_at_mut(m);
@@ -565,18 +713,13 @@ fn kf_bfly5_scalar(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
         let (f3, f4) = rest.split_at_mut(m);
         let f4 = &mut f4[..m];
         for j in 0..m {
-            bfly5_one(
+            bfly5_one::<A>(
                 &mut f0[j],
                 &mut f1[j],
                 &mut f2[j],
                 &mut f3[j],
                 &mut f4[j],
-                [
-                    KissCpx::new(w1r[j], w1i[j]),
-                    KissCpx::new(w2r[j], w2i[j]),
-                    KissCpx::new(w3r[j], w3i[j]),
-                    KissCpx::new(w4r[j], w4i[j]),
-                ],
+                [w1.get(j), w2.get(j), w3.get(j), w4.get(j)],
             );
         }
     }
@@ -584,7 +727,7 @@ fn kf_bfly5_scalar(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
 
 /// Runs all stages with the portable butterflies.
 #[inline(always)]
-fn fft_stages_scalar(st: &KissFftState, fout: &mut [KissCpx]) {
+fn fft_stages_scalar<A: Arith>(st: &KissFftState, fout: &mut [KissCpx]) {
     for s in &st.stages[..st.nstages] {
         let m = s.m as usize;
         let groups = s.groups as usize;
@@ -592,9 +735,9 @@ fn fft_stages_scalar(st: &KissFftState, fout: &mut [KissCpx]) {
         match (s.radix, m) {
             (2, _) => kf_bfly2_scalar(fout, m, groups),
             (4, 1) => kf_bfly4_m1_scalar(fout, groups),
-            (4, _) => kf_bfly4_scalar(fout, tw, m, groups),
-            (3, _) => kf_bfly3_scalar(fout, tw, m, groups),
-            (5, _) => kf_bfly5_scalar(fout, tw, m, groups),
+            (4, _) => kf_bfly4_scalar::<A>(fout, tw, m, groups),
+            (3, _) => kf_bfly3_scalar::<A>(fout, tw, m, groups),
+            (5, _) => kf_bfly5_scalar::<A>(fout, tw, m, groups),
             // A one-point transform has a single stage of radix 1. It
             // leaves the sample as it is.
             _ => {}
@@ -606,43 +749,28 @@ fn fft_stages_scalar(st: &KissFftState, fout: &mut [KissCpx]) {
 ///
 /// The code is the portable one; AVX only changes how the compiler encodes
 /// and vectorizes it. The results are the same bits.
+///
+/// # Safety
+/// The processor must support AVX.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 unsafe fn fft_stages_avx(st: &KissFftState, fout: &mut [KissCpx]) {
-    fft_stages_scalar(st, fout);
+    fft_stages_scalar::<Separate>(st, fout);
 }
 
 // ---------------------------------------------------------------------------
-// NEON butterflies (aarch64).
+// NEON butterflies without twiddle tables (aarch64).
 //
-// Each one gives the same bits as its portable version: every lane does the
-// same multiplies, additions and subtractions in the same order, and no
-// product is fused with a sum.
+// These three passes have no product next to a sum, so no build of libopus
+// fuses anything in them. Each one gives the same bits as its portable
+// version: every lane does the same multiplies, additions and subtractions
+// in the same order.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::{
-        EPI3_I, KissCpx, YA_I, YA_R, YB_I, YB_R, bfly3_one, bfly4_one, bfly5_one, c_add, c_sub,
-    };
+    use super::{KissCpx, c_add, c_sub};
     use core::arch::aarch64::*;
-
-    /// Product of four complex numbers `a` with four twiddles `w`.
-    ///
-    /// Real and imaginary parts are in separate vectors. The operations are
-    /// those of `c_mul`, in the same order.
-    #[inline(always)]
-    unsafe fn cmul(
-        ar: float32x4_t,
-        ai: float32x4_t,
-        wr: float32x4_t,
-        wi: float32x4_t,
-    ) -> (float32x4_t, float32x4_t) {
-        (
-            vsubq_f32(vmulq_f32(ar, wr), vmulq_f32(ai, wi)),
-            vaddq_f32(vmulq_f32(ar, wi), vmulq_f32(ai, wr)),
-        )
-    }
 
     /// The first sample of each of two groups: `[a.lo, b.lo]`.
     #[inline(always)]
@@ -812,345 +940,520 @@ mod neon {
             vst1q_f32(p.add(4), vsubq_f32(a, b));
         }
     }
+}
 
-    /// Radix-3 pass. Four butterflies per iteration.
+// ---------------------------------------------------------------------------
+// Butterflies with twiddles (aarch64).
+//
+// They compute what the portable butterflies compute with `Fused`, which is
+// what the arm64 build of libopus computes. A vector holds two complex
+// numbers as (re, im, re, im), the layout of the samples and of the stage
+// tables, so nothing is shuffled between memory and the arithmetic.
+//
+// There are two versions with the same arithmetic and the same bits:
+// - `fcma` uses the complex-number instructions of FEAT_FCMA (ARMv8.3):
+//   `fcmla` for a complex product and `fcadd` for "a plus or minus i times
+//   b". They are written with `core::arch::asm!`, because the intrinsics for
+//   them are not stable.
+// - `fma` uses plain NEON with `fmla`. It runs on processors without
+//   FEAT_FCMA and needs more instructions.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+mod fused {
+    use super::{EPI3_I, KissCpx, KissFftState, YA_I, YA_R, YB_I, YB_R, neon};
+    use core::arch::aarch64::*;
+    use core::arch::asm;
+
+    const SIGN: u32 = 0x8000_0000;
+
+    /// `a * t` for two complex numbers, with `fcmla`.
     ///
-    /// # Safety
-    /// `fout` must hold at least `3 * m * groups` samples and `tw` at least
-    /// `4 * m` values.
-    pub(super) unsafe fn bfly3(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
-        debug_assert!(3 * m * groups <= fout.len());
-        debug_assert!(4 * m <= tw.len());
-        let half = vdupq_n_f32(0.5);
-        let epi3 = vdupq_n_f32(EPI3_I);
-        let w = tw.as_ptr();
-        let base = fout.as_mut_ptr();
-        let m4 = m & !3;
-
-        // SAFETY: group `g` is `3 * m` samples. `p0`, `p1`, `p2` point to its
-        // three streams of `m` samples (`2 * m` floats) each. A vector step
-        // at `j` reads and writes samples `j..j + 4` of each stream and
-        // twiddles `j..j + 4` of each of the four `m`-long tables, and
-        // `j + 4 <= m`. The tail touches sample `j < m` of each stream.
-        for g in 0..groups {
-            let c0 = base.add(3 * m * g);
-            let c1 = c0.add(m);
-            let c2 = c1.add(m);
-            let p0 = c0 as *mut f32;
-            let p1 = c1 as *mut f32;
-            let p2 = c2 as *mut f32;
-
-            let mut j = 0usize;
-            while j < m4 {
-                let a0 = vld2q_f32(p0.add(2 * j));
-                let a1 = vld2q_f32(p1.add(2 * j));
-                let a2 = vld2q_f32(p2.add(2 * j));
-                let (s1r, s1i) = cmul(a1.0, a1.1, vld1q_f32(w.add(j)), vld1q_f32(w.add(m + j)));
-                let (s2r, s2i) = cmul(
-                    a2.0,
-                    a2.1,
-                    vld1q_f32(w.add(2 * m + j)),
-                    vld1q_f32(w.add(3 * m + j)),
-                );
-
-                let s3r = vaddq_f32(s1r, s2r);
-                let s3i = vaddq_f32(s1i, s2i);
-                let s0r = vsubq_f32(s1r, s2r);
-                let s0i = vsubq_f32(s1i, s2i);
-
-                let fmr = vsubq_f32(a0.0, vmulq_f32(s3r, half));
-                let fmi = vsubq_f32(a0.1, vmulq_f32(s3i, half));
-                let s0r = vmulq_f32(s0r, epi3);
-                let s0i = vmulq_f32(s0i, epi3);
-
-                vst2q_f32(
-                    p0.add(2 * j),
-                    float32x4x2_t(vaddq_f32(a0.0, s3r), vaddq_f32(a0.1, s3i)),
-                );
-                vst2q_f32(
-                    p1.add(2 * j),
-                    float32x4x2_t(vsubq_f32(fmr, s0i), vaddq_f32(fmi, s0r)),
-                );
-                vst2q_f32(
-                    p2.add(2 * j),
-                    float32x4x2_t(vaddq_f32(fmr, s0i), vsubq_f32(fmi, s0r)),
-                );
-                j += 4;
-            }
-
-            while j < m {
-                bfly3_one(
-                    &mut *c0.add(j),
-                    &mut *c1.add(j),
-                    &mut *c2.add(j),
-                    KissCpx::new(*w.add(j), *w.add(m + j)),
-                    KissCpx::new(*w.add(2 * m + j), *w.add(3 * m + j)),
-                );
-                j += 1;
-            }
-        }
+    /// `fcmla #90` adds `-(a.im * t.im)` to the real part of the accumulator
+    /// and `a.im * t.re` to its imaginary part. `fcmla #0` adds
+    /// `a.re * t.re` and `a.re * t.im`. Every addition is fused.
+    ///
+    /// The accumulator starts at -0.0. Adding -0.0 changes no value, not even
+    /// the sign of a zero, so the first step leaves the two rounded products
+    /// and the second step fuses the other two onto them. That is `c_mul`
+    /// with `Fused`.
+    ///
+    /// The block does not promise to keep the flags: the instructions set
+    /// the cumulative exception bits of the floating-point status register.
+    macro_rules! cmul_fcma {
+        ($a:expr, $t:expr) => {{
+            let a: float32x4_t = $a;
+            let t: float32x4_t = $t;
+            let mut acc = vdupq_n_f32(-0.0);
+            asm!(
+                "fcmla {acc:v}.4s, {a:v}.4s, {t:v}.4s, #90",
+                "fcmla {acc:v}.4s, {a:v}.4s, {t:v}.4s, #0",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                t = in(vreg) t,
+                options(pure, nomem, nostack),
+            );
+            acc
+        }};
     }
 
-    /// Radix-4 pass with `m > 1`. Four butterflies per iteration.
-    ///
-    /// # Safety
-    /// `fout` must hold at least `4 * m * groups` samples and `tw` at least
-    /// `6 * m` values.
-    pub(super) unsafe fn bfly4(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
-        debug_assert!(4 * m * groups <= fout.len());
-        debug_assert!(6 * m <= tw.len());
-        let w = tw.as_ptr();
-        let base = fout.as_mut_ptr();
-        let m4 = m & !3;
-
-        // SAFETY: group `g` is `4 * m` samples. `p0..p3` point to its four
-        // streams of `m` samples (`2 * m` floats) each. A vector step at `j`
-        // reads and writes samples `j..j + 4` of each stream and twiddles
-        // `j..j + 4` of each of the six `m`-long tables, and `j + 4 <= m`.
-        // The tail touches sample `j < m` of each stream.
-        for g in 0..groups {
-            let c0 = base.add(4 * m * g);
-            let c1 = c0.add(m);
-            let c2 = c1.add(m);
-            let c3 = c2.add(m);
-            let p0 = c0 as *mut f32;
-            let p1 = c1 as *mut f32;
-            let p2 = c2 as *mut f32;
-            let p3 = c3 as *mut f32;
-
-            let mut j = 0usize;
-            while j < m4 {
-                let a0 = vld2q_f32(p0.add(2 * j));
-                let a1 = vld2q_f32(p1.add(2 * j));
-                let a2 = vld2q_f32(p2.add(2 * j));
-                let a3 = vld2q_f32(p3.add(2 * j));
-                let (s0r, s0i) = cmul(a1.0, a1.1, vld1q_f32(w.add(j)), vld1q_f32(w.add(m + j)));
-                let (s1r, s1i) = cmul(
-                    a2.0,
-                    a2.1,
-                    vld1q_f32(w.add(2 * m + j)),
-                    vld1q_f32(w.add(3 * m + j)),
-                );
-                let (s2r, s2i) = cmul(
-                    a3.0,
-                    a3.1,
-                    vld1q_f32(w.add(4 * m + j)),
-                    vld1q_f32(w.add(5 * m + j)),
-                );
-
-                let s5r = vsubq_f32(a0.0, s1r);
-                let s5i = vsubq_f32(a0.1, s1i);
-                let sumr = vaddq_f32(a0.0, s1r);
-                let sumi = vaddq_f32(a0.1, s1i);
-
-                let s3r = vaddq_f32(s0r, s2r);
-                let s3i = vaddq_f32(s0i, s2i);
-                let s4r = vsubq_f32(s0r, s2r);
-                let s4i = vsubq_f32(s0i, s2i);
-
-                vst2q_f32(
-                    p2.add(2 * j),
-                    float32x4x2_t(vsubq_f32(sumr, s3r), vsubq_f32(sumi, s3i)),
-                );
-                vst2q_f32(
-                    p0.add(2 * j),
-                    float32x4x2_t(vaddq_f32(sumr, s3r), vaddq_f32(sumi, s3i)),
-                );
-                vst2q_f32(
-                    p1.add(2 * j),
-                    float32x4x2_t(vaddq_f32(s5r, s4i), vsubq_f32(s5i, s4r)),
-                );
-                vst2q_f32(
-                    p3.add(2 * j),
-                    float32x4x2_t(vsubq_f32(s5r, s4i), vaddq_f32(s5i, s4r)),
-                );
-                j += 4;
-            }
-
-            while j < m {
-                bfly4_one(
-                    &mut *c0.add(j),
-                    &mut *c1.add(j),
-                    &mut *c2.add(j),
-                    &mut *c3.add(j),
-                    KissCpx::new(*w.add(j), *w.add(m + j)),
-                    KissCpx::new(*w.add(2 * m + j), *w.add(3 * m + j)),
-                    KissCpx::new(*w.add(4 * m + j), *w.add(5 * m + j)),
-                );
-                j += 1;
-            }
-        }
+    /// `(a + i * b, a - i * b)` for two complex numbers, with `fcadd`.
+    macro_rules! pm_i_fcma {
+        ($a:expr, $b:expr) => {{
+            let a: float32x4_t = $a;
+            let b: float32x4_t = $b;
+            let plus: float32x4_t;
+            let minus: float32x4_t;
+            asm!(
+                "fcadd {plus:v}.4s, {a:v}.4s, {b:v}.4s, #90",
+                "fcadd {minus:v}.4s, {a:v}.4s, {b:v}.4s, #270",
+                // `plus` is written while `a` and `b` are still needed, so it
+                // must not share a register with them. `minus` is written
+                // last and may.
+                plus = out(vreg) plus,
+                minus = lateout(vreg) minus,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack),
+            );
+            (plus, minus)
+        }};
     }
 
-    /// Radix-5 pass. Four butterflies per iteration.
+    /// `a * t` for two complex numbers, with `fmla`: the same four products
+    /// and the same two roundings as `cmul_fcma`.
+    macro_rules! cmul_fma {
+        ($a:expr, $t:expr) => {{
+            let a: float32x4_t = $a;
+            let t: float32x4_t = $t;
+            let a_re = vtrn1q_f32(a, a);
+            let a_im = vtrn2q_f32(a, a);
+            // i * t = (-t.im, t.re)
+            let i_t = vreinterpretq_f32_u32(veorq_u32(
+                vreinterpretq_u32_f32(vrev64q_f32(t)),
+                vld1q_u32([SIGN, 0, SIGN, 0].as_ptr()),
+            ));
+            // (-(a.im * t.im), a.im * t.re) is rounded. Then a.re * t is
+            // fused onto it.
+            vfmaq_f32(vmulq_f32(a_im, i_t), a_re, t)
+        }};
+    }
+
+    /// `(a + i * b, a - i * b)` for two complex numbers, with plain NEON.
+    macro_rules! pm_i_fma {
+        ($a:expr, $b:expr) => {{
+            let a: float32x4_t = $a;
+            let b_swapped = vreinterpretq_u32_f32(vrev64q_f32($b));
+            // i * b = (-b.im, b.re) and -i * b = (b.im, -b.re). Adding -x
+            // is the same as subtracting x, bit for bit.
+            let i_b = veorq_u32(b_swapped, vld1q_u32([SIGN, 0, SIGN, 0].as_ptr()));
+            let neg_i_b = veorq_u32(b_swapped, vld1q_u32([0, SIGN, 0, SIGN].as_ptr()));
+            (
+                vaddq_f32(a, vreinterpretq_f32_u32(i_b)),
+                vaddq_f32(a, vreinterpretq_f32_u32(neg_i_b)),
+            )
+        }};
+    }
+
+    /// `(a.re, b.im)` for two complex numbers.
+    #[inline(always)]
+    unsafe fn re_of_a_im_of_b(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+        vbslq_f32(vld1q_u32([u32::MAX, 0, u32::MAX, 0].as_ptr()), a, b)
+    }
+
+    /// Two radix-3 butterflies. Returns the new `(f0, f1, f2)`.
+    macro_rules! bfly3_step {
+        ($cmul:ident, $pm_i:ident, $f0:expr, $f1:expr, $f2:expr, $w1:expr, $w2:expr) => {{
+            let f0: float32x4_t = $f0;
+            let s1 = $cmul!($f1, $w1);
+            let s2 = $cmul!($f2, $w2);
+            let s3 = vaddq_f32(s1, s2);
+            let s0 = vsubq_f32(s1, s2);
+            // fm = f0 - s3 * 0.5, fused.
+            let fm = vfmsq_n_f32(f0, s3, 0.5);
+            let s0 = vmulq_n_f32(s0, EPI3_I);
+            // f1 = fm + i * s0 and f2 = fm - i * s0
+            let (plus, minus) = $pm_i!(fm, s0);
+            (vaddq_f32(f0, s3), plus, minus)
+        }};
+    }
+
+    /// Two radix-4 butterflies. Returns the new `(f0, f1, f2, f3)`.
+    macro_rules! bfly4_step {
+        ($cmul:ident, $pm_i:ident, $f0:expr, $f1:expr, $f2:expr, $f3:expr,
+         $w1:expr, $w2:expr, $w3:expr) => {{
+            let f0: float32x4_t = $f0;
+            let s0 = $cmul!($f1, $w1);
+            let s1 = $cmul!($f2, $w2);
+            let s2 = $cmul!($f3, $w3);
+            let s5 = vsubq_f32(f0, s1);
+            let sum = vaddq_f32(f0, s1);
+            let s3 = vaddq_f32(s0, s2);
+            let s4 = vsubq_f32(s0, s2);
+            // f1 = s5 - i * s4 and f3 = s5 + i * s4
+            let (plus, minus) = $pm_i!(s5, s4);
+            (vaddq_f32(sum, s3), minus, vsubq_f32(sum, s3), plus)
+        }};
+    }
+
+    /// Two radix-5 butterflies. Returns the new `(f0, f1, f2, f3, f4)`.
+    ///
+    /// The names are those of `bfly5_one`. Where that function has
+    /// `mul_add(a, b, c * d)`, the product `c * d` is computed first with
+    /// `fmul` and `a * b` is fused onto it with `fmla`.
+    macro_rules! bfly5_step {
+        ($cmul:ident, $pm_i:ident, $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr,
+         $w1:expr, $w2:expr, $w3:expr, $w4:expr) => {{
+            let s0: float32x4_t = $f0;
+            let s1 = $cmul!($f1, $w1);
+            let s2 = $cmul!($f2, $w2);
+            let s3 = $cmul!($f3, $w3);
+            let s4 = $cmul!($f4, $w4);
+            let s7 = vaddq_f32(s1, s4);
+            let s10 = vsubq_f32(s1, s4);
+            let s8 = vaddq_f32(s2, s3);
+            let s9 = vsubq_f32(s2, s3);
+            let o0 = vaddq_f32(s0, vaddq_f32(s7, s8));
+
+            let s5 = vaddq_f32(s0, vfmaq_n_f32(vmulq_n_f32(s8, YB_R), s7, YA_R));
+            // t = s10 * ya.i + s9 * yb.i. scratch6 is (t.im, -t.re), so
+            // f1 = s5 - scratch6 = s5 + i * t and f4 = s5 - i * t.
+            let t = vfmaq_n_f32(vmulq_n_f32(s9, YB_I), s10, YA_I);
+            let (o1, o4) = $pm_i!(s5, t);
+
+            let s11 = vaddq_f32(s0, vfmaq_n_f32(vmulq_n_f32(s8, YA_R), s7, YB_R));
+            // scratch12 = (s9.im * ya.i - s10.im * yb.i,
+            //              s10.re * yb.i - s9.re * ya.i).
+            // Its two parts fuse different products, so they are computed
+            // with their places swapped:
+            //   v.re = s10.re * yb.i + (-(s9.re * ya.i))    = scratch12.im
+            //   v.im = s9.im * ya.i + (-(s10.im * yb.i))    = scratch12.re
+            let rounded = vmulq_f32(
+                re_of_a_im_of_b(s9, s10),
+                vld1q_f32([-YA_I, -YB_I, -YA_I, -YB_I].as_ptr()),
+            );
+            let v = vfmaq_f32(
+                rounded,
+                re_of_a_im_of_b(s10, s9),
+                vld1q_f32([YB_I, YA_I, YB_I, YA_I].as_ptr()),
+            );
+            let s12 = vrev64q_f32(v);
+            (o0, o1, vaddq_f32(s11, s12), vsubq_f32(s11, s12), o4)
+        }};
+    }
+
+    /// One complex number in the low half of a vector, zero in the high half.
     ///
     /// # Safety
-    /// `fout` must hold at least `5 * m * groups` samples and `tw` at least
-    /// `8 * m` values.
-    pub(super) unsafe fn bfly5(fout: &mut [KissCpx], tw: &[f32], m: usize, groups: usize) {
-        debug_assert!(5 * m * groups <= fout.len());
-        debug_assert!(8 * m <= tw.len());
-        let ya_r = vdupq_n_f32(YA_R);
-        let ya_i = vdupq_n_f32(YA_I);
-        let yb_r = vdupq_n_f32(YB_R);
-        let yb_i = vdupq_n_f32(YB_I);
-        let w = tw.as_ptr();
-        let base = fout.as_mut_ptr();
-        let m4 = m & !3;
+    /// `p[0..2]` must be readable.
+    #[inline(always)]
+    unsafe fn load1(p: *const f32) -> float32x4_t {
+        vcombine_f32(vld1_f32(p), vdup_n_f32(0.0))
+    }
 
-        // SAFETY: group `g` is `5 * m` samples. `p0..p4` point to its five
-        // streams of `m` samples (`2 * m` floats) each. A vector step at `j`
-        // reads and writes samples `j..j + 4` of each stream and twiddles
-        // `j..j + 4` of each of the eight `m`-long tables, and `j + 4 <= m`.
-        // The tail touches sample `j < m` of each stream.
-        for g in 0..groups {
-            let c0 = base.add(5 * m * g);
-            let c1 = c0.add(m);
-            let c2 = c1.add(m);
-            let c3 = c2.add(m);
-            let c4 = c3.add(m);
-            let p0 = c0 as *mut f32;
-            let p1 = c1 as *mut f32;
-            let p2 = c2 as *mut f32;
-            let p3 = c3 as *mut f32;
-            let p4 = c4 as *mut f32;
+    /// Stores the complex number in the low half of `v`.
+    ///
+    /// # Safety
+    /// `p[0..2]` must be writable.
+    #[inline(always)]
+    unsafe fn store1(p: *mut f32, v: float32x4_t) {
+        vst1_f32(p, vget_low_f32(v));
+    }
 
-            let mut j = 0usize;
-            while j < m4 {
-                let s0 = vld2q_f32(p0.add(2 * j));
-                let a1 = vld2q_f32(p1.add(2 * j));
-                let a2 = vld2q_f32(p2.add(2 * j));
-                let a3 = vld2q_f32(p3.add(2 * j));
-                let a4 = vld2q_f32(p4.add(2 * j));
-                let (s1r, s1i) = cmul(a1.0, a1.1, vld1q_f32(w.add(j)), vld1q_f32(w.add(m + j)));
-                let (s2r, s2i) = cmul(
-                    a2.0,
-                    a2.1,
-                    vld1q_f32(w.add(2 * m + j)),
-                    vld1q_f32(w.add(3 * m + j)),
-                );
-                let (s3r, s3i) = cmul(
-                    a3.0,
-                    a3.1,
-                    vld1q_f32(w.add(4 * m + j)),
-                    vld1q_f32(w.add(5 * m + j)),
-                );
-                let (s4r, s4i) = cmul(
-                    a4.0,
-                    a4.1,
-                    vld1q_f32(w.add(6 * m + j)),
-                    vld1q_f32(w.add(7 * m + j)),
-                );
+    /// The kernels of one version. `$features` are the target features the
+    /// functions are compiled with; `$cmul` and `$pm_i` are the two
+    /// operations that differ between the versions.
+    macro_rules! kernels {
+        ($name:ident, $features:literal, $cmul:ident, $pm_i:ident) => {
+            pub(super) mod $name {
+                use super::*;
 
-                let s7r = vaddq_f32(s1r, s4r);
-                let s7i = vaddq_f32(s1i, s4i);
-                let s10r = vsubq_f32(s1r, s4r);
-                let s10i = vsubq_f32(s1i, s4i);
-                let s8r = vaddq_f32(s2r, s3r);
-                let s8i = vaddq_f32(s2i, s3i);
-                let s9r = vsubq_f32(s2r, s3r);
-                let s9i = vsubq_f32(s2i, s3i);
+                /// Radix-3 pass. Two butterflies per iteration.
+                ///
+                /// # Safety
+                /// The processor must have the target features of this
+                /// function. `fout` must hold at least `3 * m * groups`
+                /// samples and `tw` at least `4 * m` values.
+                #[target_feature(enable = $features)]
+                pub(crate) unsafe fn bfly3(
+                    fout: &mut [KissCpx],
+                    tw: &[f32],
+                    m: usize,
+                    groups: usize,
+                ) {
+                    debug_assert!(3 * m * groups <= fout.len());
+                    debug_assert!(4 * m <= tw.len());
+                    let w1 = tw.as_ptr();
+                    let w2 = w1.add(2 * m);
+                    let base = fout.as_mut_ptr() as *mut f32;
 
-                vst2q_f32(
-                    p0.add(2 * j),
-                    float32x4x2_t(
-                        vaddq_f32(vaddq_f32(s0.0, s7r), s8r),
-                        vaddq_f32(vaddq_f32(s0.1, s7i), s8i),
-                    ),
-                );
+                    // SAFETY: group `g` is `3 * m` samples, 2 floats each.
+                    // `p0`, `p1`, `p2` point to its three streams of `m`
+                    // samples. A step at `j` touches samples `j` and `j + 1`
+                    // of each stream and of each twiddle table, with
+                    // `j + 2 <= m`. The last step of an odd `m` touches
+                    // sample `j = m - 1` only.
+                    for g in 0..groups {
+                        let p0 = base.add(6 * m * g);
+                        let p1 = p0.add(2 * m);
+                        let p2 = p1.add(2 * m);
+                        let mut j = 0usize;
+                        while j + 2 <= m {
+                            let k = 2 * j;
+                            let (o0, o1, o2) = bfly3_step!(
+                                $cmul,
+                                $pm_i,
+                                vld1q_f32(p0.add(k)),
+                                vld1q_f32(p1.add(k)),
+                                vld1q_f32(p2.add(k)),
+                                vld1q_f32(w1.add(k)),
+                                vld1q_f32(w2.add(k))
+                            );
+                            vst1q_f32(p0.add(k), o0);
+                            vst1q_f32(p1.add(k), o1);
+                            vst1q_f32(p2.add(k), o2);
+                            j += 2;
+                        }
+                        if j < m {
+                            let k = 2 * j;
+                            let (o0, o1, o2) = bfly3_step!(
+                                $cmul,
+                                $pm_i,
+                                load1(p0.add(k)),
+                                load1(p1.add(k)),
+                                load1(p2.add(k)),
+                                load1(w1.add(k)),
+                                load1(w2.add(k))
+                            );
+                            store1(p0.add(k), o0);
+                            store1(p1.add(k), o1);
+                            store1(p2.add(k), o2);
+                        }
+                    }
+                }
 
-                let s5r = vaddq_f32(
-                    vaddq_f32(s0.0, vmulq_f32(s7r, ya_r)),
-                    vmulq_f32(s8r, yb_r),
-                );
-                let s5i = vaddq_f32(
-                    vaddq_f32(s0.1, vmulq_f32(s7i, ya_r)),
-                    vmulq_f32(s8i, yb_r),
-                );
-                // scratch6 = (s6r, -s6i_neg). Subtracting -x is the same as
-                // adding x, bit for bit, so the negation is not computed.
-                let s6r = vaddq_f32(vmulq_f32(s10i, ya_i), vmulq_f32(s9i, yb_i));
-                let s6i_neg = vaddq_f32(vmulq_f32(s10r, ya_i), vmulq_f32(s9r, yb_i));
+                /// Radix-4 pass with `m > 1`. Two butterflies per iteration.
+                ///
+                /// # Safety
+                /// The processor must have the target features of this
+                /// function. `fout` must hold at least `4 * m * groups`
+                /// samples and `tw` at least `6 * m` values.
+                #[target_feature(enable = $features)]
+                pub(crate) unsafe fn bfly4(
+                    fout: &mut [KissCpx],
+                    tw: &[f32],
+                    m: usize,
+                    groups: usize,
+                ) {
+                    debug_assert!(4 * m * groups <= fout.len());
+                    debug_assert!(6 * m <= tw.len());
+                    let w1 = tw.as_ptr();
+                    let w2 = w1.add(2 * m);
+                    let w3 = w2.add(2 * m);
+                    let base = fout.as_mut_ptr() as *mut f32;
 
-                vst2q_f32(
-                    p1.add(2 * j),
-                    float32x4x2_t(vsubq_f32(s5r, s6r), vaddq_f32(s5i, s6i_neg)),
-                );
-                vst2q_f32(
-                    p4.add(2 * j),
-                    float32x4x2_t(vaddq_f32(s5r, s6r), vsubq_f32(s5i, s6i_neg)),
-                );
+                    // SAFETY: as in `bfly3`, with four streams and three
+                    // twiddle tables.
+                    for g in 0..groups {
+                        let p0 = base.add(8 * m * g);
+                        let p1 = p0.add(2 * m);
+                        let p2 = p1.add(2 * m);
+                        let p3 = p2.add(2 * m);
+                        let mut j = 0usize;
+                        while j + 2 <= m {
+                            let k = 2 * j;
+                            let (o0, o1, o2, o3) = bfly4_step!(
+                                $cmul,
+                                $pm_i,
+                                vld1q_f32(p0.add(k)),
+                                vld1q_f32(p1.add(k)),
+                                vld1q_f32(p2.add(k)),
+                                vld1q_f32(p3.add(k)),
+                                vld1q_f32(w1.add(k)),
+                                vld1q_f32(w2.add(k)),
+                                vld1q_f32(w3.add(k))
+                            );
+                            vst1q_f32(p0.add(k), o0);
+                            vst1q_f32(p1.add(k), o1);
+                            vst1q_f32(p2.add(k), o2);
+                            vst1q_f32(p3.add(k), o3);
+                            j += 2;
+                        }
+                        if j < m {
+                            let k = 2 * j;
+                            let (o0, o1, o2, o3) = bfly4_step!(
+                                $cmul,
+                                $pm_i,
+                                load1(p0.add(k)),
+                                load1(p1.add(k)),
+                                load1(p2.add(k)),
+                                load1(p3.add(k)),
+                                load1(w1.add(k)),
+                                load1(w2.add(k)),
+                                load1(w3.add(k))
+                            );
+                            store1(p0.add(k), o0);
+                            store1(p1.add(k), o1);
+                            store1(p2.add(k), o2);
+                            store1(p3.add(k), o3);
+                        }
+                    }
+                }
 
-                let s11r = vaddq_f32(
-                    vaddq_f32(s0.0, vmulq_f32(s7r, yb_r)),
-                    vmulq_f32(s8r, ya_r),
-                );
-                let s11i = vaddq_f32(
-                    vaddq_f32(s0.1, vmulq_f32(s7i, yb_r)),
-                    vmulq_f32(s8i, ya_r),
-                );
-                let s12r = vsubq_f32(vmulq_f32(s9i, ya_i), vmulq_f32(s10i, yb_i));
-                let s12i = vsubq_f32(vmulq_f32(s10r, yb_i), vmulq_f32(s9r, ya_i));
+                /// Radix-5 pass. Two butterflies per iteration.
+                ///
+                /// # Safety
+                /// The processor must have the target features of this
+                /// function. `fout` must hold at least `5 * m * groups`
+                /// samples and `tw` at least `8 * m` values.
+                #[target_feature(enable = $features)]
+                pub(crate) unsafe fn bfly5(
+                    fout: &mut [KissCpx],
+                    tw: &[f32],
+                    m: usize,
+                    groups: usize,
+                ) {
+                    debug_assert!(5 * m * groups <= fout.len());
+                    debug_assert!(8 * m <= tw.len());
+                    let w1 = tw.as_ptr();
+                    let w2 = w1.add(2 * m);
+                    let w3 = w2.add(2 * m);
+                    let w4 = w3.add(2 * m);
+                    let base = fout.as_mut_ptr() as *mut f32;
 
-                vst2q_f32(
-                    p2.add(2 * j),
-                    float32x4x2_t(vaddq_f32(s11r, s12r), vaddq_f32(s11i, s12i)),
-                );
-                vst2q_f32(
-                    p3.add(2 * j),
-                    float32x4x2_t(vsubq_f32(s11r, s12r), vsubq_f32(s11i, s12i)),
-                );
-                j += 4;
+                    // SAFETY: as in `bfly3`, with five streams and four
+                    // twiddle tables.
+                    for g in 0..groups {
+                        let p0 = base.add(10 * m * g);
+                        let p1 = p0.add(2 * m);
+                        let p2 = p1.add(2 * m);
+                        let p3 = p2.add(2 * m);
+                        let p4 = p3.add(2 * m);
+                        let mut j = 0usize;
+                        while j + 2 <= m {
+                            let k = 2 * j;
+                            let (o0, o1, o2, o3, o4) = bfly5_step!(
+                                $cmul,
+                                $pm_i,
+                                vld1q_f32(p0.add(k)),
+                                vld1q_f32(p1.add(k)),
+                                vld1q_f32(p2.add(k)),
+                                vld1q_f32(p3.add(k)),
+                                vld1q_f32(p4.add(k)),
+                                vld1q_f32(w1.add(k)),
+                                vld1q_f32(w2.add(k)),
+                                vld1q_f32(w3.add(k)),
+                                vld1q_f32(w4.add(k))
+                            );
+                            vst1q_f32(p0.add(k), o0);
+                            vst1q_f32(p1.add(k), o1);
+                            vst1q_f32(p2.add(k), o2);
+                            vst1q_f32(p3.add(k), o3);
+                            vst1q_f32(p4.add(k), o4);
+                            j += 2;
+                        }
+                        if j < m {
+                            let k = 2 * j;
+                            let (o0, o1, o2, o3, o4) = bfly5_step!(
+                                $cmul,
+                                $pm_i,
+                                load1(p0.add(k)),
+                                load1(p1.add(k)),
+                                load1(p2.add(k)),
+                                load1(p3.add(k)),
+                                load1(p4.add(k)),
+                                load1(w1.add(k)),
+                                load1(w2.add(k)),
+                                load1(w3.add(k)),
+                                load1(w4.add(k))
+                            );
+                            store1(p0.add(k), o0);
+                            store1(p1.add(k), o1);
+                            store1(p2.add(k), o2);
+                            store1(p3.add(k), o3);
+                            store1(p4.add(k), o4);
+                        }
+                    }
+                }
+
+                /// Runs all stages.
+                ///
+                /// # Safety
+                /// The processor must have the target features of this
+                /// function. `fout` must hold exactly `st.nfft` samples.
+                #[target_feature(enable = $features)]
+                pub(crate) unsafe fn stages(st: &KissFftState, fout: &mut [KissCpx]) {
+                    debug_assert!(fout.len() == st.nfft);
+                    // SAFETY: `KissFftState::build` makes
+                    // `groups * radix * m == nfft` for every stage, and gives
+                    // each stage a table of `tw_len()` values.
+                    for s in &st.stages[..st.nstages] {
+                        let m = s.m as usize;
+                        let groups = s.groups as usize;
+                        let tw = &st.stage_tw[s.tw as usize..s.tw as usize + s.tw_len()];
+                        match (s.radix, m) {
+                            (2, 1) => neon::bfly2_m1(fout, groups),
+                            (2, _) => neon::bfly2_m4(fout, groups),
+                            (4, 1) => neon::bfly4_m1(fout, groups),
+                            (4, _) => bfly4(fout, tw, m, groups),
+                            (3, _) => bfly3(fout, tw, m, groups),
+                            (5, _) => bfly5(fout, tw, m, groups),
+                            // A one-point transform has a single stage of
+                            // radix 1. It leaves the sample as it is.
+                            _ => {}
+                        }
+                    }
+                }
             }
+        };
+    }
 
-            while j < m {
-                bfly5_one(
-                    &mut *c0.add(j),
-                    &mut *c1.add(j),
-                    &mut *c2.add(j),
-                    &mut *c3.add(j),
-                    &mut *c4.add(j),
-                    [
-                        KissCpx::new(*w.add(j), *w.add(m + j)),
-                        KissCpx::new(*w.add(2 * m + j), *w.add(3 * m + j)),
-                        KissCpx::new(*w.add(4 * m + j), *w.add(5 * m + j)),
-                        KissCpx::new(*w.add(6 * m + j), *w.add(7 * m + j)),
-                    ],
-                );
-                j += 1;
-            }
-        }
+    kernels!(fcma, "neon,fcma", cmul_fcma, pm_i_fcma);
+    kernels!(fma, "neon", cmul_fma, pm_i_fma);
+}
+
+/// Whether the processor has the complex-number instructions (FEAT_FCMA).
+///
+/// Known at compile time where they are part of the target (Apple silicon).
+/// Elsewhere it is a run-time check, which needs `std`; without `std` the
+/// answer is no.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn has_fcma() -> bool {
+    #[cfg(target_feature = "fcma")]
+    {
+        true
+    }
+    #[cfg(all(not(target_feature = "fcma"), feature = "std"))]
+    {
+        std::arch::is_aarch64_feature_detected!("fcma")
+    }
+    #[cfg(all(not(target_feature = "fcma"), not(feature = "std")))]
+    {
+        false
     }
 }
 
-/// Runs all stages with the NEON butterflies.
+/// Runs all stages with the aarch64 butterflies.
 ///
 /// # Safety
 /// `fout` must hold exactly `st.nfft` samples.
 #[cfg(target_arch = "aarch64")]
 unsafe fn fft_stages_neon(st: &KissFftState, fout: &mut [KissCpx]) {
     debug_assert!(fout.len() == st.nfft);
-    // SAFETY: `KissFftState::build` makes `groups * radix * m == nfft` for
-    // every stage, and gives each stage a table of `tw_len()` values.
-    for s in &st.stages[..st.nstages] {
-        let m = s.m as usize;
-        let groups = s.groups as usize;
-        let tw = &st.stage_tw[s.tw as usize..s.tw as usize + s.tw_len()];
-        match (s.radix, m) {
-            (2, 1) => neon::bfly2_m1(fout, groups),
-            (2, _) => neon::bfly2_m4(fout, groups),
-            (4, 1) => neon::bfly4_m1(fout, groups),
-            (4, _) => neon::bfly4(fout, tw, m, groups),
-            (3, _) => neon::bfly3(fout, tw, m, groups),
-            (5, _) => neon::bfly5(fout, tw, m, groups),
-            // A one-point transform has a single stage of radix 1. It
-            // leaves the sample as it is.
-            _ => {}
-        }
+    if has_fcma() {
+        // SAFETY: the processor has FEAT_FCMA.
+        fused::fcma::stages(st, fout)
+    } else {
+        fused::fma::stages(st, fout)
     }
 }
 
 /// In-place FFT of `st.nfft()` samples that are already in bit-reversed order.
+///
+/// On aarch64 it gives the bits of `opus_fft_impl_fused`, which are the bits
+/// of the arm64 build of libopus. On every other target it gives the bits of
+/// `opus_fft_impl_scalar`.
 pub fn opus_fft_impl(st: &KissFftState, fout: &mut [KissCpx]) {
     // The butterfly kernels index up to nfft elements; the SIMD paths read
     // through raw pointers, so an undersized slice would be out-of-bounds
@@ -1177,7 +1480,7 @@ pub fn opus_fft_impl(st: &KissFftState, fout: &mut [KissCpx]) {
             // SAFETY: the processor has AVX.
             unsafe { fft_stages_avx(st, fout) }
         } else {
-            fft_stages_scalar(st, fout);
+            fft_stages_scalar::<Separate>(st, fout);
         }
     }
     #[cfg(not(any(
@@ -1185,13 +1488,14 @@ pub fn opus_fft_impl(st: &KissFftState, fout: &mut [KissCpx]) {
         target_arch = "x86",
         target_arch = "x86_64"
     )))]
-    fft_stages_scalar(st, fout);
+    fft_stages_scalar::<Separate>(st, fout);
 }
 
-/// The same transform as `opus_fft_impl`, computed with the portable
-/// butterflies on every target.
+/// The transform of `opus_fft_impl` with the portable butterflies and no
+/// fused product, on every target.
 ///
-/// It is the reference the vector versions are tested against.
+/// It is the code of the targets without a vector version, and what a build
+/// of libopus without fused multiply-add computes.
 pub fn opus_fft_impl_scalar(st: &KissFftState, fout: &mut [KissCpx]) {
     assert!(
         fout.len() >= st.nfft,
@@ -1199,7 +1503,22 @@ pub fn opus_fft_impl_scalar(st: &KissFftState, fout: &mut [KissCpx]) {
         fout.len(),
         st.nfft
     );
-    fft_stages_scalar(st, &mut fout[..st.nfft]);
+    fft_stages_scalar::<Separate>(st, &mut fout[..st.nfft]);
+}
+
+/// The transform of `opus_fft_impl` with the portable butterflies and the
+/// products fused as clang fuses them in libopus for arm64, on every target.
+///
+/// It is the reference the aarch64 butterflies are tested against. On a
+/// processor without a fused multiply-add instruction it is slow.
+pub fn opus_fft_impl_fused(st: &KissFftState, fout: &mut [KissCpx]) {
+    assert!(
+        fout.len() >= st.nfft,
+        "opus_fft_impl_fused: fout.len() ({}) < nfft ({})",
+        fout.len(),
+        st.nfft
+    );
+    fft_stages_scalar::<Fused>(st, &mut fout[..st.nfft]);
 }
 
 pub fn opus_fft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
@@ -1230,9 +1549,400 @@ pub fn opus_ifft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
     }
 }
 
+/// The twiddle table of the 480-point FFT: entry `i` is
+/// `exp(-2 * pi * i / 480)`.
+///
+/// It is `fft_twiddles48000_960` of libopus 1.6
+/// (celt/static_modes_float.h:132-373), digit for digit. The FFT sizes 240,
+/// 120 and 60 read every second, fourth and eighth entry.
+///
+/// The numbers have eight significant digits. Some of them are not the `f32`
+/// nearest to the exact cosine, so the table cannot be computed here; it has
+/// to be copied.
+#[allow(clippy::excessive_precision, clippy::approx_constant)]
+pub static FFT_TWIDDLES_480: [KissCpx; KISS_MAX_N] = [
+    KissCpx::new(1.0000000, -0.0000000), KissCpx::new(0.99991433, -0.013089596),
+    KissCpx::new(0.99965732, -0.026176948), KissCpx::new(0.99922904, -0.039259816),
+    KissCpx::new(0.99862953, -0.052335956), KissCpx::new(0.99785892, -0.065403129),
+    KissCpx::new(0.99691733, -0.078459096), KissCpx::new(0.99580493, -0.091501619),
+    KissCpx::new(0.99452190, -0.10452846), KissCpx::new(0.99306846, -0.11753740),
+    KissCpx::new(0.99144486, -0.13052619), KissCpx::new(0.98965139, -0.14349262),
+    KissCpx::new(0.98768834, -0.15643447), KissCpx::new(0.98555606, -0.16934950),
+    KissCpx::new(0.98325491, -0.18223553), KissCpx::new(0.98078528, -0.19509032),
+    KissCpx::new(0.97814760, -0.20791169), KissCpx::new(0.97534232, -0.22069744),
+    KissCpx::new(0.97236992, -0.23344536), KissCpx::new(0.96923091, -0.24615329),
+    KissCpx::new(0.96592583, -0.25881905), KissCpx::new(0.96245524, -0.27144045),
+    KissCpx::new(0.95881973, -0.28401534), KissCpx::new(0.95501994, -0.29654157),
+    KissCpx::new(0.95105652, -0.30901699), KissCpx::new(0.94693013, -0.32143947),
+    KissCpx::new(0.94264149, -0.33380686), KissCpx::new(0.93819134, -0.34611706),
+    KissCpx::new(0.93358043, -0.35836795), KissCpx::new(0.92880955, -0.37055744),
+    KissCpx::new(0.92387953, -0.38268343), KissCpx::new(0.91879121, -0.39474386),
+    KissCpx::new(0.91354546, -0.40673664), KissCpx::new(0.90814317, -0.41865974),
+    KissCpx::new(0.90258528, -0.43051110), KissCpx::new(0.89687274, -0.44228869),
+    KissCpx::new(0.89100652, -0.45399050), KissCpx::new(0.88498764, -0.46561452),
+    KissCpx::new(0.87881711, -0.47715876), KissCpx::new(0.87249601, -0.48862124),
+    KissCpx::new(0.86602540, -0.50000000), KissCpx::new(0.85940641, -0.51129309),
+    KissCpx::new(0.85264016, -0.52249856), KissCpx::new(0.84572782, -0.53361452),
+    KissCpx::new(0.83867057, -0.54463904), KissCpx::new(0.83146961, -0.55557023),
+    KissCpx::new(0.82412619, -0.56640624), KissCpx::new(0.81664156, -0.57714519),
+    KissCpx::new(0.80901699, -0.58778525), KissCpx::new(0.80125381, -0.59832460),
+    KissCpx::new(0.79335334, -0.60876143), KissCpx::new(0.78531693, -0.61909395),
+    KissCpx::new(0.77714596, -0.62932039), KissCpx::new(0.76884183, -0.63943900),
+    KissCpx::new(0.76040597, -0.64944805), KissCpx::new(0.75183981, -0.65934582),
+    KissCpx::new(0.74314483, -0.66913061), KissCpx::new(0.73432251, -0.67880075),
+    KissCpx::new(0.72537437, -0.68835458), KissCpx::new(0.71630194, -0.69779046),
+    KissCpx::new(0.70710678, -0.70710678), KissCpx::new(0.69779046, -0.71630194),
+    KissCpx::new(0.68835458, -0.72537437), KissCpx::new(0.67880075, -0.73432251),
+    KissCpx::new(0.66913061, -0.74314483), KissCpx::new(0.65934582, -0.75183981),
+    KissCpx::new(0.64944805, -0.76040597), KissCpx::new(0.63943900, -0.76884183),
+    KissCpx::new(0.62932039, -0.77714596), KissCpx::new(0.61909395, -0.78531693),
+    KissCpx::new(0.60876143, -0.79335334), KissCpx::new(0.59832460, -0.80125381),
+    KissCpx::new(0.58778525, -0.80901699), KissCpx::new(0.57714519, -0.81664156),
+    KissCpx::new(0.56640624, -0.82412619), KissCpx::new(0.55557023, -0.83146961),
+    KissCpx::new(0.54463904, -0.83867057), KissCpx::new(0.53361452, -0.84572782),
+    KissCpx::new(0.52249856, -0.85264016), KissCpx::new(0.51129309, -0.85940641),
+    KissCpx::new(0.50000000, -0.86602540), KissCpx::new(0.48862124, -0.87249601),
+    KissCpx::new(0.47715876, -0.87881711), KissCpx::new(0.46561452, -0.88498764),
+    KissCpx::new(0.45399050, -0.89100652), KissCpx::new(0.44228869, -0.89687274),
+    KissCpx::new(0.43051110, -0.90258528), KissCpx::new(0.41865974, -0.90814317),
+    KissCpx::new(0.40673664, -0.91354546), KissCpx::new(0.39474386, -0.91879121),
+    KissCpx::new(0.38268343, -0.92387953), KissCpx::new(0.37055744, -0.92880955),
+    KissCpx::new(0.35836795, -0.93358043), KissCpx::new(0.34611706, -0.93819134),
+    KissCpx::new(0.33380686, -0.94264149), KissCpx::new(0.32143947, -0.94693013),
+    KissCpx::new(0.30901699, -0.95105652), KissCpx::new(0.29654157, -0.95501994),
+    KissCpx::new(0.28401534, -0.95881973), KissCpx::new(0.27144045, -0.96245524),
+    KissCpx::new(0.25881905, -0.96592583), KissCpx::new(0.24615329, -0.96923091),
+    KissCpx::new(0.23344536, -0.97236992), KissCpx::new(0.22069744, -0.97534232),
+    KissCpx::new(0.20791169, -0.97814760), KissCpx::new(0.19509032, -0.98078528),
+    KissCpx::new(0.18223553, -0.98325491), KissCpx::new(0.16934950, -0.98555606),
+    KissCpx::new(0.15643447, -0.98768834), KissCpx::new(0.14349262, -0.98965139),
+    KissCpx::new(0.13052619, -0.99144486), KissCpx::new(0.11753740, -0.99306846),
+    KissCpx::new(0.10452846, -0.99452190), KissCpx::new(0.091501619, -0.99580493),
+    KissCpx::new(0.078459096, -0.99691733), KissCpx::new(0.065403129, -0.99785892),
+    KissCpx::new(0.052335956, -0.99862953), KissCpx::new(0.039259816, -0.99922904),
+    KissCpx::new(0.026176948, -0.99965732), KissCpx::new(0.013089596, -0.99991433),
+    KissCpx::new(6.1232340e-17, -1.0000000), KissCpx::new(-0.013089596, -0.99991433),
+    KissCpx::new(-0.026176948, -0.99965732), KissCpx::new(-0.039259816, -0.99922904),
+    KissCpx::new(-0.052335956, -0.99862953), KissCpx::new(-0.065403129, -0.99785892),
+    KissCpx::new(-0.078459096, -0.99691733), KissCpx::new(-0.091501619, -0.99580493),
+    KissCpx::new(-0.10452846, -0.99452190), KissCpx::new(-0.11753740, -0.99306846),
+    KissCpx::new(-0.13052619, -0.99144486), KissCpx::new(-0.14349262, -0.98965139),
+    KissCpx::new(-0.15643447, -0.98768834), KissCpx::new(-0.16934950, -0.98555606),
+    KissCpx::new(-0.18223553, -0.98325491), KissCpx::new(-0.19509032, -0.98078528),
+    KissCpx::new(-0.20791169, -0.97814760), KissCpx::new(-0.22069744, -0.97534232),
+    KissCpx::new(-0.23344536, -0.97236992), KissCpx::new(-0.24615329, -0.96923091),
+    KissCpx::new(-0.25881905, -0.96592583), KissCpx::new(-0.27144045, -0.96245524),
+    KissCpx::new(-0.28401534, -0.95881973), KissCpx::new(-0.29654157, -0.95501994),
+    KissCpx::new(-0.30901699, -0.95105652), KissCpx::new(-0.32143947, -0.94693013),
+    KissCpx::new(-0.33380686, -0.94264149), KissCpx::new(-0.34611706, -0.93819134),
+    KissCpx::new(-0.35836795, -0.93358043), KissCpx::new(-0.37055744, -0.92880955),
+    KissCpx::new(-0.38268343, -0.92387953), KissCpx::new(-0.39474386, -0.91879121),
+    KissCpx::new(-0.40673664, -0.91354546), KissCpx::new(-0.41865974, -0.90814317),
+    KissCpx::new(-0.43051110, -0.90258528), KissCpx::new(-0.44228869, -0.89687274),
+    KissCpx::new(-0.45399050, -0.89100652), KissCpx::new(-0.46561452, -0.88498764),
+    KissCpx::new(-0.47715876, -0.87881711), KissCpx::new(-0.48862124, -0.87249601),
+    KissCpx::new(-0.50000000, -0.86602540), KissCpx::new(-0.51129309, -0.85940641),
+    KissCpx::new(-0.52249856, -0.85264016), KissCpx::new(-0.53361452, -0.84572782),
+    KissCpx::new(-0.54463904, -0.83867057), KissCpx::new(-0.55557023, -0.83146961),
+    KissCpx::new(-0.56640624, -0.82412619), KissCpx::new(-0.57714519, -0.81664156),
+    KissCpx::new(-0.58778525, -0.80901699), KissCpx::new(-0.59832460, -0.80125381),
+    KissCpx::new(-0.60876143, -0.79335334), KissCpx::new(-0.61909395, -0.78531693),
+    KissCpx::new(-0.62932039, -0.77714596), KissCpx::new(-0.63943900, -0.76884183),
+    KissCpx::new(-0.64944805, -0.76040597), KissCpx::new(-0.65934582, -0.75183981),
+    KissCpx::new(-0.66913061, -0.74314483), KissCpx::new(-0.67880075, -0.73432251),
+    KissCpx::new(-0.68835458, -0.72537437), KissCpx::new(-0.69779046, -0.71630194),
+    KissCpx::new(-0.70710678, -0.70710678), KissCpx::new(-0.71630194, -0.69779046),
+    KissCpx::new(-0.72537437, -0.68835458), KissCpx::new(-0.73432251, -0.67880075),
+    KissCpx::new(-0.74314483, -0.66913061), KissCpx::new(-0.75183981, -0.65934582),
+    KissCpx::new(-0.76040597, -0.64944805), KissCpx::new(-0.76884183, -0.63943900),
+    KissCpx::new(-0.77714596, -0.62932039), KissCpx::new(-0.78531693, -0.61909395),
+    KissCpx::new(-0.79335334, -0.60876143), KissCpx::new(-0.80125381, -0.59832460),
+    KissCpx::new(-0.80901699, -0.58778525), KissCpx::new(-0.81664156, -0.57714519),
+    KissCpx::new(-0.82412619, -0.56640624), KissCpx::new(-0.83146961, -0.55557023),
+    KissCpx::new(-0.83867057, -0.54463904), KissCpx::new(-0.84572782, -0.53361452),
+    KissCpx::new(-0.85264016, -0.52249856), KissCpx::new(-0.85940641, -0.51129309),
+    KissCpx::new(-0.86602540, -0.50000000), KissCpx::new(-0.87249601, -0.48862124),
+    KissCpx::new(-0.87881711, -0.47715876), KissCpx::new(-0.88498764, -0.46561452),
+    KissCpx::new(-0.89100652, -0.45399050), KissCpx::new(-0.89687274, -0.44228869),
+    KissCpx::new(-0.90258528, -0.43051110), KissCpx::new(-0.90814317, -0.41865974),
+    KissCpx::new(-0.91354546, -0.40673664), KissCpx::new(-0.91879121, -0.39474386),
+    KissCpx::new(-0.92387953, -0.38268343), KissCpx::new(-0.92880955, -0.37055744),
+    KissCpx::new(-0.93358043, -0.35836795), KissCpx::new(-0.93819134, -0.34611706),
+    KissCpx::new(-0.94264149, -0.33380686), KissCpx::new(-0.94693013, -0.32143947),
+    KissCpx::new(-0.95105652, -0.30901699), KissCpx::new(-0.95501994, -0.29654157),
+    KissCpx::new(-0.95881973, -0.28401534), KissCpx::new(-0.96245524, -0.27144045),
+    KissCpx::new(-0.96592583, -0.25881905), KissCpx::new(-0.96923091, -0.24615329),
+    KissCpx::new(-0.97236992, -0.23344536), KissCpx::new(-0.97534232, -0.22069744),
+    KissCpx::new(-0.97814760, -0.20791169), KissCpx::new(-0.98078528, -0.19509032),
+    KissCpx::new(-0.98325491, -0.18223553), KissCpx::new(-0.98555606, -0.16934950),
+    KissCpx::new(-0.98768834, -0.15643447), KissCpx::new(-0.98965139, -0.14349262),
+    KissCpx::new(-0.99144486, -0.13052619), KissCpx::new(-0.99306846, -0.11753740),
+    KissCpx::new(-0.99452190, -0.10452846), KissCpx::new(-0.99580493, -0.091501619),
+    KissCpx::new(-0.99691733, -0.078459096), KissCpx::new(-0.99785892, -0.065403129),
+    KissCpx::new(-0.99862953, -0.052335956), KissCpx::new(-0.99922904, -0.039259816),
+    KissCpx::new(-0.99965732, -0.026176948), KissCpx::new(-0.99991433, -0.013089596),
+    KissCpx::new(-1.0000000, -1.2246468e-16), KissCpx::new(-0.99991433, 0.013089596),
+    KissCpx::new(-0.99965732, 0.026176948), KissCpx::new(-0.99922904, 0.039259816),
+    KissCpx::new(-0.99862953, 0.052335956), KissCpx::new(-0.99785892, 0.065403129),
+    KissCpx::new(-0.99691733, 0.078459096), KissCpx::new(-0.99580493, 0.091501619),
+    KissCpx::new(-0.99452190, 0.10452846), KissCpx::new(-0.99306846, 0.11753740),
+    KissCpx::new(-0.99144486, 0.13052619), KissCpx::new(-0.98965139, 0.14349262),
+    KissCpx::new(-0.98768834, 0.15643447), KissCpx::new(-0.98555606, 0.16934950),
+    KissCpx::new(-0.98325491, 0.18223553), KissCpx::new(-0.98078528, 0.19509032),
+    KissCpx::new(-0.97814760, 0.20791169), KissCpx::new(-0.97534232, 0.22069744),
+    KissCpx::new(-0.97236992, 0.23344536), KissCpx::new(-0.96923091, 0.24615329),
+    KissCpx::new(-0.96592583, 0.25881905), KissCpx::new(-0.96245524, 0.27144045),
+    KissCpx::new(-0.95881973, 0.28401534), KissCpx::new(-0.95501994, 0.29654157),
+    KissCpx::new(-0.95105652, 0.30901699), KissCpx::new(-0.94693013, 0.32143947),
+    KissCpx::new(-0.94264149, 0.33380686), KissCpx::new(-0.93819134, 0.34611706),
+    KissCpx::new(-0.93358043, 0.35836795), KissCpx::new(-0.92880955, 0.37055744),
+    KissCpx::new(-0.92387953, 0.38268343), KissCpx::new(-0.91879121, 0.39474386),
+    KissCpx::new(-0.91354546, 0.40673664), KissCpx::new(-0.90814317, 0.41865974),
+    KissCpx::new(-0.90258528, 0.43051110), KissCpx::new(-0.89687274, 0.44228869),
+    KissCpx::new(-0.89100652, 0.45399050), KissCpx::new(-0.88498764, 0.46561452),
+    KissCpx::new(-0.87881711, 0.47715876), KissCpx::new(-0.87249601, 0.48862124),
+    KissCpx::new(-0.86602540, 0.50000000), KissCpx::new(-0.85940641, 0.51129309),
+    KissCpx::new(-0.85264016, 0.52249856), KissCpx::new(-0.84572782, 0.53361452),
+    KissCpx::new(-0.83867057, 0.54463904), KissCpx::new(-0.83146961, 0.55557023),
+    KissCpx::new(-0.82412619, 0.56640624), KissCpx::new(-0.81664156, 0.57714519),
+    KissCpx::new(-0.80901699, 0.58778525), KissCpx::new(-0.80125381, 0.59832460),
+    KissCpx::new(-0.79335334, 0.60876143), KissCpx::new(-0.78531693, 0.61909395),
+    KissCpx::new(-0.77714596, 0.62932039), KissCpx::new(-0.76884183, 0.63943900),
+    KissCpx::new(-0.76040597, 0.64944805), KissCpx::new(-0.75183981, 0.65934582),
+    KissCpx::new(-0.74314483, 0.66913061), KissCpx::new(-0.73432251, 0.67880075),
+    KissCpx::new(-0.72537437, 0.68835458), KissCpx::new(-0.71630194, 0.69779046),
+    KissCpx::new(-0.70710678, 0.70710678), KissCpx::new(-0.69779046, 0.71630194),
+    KissCpx::new(-0.68835458, 0.72537437), KissCpx::new(-0.67880075, 0.73432251),
+    KissCpx::new(-0.66913061, 0.74314483), KissCpx::new(-0.65934582, 0.75183981),
+    KissCpx::new(-0.64944805, 0.76040597), KissCpx::new(-0.63943900, 0.76884183),
+    KissCpx::new(-0.62932039, 0.77714596), KissCpx::new(-0.61909395, 0.78531693),
+    KissCpx::new(-0.60876143, 0.79335334), KissCpx::new(-0.59832460, 0.80125381),
+    KissCpx::new(-0.58778525, 0.80901699), KissCpx::new(-0.57714519, 0.81664156),
+    KissCpx::new(-0.56640624, 0.82412619), KissCpx::new(-0.55557023, 0.83146961),
+    KissCpx::new(-0.54463904, 0.83867057), KissCpx::new(-0.53361452, 0.84572782),
+    KissCpx::new(-0.52249856, 0.85264016), KissCpx::new(-0.51129309, 0.85940641),
+    KissCpx::new(-0.50000000, 0.86602540), KissCpx::new(-0.48862124, 0.87249601),
+    KissCpx::new(-0.47715876, 0.87881711), KissCpx::new(-0.46561452, 0.88498764),
+    KissCpx::new(-0.45399050, 0.89100652), KissCpx::new(-0.44228869, 0.89687274),
+    KissCpx::new(-0.43051110, 0.90258528), KissCpx::new(-0.41865974, 0.90814317),
+    KissCpx::new(-0.40673664, 0.91354546), KissCpx::new(-0.39474386, 0.91879121),
+    KissCpx::new(-0.38268343, 0.92387953), KissCpx::new(-0.37055744, 0.92880955),
+    KissCpx::new(-0.35836795, 0.93358043), KissCpx::new(-0.34611706, 0.93819134),
+    KissCpx::new(-0.33380686, 0.94264149), KissCpx::new(-0.32143947, 0.94693013),
+    KissCpx::new(-0.30901699, 0.95105652), KissCpx::new(-0.29654157, 0.95501994),
+    KissCpx::new(-0.28401534, 0.95881973), KissCpx::new(-0.27144045, 0.96245524),
+    KissCpx::new(-0.25881905, 0.96592583), KissCpx::new(-0.24615329, 0.96923091),
+    KissCpx::new(-0.23344536, 0.97236992), KissCpx::new(-0.22069744, 0.97534232),
+    KissCpx::new(-0.20791169, 0.97814760), KissCpx::new(-0.19509032, 0.98078528),
+    KissCpx::new(-0.18223553, 0.98325491), KissCpx::new(-0.16934950, 0.98555606),
+    KissCpx::new(-0.15643447, 0.98768834), KissCpx::new(-0.14349262, 0.98965139),
+    KissCpx::new(-0.13052619, 0.99144486), KissCpx::new(-0.11753740, 0.99306846),
+    KissCpx::new(-0.10452846, 0.99452190), KissCpx::new(-0.091501619, 0.99580493),
+    KissCpx::new(-0.078459096, 0.99691733), KissCpx::new(-0.065403129, 0.99785892),
+    KissCpx::new(-0.052335956, 0.99862953), KissCpx::new(-0.039259816, 0.99922904),
+    KissCpx::new(-0.026176948, 0.99965732), KissCpx::new(-0.013089596, 0.99991433),
+    KissCpx::new(-1.8369702e-16, 1.0000000), KissCpx::new(0.013089596, 0.99991433),
+    KissCpx::new(0.026176948, 0.99965732), KissCpx::new(0.039259816, 0.99922904),
+    KissCpx::new(0.052335956, 0.99862953), KissCpx::new(0.065403129, 0.99785892),
+    KissCpx::new(0.078459096, 0.99691733), KissCpx::new(0.091501619, 0.99580493),
+    KissCpx::new(0.10452846, 0.99452190), KissCpx::new(0.11753740, 0.99306846),
+    KissCpx::new(0.13052619, 0.99144486), KissCpx::new(0.14349262, 0.98965139),
+    KissCpx::new(0.15643447, 0.98768834), KissCpx::new(0.16934950, 0.98555606),
+    KissCpx::new(0.18223553, 0.98325491), KissCpx::new(0.19509032, 0.98078528),
+    KissCpx::new(0.20791169, 0.97814760), KissCpx::new(0.22069744, 0.97534232),
+    KissCpx::new(0.23344536, 0.97236992), KissCpx::new(0.24615329, 0.96923091),
+    KissCpx::new(0.25881905, 0.96592583), KissCpx::new(0.27144045, 0.96245524),
+    KissCpx::new(0.28401534, 0.95881973), KissCpx::new(0.29654157, 0.95501994),
+    KissCpx::new(0.30901699, 0.95105652), KissCpx::new(0.32143947, 0.94693013),
+    KissCpx::new(0.33380686, 0.94264149), KissCpx::new(0.34611706, 0.93819134),
+    KissCpx::new(0.35836795, 0.93358043), KissCpx::new(0.37055744, 0.92880955),
+    KissCpx::new(0.38268343, 0.92387953), KissCpx::new(0.39474386, 0.91879121),
+    KissCpx::new(0.40673664, 0.91354546), KissCpx::new(0.41865974, 0.90814317),
+    KissCpx::new(0.43051110, 0.90258528), KissCpx::new(0.44228869, 0.89687274),
+    KissCpx::new(0.45399050, 0.89100652), KissCpx::new(0.46561452, 0.88498764),
+    KissCpx::new(0.47715876, 0.87881711), KissCpx::new(0.48862124, 0.87249601),
+    KissCpx::new(0.50000000, 0.86602540), KissCpx::new(0.51129309, 0.85940641),
+    KissCpx::new(0.52249856, 0.85264016), KissCpx::new(0.53361452, 0.84572782),
+    KissCpx::new(0.54463904, 0.83867057), KissCpx::new(0.55557023, 0.83146961),
+    KissCpx::new(0.56640624, 0.82412619), KissCpx::new(0.57714519, 0.81664156),
+    KissCpx::new(0.58778525, 0.80901699), KissCpx::new(0.59832460, 0.80125381),
+    KissCpx::new(0.60876143, 0.79335334), KissCpx::new(0.61909395, 0.78531693),
+    KissCpx::new(0.62932039, 0.77714596), KissCpx::new(0.63943900, 0.76884183),
+    KissCpx::new(0.64944805, 0.76040597), KissCpx::new(0.65934582, 0.75183981),
+    KissCpx::new(0.66913061, 0.74314483), KissCpx::new(0.67880075, 0.73432251),
+    KissCpx::new(0.68835458, 0.72537437), KissCpx::new(0.69779046, 0.71630194),
+    KissCpx::new(0.70710678, 0.70710678), KissCpx::new(0.71630194, 0.69779046),
+    KissCpx::new(0.72537437, 0.68835458), KissCpx::new(0.73432251, 0.67880075),
+    KissCpx::new(0.74314483, 0.66913061), KissCpx::new(0.75183981, 0.65934582),
+    KissCpx::new(0.76040597, 0.64944805), KissCpx::new(0.76884183, 0.63943900),
+    KissCpx::new(0.77714596, 0.62932039), KissCpx::new(0.78531693, 0.61909395),
+    KissCpx::new(0.79335334, 0.60876143), KissCpx::new(0.80125381, 0.59832460),
+    KissCpx::new(0.80901699, 0.58778525), KissCpx::new(0.81664156, 0.57714519),
+    KissCpx::new(0.82412619, 0.56640624), KissCpx::new(0.83146961, 0.55557023),
+    KissCpx::new(0.83867057, 0.54463904), KissCpx::new(0.84572782, 0.53361452),
+    KissCpx::new(0.85264016, 0.52249856), KissCpx::new(0.85940641, 0.51129309),
+    KissCpx::new(0.86602540, 0.50000000), KissCpx::new(0.87249601, 0.48862124),
+    KissCpx::new(0.87881711, 0.47715876), KissCpx::new(0.88498764, 0.46561452),
+    KissCpx::new(0.89100652, 0.45399050), KissCpx::new(0.89687274, 0.44228869),
+    KissCpx::new(0.90258528, 0.43051110), KissCpx::new(0.90814317, 0.41865974),
+    KissCpx::new(0.91354546, 0.40673664), KissCpx::new(0.91879121, 0.39474386),
+    KissCpx::new(0.92387953, 0.38268343), KissCpx::new(0.92880955, 0.37055744),
+    KissCpx::new(0.93358043, 0.35836795), KissCpx::new(0.93819134, 0.34611706),
+    KissCpx::new(0.94264149, 0.33380686), KissCpx::new(0.94693013, 0.32143947),
+    KissCpx::new(0.95105652, 0.30901699), KissCpx::new(0.95501994, 0.29654157),
+    KissCpx::new(0.95881973, 0.28401534), KissCpx::new(0.96245524, 0.27144045),
+    KissCpx::new(0.96592583, 0.25881905), KissCpx::new(0.96923091, 0.24615329),
+    KissCpx::new(0.97236992, 0.23344536), KissCpx::new(0.97534232, 0.22069744),
+    KissCpx::new(0.97814760, 0.20791169), KissCpx::new(0.98078528, 0.19509032),
+    KissCpx::new(0.98325491, 0.18223553), KissCpx::new(0.98555606, 0.16934950),
+    KissCpx::new(0.98768834, 0.15643447), KissCpx::new(0.98965139, 0.14349262),
+    KissCpx::new(0.99144486, 0.13052619), KissCpx::new(0.99306846, 0.11753740),
+    KissCpx::new(0.99452190, 0.10452846), KissCpx::new(0.99580493, 0.091501619),
+    KissCpx::new(0.99691733, 0.078459096), KissCpx::new(0.99785892, 0.065403129),
+    KissCpx::new(0.99862953, 0.052335956), KissCpx::new(0.99922904, 0.039259816),
+    KissCpx::new(0.99965732, 0.026176948), KissCpx::new(0.99991433, 0.013089596),
+];
+
+/// Test memory with pages around it that must not be touched.
+///
+/// A kernel that reads or writes even one value outside a slice placed here
+/// stops the test with a memory fault. The tests of `mdct.rs` use it too.
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod test_guard {
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64"
+    ))]
+    mod imp {
+        use core::ffi::{c_int, c_void};
+
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut c_void,
+                len: usize,
+                prot: c_int,
+                flags: c_int,
+                fd: c_int,
+                offset: i64,
+            ) -> *mut c_void;
+            fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+            fn munmap(addr: *mut c_void, len: usize) -> c_int;
+        }
+
+        /// 64 KiB: a multiple of every page size in use (4, 16 and 64 KiB).
+        const SPAN: usize = 1 << 16;
+        const PROT_NONE: c_int = 0;
+        const PROT_READ_WRITE: c_int = 3;
+        const MAP_PRIVATE: c_int = 2;
+        #[cfg(target_os = "macos")]
+        const MAP_ANON: c_int = 0x1000;
+        #[cfg(target_os = "linux")]
+        const MAP_ANON: c_int = 0x20;
+
+        /// 64 KiB of memory between two blocks of 64 KiB that may be neither
+        /// read nor written.
+        pub(crate) struct Region {
+            base: *mut u8,
+        }
+
+        impl Region {
+            pub(crate) fn new() -> Self {
+                // SAFETY: a new private mapping; the two calls of `mprotect`
+                // cover its first and its last third.
+                unsafe {
+                    let base = mmap(
+                        core::ptr::null_mut(),
+                        3 * SPAN,
+                        PROT_READ_WRITE,
+                        MAP_PRIVATE | MAP_ANON,
+                        -1,
+                        0,
+                    );
+                    assert!(base as isize != -1, "mmap failed");
+                    assert_eq!(mprotect(base, SPAN, PROT_NONE), 0);
+                    assert_eq!(mprotect(base.add(2 * SPAN), SPAN, PROT_NONE), 0);
+                    Region {
+                        base: base as *mut u8,
+                    }
+                }
+            }
+
+            /// A copy of `data` that ends at the protected block behind the
+            /// region (`at_end`), or starts right behind the protected block
+            /// in front of it.
+            pub(crate) fn place<T: Copy>(&mut self, data: &[T], at_end: bool) -> &mut [T] {
+                let bytes = core::mem::size_of_val(data);
+                assert!(bytes <= SPAN && SPAN.is_multiple_of(core::mem::align_of::<T>()));
+                // SAFETY: the middle third of the mapping is readable and
+                // writable and `bytes` fit in it. Its two ends are aligned
+                // for `T`, and `bytes` is a multiple of the size of `T`. The
+                // returned slice borrows `self`.
+                unsafe {
+                    let start = if at_end {
+                        self.base.add(2 * SPAN - bytes)
+                    } else {
+                        self.base.add(SPAN)
+                    } as *mut T;
+                    core::ptr::copy_nonoverlapping(data.as_ptr(), start, data.len());
+                    core::slice::from_raw_parts_mut(start, data.len())
+                }
+            }
+        }
+
+        impl Drop for Region {
+            fn drop(&mut self) {
+                // SAFETY: the mapping made in `new`.
+                unsafe {
+                    munmap(self.base as *mut c_void, 3 * SPAN);
+                }
+            }
+        }
+    }
+
+    /// Without `mmap`: a plain buffer of exactly the length asked for.
+    #[cfg(not(all(
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64"
+    )))]
+    mod imp {
+        pub(crate) struct Region {
+            /// `u128` gives the alignment of every type the tests place.
+            buf: Vec<u128>,
+        }
+
+        impl Region {
+            pub(crate) fn new() -> Self {
+                Region { buf: Vec::new() }
+            }
+
+            pub(crate) fn place<T: Copy>(&mut self, data: &[T], _at_end: bool) -> &mut [T] {
+                let bytes = core::mem::size_of_val(data);
+                assert!(core::mem::align_of::<T>() <= core::mem::align_of::<u128>());
+                self.buf.clear();
+                self.buf.resize(bytes.div_ceil(16), 0);
+                // SAFETY: the buffer holds at least `bytes` bytes and is
+                // aligned for `T`. The returned slice borrows `self`.
+                unsafe {
+                    let start = self.buf.as_mut_ptr() as *mut T;
+                    core::ptr::copy_nonoverlapping(data.as_ptr(), start, data.len());
+                    core::slice::from_raw_parts_mut(start, data.len())
+                }
+            }
+        }
+    }
+
+    pub(crate) use imp::Region;
+
+    /// The two places the tests put each slice: ending at a protected block,
+    /// and starting right behind one.
+    pub(crate) const PLACEMENTS: [bool; 2] = [true, false];
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
+    use super::test_guard::{PLACEMENTS, Region};
     use super::*;
+    use core::f32::consts::PI;
 
     fn almost_equal(a: f32, b: f32, tolerance: f32) -> bool {
         (a - b).abs() < tolerance
@@ -1261,14 +1971,19 @@ mod tests {
     }
 
     /// Number of input classes `fill` knows.
-    const CLASSES: usize = 4;
+    const CLASSES: usize = 5;
+
+    /// The numbers of class 4.
+    const ZEROS_AND_ONES: [f32; 4] = [0.0, -0.0, 1.0, -1.0];
 
     /// Fills `out` with test data.
     ///
     /// Class 0: audio-sized values. Class 1: values whose products overflow
     /// to infinity and then give NaN. Class 2: values whose products are
     /// subnormal. Class 3: signed zeros, infinities, the largest and the
-    /// smallest numbers, mixed with ordinary values.
+    /// smallest numbers, mixed with ordinary values. Class 4: zeros of both
+    /// signs, 1 and -1; many products and sums are then exactly zero, and
+    /// the sign of the zero is all that can go wrong.
     fn fill(rng: &mut Lcg, out: &mut [KissCpx], class: usize) {
         const SPECIAL: [f32; 9] = [
             0.0,
@@ -1285,6 +2000,7 @@ mod tests {
             0 => rng.unit() * 32768.0,
             1 => rng.unit() * 1e30,
             2 => rng.unit() * 1e-38,
+            4 => ZEROS_AND_ONES[rng.next_u32() as usize % 4],
             _ => {
                 let pick = rng.next_u32() as usize % (2 * SPECIAL.len());
                 if pick < SPECIAL.len() {
@@ -1318,7 +2034,8 @@ mod tests {
     }
 
     /// The FFT as it was before the per-stage twiddle tables: the butterflies
-    /// of libopus, reading one shared twiddle table with a stride.
+    /// of libopus, reading one shared twiddle table with a stride. `A` says
+    /// whether the products that clang fuses for arm64 are fused.
     mod strided {
         use super::super::*;
 
@@ -1360,7 +2077,7 @@ mod tests {
             }
         }
 
-        fn bfly4(
+        fn bfly4<A: Arith>(
             fout: &mut [KissCpx],
             fstride: usize,
             twiddles: &[KissCpx],
@@ -1396,9 +2113,9 @@ mod tests {
                     for j in 0..m {
                         let idx = base + j;
 
-                        let scratch0 = c_mul(&fout[idx + m], &twiddles[tw1]);
-                        let scratch1 = c_mul(&fout[idx + m2], &twiddles[tw2]);
-                        let scratch2 = c_mul(&fout[idx + m3], &twiddles[tw3]);
+                        let scratch0 = c_mul::<A>(&fout[idx + m], &twiddles[tw1]);
+                        let scratch1 = c_mul::<A>(&fout[idx + m2], &twiddles[tw2]);
+                        let scratch2 = c_mul::<A>(&fout[idx + m3], &twiddles[tw3]);
 
                         let scratch5 = c_sub(&fout[idx], &scratch1);
                         fout[idx] = c_add(&fout[idx], &scratch1);
@@ -1422,7 +2139,7 @@ mod tests {
             }
         }
 
-        fn bfly3(
+        fn bfly3<A: Arith>(
             fout: &mut [KissCpx],
             fstride: usize,
             twiddles: &[KissCpx],
@@ -1442,16 +2159,16 @@ mod tests {
                 for j in 0..m {
                     let idx = base + j;
 
-                    let scratch1 = c_mul(&fout[idx + m], &twiddles[tw1]);
-                    let scratch2 = c_mul(&fout[idx + m2], &twiddles[tw2]);
+                    let scratch1 = c_mul::<A>(&fout[idx + m], &twiddles[tw1]);
+                    let scratch2 = c_mul::<A>(&fout[idx + m2], &twiddles[tw2]);
 
                     let scratch3 = c_add(&scratch1, &scratch2);
                     let scratch0 = c_sub(&scratch1, &scratch2);
 
-                    let half_scratch3 = KissCpx::new(scratch3.r * 0.5, scratch3.i * 0.5);
-
-                    let fout_m =
-                        KissCpx::new(fout[idx].r - half_scratch3.r, fout[idx].i - half_scratch3.i);
+                    let fout_m = KissCpx::new(
+                        A::mul_add(-scratch3.r, 0.5, fout[idx].r),
+                        A::mul_add(-scratch3.i, 0.5, fout[idx].i),
+                    );
 
                     let scratch0_scaled = KissCpx::new(scratch0.r * epi3_i, scratch0.i * epi3_i);
 
@@ -1468,7 +2185,7 @@ mod tests {
             }
         }
 
-        fn bfly5(
+        fn bfly5<A: Arith>(
             fout: &mut [KissCpx],
             fstride: usize,
             twiddles: &[KissCpx],
@@ -1499,10 +2216,10 @@ mod tests {
 
                     let scratch0 = fout[idx0];
 
-                    let scratch1 = c_mul(&fout[idx1], &twiddles[tw1]);
-                    let scratch2 = c_mul(&fout[idx2], &twiddles[tw2]);
-                    let scratch3 = c_mul(&fout[idx3], &twiddles[tw3]);
-                    let scratch4 = c_mul(&fout[idx4], &twiddles[tw4]);
+                    let scratch1 = c_mul::<A>(&fout[idx1], &twiddles[tw1]);
+                    let scratch2 = c_mul::<A>(&fout[idx2], &twiddles[tw2]);
+                    let scratch3 = c_mul::<A>(&fout[idx3], &twiddles[tw3]);
+                    let scratch4 = c_mul::<A>(&fout[idx4], &twiddles[tw4]);
 
                     let scratch7 = c_add(&scratch1, &scratch4);
                     let scratch10 = c_sub(&scratch1, &scratch4);
@@ -1510,31 +2227,31 @@ mod tests {
                     let scratch9 = c_sub(&scratch2, &scratch3);
 
                     fout[idx0] = KissCpx::new(
-                        scratch0.r + scratch7.r + scratch8.r,
-                        scratch0.i + scratch7.i + scratch8.i,
+                        scratch0.r + (scratch7.r + scratch8.r),
+                        scratch0.i + (scratch7.i + scratch8.i),
                     );
 
                     let scratch5 = KissCpx::new(
-                        scratch0.r + scratch7.r * ya.r + scratch8.r * yb.r,
-                        scratch0.i + scratch7.i * ya.r + scratch8.i * yb.r,
+                        scratch0.r + A::mul_add(scratch7.r, ya.r, scratch8.r * yb.r),
+                        scratch0.i + A::mul_add(scratch7.i, ya.r, scratch8.i * yb.r),
                     );
 
                     let scratch6 = KissCpx::new(
-                        scratch10.i * ya.i + scratch9.i * yb.i,
-                        -(scratch10.r * ya.i + scratch9.r * yb.i),
+                        A::mul_add(scratch10.i, ya.i, scratch9.i * yb.i),
+                        -A::mul_add(scratch10.r, ya.i, scratch9.r * yb.i),
                     );
 
                     fout[idx1] = c_sub(&scratch5, &scratch6);
                     fout[idx4] = c_add(&scratch5, &scratch6);
 
                     let scratch11 = KissCpx::new(
-                        scratch0.r + scratch7.r * yb.r + scratch8.r * ya.r,
-                        scratch0.i + scratch7.i * yb.r + scratch8.i * ya.r,
+                        scratch0.r + A::mul_add(scratch7.r, yb.r, scratch8.r * ya.r),
+                        scratch0.i + A::mul_add(scratch7.i, yb.r, scratch8.i * ya.r),
                     );
 
                     let scratch12 = KissCpx::new(
-                        scratch9.i * ya.i - scratch10.i * yb.i,
-                        scratch10.r * yb.i - scratch9.r * ya.i,
+                        A::mul_add(scratch9.i, ya.i, -(scratch10.i * yb.i)),
+                        A::mul_add(scratch10.r, yb.i, -(scratch9.r * ya.i)),
                     );
 
                     fout[idx2] = c_add(&scratch11, &scratch12);
@@ -1550,7 +2267,7 @@ mod tests {
 
         /// In-place FFT of `nfft` samples with the twiddle table of the size
         /// `nfft << shift`.
-        pub fn fft(nfft: usize, shift: usize, fout: &mut [KissCpx]) {
+        pub fn fft<A: Arith>(nfft: usize, shift: usize, fout: &mut [KissCpx]) {
             let mut factors = [0i16; 2 * MAXFACTORS];
             assert!(kf_factor(nfft, &mut factors));
             let twiddles = compute_twiddles(nfft << shift);
@@ -1581,14 +2298,44 @@ mod tests {
                 };
                 match p {
                     2 => bfly2(fout, m, fstride_i),
-                    4 => bfly4(fout, fstride_adjusted, &twiddles, m, fstride_i, m2),
-                    3 => bfly3(fout, fstride_adjusted, &twiddles, m, fstride_i, m2),
-                    5 => bfly5(fout, fstride_adjusted, &twiddles, m, fstride_i, m2),
+                    4 => bfly4::<A>(fout, fstride_adjusted, &twiddles, m, fstride_i, m2),
+                    3 => bfly3::<A>(fout, fstride_adjusted, &twiddles, m, fstride_i, m2),
+                    5 => bfly5::<A>(fout, fstride_adjusted, &twiddles, m, fstride_i, m2),
                     _ => {}
                 }
                 m = m2;
             }
         }
+    }
+
+    /// The constants of the radix-3 and radix-5 butterflies are the table
+    /// entries libopus uses for them.
+    #[test]
+    fn test_butterfly_constants_are_table_entries() {
+        assert_eq!(EPI3_I.to_bits(), FFT_TWIDDLES_480[160].i.to_bits());
+        assert_eq!(YA_R.to_bits(), FFT_TWIDDLES_480[96].r.to_bits());
+        assert_eq!(YA_I.to_bits(), FFT_TWIDDLES_480[96].i.to_bits());
+        assert_eq!(YB_R.to_bits(), FFT_TWIDDLES_480[192].r.to_bits());
+        assert_eq!(YB_I.to_bits(), FFT_TWIDDLES_480[192].i.to_bits());
+    }
+
+    /// The copied table is a twiddle table: every entry is within one unit
+    /// in the last place of the exact value.
+    #[test]
+    fn test_twiddle_table_values() {
+        let mut inexact = 0;
+        for (i, t) in FFT_TWIDDLES_480.iter().enumerate() {
+            let phase = -2.0 * core::f64::consts::PI * i as f64 / 480.0;
+            let (s, c) = phase.sin_cos();
+            assert!((t.r as f64 - c).abs() <= 6.0e-8, "entry {i}");
+            assert!((t.i as f64 - s).abs() <= 6.0e-8, "entry {i}");
+            if t.r != c as f32 || t.i != s as f32 {
+                inexact += 1;
+            }
+        }
+        // Why the table is copied and not computed.
+        assert!(inexact > 0);
+        assert_eq!(FFT_TWIDDLES_480[0].i.to_bits(), (-0.0f32).to_bits());
     }
 
     #[test]
@@ -1615,21 +2362,61 @@ mod tests {
         assert!(KissFftState::new_sub(&base, 100).is_none());
     }
 
+    /// Every plan holds a permutation of `0..nfft` in `bitrev`. The MDCT
+    /// relies on it.
     #[test]
     fn test_bitrev_permutation() {
-        for &nfft in &[60, 120, 240, 480] {
-            let st = KissFftState::new(nfft).unwrap();
+        let base = KissFftState::new(480).unwrap();
+        let mut plans: Vec<KissFftState> = valid_sizes()
+            .into_iter()
+            .map(|n| KissFftState::new(n).unwrap())
+            .collect();
+        for n in [60, 120, 240] {
+            plans.push(KissFftState::new_sub(&base, n).unwrap());
+        }
+        for st in &plans {
+            let nfft = st.nfft();
             let mut sorted: Vec<i16> = st.bitrev.as_slice().to_vec();
             sorted.sort();
             let expected: Vec<i16> = (0..nfft).map(|x| x as i16).collect();
-            assert_eq!(
-                sorted,
-                expected,
-                "bitrev for nfft={} should be a permutation of 0..{}",
-                nfft,
-                nfft - 1
-            );
+            assert_eq!(sorted, expected, "bitrev for nfft={nfft}");
         }
+    }
+
+    /// The permutation check of `build` rejects no size: the table is a
+    /// permutation for every size that has a factorisation.
+    #[test]
+    fn test_bitrev_is_a_permutation_for_every_factorisation() {
+        let mut sizes = 0;
+        for nfft in 1..=KISS_MAX_N {
+            let mut factors = [0i16; 2 * MAXFACTORS];
+            if !kf_factor(nfft, &mut factors) {
+                continue;
+            }
+            let mut bitrev = vec![0i16; nfft];
+            compute_bitrev_table(0, &mut bitrev, 1, 1, &factors);
+            assert!(is_permutation(&bitrev), "nfft {nfft}");
+            sizes += 1;
+        }
+        assert!(sizes >= valid_sizes().len());
+        assert!(valid_sizes().contains(&480));
+    }
+
+    #[test]
+    fn test_is_permutation() {
+        assert!(is_permutation(&[]));
+        assert!(is_permutation(&[0]));
+        assert!(is_permutation(&[2, 0, 1]));
+        // A number twice, a number too large, a negative number.
+        assert!(!is_permutation(&[0, 0]));
+        assert!(!is_permutation(&[0, 2]));
+        assert!(!is_permutation(&[1, -1]));
+        // The last bit of a word and the first bit of the next one.
+        let mut long: Vec<i16> = (0..130).collect();
+        assert!(is_permutation(&long));
+        long[63] = 64;
+        assert!(!is_permutation(&long));
+        assert!(!is_permutation(&vec![0i16; KISS_MAX_N + 1]));
     }
 
     #[test]
@@ -1665,7 +2452,7 @@ mod tests {
     }
 
     /// The portable FFT with per-stage tables gives the bits of the FFT that
-    /// read one shared table with a stride.
+    /// read one shared table with a stride, with and without fused products.
     #[test]
     fn test_scalar_fft_matches_strided_tables() {
         let mut rng = Lcg(0x5eed_0001);
@@ -1683,21 +2470,110 @@ mod tests {
                 let mut a = vec![KissCpx::default(); *nfft];
                 fill(&mut rng, &mut a, class);
                 let mut b = a.clone();
+                let mut c = a.clone();
+                let mut d = a.clone();
                 opus_fft_impl_scalar(st, &mut a);
-                strided::fft(*nfft, *shift, &mut b);
+                strided::fft::<Separate>(*nfft, *shift, &mut b);
                 assert_eq!(
                     first_difference(&a, &b),
                     None,
                     "nfft {nfft} shift {shift} class {class}"
                 );
+                opus_fft_impl_fused(st, &mut c);
+                strided::fft::<Fused>(*nfft, *shift, &mut d);
+                assert_eq!(
+                    first_difference(&c, &d),
+                    None,
+                    "fused, nfft {nfft} shift {shift} class {class}"
+                );
             }
         }
     }
 
-    /// `opus_fft_impl` gives the bits of the portable FFT for every size.
+    /// The portable FFT whose bits `opus_fft_impl` gives on this target.
+    fn reference_fft(st: &KissFftState, fout: &mut [KissCpx]) {
+        if cfg!(target_arch = "aarch64") {
+            opus_fft_impl_fused(st, fout);
+        } else {
+            opus_fft_impl_scalar(st, fout);
+        }
+    }
+
+    /// Largest difference between two results, relative to the largest
+    /// value.
+    fn max_relative_difference(a: &[KissCpx], b: &[KissCpx]) -> f32 {
+        let peak = b.iter().fold(0f32, |m, c| m.max(c.r.abs()).max(c.i.abs()));
+        let diff = a
+            .iter()
+            .zip(b)
+            .fold(0f32, |m, (x, y)| m.max((x.r - y.r).abs()).max((x.i - y.i).abs()));
+        if peak == 0.0 { diff } else { diff / peak }
+    }
+
+    /// `opus_fft_impl` gives the bits of the portable FFT of this target for
+    /// every size.
     #[test]
-    fn test_fft_matches_scalar_fft() {
+    fn test_fft_matches_reference_fft() {
         let mut rng = Lcg(0x5eed_0002);
+        let mut plans: Vec<KissFftState> = valid_sizes()
+            .into_iter()
+            .map(|n| KissFftState::new(n).unwrap())
+            .collect();
+        let base = KissFftState::new(480).unwrap();
+        for n in [60, 120, 240] {
+            plans.push(KissFftState::new_sub(&base, n).unwrap());
+        }
+        let mut region = Region::new();
+        for st in &plans {
+            let nfft = st.nfft();
+            for class in 0..CLASSES {
+                for _ in 0..4 {
+                    // Three extra samples behind the transform must stay as
+                    // they are.
+                    let mut a = vec![KissCpx::default(); nfft + 3];
+                    fill(&mut rng, &mut a, class);
+                    let mut b = a.clone();
+                    // A buffer of exactly `nfft` samples between two blocks
+                    // of memory that must not be touched.
+                    for at_end in PLACEMENTS {
+                        let c = region.place(&a[..nfft], at_end);
+                        opus_fft_impl(st, c);
+                        reference_fft(st, &mut b[..nfft]);
+                        assert_eq!(first_difference(c, &b[..nfft]), None, "nfft {nfft} class {class}");
+                        b[..nfft].copy_from_slice(&a[..nfft]);
+                    }
+                    opus_fft_impl(st, &mut a);
+                    reference_fft(st, &mut b);
+                    assert_eq!(first_difference(&a, &b), None, "nfft {nfft} class {class}");
+                }
+            }
+        }
+    }
+
+    /// Fusing the products changes the last bits only: for audio-sized input
+    /// the two portable transforms agree to 1e-5 of the largest value.
+    #[test]
+    fn test_fused_fft_is_close_to_the_separate_one() {
+        let mut rng = Lcg(0x5eed_0004);
+        for nfft in valid_sizes() {
+            let st = KissFftState::new(nfft).unwrap();
+            let mut a = vec![KissCpx::default(); nfft];
+            fill(&mut rng, &mut a, 0);
+            let mut b = a.clone();
+            opus_fft_impl_fused(&st, &mut a);
+            opus_fft_impl_scalar(&st, &mut b);
+            let d = max_relative_difference(&a, &b);
+            assert!(d < 1e-5, "nfft {nfft}: {d}");
+        }
+    }
+
+    /// The two aarch64 versions of the transform give the bits of the
+    /// portable fused one for every size. The `fcma` version runs only on a
+    /// processor that has the instructions.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_fused_fft_versions_agree() {
+        let mut rng = Lcg(0x5eed_0005);
         let mut plans: Vec<KissFftState> = valid_sizes()
             .into_iter()
             .map(|n| KissFftState::new(n).unwrap())
@@ -1709,58 +2585,80 @@ mod tests {
         for st in &plans {
             let nfft = st.nfft();
             for class in 0..CLASSES {
-                for _ in 0..4 {
-                    // Three extra samples behind the transform must stay as
-                    // they are.
-                    let mut a = vec![KissCpx::default(); nfft + 3];
-                    fill(&mut rng, &mut a, class);
-                    let mut b = a.clone();
-                    opus_fft_impl(st, &mut a);
-                    opus_fft_impl_scalar(st, &mut b);
-                    assert_eq!(first_difference(&a, &b), None, "nfft {nfft} class {class}");
+                let mut want = vec![KissCpx::default(); nfft];
+                fill(&mut rng, &mut want, class);
+                let mut a = want.clone();
+                let mut b = want.clone();
+                opus_fft_impl_fused(st, &mut want);
+                unsafe { fused::fma::stages(st, &mut a) };
+                assert_eq!(first_difference(&a, &want), None, "fma, nfft {nfft} class {class}");
+                if has_fcma() {
+                    unsafe { fused::fcma::stages(st, &mut b) };
+                    assert_eq!(first_difference(&b, &want), None, "fcma, nfft {nfft} class {class}");
                 }
             }
         }
     }
 
-    /// Each NEON butterfly gives the bits of its portable version, for every
-    /// number of butterflies left over after the vector loop.
+    /// Each aarch64 butterfly gives the bits of its portable version, for
+    /// every number of butterflies left over after the vector loop.
+    ///
+    /// The samples and the twiddles have exactly the lengths the kernel
+    /// needs, and lie between two blocks of memory that must not be touched.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_neon_butterflies_match_scalar() {
         let mut rng = Lcg(0x5eed_0003);
+        let mut samples = Region::new();
+        let mut twiddles = Region::new();
         let ms: Vec<usize> = (0..=13).chain([16, 24, 32, 96]).collect();
         for class in 0..CLASSES {
             for &m in &ms {
                 for groups in 0..=3usize {
                     // Twiddles: any finite values, the kernels do not rely on
-                    // them having magnitude 1.
-                    let tw: Vec<f32> = (0..8 * m).map(|_| rng.unit()).collect();
+                    // them having magnitude 1. For the class of zeros and
+                    // ones the twiddles are zeros and ones too, like the
+                    // first twiddle of every stage, which is (1, -0).
+                    let tw: Vec<f32> = (0..8 * m)
+                        .map(|_| {
+                            if class == 4 {
+                                ZEROS_AND_ONES[rng.next_u32() as usize % 4]
+                            } else {
+                                rng.unit()
+                            }
+                        })
+                        .collect();
                     for radix in [3usize, 4, 5] {
                         let n = radix * m * groups;
                         let mut a = vec![KissCpx::default(); n];
                         fill(&mut rng, &mut a, class);
-                        let mut b = a.clone();
+                        let input = a.clone();
                         let tw = &tw[..2 * (radix - 1) * m];
                         match radix {
-                            3 => {
-                                kf_bfly3_scalar(&mut a, tw, m, groups);
-                                unsafe { neon::bfly3(&mut b, tw, m, groups) };
+                            3 => kf_bfly3_scalar::<Fused>(&mut a, tw, m, groups),
+                            4 => kf_bfly4_scalar::<Fused>(&mut a, tw, m, groups),
+                            _ => kf_bfly5_scalar::<Fused>(&mut a, tw, m, groups),
+                        }
+                        for at_end in PLACEMENTS {
+                            let what = format!("radix {radix} m {m} groups {groups} class {class}");
+                            let b = samples.place(&input, at_end);
+                            let tw = twiddles.place(tw, at_end);
+                            match radix {
+                                3 => unsafe { fused::fma::bfly3(b, tw, m, groups) },
+                                4 => unsafe { fused::fma::bfly4(b, tw, m, groups) },
+                                _ => unsafe { fused::fma::bfly5(b, tw, m, groups) },
                             }
-                            4 => {
-                                kf_bfly4_scalar(&mut a, tw, m, groups);
-                                unsafe { neon::bfly4(&mut b, tw, m, groups) };
-                            }
-                            _ => {
-                                kf_bfly5_scalar(&mut a, tw, m, groups);
-                                unsafe { neon::bfly5(&mut b, tw, m, groups) };
+                            assert_eq!(first_difference(&a, b), None, "fma, {what}");
+                            if has_fcma() {
+                                let b = samples.place(&input, at_end);
+                                match radix {
+                                    3 => unsafe { fused::fcma::bfly3(b, tw, m, groups) },
+                                    4 => unsafe { fused::fcma::bfly4(b, tw, m, groups) },
+                                    _ => unsafe { fused::fcma::bfly5(b, tw, m, groups) },
+                                }
+                                assert_eq!(first_difference(&a, b), None, "fcma, {what}");
                             }
                         }
-                        assert_eq!(
-                            first_difference(&a, &b),
-                            None,
-                            "radix {radix} m {m} groups {groups} class {class}"
-                        );
                     }
                 }
             }
@@ -1769,26 +2667,24 @@ mod tests {
                 for (radix, m) in [(2usize, 1usize), (2, 4), (4, 1)] {
                     let mut a = vec![KissCpx::default(); radix * m * groups];
                     fill(&mut rng, &mut a, class);
-                    let mut b = a.clone();
+                    let input = a.clone();
                     match (radix, m) {
-                        (2, 1) => {
-                            kf_bfly2_scalar(&mut a, 1, groups);
-                            unsafe { neon::bfly2_m1(&mut b, groups) };
-                        }
-                        (2, _) => {
-                            kf_bfly2_scalar(&mut a, 4, groups);
-                            unsafe { neon::bfly2_m4(&mut b, groups) };
-                        }
-                        _ => {
-                            kf_bfly4_m1_scalar(&mut a, groups);
-                            unsafe { neon::bfly4_m1(&mut b, groups) };
-                        }
+                        (2, _) => kf_bfly2_scalar(&mut a, m, groups),
+                        _ => kf_bfly4_m1_scalar(&mut a, groups),
                     }
-                    assert_eq!(
-                        first_difference(&a, &b),
-                        None,
-                        "radix {radix} m {m} groups {groups} class {class}"
-                    );
+                    for at_end in PLACEMENTS {
+                        let b = samples.place(&input, at_end);
+                        match (radix, m) {
+                            (2, 1) => unsafe { neon::bfly2_m1(b, groups) },
+                            (2, _) => unsafe { neon::bfly2_m4(b, groups) },
+                            _ => unsafe { neon::bfly4_m1(b, groups) },
+                        }
+                        assert_eq!(
+                            first_difference(&a, b),
+                            None,
+                            "radix {radix} m {m} groups {groups} class {class}"
+                        );
+                    }
                 }
             }
         }

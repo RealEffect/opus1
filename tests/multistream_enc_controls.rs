@@ -752,7 +752,6 @@ fn tight_output_buffers_with_40_and_60_ms_frames() {
 }
 
 #[test]
-#[ignore = "src/lib.rs splits a 40 or 60 ms frame into 20 ms parts before it applies the too-few-bytes rule of opus_encode_native, and refuses a 1-byte buffer"]
 fn tight_output_buffers_with_40_and_60_ms_frames_like_libopus() {
     let tight = tight_buffers(&[1920, 2880]);
     assert!(
@@ -869,10 +868,9 @@ fn final_range_is_the_xor_of_the_stream_encoders() {
 /// every frame, as libopus does. A mask set by hand does not survive a
 /// frame there. In any other layout the encoder leaves the mask alone.
 ///
-/// The surround analysis that computes the masks is not ported yet, so the
-/// streams of a surround layout have no mask after a frame. Once it is,
-/// they have the 21 values per channel the analysis gives them. The test
-/// holds in both states.
+/// After a frame every stream of a surround layout has the 21 values per
+/// channel the surround analysis gave it. tests/multistream_enc_streams.rs
+/// checks the values.
 #[test]
 fn surround_mode_sets_the_energy_mask_of_every_stream() {
     let fs = 48_000;
@@ -904,7 +902,8 @@ fn surround_mode_sets_the_energy_mask_of_every_stream() {
                     Some(mask) => {
                         assert_eq!(mask, &by_hand[..values], "{}: stream {s}", case.name)
                     }
-                    None => assert!(surround, "{}: stream {s} lost its mask", case.name),
+                    None if surround => panic!("{}: stream {s} has no mask", case.name),
+                    None => panic!("{}: stream {s} lost its mask", case.name),
                 }
             }
         }

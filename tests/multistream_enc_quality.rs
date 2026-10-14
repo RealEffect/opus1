@@ -26,6 +26,7 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus_rs::multistream::encoder::MultistreamEncoder;
+use opus_rs::multistream::surround::SurroundProbe;
 use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 const FS: i32 = 48_000;
@@ -200,57 +201,126 @@ fn snr_on_a_speech_like_signal_against_libopus() {
     check_quality("voiced", 7.0, 7.0);
 }
 
-/// The gap of the coupled streams is not made by the multistream encoder: a
-/// coupled stream holds exactly the packets a single stereo encoder with
-/// the same settings writes for the two channels.
-#[test]
-#[ignore = "fails since surround masking, LFE tuning and channel conversion were merged together: expectations to be reviewed"]
-fn a_coupled_stream_is_what_a_stereo_encoder_writes() {
+/// How the coupled streams of the 7.1 layout compare with a single stereo
+/// encoder that codes the two channels of the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaskGiven {
+    /// The mask of the stream's left channel, then that of its right
+    /// channel, as libopus hands it over
+    /// (opus_multistream_encoder.c:989-995).
+    LeftThenRight,
+    /// The mask of the two channels of the next coupled stream.
+    OfAnotherStream,
+    /// No mask, as for a stream outside surround mode.
+    Nothing,
+}
+
+/// Codes one second on the 7.1 layout and codes the channels of every
+/// coupled stream again with a stereo encoder that has the settings libopus
+/// gives a coupled surround stream. The mask comes from an analysis of the
+/// same input that is separate from the multistream encoder. Returns how
+/// many stream packets are the same bytes, and how many were compared.
+fn coupled_streams_equal_to_a_stereo_encoder(vbr: bool, given: MaskGiven) -> (usize, usize) {
     let case = Case::family("7.1", 8, 1);
+    let mut enc = rust_encoder(&case, FS, Application::Audio);
+    enc.set_bitrate(rust_bitrate(320_000)).unwrap();
+    enc.set_vbr(vbr);
+    let pcm = voiced(FS, 8, FS as usize);
+    let packets = rust_encode_all(&mut enc, &pcm, FRAME);
+    let layout = enc.layout().clone();
+
+    // The mask of every frame: 21 values per input channel.
+    let mut probe = SurroundProbe::new(8, FS);
+    let masks: Vec<Vec<f32>> = pcm
+        .chunks_exact(FRAME * 8)
+        .map(|frame| {
+            let mut band_smr = vec![0f32; 21 * 8];
+            assert!(probe.run(frame, FRAME, &mut band_smr));
+            band_smr
+        })
+        .collect();
+
+    let (mut equal, mut compared) = (0, 0);
+    for stream in 0..layout.coupled_streams() {
+        let left = layout.left_channel(stream, None).unwrap();
+        let right = layout.right_channel(stream, None).unwrap();
+        let mut single = OpusEncoder::new(FS, 2, Application::Audio).unwrap();
+        single.bitrate_bps = enc.stream_encoder(stream).unwrap().bitrate_bps;
+        single.use_cbr = !vbr;
+        single.set_force_mode(Some(ForcedMode::CeltOnly));
+        single.set_bandwidth(Bandwidth::Fullband);
+        let mut out = vec![0u8; 1500];
+        for (f, frame) in pcm.chunks_exact(FRAME * 8).enumerate() {
+            let stereo: Vec<f32> = frame
+                .chunks_exact(8)
+                .flat_map(|x| [x[left], x[right]])
+                .collect();
+            let of = |c: usize| &masks[f][21 * c..21 * c + 21];
+            let mask = match given {
+                MaskGiven::LeftThenRight => [of(left), of(right)].concat(),
+                MaskGiven::OfAnotherStream => {
+                    let other = (stream + 1) % layout.coupled_streams();
+                    [
+                        of(layout.left_channel(other, None).unwrap()),
+                        of(layout.right_channel(other, None).unwrap()),
+                    ]
+                    .concat()
+                }
+                MaskGiven::Nothing => Vec::new(),
+            };
+            single.set_energy_mask((given != MaskGiven::Nothing).then_some(&mask[..]));
+            let n = single.encode(&stereo, FRAME, &mut out).unwrap();
+            let parts = split_streams(&packets[f], layout.streams()).unwrap();
+            equal += usize::from(parts[stream].packet == out[..n]);
+            compared += 1;
+        }
+    }
+    (equal, compared)
+}
+
+/// The gap of the coupled streams is not made by the multistream encoder: a
+/// coupled stream holds exactly the packets a single stereo encoder writes
+/// for the two channels, when that encoder has the settings and the energy
+/// mask libopus gives a coupled surround stream.
+#[test]
+fn a_coupled_stream_is_what_a_stereo_encoder_with_its_mask_writes() {
     for vbr in [true, false] {
-        let mut enc = rust_encoder(&case, FS, Application::Audio);
-        enc.set_bitrate(rust_bitrate(320_000)).unwrap();
-        enc.set_vbr(vbr);
-        let pcm = voiced(FS, 8, FS as usize);
-        let packets = rust_encode_all(&mut enc, &pcm, FRAME);
-        let layout = enc.layout().clone();
-        for stream in 0..layout.coupled_streams() {
-            let left = layout.left_channel(stream, None).unwrap();
-            let right = layout.right_channel(stream, None).unwrap();
-            let mut single = OpusEncoder::new(FS, 2, Application::Audio).unwrap();
-            single.bitrate_bps = enc.stream_encoder(stream).unwrap().bitrate_bps;
-            single.use_cbr = !vbr;
-            single.set_force_mode(Some(ForcedMode::CeltOnly));
-            single.set_bandwidth(Bandwidth::Fullband);
-            let mut out = vec![0u8; 1500];
-            for (f, frame) in pcm.as_chunks::<{ FRAME * 8 }>().0.iter().enumerate() {
-                let stereo: Vec<f32> = frame
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .flat_map(|x| [x[left], x[right]])
-                    .collect();
-                let n = single.encode(&stereo, FRAME, &mut out).unwrap();
-                let parts = split_streams(&packets[f], layout.streams()).unwrap();
-                assert_eq!(
-                    parts[stream].packet,
-                    &out[..n],
-                    "stream {stream}, frame {f}, vbr {vbr}"
-                );
-            }
+        let (equal, compared) = coupled_streams_equal_to_a_stereo_encoder(vbr, MaskGiven::LeftThenRight);
+        assert_eq!(compared, 150);
+        assert_eq!(equal, compared, "vbr {vbr}");
+    }
+}
+
+/// The control for the test above: it can tell the masks apart. Without a
+/// mask, or with the mask of another stream, the stereo encoder writes
+/// other packets.
+///
+/// Exchanging the masks of the left and the right channel is not a control:
+/// CELT uses the two halves alike (celt_encoder.c:2114-2165), so the packets
+/// stay the same. tests/multistream_enc_streams.rs compares the mask of
+/// every stream value by value instead.
+#[test]
+fn a_coupled_stream_differs_from_a_stereo_encoder_with_another_mask() {
+    for vbr in [true, false] {
+        for given in [MaskGiven::Nothing, MaskGiven::OfAnotherStream] {
+            let (equal, compared) = coupled_streams_equal_to_a_stereo_encoder(vbr, given);
+            println!("vbr {vbr}, {given:?}: {equal} of {compared} packets are the same");
+            assert!(
+                10 * equal < compared,
+                "vbr {vbr}, {given:?}: {equal} of {compared} packets are the same"
+            );
         }
     }
 }
 
 /// The 80 Hz tone on the LFE channel of 5.1, 6.1 and 7.1.
 ///
-/// libopus codes the LFE stream with a tuning of its own inside CELT. In
-/// opus-rs the stream encoder does not pass the LFE flag on to its CELT
-/// layer yet, so the stream is plain CELT-only narrowband. This test must
-/// hold in both states, before and after that is wired up, so its limit is
-/// a floor: the tone comes back with an SNR of at least 8 dB. Measured
-/// without the tuning: 10.8 to 13.4 dB, where libopus has 18.2 to 27.9 dB.
-/// `lfe_tone_is_within_6_db_of_libopus` holds the limit for the tuned state.
+/// libopus codes the LFE stream with a tuning of its own inside CELT, and
+/// so does opus-rs: the stream encoder passes the LFE flag on to its CELT
+/// layer. Measured: 18.2 to 27.8 dB, where libopus has 18.2 to 27.9 dB.
+/// Without the tuning it was 10.8 to 13.4 dB. The limit here is a floor of
+/// 15 dB, which the untuned stream does not reach.
+/// `lfe_tone_is_within_2_db_of_libopus` holds the limit against libopus.
 #[test]
 fn lfe_tone_survives() {
     for (channels, bitrate) in [(6usize, 256_000), (7, 288_000), (8, 320_000)] {
@@ -267,7 +337,7 @@ fn lfe_tone_survives() {
                 lfe.c
             );
             assert!(
-                lfe.rust >= 8.0,
+                lfe.rust >= 15.0,
                 "{channels} channels: LFE tone {:.1} dB",
                 lfe.rust
             );
@@ -275,8 +345,10 @@ fn lfe_tone_survives() {
     }
 }
 
+/// Measured: the LFE tone is 1.3 dB below libopus at worst (6.1, constant
+/// bitrate) and equal within 0.1 dB in four of the six cases.
 #[test]
-fn lfe_tone_is_within_6_db_of_libopus() {
+fn lfe_tone_is_within_2_db_of_libopus() {
     for (channels, bitrate) in [(6usize, 256_000), (7, 288_000), (8, 320_000)] {
         let case = Case::family("surround", channels, 1);
         let pcm = tones(FS, channels, 1, 2 * FS as usize);
@@ -284,7 +356,7 @@ fn lfe_tone_is_within_6_db_of_libopus() {
             let snrs = measure(&case, bitrate, vbr, &pcm);
             let lfe = &snrs[channels - 1];
             assert!(
-                lfe.rust >= lfe.c - 6.0,
+                lfe.rust >= lfe.c - 2.0,
                 "{channels} channels, vbr {vbr}: LFE tone {:.1} dB, libopus {:.1} dB",
                 lfe.rust,
                 lfe.c

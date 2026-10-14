@@ -4,12 +4,19 @@
 //! allocations of each thread. `encode` and `encode_i16` must not add to the
 //! count, from the very first frame on: no buffer is grown on first use.
 //!
+//! The surround layouts run with everything a surround encoder does per
+//! frame: the masking analysis reads every channel through the same input
+//! as the streams, and every stream gets its energy mask. The test checks
+//! that the streams have a mask after the measured frames, so the analysis
+//! was part of what was measured.
+//!
 //! The setters are covered too. `reset_state` is not: `OpusEncoder`
 //! builds a new encoder in its `reset_state`, which allocates with the
 //! `heap` feature. It is not called per frame.
 #![cfg(feature = "std")]
 
 use opus_rs::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus_rs::multistream::layout::MappingType;
 use opus_rs::{Application, Bandwidth};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -95,8 +102,10 @@ fn encode_does_not_allocate() {
     let kinds = [
         Kind::Family(1, 1),
         Kind::Family(2, 1),
+        Kind::Family(3, 1),
         Kind::Family(4, 1),
         Kind::Family(6, 1),
+        Kind::Family(7, 1),
         Kind::Family(8, 1),
         Kind::Family(3, 255),
         Kind::Family(6, 2),
@@ -104,11 +113,13 @@ fn encode_does_not_allocate() {
         Kind::Generic(5, 2, 1, &[0, 1, 255, 2, 2]),
     ];
     let mut frames = 0;
+    // Frames coded by an encoder that runs the surround analysis.
+    let mut analysed_frames = 0;
     for kind in &kinds {
-        for fs in [48_000, 16_000] {
+        for fs in [48_000, 24_000, 16_000] {
             for application in [Application::Audio, Application::Voip] {
-                // Frames of 2.5, 10, 20 and 60 ms.
-                for frame_size in [fs / 400, fs / 100, fs / 50, 3 * fs / 50] {
+                // Frames of 2.5, 10, 20, 40 and 60 ms.
+                for frame_size in [fs / 400, fs / 100, fs / 50, fs / 25, 3 * fs / 50] {
                     let frame_size = frame_size as usize;
                     // A low bitrate brings SILK and Hybrid streams, a high
                     // one CELT streams.
@@ -162,12 +173,30 @@ fn encode_does_not_allocate() {
                         // not count as an allocation of the encoder.
                         assert_eq!(failed, None, "{label}: encode failed");
                         assert_eq!(after - before, 0, "{label}: allocations");
+                        // The analysis ran in the measured frames: every
+                        // stream of a surround layout was given a mask.
+                        if enc.mapping_type() == MappingType::Surround {
+                            for s in 0..enc.layout().streams() {
+                                let stream = enc.stream_encoder(s).unwrap();
+                                assert_eq!(
+                                    stream.energy_mask().map(|m| m.len()),
+                                    Some(21 * stream.channels()),
+                                    "{label}: stream {s} has no mask"
+                                );
+                            }
+                            analysed_frames += 6;
+                        }
                     }
                 }
             }
         }
     }
-    assert!(frames > 2500, "only {frames} frames encoded");
+    println!("{frames} frames encoded, {analysed_frames} of them with the surround analysis");
+    assert!(frames > 5000, "only {frames} frames encoded");
+    assert!(
+        analysed_frames > 2500,
+        "only {analysed_frames} frames with the surround analysis"
+    );
 
     // The counter works: it sees an allocation when there is one.
     let before = allocations();

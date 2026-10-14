@@ -14,14 +14,14 @@
 //! 16-bit input is checked against float input: `encode_i16` must write the
 //! bytes `encode` writes for the same samples.
 //!
-//! One fault outside the multistream encoder shows here. A stereo stream in
-//! Hybrid mode has a CELT layer the decoder reads differently from how it
-//! was written: src/celt.rs limits the intensity band to `0..end` where
-//! libopus uses `start..end`. The packet decodes, but the final range
-//! differs. The matrix leaves the final range of such packets out, and
-//! `final_range_of_packets_with_a_stereo_hybrid_stream` holds the full rule.
-//! Surround and ambisonics layouts never produce such a stream: their
-//! stereo streams are CELT-only.
+//! One fault outside the multistream encoder used to show here. A stereo
+//! stream in Hybrid mode had a CELT layer the decoder read differently from
+//! how it was written: src/celt.rs limited the intensity band to `0..end`
+//! where libopus uses `start..end`. The packet decoded, but the final range
+//! differed. That is corrected, and the matrix holds such packets to the
+//! same rule as all others. `final_range_of_packets_with_a_stereo_hybrid_stream`
+//! makes sure the matrix still reaches them. Surround and ambisonics layouts
+//! never produce such a stream: their stereo streams are CELT-only.
 #![cfg(feature = "std")]
 
 mod ms_support;
@@ -124,7 +124,8 @@ fn run_case(
         if has_stereo_hybrid_stream(packet, streams) {
             outcome.stereo_hybrid += 1;
             outcome.stereo_hybrid_range_differs += !same_range as usize;
-        } else if !same_range {
+        }
+        if !same_range {
             outcome.failures.push(format!(
                 "{label}: frame {f}: final range {:08x}, C decoder {:08x}: {}",
                 enc.final_range(),
@@ -213,7 +214,6 @@ fn c_decodes_every_packet_16k_cbr() {
 }
 
 #[test]
-#[ignore = "stereo Hybrid packets have a corrupt CELT layer: src/celt.rs limits the intensity band to 0..end, libopus to start..end"]
 fn final_range_of_packets_with_a_stereo_hybrid_stream() {
     let mut packets = 0;
     let mut differs = 0;

@@ -5,7 +5,9 @@
 //!   output channel.
 //! - Stream structure in surround mode: the coupled streams are CELT stereo,
 //!   the LFE stream is CELT narrowband mono, and every stream has the audio
-//!   bandwidth of the C encoder's stream.
+//!   bandwidth of the C encoder's stream. A stream that is left too few
+//!   bytes for audio is without audio in the C packet too, and has the same
+//!   TOC byte.
 //! - Ambisonics: every stream is CELT.
 //! - Bitrates: every stream encoder is set to the bitrate the C encoder sets
 //!   on its stream encoder, and `bitrate()` equals `OPUS_GET_BITRATE`.
@@ -179,6 +181,25 @@ fn check_surround_packet(
         if part.samples(fs) != frame_size {
             wrong.push(format!("stream {s}: {} samples", part.samples(fs)));
         }
+        let c = c_parts.as_ref().map(|c_parts| &c_parts[s]);
+        // A stream that is left too few bytes carries no audio. Its TOC byte
+        // then names the mode and bandwidth of the last frame the stream
+        // coded, or Hybrid fullband when it has coded none
+        // (opus_encoder.c:1344-1385). What the frame was set to does not
+        // show, so such a stream is only compared with the C stream: that
+        // one is without audio too and has the same TOC byte.
+        if part.payload_len == 0 {
+            if let Some(c) = c
+                && (c.payload_len != 0 || c.toc != part.toc)
+            {
+                wrong.push(format!(
+                    "stream {s} without audio is {t}, C has {} with {} bytes",
+                    toc(c.toc),
+                    c.payload_len
+                ));
+            }
+            continue;
+        }
         if s < coupled {
             // To keep the spatial image: CELT, two channels, and the
             // bandwidth of the whole layout.
@@ -197,13 +218,11 @@ fn check_surround_packet(
         } else if t.stereo {
             wrong.push(format!("mono stream {s} is {t}"));
         }
-        // Against the C encoder. A C stream without audio is left out: its
-        // TOC byte names the mode and bandwidth the stream encoder started
-        // with (Hybrid fullband), not what the frame was set to.
-        if let Some(c_parts) = &c_parts {
-            let c = &c_parts[s];
+        // Against the C encoder.
+        if let Some(c) = c {
             let ct = toc(c.toc);
             if c.payload_len == 0 {
+                wrong.push(format!("stream {s} is {t}, C has no audio"));
                 continue;
             }
             if (t.bandwidth, t.stereo) != (ct.bandwidth, ct.stereo) {
@@ -221,10 +240,11 @@ fn check_surround_packet(
 }
 
 #[test]
-#[ignore = "fails since surround masking, LFE tuning and channel conversion were merged together: expectations to be reviewed"]
 fn surround_streams_have_the_structure_of_libopus() {
     let mut wrong = Vec::new();
     let mut packets = 0;
+    // Streams without audio. They are compared with C byte for byte.
+    let mut empty_streams = 0;
     for fs in [48_000, 24_000, 16_000] {
         for channels in 3..=8usize {
             let case = Case::family("surround", channels, 1);
@@ -246,6 +266,11 @@ fn surround_streams_have_the_structure_of_libopus() {
                     let c_packets = c.encode_all(&pcm, frame_size);
                     for (f, (r, cp)) in rust_packets.iter().zip(&c_packets).enumerate() {
                         packets += 1;
+                        empty_streams += split_streams(r, c.streams)
+                            .unwrap()
+                            .iter()
+                            .filter(|part| part.payload_len == 0)
+                            .count();
                         for w in check_surround_packet(&rust, r, Some(cp), bandwidth, frame_size) {
                             wrong.push(format!(
                                 "{fs} Hz, {channels} channels, {bitrate} b/s, {}, frame {f}: {w}",
@@ -257,11 +282,18 @@ fn surround_streams_have_the_structure_of_libopus() {
             }
         }
     }
-    println!("{packets} packets, {} differences", wrong.len());
+    println!(
+        "{packets} packets, {empty_streams} streams without audio, {} differences",
+        wrong.len()
+    );
     for w in wrong.iter().take(30) {
         println!("{w}");
     }
     assert!(wrong.is_empty(), "{} differences", wrong.len());
+    // The settings must keep reaching streams without audio: 4785 of them
+    // when this was written, most of them LFE streams at a low bitrate or
+    // with a short frame.
+    assert!(empty_streams > 4000, "{empty_streams} streams without audio");
 }
 
 /// With an automatic or a maximum bitrate libopus codes every stream of a

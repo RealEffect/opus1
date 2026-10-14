@@ -126,8 +126,9 @@ fn quant_coarse_energy_impl(
             let f = x - coef * old_e - prev[c];
 
             let mut qi = ((f + 0.5).floor() as i32).clamp(-32767, 32767);
-            let qi0 = qi;
 
+            // Prevent the energy from going down too quickly (for example
+            // in bands that have just one bin).
             let decay_bound = old_e_val.max(-28.0) - max_decay;
             if qi < 0 && x < decay_bound {
                 qi = qi.saturating_add(((decay_bound - x) as i32).max(0));
@@ -135,6 +136,12 @@ fn quant_coarse_energy_impl(
                     qi = 0;
                 }
             }
+            // `badness` counts how far the coded value is from this one.
+            // libopus takes it after the limit above (celt/quant_bands.c,
+            // quant_coarse_energy_impl: `qi0 = qi;` follows the decay
+            // bound). The limit is the same in the intra and in the inter
+            // pass, so it must not count against either of them.
+            let qi0 = qi;
 
             let tell = enc.tell();
             let bits_left = budget as i32 - tell - 3 * channels as i32 * (end - i) as i32;
@@ -385,21 +392,20 @@ pub fn unquant_coarse_energy(
 
     for i in start..end {
         for c in 0..channels {
-            let qi;
             let tell = dec.tell();
-            if budget - tell >= 15 {
+            let qi = if budget - tell >= 15 {
                 let prob_idx = 2 * i.min(20);
                 let fs = (prob_model[prob_idx] as u32) << 7;
                 let decay = (prob_model[prob_idx + 1] as i32) << 6;
-                qi = dec.laplace_decode(fs, decay);
+                dec.laplace_decode(fs, decay)
             } else if budget - tell >= 2 {
                 let s = dec.decode_icdf(&SMALL_ENERGY_ICDF, 2);
-                qi = (s >> 1) ^ -(s & 1);
+                (s >> 1) ^ -(s & 1)
             } else if budget - tell >= 1 {
-                qi = if dec.decode_bit_logp(1) { -1 } else { 0 };
+                if dec.decode_bit_logp(1) { -1 } else { 0 }
             } else {
-                qi = -1;
-            }
+                -1
+            };
 
             // Clamp in-place, matching C: oldEBands[i] = MAXG(-GCONST(9.f), oldEBands[i])
             old_e_bands[c * m.nb_ebands + i] = old_e_bands[c * m.nb_ebands + i].max(-9.0);

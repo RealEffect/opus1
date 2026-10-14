@@ -1,13 +1,11 @@
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
+use crate::celt_lpc::{autocorr, lpc};
 use crate::fixedvec::FixedVec;
 
 /// Capacity for pitch-search working buffers (x_lp4 / y_lp4 / xcorr). Bounded by
 /// `COMBFILTER_MAXPERIOD = 1024` and the maximum pitch lag.
 const PITCH_BUF_MAX: usize = 1024;
-
-#[cfg(target_arch = "aarch64")]
-use crate::celt_lpc::{autocorr, lpc};
 
 // How the sums of products in this file are rounded
 // --------------------------------------------------
@@ -110,6 +108,9 @@ pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
     // The vector kernels read `n` samples through pointers without a check,
     // so the lengths are checked here.
     let (x, y) = (&x[..n], &y[..n]);
+    // SAFETY (all three blocks): `x` and `y` hold exactly `n` samples. The
+    // AVX kernel runs only when the CPU has AVX and FMA; NEON and SSE are
+    // part of the baseline of their targets.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         if crate::compat::x86_has_avx_fma() {
@@ -142,6 +143,9 @@ pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
 pub fn dual_inner_prod(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
     // As in `inner_prod`: the kernels read `n` samples without a check.
     let (x, y1, y2) = (&x[..n], &y1[..n], &y2[..n]);
+    // SAFETY (all three blocks): the three slices hold exactly `n` samples.
+    // The AVX kernel runs only when the CPU has AVX and FMA; NEON and SSE
+    // are part of the baseline of their targets.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         if crate::compat::x86_has_avx_fma() {
@@ -189,6 +193,10 @@ pub fn pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitc
     // The vector kernels read `len` samples of `x` through pointers without
     // a check, so its length is checked here.
     let x = &x[..len];
+    // SAFETY (both blocks): `x` holds exactly `len` samples and `y` at least
+    // `len + max_pitch - 1` (`max_pitch` was limited to that above). `xcorr`
+    // is written with index checks. The AVX kernel runs only when the CPU
+    // has AVX and FMA.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         if crate::compat::x86_has_avx_fma() {
@@ -263,12 +271,19 @@ fn inner_prod_pass_neon<const K: usize>(x: &[f32], ys: &[&[f32]; MANY_PER_PASS],
     out.copy_from_slice(&sums[..out.len()]);
 }
 
+/// `inner_prod` on aarch64, in the four-lane order.
+///
+/// # Safety
+///
+/// `x` and `y` must hold at least `n` samples each. Every load covers
+/// `[i..i + 4]` with `i + 4 <= n`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn inner_prod_neon(x: &[f32], y: &[f32], n: usize) -> f32 {
     use core::arch::aarch64::*;
 
+    debug_assert!(x.len() >= n && y.len() >= n);
     let mut xy = vdupq_n_f32(0.0);
     let mut i = 0;
 
@@ -300,12 +315,19 @@ unsafe fn inner_prod_neon(x: &[f32], y: &[f32], n: usize) -> f32 {
     sum
 }
 
+/// `dual_inner_prod` on aarch64: two inner products in the four-lane order.
+///
+/// # Safety
+///
+/// `x`, `y1` and `y2` must hold at least `n` samples each. Every load covers
+/// `[i..i + 4]` with `i + 4 <= n`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dual_inner_prod_neon(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
     use core::arch::aarch64::*;
 
+    debug_assert!(x.len() >= n && y1.len() >= n && y2.len() >= n);
     let mut xy1 = vdupq_n_f32(0.0);
     let mut xy2 = vdupq_n_f32(0.0);
     let mut i = 0;
@@ -514,6 +536,10 @@ fn pitch_xcorr_neon(x: &[f32], y: &[f32], xcorr: &mut [f32]) {
     inner_prod_many(x, y, &offsets[..rest], len, &mut xcorr[by_sample..]);
 }
 
+/// # Safety
+///
+/// `x` and `y` must hold at least `n` samples each, and the CPU must have the
+/// features this function is compiled for.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -559,6 +585,10 @@ unsafe fn inner_prod_sse(x: &[f32], y: &[f32], n: usize) -> f32 {
     result
 }
 
+/// # Safety
+///
+/// `x`, `y1` and `y2` must hold at least `n` samples each, and the CPU must
+/// have the features this function is compiled for.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -602,6 +632,11 @@ unsafe fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
     (s1, s2)
 }
 
+/// # Safety
+///
+/// `x` must hold at least `len` samples and `y` at least `len + 3`, and the
+/// CPU must have the features this function is compiled for. The loads read
+/// up to `y[len + 2]`.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -671,6 +706,11 @@ unsafe fn xcorr_kernel_sse(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
     _mm_storeu_ps(sum.as_mut_ptr(), _mm_add_ps(xsum1, xsum2));
 }
 
+/// # Safety
+///
+/// `x` must hold at least `len` samples and `y` at least
+/// `len + max_pitch - 1`, and the CPU must have the features this function is
+/// compiled for. `xcorr` is written with index checks.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -692,6 +732,10 @@ unsafe fn pitch_xcorr_sse(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, m
     }
 }
 
+/// # Safety
+///
+/// `x` and `y` must hold at least `n` samples each, and the CPU must have the
+/// features this function is compiled for.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
@@ -739,6 +783,10 @@ unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
     result
 }
 
+/// # Safety
+///
+/// `x`, `y1` and `y2` must hold at least `n` samples each, and the CPU must
+/// have the features this function is compiled for.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
@@ -804,6 +852,11 @@ unsafe fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
     (s1, s2)
 }
 
+/// # Safety
+///
+/// `x` must hold at least `len` samples and `y` at least
+/// `len + max_pitch - 1`, and the CPU must have the features this function is
+/// compiled for. `xcorr` is written with index checks.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
@@ -824,6 +877,11 @@ unsafe fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, m
     }
 }
 
+/// # Safety
+///
+/// `x` must hold at least `len` samples and `y` at least `len + 3`, and the
+/// CPU must have the features this function is compiled for. The loads read
+/// up to `y[len + 2]`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize) {
@@ -923,55 +981,10 @@ unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
     _mm_storeu_ps(sum.as_mut_ptr(), _mm_add_ps(xsum1, xsum2));
 }
 
-#[cfg(target_arch = "aarch64")]
-fn celt_fir5(x: &mut [f32], num: &[f32], n: usize) {
-    let mut mem = [0.0f32; 5];
-
-    let num0 = num[0];
-    let num1 = num[1];
-    let num2 = num[2];
-    let num3 = num[3];
-    let num4 = num[4];
-
-    for i in 0..n {
-        let mut sum = x[i];
-        sum += num0 * mem[0];
-        sum += num1 * mem[1];
-        sum += num2 * mem[2];
-        sum += num3 * mem[3];
-        sum += num4 * mem[4];
-
-        mem[4] = mem[3];
-        mem[3] = mem[2];
-        mem[2] = mem[1];
-        mem[1] = mem[0];
-        mem[0] = x[i];
-
-        x[i] = sum;
-    }
-}
-
 pub fn pitch_downsample(x: &[&[f32]], x_lp: &mut [f32], len: usize, c: usize, factor: usize) {
     let offset = factor / 2;
 
     if x_lp.len() < len {
-        return;
-    }
-
-    // The NEON path reads through raw pointers up to factor*len+offset source
-    // samples per channel; only take it when every channel actually provides
-    // them (the scalar loop below bounds-checks per sample instead)
-    // (issue #27 deep scan).
-    //
-    // The encoder passes `factor * len` samples per channel, one fewer than
-    // this path asks for, so the encoder never takes it. It is not the same
-    // computation as the code below: it also whitens the result (as libopus
-    // does), and its mono loop reads four neighbouring samples per group of
-    // four outputs instead of every second one. It is left as it is here;
-    // changing either path changes the encoder output.
-    #[cfg(target_arch = "aarch64")]
-    if factor == 2 && c <= 2 && x.iter().take(c).all(|s| s.len() >= factor * len + offset) {
-        pitch_downsample_neon(x, x_lp, len, c, offset);
         return;
     }
 
@@ -1014,6 +1027,73 @@ pub fn pitch_downsample(x: &[&[f32]], x_lp: &mut [f32], len: usize, c: usize, fa
     }
 
     pitch_downsample_boundary(x, x_lp, c, offset);
+
+    flatten_spectrum(&mut x_lp[..len]);
+}
+
+/// Flattens the spectrum of the decimated signal: the second half of
+/// libopus's pitch_downsample (celt/pitch.c).
+///
+/// A fourth-order LPC analysis gives the spectral envelope, and a filter
+/// built from it removes most of that envelope. The pitch search then
+/// compares the fine structure of the signal instead of following its
+/// strongest formant.
+fn flatten_spectrum(x_lp: &mut [f32]) {
+    let len = x_lp.len();
+    if len < 5 {
+        // The autocorrelation needs more samples than lags. libopus is
+        // never called with so few.
+        return;
+    }
+    let mut ac = [0.0f32; 5];
+    autocorr(x_lp, &mut ac, None, 0, 4, len);
+
+    // "Noise floor -40 dB"
+    ac[0] *= 1.0001;
+    // "Lag windowing"
+    for (i, a) in ac.iter_mut().enumerate().skip(1) {
+        let f = 0.008 * i as f32;
+        *a -= *a * f * f;
+    }
+
+    let mut coef = [0.0f32; 4];
+    lpc(&mut coef, &ac, 4);
+    let mut tmp = 1.0f32;
+    for v in coef.iter_mut() {
+        tmp *= 0.9;
+        *v *= tmp;
+    }
+    // "Add a zero"
+    let c1 = 0.8f32;
+    let lpc2 = [
+        coef[0] + 0.8,
+        coef[1] + c1 * coef[0],
+        coef[2] + c1 * coef[1],
+        coef[3] + c1 * coef[2],
+        c1 * coef[3],
+    ];
+    celt_fir5(x_lp, &lpc2);
+}
+
+/// Filter with five feed-forward taps, in place (libopus: celt_fir5):
+/// `x[i] += num[0] * x[i - 1] + .. + num[4] * x[i - 5]`, with the samples
+/// before `x[0]` taken as zero and the old values of `x` on the right.
+fn celt_fir5(x: &mut [f32], num: &[f32; 5]) {
+    let mut mem = [0.0f32; 5];
+    for v in x.iter_mut() {
+        let mut sum = *v;
+        sum += num[0] * mem[0];
+        sum += num[1] * mem[1];
+        sum += num[2] * mem[2];
+        sum += num[3] * mem[3];
+        sum += num[4] * mem[4];
+        mem[4] = mem[3];
+        mem[3] = mem[2];
+        mem[2] = mem[1];
+        mem[1] = mem[0];
+        mem[0] = *v;
+        *v = sum;
+    }
 }
 
 /// Decimation by two with the low-pass filter (0.25, 0.5, 0.25), summed over
@@ -1112,96 +1192,6 @@ fn pitch_downsample_boundary(x: &[&[f32]], x_lp: &mut [f32], c: usize, offset: u
         }
         x_lp[0] = val;
     }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn pitch_downsample_neon(x: &[&[f32]], x_lp: &mut [f32], len: usize, c: usize, offset: usize) {
-    use core::arch::aarch64::*;
-
-    unsafe {
-        let v025 = vdupq_n_f32(0.25);
-        let v05 = vdupq_n_f32(0.5);
-
-        if c == 1 {
-            let x0 = x[0];
-
-            let mut i = 1;
-            while i + 4 <= len {
-                let idx_m = 2 * i - offset;
-                let idx_p = 2 * i + offset;
-                let idx_c = 2 * i;
-
-                let vm = vld1q_f32(x0.as_ptr().add(idx_m));
-                let vp = vld1q_f32(x0.as_ptr().add(idx_p));
-                let vc = vld1q_f32(x0.as_ptr().add(idx_c));
-
-                let mut val = vmulq_f32(vm, v025);
-                val = vfmaq_f32(val, vp, v025);
-                val = vfmaq_f32(val, vc, v05);
-
-                vst1q_f32(x_lp.as_mut_ptr().add(i), val);
-                i += 4;
-            }
-
-            while i < len {
-                let idx_m = 2 * i - offset;
-                let idx_p = 2 * i + offset;
-                let idx_c = 2 * i;
-
-                if idx_p < x0.len() {
-                    x_lp[i] = 0.25 * x0[idx_m] + 0.25 * x0[idx_p] + 0.5 * x0[idx_c];
-                }
-                i += 1;
-            }
-        } else {
-            let x0 = x[0];
-            let x1 = x[1];
-            let mut i = 1;
-            while i < len {
-                let idx_m = 2 * i - offset;
-                let idx_p = 2 * i + offset;
-                let idx_c = 2 * i;
-
-                if idx_p < x0.len() {
-                    let v0 = 0.25 * x0[idx_m] + 0.25 * x0[idx_p] + 0.5 * x0[idx_c];
-                    let v1 = 0.25 * x1[idx_m] + 0.25 * x1[idx_p] + 0.5 * x1[idx_c];
-                    x_lp[i] = v0 + v1;
-                }
-                i += 1;
-            }
-        }
-    }
-
-    pitch_downsample_boundary(x, x_lp, c, offset);
-
-    let mut ac = [0.0f32; 5];
-    autocorr(&x_lp[0..len], &mut ac, None, 0, 4, len);
-
-    ac[0] *= 1.0001;
-
-    for i in 1..=4 {
-        let f = 0.008 * (i as f32);
-        ac[i] -= ac[i] * f * f;
-    }
-
-    let mut lpc_coeffs = [0.0f32; 4];
-    lpc(&mut lpc_coeffs, &ac, 4);
-
-    let mut tmp = 1.0f32;
-    for i in 0..4 {
-        tmp *= 0.9;
-        lpc_coeffs[i] *= tmp;
-    }
-
-    let c1 = 0.8f32;
-    let mut lpc2 = [0.0f32; 5];
-    lpc2[0] = lpc_coeffs[0] + c1;
-    lpc2[1] = lpc_coeffs[1] + c1 * lpc_coeffs[0];
-    lpc2[2] = lpc_coeffs[2] + c1 * lpc_coeffs[1];
-    lpc2[3] = lpc_coeffs[3] + c1 * lpc_coeffs[2];
-    lpc2[4] = c1 * lpc_coeffs[3];
-
-    celt_fir5(x_lp, &lpc2, len);
 }
 
 /// One plus the energy of `y`: the start value of the window energy in
@@ -1330,7 +1320,16 @@ fn find_best_pitch(
         .enumerate()
     {
         if xc > 0.0 {
-            let num = xc * xc;
+            // libopus scales the correlation before it squares it ("this
+            // should avoid both underflows and overflows (inf) when squaring
+            // xcorr16", celt/pitch.c, find_best_pitch). The signal is at the
+            // scale of 16-bit samples, so a correlation reaches 5e11 for a
+            // full-scale frame. Without the scaling its square times a
+            // window energy no longer fits an f32 from about four times
+            // full scale on (float input may exceed full scale). The
+            // products then became infinite and the comparisons below false.
+            let xc16 = xc * 1e-12;
+            let num = xc16 * xc16;
             if num * best_den[1] > best_num[1] * syy {
                 if num * best_den[0] > best_num[0] * syy {
                     best_num[1] = best_num[0];
@@ -2328,7 +2327,8 @@ pub(crate) mod tests {
         let mut syy = window_energy_plus_one(&y[..len]);
         for i in 0..max_pitch {
             if xcorr[i] > 0.0 {
-                let num = xcorr[i] * xcorr[i];
+                let xc16 = xcorr[i] * 1e-12;
+                let num = xc16 * xc16;
                 if num * best_den[1] > best_num[1] * syy {
                     if num * best_den[0] > best_num[0] * syy {
                         best_num[1] = best_num[0];
@@ -2478,6 +2478,7 @@ pub(crate) mod tests {
                             pitch_downsample(&chans[..c], &mut got, len, c, factor);
                             let mut want = vec![f32::NAN; len];
                             pitch_downsample_plain(&chans[..c], &mut want, len, c, factor);
+                            flatten_spectrum(&mut want);
                             assert_same(
                                 &got,
                                 &want,

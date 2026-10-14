@@ -25,7 +25,9 @@ macro_rules! tell_frac_inline {
         let r = $rc.rng >> (l - 16);
         let b = (r >> 12).wrapping_sub(8);
 
-        let correction = unsafe { *CORRECTION.get_unchecked(b as usize) };
+        // `rng` is above 2^23 between symbols, so `r` has 16 bits and `b` is
+        // 0 to 7. The mask keeps the index inside the table for any `rng`.
+        let correction = CORRECTION[(b & 7) as usize];
         let b = b + (r > correction) as u32;
         nbits - (l << 3) - b as i32
     }};
@@ -159,9 +161,9 @@ impl RangeCoder {
     /// also puts back the bytes between the two `offs` values.
     ///
     /// Panics if the saved `storage` is larger than this coder's buffer,
-    /// which means the state was saved from another coder. The encoder
-    /// writes bytes below `storage` without an index check, so such a state
-    /// must not get in.
+    /// which means the state was saved from another coder. Such a coder
+    /// could not write a valid packet: every write past the buffer would
+    /// only set the error flag.
     #[inline]
     pub fn restore_state(&mut self, state: &RangeCoderState) {
         // As in `write_parts`: a word that is not put back is reported as an
@@ -344,6 +346,13 @@ impl RangeCoder {
         }
     }
 
+    /// Decodes an integer from 0 to `ft - 1` (libopus: `ec_dec_uint`,
+    /// celt/entdec.c).
+    ///
+    /// Above 256 values the integer is coded in two parts: the high bits
+    /// with the range coder, the low bits as raw bits. In a damaged packet
+    /// the two parts can combine to `ft` or more. As in libopus, the result
+    /// is then `ft - 1` and the error flag of the coder is set.
     #[inline(always)]
     pub fn dec_uint(&mut self, ft: u32) -> u32 {
         if ft > 1 {
@@ -354,8 +363,13 @@ impl RangeCoder {
                 let ft = (ft_minus_1 >> s) + 1;
                 let fs = self.decode(ft);
                 self.update(fs, fs.wrapping_add(1), ft);
-                let r = self.dec_bits(s as u32);
-                (fs << s) | r
+                let t = (fs << s) | self.dec_bits(s as u32);
+                if t <= ft_minus_1 {
+                    t
+                } else {
+                    self.error = 1;
+                    ft_minus_1
+                }
             } else {
                 let fs = self.decode(ft);
                 self.update(fs, fs.wrapping_add(1), ft);
@@ -385,47 +399,6 @@ impl RangeCoder {
         self.end_window = window;
         self.nend_bits = used;
         self.nbits_total += bits as i32;
-    }
-
-    pub fn pad_to_bits(&mut self, target_bits: i32) {
-        let remaining = target_bits - self.nbits_total;
-        if remaining <= 0 {
-            return;
-        }
-        let mut remaining = remaining as u32;
-
-        let partial =
-            (EC_SYM_BITS - (self.nend_bits as u32 & (EC_SYM_BITS - 1))) & (EC_SYM_BITS - 1);
-        if partial > 0 && remaining >= partial {
-            self.enc_bits(0, partial.min(remaining));
-            remaining -= partial.min(remaining);
-        }
-
-        let full_bytes = remaining / EC_SYM_BITS;
-        if full_bytes > 0 {
-            let available = self.storage - self.offs - self.end_offs;
-            let write_count = full_bytes.min(available);
-            if write_count > 0 {
-                let start = (self.storage - self.end_offs - write_count) as usize;
-                unsafe {
-                    core::ptr::write_bytes(
-                        self.buf.as_mut_ptr().add(start),
-                        0,
-                        write_count as usize,
-                    );
-                }
-                self.end_offs += write_count;
-            }
-            if write_count < full_bytes {
-                self.error = 1;
-            }
-            self.nbits_total += (full_bytes * EC_SYM_BITS) as i32;
-            remaining -= full_bytes * EC_SYM_BITS;
-        }
-
-        if remaining > 0 {
-            self.enc_bits(0, remaining);
-        }
     }
 
     pub fn dec_bits(&mut self, bits: u32) -> u32 {
@@ -492,12 +465,18 @@ impl RangeCoder {
         self.storage = new_size;
     }
 
+    /// Writes the next range coder byte, or sets the error flag when the
+    /// buffer is full (libopus: `ec_write_byte`).
+    ///
+    /// The second condition is always true for a coder whose `storage` is
+    /// within its buffer. It is what keeps the write inside the buffer when
+    /// safe code has set `storage`, `offs` or the buffer length to something
+    /// else: all three are public.
     #[inline(always)]
     fn write_byte(&mut self, value: u8) {
-        if self.offs + self.end_offs < self.storage {
-            unsafe {
-                *self.buf.get_unchecked_mut(self.offs as usize) = value;
-            }
+        let offs = self.offs as usize;
+        if self.offs + self.end_offs < self.storage && offs < self.buf.len() {
+            self.buf[offs] = value;
             self.offs += 1;
         } else {
             self.error = 1;
@@ -559,28 +538,13 @@ impl RangeCoder {
             if c != EC_SYM_MAX as i32 {
                 let carry = c >> EC_SYM_BITS;
                 if self.rem >= 0 {
-                    if self.offs + self.end_offs < self.storage {
-                        unsafe {
-                            *self.buf.get_unchecked_mut(self.offs as usize) =
-                                (self.rem + carry) as u8;
-                        }
-                        self.offs += 1;
-                    } else {
-                        self.error = 1;
-                    }
+                    self.write_byte((self.rem + carry) as u8);
                 }
                 if self.ext > 0 {
                     let sym = (EC_SYM_MAX as i32 + carry) & EC_SYM_MAX as i32;
                     let ext = self.ext as usize;
                     for _j in 0..ext {
-                        if self.offs + self.end_offs < self.storage {
-                            unsafe {
-                                *self.buf.get_unchecked_mut(self.offs as usize) = sym as u8;
-                            }
-                            self.offs += 1;
-                        } else {
-                            self.error = 1;
-                        }
+                        self.write_byte(sym as u8);
                     }
                     self.ext = 0;
                 }
@@ -609,17 +573,21 @@ impl RangeCoder {
 
     #[inline(always)]
     pub fn encode_icdf(&mut self, s: i32, icdf: &[u8], ftb: u32) {
+        // The table is indexed with a check: a symbol outside the table is
+        // a bug in the caller and panics, it does not read other memory. A
+        // negative symbol becomes a huge index. Entry `s` is read first, so
+        // that one check covers entry `s - 1` as well.
+        let s = s as usize;
+        let lower = icdf[s] as u32;
         let r = self.rng >> ftb;
         if s > 0 {
-            let val = unsafe { *icdf.get_unchecked((s - 1) as usize) as u32 };
+            let val = icdf[s - 1] as u32;
             self.val = self
                 .val
                 .wrapping_add(self.rng.wrapping_sub(r.wrapping_mul(val)));
-            let lower = unsafe { *icdf.get_unchecked(s as usize) };
-            self.rng = r.wrapping_mul(val.wrapping_sub(lower as u32));
+            self.rng = r.wrapping_mul(val.wrapping_sub(lower));
         } else {
-            let val = unsafe { *icdf.get_unchecked(s as usize) as u32 };
-            self.rng = self.rng.wrapping_sub(r.wrapping_mul(val));
+            self.rng = self.rng.wrapping_sub(r.wrapping_mul(lower));
         }
         self.normalize_encoder();
     }
@@ -765,14 +733,16 @@ impl RangeCoder {
         val
     }
 
+    /// Writes the next byte of raw bits, from the end of the buffer
+    /// downwards, or sets the error flag when the buffer is full (libopus:
+    /// `ec_write_byte_at_end`). As in `write_byte`, the second condition
+    /// only matters for a coder whose public words were set inconsistently.
     #[inline(always)]
     fn write_byte_at_end(&mut self, value: u8) {
-        if self.offs + self.end_offs < self.storage {
+        let idx = self.storage.wrapping_sub(self.end_offs).wrapping_sub(1) as usize;
+        if self.offs + self.end_offs < self.storage && idx < self.buf.len() {
             self.end_offs += 1;
-            let idx = (self.storage - self.end_offs) as usize;
-            unsafe {
-                *self.buf.get_unchecked_mut(idx) = value;
-            }
+            self.buf[idx] = value;
         } else {
             self.error = 1;
         }

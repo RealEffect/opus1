@@ -292,7 +292,10 @@ pub fn silk_encode_frame(
             pred_coef_q12_flat[..MAX_LPC_ORDER].copy_from_slice(&s_enc_ctrl.pred_coef_q12[0]);
             pred_coef_q12_flat[MAX_LPC_ORDER..].copy_from_slice(&s_enc_ctrl.pred_coef_q12[1]);
 
-            if ps_enc.s_cmn.n_states_delayed_decision > 1 {
+            // C encode_frame_FIX.c 207: the delayed-decision quantizer also
+            // runs with one state when warping is on. The plain quantizer
+            // has no warped noise shaping.
+            if ps_enc.s_cmn.n_states_delayed_decision > 1 || ps_enc.s_cmn.warping_q16 > 0 {
                 let winner_seed = silk_nsq_del_dec(
                     &ps_enc.s_cmn,
                     &mut ps_enc.s_nsq,

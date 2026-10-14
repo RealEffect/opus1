@@ -691,18 +691,17 @@ fn final_range_equals_the_decoders() {
     }
 }
 
-/// Stereo Hybrid. The final range shows a fault in the CELT layer of these
-/// packets: the two decoders agree with each other and disagree with the
-/// encoder on every packet.
+/// Stereo Hybrid. The final range guards against a fault the CELT layer of
+/// these packets had: the two decoders agreed with each other and disagreed
+/// with the encoder on every packet.
 ///
-/// The cause is in the CELT encoder (src/celt.rs). It limits the first
-/// intensity-stereo band with `self.intensity.clamp(0, end)`. libopus
-/// limits it to the coded bands, `IMIN(st->end, IMAX(st->start,
-/// st->intensity))` (celt_encoder.c). A Hybrid frame starts at band 17, so
-/// a band below 17 is written as a negative offset and the rest of the
-/// frame decodes to noise (see the next test).
+/// The cause was in the CELT encoder (src/celt.rs). It limited the first
+/// intensity-stereo band to `0..end`. libopus limits it to the coded bands,
+/// `IMIN(end, IMAX(start, st->intensity))` (celt_encoder.c line 2408), and
+/// so does opus-rs now. A Hybrid frame starts at band 17, so a band below
+/// 17 was written as a negative offset and the rest of the frame decoded to
+/// noise (see the next test).
 #[test]
-#[ignore = "stereo Hybrid packets have a corrupt CELT layer: src/celt.rs limits the intensity band to 0..end, libopus to start..end"]
 fn final_range_equals_the_decoders_for_stereo_hybrid() {
     let streams: [RangeStream; 4] = [
         (48000, 2, ForcedMode::Hybrid, Bandwidth::Fullband, 64000, 8, false, false),
@@ -727,14 +726,13 @@ fn tone_power(x: &[f32], rate: usize, freq: f64) -> f64 {
     (re * re + im * im) / (x.len() as f64).powi(2)
 }
 
-/// What the fault above does to the sound: a tone at 9 kHz, in the CELT
-/// layer of a stereo Hybrid stream, comes back 30 dB or more too quiet in
-/// the left channel, where libopus loses about 1 dB. With the intensity
-/// band limited as in libopus it is within 2 dB of libopus. Only the left
-/// channel is measured: the right one also depends on where intensity
-/// stereo starts, which opus-rs still chooses differently.
+/// What the fault above did to the sound: a tone at 9 kHz, in the CELT
+/// layer of a stereo Hybrid stream, came back 30 dB or more too quiet in
+/// the left channel. With the intensity band limited as in libopus it is
+/// within 2 dB of libopus (measured: both keep the level of the input).
+/// Only the left channel is measured: the right one also depends on where
+/// intensity stereo starts, which opus-rs still chooses differently.
 #[test]
-#[ignore = "stereo Hybrid packets have a corrupt CELT layer: src/celt.rs limits the intensity band to 0..end, libopus to start..end"]
 fn stereo_hybrid_keeps_the_band_above_8_khz() {
     let rate = 48000;
     let frame = 960;
@@ -829,6 +827,58 @@ fn reset_state_gives_a_new_encoder_with_the_same_settings() {
                 "{rate} Hz, {channels} ch, {app:?}, {mode:?}, {bandwidth:?}, maximum {max:?}, LFE {lfe}"
             );
         }
+    }
+}
+
+/// libopus keeps one thing about the signal across `OPUS_RESET_STATE`:
+/// whether the last packet was to carry in-band FEC (`silk_mode.LBRR_coded`,
+/// which lies before `OPUS_ENCODER_RESET_START`). The next FEC decision
+/// leans the same way, and with more than 5 % loss that decision also
+/// picks the bandwidth (`decide_fec`).
+///
+/// Here the bitrate after the reset lies between the two thresholds: an
+/// encoder that had FEC before the reset goes on with FEC at narrowband,
+/// a new encoder codes wideband without FEC.
+#[test]
+fn fec_decision_after_a_reset_matches_libopus() {
+    for rate in [16000usize, 48000] {
+        let frame = rate / 50;
+        let pcm = speech(rate, 1, 1.0);
+        let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
+        c_enc.complexity(5).vbr(false).fec(true, 30).max_bandwidth(BW_WB);
+        let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+        enc.complexity = 5;
+        enc.use_cbr = true;
+        enc.use_inband_fec = true;
+        enc.packet_loss_perc = 30;
+        enc.set_max_bandwidth(Bandwidth::Wideband).unwrap();
+        // A new C encoder at the low bitrate, for comparison.
+        let mut c_new = CEncoder::new(rate, 1, APP_AUDIO);
+        c_new.complexity(5).vbr(false).fec(true, 30).max_bandwidth(BW_WB).bitrate(16000);
+
+        let mut buf = vec![0u8; 1500];
+        let (mut tocs, mut c_tocs, mut c_new_tocs) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, input) in pcm.chunks_exact(frame).take(30).enumerate() {
+            if i == 15 {
+                c_enc.reset();
+                enc.reset_state();
+            }
+            let bitrate = if i < 15 { 64000 } else { 16000 };
+            c_enc.bitrate(bitrate);
+            enc.bitrate_bps = bitrate;
+            let c_packet = c_enc.encode(input);
+            let n = enc.encode(input, frame, &mut buf).unwrap();
+            assert_eq!(n, c_packet.len(), "{rate} Hz, packet {i}: size");
+            tocs.push(buf[0] & 0xFC);
+            c_tocs.push(c_packet[0] & 0xFC);
+            if i >= 15 {
+                c_new_tocs.push(c_new.encode(input)[0] & 0xFC);
+            }
+        }
+        assert_eq!(tocs, c_tocs, "{rate} Hz: first bytes");
+        // The case is the one described: the reset encoder and the new one
+        // differ in libopus.
+        assert_ne!(c_tocs[15..], c_new_tocs[..], "{rate} Hz: libopus after a reset against a new encoder");
     }
 }
 

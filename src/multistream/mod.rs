@@ -3,21 +3,24 @@
 //!
 //! A multistream packet holds one ordinary Opus packet per stream. The first
 //! streams are stereo ("coupled" streams), the others are mono. Every stream
-//! has its own [`OpusDecoder`](crate::OpusDecoder), so the codec itself never
-//! sees more than 2 channels. A channel layout says which decoded channel
-//! each channel of the application uses.
+//! has its own [`OpusEncoder`](crate::OpusEncoder) or
+//! [`OpusDecoder`](crate::OpusDecoder), so the codec itself never sees more
+//! than 2 channels. A channel layout says which stream each channel of the
+//! application goes to or comes from.
 //!
 //! What is here:
 //!
+//! - [`MultistreamEncoder`](crate::multistream::MultistreamEncoder), in the
+//!   module `encoder`: encodes interleaved samples into a multistream
+//!   packet. A port of libopus `opus_multistream_encoder.c`. The module
+//!   `surround` holds its surround masking analysis, and the module
+//!   `rate_alloc` how it divides a bitrate among the streams.
 //! - [`MultistreamDecoder`](crate::multistream::MultistreamDecoder), in the
 //!   module `decoder`: decodes a multistream packet into interleaved
 //!   samples. A port of libopus `opus_multistream_decoder.c`.
 //! - [`ChannelLayout`](crate::multistream::ChannelLayout), in the module
 //!   `layout`: the layout, its checks, and the layouts of the mapping
 //!   families of the Ogg Opus header.
-//! - the module `rate_alloc`: how an encoder divides a bitrate among the
-//!   streams.
-//! - the modules `encoder` and `surround` belong to the multistream encoder.
 //! - [`ChannelMappingTable`](crate::multistream::ChannelMappingTable): the
 //!   channel mapping table as it is stored in an Ogg Opus header.
 //! - [`split_self_delimited`](crate::multistream::split_self_delimited):
@@ -25,8 +28,91 @@
 //!   look at the streams itself. The decoder does not need it.
 //!
 //! The module needs the `std` feature. The number of streams is known only at
-//! run time (up to 255), so the stream decoders live in a `Vec`. Memory is
-//! allocated when a decoder is built. Decoding allocates nothing.
+//! run time (up to 255), so the stream encoders and decoders live in a
+//! `Vec`. Memory is allocated when an encoder or a decoder is built.
+//! Encoding and decoding allocate nothing.
+//!
+//! # Encoding
+//!
+//! [`MultistreamEncoder::new_surround`](crate::multistream::MultistreamEncoder::new_surround)
+//! picks the layout of a mapping family of the Ogg Opus header. Family 1 is
+//! the one for surround sound: 1 to 8 channels in the channel order of
+//! Vorbis. With more than 2 channels the encoder works in surround mode. It
+//! then codes the stereo pairs with CELT and spends fewer bits on what
+//! other channels mask. With 6, 7 or 8 channels the last channel is the
+//! low-frequency-effects (LFE) channel, which gets a small stream of its
+//! own.
+//!
+//! ```
+//! use opus_rs::Application;
+//! use opus_rs::multistream::{Bitrate, MultistreamEncoder};
+//!
+//! // 5.1 at 48 kHz: front left, centre, front right, rear left, rear
+//! // right, LFE.
+//! let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio)?;
+//! encoder.set_bitrate(Bitrate::BitsPerSecond(256_000))?;
+//!
+//! // Two stereo streams (front and rear), then the centre and the LFE
+//! // channel as mono streams. An Ogg Opus header stores these numbers and
+//! // the mapping.
+//! let layout = encoder.layout();
+//! assert_eq!((layout.streams(), layout.coupled_streams()), (4, 2));
+//! assert_eq!(layout.mapping(), &[0, 4, 1, 2, 3, 5]);
+//! assert_eq!(encoder.lfe_stream(), Some(3));
+//!
+//! // One frame of 20 ms: 960 samples per channel, interleaved. Sample `i`
+//! // of channel `c` is `pcm[i * 6 + c]`.
+//! let pcm: Vec<f32> = (0..960 * 6)
+//!     .map(|k| 0.2 * ((k / 6) as f32 * 0.02 * (1 + k % 6) as f32).sin())
+//!     .collect();
+//! // The length of the buffer is the largest packet allowed.
+//! let mut packet = vec![0u8; 4000];
+//! let len = encoder.encode(&pcm, 960, &mut packet)?;
+//! assert!(len > 0 && len <= packet.len());
+//! # Ok::<(), &'static str>(())
+//! ```
+//!
+//! # Decoding
+//!
+//! The decoder needs the layout the encoder used: the number of channels,
+//! of streams and of coupled streams, and the mapping. A file carries them
+//! in its header. A packet does not, so a decoder with another layout reads
+//! it wrongly or rejects it.
+//!
+//! ```
+//! use opus_rs::Application;
+//! use opus_rs::multistream::{MultistreamDecoder, MultistreamEncoder};
+//!
+//! // A packet to decode: one 20 ms frame of quadraphonic sound.
+//! let mut encoder = MultistreamEncoder::new_surround(48_000, 4, 1, Application::Audio)?;
+//! let pcm = vec![0.1f32; 960 * 4];
+//! let mut packet = vec![0u8; 4000];
+//! let len = encoder.encode(&pcm, 960, &mut packet)?;
+//!
+//! // The decoder for the same layout.
+//! let layout = encoder.layout();
+//! let mut decoder = MultistreamDecoder::with_layout(
+//!     48_000,
+//!     layout.channels(),
+//!     layout.streams(),
+//!     layout.coupled_streams(),
+//!     layout.mapping(),
+//! )?;
+//!
+//! // `out` has room for 960 samples per channel. The result is the number
+//! // of samples per channel that were written, interleaved like the input.
+//! let mut out = vec![0f32; 960 * 4];
+//! let samples = decoder.decode(&packet[..len], 960, &mut out)?;
+//! assert_eq!(samples, 960);
+//!
+//! // An empty packet stands for a lost one: the decoder fills the gap.
+//! let samples = decoder.decode(&[], 960, &mut out)?;
+//! assert_eq!(samples, 960);
+//! # Ok::<(), &'static str>(())
+//! ```
+//!
+//! `examples/multistream.rs` encodes and decodes a longer 5.1 signal and
+//! prints the packet sizes and the quality of every channel.
 
 // The links in the text above are written with their full path on purpose.
 // `src/lib.rs` puts a line of documentation in front of that text, and
@@ -46,7 +132,6 @@ use crate::packet;
 
 /// Source of the input samples of one frame, by input channel.
 /// libopus calls this `opus_copy_channel_in_func`.
-#[allow(dead_code)] // used once the multistream encoder is in
 pub(crate) trait ChannelSource {
     /// Writes `frame_size` samples of input channel `src_channel` to
     /// `dst[0]`, `dst[dst_stride]`, `dst[2 * dst_stride]` and so on.

@@ -5,10 +5,18 @@
 //! is the signal-to-noise ratio of the `f32` result: reference power divided
 //! by error power, in decibels. Single-precision rounding gives about 140 dB.
 //!
+//! Three versions are measured: the transform the codec runs on this target,
+//! the portable one that rounds every product before it adds
+//! (`*_scalar`), and the portable one that fuses the products clang fuses in
+//! libopus for arm64 (`*_fused`). On aarch64 the codec runs the fused
+//! arithmetic, elsewhere the separate one.
+//!
 //! The limits below sit a few decibels under what the code measures today.
 //! Run with `--nocapture` to see the measured values.
 
-use opus_rs::kiss_fft::{KissCpx, KissFftState, opus_fft_impl, opus_fft_impl_scalar};
+use opus_rs::kiss_fft::{
+    KissCpx, KissFftState, opus_fft_impl, opus_fft_impl_fused, opus_fft_impl_scalar,
+};
 use opus_rs::mdct::MdctLookup;
 use opus_rs::modes::default_mode;
 use std::f64::consts::PI;
@@ -148,9 +156,9 @@ fn mdct_backward_f64(input: &[f32], out: &mut [f64], window: &[f32], overlap: us
 }
 
 /// Lowest signal-to-noise ratio the FFT may have, in decibels.
-const FFT_MIN_SNR_DB: f64 = 130.0;
+const FFT_MIN_SNR_DB: f64 = 136.0;
 /// Lowest signal-to-noise ratio the MDCT may have, in decibels.
-const MDCT_MIN_SNR_DB: f64 = 125.0;
+const MDCT_MIN_SNR_DB: f64 = 134.0;
 
 #[test]
 fn fft_accuracy_against_double_precision() {
@@ -164,8 +172,8 @@ fn fft_accuracy_against_double_precision() {
             sub = KissFftState::new_sub(&base, nfft).unwrap();
             &sub
         };
-        let mut worst = f64::INFINITY;
-        let mut worst_scalar = f64::INFINITY;
+        // The codec's transform, the separate one, the fused one.
+        let mut worst = [f64::INFINITY; 3];
         for _ in 0..20 {
             let x: Vec<(f32, f32)> = (0..nfft).map(|_| (rng.unit(), rng.unit())).collect();
             let want = dft(&x.iter().map(|&(r, i)| (r as f64, i as f64)).collect::<Vec<_>>());
@@ -177,19 +185,23 @@ fn fft_accuracy_against_double_precision() {
                 buf[st.bitrev[i] as usize] = KissCpx::new(r, im);
             }
             let mut buf_scalar = buf.clone();
+            let mut buf_fused = buf.clone();
             opus_fft_impl(st, &mut buf);
             opus_fft_impl_scalar(st, &mut buf_scalar);
+            opus_fft_impl_fused(st, &mut buf_fused);
 
             let flat = |b: &[KissCpx]| b.iter().flat_map(|c| [c.r, c.i]).collect::<Vec<f32>>();
-            worst = worst.min(snr_db(&flat(&buf), &want));
-            worst_scalar = worst_scalar.min(snr_db(&flat(&buf_scalar), &want));
+            for (w, b) in worst.iter_mut().zip([&buf, &buf_scalar, &buf_fused]) {
+                *w = w.min(snr_db(&flat(b), &want));
+            }
         }
-        println!("fft {nfft:3} points: {worst:.1} dB, portable {worst_scalar:.1} dB");
-        assert!(worst >= FFT_MIN_SNR_DB, "fft {nfft}: {worst:.1} dB");
-        assert!(
-            worst_scalar >= FFT_MIN_SNR_DB,
-            "portable fft {nfft}: {worst_scalar:.1} dB"
+        println!(
+            "fft {nfft:3} points: {:.1} dB, separate {:.1} dB, fused {:.1} dB",
+            worst[0], worst[1], worst[2]
         );
+        for (what, snr) in ["fft", "separate fft", "fused fft"].iter().zip(worst) {
+            assert!(snr >= FFT_MIN_SNR_DB, "{what} {nfft}: {snr:.1} dB");
+        }
     }
 }
 
@@ -201,18 +213,24 @@ fn mdct_accuracy_against_double_precision() {
     let mut rng = Lcg(0xacc0_0002);
     for shift in 0..=mode.max_lm {
         let n2 = (mode.mdct.n >> shift) / 2;
-        let mut worst = [f64::INFINITY; 4];
+        // Forward: the codec's transform, separate, fused. Then the same
+        // three for the inverse.
+        let mut worst = [f64::INFINITY; 6];
         for _ in 0..10 {
             // Forward.
             let input: Vec<f32> = (0..n2 + overlap).map(|_| rng.unit() * 32768.0).collect();
             let want = mdct_forward_f64(&input, window, overlap, n2);
             let mut got = vec![0f32; n2];
             let mut got_scalar = vec![0f32; n2];
+            let mut got_fused = vec![0f32; n2];
             mode.mdct.forward(&input, &mut got, window, overlap, shift, 1);
             mode.mdct
                 .forward_scalar(&input, &mut got_scalar, window, overlap, shift, 1);
+            mode.mdct
+                .forward_fused(&input, &mut got_fused, window, overlap, shift, 1);
             worst[0] = worst[0].min(snr_db(&got, &want));
             worst[1] = worst[1].min(snr_db(&got_scalar, &want));
+            worst[2] = worst[2].min(snr_db(&got_fused, &want));
 
             // Inverse.
             let coeffs: Vec<f32> = (0..n2).map(|_| rng.unit() * 32768.0).collect();
@@ -221,20 +239,31 @@ fn mdct_accuracy_against_double_precision() {
             mdct_backward_f64(&coeffs, &mut want, window, overlap, n2);
             let mut got = tail.clone();
             let mut got_scalar = tail.clone();
+            let mut got_fused = tail.clone();
             mode.mdct
                 .backward(&coeffs, &mut got, window, overlap, shift, 1);
             mode.mdct
                 .backward_scalar(&coeffs, &mut got_scalar, window, overlap, shift, 1);
-            worst[2] = worst[2].min(snr_db(&got, &want));
-            worst[3] = worst[3].min(snr_db(&got_scalar, &want));
+            mode.mdct
+                .backward_fused(&coeffs, &mut got_fused, window, overlap, shift, 1);
+            worst[3] = worst[3].min(snr_db(&got, &want));
+            worst[4] = worst[4].min(snr_db(&got_scalar, &want));
+            worst[5] = worst[5].min(snr_db(&got_fused, &want));
         }
         println!(
-            "mdct {n2:3} coefficients: forward {:.1} dB (portable {:.1}), inverse {:.1} dB (portable {:.1})",
-            worst[0], worst[1], worst[2], worst[3]
+            "mdct {n2:3} coefficients: forward {:.1} dB (separate {:.1}, fused {:.1}), inverse {:.1} dB (separate {:.1}, fused {:.1})",
+            worst[0], worst[1], worst[2], worst[3], worst[4], worst[5]
         );
-        for (what, snr) in ["forward", "portable forward", "inverse", "portable inverse"]
-            .iter()
-            .zip(worst)
+        for (what, snr) in [
+            "forward",
+            "separate forward",
+            "fused forward",
+            "inverse",
+            "separate inverse",
+            "fused inverse",
+        ]
+        .iter()
+        .zip(worst)
         {
             assert!(snr >= MDCT_MIN_SNR_DB, "{what} mdct {n2}: {snr:.1} dB");
         }

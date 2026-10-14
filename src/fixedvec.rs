@@ -322,9 +322,9 @@ impl<T, const N: usize> Drop for FixedVec<T, N> {
     }
 }
 
-// `FixedVec` owns its storage inline and (once fully initialized) is safe to share.
-unsafe impl<T: Sync, const N: usize> Sync for FixedVec<T, N> {}
-unsafe impl<T: Send, const N: usize> Send for FixedVec<T, N> {}
+// `FixedVec<T, N>` is `Send` and `Sync` exactly when `T` is: its fields are a
+// `usize` and an array of `MaybeUninit<T>`, and the compiler derives both
+// traits from them. `auto_traits_follow_the_element_type` checks it.
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
@@ -360,6 +360,33 @@ mod tests {
         fn drop(&mut self) {
             self.live.set(self.live.get() - 1);
         }
+    }
+
+    /// `Send` and `Sync` come from the element type. They used to be two
+    /// `unsafe impl`s with the same bounds.
+    #[test]
+    fn auto_traits_follow_the_element_type() {
+        fn is_send<T: Send>() {}
+        fn is_sync<T: Sync>() {}
+        is_send::<FixedVec<u8, 16>>();
+        is_sync::<FixedVec<u8, 16>>();
+        is_send::<FixedVec<f32, 2048>>();
+        is_sync::<FixedVec<f32, 2048>>();
+        // `Cell<u8>` is `Send` but not `Sync`; a buffer of them must not be
+        // `Sync` either. `Rc` is neither.
+        is_send::<FixedVec<Cell<u8>, 4>>();
+        trait NotSync {
+            const IS_SYNC: bool = false;
+        }
+        impl<T: ?Sized> NotSync for T {}
+        struct Probe<T: ?Sized>(core::marker::PhantomData<T>);
+        #[allow(dead_code)]
+        impl<T: ?Sized + Sync> Probe<T> {
+            const IS_SYNC: bool = true;
+        }
+        assert!(Probe::<FixedVec<u8, 4>>::IS_SYNC);
+        assert!(!Probe::<FixedVec<Cell<u8>, 4>>::IS_SYNC);
+        assert!(!Probe::<FixedVec<Rc<u8>, 4>>::IS_SYNC);
     }
 
     /// The constructors and `clone` give the same elements as a `Vec`, for

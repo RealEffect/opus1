@@ -211,6 +211,8 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     let x = &mut x[..2 * (n0 >> 1) * stride];
     #[cfg(target_arch = "aarch64")]
     haar1_neon(x, stride);
+    // SAFETY: `x` holds exactly `2 * (n0 / 2) * stride` values and the kernel
+    // runs for `stride == 1` only, on a CPU with AVX2.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         // NOTE: the previous AVX1 kernel loaded its second vector at +4
@@ -227,6 +229,9 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     haar1_scalar(x, stride);
 }
 
+/// # Safety
+///
+/// `x` must hold at least `2 * (n0 / 2)` values, and the CPU must have AVX2.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
@@ -833,13 +838,15 @@ pub fn compute_theta(
     } else if stereo {
         if ctx.encode {
             let inv = itheta > 8192 && !ctx.disable_inv;
-            // libopus negates `y` at this point when `inv` is set, so that
-            // the mix below adds two channels of the same sign. The loop
-            // that did this here wrote through a pointer taken from a
-            // shared slice, and the compiler removed it from every release
-            // build. It is left out on purpose in this commit, so that the
-            // encoder output stays exactly as it was. The commit "negate the
-            // right channel of a phase-inverted intensity band" restores it.
+            if inv {
+                // The two channels are out of phase. Negate the right one,
+                // so that the mix below does not cancel. The decoder negates
+                // it again when it reads the `inv` bit. Same as libopus
+                // (celt/bands.c, compute_theta).
+                for yv in y[..n].iter_mut() {
+                    *yv = -*yv;
+                }
+            }
             intensity_stereo(ctx.m, x, y, ctx.band_e, ctx.i, n);
             if *b > (2 << BITRES) && ctx.remaining_bits > (2 << BITRES) {
                 ctx.rc.encode_bit_logp(inv, 2);
@@ -1265,6 +1272,188 @@ fn quant_partition_encode(
     }
 }
 
+/// `LCG_AHEAD[k - 1]` takes the noise generator `k` steps ahead, for `k`
+/// from 1 to 8: the seed after `k` steps of `celt_lcg_rand` is
+/// `seed * multiplier + increment` (wrapping).
+///
+/// One step waits for the step before it. With these constants eight
+/// values are computed from the same seed at once.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const LCG_AHEAD: [(u32, u32); 8] = {
+    let mut table = [(0u32, 0u32); 8];
+    let (mut mul, mut add) = (1u32, 0u32);
+    let mut k = 0;
+    while k < 8 {
+        // One more step on top of `seed * mul + add`.
+        mul = mul.wrapping_mul(1664525);
+        add = add.wrapping_mul(1664525).wrapping_add(1013904223);
+        table[k] = (mul, add);
+        k += 1;
+    }
+    table
+};
+
+/// Portable form of `fold_with_noise`; `x` and `lb` have the same length.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline(always)]
+fn fold_with_noise_scalar(x: &mut [f32], lb: &[f32], mut seed: u32) -> u32 {
+    debug_assert_eq!(x.len(), lb.len());
+    for (xv, &l) in x.iter_mut().zip(lb) {
+        seed = celt_lcg_rand(seed);
+        *xv = l + if seed & 0x8000 != 0 {
+            1.0 / 256.0
+        } else {
+            -1.0 / 256.0
+        };
+    }
+    seed
+}
+
+/// Portable form of `fill_with_noise`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline(always)]
+fn fill_with_noise_scalar(x: &mut [f32], mut seed: u32) -> u32 {
+    for xv in x.iter_mut() {
+        seed = celt_lcg_rand(seed);
+        *xv = ((seed as i32 >> 20) as f32) / 16384.0;
+    }
+    seed
+}
+
+/// The seeds of the next eight values, as two vectors, and the seed after
+/// them in every lane of a third one.
+///
+/// # Safety
+///
+/// Needs NEON, which is part of the baseline of every aarch64 target.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lcg_next8(
+    vseed: core::arch::aarch64::uint32x4_t,
+) -> (
+    core::arch::aarch64::uint32x4_t,
+    core::arch::aarch64::uint32x4_t,
+    core::arch::aarch64::uint32x4_t,
+) {
+    use core::arch::aarch64::*;
+    const MUL: [u32; 8] = {
+        let mut m = [0u32; 8];
+        let mut k = 0;
+        while k < 8 {
+            m[k] = LCG_AHEAD[k].0;
+            k += 1;
+        }
+        m
+    };
+    const ADD: [u32; 8] = {
+        let mut a = [0u32; 8];
+        let mut k = 0;
+        while k < 8 {
+            a[k] = LCG_AHEAD[k].1;
+            k += 1;
+        }
+        a
+    };
+    // SAFETY: each load reads four values of an array of eight.
+    unsafe {
+        let lo = vmlaq_u32(vld1q_u32(ADD.as_ptr()), vseed, vld1q_u32(MUL.as_ptr()));
+        let hi = vmlaq_u32(vld1q_u32(ADD.as_ptr().add(4)), vseed, vld1q_u32(MUL.as_ptr().add(4)));
+        // The seed eight steps ahead, computed in all lanes, so that the
+        // next pass does not wait for a move between registers.
+        let next = vmlaq_u32(vdupq_n_u32(ADD[7]), vseed, vdupq_n_u32(MUL[7]));
+        (lo, hi, next)
+    }
+}
+
+/// NEON form of `fold_with_noise`: eight values per pass. `lb` must be at
+/// least as long as `x`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fold_with_noise_neon(x: &mut [f32], lb: &[f32], seed: u32) -> u32 {
+    use core::arch::aarch64::*;
+
+    let lb = &lb[..x.len()];
+    let (x8, x_tail) = x.as_chunks_mut::<8>();
+    let (lb8, lb_tail) = lb.as_chunks::<8>();
+    // SAFETY: NEON is part of the baseline of every aarch64 target. Each
+    // load and store covers one half of a `[f32; 8]`.
+    let seed = unsafe {
+        let bit = vdupq_n_u32(0x8000);
+        let plus = vdupq_n_f32(1.0 / 256.0);
+        let minus = vdupq_n_f32(-1.0 / 256.0);
+        let mut vseed = vdupq_n_u32(seed);
+        for (xo, l) in x8.iter_mut().zip(lb8) {
+            let (s_lo, s_hi, next) = lcg_next8(vseed);
+            vseed = next;
+            let n_lo = vbslq_f32(vtstq_u32(s_lo, bit), plus, minus);
+            let n_hi = vbslq_f32(vtstq_u32(s_hi, bit), plus, minus);
+            vst1q_f32(xo.as_mut_ptr(), vaddq_f32(vld1q_f32(l.as_ptr()), n_lo));
+            vst1q_f32(xo.as_mut_ptr().add(4), vaddq_f32(vld1q_f32(l.as_ptr().add(4)), n_hi));
+        }
+        vgetq_lane_u32::<0>(vseed)
+    };
+    fold_with_noise_scalar(x_tail, lb_tail, seed)
+}
+
+/// NEON form of `fill_with_noise`: eight values per pass.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fill_with_noise_neon(x: &mut [f32], seed: u32) -> u32 {
+    use core::arch::aarch64::*;
+
+    let (x8, x_tail) = x.as_chunks_mut::<8>();
+    // SAFETY: NEON is part of the baseline of every aarch64 target. Each
+    // store covers one half of a `[f32; 8]`.
+    let seed = unsafe {
+        let mut vseed = vdupq_n_u32(seed);
+        for xo in x8.iter_mut() {
+            let (s_lo, s_hi, next) = lcg_next8(vseed);
+            vseed = next;
+            // The top 12 bits as a signed number, divided by 2^14. The
+            // conversion with 14 fraction bits does the division, exactly.
+            let v_lo = vcvtq_n_f32_s32::<14>(vshrq_n_s32::<20>(vreinterpretq_s32_u32(s_lo)));
+            let v_hi = vcvtq_n_f32_s32::<14>(vshrq_n_s32::<20>(vreinterpretq_s32_u32(s_hi)));
+            vst1q_f32(xo.as_mut_ptr(), v_lo);
+            vst1q_f32(xo.as_mut_ptr().add(4), v_hi);
+        }
+        vgetq_lane_u32::<0>(vseed)
+    };
+    fill_with_noise_scalar(x_tail, seed)
+}
+
+/// Fills a band that got no pulses with the folded band `lb` plus noise:
+/// `x[j] = lb[j] + 1/256` or `lb[j] - 1/256`, by bit 15 of one step of the
+/// noise generator per value (libopus: quant_partition, the `lowband`
+/// case). Returns the seed after the last value. `x` and `lb` must have the
+/// same length.
+#[inline(always)]
+fn fold_with_noise(x: &mut [f32], lb: &[f32], seed: u32) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        fold_with_noise_neon(x, lb, seed)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        fold_with_noise_scalar(x, lb, seed)
+    }
+}
+
+/// Fills a band that got no pulses and has no band to fold with noise: the
+/// top 12 bits of one step of the noise generator per value, as a signed
+/// number divided by 16384 (libopus: quant_partition, the noise case).
+/// Returns the seed after the last value.
+#[inline(always)]
+fn fill_with_noise(x: &mut [f32], seed: u32) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        fill_with_noise_neon(x, seed)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        fill_with_noise_scalar(x, seed)
+    }
+}
+
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn quant_partition(
@@ -1483,66 +1672,14 @@ pub fn quant_partition(
                 if fill_masked == 0 {
                     x[..n].fill(0.0);
                 } else if let Some(lb) = lowband {
-                    // One bounds check per slice for the loops below.
+                    // One bounds check per slice; the kernels need none.
                     let x = &mut x[..n];
-                    let lb = &lb[..n];
-                    // SAFETY: the vector loop reads `lb[i..i + 8]` and writes
-                    // `x[i..i + 8]` with `i + 8 <= n8 <= n`, and both slices
-                    // hold exactly `n` values. `vals` is a local array of 8.
-                    #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        use core::arch::aarch64::*;
-                        let n8 = n & !7;
-                        let mut i = 0;
-                        while i < n8 {
-                            let mut vals = [0.0f32; 8];
-                            for j in 0..8 {
-                                ctx.seed = celt_lcg_rand(ctx.seed);
-                                vals[j] = if ctx.seed & 0x8000 != 0 {
-                                    1.0 / 256.0
-                                } else {
-                                    -1.0 / 256.0
-                                };
-                            }
-                            let vnoise = vld1q_f32(vals.as_ptr());
-                            let vnoise1 = vld1q_f32(vals.as_ptr().add(4));
-                            let vlb = vld1q_f32(lb.as_ptr().add(i));
-                            let vlb1 = vld1q_f32(lb.as_ptr().add(i + 4));
-                            let vres = vaddq_f32(vlb, vnoise);
-                            let vres1 = vaddq_f32(vlb1, vnoise1);
-                            vst1q_f32(x.as_mut_ptr().add(i), vres);
-                            vst1q_f32(x.as_mut_ptr().add(i + 4), vres1);
-                            i += 8;
-                        }
-                        for j in i..n {
-                            ctx.seed = celt_lcg_rand(ctx.seed);
-                            x[j] = lb[j]
-                                + if ctx.seed & 0x8000 != 0 {
-                                    1.0 / 256.0
-                                } else {
-                                    -1.0 / 256.0
-                                };
-                        }
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        for j in 0..n {
-                            ctx.seed = celt_lcg_rand(ctx.seed);
-                            x[j] = lb[j]
-                                + if ctx.seed & 0x8000 != 0 {
-                                    1.0 / 256.0
-                                } else {
-                                    -1.0 / 256.0
-                                };
-                        }
-                    }
+                    ctx.seed = fold_with_noise(x, &lb[..n], ctx.seed);
                     renormalise_vector(x, n, gain);
                     cm = fill_masked;
                 } else {
-                    for xv in x[..n].iter_mut() {
-                        ctx.seed = celt_lcg_rand(ctx.seed);
-                        *xv = ((ctx.seed as i32 >> 20) as f32) / 16384.0;
-                    }
+                    let x = &mut x[..n];
+                    ctx.seed = fill_with_noise(x, ctx.seed);
                     renormalise_vector(x, n, gain);
                     cm = cm_mask;
                 }
@@ -1554,6 +1691,8 @@ pub fn quant_partition(
 
 /// Hadamard row order for `stride` rows. `ORDERY_TABLE` holds the orders
 /// for 2, 4, 8 and 16 rows, one after the other.
+///
+/// Panics for any other number of rows: the table has no order for it.
 #[inline(always)]
 fn hadamard_order(stride: usize) -> &'static [i32] {
     let offset = match stride {
@@ -1561,71 +1700,174 @@ fn hadamard_order(stride: usize) -> &'static [i32] {
         4 => 2,
         8 => 6,
         16 => 14,
-        _ => 0,
+        _ => panic!("no Hadamard order for {stride} rows"),
     };
     &ORDERY_TABLE[offset..offset + stride]
 }
 
-/// Scratch buffer of the two functions below, as a slice of `n` values that
-/// are not initialised yet. The caller must write every value before it
-/// reads one.
+// Each order in `ORDERY_TABLE` names every row exactly once.
+const _: () = {
+    let mut stride = 2;
+    let mut offset = 0;
+    while stride <= 16 {
+        let mut seen = 0u32;
+        let mut i = 0;
+        while i < stride {
+            seen |= 1 << ORDERY_TABLE[offset + i];
+            i += 1;
+        }
+        assert!(seen == (1u32 << stride) - 1);
+        offset += stride;
+        stride *= 2;
+    }
+};
+
+/// Scratch buffer of the reordering functions below. They write all the
+/// values they use before they read them.
+type HadamardScratch = [core::mem::MaybeUninit<f32>; MAX_PVQ_N];
+
+/// The first `n` values of `tmp` as initialised values.
+///
+/// # Safety
+///
+/// The caller must have written `tmp[..n]` completely.
 #[inline(always)]
-fn hadamard_scratch(buf: &mut [core::mem::MaybeUninit<f32>; MAX_PVQ_N], n: usize) -> &mut [f32] {
-    // A band never has more than MAX_PVQ_N values. This is checked in
-    // release builds too, because the slice below must fit in the buffer.
-    assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
-    // SAFETY: `n` values fit in the buffer (checked above). The callers
-    // write all `n` values, `stride` rows of `n0` values, before they read
-    // any of them.
-    unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, n) }
+unsafe fn hadamard_written(tmp: &HadamardScratch, n: usize) -> &[f32] {
+    let tmp = &tmp[..n];
+    // SAFETY: `MaybeUninit<f32>` has the layout of `f32`, and the caller
+    // wrote all `n` values.
+    unsafe { &*(tmp as *const [core::mem::MaybeUninit<f32>] as *const [f32]) }
+}
+
+/// `deinterleave_hadamard` for `S` rows; `x` holds exactly `n0 * S` values
+/// and `n0 >= 1`. Value `i` of every group goes to row `order[i]`, or to row
+/// `i` without an order.
+///
+/// The number of rows is a constant so that the compiler can use vector
+/// loads that skip `S - 1` values.
+#[inline(always)]
+fn deinterleave_rows<const S: usize>(x: &mut [f32], n0: usize, order: Option<&[i32]>) {
+    let n = x.len();
+    debug_assert!(n0 >= 1 && n == n0 * S);
+    let mut tmp_buf: HadamardScratch = [core::mem::MaybeUninit::uninit(); MAX_PVQ_N];
+    {
+        // A band never has more than MAX_PVQ_N values; a longer one panics here.
+        let mut rows_left = tmp_buf[..n].chunks_exact_mut(n0);
+        let mut rows: [Option<&mut [core::mem::MaybeUninit<f32>]>; S] =
+            core::array::from_fn(|_| rows_left.next());
+        let (groups, _) = x.as_chunks::<S>();
+        for i in 0..S {
+            let row = order.map_or(i, |o| o[i] as usize);
+            // Each row is handed out once. A row that is asked for twice
+            // means the order is not a permutation.
+            let dst = rows[row].take().expect("each row is used once");
+            for (d, g) in dst.iter_mut().zip(groups) {
+                d.write(g[i]);
+            }
+        }
+    }
+    // SAFETY: the loop above ran `S` times and took a different row of
+    // `tmp_buf[..n]` each time, so it used all `S` rows. `x` has `n0` groups,
+    // so every row of `n0` values was written completely.
+    x.copy_from_slice(unsafe { hadamard_written(&tmp_buf, n) });
+}
+
+/// `interleave_hadamard` for `S` rows; `x` holds exactly `n0 * S` values.
+/// Value `i` of every group comes from row `order[i]`, or from row `i`
+/// without an order.
+#[inline(always)]
+fn interleave_rows<const S: usize>(x: &mut [f32], n0: usize, order: Option<&[i32]>) {
+    let n = x.len();
+    debug_assert!(n == n0 * S);
+    let mut tmp_buf: HadamardScratch = [core::mem::MaybeUninit::uninit(); MAX_PVQ_N];
+    {
+        // A band never has more than MAX_PVQ_N values; a longer one panics here.
+        let (groups, _) = tmp_buf[..n].as_chunks_mut::<S>();
+        for i in 0..S {
+            let row = order.map_or(i, |o| o[i] as usize);
+            let src = &x[row * n0..(row + 1) * n0];
+            for (g, &v) in groups.iter_mut().zip(src) {
+                g[i].write(v);
+            }
+        }
+    }
+    // SAFETY: `tmp_buf[..n]` is `n0` groups of `S` values. Every row of `x`
+    // has `n0` values, so pass `i` of the loop above wrote value `i` of
+    // every group, and the `S` passes wrote all of them.
+    x.copy_from_slice(unsafe { hadamard_written(&tmp_buf, n) });
 }
 
 /// Reorders `x` from `n0` groups of `stride` values (one value per short
 /// block) to `stride` rows of `n0` values (one row per short block). With
 /// `hadamard`, the rows are stored in the order of the Hadamard transform.
+///
+/// Panics when `x` has fewer than `n0 * stride` values, when that product
+/// exceeds `MAX_PVQ_N`, and with `hadamard` when `stride` is not 2, 4, 8 or
+/// 16.
 pub fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
     let x = &mut x[..n];
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = hadamard_scratch(&mut tmp_buf, n);
-    if hadamard {
-        let ordery = hadamard_order(stride);
-        for i in 0..stride {
-            for j in 0..n0 {
-                tmp[ordery[i] as usize * n0 + j] = x[j * stride + i];
-            }
-        }
+    if n == 0 {
+        return;
+    }
+    let order = if hadamard {
+        Some(hadamard_order(stride))
     } else {
-        for i in 0..stride {
-            for j in 0..n0 {
-                tmp[i * n0 + j] = x[j * stride + i];
+        None
+    };
+    match stride {
+        // The codec uses 2, 4 and 8 rows (one row per short block).
+        2 => deinterleave_rows::<2>(x, n0, order),
+        4 => deinterleave_rows::<4>(x, n0, order),
+        8 => deinterleave_rows::<8>(x, n0, order),
+        16 => deinterleave_rows::<16>(x, n0, order),
+        _ => {
+            // Any other number of rows comes without an order
+            // (`hadamard_order` panics otherwise).
+            let mut tmp_buf: HadamardScratch = [core::mem::MaybeUninit::uninit(); MAX_PVQ_N];
+            let tmp = &mut tmp_buf[..n];
+            for i in 0..stride {
+                for j in 0..n0 {
+                    tmp[i * n0 + j].write(x[j * stride + i]);
+                }
             }
+            // SAFETY: `i * n0 + j` takes every value below `n0 * stride`
+            // once, so all of `tmp_buf[..n]` was written.
+            x.copy_from_slice(unsafe { hadamard_written(&tmp_buf, n) });
         }
     }
-    x.copy_from_slice(tmp);
 }
 
-/// The reverse of `deinterleave_hadamard`.
+/// The reverse of `deinterleave_hadamard`. It panics in the same cases.
 pub fn interleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
     let x = &mut x[..n];
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = hadamard_scratch(&mut tmp_buf, n);
-    if hadamard {
-        let ordery = hadamard_order(stride);
-        for i in 0..stride {
-            for j in 0..n0 {
-                tmp[j * stride + i] = x[ordery[i] as usize * n0 + j];
-            }
-        }
+    if n == 0 {
+        return;
+    }
+    let order = if hadamard {
+        Some(hadamard_order(stride))
     } else {
-        for i in 0..stride {
-            for j in 0..n0 {
-                tmp[j * stride + i] = x[i * n0 + j];
+        None
+    };
+    match stride {
+        2 => interleave_rows::<2>(x, n0, order),
+        4 => interleave_rows::<4>(x, n0, order),
+        8 => interleave_rows::<8>(x, n0, order),
+        16 => interleave_rows::<16>(x, n0, order),
+        _ => {
+            let mut tmp_buf: HadamardScratch = [core::mem::MaybeUninit::uninit(); MAX_PVQ_N];
+            let tmp = &mut tmp_buf[..n];
+            for i in 0..stride {
+                for j in 0..n0 {
+                    tmp[j * stride + i].write(x[i * n0 + j]);
+                }
             }
+            // SAFETY: `j * stride + i` takes every value below
+            // `n0 * stride` once, so all of `tmp_buf[..n]` was written.
+            x.copy_from_slice(unsafe { hadamard_written(&tmp_buf, n) });
         }
     }
-    x.copy_from_slice(tmp);
 }
 
 const ORDERY_TABLE: [i32; 30] = [
@@ -1960,142 +2202,6 @@ fn prepare_lowband_views(
     }
 
     (Some(&mut norm[lb_start..lb_end]), None)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(dead_code)]
-unsafe fn stereo_merge_avx2(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-
-    let mut i = 0;
-
-    let v_mid = _mm256_set1_ps(mid);
-    let v_side = _mm256_set1_ps(side);
-
-    while i + 15 < n {
-        let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let x1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
-        let y1 = _mm256_loadu_ps(y.as_ptr().add(i + 8));
-
-        let x_val0 = _mm256_mul_ps(x0, v_mid);
-        let x_val1 = _mm256_mul_ps(x1, v_mid);
-        let y_val0 = _mm256_mul_ps(y0, v_side);
-        let y_val1 = _mm256_mul_ps(y1, v_side);
-
-        let new_x0 = _mm256_sub_ps(x_val0, y_val0);
-        let new_x1 = _mm256_sub_ps(x_val1, y_val1);
-        let new_y0 = _mm256_add_ps(x_val0, y_val0);
-        let new_y1 = _mm256_add_ps(x_val1, y_val1);
-
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), new_x0);
-        _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), new_x1);
-        _mm256_storeu_ps(y.as_mut_ptr().add(i), new_y0);
-        _mm256_storeu_ps(y.as_mut_ptr().add(i + 8), new_y1);
-
-        i += 16;
-    }
-
-    while i + 7 < n {
-        let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
-
-        let x_val = _mm256_mul_ps(x0, v_mid);
-        let y_val = _mm256_mul_ps(y0, v_side);
-
-        let new_x = _mm256_sub_ps(x_val, y_val);
-        let new_y = _mm256_add_ps(x_val, y_val);
-
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), new_x);
-        _mm256_storeu_ps(y.as_mut_ptr().add(i), new_y);
-
-        i += 8;
-    }
-
-    for j in i..n {
-        let x_val = x[j] * mid;
-        let y_val = y[j] * side;
-        x[j] = x_val - y_val;
-        y[j] = x_val + y_val;
-    }
-}
-
-#[allow(dead_code)]
-#[inline]
-fn stereo_merge_scalar(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    for i in 0..n {
-        let x_val = x[i] * mid;
-        let y_val = y[i] * side;
-        x[i] = x_val - y_val;
-        y[i] = x_val + y_val;
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-fn stereo_merge_neon(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    use core::arch::aarch64::*;
-
-    unsafe {
-        let vmid = vdupq_n_f32(mid);
-        let vside = vdupq_n_f32(side);
-
-        let n16 = n & !15;
-        for i in (0..n16).step_by(16) {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-            let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-            let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-            let y3 = vld1q_f32(y.as_ptr().add(i + 12));
-
-            let xv0 = vmulq_f32(x0, vmid);
-            let xv1 = vmulq_f32(x1, vmid);
-            let xv2 = vmulq_f32(x2, vmid);
-            let xv3 = vmulq_f32(x3, vmid);
-
-            let yv0 = vmulq_f32(y0, vside);
-            let yv1 = vmulq_f32(y1, vside);
-            let yv2 = vmulq_f32(y2, vside);
-            let yv3 = vmulq_f32(y3, vside);
-
-            vst1q_f32(x.as_mut_ptr().add(i), vsubq_f32(xv0, yv0));
-            vst1q_f32(x.as_mut_ptr().add(i + 4), vsubq_f32(xv1, yv1));
-            vst1q_f32(x.as_mut_ptr().add(i + 8), vsubq_f32(xv2, yv2));
-            vst1q_f32(x.as_mut_ptr().add(i + 12), vsubq_f32(xv3, yv3));
-
-            vst1q_f32(y.as_mut_ptr().add(i), vaddq_f32(xv0, yv0));
-            vst1q_f32(y.as_mut_ptr().add(i + 4), vaddq_f32(xv1, yv1));
-            vst1q_f32(y.as_mut_ptr().add(i + 8), vaddq_f32(xv2, yv2));
-            vst1q_f32(y.as_mut_ptr().add(i + 12), vaddq_f32(xv3, yv3));
-        }
-
-        let n4 = (n & !3) - n16;
-        for i in (n16..n16 + n4).step_by(4) {
-            let xv = vld1q_f32(x.as_ptr().add(i));
-            let yv = vld1q_f32(y.as_ptr().add(i));
-
-            let x_val = vmulq_f32(xv, vmid);
-            let y_val = vmulq_f32(yv, vside);
-
-            vst1q_f32(x.as_mut_ptr().add(i), vsubq_f32(x_val, y_val));
-            vst1q_f32(y.as_mut_ptr().add(i), vaddq_f32(x_val, y_val));
-        }
-
-        for i in (n16 + n4)..n {
-            let x_val = x[i] * mid;
-            let y_val = y[i] * side;
-            x[i] = x_val - y_val;
-            y[i] = x_val + y_val;
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2655,6 +2761,10 @@ fn compute_band_energy_neon(band: &[f32]) -> f32 {
     sum.sqrt()
 }
 
+/// # Safety
+///
+/// The CPU must have AVX2 and FMA. Every load covers `band[i..i + 8]` with
+/// `i + 8 <= band.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn compute_band_energy_avx2(band: &[f32]) -> f32 {
@@ -2726,6 +2836,7 @@ pub fn compute_band_energies(
             #[cfg(target_arch = "x86_64")]
             {
                 if n >= 8 && use_avx2 {
+                    // SAFETY: the CPU has AVX2 and FMA (`use_avx2`).
                     band_e[c * m.nb_ebands + i] = unsafe { compute_band_energy_avx2(band) };
                 } else {
                     let sum = band.iter().fold(1e-27f32, |acc, &v| acc + v * v);
@@ -2790,6 +2901,8 @@ pub fn normalise_bands(
             let dst = &mut x[base..base + n];
             #[cfg(target_arch = "x86_64")]
             if n >= 8 && use_avx2 {
+                // SAFETY: `src` and `dst` were sliced to `n` values above,
+                // and the CPU has AVX2.
                 unsafe { scale_slice_avx2(src, dst, norm, n) };
                 continue;
             }
@@ -2806,6 +2919,10 @@ pub fn normalise_bands(
     }
 }
 
+/// # Safety
+///
+/// `src` and `dst` must hold at least `n` values each, and the CPU must have
+/// AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
@@ -2904,6 +3021,8 @@ pub fn denormalise_bands(
             let dst = &mut freq[base..base + n];
             #[cfg(target_arch = "x86_64")]
             if n >= 8 && use_avx2 {
+                // SAFETY: `src` and `dst` were sliced to `n` values above,
+                // and the CPU has AVX2.
                 unsafe { scale_slice_avx2(src, dst, g, n) };
                 continue;
             }
@@ -3008,6 +3127,9 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
     }
 }
 
+/// # Safety
+///
+/// `x` must hold at least `n` values, and the CPU must have AVX2 and FMA.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
@@ -3575,12 +3697,25 @@ mod tests {
         }
     }
 
+    /// The row orders of the Hadamard transform as libopus lists them
+    /// (celt/bands.c, ordery_table), written out a second time so that the
+    /// test does not read the table it checks.
+    const HADAMARD_ORDERS: [(usize, &[usize]); 4] = [
+        (2, &[1, 0]),
+        (4, &[3, 0, 2, 1]),
+        (8, &[7, 0, 4, 3, 6, 1, 5, 2]),
+        (16, &[15, 0, 8, 7, 12, 3, 11, 4, 14, 1, 9, 6, 13, 2, 10, 5]),
+    ];
+
     #[test]
     fn hadamard_reorder_matches_its_definition_and_round_trips() {
-        for stride in [2usize, 3, 4, 5, 8, 16] {
-            for n0 in 1..=22 {
+        for stride in 1usize..=16 {
+            let order = HADAMARD_ORDERS.iter().find(|(s, _)| *s == stride).map(|(_, o)| *o);
+            // Every band size up to the largest one that fits the scratch
+            // buffer, and the empty band.
+            for n0 in 0..=(MAX_PVQ_N / stride).min(48) {
                 // The Hadamard order exists for 2, 4, 8 and 16 rows only.
-                let orders: &[bool] = if stride.is_power_of_two() { &[false, true] } else { &[false] };
+                let orders: &[bool] = if order.is_some() { &[false, true] } else { &[false] };
                 for &hadamard in orders {
                     let n = n0 * stride;
                     // Two values more than `n`: they must stay unchanged.
@@ -3588,9 +3723,7 @@ mod tests {
                     let what = format!("n0 {n0} stride {stride} hadamard {hadamard}");
 
                     // Row of the reordered layout that takes column `i`.
-                    let row = |i: usize| -> usize {
-                        if hadamard { hadamard_order(stride)[i] as usize } else { i }
-                    };
+                    let row = |i: usize| -> usize { if hadamard { order.unwrap()[i] } else { i } };
                     let mut want = input.clone();
                     for i in 0..stride {
                         for j in 0..n0 {
@@ -3608,11 +3741,57 @@ mod tests {
         }
     }
 
+    /// With a row count that has no Hadamard order the two functions must
+    /// panic. Before, some of these counts made `deinterleave_hadamard` copy
+    /// scratch values that it had never written.
     #[test]
-    #[should_panic]
+    fn hadamard_reorder_rejects_a_row_count_without_an_order() {
+        for stride in [1usize, 3, 5, 6, 7, 9, 12, 15, 17, 32] {
+            for deinterleave in [true, false] {
+                let result = std::panic::catch_unwind(|| {
+                    let mut x = vec![1.0f32; 4 * stride];
+                    if deinterleave {
+                        deinterleave_hadamard(&mut x, 4, stride, true);
+                    } else {
+                        interleave_hadamard(&mut x, 4, stride, true);
+                    }
+                });
+                assert!(result.is_err(), "stride {stride} deinterleave {deinterleave}");
+            }
+        }
+    }
+
+    #[test]
     fn hadamard_reorder_rejects_a_band_that_is_too_long() {
-        let mut x = vec![0.0f32; 2 * MAX_PVQ_N];
-        deinterleave_hadamard(&mut x, MAX_PVQ_N, 2, false);
+        for stride in [2usize, 3, 8] {
+            for deinterleave in [true, false] {
+                let result = std::panic::catch_unwind(|| {
+                    let n0 = MAX_PVQ_N / stride + 1;
+                    let mut x = vec![0.0f32; n0 * stride];
+                    if deinterleave {
+                        deinterleave_hadamard(&mut x, n0, stride, false);
+                    } else {
+                        interleave_hadamard(&mut x, n0, stride, false);
+                    }
+                });
+                assert!(result.is_err(), "stride {stride} deinterleave {deinterleave}");
+            }
+        }
+    }
+
+    #[test]
+    fn hadamard_reorder_rejects_a_slice_that_is_too_short() {
+        for deinterleave in [true, false] {
+            let result = std::panic::catch_unwind(|| {
+                let mut x = vec![0.0f32; 31];
+                if deinterleave {
+                    deinterleave_hadamard(&mut x, 4, 8, true);
+                } else {
+                    interleave_hadamard(&mut x, 4, 8, true);
+                }
+            });
+            assert!(result.is_err(), "deinterleave {deinterleave}");
+        }
     }
 
     #[test]
@@ -3620,5 +3799,71 @@ mod tests {
     fn haar1_rejects_a_slice_that_is_too_short() {
         let mut x = [0.0f32; 15];
         haar1(&mut x, 16, 1);
+    }
+
+    #[test]
+    fn lcg_ahead_matches_single_steps() {
+        for seed in [0u32, 1, 0x8000, 0xffff_ffff, 0x1234_5678, 0xdead_beef] {
+            let mut s = seed;
+            for (mul, add) in LCG_AHEAD {
+                s = celt_lcg_rand(s);
+                assert_eq!(seed.wrapping_mul(mul).wrapping_add(add), s, "seed {seed:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn noise_kernels_match_the_loops_they_replace() {
+        let mut gen_seed = 0x0153_0001u32;
+        for n in kernel_lengths() {
+            for round in 0..12u32 {
+                gen_seed = celt_lcg_rand(gen_seed);
+                let seed = match round {
+                    0 => 0,
+                    1 => 0xffff_ffff,
+                    2 => 0x8000,
+                    _ => gen_seed,
+                };
+                let lb = test_values(n, &mut gen_seed, round % 2 == 1);
+                let what = format!("n {n} seed {seed:#x}");
+
+                // The folded band plus noise, as libopus writes it.
+                let mut want = vec![0.0f32; n];
+                let mut s = seed;
+                for j in 0..n {
+                    s = celt_lcg_rand(s);
+                    want[j] = lb[j] + if s & 0x8000 != 0 { 1.0 / 256.0 } else { -1.0 / 256.0 };
+                }
+                let mut got = vec![7.0f32; n];
+                assert_eq!(fold_with_noise_scalar(&mut got, &lb, seed), s, "scalar seed, {what}");
+                assert_same_bits(&got, &want, &format!("fold scalar, {what}"));
+                let mut got = vec![7.0f32; n];
+                assert_eq!(fold_with_noise(&mut got, &lb, seed), s, "seed, {what}");
+                assert_same_bits(&got, &want, &format!("fold, {what}"));
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // A longer `lb`: only the first `n` values count.
+                    let mut lb_long = lb.clone();
+                    lb_long.extend([9.0, 9.0, 9.0]);
+                    let mut got = vec![7.0f32; n];
+                    assert_eq!(fold_with_noise_neon(&mut got, &lb_long, seed), s, "neon seed, {what}");
+                    assert_same_bits(&got, &want, &format!("fold neon, {what}"));
+                }
+
+                // Noise alone.
+                let mut want = vec![0.0f32; n];
+                let mut s = seed;
+                for v in want.iter_mut() {
+                    s = celt_lcg_rand(s);
+                    *v = ((s as i32 >> 20) as f32) / 16384.0;
+                }
+                let mut got = vec![7.0f32; n];
+                assert_eq!(fill_with_noise_scalar(&mut got, seed), s, "scalar seed, {what}");
+                assert_same_bits(&got, &want, &format!("fill scalar, {what}"));
+                let mut got = vec![7.0f32; n];
+                assert_eq!(fill_with_noise(&mut got, seed), s, "seed, {what}");
+                assert_same_bits(&got, &want, &format!("fill, {what}"));
+            }
+        }
     }
 }

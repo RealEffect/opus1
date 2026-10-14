@@ -512,8 +512,10 @@ pub fn silk_burg_modified_fix(
     let mut ca_f = [0i32; MAX_LPC_ORDER + 1];
     let mut ca_b = [0i32; MAX_LPC_ORDER + 1];
 
+    // The energy plus one, as in libopus: "make sure the noise corresponds
+    // to at least a unit pulse".
     let total_len = subfr_length * nb_subfr;
-    let c0_64 = inner_prod16_i64(&x[..total_len], &x[..total_len]);
+    let c0_64 = inner_prod16_i64(&x[..total_len], &x[..total_len]) + 1;
 
     let lz = silk_clz64(c0_64);
     let rshifts = (32 + 1 + N_BITS_HEAD_ROOM - lz).clamp(MIN_RSHIFTS, MAX_RSHIFTS);
@@ -1023,7 +1025,8 @@ mod burg_tests {
         let mut ca_b = [0i32; MAX_LPC_ORDER + 1];
 
         let total_len = subfr_length * nb_subfr;
-        let mut c0_64: i64 = 0;
+        // The energy plus one, as in libopus.
+        let mut c0_64: i64 = 1;
         for i in 0..total_len {
             c0_64 += (x[i] as i64) * (x[i] as i64);
         }

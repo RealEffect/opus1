@@ -422,20 +422,21 @@ fn measure_rates() -> Vec<(String, f64, f64)> {
     rows
 }
 
-/// At 16 kHz a mono stream of opus-rs codes this signal with SILK at every
-/// bitrate. At 48 kHz with the application `Voip` it codes it with Hybrid at
-/// 32 kb/s. SILK does not spend more than it needs for the signal, so the
-/// average rate falls below the request: by up to 58 % at 16 kHz (three
-/// mono streams, 64 kb/s each) and by up to 23 % at 48 kHz (three mono
-/// streams, 32 kb/s each). libopus stays within 3 % of the request at 32
-/// and 64 kb/s per channel: its analysis of the signal moves the streams
-/// to CELT after about 0.4 s.
+/// At 16 kHz and 16 kb/s a mono stream of opus-rs codes this signal with
+/// SILK. At 48 kHz with the application `Voip` it codes it with Hybrid at
+/// 16 and 32 kb/s. SILK does not spend more than it needs for the signal,
+/// so the average rate falls below the request: by up to 34 % at 16 kHz
+/// (three mono streams, 16 kb/s each) and by up to 23 % at 48 kHz (three
+/// mono streams, 32 kb/s each). libopus stays within 3 % of the request
+/// there: its analysis of the signal moves the streams to CELT after about
+/// 0.4 s. tests/multistream_e2e_modes.rs shows that this is the whole
+/// difference in the choice of mode.
 ///
-/// A single mono stream shows the same (54 % below at 16 kHz and 64 kb/s),
+/// A single mono stream shows the same (29 % below at 16 kHz and 16 kb/s),
 /// so the multistream encoder adds nothing to it. This test records the
 /// state: the rate never exceeds the request by more than 10 %, the limit
-/// of the design (measured: 9.8 % at most, a stereo stream at 48 kHz and
-/// 32 kb/s), and is never below 40 % of it (measured: 42 %). The limit of
+/// of the design (measured: 9.7 % at most, a stereo stream at 48 kHz and
+/// 32 kb/s), and is never below 60 % of it (measured: 66 %). The limit of
 /// the design for the low side is in the ignored test below.
 #[test]
 fn average_rate_at_16_khz_and_for_voip_stays_below_the_request() {
@@ -449,7 +450,7 @@ fn average_rate_at_16_khz_and_for_voip_stays_below_the_request() {
     );
     for (label, rust, _) in &rows {
         assert!(
-            (0.40..=1.10).contains(rust),
+            (0.60..=1.10).contains(rust),
             "{label}: {:.0} % of the request",
             100.0 * rust
         );
@@ -466,7 +467,7 @@ fn average_rate_at_16_khz_and_for_voip_stays_below_the_request() {
 }
 
 #[test]
-#[ignore = "single-stream encoder (src/lib.rs): no analysis of speech against music, so a stream stays SILK or Hybrid where libopus changes to CELT, and SILK leaves up to 58 % of the bitrate unused"]
+#[ignore = "single-stream encoder (src/lib.rs): no analysis of speech against music, so a stream stays SILK or Hybrid where libopus changes to CELT, and SILK leaves up to 34 % of the bitrate unused"]
 fn average_rate_at_16_khz_and_for_voip_is_within_the_design_limits() {
     let low: Vec<String> = measure_rates()
         .into_iter()

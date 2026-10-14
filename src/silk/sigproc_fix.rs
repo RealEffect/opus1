@@ -108,6 +108,9 @@ pub fn silk_biquad_alt_stride1(
     }
 }
 
+/// Second-order filter on two interleaved channels (libopus
+/// `silk_biquad_alt_stride2`). `input_output` holds `len` pairs of samples,
+/// `s` the two state values of channel 0 followed by those of channel 1.
 pub fn silk_biquad_alt_stride2(
     input_output: &mut [i16],
     b_q28: &[i32],
@@ -115,39 +118,58 @@ pub fn silk_biquad_alt_stride2(
     s: &mut [i32],
     len: usize,
 ) {
+    // The kernels read and write exactly these elements.
+    let input_output = &mut input_output[..2 * len];
+    let b_q28: &[i32; 3] = b_q28[..3].try_into().unwrap();
+    let a_q28: &[i32; 2] = a_q28[..2].try_into().unwrap();
+    let s: &mut [i32; 4] = (&mut s[..4]).try_into().unwrap();
+
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline. The kernel requires
+    // `input_output.len()` to be even, which the slicing above guarantees.
     unsafe {
-        silk_biquad_alt_stride2_neon(input_output, b_q28, a_q28, s, len);
+        silk_biquad_alt_stride2_neon(input_output, b_q28, a_q28, s);
     }
     #[cfg(not(target_arch = "aarch64"))]
-    {
-        let a0_l_q28 = (-a_q28[0]) & 0x00003FFF;
-        let a0_u_q28 = -a_q28[0] >> 14;
-        let a1_l_q28 = (-a_q28[1]) & 0x00003FFF;
-        let a1_u_q28 = -a_q28[1] >> 14;
+    silk_biquad_alt_stride2_scalar(input_output, b_q28, a_q28, s);
+}
 
-        for k in 0..len {
-            let out32_q14_0 = silk_smlawb(s[0], b_q28[0], input_output[2 * k] as i32) << 2;
-            let out32_q14_1 = silk_smlawb(s[2], b_q28[0], input_output[2 * k + 1] as i32) << 2;
+/// Portable form of [`silk_biquad_alt_stride2`]. `input_output` holds pairs
+/// of samples.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn silk_biquad_alt_stride2_scalar(
+    input_output: &mut [i16],
+    b_q28: &[i32; 3],
+    a_q28: &[i32; 2],
+    s: &mut [i32; 4],
+) {
+    let a0_l_q28 = (-a_q28[0]) & 0x00003FFF;
+    let a0_u_q28 = -a_q28[0] >> 14;
+    let a1_l_q28 = (-a_q28[1]) & 0x00003FFF;
+    let a1_u_q28 = -a_q28[1] >> 14;
 
-            s[0] = s[1] + silk_rshift_round(silk_smulwb(out32_q14_0, a0_l_q28), 14);
-            s[2] = s[3] + silk_rshift_round(silk_smulwb(out32_q14_1, a0_l_q28), 14);
-            s[0] = silk_smlawb(s[0], out32_q14_0, a0_u_q28);
-            s[2] = silk_smlawb(s[2], out32_q14_1, a0_u_q28);
-            s[0] = silk_smlawb(s[0], b_q28[1], input_output[2 * k] as i32);
-            s[2] = silk_smlawb(s[2], b_q28[1], input_output[2 * k + 1] as i32);
+    let (pairs, _) = input_output.as_chunks_mut::<2>();
+    for pair in pairs {
+        let (in0, in1) = (pair[0] as i32, pair[1] as i32);
+        let out32_q14_0 = silk_smlawb(s[0], b_q28[0], in0) << 2;
+        let out32_q14_1 = silk_smlawb(s[2], b_q28[0], in1) << 2;
 
-            s[1] = silk_rshift_round(silk_smulwb(out32_q14_0, a1_l_q28), 14);
-            s[3] = silk_rshift_round(silk_smulwb(out32_q14_1, a1_l_q28), 14);
-            s[1] = silk_smlawb(s[1], out32_q14_0, a1_u_q28);
-            s[3] = silk_smlawb(s[3], out32_q14_1, a1_u_q28);
-            s[1] = silk_smlawb(s[1], b_q28[2], input_output[2 * k] as i32);
-            s[3] = silk_smlawb(s[3], b_q28[2], input_output[2 * k + 1] as i32);
+        s[0] = s[1].wrapping_add(silk_rshift_round(silk_smulwb(out32_q14_0, a0_l_q28), 14));
+        s[2] = s[3].wrapping_add(silk_rshift_round(silk_smulwb(out32_q14_1, a0_l_q28), 14));
+        s[0] = silk_smlawb(s[0], out32_q14_0, a0_u_q28);
+        s[2] = silk_smlawb(s[2], out32_q14_1, a0_u_q28);
+        s[0] = silk_smlawb(s[0], b_q28[1], in0);
+        s[2] = silk_smlawb(s[2], b_q28[1], in1);
 
-            input_output[2 * k] = silk_sat16(silk_rshift(out32_q14_0 + (1 << 14) - 1, 14)) as i16;
-            input_output[2 * k + 1] =
-                silk_sat16(silk_rshift(out32_q14_1 + (1 << 14) - 1, 14)) as i16;
-        }
+        s[1] = silk_rshift_round(silk_smulwb(out32_q14_0, a1_l_q28), 14);
+        s[3] = silk_rshift_round(silk_smulwb(out32_q14_1, a1_l_q28), 14);
+        s[1] = silk_smlawb(s[1], out32_q14_0, a1_u_q28);
+        s[3] = silk_smlawb(s[3], out32_q14_1, a1_u_q28);
+        s[1] = silk_smlawb(s[1], b_q28[2], in0);
+        s[3] = silk_smlawb(s[3], b_q28[2], in1);
+
+        pair[0] = silk_sat16(silk_rshift(out32_q14_0.wrapping_add((1 << 14) - 1), 14)) as i16;
+        pair[1] = silk_sat16(silk_rshift(out32_q14_1.wrapping_add((1 << 14) - 1), 14)) as i16;
     }
 }
 
@@ -401,15 +423,12 @@ pub fn silk_autocorr(
 }
 
 /// Energy of `x[..len]` with the right shift that makes it fit 32 bits with
-/// 2 bits of headroom (libopus `silk_sum_sqr_shift`). A first pass with a
-/// shift that is safe for `len` samples measures the energy, a second pass
-/// uses the smallest shift that fits.
+/// 2 bits of headroom (libopus `silk_sum_sqr_shift`, silk/sum_sqr_shift.c).
+/// A first pass with a shift that is safe for `len` samples measures the
+/// energy, a second pass uses the smallest shift that fits.
 ///
-/// The second pass is not the same on every target. aarch64 shifts every
-/// square on its own and x86-64 with AVX2 has its own kernel; other targets
-/// shift the sum of each pair of squares, as libopus does. The results can
-/// differ in the last bits. [`silk_sum_sqr_shift_exact`] is the libopus form
-/// on every target.
+/// Both passes add the squares in pairs and shift the sum of each pair, as
+/// libopus does. The result is the same on every target.
 pub fn silk_sum_sqr_shift(energy: &mut i32, shift: &mut i32, x: &[i16], len: usize) {
     let x = &x[..len];
 
@@ -417,32 +436,24 @@ pub fn silk_sum_sqr_shift(energy: &mut i32, shift: &mut i32, x: &[i16], len: usi
     let nrg = sum_sqr_pairs_shifted(x, len as i32, shft);
     shft = (shft + 3 - silk_clz32(nrg)).max(0);
 
-    #[cfg(target_arch = "aarch64")]
-    let nrg = sum_sqr_each_shifted(x, shft);
     #[cfg(target_arch = "x86_64")]
     let nrg = if crate::compat::x86_has_avx2() {
+        // SAFETY: AVX2 was detected, and `x` has exactly `len` elements.
         unsafe { silk_sum_sqr_shift_avx2(x, len, shft) }
     } else {
         sum_sqr_pairs_shifted(x, 0, shft)
     };
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     let nrg = sum_sqr_pairs_shifted(x, 0, shft);
 
     *shift = shft;
     *energy = nrg;
 }
 
-/// `silk_sum_sqr_shift` exactly as libopus computes it (sum_sqr_shift.c), on
-/// every target. The second passes of [`silk_sum_sqr_shift`] on aarch64 and
-/// with AVX2 are not bit-exact with it. Code that must match libopus to the
-/// bit, such as the stereo predictor estimate, uses this.
+/// The same as [`silk_sum_sqr_shift`]. It dates from the time when that
+/// function did not give the libopus result on every target.
 pub(crate) fn silk_sum_sqr_shift_exact(energy: &mut i32, shift: &mut i32, x: &[i16], len: usize) {
-    let x = &x[..len];
-    let mut shft = 31 - silk_clz32(len as i32);
-    let nrg = sum_sqr_pairs_shifted(x, len as i32, shft);
-    shft = (shft + 3 - silk_clz32(nrg)).max(0);
-    *energy = sum_sqr_pairs_shifted(x, 0, shft);
-    *shift = shft;
+    silk_sum_sqr_shift(energy, shift, x, len);
 }
 
 /// One pass of libopus's `silk_sum_sqr_shift`: squares summed in pairs, each
@@ -464,19 +475,6 @@ fn sum_sqr_pairs_shifted(x: &[i16], init: i32, shft: i32) -> i32 {
     nrg
 }
 
-/// The second pass of [`silk_sum_sqr_shift`] on aarch64: every square
-/// shifted right by `shft` on its own, summed with wrap-around at 32 bits.
-/// This is what the NEON kernel computed that this loop replaces; the
-/// compiler vectorizes it.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-#[inline(always)]
-fn sum_sqr_each_shifted(x: &[i16], shft: i32) -> i32 {
-    x.iter().fold(0i32, |nrg, &sample| {
-        let square = silk_smulbb(sample as i32, sample as i32) as u32;
-        nrg.wrapping_add((square >> shft) as i32)
-    })
-}
-
 /// Inner product with each product shifted right by `scale` before it is
 /// accumulated (libopus `silk_inner_prod_aligned_scale`).
 pub fn silk_inner_prod_aligned_scale(
@@ -492,20 +490,32 @@ pub fn silk_inner_prod_aligned_scale(
     sum
 }
 
+/// Inner product of `ptr1[..len]` and `ptr2[..len]` as a 32-bit sum that
+/// wraps on overflow (libopus `silk_inner_prod_aligned`).
 #[inline(always)]
 pub fn silk_inner_prod_aligned(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
+    // The vector kernels read `len` elements through pointers, so both
+    // lengths are checked here.
+    let ptr1 = &ptr1[..len];
+    let ptr2 = &ptr2[..len];
+
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline. Both slices have `len`
+    // elements, which is what the kernel requires.
     unsafe {
         silk_inner_prod_aligned_neon(ptr1, ptr2, len)
     }
     #[cfg(target_arch = "x86_64")]
     if crate::compat::x86_has_avx2() {
+        // SAFETY: AVX2 was detected. Both slices have `len` elements, which
+        // is what the kernel requires.
         return unsafe { silk_inner_prod_aligned_avx2(ptr1, ptr2, len) };
     }
     #[cfg(not(target_arch = "aarch64"))]
     silk_inner_prod_aligned_scalar(ptr1, ptr2, len)
 }
 
+/// Portable form of [`silk_inner_prod_aligned`].
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 fn silk_inner_prod_aligned_scalar(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
@@ -536,11 +546,19 @@ fn silk_inner_prod_aligned_scalar(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32
         .wrapping_add(sum3)
 }
 
+/// NEON form of [`silk_inner_prod_aligned`].
+///
+/// # Safety
+///
+/// Both slices must have at least `len` elements: the loads read 8 elements
+/// at an offset `i` with `i + 8 <= len`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
     use core::arch::aarch64::*;
+
+    debug_assert!(ptr1.len() >= len && ptr2.len() >= len);
 
     let mut acc0 = vdupq_n_s32(0i32);
     let mut acc1 = vdupq_n_s32(0i32);
@@ -1252,16 +1270,20 @@ pub fn silk_lpc_analysis_filter(
     assert!((d & 1) == 0);
     assert!(d <= len);
 
+    // Every implementation below reads and writes exactly `len` samples.
+    let out = &mut out[..len];
+    let input = &input[..len];
+
     #[cfg(target_arch = "x86_64")]
     if d <= 16 && crate::compat::x86_has_avx2() {
+        // SAFETY: AVX2 was detected. `out` and `input` have `len` elements
+        // and `d` is at most 16; the kernel checks `b` itself.
         unsafe {
             silk_lpc_analysis_filter_avx2(out, input, b, len, d);
         }
         return;
     }
 
-    let out = &mut out[..len];
-    let input = &input[..len];
     // One copy of the loop per order the codec uses. With the number of
     // taps known, the compiler unrolls the sum and vectorizes over the
     // outputs.
@@ -1333,6 +1355,8 @@ use core::arch::x86_64::*;
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
+    // The caller guarantees this; every load below stays inside `len`.
+    debug_assert!(ptr1.len() >= len && ptr2.len() >= len);
     let mut acc0 = _mm256_setzero_si256();
     let mut acc1 = _mm256_setzero_si256();
     let mut i = 0;
@@ -1438,6 +1462,8 @@ unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
+    // The caller guarantees this; every load below stays inside `len`.
+    debug_assert!(x.len() >= len);
     let mut acc = _mm256_setzero_si256();
     let mut i = 0;
 
@@ -1461,16 +1487,12 @@ unsafe fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
     let sum4 = _mm_add_epi32(lo, hi);
     let sum2 = _mm_add_epi32(sum4, _mm_srli_si128(sum4, 8));
     let sum1 = _mm_add_epi32(sum2, _mm_srli_si128(sum2, 4));
-    let mut nrg = _mm_cvtsi128_si32(sum1);
+    let nrg = _mm_cvtsi128_si32(sum1);
 
-    while i < len {
-        let v = x[i] as i32;
-        let sq = (v * v) as u32;
-        nrg = nrg.wrapping_add((sq >> shft) as i32);
-        i += 1;
-    }
-
-    nrg
+    // The samples after the last block of 16: in pairs with the sum of each
+    // pair shifted, as in the blocks above and in libopus. `i` is even, so
+    // the pairs are the same ones.
+    sum_sqr_pairs_shifted(&x[i..len], nrg, shft)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1484,6 +1506,9 @@ unsafe fn silk_lpc_analysis_filter_avx2(
     d: usize,
 ) {
     debug_assert!(d >= 6 && (d & 1) == 0 && d <= 16);
+    // The caller guarantees this; the vector loads read `input[ix - 16..ix]`
+    // with `ix < len`.
+    debug_assert!(input.len() >= len && out.len() >= len);
 
     let mut b_rev_pad = [0i16; 16];
     for k in 0..d {
@@ -1532,17 +1557,27 @@ unsafe fn silk_lpc_analysis_filter_avx2(
     }
 }
 
+/// NEON form of [`silk_biquad_alt_stride2`], as libopus
+/// `silk_biquad_alt_stride2_neon`: two pairs of samples per pass.
+///
+/// # Safety
+///
+/// `input_output.len()` must be even. Each pass reads and writes the 4
+/// samples from `2 * k` on, with `2 * k + 4 <= input_output.len()`. The
+/// loads of the coefficients and of the state read whole arrays.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn silk_biquad_alt_stride2_neon(
     input_output: &mut [i16],
-    b_q28: &[i32],
-    a_q28: &[i32],
-    s: &mut [i32],
-    len: usize,
+    b_q28: &[i32; 3],
+    a_q28: &[i32; 2],
+    s: &mut [i32; 4],
 ) {
     use core::arch::aarch64::*;
+
+    debug_assert!(input_output.len().is_multiple_of(2));
+    let len = input_output.len() / 2;
 
     let offset_s32x2 = vdup_n_s32((1 << 14) - 1);
     let offset_s32x4 = vcombine_s32(offset_s32x2, offset_s32x2);
@@ -1625,21 +1660,23 @@ unsafe fn silk_biquad_alt_stride2_neon(
     }
 
     if k < len {
+        // One pair is left. The register holds the state as
+        // `[s[0], s[2], s[1], s[3]]`.
         let in0 = input_output[2 * k] as i32;
         let in1 = input_output[2 * k + 1] as i32;
 
         let out32_q14_0 = silk_smlawb(vgetq_lane_s32(s_s32x4, 0), b_q28[0], in0) << 2;
-        let out32_q14_1 = silk_smlawb(vgetq_lane_s32(s_s32x4, 2), b_q28[0], in1) << 2;
+        let out32_q14_1 = silk_smlawb(vgetq_lane_s32(s_s32x4, 1), b_q28[0], in1) << 2;
 
         let a0_l = (-a_q28[0]) & 0x00003FFF;
         let a0_u = -a_q28[0] >> 14;
         let a1_l = (-a_q28[1]) & 0x00003FFF;
         let a1_u = -a_q28[1] >> 14;
 
-        let s0_new =
-            vgetq_lane_s32(s_s32x4, 1) + silk_rshift_round(silk_smulwb(out32_q14_0, a0_l), 14);
-        let s2_new =
-            vgetq_lane_s32(s_s32x4, 3) + silk_rshift_round(silk_smulwb(out32_q14_1, a0_l), 14);
+        let s0_new = vgetq_lane_s32(s_s32x4, 2)
+            .wrapping_add(silk_rshift_round(silk_smulwb(out32_q14_0, a0_l), 14));
+        let s2_new = vgetq_lane_s32(s_s32x4, 3)
+            .wrapping_add(silk_rshift_round(silk_smulwb(out32_q14_1, a0_l), 14));
 
         let s0_new = silk_smlawb(s0_new, out32_q14_0, a0_u);
         let s2_new = silk_smlawb(s2_new, out32_q14_1, a0_u);
@@ -1653,8 +1690,10 @@ unsafe fn silk_biquad_alt_stride2_neon(
         let s1_new = silk_smlawb(s1_new, b_q28[2], in0);
         let s3_new = silk_smlawb(s3_new, b_q28[2], in1);
 
-        input_output[2 * k] = silk_sat16(silk_rshift(out32_q14_0 + (1 << 14) - 1, 14)) as i16;
-        input_output[2 * k + 1] = silk_sat16(silk_rshift(out32_q14_1 + (1 << 14) - 1, 14)) as i16;
+        input_output[2 * k] =
+            silk_sat16(silk_rshift(out32_q14_0.wrapping_add((1 << 14) - 1), 14)) as i16;
+        input_output[2 * k + 1] =
+            silk_sat16(silk_rshift(out32_q14_1.wrapping_add((1 << 14) - 1), 14)) as i16;
 
         s[0] = s0_new;
         s[1] = s1_new;
@@ -2072,24 +2111,18 @@ mod tests {
         }
     }
 
-    /// The two passes of `silk_sum_sqr_shift` written out: returns the shift,
-    /// the energy with each pair's sum shifted (libopus) and the energy with
-    /// each square shifted on its own.
-    fn sum_sqr_shift_ref(x: &[i16]) -> (i32, i32, i32) {
+    /// libopus `silk_sum_sqr_shift` written out: the shift, and the energy
+    /// with the sum of each pair of squares shifted.
+    fn sum_sqr_shift_ref(x: &[i16]) -> (i32, i32) {
         let len = x.len();
-        let pass = |init: i32, shft: i32, pairwise: bool| {
+        let pass = |init: i32, shft: i32| {
             let mut nrg = init;
             let mut i = 0;
             while i < len {
                 let a = (x[i] as i32 * x[i] as i32) as u32;
                 if i + 1 < len {
                     let b = (x[i + 1] as i32 * x[i + 1] as i32) as u32;
-                    let term = if pairwise {
-                        a.wrapping_add(b) >> shft
-                    } else {
-                        (a >> shft).wrapping_add(b >> shft)
-                    };
-                    nrg = nrg.wrapping_add(term as i32);
+                    nrg = nrg.wrapping_add((a.wrapping_add(b) >> shft) as i32);
                 } else {
                     nrg = nrg.wrapping_add((a >> shft) as i32);
                 }
@@ -2098,13 +2131,9 @@ mod tests {
             nrg
         };
         let shft = 31 - (len as i32).leading_zeros() as i32;
-        let first = if len == 0 {
-            0
-        } else {
-            pass(len as i32, shft, true)
-        };
+        let first = if len == 0 { 0 } else { pass(len as i32, shft) };
         let shft = (shft + 3 - first.leading_zeros() as i32).max(0);
-        (shft, pass(0, shft, true), pass(0, shft, false))
+        (shft, pass(0, shft))
     }
 
     #[test]
@@ -2119,29 +2148,17 @@ mod tests {
                 } else {
                     test_signal(&mut rng, len, kind)
                 };
-                let (shft, nrg_pairs, nrg_each) = sum_sqr_shift_ref(&x);
+                let (shft, nrg) = sum_sqr_shift_ref(&x);
                 // Samples after `len` must not be read.
                 x.extend_from_slice(&[i16::MIN; 3]);
 
                 let (mut energy, mut shift) = (-1, -1);
-                silk_sum_sqr_shift_exact(&mut energy, &mut shift, &x, len);
-                assert_eq!(
-                    (energy, shift),
-                    (nrg_pairs, shft),
-                    "exact: len={len} kind={kind}"
-                );
+                silk_sum_sqr_shift(&mut energy, &mut shift, &x, len);
+                assert_eq!((energy, shift), (nrg, shft), "len={len} kind={kind}");
 
                 let (mut energy, mut shift) = (-1, -1);
-                silk_sum_sqr_shift(&mut energy, &mut shift, &x, len);
-                assert_eq!(shift, shft, "len={len} kind={kind}");
-                // aarch64 shifts each square, other targets each pair. With
-                // AVX2 the kernel has a rule of its own, not checked here.
-                if cfg!(target_arch = "aarch64") {
-                    assert_eq!(energy, nrg_each, "len={len} kind={kind}");
-                } else if !cfg!(target_arch = "x86_64") {
-                    assert_eq!(energy, nrg_pairs, "len={len} kind={kind}");
-                }
-                let _ = nrg_each;
+                silk_sum_sqr_shift_exact(&mut energy, &mut shift, &x, len);
+                assert_eq!((energy, shift), (nrg, shft), "exact: len={len} kind={kind}");
             }
         }
     }
@@ -2236,6 +2253,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `silk_inner_prod_aligned` by its definition.
+    fn inner_prod_ref(a: &[i16], b: &[i16], len: usize) -> i32 {
+        let mut sum = 0i32;
+        for i in 0..len {
+            sum = sum.wrapping_add((a[i] as i32).wrapping_mul(b[i] as i32));
+        }
+        sum
+    }
+
+    #[test]
+    fn inner_prod_aligned_matches_reference() {
+        let mut rng = TestRng(0x1bad_f00d_5eed_0001);
+        // Lengths 0 to 100 cover every count of 32-sample and 8-sample
+        // blocks of the vector loops and every remainder.
+        for len in (0..=100usize).chain([160, 320, 641]) {
+            for kind in 0..6 {
+                let mut a = test_signal(&mut rng, len, kind);
+                let mut b = test_signal(&mut rng, len, (kind + len as u32) % 6);
+                let expected = inner_prod_ref(&a, &b, len);
+                assert_eq!(
+                    silk_inner_prod_aligned_scalar(&a, &b, len),
+                    expected,
+                    "scalar: len={len} kind={kind}"
+                );
+                // Samples after `len` must not be read.
+                a.extend_from_slice(&[i16::MAX; 9]);
+                b.extend_from_slice(&[i16::MIN; 9]);
+                assert_eq!(
+                    silk_inner_prod_aligned(&a, &b, len),
+                    expected,
+                    "dispatch: len={len} kind={kind}"
+                );
+            }
+        }
+    }
+
+    /// A slice shorter than `len` must stop with a panic and never be read
+    /// past its end.
+    #[test]
+    #[should_panic]
+    fn inner_prod_aligned_short_first_slice_panics() {
+        silk_inner_prod_aligned(&[1i16; 39], &[1i16; 40], 40);
+    }
+
+    #[test]
+    #[should_panic]
+    fn inner_prod_aligned_short_second_slice_panics() {
+        silk_inner_prod_aligned(&[1i16; 40], &[1i16; 39], 40);
+    }
+
+    #[test]
+    fn biquad_alt_stride2_matches_scalar() {
+        let mut rng = TestRng(0x0123_4567_89ab_cdef);
+        for case in 0..600u32 {
+            // Pair counts 0 to 9 cover the two-pair vector loop with and
+            // without the single pair that is left, then longer blocks.
+            let len = match case % 12 {
+                10 => 160,
+                11 => 481,
+                n => n as usize,
+            };
+            // High-pass coefficients as the encoder computes them: `r` close
+            // to 1 in Q28, `b = [r, -2r, r]`, `a = [-2r(1 - fc^2 / 2), r^2]`.
+            let fc_q19 = 1 + rng.below(80_000) as i64;
+            let r_q28 = (1i64 << 28) - 471 * fc_q19 / 2;
+            let r_q22 = r_q28 >> 6;
+            let fc2_q28 = (fc_q19 * fc_q19) >> 10;
+            let b = [r_q28 as i32, (-2 * r_q28) as i32, r_q28 as i32];
+            let a = [
+                ((r_q22 * (fc2_q28 - (2i64 << 28))) >> 22) as i32,
+                ((r_q22 * r_q22) >> 16) as i32,
+            ];
+            let kind = case % 6;
+            let input = test_signal(&mut rng, 2 * len, kind);
+            // A state as a running filter has it, or zero.
+            let start: [i32; 4] = if case % 5 == 0 {
+                [0; 4]
+            } else {
+                core::array::from_fn(|_| (rng.next_u32() as i32) >> (6 + rng.below(8)))
+            };
+
+            let mut expected = input.clone();
+            let mut state_expected = start;
+            silk_biquad_alt_stride2_scalar(&mut expected, &b, &a, &mut state_expected);
+
+            // Longer slices than the call names: nothing after them may
+            // change.
+            let mut got = input.clone();
+            got.extend_from_slice(&[0x55aai16; 5]);
+            let mut b_long = b.to_vec();
+            b_long.push(i32::MIN);
+            let mut a_long = a.to_vec();
+            a_long.push(i32::MIN);
+            let mut state = [0x0bad_beefi32; 6];
+            state[..4].copy_from_slice(&start);
+            silk_biquad_alt_stride2(&mut got, &b_long, &a_long, &mut state, len);
+
+            assert_eq!(&got[..2 * len], &expected[..], "len={len} kind={kind}");
+            assert_eq!(&got[2 * len..], &[0x55aai16; 5], "len={len} kind={kind}");
+            assert_eq!(&state[..4], &state_expected, "len={len} kind={kind}");
+            assert_eq!(&state[4..], &[0x0bad_beefi32; 2], "len={len} kind={kind}");
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn biquad_alt_stride2_short_input_panics() {
+        let mut samples = [1i16; 7];
+        let mut state = [0i32; 4];
+        silk_biquad_alt_stride2(&mut samples, &[1 << 28, -2 << 28, 1 << 28], &[0, 0], &mut state, 4);
     }
 
     #[test]

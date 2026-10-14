@@ -24,8 +24,16 @@ fn hex_to_bytes(s: &str) -> Vec<u8> {
 
 // Byte-exact fixtures are SIMD-path dependent: the encoder mirrors libopus'
 // per-architecture kernels (x86 SSE2/AVX2 vs aarch64 NEON), which produce
-// different, equally valid bitstreams. One fixture per supported arch; other
-// arches fall back to size/determinism/decode checks only.
+// different, equally valid bitstreams. There is a stored fixture for x86_64
+// only; other arches fall back to size/determinism/decode checks.
+//
+// aarch64 had stored fixtures too. They were packets recorded from opus-rs,
+// not packets of libopus: the sine fixture equalled the packet of the linked
+// libopus 1.6.1 (arm64) in 124 of 160 bytes, the impulse fixture in the
+// first 7. They went away when the pulse search became the one of libopus
+// (celt/vq.c, op_pvq_search_c), which changes both packets. On aarch64 the
+// two `..._is_the_packet_of_libopus` tests below compare with the linked
+// libopus itself instead of a recording.
 #[cfg(target_arch = "x86_64")]
 fn sine_fixture_hex() -> Option<&'static str> {
     // Validated against libopus 1.6.1-51-g03647f52 (float, x86 SSE2/AVX2).
@@ -34,14 +42,7 @@ fn sine_fixture_hex() -> Option<&'static str> {
     )
 }
 
-#[cfg(target_arch = "aarch64")]
-fn sine_fixture_hex() -> Option<&'static str> {
-    Some(
-        "f87b5e0950b78c08d0bbae9ae1d725a72fe5ee25c26a2bc9885951173822973b042c80fdb66da4a3a2cb9c192af55d6bf6dd65c5d6cebf67144ecc6b0565f260a3585de2215ab8fc6f9f4f48cad42d1c1999da21cfa221cfa037aa44b81ad922530d1d581511cf6c6116331bf2570f00b4620320a328ae650837e79c9e8f6ce17951dc2e4d33034de491e34014167106e2646590e686571dcf2104af43ab137d",
-    )
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(target_arch = "x86_64"))]
 fn sine_fixture_hex() -> Option<&'static str> {
     None
 }
@@ -56,16 +57,65 @@ fn impulse_fixture_hex() -> Option<&'static str> {
     )
 }
 
-#[cfg(target_arch = "aarch64")]
-fn impulse_fixture_hex() -> Option<&'static str> {
-    Some(
-        "f87346b9c0165858f73144258b8b79c2179a4272570325a2d263ab6067bb99337594b193d46e1904601599caff6d6cf2137f5b308605f16268351c8f23efd5a0648d719e14506817cffc23fd39b6e3e782a662edfe6a671d1c58cb3f6a3f210bcba83e1dfad82ad585de11653bfacdcab60fc26370d5f7945c3ca511ba07ffb4d8ff77fa73d7e883f06d09b55d8db6a05ad7119fb82d72fb7375ccb483588e35",
-    )
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(target_arch = "x86_64"))]
 fn impulse_fixture_hex() -> Option<&'static str> {
     None
+}
+
+/// One 20 ms frame, 48 kHz mono, 64 kb/s constant bitrate, complexity 10,
+/// through opus-rs and through the linked libopus: (opus-rs, libopus).
+#[cfg(target_arch = "aarch64")]
+fn first_packets(pcm: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    let mut rs_enc = RsEnc::new(48000, 1, RsApp::Audio).unwrap();
+    rs_enc.bitrate_bps = 64000;
+    rs_enc.use_cbr = true;
+    rs_enc.complexity = 10;
+    let mut rs_buf = vec![0u8; 1276];
+    let rs_n = rs_enc.encode(pcm, 960, &mut rs_buf).unwrap();
+    let mut c_enc = CEnc::new(48000, CCh::Mono, CApp::Audio).unwrap();
+    c_enc.set_bitrate(opus::Bitrate::Bits(64000)).unwrap();
+    c_enc.set_vbr(false).unwrap();
+    c_enc.set_complexity(10).unwrap();
+    let mut c_buf = vec![0u8; 1276];
+    let c_n = c_enc.encode_float(pcm, &mut c_buf).unwrap();
+    (rs_buf[..rs_n].to_vec(), c_buf[..c_n].to_vec())
+}
+
+/// Number of equal bytes and the position of the first byte that differs.
+#[cfg(target_arch = "aarch64")]
+fn equal_bytes(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
+    let equal = a.iter().zip(b).filter(|(x, y)| x == y).count();
+    let first = a.iter().zip(b).position(|(x, y)| x != y);
+    (equal, first)
+}
+
+/// The sine packet of `oracle_celt_sine_48k_mono_64k`, byte for byte against
+/// the packet the linked libopus writes for the same input.
+///
+/// On aarch64 libopus has no kernels of its own for the pulse search, so
+/// there is one right answer. opus-rs does not reach it yet.
+#[test]
+#[cfg(target_arch = "aarch64")]
+#[ignore = "the 48 kHz sine packet equals libopus 1.6.1 in 132 of 160 bytes (124 before the pulse search of libopus); the first difference is at byte 16, cause not located"]
+fn sine_48k_mono_64k_is_the_packet_of_libopus() {
+    let (rs, c) = first_packets(&make_sine(48000, 1, 960, 440.0));
+    let (equal, first) = equal_bytes(&rs, &c);
+    println!("sine: {equal} of {} bytes equal, first difference at {first:?}", c.len());
+    assert_eq!(rs, c);
+}
+
+/// The impulse packet of `oracle_impulse_48k_mono_64k`, byte for byte
+/// against the packet the linked libopus writes for the same input.
+#[test]
+#[cfg(target_arch = "aarch64")]
+#[ignore = "the 48 kHz impulse packet equals libopus 1.6.1 in its first 7 bytes only: opus-rs does not run the tonality analysis of libopus (analysis.c), which changes the allocation trim of this frame"]
+fn impulse_48k_mono_64k_is_the_packet_of_libopus() {
+    let mut pcm = vec![0.0f32; 960];
+    pcm[0] = 1.0;
+    let (rs, c) = first_packets(&pcm);
+    let (equal, first) = equal_bytes(&rs, &c);
+    println!("impulse: {equal} of {} bytes equal, first difference at {first:?}", c.len());
+    assert_eq!(rs, c);
 }
 
 #[test]

@@ -117,8 +117,7 @@ pub fn silk_quant_ltp_gains(
     _arch: i32,
 ) {
     let mut temp_idx = [0i8; MAX_NB_SUBFR];
-    let mut res_nrg_total_q15: i32;
-    let mut best_res_nrg_total_q15: i32 = 0;
+    let mut res_nrg_total_q15: i32 = 0;
     let mut rate_dist_total_q7: i32;
     let mut min_rate_dist_q7: i32;
     let mut sum_log_gain_tmp_q7: i32;
@@ -154,15 +153,14 @@ pub fn silk_quant_ltp_gains(
                 gain_q7 = found_gain_q7;
             }
 
-            res_nrg_total_q15 = silk_add_pos_sat32(res_nrg_total_q15, choice.res_nrg_q15);
-            rate_dist_total_q7 = silk_add_pos_sat32(rate_dist_total_q7, choice.rate_dist_q7);
+            res_nrg_total_q15 = add_pos_sat32(res_nrg_total_q15, choice.res_nrg_q15);
+            rate_dist_total_q7 = add_pos_sat32(rate_dist_total_q7, choice.rate_dist_q7);
             sum_log_gain_tmp_q7 =
                 0.max(sum_log_gain_tmp_q7 + silk_lin2log(gain_q7 + gain_safety) - 896);
         }
 
         if rate_dist_total_q7 <= min_rate_dist_q7 {
             min_rate_dist_q7 = rate_dist_total_q7;
-            best_res_nrg_total_q15 = res_nrg_total_q15;
             best_sum_log_gain_q7 = sum_log_gain_tmp_q7;
             *periodicity_index = k as i8;
             cbk_index[..nb_subfr].copy_from_slice(&temp_idx[..nb_subfr]);
@@ -178,12 +176,35 @@ pub fn silk_quant_ltp_gains(
         }
     }
 
+    // libopus (silk/quant_LTP_gains.c) computes the prediction gain from
+    // the residual energy of the codebook it tried last, which is codebook
+    // 2, and not from that of the codebook it chose. The decoder never sees
+    // this value, but the encoder's later decisions depend on it, so the
+    // same value is used here.
     let res_nrg_shift = if nb_subfr == 2 {
-        silk_rshift32(best_res_nrg_total_q15, 1)
+        silk_rshift32(res_nrg_total_q15, 1)
     } else {
-        silk_rshift32(best_res_nrg_total_q15, 2)
+        silk_rshift32(res_nrg_total_q15, 2)
     };
     *pred_gain_db_q7 = silk_smulbb(-3, silk_lin2log(res_nrg_shift) - 1920);
+}
+
+/// libopus `silk_ADD_POS_SAT32`: the sum of two numbers, or `i32::MAX` when
+/// the 32-bit sum has its top bit set.
+///
+/// The macro is meant for two positive numbers, where this is an addition
+/// that saturates. `silk_quant_ltp_gains` also calls it with the bit count of
+/// a subframe, which is negative when the predictor works well. A negative
+/// sum then turns into `i32::MAX`. libopus chooses its codebook from these
+/// sums, so the same is done here.
+#[inline(always)]
+fn add_pos_sat32(a: i32, b: i32) -> i32 {
+    let sum = (a as u32).wrapping_add(b as u32);
+    if sum & 0x8000_0000 != 0 {
+        i32::MAX
+    } else {
+        sum as i32
+    }
 }
 
 fn silk_float_to_fixed_q7(f: f32) -> i32 {

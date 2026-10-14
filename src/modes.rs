@@ -139,9 +139,12 @@ const LOG_N_400: [i16; 21] = [
     0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 16, 16, 16, 21, 21, 24, 29, 34, 36,
 ];
 
+/// The window of the built-in 48 kHz mode: `window120` in libopus
+/// celt/static_modes_float.h, value for value. tests/perfk_fft_libopus.rs
+/// compares it with the table inside the linked library.
 const WINDOW_120: [f32; 120] = [
     6.728_696_6e-05,
-    0.000_605_513_5,
+    0.000_605_513_48,
     0.001_681_597,
     0.003_294_796_2,
     0.005_443_994_3,

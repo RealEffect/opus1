@@ -33,10 +33,9 @@ fn to_i16(pcm: &[f32]) -> Vec<i16> {
 ///
 /// - the C decoder and the opus-rs decoder decode it, and both end in the
 ///   encoder's final range;
-/// - the TOC byte is libopus's, except on the first packet after a switch
-///   to CELT-only. libopus codes that one in the old mode with a 5 ms CELT
-///   frame appended (the "redundancy" frame), which opus-rs does not write
-///   yet, and switches one packet later.
+/// - the TOC byte is libopus's. That includes the first packet after a
+///   switch to CELT-only, which both encoders still code in the old mode,
+///   with a 5 ms CELT frame appended (the "redundancy" frame).
 ///
 /// Mono only: stereo Hybrid packets have a known fault, see
 /// `tests/core_encoder.rs`.
@@ -57,7 +56,6 @@ fn mode_changes_in_a_running_stream_keep_the_final_range() {
         let mut buf = vec![0u8; 4000];
         let mut out = vec![0f32; frame];
         let (mut packets, mut c_packets) = (Vec::new(), Vec::new());
-        let mut switches_to_celt = 0;
         for (i, input) in pcm.chunks_exact(frame).enumerate() {
             let step = (i / 25) % schedule.len();
             let (_, c_mode, mode) = MODES[schedule[step]];
@@ -74,16 +72,12 @@ fn mode_changes_in_a_running_stream_keep_the_final_range() {
             assert_ne!(enc.final_range(), 0, "{what}");
             assert_eq!(enc.final_range(), c_dec.final_range(), "{what}: final range, C decoder");
             assert_eq!(enc.final_range(), dec.final_range(), "{what}: final range, opus-rs decoder");
-            if c_packet[0] & 0xFC != buf[0] & 0xFC {
-                let to_celt = switched && i > 0 && c_mode == MODE_CELT;
-                assert!(to_celt, "{what}: TOC libopus {:#04x}, opus-rs {:#04x}", c_packet[0], buf[0]);
-                switches_to_celt += 1;
-            }
+            assert_eq!(buf[0] & 0xFC, c_packet[0] & 0xFC, "{what}: TOC");
             packets.push(buf[..n].to_vec());
             c_packets.push(c_packet);
         }
-        println!("{rate} Hz: {} packets, {switches_to_celt} switch one packet before libopus\n  libopus [{}]\n  opus-rs [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
-        assert!(packets.len() >= 170 && switches_to_celt <= 4, "{rate} Hz");
+        println!("{rate} Hz: {} packets\n  libopus [{}]\n  opus-rs [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
+        assert!(packets.len() >= 170, "{rate} Hz");
     }
 }
 
@@ -259,14 +253,15 @@ fn forced_modes_with_16_bit_input_at_a_constant_bitrate() {
 /// The same streams where the packets have a SILK layer: forced SILK and
 /// forced Hybrid.
 ///
-/// The packets have libopus's TOC byte and length, but on this signal
-/// (steady tones under speech) the C decoder gets 2 to 10 dB less from them
-/// than from libopus's packets. The automatic mode choice gives the same
-/// packets, so the forced mode is not the cause: the SILK encoder
-/// (src/silk) codes steady tones worse than libopus at the same size. On
-/// the synthetic speech of `tests/core_encoder.rs` the two are within 1 dB.
+/// The packets have libopus's TOC byte and length, and on this signal
+/// (steady tones under speech) the C decoder gets from them within 2 dB of
+/// what it gets from libopus's packets.
+///
+/// This signal is the hard one for the SILK pitch analysis. Until
+/// `silk_pitch_analysis_core` searched the lags libopus searches
+/// (silk/fixed/pitch_analysis_core_FIX.c), these streams were 2 to 10 dB
+/// below libopus.
 #[test]
-#[ignore = "SILK encoder: on input with steady tones the quality is 2 to 10 dB below libopus at the same packet size (src/silk, not the encoder controls)"]
 fn forced_silk_and_hybrid_on_tonal_input_are_within_2_db_of_libopus() {
     let mut failures = Vec::new();
     for rate in [8000usize, 12000, 16000, 24000, 48000] {

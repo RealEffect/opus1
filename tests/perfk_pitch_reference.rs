@@ -18,6 +18,8 @@
 //! fault.
 
 #![cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+// The reference functions repeat the index-based loops of the C code.
+#![allow(clippy::needless_range_loop)]
 
 use opus_rs::celt_lpc::{autocorr, celt_fir, celt_iir};
 use opus_rs::pitch::{
@@ -339,7 +341,8 @@ fn ref_find_best_pitch(
     let mut syy = ref_energy_plus_one(&y[..len]);
     for i in 0..max_pitch {
         if xcorr[i] > 0.0 {
-            let num = xcorr[i] * xcorr[i];
+            let xc16 = xcorr[i] * 1e-12;
+            let num = xc16 * xc16;
             if num * best_den[1] > best_num[1] * syy {
                 if num * best_den[0] > best_num[0] * syy {
                     best_num[1] = best_num[0];
@@ -517,8 +520,51 @@ fn ref_remove_doubling(
     pg.min(g)
 }
 
-/// `pitch_downsample` without the whitening that aarch64 applies to channels
-/// of more than `factor * len` samples. No test below passes such channels.
+/// The spectral flattening at the end of `pitch_downsample` (libopus,
+/// celt/pitch.c): an LPC analysis of order 4 and a 5-tap filter built from
+/// it. The autocorrelation and the LPC recursion are the library's own; they
+/// have their tests further down.
+fn ref_flatten(x_lp: &mut [f32]) {
+    let len = x_lp.len();
+    if len < 5 {
+        return;
+    }
+    let mut ac = [0.0f32; 5];
+    opus_rs::celt_lpc::autocorr(x_lp, &mut ac, None, 0, 4, len);
+    ac[0] *= 1.0001;
+    for i in 1..=4 {
+        let f = 0.008 * i as f32;
+        ac[i] -= ac[i] * f * f;
+    }
+    let mut coef = [0.0f32; 4];
+    opus_rs::celt_lpc::lpc(&mut coef, &ac, 4);
+    let mut tmp = 1.0f32;
+    for c in coef.iter_mut() {
+        tmp *= 0.9;
+        *c *= tmp;
+    }
+    let num = [
+        coef[0] + 0.8,
+        coef[1] + 0.8 * coef[0],
+        coef[2] + 0.8 * coef[1],
+        coef[3] + 0.8 * coef[2],
+        0.8 * coef[3],
+    ];
+    // x[i] += num[0] * x[i - 1] + .. + num[4] * x[i - 5], on the old values,
+    // with zeros before the first sample.
+    let mut past = [0.0f32; 5];
+    for v in x_lp.iter_mut() {
+        let mut sum = *v;
+        for j in 0..5 {
+            sum += num[j] * past[j];
+        }
+        past.copy_within(0..4, 1);
+        past[0] = *v;
+        *v = sum;
+    }
+}
+
+/// The decimation of `pitch_downsample`, before the spectral flattening.
 fn ref_downsample(x: &[&[f32]], len: usize, factor: usize) -> Vec<f32> {
     let offset = factor / 2;
     let mut out = vec![0.0f32; len];
@@ -749,7 +795,8 @@ fn pitch_downsample_matches_the_formula() {
                     let x1 = fill(&mut g, full - cut.1.min(full), kind);
                     let x2 = fill(&mut g, full, kind);
                     let chans: [&[f32]; 3] = [&x0, &x1, &x2];
-                    let want = ref_downsample(&chans[..c], len, factor);
+                    let mut want = ref_downsample(&chans[..c], len, factor);
+                    ref_flatten(&mut want);
                     for at_end in [true, false] {
                         let p0 = &*r0.place(&x0, at_end);
                         let p1 = &*r1.place(&x1, at_end);
