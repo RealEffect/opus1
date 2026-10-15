@@ -1359,6 +1359,8 @@ pub fn silk_resampler_down2_3(s: &mut [i32], out: &mut [i16], input: &[i16], in_
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::*;
 
     /// Small deterministic pseudo-random generator.

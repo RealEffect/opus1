@@ -39,6 +39,8 @@
 //! 78.7, 49.3 and 49.3 kb/s instead of 95.1, 95.1, 57.6 and 8.2), and it
 //! does not force CELT on the stereo streams. For these reasons alone its
 //! streams are about 20 % smaller than those of the surround encoder.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 

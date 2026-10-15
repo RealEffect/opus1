@@ -157,10 +157,7 @@ fn run(stream: &Stream) -> Outcome {
             .unwrap_or_else(|e| panic!("packet {i}: C decoder: {e}"));
         decoded.extend(pcm_out);
         c_decoded.extend(c_dec.decode(Some(&c_packet), frame, false).unwrap());
-        // Stereo Hybrid packets have a known fault in their CELT layer, see
-        // tests/core_encoder.rs.
-        let stereo_hybrid = mode_of(buf[0]) == 1 && buf[0] & 4 != 0;
-        if enc.final_range() != dec.final_range() && !stereo_hybrid {
+        if enc.final_range() != dec.final_range() {
             range_mismatches.push(i);
         }
         tocs.push(buf[0] & 0xFC);
@@ -336,13 +333,12 @@ fn forced_mode_switches_match_libopus_stereo() {
     stereo_switches(false);
 }
 
-/// Stereo with Hybrid steps. The CELT layer of a stereo Hybrid packet is
-/// corrupt until src/celt.rs limits the intensity band to start..end (see
-/// tests/core_encoder.rs). In a packet that also carries a redundant frame
-/// the CELT layer has few bits, and the fault then shows as a burst 29 dB
-/// above the signal (24 kHz, 10 ms, constant bitrate).
+/// Stereo with Hybrid steps. The CELT layer of a stereo Hybrid packet was
+/// corrupt while src/celt.rs limited the intensity band to 0..end instead
+/// of start..end (celt_encoder.c 2408). In a packet that also carries a
+/// redundant frame the CELT layer has few bits, and the fault then showed
+/// as a burst 29 dB above the signal (24 kHz, 10 ms, constant bitrate).
 #[test]
-#[ignore = "stereo Hybrid packets have a corrupt CELT layer: src/celt.rs limits the intensity band to 0..end, libopus to start..end"]
 fn forced_mode_switches_match_libopus_stereo_hybrid() {
     stereo_switches(true);
 }
@@ -390,7 +386,6 @@ fn bitrate_changes_switch_the_mode_like_libopus() {
 /// last packet at the old rate and one at the start of the first packet at
 /// the new rate (`silk_bw_switch`). Every packet has libopus's first byte.
 #[test]
-#[ignore = "after the fidelity merge: 48 kHz, 20 ms, CBR is 3.6 dB below libopus around SILK bandwidth switches on average; to be reconciled"]
 fn silk_bandwidth_switches_match_libopus() {
     let steps = [
         (BW_WB, Bandwidth::Wideband),
@@ -445,10 +440,17 @@ fn silk_bandwidth_switches_match_libopus() {
                 assert!(differ * 100 <= outcome.tocs.len(), "{what}: {differ} first bytes differ");
                 // SILK changes its rate in a pause, where the level is low and
                 // the signal-to-noise ratio says little. libopus restarts
-                // SILK there, and so does opus-rs now. Measured against
-                // libopus: 6.3 dB at most around a switch, 2.4 dB on
-                // average, 2.2 dB over the stream (a SILK-only stream).
-                check(&what, &outcome, 4, &Margins { window: 9.0, mean: 3.5, stream: 3.0 });
+                // SILK there, and so does opus-rs. Measured against libopus:
+                // 6.7 dB at most around a switch (16 kHz, CBR), 0.8 dB on
+                // average, 0.1 dB over the stream.
+                //
+                // The redundant frame at the end of the last packet at the
+                // old rate starts from a reset CELT encoder, which first
+                // codes the 2.5 ms before it into two bytes it throws away
+                // (opus_encoder.c:2523-2538). Without those 2.5 ms the
+                // frame was coded against an empty overlap: 3.3 dB below
+                // libopus on average (48 kHz, CBR).
+                check(&what, &outcome, 4, &Margins { window: 9.0, mean: 1.5, stream: 3.0 });
             }
         }
     }
@@ -551,15 +553,7 @@ fn forced_mode_switches_with_long_packets_voip_and_low_rates_match_libopus() {
         ("8 kHz, 10 ms, CBR", 8000, 1, 10, 16000, AUDIO, true, AUTO_BW),
         ("12 kHz, 20 ms", 12000, 1, 20, 20000, AUDIO, false, AUTO_BW),
     ] {
-        let mut schedule = forced_schedule(bitrate, silk_bandwidth);
-        if channels == 2 {
-            // No stereo Hybrid: see `forced_mode_switches_match_libopus_stereo_hybrid`.
-            for step in &mut schedule {
-                if step.mode == HYBRID {
-                    *step = Step { mode: SILK, bitrate, bandwidth: wideband };
-                }
-            }
-        }
+        let schedule = forced_schedule(bitrate, silk_bandwidth);
         let outcome = run(&Stream {
             rate,
             channels,
@@ -592,7 +586,10 @@ fn high_band_level(x: &[f32]) -> f64 {
 /// An encoder that goes on from the energies of the last Hybrid packets
 /// predicts from a state the decoder no longer has. Measured without the
 /// reset: the band above 8 kHz of the first Hybrid packets decodes up to
-/// 14.4 dB below libopus's. With it: within 1.5 dB.
+/// 14.4 dB below libopus's. With a reset alone: within 1.5 dB. libopus
+/// also codes the 2.5 ms before the frame into two bytes it throws away,
+/// and codes the frame without prediction (C 2478-2486). With that: within
+/// 0.2 dB at a variable bitrate and 0.7 dB at a constant one.
 #[test]
 fn hybrid_after_silk_only_starts_its_celt_layer_afresh() {
     let rate = 48000usize;
@@ -637,6 +634,6 @@ fn hybrid_after_silk_only_starts_its_celt_layer_afresh() {
             }
         }
         assert_eq!(hybrid_starts, 3);
-        assert!(worst < 3.0, "CBR {cbr}: the high band is {worst:.1} dB from libopus's after a switch to Hybrid");
+        assert!(worst < 1.0, "CBR {cbr}: the high band is {worst:.1} dB from libopus's after a switch to Hybrid");
     }
 }

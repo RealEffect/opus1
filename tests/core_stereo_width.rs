@@ -92,15 +92,14 @@ fn celt_stereo_width_follows_the_bitrate_like_libopus() {
             for cbr in [false, true] {
                 let what = format!("{rate} Hz, {bitrate} b/s, CBR {cbr}");
                 let (rust, c) = celt_streams(rate, bitrate, cbr, &input);
-                // Only where libopus codes stereo do the streams compare. At
-                // 18 kb/s with a constant bitrate it codes mono, which
-                // opus-rs does not do yet (see the test below).
+                // At 18 kb/s with a constant bitrate libopus codes mono, and
+                // so does opus-rs (see the test below).
+                assert_eq!(rust.stereo_packets, c.stereo_packets, "{what}: stereo packets");
                 if c.stereo_packets == 0 {
                     assert!(cbr && bitrate == 18000, "{what}: libopus codes mono");
                     continue;
                 }
                 assert_eq!(c.stereo_packets, c.packets, "{what}: libopus changes the channel count");
-                assert_eq!(rust.stereo_packets, rust.packets, "{what}");
                 let (side, c_side) = (side_level_db(&rust.pcm), side_level_db(&c.pcm));
                 let n = rust.pcm.len();
                 let (quality, c_quality) = (snr(&input[..n], &rust.pcm), snr(&input[..n], &c.pcm));
@@ -120,7 +119,6 @@ fn celt_stereo_width_follows_the_bitrate_like_libopus() {
 /// 19 kb/s for speech, with 1 kb/s of hysteresis, and SILK takes two frames
 /// to fade the side signal out before the first mono packet.
 #[test]
-#[ignore = "coding stereo input as mono is not ported: the CELT encoder cannot code one channel from two (CELT_SET_CHANNELS, src/celt.rs), and silk_encode_stereo_packet has no `to_mono` (src/silk/enc_api.rs)"]
 fn stereo_input_at_low_bitrates_has_the_channel_count_of_libopus() {
     for (rate, application, c_application) in [
         (48000usize, Application::Audio, APP_AUDIO),

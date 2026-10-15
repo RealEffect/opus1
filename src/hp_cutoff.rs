@@ -1,3 +1,4 @@
+use crate::celt::approx_mac;
 use crate::silk::biquad_alt::{silk_biquad_alt_stride1, silk_biquad_alt_stride2};
 use crate::silk::macros::*;
 
@@ -137,6 +138,11 @@ fn float_to_i16_round(input: &[f32], output: &mut [i16]) {
 ///
 /// `B_Q28`/`A_Q28` are Q28 coefficients; the state `S` is 2 elements per
 /// channel (stride pass). Output is written with the same `stride` as the input.
+///
+/// The steps round as in libopus 1.6.1 on 64-bit ARM, whose disassembly
+/// shows fused multiply-adds (`approx_mac`): `vout = S0 + B0*in` is one,
+/// `S0 = S1 - vout*A0 + B1*in` is two, and in `S1 = -vout*A1 + B2*in +
+/// VERY_SMALL` the first product is fused into the sum with `B2*in`.
 fn silk_biquad_res_float(
     input: &[f32],
     b_q28: &[i32; 3],
@@ -155,9 +161,9 @@ fn silk_biquad_res_float(
 
     for k in 0..len {
         let inval = input[k * stride];
-        let vout = s[0] + b0 * inval;
-        s[0] = s[1] - vout * a0 + b1 * inval;
-        s[1] = -vout * a1 + b2 * inval + 1e-30;
+        let vout = approx_mac(b0, inval, s[0]);
+        s[0] = approx_mac(b1, inval, approx_mac(-vout, a0, s[1]));
+        s[1] = approx_mac(-vout, a1, b2 * inval) + 1e-30;
         output[k * stride] = vout;
     }
 }
@@ -218,6 +224,10 @@ pub fn hp_cutoff_float(
 /// DC-reject first-order high-pass filter (C `dc_reject()` float path,
 /// opus_encoder.c:507). `VERY_SMALL` matches `arch.h` float builds (1e-30f).
 /// Used for the CELT/hybrid input when the application is not VOIP.
+///
+/// The state update `coef*x + VERY_SMALL + coef2*m0` is two fused
+/// multiply-adds in libopus on 64-bit ARM (`approx_mac`), as the
+/// disassembly of libopus 1.6.1 shows.
 pub fn dc_reject_float(
     input: &[f32],
     cutoff_hz: i32,
@@ -237,8 +247,8 @@ pub fn dc_reject_float(
             let x1 = input[2 * i + 1];
             let out0 = x0 - m0;
             let out1 = x1 - m2;
-            m0 = coef * x0 + 1e-30 + coef2 * m0;
-            m2 = coef * x1 + 1e-30 + coef2 * m2;
+            m0 = approx_mac(coef2, m0, approx_mac(coef, x0, 1e-30));
+            m2 = approx_mac(coef2, m2, approx_mac(coef, x1, 1e-30));
             output[2 * i] = out0;
             output[2 * i + 1] = out1;
         }
@@ -249,7 +259,7 @@ pub fn dc_reject_float(
         for i in 0..len {
             let x = input[i];
             let y = x - m0;
-            m0 = coef * x + 1e-30 + coef2 * m0;
+            m0 = approx_mac(coef2, m0, approx_mac(coef, x, 1e-30));
             output[i] = y;
         }
         hp_mem[0] = m0;

@@ -19,6 +19,8 @@
 //! CELT frame repeats the last pitch period of the signal, and it is not
 //! bit-exact with libopus: the difference is 25 to 100 dB below the signal
 //! on speech-like input.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 mod multistream_dec_common;

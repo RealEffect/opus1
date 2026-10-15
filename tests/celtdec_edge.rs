@@ -949,7 +949,7 @@ fn loss_next_to_a_mode_change() {
                     if db < POOR_DB {
                         poor += 1;
                     }
-                    if since_loss * frame_ms >= 120 {
+                    if since_loss.saturating_mul(frame_ms) >= 120 {
                         worst_away = worst_away.min(db);
                     }
                 }

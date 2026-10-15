@@ -433,247 +433,143 @@ pub fn compute_qn(n: usize, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -
     }
 }
 
-/// Turns the two energies of a band into the angle `atan2(side, mid)`,
-/// scaled so that a quarter turn is 16384.
+/// libopus `celt_inner_prod` of the float build: the sum of `x[i] * y[i]`.
+///
+/// On aarch64 this is `celt_inner_prod_neon` (celt/arm/pitch_neon_intr.c
+/// 186-214). It has one accumulator of four lanes, updated with fused
+/// multiply-adds, eight values per step and then four more if they are
+/// there. The lanes are added low half plus high half, then the two
+/// results. The last one to three values are added one at a time with
+/// fused multiply-adds.
+///
+/// Elsewhere this is `celt_inner_prod_c` (celt/pitch.h 159-168): one value
+/// at a time from 0, without fusing.
+///
+/// `y` must be at least as long as `x`.
 #[inline(always)]
-fn itheta_from_energies(emid: f32, eside: f32) -> i32 {
-    let mid = emid.sqrt();
-    let side = eside.sqrt();
-    let theta_norm = celt_atan2p_norm(side, mid);
-    (0.5 + 16384.0 * theta_norm) as i32
-}
-
-/// Portable angle between `x` and `y`, which must have the same length.
-///
-/// With `stereo`, the angle is between the sum and the difference of the
-/// two channels; otherwise between `x` and `y` themselves. The energies are
-/// summed one value at a time, as in libopus without vector code.
-///
-/// This is what every target except aarch64 runs. The NEON kernel sums in
-/// four lanes with fused multiply-add, so its angle can differ by one step.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-#[inline]
-fn stereo_itheta_scalar(x: &[f32], y: &[f32], stereo: bool) -> i32 {
-    debug_assert_eq!(x.len(), y.len());
-    let mut emid = 1e-15f32;
-    let mut eside = 1e-15f32;
-    if stereo {
-        for (&xv, &yv) in x.iter().zip(y) {
-            let m = xv + yv;
-            let s = xv - yv;
-            emid += m * m;
-            eside += s * s;
-        }
-    } else {
-        for (&xv, &yv) in x.iter().zip(y) {
-            emid += xv * xv;
-            eside += yv * yv;
-        }
-    }
-    itheta_from_energies(emid, eside)
-}
-
-/// NEON angle between `x` and `y`, which must have the same length.
-///
-/// The energies are summed in four lanes with fused multiply-add, the lanes
-/// are added in pairs, and the last one to three values are added one at a
-/// time without fusing. The unit test checks this order against a scalar
-/// model, because the encoder output depends on it.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool) -> i32 {
-    debug_assert_eq!(x.len(), y.len());
+pub(crate) fn celt_inner_prod(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
-    // One bounds check; the loads below rely on it.
-    let y = &y[..n];
-    // SAFETY: every vector load reads `x[i..i + 4]` or `y[i..i + 4]` with
-    // `i + 4 <= n`, because each loop tests `i + 16`, `i + 8` or `i + 4`
-    // against `n` before its loads. Both slices hold exactly `n` values.
-    let (emid, eside) = unsafe {
-        use core::arch::aarch64::*;
-
-        let mut emid = 1e-15f32;
-        let mut eside = 1e-15f32;
-
-        if stereo {
-            let mut sum_mid = vdupq_n_f32(0.0);
-            let mut sum_side = vdupq_n_f32(0.0);
-            let mut i = 0;
-
-            while i + 16 <= n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-                let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-                let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-                let y0 = vld1q_f32(y.as_ptr().add(i));
-                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-                let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-                let y3 = vld1q_f32(y.as_ptr().add(i + 12));
-
-                let m0 = vaddq_f32(x0, y0);
-                let m1 = vaddq_f32(x1, y1);
-                let m2 = vaddq_f32(x2, y2);
-                let m3 = vaddq_f32(x3, y3);
-                let s0 = vsubq_f32(x0, y0);
-                let s1 = vsubq_f32(x1, y1);
-                let s2 = vsubq_f32(x2, y2);
-                let s3 = vsubq_f32(x3, y3);
-
-                sum_mid = vfmaq_f32(sum_mid, m0, m0);
-                sum_mid = vfmaq_f32(sum_mid, m1, m1);
-                sum_mid = vfmaq_f32(sum_mid, m2, m2);
-                sum_mid = vfmaq_f32(sum_mid, m3, m3);
-                sum_side = vfmaq_f32(sum_side, s0, s0);
-                sum_side = vfmaq_f32(sum_side, s1, s1);
-                sum_side = vfmaq_f32(sum_side, s2, s2);
-                sum_side = vfmaq_f32(sum_side, s3, s3);
-
-                i += 16;
-            }
-
-            while i + 8 <= n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-                let y0 = vld1q_f32(y.as_ptr().add(i));
-                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-
-                let m0 = vaddq_f32(x0, y0);
-                let m1 = vaddq_f32(x1, y1);
-                let s0 = vsubq_f32(x0, y0);
-                let s1 = vsubq_f32(x1, y1);
-
-                sum_mid = vfmaq_f32(sum_mid, m0, m0);
-                sum_mid = vfmaq_f32(sum_mid, m1, m1);
-                sum_side = vfmaq_f32(sum_side, s0, s0);
-                sum_side = vfmaq_f32(sum_side, s1, s1);
-
-                i += 8;
-            }
-
-            while i + 4 <= n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                let y0 = vld1q_f32(y.as_ptr().add(i));
-                let m0 = vaddq_f32(x0, y0);
-                let s0 = vsubq_f32(x0, y0);
-                sum_mid = vfmaq_f32(sum_mid, m0, m0);
-                sum_side = vfmaq_f32(sum_side, s0, s0);
-                i += 4;
-            }
-
-            emid += vaddvq_f32(sum_mid);
-            eside += vaddvq_f32(sum_side);
-
-            for j in i..n {
-                let m = x[j] + y[j];
-                let s = x[j] - y[j];
-                emid += m * m;
-                eside += s * s;
-            }
-        } else {
-            let mut sum_mid = vdupq_n_f32(0.0);
-            let mut sum_side = vdupq_n_f32(0.0);
-            let mut i = 0;
-
-            while i + 16 <= n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-                let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-                let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-                let y0 = vld1q_f32(y.as_ptr().add(i));
-                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-                let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-                let y3 = vld1q_f32(y.as_ptr().add(i + 12));
-
-                sum_mid = vfmaq_f32(sum_mid, x0, x0);
-                sum_mid = vfmaq_f32(sum_mid, x1, x1);
-                sum_mid = vfmaq_f32(sum_mid, x2, x2);
-                sum_mid = vfmaq_f32(sum_mid, x3, x3);
-                sum_side = vfmaq_f32(sum_side, y0, y0);
-                sum_side = vfmaq_f32(sum_side, y1, y1);
-                sum_side = vfmaq_f32(sum_side, y2, y2);
-                sum_side = vfmaq_f32(sum_side, y3, y3);
-
-                i += 16;
-            }
-
-            while i + 8 <= n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-                let y0 = vld1q_f32(y.as_ptr().add(i));
-                let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-
-                sum_mid = vfmaq_f32(sum_mid, x0, x0);
-                sum_mid = vfmaq_f32(sum_mid, x1, x1);
-                sum_side = vfmaq_f32(sum_side, y0, y0);
-                sum_side = vfmaq_f32(sum_side, y1, y1);
-
-                i += 8;
-            }
-
-            while i + 4 <= n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                let y0 = vld1q_f32(y.as_ptr().add(i));
-                sum_mid = vfmaq_f32(sum_mid, x0, x0);
-                sum_side = vfmaq_f32(sum_side, y0, y0);
-                i += 4;
-            }
-
-            emid += vaddvq_f32(sum_mid);
-            eside += vaddvq_f32(sum_side);
-
-            for j in i..n {
-                emid += x[j] * x[j];
-                eside += y[j] * y[j];
-            }
-        }
-
-        (emid, eside)
-    };
-    itheta_from_energies(emid, eside)
-}
-
-/// Angle between `x[..n]` and `y[..n]`, see `stereo_itheta_scalar`.
-#[inline(always)]
-pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
-    // The only bounds checks. The kernels get slices of exactly `n` values.
-    let x = &x[..n];
+    // The only bounds check. The loads below rely on it.
     let y = &y[..n];
     #[cfg(target_arch = "aarch64")]
     {
-        stereo_itheta_neon(x, y, stereo)
+        use core::arch::aarch64::*;
+        // SAFETY: every load reads `x[i..i + 4]` or `y[i..i + 4]` with
+        // `i + 4 <= n`; both slices hold exactly `n` values.
+        unsafe {
+            let xp = x.as_ptr();
+            let yp = y.as_ptr();
+            let mut acc = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i + 8 <= n {
+                acc = vfmaq_f32(acc, vld1q_f32(xp.add(i)), vld1q_f32(yp.add(i)));
+                acc = vfmaq_f32(acc, vld1q_f32(xp.add(i + 4)), vld1q_f32(yp.add(i + 4)));
+                i += 8;
+            }
+            if n - i >= 4 {
+                acc = vfmaq_f32(acc, vld1q_f32(xp.add(i)), vld1q_f32(yp.add(i)));
+                i += 4;
+            }
+            let half = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+            let mut xy = vget_lane_f32::<0>(vpadd_f32(half, half));
+            while i < n {
+                xy = mac(xy, *xp.add(i), *yp.add(i));
+                i += 1;
+            }
+            xy
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        stereo_itheta_scalar(x, y, stereo)
+        let mut xy = 0.0f32;
+        for (&a, &b) in x.iter().zip(y) {
+            xy = mac(xy, a, b);
+        }
+        xy
     }
 }
 
+/// libopus `stereo_itheta` (celt/vq.c 724-754, float build): the angle
+/// between `x[..n]` and `y[..n]`, `atan2(side, mid)` in Q30, so that a
+/// quarter turn is `1 << 30`.
+///
+/// With `stereo`, mid and side are the sum and the difference of the two
+/// channels, summed one value at a time. Otherwise they are `x` and `y`
+/// themselves, summed with `celt_inner_prod`. Both energies start at 0, so
+/// two silent halves give the angle 0. The angle is rounded down to a
+/// multiple of 64 or finer, from `floor(0.5 + 2^30 * theta)` in single
+/// precision. `compute_theta` keeps the top 14 bits (`itheta_q30 >> 16`).
+#[inline(always)]
+pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
+    // The only bounds checks. The loops get slices of exactly `n` values.
+    let x = &x[..n];
+    let y = &y[..n];
+    let (emid, eside) = if stereo {
+        // C: `Emid = MAC16_16(Emid, m, m)` in a plain loop, which no
+        // compiler may reorder. On aarch64 each step is one `fmadd`.
+        let mut emid = 0.0f32;
+        let mut eside = 0.0f32;
+        for (&xv, &yv) in x.iter().zip(y) {
+            let m = xv + yv;
+            let s = xv - yv;
+            emid = mac(emid, m, m);
+            eside = mac(eside, s, s);
+        }
+        (emid, eside)
+    } else {
+        // C: `Emid += celt_inner_prod_norm_shift(X, X, N, arch)`, which is
+        // `celt_inner_prod` in the float build. Adding it to 0 changes no
+        // bits of a sum of squares.
+        (celt_inner_prod(x, x), celt_inner_prod(y, y))
+    };
+    let mid = emid.sqrt();
+    let side = eside.sqrt();
+    // C: `(int)floor(.5f+65536.f*16384*celt_atan2p_norm(side,mid))`. The
+    // product with 2^30 is exact, so fused or not it rounds once, in the
+    // add. The value is not negative, so the cast rounds down like floor.
+    (0.5 + 1_073_741_824.0 * celt_atan2p_norm(side, mid)) as i32
+}
+
+/// libopus `celt_atan_norm` (celt/mathops.h 144-168, float build):
+/// `atan(x) * 2 / pi` for `x` in `[0, 1]`, from an odd polynomial.
+#[inline(always)]
+fn celt_atan_norm(x: f32) -> f32 {
+    // The values of the C constants, written as short as each float allows.
+    // A09 and A13 were one float step off before.
+    const ATAN2_2_OVER_PI: f32 = core::f32::consts::FRAC_2_PI;
+    const A03: f32 = -3.333_166e-1;
+    const A05: f32 = 1.996_270_4e-1;
+    const A07: f32 = -1.397_658_3e-1;
+    const A09: f32 = 9.794_234_5e-2;
+    const A11: f32 = -5.777_359e-2;
+    const A13: f32 = 2.304_013_6e-2;
+    const A15: f32 = -4.355_406e-3;
+    let x_sq = x * x;
+    // C: `ATAN2_2_OVER_PI * (x + x * x_sq * (A03 + x_sq * (A05 + ...)))`.
+    // Each `c + x_sq * p` and the final `x + (x * x_sq) * p` are one fused
+    // step on aarch64 (see `mac`); the product with the constant is not.
+    let mut p = mac(A13, x_sq, A15);
+    p = mac(A11, x_sq, p);
+    p = mac(A09, x_sq, p);
+    p = mac(A07, x_sq, p);
+    p = mac(A05, x_sq, p);
+    p = mac(A03, x_sq, p);
+    ATAN2_2_OVER_PI * mac(x, x * x_sq, p)
+}
+
+/// libopus `celt_atan2p_norm` (celt/mathops.h 172-188, float build):
+/// `atan2(y, x) * 2 / pi` for `x, y >= 0`, so a quarter turn is 1.
 #[inline(always)]
 fn celt_atan2p_norm(y: f32, x: f32) -> f32 {
-    #[inline(always)]
-    fn atan_norm(x: f32) -> f32 {
-        const ATAN2_2_OVER_PI: f32 = core::f32::consts::FRAC_2_PI;
-        const A03: f32 = -3.333_166e-1_f32;
-        const A05: f32 = 1.996_270_4e-1_f32;
-        const A07: f32 = -1.397_658_3e-1_f32;
-        const A09: f32 = 9.794_234_e-2_f32;
-        const A11: f32 = -5.777_359_e-2_f32;
-        const A13: f32 = 2.304_014e-2_f32;
-        const A15: f32 = -4.355_406e-3_f32;
-        let x2 = x * x;
-        ATAN2_2_OVER_PI
-            * x
-            * (1.0
-                + x2 * (A03
-                    + x2 * (A05 + x2 * (A07 + x2 * (A09 + x2 * (A11 + x2 * (A13 + x2 * A15)))))))
-    }
-    if x * x + y * y < 1e-18 {
+    // C: `(x*x + y*y) < 1e-18f`. clang computes `y*y` and fuses `x*x` into
+    // the add on aarch64.
+    if mac(y * y, x, x) < 1e-18 {
         return 0.0;
     }
     if y < x {
-        atan_norm(y / x)
+        celt_atan_norm(y / x)
     } else {
-        1.0 - atan_norm(x / y)
+        1.0 - celt_atan_norm(x / y)
     }
 }
 
@@ -720,7 +616,8 @@ pub fn compute_theta(
 
     let mut itheta = 0;
     if ctx.encode {
-        itheta = stereo_itheta(x, y, stereo, n);
+        // C (bands.c 741-742): the angle in Q30, rounded down to Q14.
+        itheta = stereo_itheta(x, y, stereo, n) >> 16;
     }
 
     let tell_start = tell_frac_inline!(ctx.rc);
@@ -848,9 +745,15 @@ pub fn compute_theta(
                 }
             }
             intensity_stereo(ctx.m, x, y, ctx.band_e, ctx.i, n);
-            if *b > (2 << BITRES) && ctx.remaining_bits > (2 << BITRES) {
+            // C: the flag is coded only when there are bits for it, and is 0
+            // otherwise, for the encoder too. Its resynthesis then keeps the
+            // right channel as the decoder will have it.
+            let inv = if *b > (2 << BITRES) && ctx.remaining_bits > (2 << BITRES) {
                 ctx.rc.encode_bit_logp(inv, 2);
-            }
+                inv
+            } else {
+                false
+            };
             itheta = 0;
             sctx.inv = inv;
         } else {
@@ -917,12 +820,10 @@ fn quant_partition_n2_encode(
         let k = get_pulses(q);
         alg_quant(x, 2, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
     } else {
-        let has_lowband = lowband.is_some();
-        if has_lowband {
-            fill
-        } else {
-            (1u32 << b_blocks) - 1
-        }
+        // C (quant_partition): without pulses and without resynthesis the
+        // band is not filled and its collapse mask stays 0.
+        let _ = (lowband, fill);
+        0
     }
 }
 
@@ -952,12 +853,10 @@ fn quant_partition_n4_encode(
         let k = get_pulses(q);
         alg_quant(x, 4, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
     } else {
-        let has_lowband = lowband.is_some();
-        if has_lowband {
-            fill
-        } else {
-            (1u32 << b_blocks) - 1
-        }
+        // C (quant_partition): without pulses and without resynthesis the
+        // band is not filled and its collapse mask stays 0.
+        let _ = (lowband, fill);
+        0
     }
 }
 
@@ -987,12 +886,10 @@ fn quant_partition_n8_encode(
         let k = get_pulses(q);
         alg_quant(x, 8, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
     } else {
-        let has_lowband = lowband.is_some();
-        if has_lowband {
-            fill
-        } else {
-            (1u32 << b_blocks) - 1
-        }
+        // C (quant_partition): without pulses and without resynthesis the
+        // band is not filled and its collapse mask stays 0.
+        let _ = (lowband, fill);
+        0
     }
 }
 
@@ -1024,12 +921,10 @@ fn quant_partition_direct_encode(
         let k = get_pulses(q);
         alg_quant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
     } else {
-        let has_lowband = lowband.is_some();
-        if has_lowband {
-            fill
-        } else {
-            (1u32 << b_blocks) - 1
-        }
+        // C (quant_partition): without pulses and without resynthesis the
+        // band is not filled and its collapse mask stays 0.
+        let _ = (lowband, fill);
+        0
     }
 }
 
@@ -1264,10 +1159,10 @@ fn quant_partition_encode(
         if q != 0 {
             let k = get_pulses(q);
             alg_quant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
-        } else if lowband.is_some() {
-            fill
         } else {
-            (1 << b_blocks) - 1
+            // C (quant_partition): without pulses and without resynthesis
+            // the band is not filled and its collapse mask stays 0.
+            0
         }
     }
 }
@@ -2004,7 +1899,10 @@ pub fn quant_band(
         }
     }
 
-    let cm = if ctx.encode {
+    // `quant_partition_encode` is the encoder without resynthesis.
+    // `quant_partition` is libopus's function as it is: it decodes, and it
+    // encodes with resynthesis (theta_rdo).
+    let cm = if ctx.encode && !ctx.resynth {
         quant_partition_encode(ctx, x, n, b, b_blocks, lowband_buf, lm, gain, fill)
     } else {
         quant_partition(ctx, x, n, b, b_blocks, lowband_buf, lm, gain, fill)
@@ -2056,24 +1954,25 @@ pub fn quant_band(
 }
 
 /// Turns the mid signal in `x` and the side signal in `y` back into the left
-/// and the right channel, each with unit energy (libopus: stereo_merge).
+/// and the right channel, each with unit energy: libopus `stereo_merge`
+/// (celt/bands.c, float build).
+///
+/// The two sums are `celt_inner_prod` (on arm64 the NEON form). clang fuses
+/// `mid * mid + side` (`MULT32_32_Q31(mid, mid) + side`, the shift is none in
+/// the float build); `2 * xp` is exact, so the second step rounds alike
+/// either way.
 pub fn stereo_merge(x: &mut [f32], y: &mut [f32], mid: f32, _side: f32, n: usize) {
     // One bounds check per slice; the loops below need none.
     let x = &mut x[..n];
     let y = &mut y[..n];
 
-    // The two sums are added one value at a time, in this order. Any other
-    // order would round differently and change the decoder output.
-    let mut xp = 0.0f32;
-    let mut side_e = 0.0f32;
-    for (&xv, &yv) in x.iter().zip(y.iter()) {
-        xp += yv * xv;
-        side_e += yv * yv;
-    }
-
-    xp *= mid;
-    let el = mid * mid + side_e - 2.0 * xp;
-    let er = mid * mid + side_e + 2.0 * xp;
+    // C: `xp = celt_inner_prod_norm_shift(Y, X, N, arch)` and
+    // `side = celt_inner_prod_norm_shift(Y, Y, N, arch)`.
+    let xp = mid * celt_inner_prod(y, x);
+    let side_e = celt_inner_prod(y, y);
+    let t = mac(side_e, mid, mid);
+    let el = t - 2.0 * xp;
+    let er = t + 2.0 * xp;
 
     if er < 6e-4f32 || el < 6e-4f32 {
         y.copy_from_slice(x);
@@ -2429,8 +2328,285 @@ pub fn quant_band_stereo(
     cm
 }
 
+/// libopus `compute_channel_weights` (celt/bands.c 362-377, float build):
+/// the weights of the two channels in the distortion of theta_rdo.
+#[inline(always)]
+fn compute_channel_weights(ex: f32, ey: f32) -> [f32; 2] {
+    // C: `minE = MIN32(Ex, Ey)`, then `Ex = ADD32(Ex, minE/3)`.
+    let min_e = if ex < ey { ex } else { ey };
+    [ex + min_e / 3.0, ey + min_e / 3.0]
+}
+
+/// One stereo band coded twice, with the angle rounded down and up, keeping
+/// the result with the smaller distortion: the `theta_rdo` branch of libopus
+/// `quant_all_bands` (celt/bands.c 1809-1880).
+///
+/// The first pass codes the band with `theta_round = -1`. Its bytes, its
+/// coder state, its decoded band and its folding output are kept. The
+/// second pass starts from the same state with `theta_round = 1`. When the
+/// first pass has the smaller or equal distortion, its result is put back.
+///
+/// libopus copies the coder bytes from the start offset to the end of the
+/// buffer. A pass writes only bytes from `offs` up and raw bits from the
+/// end down, so this copies just those two ranges; the bytes in between are
+/// written again later or cleared by `RangeCoder::done`.
+///
+/// `hybrid_fold` is `Some((start, m_val))` for the band after the first one:
+/// libopus folds its first band into `norm` again before the second pass
+/// (`special_hybrid_folding`), because the first pass overwrote it.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn quant_band_stereo_rdo(
+    ctx: &mut BandCtx,
+    x: &mut [f32],
+    y: &mut [f32],
+    n: usize,
+    b: i32,
+    b_blocks: i32,
+    lm: i32,
+    fill: u32,
+    norm: &mut [f32],
+    lowband_scratch_ptr: *mut f32,
+    allow_lowband_scratch: bool,
+    effective_lowband: i32,
+    norm_pos: usize,
+    last: bool,
+    hybrid_fold: Option<(usize, usize)>,
+) -> u32 {
+    use core::mem::MaybeUninit;
+    // A band never has more than MAX_PVQ_N values. Checked in release builds
+    // too, because the copies below go to buffers of that size.
+    assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
+    let x = &mut x[..n];
+    let y = &mut y[..n];
+    let mut x_save_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let mut y_save_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    // SAFETY (both): `n <= MAX_PVQ_N` values fit in each buffer, and each
+    // slice is written by `copy_from_slice` before it is read.
+    let x_save = unsafe { core::slice::from_raw_parts_mut(x_save_mu.as_mut_ptr() as *mut f32, n) };
+    let y_save = unsafe { core::slice::from_raw_parts_mut(y_save_mu.as_mut_ptr() as *mut f32, n) };
+    x_save.copy_from_slice(x);
+    y_save.copy_from_slice(y);
+
+    let w = compute_channel_weights(ctx.band_e[ctx.i], ctx.band_e[ctx.i + ctx.m.nb_ebands]);
+    // C: `MULT16_32_Q15(w[0], ip(X_save, X)) + MULT16_32_Q15(w[1], ip(Y_save,
+    // Y))`. clang fuses the first product into the add (fmadd).
+    let distortion = |x: &[f32], y: &[f32], x_save: &[f32], y_save: &[f32]| {
+        mac(w[1] * celt_inner_prod(y_save, y), w[0], celt_inner_prod(x_save, x))
+    };
+
+    let state0 = ctx.rc.save_state();
+    let (offs0, end_offs0) = (ctx.rc.offs as usize, ctx.rc.end_offs as usize);
+    let (seed0, remaining0) = (ctx.seed, ctx.remaining_bits);
+
+    // Encode and round down.
+    ctx.theta_round = -1;
+    let (lb, lb_out) = prepare_lowband_views(
+        norm,
+        lowband_scratch_ptr,
+        allow_lowband_scratch,
+        effective_lowband,
+        norm_pos,
+        n,
+        !last,
+    );
+    let cm_down = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, 1.0, fill);
+    let dist_down = distortion(x, y, x_save, y_save);
+
+    // Keep the first result.
+    let state_down = ctx.rc.save_state();
+    let (seed_down, remaining_down) = (ctx.seed, ctx.remaining_bits);
+    let mut x_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let mut y_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let mut norm_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    // SAFETY (all three): as above. `norm_down` is written and read only
+    // when `keep_norm` holds.
+    let x_down = unsafe { core::slice::from_raw_parts_mut(x_down_mu.as_mut_ptr() as *mut f32, n) };
+    let y_down = unsafe { core::slice::from_raw_parts_mut(y_down_mu.as_mut_ptr() as *mut f32, n) };
+    let norm_down =
+        unsafe { core::slice::from_raw_parts_mut(norm_down_mu.as_mut_ptr() as *mut f32, n) };
+    x_down.copy_from_slice(x);
+    y_down.copy_from_slice(y);
+    let keep_norm = !last && norm_pos + n <= norm.len();
+    if keep_norm {
+        norm_down.copy_from_slice(&norm[norm_pos..norm_pos + n]);
+    }
+    // The bytes the first pass wrote: range coder bytes from `offs0` up, raw
+    // bits from the end down.
+    let storage = ctx.rc.storage as usize;
+    let front = offs0..(ctx.rc.offs as usize).max(offs0);
+    let back = storage - (ctx.rc.end_offs as usize).max(end_offs0)..storage - end_offs0;
+    let mut bytes_mu = [MaybeUninit::<u8>::uninit(); crate::range_coder::RANGE_BUF_MAX];
+    // Both ranges lie inside the coder's buffer of `storage` bytes and do not
+    // overlap, so together they hold at most RANGE_BUF_MAX bytes. Checked in
+    // release builds too, because the slice below must fit in the buffer.
+    let saved = front.len() + back.len();
+    assert!(saved <= crate::range_coder::RANGE_BUF_MAX);
+    // SAFETY: `saved` bytes fit in the buffer (checked above), and both
+    // copies below write all of them before anything reads them.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(bytes_mu.as_mut_ptr() as *mut u8, saved) };
+    bytes[..front.len()].copy_from_slice(&ctx.rc.buf[front.clone()]);
+    bytes[front.len()..].copy_from_slice(&ctx.rc.buf[back.clone()]);
+
+    // Restore.
+    ctx.rc.restore_state(&state0);
+    ctx.seed = seed0;
+    ctx.remaining_bits = remaining0;
+    x.copy_from_slice(x_save);
+    y.copy_from_slice(y_save);
+    if let Some((start, m_val)) = hybrid_fold {
+        special_hybrid_folding(ctx.m, norm, start, m_val);
+    }
+
+    // Encode and round up.
+    ctx.theta_round = 1;
+    let (lb, lb_out) = prepare_lowband_views(
+        norm,
+        lowband_scratch_ptr,
+        allow_lowband_scratch,
+        effective_lowband,
+        norm_pos,
+        n,
+        !last,
+    );
+    let cm_up = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, 1.0, fill);
+    let dist_up = distortion(x, y, x_save, y_save);
+
+    if dist_down >= dist_up {
+        ctx.rc.restore_state(&state_down);
+        ctx.rc.buf[front.clone()].copy_from_slice(&bytes[..front.len()]);
+        ctx.rc.buf[back].copy_from_slice(&bytes[front.len()..]);
+        ctx.seed = seed_down;
+        ctx.remaining_bits = remaining_down;
+        ctx.theta_round = -1;
+        x.copy_from_slice(x_down);
+        y.copy_from_slice(y_down);
+        if keep_norm {
+            norm[norm_pos..norm_pos + n].copy_from_slice(norm_down);
+        }
+        cm_down
+    } else {
+        cm_up
+    }
+}
+
+/// The encoder's call of `quant_all_bands` as libopus makes it
+/// (celt/celt_encoder.c 2674-2679), with the encoder's complexity and
+/// phase-inversion setting. `seed` is the encoder's `rng`: the final range
+/// of its previous frame, or 0 after a reset.
+///
+/// At complexity 8 and above a stereo frame that is not dual stereo is coded
+/// with `theta_rdo`: the encoder resynthesises every band, and codes each
+/// band below the intensity band twice (`quant_band_stereo_rdo`).
+#[allow(clippy::too_many_arguments)]
+pub fn quant_all_bands_enc(
+    m: &CeltMode,
+    start: usize,
+    end: usize,
+    x: &mut [f32],
+    y: Option<&mut [f32]>,
+    collapse_masks: &mut [u32],
+    band_e: &[f32],
+    pulses: &[i32],
+    short_blocks: bool,
+    spread: i32,
+    dual_stereo: &mut bool,
+    intensity: usize,
+    tf_res: &[i32],
+    total_bits: i32,
+    balance: &mut i32,
+    rc: &mut RangeCoder,
+    lm: i32,
+    coded_bands: i32,
+    seed: &mut u32,
+    complexity: i32,
+    disable_inv: bool,
+) {
+    quant_all_bands_impl(
+        true,
+        m,
+        start,
+        end,
+        x,
+        y,
+        collapse_masks,
+        band_e,
+        pulses,
+        short_blocks,
+        spread,
+        dual_stereo,
+        intensity,
+        tf_res,
+        total_bits,
+        balance,
+        rc,
+        lm,
+        coded_bands,
+        false,
+        disable_inv,
+        seed,
+        complexity,
+    );
+}
+
+/// libopus `quant_all_bands` without the encoder's complexity: no
+/// `theta_rdo`. The decoder calls it with `resynth` set.
 #[allow(clippy::too_many_arguments)]
 pub fn quant_all_bands(
+    encode: bool,
+    m: &CeltMode,
+    start: usize,
+    end: usize,
+    x: &mut [f32],
+    y: Option<&mut [f32]>,
+    collapse_masks: &mut [u32],
+    band_e: &[f32],
+    pulses: &[i32],
+    short_blocks: bool,
+    spread: i32,
+    dual_stereo: &mut bool,
+    intensity: usize,
+    tf_res: &[i32],
+    total_bits: i32,
+    balance: &mut i32,
+    rc: &mut RangeCoder,
+    lm: i32,
+    coded_bands: i32,
+    resynth: bool,
+    disable_inv: bool,
+    seed: &mut u32,
+) {
+    quant_all_bands_impl(
+        encode,
+        m,
+        start,
+        end,
+        x,
+        y,
+        collapse_masks,
+        band_e,
+        pulses,
+        short_blocks,
+        spread,
+        dual_stereo,
+        intensity,
+        tf_res,
+        total_bits,
+        balance,
+        rc,
+        lm,
+        coded_bands,
+        resynth,
+        disable_inv,
+        seed,
+        0,
+    );
+}
+
+/// libopus `quant_all_bands` (celt/bands.c 1589-1925).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn quant_all_bands_impl(
     encode: bool,
     m: &CeltMode,
     start: usize,
@@ -2453,7 +2629,12 @@ pub fn quant_all_bands(
     resynth: bool,
     disable_inv: bool,
     seed: &mut u32,
+    complexity: i32,
 ) {
+    // C 1618-1623: at complexity 8 and above the encoder codes each stereo
+    // band twice and resynthesises every band for it.
+    let theta_rdo = encode && y.is_some() && !*dual_stereo && complexity >= 8;
+    let resynth = resynth || theta_rdo;
     let mut balance_val = *balance;
     let b_blocks = if short_blocks { 1 << lm } else { 1 };
     let c_channels = if y.is_some() { 2 } else { 1 };
@@ -2590,7 +2771,9 @@ pub fn quant_all_bands(
 
         let x_slice = &mut x[offset..offset + n];
         let band_uses_direct_norm = i >= m.eff_ebands;
-        let allow_lowband_scratch = !(band_uses_direct_norm || (last && !encode));
+        // C 1749-1758: no scratch for bands past `effEBands`, nor for the last
+        // band unless theta_rdo codes it twice.
+        let allow_lowband_scratch = !(band_uses_direct_norm || (last && !theta_rdo));
         if *dual_stereo && i == intensity {
             *dual_stereo = false;
             if resynth {
@@ -2648,28 +2831,48 @@ pub fn quant_all_bands(
             );
         } else if let Some(y_all) = y.as_mut() {
             let y_slice = &mut y_all[offset..offset + n];
-            let (lb, lb_out) = prepare_lowband_views(
-                norm,
-                lowband_scratch_ptr,
-                allow_lowband_scratch,
-                effective_lowband,
-                norm_pos,
-                n,
-                !last,
-            );
-            x_cm = quant_band_stereo(
-                &mut ctx,
-                x_slice,
-                y_slice,
-                n,
-                b,
-                b_blocks,
-                lb,
-                lm,
-                lb_out,
-                1.0,
-                x_cm | y_cm,
-            );
+            if theta_rdo && i < intensity {
+                x_cm = quant_band_stereo_rdo(
+                    &mut ctx,
+                    x_slice,
+                    y_slice,
+                    n,
+                    b,
+                    b_blocks,
+                    lm,
+                    x_cm | y_cm,
+                    norm,
+                    lowband_scratch_ptr,
+                    allow_lowband_scratch,
+                    effective_lowband,
+                    norm_pos,
+                    last,
+                    if i == start + 1 { Some((start, m_val)) } else { None },
+                );
+            } else {
+                let (lb, lb_out) = prepare_lowband_views(
+                    norm,
+                    lowband_scratch_ptr,
+                    allow_lowband_scratch,
+                    effective_lowband,
+                    norm_pos,
+                    n,
+                    !last,
+                );
+                x_cm = quant_band_stereo(
+                    &mut ctx,
+                    x_slice,
+                    y_slice,
+                    n,
+                    b,
+                    b_blocks,
+                    lb,
+                    lm,
+                    lb_out,
+                    1.0,
+                    x_cm | y_cm,
+                );
+            }
             y_cm = x_cm;
         } else {
             let (lb, lb_out) = prepare_lowband_views(
@@ -2698,67 +2901,6 @@ pub fn quant_all_bands(
     }
     *balance = balance_val;
     *seed = ctx_seed;
-}
-
-/// Square root of the energy of one band, plus a tiny offset.
-///
-/// The sum uses four accumulators of four lanes for the first multiple of
-/// 16 values, one accumulator for the next multiple of 4, and plain adds
-/// for the rest, all with fused multiply-add in the vector part. The unit
-/// test checks this order against a scalar model.
-#[cfg(target_arch = "aarch64")]
-fn compute_band_energy_neon(band: &[f32]) -> f32 {
-    use core::arch::aarch64::*;
-
-    let n = band.len();
-    let mut sum = 1e-27f32;
-
-    // SAFETY: every load reads `band[i..i + 4]` with `i + 4 <= n`: the first
-    // loop stops at `n16`, the largest multiple of 16 up to `n`, and the
-    // second at `n16 + n4`, the largest multiple of 4 up to `n`.
-    unsafe {
-        let n16 = n & !15;
-        if n16 > 0 {
-            let mut acc0 = vdupq_n_f32(0.0);
-            let mut acc1 = vdupq_n_f32(0.0);
-            let mut acc2 = vdupq_n_f32(0.0);
-            let mut acc3 = vdupq_n_f32(0.0);
-
-            for i in (0..n16).step_by(16) {
-                let v0 = vld1q_f32(band.as_ptr().add(i));
-                let v1 = vld1q_f32(band.as_ptr().add(i + 4));
-                let v2 = vld1q_f32(band.as_ptr().add(i + 8));
-                let v3 = vld1q_f32(band.as_ptr().add(i + 12));
-
-                acc0 = vfmaq_f32(acc0, v0, v0);
-                acc1 = vfmaq_f32(acc1, v1, v1);
-                acc2 = vfmaq_f32(acc2, v2, v2);
-                acc3 = vfmaq_f32(acc3, v3, v3);
-            }
-
-            acc0 = vaddq_f32(acc0, acc1);
-            acc2 = vaddq_f32(acc2, acc3);
-            acc0 = vaddq_f32(acc0, acc2);
-            sum += vaddvq_f32(acc0);
-        }
-
-        let n4 = (n & !3) - n16;
-        if n4 > 0 {
-            let mut acc = vdupq_n_f32(0.0);
-            for i in (n16..n16 + n4).step_by(4) {
-                let v = vld1q_f32(band.as_ptr().add(i));
-                acc = vfmaq_f32(acc, v, v);
-            }
-            sum += vaddvq_f32(acc);
-        }
-
-        for i in (n16 + n4)..n {
-            let v = band[i];
-            sum += v * v;
-        }
-    }
-
-    sum.sqrt()
 }
 
 /// # Safety
@@ -2809,6 +2951,13 @@ unsafe fn compute_band_energy_avx2(band: &[f32]) -> f32 {
     sum.sqrt()
 }
 
+/// libopus `compute_band_energies` (celt/bands.c 151-166, float build): the
+/// amplitude of each band, `sqrt(1e-27 + sum of x^2)`.
+///
+/// The sum is `celt_inner_prod` of the band with itself, in the order of
+/// libopus on this processor (see `celt_inner_prod`); the offset is added
+/// after it. On x86-64 with AVX2 the bands of 8 values and more use a wider
+/// kernel of their own.
 pub fn compute_band_energies(
     m: &CeltMode,
     x: &[f32],
@@ -2829,25 +2978,14 @@ pub fn compute_band_energies(
             let n = ((m.e_bands[i + 1] - m.e_bands[i]) as usize) << lm;
             let band = &ch[offset..offset + n];
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                band_e[c * m.nb_ebands + i] = compute_band_energy_neon(band);
-            }
             #[cfg(target_arch = "x86_64")]
-            {
-                if n >= 8 && use_avx2 {
-                    // SAFETY: the CPU has AVX2 and FMA (`use_avx2`).
-                    band_e[c * m.nb_ebands + i] = unsafe { compute_band_energy_avx2(band) };
-                } else {
-                    let sum = band.iter().fold(1e-27f32, |acc, &v| acc + v * v);
-                    band_e[c * m.nb_ebands + i] = sum.sqrt();
-                }
+            if n >= 8 && use_avx2 {
+                // SAFETY: the CPU has AVX2 and FMA (`use_avx2`).
+                band_e[c * m.nb_ebands + i] = unsafe { compute_band_energy_avx2(band) };
+                continue;
             }
-            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
-            {
-                let sum = band.iter().fold(1e-27f32, |acc, &v| acc + v * v);
-                band_e[c * m.nb_ebands + i] = sum.sqrt();
-            }
+            // C: `sum = 1e-27f + celt_inner_prod(X, X, N, arch)`.
+            band_e[c * m.nb_ebands + i] = (1e-27f32 + celt_inner_prod(band, band)).sqrt();
         }
     }
 }
@@ -3015,8 +3153,9 @@ pub fn denormalise_bands(
             let n = ((m.e_bands[i + 1] - m.e_bands[i]) as usize) << lm;
             let band_log = band_e[c * m.nb_ebands + i];
 
-            // Match C: celt_exp2_db(MIN32(32.f, lg)) — cap gain to prevent overflow
-            let g = (2.0f32).powf(band_log.min(32.0));
+            // C: `g = celt_exp2_db(MIN32(32.f, lg))`, the polynomial
+            // `celt_exp2` of the float build. The cap keeps the gain finite.
+            let g = celt_exp2(if 32.0 < band_log { 32.0 } else { band_log });
             let src = &x[base..base + n];
             let dst = &mut freq[base..base + n];
             #[cfg(target_arch = "x86_64")]
@@ -3041,90 +3180,6 @@ pub fn denormalise_bands(
 
 pub fn celt_lcg_rand(seed: u32) -> u32 {
     seed.wrapping_mul(1664525).wrapping_add(1013904223)
-}
-
-/// NEON kernel of `renormalise_vector`.
-///
-/// # Safety
-///
-/// `x` must hold at least `n` values. Every load and store covers
-/// `x[i..i + 4]` with `i + 4 <= n`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
-    use core::arch::aarch64::*;
-
-    debug_assert!(x.len() >= n);
-
-    let mut sum_vec = vdupq_n_f32(0.0);
-    let mut i = 0;
-
-    while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-        sum_vec = vfmaq_f32(sum_vec, x0, x0);
-        sum_vec = vfmaq_f32(sum_vec, x1, x1);
-        sum_vec = vfmaq_f32(sum_vec, x2, x2);
-        sum_vec = vfmaq_f32(sum_vec, x3, x3);
-        i += 16;
-    }
-
-    while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        sum_vec = vfmaq_f32(sum_vec, x0, x0);
-        sum_vec = vfmaq_f32(sum_vec, x1, x1);
-        i += 8;
-    }
-
-    while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        sum_vec = vfmaq_f32(sum_vec, x0, x0);
-        i += 4;
-    }
-
-    let mut e = 1e-15f32 + vaddvq_f32(sum_vec);
-
-    for j in i..n {
-        e += x[j] * x[j];
-    }
-
-    let norm = gain / e.sqrt();
-    let vnorm = vdupq_n_f32(norm);
-
-    i = 0;
-    while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 8), vmulq_f32(x2, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 12), vmulq_f32(x3, vnorm));
-        i += 16;
-    }
-
-    while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vnorm));
-        i += 8;
-    }
-
-    while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vnorm));
-        i += 4;
-    }
-
-    for j in i..n {
-        x[j] *= norm;
-    }
 }
 
 /// # Safety
@@ -3170,7 +3225,8 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
         e += v * v;
     }
 
-    let norm = gain / e.sqrt();
+    // C (renormalise_vector): the reciprocal first, then the gain.
+    let norm = (1.0 / e.sqrt()) * gain;
     let vnorm = _mm256_set1_ps(norm);
 
     i = 0;
@@ -3191,31 +3247,26 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     }
 }
 
-/// Portable kernel of `renormalise_vector`: the energy is summed one value
-/// at a time. This is what every target without a vector kernel runs.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// libopus `renormalise_vector` (celt/vq.c, float build): `E = EPSILON +
+/// celt_inner_prod(X, X)`, then every value times `(1 / sqrt(E)) * gain`.
+/// The sum has the order of libopus on this processor (`celt_inner_prod`);
+/// the offset is added after it.
 #[inline]
-fn renormalise_vector_scalar(x: &mut [f32], gain: f32) {
-    let mut e = 1e-15f32;
-    for &xv in x.iter() {
-        e += xv * xv;
-    }
-    let norm = gain / e.sqrt();
+fn renormalise_vector_libopus(x: &mut [f32], gain: f32) {
+    let e = 1e-15f32 + celt_inner_prod(x, x);
+    let g = (1.0 / e.sqrt()) * gain;
     for xv in x.iter_mut() {
-        *xv *= norm;
+        *xv *= g;
     }
 }
 
-/// Scales `x[..n]` so that its energy becomes `gain * gain`.
+/// Scales `x[..n]` so that its energy becomes `gain * gain`, as libopus's
+/// `renormalise_vector` does (see `renormalise_vector_libopus`). x86-64 with
+/// AVX2 sums bands of 16 values and more with its own kernel.
 pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
-    // The only bounds check. The vector kernels read and write `n` values
+    // The only bounds check. The vector kernel reads and writes `n` values
     // through pointers.
     let x = &mut x[..n];
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: `x` holds exactly `n` values.
-        unsafe { renormalise_vector_neon(x, n, gain) };
-    }
     #[cfg(target_arch = "x86_64")]
     {
         if n >= 16 && crate::compat::x86_has_avx2_fma() {
@@ -3225,8 +3276,34 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
             return;
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    renormalise_vector_scalar(x, gain);
+    renormalise_vector_libopus(x, gain);
+}
+
+/// libopus `celt_exp2` of the float build with `FLOAT_APPROX`
+/// (celt/mathops.h 315-345): `2^x` from a polynomial of degree 5 for the
+/// fraction, put into the exponent bits. Each step `a + frac * p` is one
+/// fused multiply-add on arm64 (see `mac`). src/celt.rs has the same port
+/// for the encoder's analysis.
+#[inline]
+fn celt_exp2(x: f32) -> f32 {
+    let integer = x.floor() as i32;
+    if integer < -50 {
+        return 0.0;
+    }
+    let frac = x - integer as f32;
+    const A0: f32 = 9.999_999_4e-1;
+    const A1: f32 = 6.931_531e-1;
+    const A2: f32 = 2.401_536_1e-1;
+    const A3: f32 = 5.582_631_8e-2;
+    const A4: f32 = 8.989_34e-3;
+    const A5: f32 = 1.877_576_7e-3;
+    let p = mac(A4, frac, A5);
+    let p = mac(A3, frac, p);
+    let p = mac(A2, frac, p);
+    let p = mac(A1, frac, p);
+    let p = mac(A0, frac, p);
+    let bits = (p.to_bits() as i32).wrapping_add(((integer as u32) << 23) as i32) as u32 & 0x7fff_ffff;
+    f32::from_bits(bits)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3253,7 +3330,8 @@ pub fn anti_collapse(
             0
         };
 
-        let thresh = 0.5 * (-(0.125 * depth as f32)).exp2();
+        // C: `thresh = .5f*celt_exp2(-.125f*depth)`.
+        let thresh = 0.5 * celt_exp2(-0.125 * depth as f32);
         let sqrt_1 = 1.0 / ((n0 << lm) as f32).sqrt();
 
         for c in 0..channels {
@@ -3272,7 +3350,8 @@ pub fn anti_collapse(
             let e_diff = log_e[c * m.nb_ebands + i] - p1_adj.min(p2_adj);
             let e_diff = e_diff.max(0.0);
 
-            let mut r = 2.0 * (-e_diff).exp2();
+            // C: `r = 2.f*celt_exp2(-Ediff)`, then `r *= 1.41421356f` for LM 3.
+            let mut r = 2.0 * celt_exp2(-e_diff);
             if lm == 3 {
                 r *= core::f32::consts::SQRT_2;
             }
@@ -3409,15 +3488,11 @@ mod tests {
     /// stereo_merge with one indexed loop per step, as libopus writes it
     /// (celt/bands.c, stereo_merge, with the scalar inner products).
     fn stereo_merge_reference(x: &mut [f32], y: &mut [f32], mid: f32, n: usize) {
-        let mut xp = 0.0f32;
-        let mut side_e = 0.0f32;
-        for i in 0..n {
-            xp += y[i] * x[i];
-            side_e += y[i] * y[i];
-        }
-        xp *= mid;
-        let el = mid * mid + side_e - 2.0 * xp;
-        let er = mid * mid + side_e + 2.0 * xp;
+        let xp = mid * inner_prod_model(&y[..n], &x[..n]);
+        let side_e = inner_prod_model(&y[..n], &y[..n]);
+        let t = mac_model(side_e, mid, mid);
+        let el = t - 2.0 * xp;
+        let er = t + 2.0 * xp;
         if er < 6e-4f32 || el < 6e-4f32 {
             y[..n].copy_from_slice(&x[..n]);
             return;
@@ -3490,90 +3565,95 @@ mod tests {
         (0..=41).chain([63, 64, 65, 88, 127, 176])
     }
 
-    /// Scalar model of a NEON sum of squares: four lanes, each updated with
-    /// a fused multiply-add, over the complete groups of four of `values`.
-    fn fused_lanes(values: &[f32]) -> [f32; 4] {
-        let mut lanes = [0.0f32; 4];
-        for group in values.chunks_exact(4) {
-            for k in 0..4 {
-                lanes[k] = group[k].mul_add(group[k], lanes[k]);
-            }
-        }
-        lanes
-    }
-
-    /// Scalar model of `vaddvq_f32`: the lanes are added in pairs.
-    fn add_lanes(lanes: [f32; 4]) -> f32 {
-        (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
-    }
-
-    /// Scalar model of `stereo_itheta_neon`.
-    #[cfg(target_arch = "aarch64")]
-    fn stereo_itheta_model(x: &[f32], y: &[f32], stereo: bool) -> i32 {
-        let n = x.len();
-        let (a, b): (Vec<f32>, Vec<f32>) = if stereo {
-            (0..n).map(|i| (x[i] + y[i], x[i] - y[i])).unzip()
+    /// `acc + a * b` as `mac` rounds it: fused on aarch64 only.
+    fn mac_model(acc: f32, a: f32, b: f32) -> f32 {
+        if cfg!(target_arch = "aarch64") {
+            a.mul_add(b, acc)
         } else {
-            (x.to_vec(), y.to_vec())
-        };
-        let mut emid = 1e-15f32 + add_lanes(fused_lanes(&a));
-        let mut eside = 1e-15f32 + add_lanes(fused_lanes(&b));
-        for i in (n & !3)..n {
-            emid += a[i] * a[i];
-            eside += b[i] * b[i];
+            acc + a * b
         }
-        itheta_from_energies(emid, eside)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    /// Scalar model of `celt_inner_prod`. On aarch64: four lanes over the
+    /// complete groups of four, lanes added as (0 + 2) + (1 + 3), then the
+    /// rest one value at a time. Elsewhere one value at a time from 0.
+    fn inner_prod_model(x: &[f32], y: &[f32]) -> f32 {
+        let n = x.len();
+        if !cfg!(target_arch = "aarch64") {
+            return (0..n).fold(0.0, |acc, i| mac_model(acc, x[i], y[i]));
+        }
+        let mut lanes = [0.0f32; 4];
+        for i in 0..(n & !3) {
+            lanes[i % 4] = mac_model(lanes[i % 4], x[i], y[i]);
+        }
+        let mut sum = (lanes[0] + lanes[2]) + (lanes[1] + lanes[3]);
+        for i in (n & !3)..n {
+            sum = mac_model(sum, x[i], y[i]);
+        }
+        sum
+    }
+
     #[test]
-    fn stereo_itheta_neon_matches_its_scalar_model() {
-        let mut seed = 0x17e7_a001u32;
+    fn celt_inner_prod_matches_its_scalar_model() {
+        let mut seed = 0x17e7_a003u32;
         for n in kernel_lengths() {
             for extremes in [false, true] {
-                for stereo in [false, true] {
-                    for round in 0..8 {
-                        let x = test_values(n, &mut seed, extremes);
-                        let mut y = test_values(n, &mut seed, extremes);
-                        // Some rounds with a much weaker second signal, so
-                        // that small and large angles are both covered.
-                        if round % 2 == 1 {
-                            y.iter_mut().for_each(|v| *v *= 1.0e-3);
-                        }
-                        let want = stereo_itheta_model(&x, &y, stereo);
-                        let what = format!("n {n} stereo {stereo} extremes {extremes}");
-                        assert_eq!(stereo_itheta_neon(&x, &y, stereo), want, "{what}");
-                        assert_eq!(stereo_itheta(&x, &y, stereo, n), want, "{what}");
-                        if !extremes {
-                            assert!((0..=16384).contains(&want), "{what}: angle {want}");
-                        }
+                let x = test_values(n, &mut seed, extremes);
+                let y = test_values(n + 3, &mut seed, extremes);
+                let got = celt_inner_prod(&x, &y);
+                let want = inner_prod_model(&x, &y[..n]);
+                assert_same_bits(&[got], &[want], &format!("n {n} extremes {extremes}"));
+            }
+        }
+    }
+
+    /// The energies of `stereo_itheta` as the model sums them.
+    fn itheta_energies_model(x: &[f32], y: &[f32], stereo: bool) -> (f32, f32) {
+        if stereo {
+            let (mut emid, mut eside) = (0.0f32, 0.0f32);
+            for i in 0..x.len() {
+                let (m, s) = (x[i] + y[i], x[i] - y[i]);
+                emid = mac_model(emid, m, m);
+                eside = mac_model(eside, s, s);
+            }
+            (emid, eside)
+        } else {
+            (inner_prod_model(x, x), inner_prod_model(y, y))
+        }
+    }
+
+    #[test]
+    fn stereo_itheta_sums_as_libopus_does() {
+        let mut seed = 0x17e7_a001u32;
+        for n in kernel_lengths() {
+            for stereo in [false, true] {
+                for round in 0..8 {
+                    let x = test_values(n, &mut seed, false);
+                    let mut y = test_values(n, &mut seed, false);
+                    // Some rounds with a much weaker second signal, so that
+                    // small and large angles are both covered.
+                    if round % 2 == 1 {
+                        y.iter_mut().for_each(|v| *v *= 1.0e-3);
                     }
+                    let (emid, eside) = itheta_energies_model(&x, &y, stereo);
+                    let want =
+                        (0.5 + 1_073_741_824.0 * celt_atan2p_norm(eside.sqrt(), emid.sqrt())) as i32;
+                    let got = stereo_itheta(&x, &y, stereo, n);
+                    assert_eq!(got, want, "n {n} stereo {stereo} round {round}");
+                    assert!((0..=1 << 30).contains(&got), "n {n}: angle {got}");
                 }
             }
         }
     }
 
+    /// Two silent halves give the angle 0, as in libopus 1.6, whose sums
+    /// start at 0. A start at 1e-15 gave two equal energies, a quarter turn
+    /// halved: 8192 in Q14.
     #[test]
-    fn stereo_itheta_scalar_matches_indexed_loop() {
-        let mut seed = 0x17e7_a002u32;
-        for n in kernel_lengths() {
-            for stereo in [false, true] {
-                let x = test_values(n, &mut seed, false);
-                let y = test_values(n, &mut seed, false);
-                let mut emid = 1e-15f32;
-                let mut eside = 1e-15f32;
-                for i in 0..n {
-                    let (m, s) = if stereo { (x[i] + y[i], x[i] - y[i]) } else { (x[i], y[i]) };
-                    emid += m * m;
-                    eside += s * s;
-                }
-                let want = itheta_from_energies(emid, eside);
-                assert_eq!(stereo_itheta_scalar(&x, &y, stereo), want, "n {n} stereo {stereo}");
-                // The vector kernel may round the sums differently. One
-                // step of the angle is the most that can change.
-                let other = stereo_itheta(&x, &y, stereo, n);
-                assert!((other - want).abs() <= 1, "n {n} stereo {stereo}: {other} and {want}");
-            }
+    fn silent_halves_have_the_angle_zero() {
+        let zeros = [0.0f32; 24];
+        for stereo in [false, true] {
+            assert_eq!(stereo_itheta(&zeros, &zeros, stereo, 24), 0);
         }
     }
 
@@ -3585,56 +3665,37 @@ mod tests {
         stereo_itheta(&x, &y, true, 16);
     }
 
-    /// Scalar model of `compute_band_energy_neon`.
-    #[cfg(target_arch = "aarch64")]
-    fn band_energy_model(band: &[f32]) -> f32 {
-        let n = band.len();
-        let n16 = n & !15;
-        let n4 = n & !3;
-        let mut sum = 1e-27f32;
-        if n16 > 0 {
-            // Four accumulators: values 0..4 of each group of 16 go to the
-            // first, values 4..8 to the second, and so on.
-            let mut acc = [[0.0f32; 4]; 4];
-            for group in band[..n16].chunks_exact(16) {
-                for a in 0..4 {
-                    for k in 0..4 {
-                        let v = group[4 * a + k];
-                        acc[a][k] = v.mul_add(v, acc[a][k]);
+    #[test]
+    fn band_energies_add_the_offset_after_the_sum() {
+        let mode = crate::modes::default_mode();
+        let mut seed = 0xe4e2_0001u32;
+        for lm in 0..=3usize {
+            for extremes in [false, true] {
+                let n = mode.short_mdct_size << lm;
+                let x = test_values(2 * n, &mut seed, extremes);
+                let mut band_e = vec![0.0f32; 2 * mode.nb_ebands];
+                compute_band_energies(mode, &x, &mut band_e, mode.nb_ebands, 2, lm);
+                for c in 0..2 {
+                    for i in 0..mode.nb_ebands {
+                        let lo = c * n + ((mode.e_bands[i] as usize) << lm);
+                        let hi = c * n + ((mode.e_bands[i + 1] as usize) << lm);
+                        let band = &x[lo..hi];
+                        if cfg!(target_arch = "x86_64") && band.len() >= 8 {
+                            continue;
+                        }
+                        let want = (1e-27f32 + inner_prod_model(band, band)).sqrt();
+                        let got = band_e[c * mode.nb_ebands + i];
+                        assert_same_bits(&[got], &[want], &format!("lm {lm} band {i}"));
                     }
                 }
             }
-            let mut lanes = [0.0f32; 4];
-            for k in 0..4 {
-                lanes[k] = (acc[0][k] + acc[1][k]) + (acc[2][k] + acc[3][k]);
-            }
-            sum += add_lanes(lanes);
-        }
-        if n4 > n16 {
-            sum += add_lanes(fused_lanes(&band[n16..n4]));
-        }
-        for &v in &band[n4..] {
-            sum += v * v;
-        }
-        sum.sqrt()
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn compute_band_energy_neon_matches_its_scalar_model() {
-        let mut seed = 0xe4e2_0001u32;
-        for n in kernel_lengths() {
-            for extremes in [false, true] {
-                let band = test_values(n, &mut seed, extremes);
-                let got = compute_band_energy_neon(&band);
-                let want = band_energy_model(&band);
-                assert_same_bits(&[got], &[want], &format!("n {n} extremes {extremes}"));
-            }
         }
     }
 
+    /// `renormalise_vector` sums as `celt_inner_prod` does, adds the offset
+    /// after the sum and scales by `(1 / sqrt(E)) * gain`, as libopus.
     #[test]
-    fn renormalise_vector_kernels_match_their_models() {
+    fn renormalise_vector_matches_its_model() {
         let mut seed = 0x4e04_0001u32;
         for n in kernel_lengths() {
             for extremes in [false, true] {
@@ -3642,37 +3703,18 @@ mod tests {
                     // Two values more than `n`: they must stay unchanged.
                     let input = test_values(n + 2, &mut seed, extremes);
                     let what = format!("n {n} extremes {extremes} gain {gain}");
-
-                    // Portable kernel against the indexed loop.
                     let mut want = input.clone();
-                    let mut e = 1e-15f32;
-                    for i in 0..n {
-                        e += want[i] * want[i];
-                    }
-                    let norm = gain / e.sqrt();
-                    for i in 0..n {
-                        want[i] *= norm;
+                    let e = 1e-15f32 + inner_prod_model(&want[..n], &want[..n]);
+                    let g = (1.0 / e.sqrt()) * gain;
+                    for v in want[..n].iter_mut() {
+                        *v *= g;
                     }
                     let mut got = input.clone();
-                    renormalise_vector_scalar(&mut got[..n], gain);
-                    assert_same_bits(&got, &want, &format!("scalar, {what}"));
-
-                    // NEON kernel against the model of its summation order.
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let mut want = input.clone();
-                        let mut e = 1e-15f32 + add_lanes(fused_lanes(&want[..n]));
-                        for i in (n & !3)..n {
-                            e += want[i] * want[i];
-                        }
-                        let norm = gain / e.sqrt();
-                        for i in 0..n {
-                            want[i] *= norm;
-                        }
-                        let mut got = input.clone();
-                        renormalise_vector(&mut got, n, gain);
-                        assert_same_bits(&got, &want, &format!("neon, {what}"));
+                    renormalise_vector(&mut got, n, gain);
+                    if cfg!(target_arch = "x86_64") && n >= 16 {
+                        continue;
                     }
+                    assert_same_bits(&got, &want, &what);
                 }
             }
         }

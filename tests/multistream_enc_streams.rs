@@ -226,7 +226,10 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                     MappingType::Surround => {
                         single.set_bandwidth(surround_bandwidth(bitrate, channels, frame_size, fs));
                         if s < enc.layout().coupled_streams() {
+                            // CELT-only and two coded channels
+                            // (opus_multistream_encoder.c:953-958).
                             single.set_force_mode(Some(ForcedMode::CeltOnly));
+                            single.set_force_channels(Some(2)).unwrap();
                         }
                         // Every stream, the LFE stream too, gets the mask
                         // of its own channels.

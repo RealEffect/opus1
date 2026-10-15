@@ -684,11 +684,6 @@ fn lfe_wins_over_application_mode_bandwidth_and_fec_like_libopus() {
                             );
                             let mut c_enc = CEncoder::new(rate, channels, c_app);
                             c_enc.lfe(true).bitrate(bitrate).vbr(!cbr).complexity(complexity).fec(fec, 10).bandwidth(BW_FB);
-                            if channels == 2 {
-                                // libopus would also choose between mono
-                                // and stereo packets.
-                                c_enc.force_channels(2);
-                            }
                             let mut enc = OpusEncoder::new(rate as i32, channels, app).unwrap();
                             enc.set_lfe(true);
                             enc.bitrate_bps = bitrate;

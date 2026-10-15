@@ -377,16 +377,17 @@ fn sixteen_bit_extremes() {
 /// The fault behind the second exclusion of `has_stream_with_a_known_fault`,
 /// shown on a plain `OpusEncoder` without any multistream code.
 ///
-/// A SILK-only mediumband stream with 10 ms frames is fine when it starts
-/// that way. After a frame of another duration or another mode, the encoder
-/// reports a final range the C decoder does not reach: the two disagree on
-/// the bits of the packet. Two sequences that show it:
+/// A SILK-only mediumband stream with 10 ms frames after a frame of another
+/// duration or another mode: every packet has the final range of the C
+/// decoder. The encoder once reported a final range the C decoder did not
+/// reach in two sequences:
 ///
 /// - 12 kHz input: one 40 ms frame, then 10 ms frames.
 /// - 16 kHz input: one 40 ms frame, one 2.5 ms frame (CELT), then 10 ms
 ///   frames with the bandwidth set to mediumband.
+///
+/// Both pass already at the tip of integ6 (4726c16).
 #[test]
-#[ignore = "single-stream encoder: SILK mediumband 10 ms packets after a change of frame duration or mode have a final range the C decoder does not reach (src/lib.rs or src/silk)"]
 fn silk_mediumband_10_ms_after_a_change_has_the_decoders_final_range() {
     let mut differ = Vec::new();
     for (fs, celt_frame) in [(12_000, false), (16_000, true)] {

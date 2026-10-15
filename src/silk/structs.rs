@@ -10,9 +10,11 @@ use crate::silk::define::*;
 /// panicked in `FixedVec::resize`.
 const SILK_SIDE_MAX: usize = 3 * MAX_FRAME_LENGTH;
 
-/// Stereo encoder state: libopus `stereo_enc_state` plus
-/// `silk_encoder.prev_decode_only_middle`. It lives on the mid channel's
-/// [`SilkEncoderState`]; a mono encoder uses only `s_mid`.
+/// Stereo encoder state: libopus `stereo_enc_state` plus the fields of the
+/// packet-level `silk_encoder` that say how many channels are coded
+/// (`prev_decode_only_middle`, `nChannelsInternal`, `nPrevChannelsInternal`).
+/// It lives on the mid channel's [`SilkEncoderState`]; an encoder that only
+/// ever codes one channel uses `s_mid` and the channel counts.
 #[derive(Clone)]
 pub struct SilkStereoState {
     /// Last two mid (or mono) samples of the previous frame.
@@ -44,6 +46,12 @@ pub struct SilkStereoState {
     pub mid_only_flags: [i8; MAX_FRAMES_PER_PACKET],
     /// Whether the previous frame coded the mid only.
     pub prev_decode_only_middle: i32,
+    /// libopus `silk_encoder.nChannelsInternal`: the number of channels the
+    /// last packet coded, 1 before the first packet.
+    pub n_channels_internal: i32,
+    /// libopus `silk_encoder.nPrevChannelsInternal`: the same, but 0 before
+    /// the first packet.
+    pub n_prev_channels_internal: i32,
 }
 
 impl Default for SilkStereoState {
@@ -64,6 +72,8 @@ impl Default for SilkStereoState {
             pred_ix: [[[0; 3]; 2]; MAX_FRAMES_PER_PACKET],
             mid_only_flags: [0; MAX_FRAMES_PER_PACKET],
             prev_decode_only_middle: 0,
+            n_channels_internal: 1,
+            n_prev_channels_internal: 0,
         }
     }
 }

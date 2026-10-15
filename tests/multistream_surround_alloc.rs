@@ -4,6 +4,8 @@
 //! the test program with one that counts, and looks at the count around the
 //! calls of `run`. The count is kept per thread, so tests that run at the
 //! same time do not disturb each other.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 

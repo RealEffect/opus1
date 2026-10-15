@@ -16,6 +16,8 @@
 //!
 //! The last test prints the cost of the analysis for several layouts, rates
 //! and frame sizes.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 

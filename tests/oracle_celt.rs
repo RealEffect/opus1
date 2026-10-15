@@ -93,10 +93,10 @@ fn equal_bytes(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
 /// the packet the linked libopus writes for the same input.
 ///
 /// On aarch64 libopus has no kernels of its own for the pulse search, so
-/// there is one right answer. opus-rs does not reach it yet.
+/// there is one right answer. opus-rs reaches it: all 160 bytes are equal
+/// at the tip of integ6 (4726c16). When the test was ignored, 132 were.
 #[test]
 #[cfg(target_arch = "aarch64")]
-#[ignore = "the 48 kHz sine packet equals libopus 1.6.1 in 132 of 160 bytes (124 before the pulse search of libopus); the first difference is at byte 16, cause not located"]
 fn sine_48k_mono_64k_is_the_packet_of_libopus() {
     let (rs, c) = first_packets(&make_sine(48000, 1, 960, 440.0));
     let (equal, first) = equal_bytes(&rs, &c);

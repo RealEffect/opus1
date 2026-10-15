@@ -365,15 +365,20 @@ fn ambisonics_streams_are_celt() {
                         for (s, (part, c_part)) in parts.iter().zip(&c_parts).enumerate() {
                             let (t, ct) = (toc(part.toc), toc(c_part.toc));
                             assert_eq!(t.mode, Mode::Celt, "{label}: stream {s} is {t}");
-                            assert_eq!(t.stereo, s < c.coupled, "{label}: stream {s} is {t}");
+                            if s >= c.coupled {
+                                assert!(!t.stereo, "{label}: stream {s} is {t}");
+                            }
+                            // libopus forces no channel count on an
+                            // ambisonics stream (opus_multistream_encoder.c
+                            // 960-962), so both encoders can code the
+                            // coupled stream as mono at a low bitrate.
+                            assert_eq!(t.stereo, ct.stereo, "{label}: stream {s}: {t} against C {ct}");
                             assert_eq!(part.samples(fs), frame_size, "{label}: stream {s}");
                             if c_part.payload_len == 0 {
                                 continue;
                             }
                             // The bandwidth is each stream encoder's own
-                            // choice here, so it is not compared. libopus
-                            // can also code the stereo stream as mono at a
-                            // low bitrate; opus-rs codes it as stereo.
+                            // choice here, so it is not compared.
                             assert_eq!(ct.mode, Mode::Celt, "{label}: C stream {s} is {ct}");
                         }
                     }

@@ -379,8 +379,14 @@ fn the_layouts_of_the_matrix_have_the_mapping_types_of_libopus() {
 /// Shown on four CELT-only mono streams (family 2) at 24 kHz with 2.5 ms
 /// frames and 32 kb/s per channel. Measured without the noise: libopus
 /// codes narrowband in 964 of 1280 stream packets where opus-rs codes
-/// wideband, and opus-rs is 8.6 dB below libopus on average. With the
-/// noise: the same bandwidth in every packet, and opus-rs is 0.2 dB above.
+/// wideband, and opus-rs is 3.4 dB below libopus on average (8.6 dB when
+/// this test was written; opus-rs has improved since). With the noise: the
+/// same bandwidth in every packet, and opus-rs is 0.8 dB above.
+///
+/// The bound on the gap without the noise is relative to the gap with it,
+/// where both code the same bandwidth: the narrower bandwidth gains libopus
+/// at least 2 dB against opus-rs (measured 4.2 dB). A fixed bound on the gap
+/// itself held opus-rs to being far behind.
 #[test]
 fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
     let fs = 24_000;
@@ -409,7 +415,6 @@ fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
         gap(&without)
     );
     assert!(2 * without.structure.bandwidth > without.structure.compared);
-    assert!(gap(&without) < -5.0);
 
     let with = measure_signal(setting, &program(fs, &case, samples));
     println!(
@@ -420,28 +425,32 @@ fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
     );
     assert_eq!(with.structure.bandwidth, 0);
     assert!(gap(&with).abs() < 2.0);
+    assert!(
+        gap(&without) < gap(&with) - 2.0,
+        "the narrower bandwidth gains libopus {:.1} dB",
+        gap(&with) - gap(&without)
+    );
 }
 
-/// Where a single CELT stream of opus-rs is furthest behind libopus: mono,
-/// 48 kHz, 2.5 ms frames, 32 kb/s. Mode, bandwidth and packet sizes are
-/// those of libopus; the difference is inside the CELT encoder.
+/// A single CELT stream of opus-rs against libopus where it was furthest
+/// behind: mono, 48 kHz, 2.5 ms frames, 32 kb/s. Mode, bandwidth and packet
+/// sizes are those of libopus.
 ///
 /// It is not the multistream layer: the layout is one mono stream.
 ///
-/// The gap comes with the pitch pre-filter of the CELT encoder, which both
-/// encoders use from complexity 5 on and opus-rs only for mono. Measured,
-/// opus-rs / libopus:
+/// Both encoders use the pitch pre-filter of CELT from complexity 5 on.
+/// When this test was written opus-rs was 0.5 dB behind libopus at
+/// complexity 4 and 8 dB behind with the pre-filter (11.5 / 19.3 dB); it was
+/// then ignored because a merge left 17.8 dB at complexity 4. Measured now,
+/// on the integration branch as on this one, opus-rs / libopus:
 ///
-/// - complexity 4, no pre-filter: 19.9 / 20.4 dB;
-/// - complexity 5: 11.5 / 19.3 dB;
-/// - complexity 9: 11.5 / 19.1 dB.
+/// - complexity 4, no pre-filter: 20.4 / 20.4 dB;
+/// - complexity 5: 19.3 / 19.3 dB;
+/// - complexity 9: 19.3 / 19.1 dB.
 ///
-/// So the pre-filter costs libopus 1 dB of SNR on this signal and opus-rs
-/// 8 dB. The test holds the state without the pre-filter to 2 dB of
-/// libopus, and keeps the state with it from getting worse.
+/// The test holds all three to 0.5 dB of libopus.
 #[test]
-#[ignore = "after the fidelity merge: mono 2.5 ms at complexity 4 gives 17.8 dB where libopus gives 20.4 dB (19.9 before the merge); to be bisected"]
-fn the_largest_gap_of_one_stream_comes_with_the_pre_filter_at_2_5_ms() {
+fn mono_2_5_ms_frames_reach_libopus_with_and_without_the_pre_filter() {
     let fs = 48_000;
     let case = LAYOUTS[0];
     let setting = Setting {
@@ -453,7 +462,7 @@ fn the_largest_gap_of_one_stream_comes_with_the_pre_filter_at_2_5_ms() {
         bitrate: 32_000,
         complexity: 9,
     };
-    for (complexity, limit) in [(4, -2.0), (5, -10.5), (9, -10.5)] {
+    for (complexity, limit) in [(4, -0.5), (5, -0.5), (9, -0.5)] {
         let m = measure(Setting { complexity, ..setting }, 2.0);
         let (rust, c) = (m.channels[0].snr[RUST_TO_C], m.channels[0].snr[C_TO_C]);
         println!(

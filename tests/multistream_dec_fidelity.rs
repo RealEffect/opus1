@@ -15,6 +15,8 @@
 //! decoder of opus-rs does not decode such a packet into two channels yet.
 //! The cases with such packets are in tests of their own, which are ignored
 //! until it does.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 mod multistream_dec_common;

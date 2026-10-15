@@ -19,6 +19,20 @@ const fn fix_const_q16(c: f64) -> i32 {
 }
 
 pub fn silk_setup_fs(ps_enc: &mut SilkEncoderState, fs_khz: i32, packet_size_ms: i32) -> i32 {
+    // Set the internal sampling rate and the packet size. Port of
+    // `silk_setup_fs` (control_codec.c:197-298).
+    //
+    // libopus reports a packet size other than 10, 20, 40 or 60 ms
+    // (control_codec.c:207-213) and asserts that the rate is 8, 12 or 16 kHz
+    // (control_codec.c:249). Here both return the error code and leave the
+    // encoder as it was. A frame of one subframe, or one longer than
+    // `MAX_FRAME_LENGTH`, would make the frame encoder index out of bounds.
+    if fs_khz != 8 && fs_khz != 12 && fs_khz != 16 {
+        return SILK_ENC_FS_NOT_SUPPORTED;
+    }
+    if !matches!(packet_size_ms, 10 | 20 | 40 | 60) {
+        return SILK_ENC_PACKET_SIZE_NOT_SUPPORTED;
+    }
     let cmn = &mut ps_enc.s_cmn;
 
     if packet_size_ms <= 10 {
@@ -35,8 +49,17 @@ pub fn silk_setup_fs(ps_enc: &mut SilkEncoderState, fs_khz: i32, packet_size_ms:
     cmn.packet_size_ms = packet_size_ms;
 
     if cmn.fs_khz != fs_khz {
+        // control_codec.c:254-262, "reset part of the state": the noise
+        // shaping smoothers, the quantizer, the previous NLSFs and the
+        // state of the input low-pass filter belong to the old rate.
+        ps_enc.s_shape = SilkShapeState::default();
         ps_enc.s_nsq = SilkNSQState::default();
         cmn.prev_nlsf_q15 = [0; MAX_LPC_ORDER];
+        cmn.s_lp.in_lp_state = [0; 2];
+        cmn.input_buf_ix = 0;
+        cmn.n_frames_encoded = 0;
+        // "trigger new SNR computation"
+        cmn.target_rate_bps = 0;
 
         cmn.prev_lag = 100;
         cmn.first_frame_after_reset = 1;
@@ -171,6 +194,10 @@ pub fn silk_control_encoder(
     complexity: i32,
 ) -> i32 {
     let mut ret = silk_setup_fs(ps_enc, fs_khz, packet_size_ms);
+    if ret != SILK_NO_ERROR {
+        // Nothing was set up: the encoder keeps its settings.
+        return ret;
+    }
     ret += silk_setup_complexity(ps_enc, complexity);
 
     ps_enc.s_cmn.target_rate_bps = target_rate_bps;
@@ -202,4 +229,141 @@ pub fn silk_setup_lbrr(ps_enc: &mut SilkEncoderState, lbrr_coded: i32) -> i32 {
     }
 
     SILK_NO_ERROR
+}
+
+/// libopus `SILK_ENC_FS_NOT_SUPPORTED` (silk/errors.h).
+pub const SILK_ENC_FS_NOT_SUPPORTED: i32 = -102;
+/// libopus `SILK_ENC_PACKET_SIZE_NOT_SUPPORTED` (silk/errors.h).
+pub const SILK_ENC_PACKET_SIZE_NOT_SUPPORTED: i32 = -103;
+
+/// What `silk_control_audio_bandwidth` reads from and writes to libopus's
+/// `silk_EncControlStruct` and the encoder state for one packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SilkBandwidthControl {
+    /// Sampling rate of the input (`API_sampleRate`), in Hz.
+    pub api_fs_hz: i32,
+    /// Highest internal rate allowed (`maxInternalSampleRate`), in Hz.
+    pub max_internal_fs_hz: i32,
+    /// Lowest internal rate allowed (`minInternalSampleRate`), in Hz.
+    pub min_internal_fs_hz: i32,
+    /// Internal rate asked for (`desiredInternalSampleRate`), in Hz.
+    pub desired_internal_fs_hz: i32,
+    /// Packet duration (`payloadSize_ms`).
+    pub payload_size_ms: i32,
+    /// SILK allows a switch: its speech activity is low
+    /// (`allow_bandwidth_switch`).
+    pub allow_bandwidth_switch: bool,
+    /// The caller can switch on this packet (`opusCanSwitch`).
+    pub opus_can_switch: bool,
+    /// In and out: the most bits SILK may use for the packet (`maxBits`).
+    /// Each channel that reports that it is ready takes room for the
+    /// redundant frame of the switch out of it.
+    pub max_bits: i32,
+    /// Out: SILK is ready to switch on the next packet (`switchReady`). The
+    /// caller clears it before the first channel of a packet.
+    pub switch_ready: bool,
+}
+
+/// "Make room for redundancy" (control_audio_bandwidth.c:88, 116): the share
+/// of the packet that the 5 ms redundant frame of the switch takes,
+/// `maxBits -= maxBits * 5 / ( payloadSize_ms + 5 )`.
+///
+/// A packet duration below zero, which libopus refuses before it gets here,
+/// reduces nothing. The product is taken in 64 bits, so no `max_bits`
+/// overflows it.
+fn make_room_for_redundancy(ctl: &mut SilkBandwidthControl) {
+    if ctl.payload_size_ms >= 0 {
+        let share = ctl.max_bits as i64 * 5 / (ctl.payload_size_ms as i64 + 5);
+        ctl.max_bits -= share as i32;
+    }
+}
+
+/// The internal sampling rate, in kHz, that one channel's state machine
+/// picks for the packet. Port of `silk_control_audio_bandwidth`
+/// (silk/control_audio_bandwidth.c:36-132).
+///
+/// libopus runs it for every coded channel (silk_control_encoder,
+/// control_codec.c:101), each with its own low-pass state. The side
+/// channel's rate is then forced to the mid's, but what the call does to
+/// `ctl` stays: in a stereo packet both channels can report that they are
+/// ready, and then `max_bits` is reduced twice.
+pub fn silk_control_audio_bandwidth(
+    ps_enc_c: &mut SilkEncoderStateCommon,
+    ctl: &mut SilkBandwidthControl,
+) -> i32 {
+    let mut orig_khz = ps_enc_c.fs_khz;
+    // "Handle a bandwidth-switching reset where we need to be aware what
+    // the last sampling rate was."
+    if orig_khz == 0 {
+        orig_khz = ps_enc_c.s_lp.saved_fs_khz;
+    }
+    let mut fs_khz = orig_khz;
+    // `silk_SMULBB( fs_kHz, 1000 )`. Saturating, for a rate that is not one
+    // of SILK's: it then counts as out of range below.
+    let mut fs_hz = fs_khz.saturating_mul(1000);
+    let orig_hz = fs_hz;
+    let lp = &mut ps_enc_c.s_lp;
+    if fs_hz == 0 {
+        // "Encoder has just been initialized"
+        fs_hz = ctl.desired_internal_fs_hz.min(ctl.api_fs_hz);
+        fs_khz = fs_hz / 1000;
+    } else if fs_hz > ctl.api_fs_hz
+        || fs_hz > ctl.max_internal_fs_hz
+        || fs_hz < ctl.min_internal_fs_hz
+    {
+        // "Make sure internal rate is not higher than external rate or
+        // maximum allowed, or lower than minimum allowed"
+        fs_hz = ctl.api_fs_hz;
+        fs_hz = fs_hz.min(ctl.max_internal_fs_hz);
+        fs_hz = fs_hz.max(ctl.min_internal_fs_hz);
+        fs_khz = fs_hz / 1000;
+    } else {
+        // "State machine for the internal sampling rate switching"
+        if lp.transition_frame_no >= TRANSITION_FRAMES {
+            // "Stop transition phase"
+            lp.mode = 0;
+        }
+        if ctl.allow_bandwidth_switch || ctl.opus_can_switch {
+            if orig_hz > ctl.desired_internal_fs_hz {
+                // "Switch down"
+                if lp.mode == 0 {
+                    // "New transition", "Reset transition filter state"
+                    lp.transition_frame_no = TRANSITION_FRAMES;
+                    lp.in_lp_state = [0; 2];
+                }
+                if ctl.opus_can_switch {
+                    // "Stop transition phase", "Switch to a lower sample
+                    // frequency"
+                    lp.mode = 0;
+                    fs_khz = if orig_khz == 16 { 12 } else { 8 };
+                } else if lp.transition_frame_no <= 0 {
+                    ctl.switch_ready = true;
+                    make_room_for_redundancy(ctl);
+                } else {
+                    // "Direction: down (at double speed)"
+                    lp.mode = -2;
+                }
+            } else if orig_hz < ctl.desired_internal_fs_hz {
+                // "Switch up"
+                if ctl.opus_can_switch {
+                    // "Switch to a higher sample frequency"
+                    fs_khz = if orig_khz == 8 { 12 } else { 16 };
+                    // "New transition", "Reset transition filter state",
+                    // "Direction: up"
+                    lp.transition_frame_no = 0;
+                    lp.in_lp_state = [0; 2];
+                    lp.mode = 1;
+                } else if lp.mode == 0 {
+                    ctl.switch_ready = true;
+                    make_room_for_redundancy(ctl);
+                } else {
+                    // "Direction: up"
+                    lp.mode = 1;
+                }
+            } else if lp.mode < 0 {
+                lp.mode = 1;
+            }
+        }
+    }
+    fs_khz
 }

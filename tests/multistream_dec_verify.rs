@@ -25,6 +25,8 @@
 //! One finding is written into `changing_frame_sizes_and_bitrates_match_libopus`:
 //! a stream without lost packets can still run the CELT loss concealment,
 //! which is not sample-exact with libopus.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 mod multistream_dec_common;

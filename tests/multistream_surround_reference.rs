@@ -12,6 +12,8 @@
 //!
 //! The analysis under test works in `f32` with the fast MDCT of the codec.
 //! The two must agree within rounding.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 // The reference keeps the constants and the loops of the C source as they
 // are written there.

@@ -1024,6 +1024,8 @@ mod stage3_table_tests {
 
 #[cfg(test)]
 mod div_tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::silk_div32_varq_batch;
     use crate::silk::macros::silk_div32_varq;
 

@@ -1,8 +1,10 @@
 //! Encoder behaviour that differed from libopus and that the LFE tests ran
 //! into. Every test here states what libopus does. All three failed, and
 //! were ignored, until the pulse search in src/pvq.rs became a port of
-//! `op_pvq_search_c` for 2 to 4 pulses and for bands of two values. They
-//! pass now and stay as guards. Run them with
+//! `op_pvq_search_c` for 2 to 4 pulses and for bands of two values. Two
+//! pass and stay as guards; `lfe_tone_packets_are_the_ones_libopus_writes`
+//! is ignored again, for a difference of the pitch pre-filter (see there).
+//! Run them with
 //! `cargo test --release --test celtenc_known_gaps -- --nocapture`
 //! to see the measured numbers.
 
@@ -168,9 +170,19 @@ fn lfe_quality_matches_libopus_in_packets_of_11_to_13_bytes() {
 
 /// On a steady tone the LFE packets of opus-rs are the ones libopus writes.
 ///
-/// Measured on a 50 Hz tone in 40-byte packets: the frame headers (energy,
-/// post-filter, allocation) are the same in 99 of 100 frames, and 95 of
-/// 100 packets are identical.
+/// Measured on a 50 Hz tone in 40-byte packets, when this test was written:
+/// the frame headers (energy, post-filter, allocation) are the same in 99
+/// of 100 frames, and 95 of 100 packets are identical.
+///
+/// Later, frames 20 and 23 got the pitch pre-filter period 960 where
+/// libopus has 959, and 25 of 100 packets were identical. The period comes
+/// from the frequency `tone_detect` finds, which sits near the rounding
+/// boundary of the period here, so it depends on the rounding of every step
+/// before it. The disassembly of libopus 1.6.1 on 64-bit ARM shows fused
+/// multiply-adds in `dc_reject` (the encoder's input high-pass) and in
+/// `tone_lpc`, and a double-precision check and `acos` in `tone_detect`.
+/// With src/celt.rs and src/hp_cutoff.rs rounding the same way, all 100
+/// packets are identical.
 ///
 /// What this guards against: `pvq_search` used `pvq_search_n2` for a band
 /// or half band of 2 coefficients. It rounds the projection of the input
@@ -208,3 +220,4 @@ fn lfe_tone_packets_are_the_ones_libopus_writes() {
         rs.len()
     );
 }
+

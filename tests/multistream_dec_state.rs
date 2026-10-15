@@ -21,6 +21,8 @@
 //!   streams with one mono stream;
 //! - packets that no encoder wrote, built stream by stream from random
 //!   framing and random frame data.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 mod multistream_dec_common;

@@ -737,6 +737,8 @@ fn scale_output(xq: &mut [i16], s_q14: &[i32], gain_q10: i32) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::*;
     use crate::silk::init_decoder::silk_decoder_set_fs;
 

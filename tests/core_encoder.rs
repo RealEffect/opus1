@@ -392,8 +392,7 @@ fn automatic_mode_follows_the_stereo_width() {
         for (name, pcm, changes) in [("the same signal in both channels", &same, false), ("wide stereo", &wide, true), ("wide stereo after one second", &later, true)] {
             let frame = rate / 50;
             let mut c_enc = CEncoder::new(rate, 2, APP_VOIP);
-            // libopus would also choose between mono and stereo packets.
-            c_enc.bitrate(56000).complexity(5).force_channels(2);
+            c_enc.bitrate(56000).complexity(5);
             let mut enc = OpusEncoder::new(rate as i32, 2, Application::Voip).unwrap();
             enc.bitrate_bps = 56000;
             enc.complexity = 5;
@@ -447,11 +446,6 @@ fn a_small_output_buffer_lowers_the_bitrate_the_decisions_go_by() {
                             let frame = rate * frame_ms / 1000;
                             let mut c_enc = CEncoder::new(rate, channels, *c_app);
                             c_enc.bitrate(bitrate).complexity(5);
-                            if channels == 2 {
-                                // libopus would also choose between mono and
-                                // stereo packets.
-                                c_enc.force_channels(2);
-                            }
                             let mut enc = OpusEncoder::new(rate as i32, channels, *app).unwrap();
                             enc.bitrate_bps = bitrate;
                             enc.complexity = 5;

@@ -69,6 +69,8 @@ impl Outcome {
 }
 
 /// Encodes `pcm` with a new encoder and decodes every packet with C.
+/// `force_stereo` forces every coupled stream to code two channels.
+#[allow(clippy::too_many_arguments)]
 fn run_case(
     case: &Case,
     fs: i32,
@@ -76,11 +78,18 @@ fn run_case(
     frame_size: usize,
     bitrate: i32,
     vbr: bool,
+    force_stereo: bool,
     pcm: &[f32],
 ) -> Outcome {
     let mut enc = rust_encoder(case, fs, application);
     enc.set_bitrate(rust_bitrate(bitrate)).unwrap();
     enc.set_vbr(vbr);
+    if force_stereo {
+        // OPUS_SET_FORCE_CHANNELS(2) on every coupled stream encoder.
+        for s in 0..enc.layout().coupled_streams() {
+            enc.stream_encoder_mut(s).unwrap().set_force_channels(Some(2)).unwrap();
+        }
+    }
     let mut dec = c_decoder(&enc);
     let streams = enc.layout().streams();
     let label = format!(
@@ -138,7 +147,8 @@ fn run_case(
 }
 
 /// The whole matrix for one sampling rate and one bitrate mode.
-fn run_matrix(fs: i32, vbr: bool) -> Outcome {
+/// `force_stereo` forces every coupled stream to code two channels.
+fn run_matrix(fs: i32, vbr: bool, force_stereo: bool) -> Outcome {
     let mut outcome = Outcome::default();
     let mut cases = 0;
     for case in CASES {
@@ -154,6 +164,7 @@ fn run_matrix(fs: i32, vbr: bool) -> Outcome {
                     frame_size,
                     bitrate,
                     vbr,
+                    force_stereo,
                     &pcm,
                 ));
                 cases += 1;
@@ -175,7 +186,7 @@ fn run_matrix(fs: i32, vbr: bool) -> Outcome {
 }
 
 fn assert_matrix(fs: i32, vbr: bool) {
-    let outcome = run_matrix(fs, vbr);
+    let outcome = run_matrix(fs, vbr, false);
     assert!(
         outcome.failures.is_empty(),
         "{} packets failed",
@@ -213,13 +224,22 @@ fn c_decodes_every_packet_16k_cbr() {
     assert_matrix(16_000, false);
 }
 
+/// The matrix with every coupled stream forced to two channels. Left to
+/// themselves, both encoders code most stereo streams of the matrix as mono
+/// at 8 kb/s per channel, and opus-rs, which has no speech analysis, codes
+/// the higher rates as CELT. Measured on this matrix at 48 and 24 kHz,
+/// packets with a stereo Hybrid stream:
+///
+/// - 8 kb/s per channel: libopus 128, opus-rs 0; forced to two channels,
+///   libopus 310, opus-rs 220.
+/// - 24 kb/s per channel: libopus 111, opus-rs 0, forced or not.
 #[test]
 fn final_range_of_packets_with_a_stereo_hybrid_stream() {
     let mut packets = 0;
     let mut differs = 0;
     for fs in [48_000, 24_000] {
         for vbr in [true, false] {
-            let outcome = run_matrix(fs, vbr);
+            let outcome = run_matrix(fs, vbr, true);
             packets += outcome.stereo_hybrid;
             differs += outcome.stereo_hybrid_range_differs;
         }
@@ -253,6 +273,7 @@ fn c_decodes_every_packet_voip_and_low_delay() {
                         frame_size,
                         bitrate,
                         vbr,
+                        false,
                         &pcm,
                     ));
                 }
@@ -300,6 +321,7 @@ fn c_decodes_every_packet_at_low_sampling_rates_and_special_bitrates() {
                         frame_size,
                         bitrate,
                         vbr,
+                        false,
                         &pcm,
                     ));
                 }
@@ -338,6 +360,7 @@ fn c_decodes_noise_and_silence() {
                         frame_size,
                         bitrate,
                         vbr,
+                        false,
                         pcm,
                     ));
                 }

@@ -293,7 +293,15 @@ fn a_coupled_stream_is_what_a_stereo_encoder_with_its_mask_writes() {
 
 /// The control for the test above: it can tell the masks apart. Without a
 /// mask, or with the mask of another stream, the stereo encoder writes
-/// other packets.
+/// other packets in at least four of five frames.
+///
+/// Some packets stay the same: in a frame where the mask does not change the
+/// allocation, the packet does not depend on it. libopus does the same in
+/// this experiment (`libopus_also_writes_some_packets_without_the_mask`):
+/// without a mask 10 of 150 packets are the same with a variable bitrate,
+/// 25 of 150 with a constant one. opus-rs, measured: 2 and 1 of 150 with a
+/// variable bitrate (no mask, mask of another stream), 20 and 10 of 150 with
+/// a constant one. The bound was one in ten, below libopus's own figure.
 ///
 /// Exchanging the masks of the left and the right channel is not a control:
 /// CELT uses the two halves alike (celt_encoder.c:2114-2165), so the packets
@@ -306,10 +314,72 @@ fn a_coupled_stream_differs_from_a_stereo_encoder_with_another_mask() {
             let (equal, compared) = coupled_streams_equal_to_a_stereo_encoder(vbr, given);
             println!("vbr {vbr}, {given:?}: {equal} of {compared} packets are the same");
             assert!(
-                10 * equal < compared,
+                5 * equal < compared,
                 "vbr {vbr}, {given:?}: {equal} of {compared} packets are the same"
             );
         }
+    }
+}
+
+/// The figure behind the bound of the test above: the same experiment with
+/// libopus. Its 7.1 encoder codes one second; a libopus stereo encoder with
+/// the settings of the test above and no mask codes the channels of each
+/// coupled stream again. Measured: 10 of 150 packets are the same with a
+/// variable bitrate, 25 of 150 with a constant one, so fewer than one in
+/// five.
+#[test]
+fn libopus_also_writes_some_packets_without_the_mask() {
+    use audiopus_sys as sys;
+    for vbr in [true, false] {
+        let case = Case::family("7.1", 8, 1);
+        let layout = rust_encoder(&case, FS, Application::Audio).layout().clone();
+        let mut c = c_encoder(&case, FS, Application::Audio);
+        c.set_bitrate(320_000);
+        c.set_vbr(vbr);
+        let pcm = voiced(FS, 8, FS as usize);
+        let packets = c.encode_all(&pcm, FRAME);
+        let (mut equal, mut compared) = (0, 0);
+        for stream in 0..layout.coupled_streams() {
+            let left = layout.left_channel(stream, None).unwrap();
+            let right = layout.right_channel(stream, None).unwrap();
+            let rate = c.stream_bitrate(stream);
+            let mut err = 0;
+            // SAFETY: plain calls of the C API; the encoder is destroyed
+            // below, and every buffer holds what the call reads or writes.
+            let single =
+                unsafe { sys::opus_encoder_create(FS, 2, sys::OPUS_APPLICATION_AUDIO, &mut err) };
+            assert!(!single.is_null(), "opus_encoder_create: {err}");
+            unsafe {
+                sys::opus_encoder_ctl(single, sys::OPUS_SET_BITRATE_REQUEST, rate);
+                sys::opus_encoder_ctl(single, sys::OPUS_SET_VBR_REQUEST, vbr as i32);
+                sys::opus_encoder_ctl(single, OPUS_SET_FORCE_MODE_REQUEST, MODE_CELT_ONLY);
+                sys::opus_encoder_ctl(
+                    single,
+                    sys::OPUS_SET_BANDWIDTH_REQUEST,
+                    sys::OPUS_BANDWIDTH_FULLBAND,
+                );
+            }
+            let mut out = vec![0u8; 1500];
+            for (f, frame) in pcm.as_chunks::<{ FRAME * 8 }>().0.iter().enumerate() {
+                let stereo: Vec<f32> = (0..FRAME)
+                    .flat_map(|i| [frame[i * 8 + left], frame[i * 8 + right]])
+                    .collect();
+                let n = unsafe {
+                    sys::opus_encode_float(single, stereo.as_ptr(), FRAME as i32, out.as_mut_ptr(), 1500)
+                };
+                assert!(n > 0, "opus_encode_float: {n}");
+                let parts = split_streams(&packets[f], layout.streams()).unwrap();
+                equal += usize::from(parts[stream].packet == out[..n as usize]);
+                compared += 1;
+            }
+            unsafe { sys::opus_encoder_destroy(single) };
+        }
+        println!("libopus, vbr {vbr}, no mask: {equal} of {compared} packets are the same");
+        assert_eq!(compared, 150);
+        assert!(
+            5 * equal < compared,
+            "vbr {vbr}: {equal} of {compared} packets are the same"
+        );
     }
 }
 

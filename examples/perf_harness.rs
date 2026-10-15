@@ -22,12 +22,12 @@
 //! * `spread` compares several `bench --json` files.
 //!
 //! The C side is libopus, linked through `audiopus_sys`. Both encoders are
-//! forced to the coding mode and the audio bandwidth that the scenario names
-//! (`OPUS_SET_FORCE_MODE` and `OPUS_SET_BANDWIDTH`; in opus-rs
-//! `set_force_mode` and `set_bandwidth`), and the C encoder to its channel
-//! count. opus-rs always codes as many channels as it is given. Both sides
-//! then do the same kind of work. The mode-switching streams of `golden`
-//! and `modes` are the exception: there nothing is forced.
+//! forced to the coding mode, the audio bandwidth and the channel count
+//! that the scenario names (`OPUS_SET_FORCE_MODE`, `OPUS_SET_BANDWIDTH` and
+//! `OPUS_SET_FORCE_CHANNELS`; in opus-rs `set_force_mode`, `set_bandwidth`
+//! and `set_force_channels`). Both sides then do the same kind of work. The
+//! mode-switching streams of `golden` and `modes` are the exception: there
+//! only the channel count is forced.
 //!
 //! The two encoders still do not do identical work. Their packets are almost
 //! never byte-identical, and:
@@ -35,7 +35,7 @@
 //! * The C library is a float build. Its SILK encoder is the floating-point
 //!   one (`silk/float`); the SILK encoder of opus-rs is a port of the
 //!   fixed-point one.
-//! * libopus 1.6 runs three encoder steps that opus-rs does not have. They
+//! * libopus 1.6 runs two encoder steps that opus-rs does not have. They
 //!   are listed at `Scenario::c_only_steps`, and `bench` names them per
 //!   scenario in the column `only C runs`.
 //!
@@ -329,18 +329,19 @@ impl Scenario {
     /// * `stereo-angle`: for stereo CELT bands at complexity 8 and above,
     ///   libopus quantises each band twice and keeps the better stereo angle
     ///   (`theta_rdo` in `bands.c`). opus-rs keeps `theta_round` at 0.
-    /// * `stereo-prefilter`: the CELT pitch pre-filter runs in libopus for
-    ///   any channel count at complexity 5 and above, outside Hybrid
-    ///   (`run_prefilter` in `celt_encoder.c`). opus-rs runs it for mono
-    ///   only.
+    ///
+    /// The CELT pitch pre-filter on stereo input is no longer listed: opus-rs
+    /// runs `run_prefilter` for every input channel, as libopus does
+    /// (`src/celt.rs`, the `cc` channels of `in_buf`).
     ///
     /// The C encoder time of a scenario that lists a step includes that
     /// step, so its Rust/C encode ratio flatters opus-rs.
     ///
     /// The list holds the large steps only. `opus_encoder.c` also has small
-    /// per-frame steps without a counterpart in opus-rs: the stereo width
-    /// estimate, the digital silence check, the frame energy tracker and the
-    /// gain reduction of the upper band in Hybrid.
+    /// per-frame steps without a counterpart in opus-rs: the digital silence
+    /// check and the frame energy tracker, which serve discontinuous
+    /// transmission. (The stereo width estimate and the gain reduction of
+    /// the upper band in Hybrid are ported.)
     fn c_only_steps(&self) -> Vec<&'static str> {
         let mut steps = Vec::new();
         if self.complexity >= 7 && self.rate >= 16000 {
@@ -348,9 +349,6 @@ impl Scenario {
         }
         if self.channels == 2 && self.mode != Mode::Silk && self.complexity >= 8 {
             steps.push("stereo-angle");
-        }
-        if self.channels == 2 && self.mode == Mode::Celt && self.complexity >= 5 {
-            steps.push("stereo-prefilter");
         }
         steps
     }
@@ -1251,9 +1249,9 @@ impl Fnv {
 // The two codecs
 // ---------------------------------------------------------------------------
 
-/// `forced` pins the coding mode and the bandwidth to what the scenario
-/// names, as `CEncoder::new` does for libopus. Without it opus-rs decides by
-/// itself.
+/// `forced` pins the coding mode, the bandwidth and the channel count to
+/// what the scenario names, as `CEncoder::new` does for libopus. Without it
+/// opus-rs decides by itself.
 fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
     let application = match sc.app {
         App::Voip => Application::Voip,
@@ -1274,6 +1272,11 @@ fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
             Mode::Celt => ForcedMode::CeltOnly,
         }));
         encoder.set_bandwidth(sc.bandwidth().rust_value());
+        if sc.channels == 2 {
+            encoder
+                .set_force_channels(Some(2))
+                .map_err(|e| format!("set_force_channels: {e}"))?;
+        }
     }
     Ok(encoder)
 }
@@ -2386,7 +2389,7 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
     );
     let _ = writeln!(
         header,
-        "- `only C runs` lists encoder steps that libopus runs for the scenario and opus-rs does not have: `analysis` (tonality analysis), `stereo-angle` (second quantisation pass per stereo band), `stereo-prefilter` (pitch pre-filter on stereo input); the C encode time includes them, so the encode ratio of such a row flatters opus-rs"
+        "- `only C runs` lists encoder steps that libopus runs for the scenario and opus-rs does not have: `analysis` (tonality analysis), `stereo-angle` (second quantisation pass per stereo band); the C encode time includes them, so the encode ratio of such a row flatters opus-rs"
     );
     let _ = writeln!(
         header,
@@ -2818,17 +2821,18 @@ fn golden_line(sc: &Scenario, clip: &Clip) -> String {
 // A scenario keeps one mode for the whole clip. The code that handles a
 // change of mode, of bandwidth or of the SILK sample rate inside a stream is
 // therefore only reached by the streams below. Their bit rate follows
-// `SWITCH_BITRATES`, one step every 200 ms, and nothing is forced:
+// `SWITCH_BITRATES`, one step every 200 ms, and neither mode nor bandwidth
+// is forced:
 //
 // * libopus then moves between SILK, Hybrid and CELT and between the
 //   bandwidths. The Rust decoder decodes that stream.
 // * opus-rs moves between SILK or Hybrid and CELT as well. It has no
 //   speech/music detection, so it does not switch on the same packets.
 //
-// For stereo input libopus also changes between stereo and mono packets.
-// The stereo streams have the C encoder forced to stereo, except the one
-// named `..._free`, in which the Rust decoder gets mono packets in a stereo
-// stream.
+// For stereo input both encoders also change between stereo and mono
+// packets. The stereo streams have both encoders forced to stereo, except
+// the one named `..._free`, in which the Rust decoder gets mono packets in a
+// stereo stream.
 
 /// Bit rates in bits per second, one per 200 ms, repeated.
 const SWITCH_BITRATES: [i32; 10] = [
@@ -2883,8 +2887,14 @@ fn switch_bitrate(sc: &Scenario, index: usize) -> i32 {
     SWITCH_BITRATES[(index / frames_per_step) % SWITCH_BITRATES.len()]
 }
 
-fn rust_encode_switching(sc: &Scenario, clip: &Clip) -> Result<Packets, String> {
+fn rust_encode_switching(case: &SwitchCase, clip: &Clip) -> Result<Packets, String> {
+    let sc = &case.sc;
     let mut encoder = rust_encoder(sc, false)?;
+    if sc.channels == 2 && !case.free_channels {
+        encoder
+            .set_force_channels(Some(2))
+            .map_err(|e| format!("set_force_channels: {e}"))?;
+    }
     let mut out = [0u8; MAX_PACKET];
     let mut packets = Packets::default();
     for (index, frame) in clip.pcm.chunks_exact(clip.step).enumerate() {
@@ -2936,7 +2946,7 @@ fn golden_switch_line(case: &SwitchCase, clip: &Clip) -> String {
     let sc = &case.sc;
     let mut errors = 0usize;
     let count = |packets: &Result<Packets, String>| packets.as_ref().map_or("-".to_string(), switch_count);
-    let rust_packets = guarded(|| rust_encode_switching(sc, clip));
+    let rust_packets = guarded(|| rust_encode_switching(case, clip));
     let c_packets = guarded(|| c_encode_switching(case, clip));
     let fields = [
         ("enc", packets_field(&rust_packets)),
@@ -3497,7 +3507,7 @@ fn cmd_modes(opts: &Opts) -> Result<i32, String> {
 /// One table row of `modes` for a mode-switching stream, and its problems.
 fn modes_switch_row(case: &SwitchCase, clip: &Clip) -> Result<(String, Vec<String>), String> {
     let sc = &case.sc;
-    let rust_packets = rust_encode_switching(sc, clip)?;
+    let rust_packets = rust_encode_switching(case, clip)?;
     let c_packets = c_encode_switching(case, clip)?;
     let rust_on_c = rust_decode_all(sc, &c_packets, Loss::None)?;
     let c_on_c = c_decode_all(sc, &c_packets)?;

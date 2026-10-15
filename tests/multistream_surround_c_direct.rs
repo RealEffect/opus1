@@ -18,6 +18,8 @@
 //! sweeps, clicks, one source on all channels, a constant offset, gated
 //! noise, 16-bit input, a signal that fades to nothing, and channels at the
 //! energy where libopus starts to drop them.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 

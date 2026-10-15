@@ -16,6 +16,8 @@
 //! decoder has (a mono-coded packet in a stereo stream, or the reverse) is
 //! valid. libopus converts it. `OpusDecoder` rejects it for now, so the
 //! tests that feed such packets are ignored.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 mod multistream_dec_common;

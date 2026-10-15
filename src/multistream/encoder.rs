@@ -38,9 +38,9 @@
 //!   smallest buffer of `2 * streams - 1` bytes. The TOC byte of a stream
 //!   without audio is the one libopus writes: it names the mode and the
 //!   bandwidth of the last frame the stream coded, or Hybrid fullband when
-//!   it has coded none. One case differs: outside surround mode libopus
-//!   codes a stereo stream as mono at low bitrates, and the TOC byte then
-//!   says mono, where [`OpusEncoder`] always says stereo. The design
+//!   it has coded none. Its channel count is also that of the last frame:
+//!   outside surround mode both encoders code a stereo stream as mono at
+//!   low bitrates, and the TOC byte then says mono. The design
 //!   document raised the smallest buffer to `2 * streams` bytes instead;
 //!   that is not needed.
 //!   For 40 and 60 ms frames a stream that is not SILK-only needs a few
@@ -54,21 +54,20 @@
 //!   - a constant bitrate of at most 1000 bits per second per channel.
 //! - **D3, frame sizes.** 80, 100 and 120 ms frames and the "expert frame
 //!   duration" control are not offered: [`OpusEncoder`] has neither.
-//! - **D5, controls.** Only the controls [`OpusEncoder`] has are forwarded.
-//!   Missing are the LSB depth, the constrained-VBR switch, the signal type,
-//!   discontinuous transmission, the forced channel count, and the switches
-//!   for prediction and phase inversion.
+//! - **D5, controls.** Missing at the multistream level are the LSB depth,
+//!   the constrained-VBR switch, the signal type, discontinuous
+//!   transmission, the forced channel count, and the switches for
+//!   prediction and phase inversion. [`OpusEncoder`] has the forced channel
+//!   count and the prediction switch; they can be set on each stream
+//!   through [`MultistreamEncoder::stream_encoder_mut`]. It has none of the
+//!   others.
 //! - **D6, energy mask.** libopus gives each stream encoder a pointer to the
 //!   mask. Here the values are copied into the stream encoder.
 //!
-//! Two things libopus does have no counterpart here, because the stream
-//! encoder has none:
-//!
-//! - libopus forces the coupled streams of a surround layout to code two
-//!   channels. A stereo [`OpusEncoder`] always codes two channels.
-//! - libopus gives each stream encoder the whole input and the channels of
-//!   the stream, for its analysis of speech against music. [`OpusEncoder`]
-//!   has no such analysis.
+//! One thing libopus does has no counterpart here, because the stream
+//! encoder has none: libopus gives each stream encoder the whole input and
+//! the channels of the stream, for its analysis of speech against music.
+//! [`OpusEncoder`] has no such analysis.
 
 use super::ChannelSource;
 use super::layout::{ChannelLayout, MappingType};
@@ -581,10 +580,14 @@ impl MultistreamEncoder {
             if let Some(bandwidth) = surround_bandwidth {
                 enc.set_bandwidth(bandwidth);
                 if s < coupled {
-                    // To preserve the spatial image, force stereo CELT on
-                    // coupled streams. libopus also forces two coded
-                    // channels; a stereo `OpusEncoder` never codes fewer.
+                    // "To preserve the spatial image, force stereo CELT on
+                    // coupled streams" (opus_multistream_encoder.c:953-958):
+                    // CELT-only, and two coded channels, so that a stereo
+                    // stream encoder does not code its input as mono at a
+                    // low bitrate. Ambisonics streams are not forced to two
+                    // channels.
                     enc.set_force_mode(Some(ForcedMode::CeltOnly));
+                    let _ = enc.set_force_channels(Some(2));
                 }
             } else if self.mapping_type == MappingType::Ambisonics {
                 enc.set_force_mode(Some(ForcedMode::CeltOnly));

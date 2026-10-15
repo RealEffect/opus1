@@ -9,10 +9,11 @@
 //! zero on both sides.
 //!
 //! The CELT encoder of opus-rs (src/celt.rs, `CeltEncoder::encode_impl`)
-//! does not clear them. It predicts the bands that come back from the
-//! energies they had before the bandwidth narrowed, and the decoder from
-//! zero. From then on the encoder's picture of the decoder differs from
-//! libopus's, and so do its decisions and the level of the decoded signal.
+//! clears them too since 1947a49. Before, it predicted the bands that come
+//! back from the energies they had before the bandwidth narrowed, and the
+//! decoder from zero. From then on the encoder's picture of the decoder
+//! differed from libopus's, and so did its decisions and the level of the
+//! decoded signal.
 //!
 //! The reference is the C libopus encoder with the same settings and the
 //! same buffers. Both streams are decoded by the C decoder.
@@ -84,9 +85,11 @@ fn level_distance_after_a_narrow_packet(small: usize) -> f64 {
 /// the narrow one. In a longer run with changing settings the same fault
 /// gave three packets up to 24 dB above the input, at full scale (24 kHz,
 /// 2.5 ms frames, 56 kb/s constant bitrate). With the energies cleared as
-/// in libopus: within 1 dB.
+/// in libopus (already at the tip of integ6, 4726c16): 0.0, 2.8 and
+/// 0.0 dB for narrow packets of 3, 4 and 6 bytes. Since aefbec9, which
+/// rounds dc_reject and the tone detection as libopus does on 64-bit ARM:
+/// 0.0 dB for all three.
 #[test]
-#[ignore = "src/celt.rs: the encoder keeps the energies of the bands outside start..end after a frame; libopus clears them (celt_encoder.c, \"In case start or end were to change\")"]
 fn celt_only_stream_recovers_from_a_narrow_packet_like_libopus() {
     for small in [3usize, 4, 6] {
         let worst = level_distance_after_a_narrow_packet(small);

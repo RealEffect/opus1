@@ -204,10 +204,8 @@ fn walk(
     let mono: Vec<f32> = voice.iter().zip(&tones).map(|(v, t)| 0.7 * v + 0.2 * t).collect();
     let pcm = if channels == 2 { to_stereo(&mono, rate) } else { mono };
 
+    // Both encoders choose between mono and stereo packets.
     let mut c_enc = RawEncoder::new(rate, channels, application.0);
-    if channels == 2 {
-        c_enc.set(sys::OPUS_SET_FORCE_CHANNELS_REQUEST, 2);
-    }
     let mut enc = OpusEncoder::new(rate as i32, channels, application.1).unwrap();
     let mut dec = CDecoder::new(rate, channels);
     let mut was_celt = None;

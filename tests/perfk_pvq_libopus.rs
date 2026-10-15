@@ -1,9 +1,10 @@
 //! The pulse search against the search of libopus itself (`op_pvq_search_c`,
 //! celt/vq.c), called directly in the C library the tests link.
 //!
-//! The two are compared where opus-rs is meant to run the libopus algorithm:
-//! bands of 2 values, and bands of up to 31 values with 2 to 4 pulses. For
-//! more pulses in a band of up to 16 values aarch64 has its own scoring.
+//! Every target but x86-64 runs the libopus algorithm for every band size
+//! and number of pulses. x86-64 has kernels of its own; there the vectors
+//! are compared where it runs the libopus algorithm too: bands of 2 values,
+//! and bands of up to 31 values with 2 to 4 pulses.
 //!
 //! The pulse vectors must be the same. One difference is allowed where the
 //! library was not built by clang for Apple silicon: libopus is compiled C,
@@ -12,9 +13,10 @@
 //! the winner of an exact tie. Such a case is accepted when the two vectors
 //! match the input equally well, and it must be rare.
 //!
-//! On Apple silicon the library has one fused multiply-add in this function,
-//! `xy = xy + X[j] * y[j]` in the projection step, and `pvq_search_libopus`
-//! (src/pvq.rs) has the same one on aarch64. There no difference is allowed.
+//! On Apple silicon the library has fused multiply-adds in the projection
+//! step (`xy = xy + X[j] * y[j]` and `yy = yy + y[j] * y[j]`), and
+//! `pvq_search_libopus` (src/pvq.rs) has the same ones on aarch64. There no
+//! difference is allowed.
 
 use audiopus_sys as _;
 use opus_rs::pvq::pvq_search;
@@ -162,4 +164,53 @@ fn ties_between_two_values_fall_as_in_libopus() {
         }
     }
     assert!(different <= allowed_ties(cases.len()), "{different} of {} ties fall differently", cases.len());
+}
+
+/// The number of pulse vectors of `n` values and `k` pulses fits in 32
+/// bits, as for every band that CELT codes without splitting it.
+fn codable(n: usize, k: usize) -> bool {
+    // V(n, k) = V(n - 1, k) + V(n, k - 1) + V(n - 1, k - 1).
+    let mut v = vec![vec![0u128; k + 1]; n + 1];
+    for row in v.iter_mut() {
+        row[0] = 1;
+    }
+    for i in 1..=n {
+        for j in 1..=k {
+            v[i][j] = (v[i - 1][j] + v[i][j - 1] + v[i - 1][j - 1]).min(1 << 40);
+        }
+    }
+    v[n][k] < 1 << 32
+}
+
+/// Every band size and every number of pulses the codec can code give the
+/// vector of libopus, outside x86-64.
+///
+/// opus-rs had kernels of its own on aarch64: bands of four values without
+/// the projection step, bands of up to 16 values scored with an estimate of
+/// `1 / sqrt`, bands of 32 and more with four pulses per pass. Measured
+/// before the change: 608 of the 7640 vectors of this test differed.
+#[test]
+fn every_band_size_gives_the_vector_of_libopus() {
+    let mut rng = Lcg(0x53);
+    let (mut trials, mut different) = (0, 0);
+    let sizes = (2..=40usize).chain([44, 48, 64, 72, 88, 96, 128, 144, 176]);
+    for n in sizes {
+        for k in [1i32, 2, 3, 4, 5, 6, 8, 10, 13, 17, 24, 32, 48, 64, 96, 128] {
+            if !codable(n, k as usize) {
+                continue;
+            }
+            for trial in 0..20 {
+                let x = band(&mut rng, n, trial);
+                let want = libopus_search(&x, k);
+                let mut got = vec![0i32; n];
+                pvq_search(&x, &mut got, k, n);
+                trials += 1;
+                different += (got != want) as usize;
+            }
+        }
+    }
+    println!("{different} of {trials} vectors differ from libopus");
+    if !cfg!(target_arch = "x86_64") {
+        assert_eq!(different, 0);
+    }
 }

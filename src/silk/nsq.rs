@@ -599,6 +599,8 @@ fn quantize_subframe(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::*;
 
     /// xorshift64 generator with a fixed seed.

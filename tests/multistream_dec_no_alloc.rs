@@ -5,6 +5,8 @@
 //! the decoders and the packets first, switches counting on, and then runs
 //! every decoding function: on the first packet, on SILK, Hybrid and CELT
 //! packets, on lost packets, on malformed packets, and after a reset.
+// The multistream API needs the `std` feature.
+#![cfg(feature = "std")]
 
 mod ms_support;
 mod multistream_dec_common;

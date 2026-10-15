@@ -677,6 +677,8 @@ pub fn silk_process_nlsfs(
 
 #[cfg(test)]
 mod a2nlsf_tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::*;
 
     /// xorshift64 generator with a fixed seed, so the test data never

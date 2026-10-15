@@ -1671,6 +1671,8 @@ pub fn remove_doubling(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::*;
 
     /// Small deterministic generator, so that a failure can be repeated.

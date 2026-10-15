@@ -14,6 +14,8 @@ use opus_rs::quant_bands::E_PROB_MODEL;
 use opus_rs::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uchar};
 
+pub mod c_celt;
+
 /// Sampling rate of every test in this group.
 pub const FS: usize = 48_000;
 /// Samples in a 20 ms frame.
@@ -591,6 +593,25 @@ pub struct Header {
 /// its TOC byte, `end` the number of coded bands, `lm` the frame size index
 /// (3 for 20 ms).
 pub fn parse_header(payload: &[u8], channels: usize, end: usize, lm: usize) -> Header {
+    parse_header_rc(payload, channels, 0, end, lm).0
+}
+
+/// `parse_header` for a frame that starts at band `start`: the CELT part
+/// of a Hybrid frame (start 17), coded without the SILK part in front of
+/// it. Such a frame has no post-filter, and the bands below `start` keep
+/// their default values in the result.
+pub fn parse_header_from(payload: &[u8], channels: usize, start: usize, end: usize, lm: usize) -> Header {
+    parse_header_rc(payload, channels, start, end, lm).0
+}
+
+/// `parse_header`, and the range decoder as the header leaves it.
+fn parse_header_rc(
+    payload: &[u8],
+    channels: usize,
+    start: usize,
+    end: usize,
+    lm: usize,
+) -> (Header, RangeCoder) {
     let mode = default_mode();
     let nb = mode.nb_ebands;
     let total_bits = (payload.len() * 8) as i32;
@@ -605,9 +626,9 @@ pub fn parse_header(payload: &[u8], channels: usize, end: usize, lm: usize) -> H
         false
     };
     if h.silence {
-        return h;
+        return (h, rc);
     }
-    if rc.tell() + 16 <= total_bits && rc.decode_bit_logp(1) {
+    if start == 0 && rc.tell() + 16 <= total_bits && rc.decode_bit_logp(1) {
         let octave = rc.dec_uint(6);
         let period = (16 << octave) + rc.dec_bits(4 + octave) - 1;
         let gain = rc.dec_bits(3);
@@ -628,7 +649,7 @@ pub fn parse_header(payload: &[u8], channels: usize, end: usize, lm: usize) -> H
     // Coarse energy (unquant_coarse_energy).
     let model = &E_PROB_MODEL[lm][h.intra as usize];
     h.coarse = vec![0; nb * channels];
-    for i in 0..end {
+    for i in start..end {
         for c in 0..channels {
             let left = total_bits - rc.tell();
             h.coarse[c * nb + i] = if left >= 15 {
@@ -654,7 +675,7 @@ pub fn parse_header(payload: &[u8], channels: usize, end: usize, lm: usize) -> H
         budget -= select_reserved;
         let (mut current, mut changed) = (0, 0);
         h.tf = vec![0; end];
-        for v in h.tf.iter_mut() {
+        for v in h.tf[start..].iter_mut() {
             if tell + logp <= budget {
                 current ^= rc.decode_bit_logp(logp as u32) as i32;
                 tell = rc.tell();
@@ -669,7 +690,7 @@ pub fn parse_header(payload: &[u8], channels: usize, end: usize, lm: usize) -> H
         if select_reserved > 0 && row[t + changed as usize] != row[t + 2 + changed as usize] {
             select = rc.decode_bit_logp(1) as usize;
         }
-        for v in h.tf.iter_mut() {
+        for v in h.tf[start..].iter_mut() {
             *v = row[t + 2 * select + *v as usize] as i32;
         }
     }
@@ -683,7 +704,7 @@ pub fn parse_header(payload: &[u8], channels: usize, end: usize, lm: usize) -> H
     let mut logp = 6i32;
     let mut total = total_bits << 3;
     let mut tell = rc.tell_frac();
-    for i in 0..end {
+    for i in start..end {
         let n = ((mode.e_bands[i + 1] - mode.e_bands[i]) as i32) << lm;
         let cap =
             ((mode.cache.caps[nb * (2 * lm + channels - 1) + i] as i32 + 64) * channels as i32 * n)
@@ -710,7 +731,180 @@ pub fn parse_header(payload: &[u8], channels: usize, end: usize, lm: usize) -> H
     if rc.tell_frac() + (6 << 3) <= total {
         h.trim = Some(rc.decode_icdf(&TRIM_ICDF, 7));
     }
-    h
+    (h, rc)
+}
+
+/// What a CELT frame says about the bit allocation, read after the header
+/// (libopus celt_decode_with_ec: clt_compute_allocation and
+/// unquant_fine_energy).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Allocation {
+    /// First band coded with intensity stereo. 0 for mono.
+    pub intensity: i32,
+    /// Left and right are coded separately, not as mid and side.
+    pub dual_stereo: bool,
+    /// Number of the band after the last one that gets pulses.
+    pub coded_bands: i32,
+    /// Bits for the shape of each band, in units of 1/8 bit.
+    pub pulses: Vec<i32>,
+    /// Fine energy bits of each band, per channel.
+    pub fine_bits: Vec<i32>,
+    /// Fine energy value of each band, `fine[21 * channel + band]`.
+    pub fine: Vec<u32>,
+}
+
+/// Read the header and the allocation of a CELT-only frame. `None` for a
+/// frame flagged as silence, which has no allocation.
+pub fn parse_frame(
+    payload: &[u8],
+    channels: usize,
+    end: usize,
+    lm: usize,
+) -> (Header, Option<Allocation>) {
+    let (h, rest) = parse_frame_rc(payload, channels, end, lm);
+    (h, rest.map(|r| r.allocation))
+}
+
+/// What `parse_frame_rc` leaves for reading the rest of a frame.
+struct FrameRest {
+    allocation: Allocation,
+    /// The range decoder after the fine energy.
+    rc: RangeCoder,
+    /// The allocator's balance, which the band decoder goes on with.
+    balance: i32,
+    /// 1/8 bit kept for the anti-collapse flag, or 0.
+    anti_collapse_rsv: i32,
+}
+
+/// The anti-collapse flag of a CELT-only frame (libopus
+/// celt_decode_with_ec: the raw bit after the bands). `None` when the
+/// frame has no such flag: it is not a transient, is shorter than 10 ms, or
+/// has no room for it.
+///
+/// The flag comes after the shapes of all bands, so they are decoded here
+/// with the band decoder of opus-rs.
+pub fn anti_collapse_flag(payload: &[u8], channels: usize, end: usize, lm: usize) -> Option<bool> {
+    let mode = default_mode();
+    let (h, rest) = parse_frame_rc(payload, channels, end, lm);
+    let FrameRest {
+        allocation: a,
+        mut rc,
+        mut balance,
+        anti_collapse_rsv,
+    } = rest?;
+    if anti_collapse_rsv == 0 {
+        return None;
+    }
+    let n = mode.short_mdct_size << lm;
+    // Room past the last band for the vector kernels, as the decoder has.
+    let mut x = vec![0.0f32; n * channels + 512];
+    let (xs, ys) = x.split_at_mut(n);
+    let mut masks = vec![0u32; mode.nb_ebands * channels];
+    let band_e = vec![1.0f32; mode.nb_ebands * channels];
+    let mut dual_stereo = a.dual_stereo;
+    opus_rs::bands::quant_all_bands(
+        false,
+        mode,
+        0,
+        end,
+        xs,
+        if channels == 2 { Some(ys) } else { None },
+        &mut masks,
+        &band_e,
+        &a.pulses,
+        h.transient,
+        h.spread.unwrap_or(2),
+        &mut dual_stereo,
+        a.intensity as usize,
+        &h.tf,
+        ((payload.len() as i32 * 8) << 3) - anti_collapse_rsv,
+        &mut balance,
+        &mut rc,
+        lm as i32,
+        a.coded_bands,
+        true,
+        false,
+        &mut 0u32,
+    );
+    Some(rc.dec_bits(1) != 0)
+}
+
+/// `parse_frame`, and what is needed to read on.
+fn parse_frame_rc(
+    payload: &[u8],
+    channels: usize,
+    end: usize,
+    lm: usize,
+) -> (Header, Option<FrameRest>) {
+    let mode = default_mode();
+    let nb = mode.nb_ebands;
+    let (h, mut rc) = parse_header_rc(payload, channels, 0, end, lm);
+    if h.silence {
+        return (h, None);
+    }
+    let mut cap = vec![0i32; nb];
+    let mut offsets = vec![0i32; nb];
+    for i in 0..nb {
+        let n = ((mode.e_bands[i + 1] - mode.e_bands[i]) as i32) << lm;
+        cap[i] =
+            ((mode.cache.caps[nb * (2 * lm + channels - 1) + i] as i32 + 64) * channels as i32 * n)
+                >> 2;
+        if i < end {
+            let width = channels as i32 * n;
+            offsets[i] = h.boost[i] * (width << 3).min((6 << 3).max(width));
+        }
+    }
+    let mut bits = ((payload.len() as i32 * 8) << 3) - rc.tell_frac() - 1;
+    let anti_collapse_rsv = if h.transient && lm >= 2 && bits >= ((lm as i32 + 2) << 3) {
+        1 << 3
+    } else {
+        0
+    };
+    bits -= anti_collapse_rsv;
+    let mut a = Allocation {
+        pulses: vec![0; nb],
+        fine_bits: vec![0; nb],
+        fine: vec![0; nb * channels],
+        ..Allocation::default()
+    };
+    let mut fine_priority = vec![0i32; nb];
+    let (mut dual_stereo, mut balance) = (0, 0);
+    a.coded_bands = opus_rs::rate::clt_compute_allocation(
+        mode,
+        0,
+        end,
+        &offsets,
+        &cap,
+        h.trim.unwrap_or(5),
+        &mut a.intensity,
+        &mut dual_stereo,
+        bits,
+        &mut balance,
+        &mut a.pulses,
+        &mut a.fine_bits,
+        &mut fine_priority,
+        channels as i32,
+        lm as i32,
+        &mut rc,
+        false,
+        0,
+        0,
+    );
+    a.dual_stereo = dual_stereo != 0;
+    for i in 0..end {
+        if a.fine_bits[i] > 0 {
+            for c in 0..channels {
+                a.fine[c * nb + i] = rc.dec_bits(a.fine_bits[i] as u32);
+            }
+        }
+    }
+    let rest = FrameRest {
+        allocation: a,
+        rc,
+        balance,
+        anti_collapse_rsv,
+    };
+    (h, Some(rest))
 }
 
 /// The header of every packet of a stream of single CELT-only frames.
@@ -827,4 +1021,101 @@ pub fn broadband(frames: usize, channels: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// `fixtures/answer_16k.wav`: 18 s of mono speech, 16-bit, 16 kHz.
+pub fn speech_16k() -> Vec<f32> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/answer_16k.wav");
+    let bytes = std::fs::read(path).expect("fixtures/answer_16k.wav");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if &bytes[pos..pos + 4] == b"data" {
+            let data = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
+            return data
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
+        }
+        pos += 8 + len + (len & 1);
+    }
+    panic!("no data chunk in answer_16k.wav");
+}
+
+/// `seconds` of the speech fixture at `fs` Hz (16000 or 48000), mono,
+/// starting 1 s into the recording. The 48 kHz version is the fixture with
+/// two zeros after each sample and a low-pass filter at 8 kHz.
+pub fn speech(fs: usize, seconds: usize) -> Vec<f32> {
+    let src = speech_16k();
+    let src = &src[16_000..16_000 * (1 + seconds)];
+    match fs {
+        16_000 => src.to_vec(),
+        48_000 => {
+            // Windowed sinc, 8 input samples to each side.
+            const HALF: isize = 24;
+            let taps: Vec<f64> = (-HALF..=HALF)
+                .map(|k| {
+                    let x = k as f64 / 3.0;
+                    let sinc = if k == 0 {
+                        1.0
+                    } else {
+                        (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+                    };
+                    let w = 0.5 + 0.5 * (std::f64::consts::PI * k as f64 / (HALF + 1) as f64).cos();
+                    sinc * w
+                })
+                .collect();
+            (0..src.len() as isize * 3)
+                .map(|i| {
+                    let mut acc = 0.0f64;
+                    for (t, &h) in taps.iter().enumerate() {
+                        let j = i + t as isize - HALF;
+                        if j >= 0 && j % 3 == 0 && ((j / 3) as usize) < src.len() {
+                            acc += h * f64::from(src[(j / 3) as usize]);
+                        }
+                    }
+                    acc as f32
+                })
+                .collect()
+        }
+        other => panic!("no speech signal at {other} Hz"),
+    }
+}
+
+/// A music-like signal, mono, `seconds` long at `fs` Hz: a new three-note
+/// chord every 250 ms, each note with decaying harmonics and a short
+/// attack, over a little noise. `voice` picks the notes, so two voices give
+/// two related but different channels.
+pub fn music(fs: usize, seconds: usize, voice: usize) -> Vec<f32> {
+    let notes = [220.0, 277.18, 329.63, 392.0, 440.0, 523.25, 659.25, 783.99];
+    let note_len = fs / 4;
+    let mut noise = Noise(11 + voice as u32);
+    (0..fs * seconds)
+        .map(|i| {
+            let k = i / note_len;
+            let t = (i % note_len) as f64 / fs as f64;
+            let env = (t / 0.004).min(1.0) * (-3.0 * t).exp();
+            let mut v = 0.0;
+            for j in 0..3 {
+                let f = notes[(k * 3 + j * 2 + voice * 3) % notes.len()];
+                for h in 1..=8 {
+                    let fh = f * h as f64;
+                    if fh < 0.45 * fs as f64 {
+                        v += (std::f64::consts::TAU * fh * i as f64 / fs as f64).sin() / h as f64;
+                    }
+                }
+            }
+            (0.12 * env * v + 0.003 * f64::from(noise.next())) as f32
+        })
+        .collect()
+}
+
+/// Two mono signals as the left and right channel of an interleaved stereo
+/// signal. Each channel also gets `leak` of the other one.
+pub fn stereo_of(left: &[f32], right: &[f32], leak: f32) -> Vec<f32> {
+    left.iter()
+        .zip(right)
+        .flat_map(|(&l, &r)| [l + leak * r, r + leak * l])
+        .collect()
 }

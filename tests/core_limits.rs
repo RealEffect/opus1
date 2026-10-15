@@ -414,8 +414,15 @@ fn insane_frames(application: (i32, Application), mode: Option<(i32, ForcedMode)
 ///
 /// The sums 0.995e9 and 1.005e9 lie on either side of the limit, within the
 /// 1 % where opus-rs adds the squares up a second time, one after the other.
+///
+/// The cleared frame is a silent CELT frame, the same 3 bytes as libopus's.
+/// What it decodes to is the tail of the frame before. With the CELT
+/// encoder of the fidelity merge (eecefa7) that tail decoded at -57.5 dB
+/// against libopus's -62.0 dB (low delay, 48 kHz, sum 1.005e9), 4.5 dB
+/// apart. Since the CELT corrections of wave 4 (merged as 584fea2) it
+/// decodes at -62.0 dB, as libopus's; before the fidelity merge (1653bce)
+/// it was -63.1 dB.
 #[test]
-#[ignore = "after the fidelity merge: low delay, 48 kHz, loud invalid frame decodes at -57.5 dB where libopus gives -62.0 dB; to be reconciled"]
 fn float_input_that_is_not_a_sane_signal_is_coded_as_silence_like_libopus() {
     for (name, application, mode, rate) in [
         ("low delay, 48 kHz", (APP_LOWDELAY, Application::RestrictedLowDelay), None, 48000usize),

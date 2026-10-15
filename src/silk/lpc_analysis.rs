@@ -993,6 +993,8 @@ pub fn silk_lpc_inverse_pred_gain(a_q12: &[i16], order: usize) -> i32 {
 
 #[cfg(test)]
 mod burg_tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::*;
 
     /// `silk_burg_modified_fix` as it was before the signal-reading part

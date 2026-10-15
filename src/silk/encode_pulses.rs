@@ -3,6 +3,9 @@ use crate::silk::define::*;
 use crate::silk::shell_coder::silk_shell_encoder;
 use crate::silk::tables::*;
 
+const LOG2_SHELL_CODEC_FRAME_LENGTH: usize = 4;
+const _: () = assert!(1 << LOG2_SHELL_CODEC_FRAME_LENGTH == SHELL_CODEC_FRAME_LENGTH);
+
 fn combine_and_check(
     pulses_comb: &mut [i32],
     pulses_in: &[i32],
@@ -19,21 +22,43 @@ fn combine_and_check(
     0
 }
 
+/// Code the excitation `pulses[..frame_length]` of one frame. Port of
+/// `silk_encode_pulses` (silk/encode_pulses.c).
+///
+/// The frame is coded in shell blocks of 16 samples. A frame of 120 samples
+/// (10 ms at 12 kHz) fills 7.5 blocks: the last block is padded with zeros.
+/// As in libopus, the padding is written into `pulses`, which must therefore
+/// be longer than the frame; the 16 samples after the frame are cleared.
 pub fn silk_encode_pulses(
     ps_range_enc: &mut RangeCoder,
     signal_type: i32,
     quant_offset_type: i32,
-    pulses: &[i8],
+    pulses: &mut [i8],
     frame_length: usize,
 ) {
     let mut pulses_comb = [0i32; 8];
 
     let mut abs_pulses = [0i32; MAX_FRAME_LENGTH + SHELL_CODEC_FRAME_LENGTH];
 
-    let iter = frame_length.div_ceil(SHELL_CODEC_FRAME_LENGTH);
+    // encode_pulses.c:86-91: "Calculate number of shell blocks". A partial
+    // last block only happens for 10 ms at 12 kHz. The loops for the least
+    // significant bits and the signs read whole blocks of `pulses`, so the
+    // tail of the last block must be zero there too.
+    let frame_length = frame_length.min(pulses.len()).min(MAX_FRAME_LENGTH);
+    let mut iter = frame_length >> LOG2_SHELL_CODEC_FRAME_LENGTH;
+    if iter * SHELL_CODEC_FRAME_LENGTH < frame_length {
+        iter += 1;
+        let pad_end = (frame_length + SHELL_CODEC_FRAME_LENGTH).min(pulses.len());
+        pulses[frame_length..pad_end].fill(0);
+    }
+    // The samples of all blocks. They lie within `pulses`, except when the
+    // caller's buffer ends inside the last block.
+    let coded_length = (iter * SHELL_CODEC_FRAME_LENGTH).min(pulses.len());
+    let pulses = &pulses[..coded_length];
 
-    for i in 0..frame_length {
-        abs_pulses[i] = pulses[i].abs() as i32;
+    // encode_pulses.c:93-101: "Take the absolute value of the pulses".
+    for (abs, &p) in abs_pulses.iter_mut().zip(pulses) {
+        *abs = (p as i32).abs();
     }
 
     let mut sum_pulses = [0i32; MAX_FRAME_LENGTH / SHELL_CODEC_FRAME_LENGTH];
@@ -141,11 +166,13 @@ pub fn silk_encode_pulses(
         }
     }
 
-    for i in 0..iter {
+    // encode_pulses.c:181-196: "LSB Encoding".
+    for (i, block) in pulses.chunks(SHELL_CODEC_FRAME_LENGTH).enumerate() {
         if n_rshifts[i] > 0 {
             let n_ls = n_rshifts[i] - 1;
             for k in 0..SHELL_CODEC_FRAME_LENGTH {
-                let abs_q = pulses[i * SHELL_CODEC_FRAME_LENGTH + k].abs() as i32;
+                // C: `abs_q = (opus_int8)silk_abs( pulses_ptr[ k ] )`.
+                let abs_q = (block.get(k).copied().unwrap_or(0) as i32).abs() as i8 as i32;
                 for j in (1..=n_ls).rev() {
                     let bit = (abs_q >> j) & 1;
                     ps_range_enc.encode_icdf(bit, &SILK_LSB_ICDF, 8);
@@ -156,14 +183,16 @@ pub fn silk_encode_pulses(
         }
     }
 
+    // silk_encode_signs (silk/code_signs.c:40-72), over the same blocks:
+    // `(length + SHELL_CODEC_FRAME_LENGTH / 2) >> LOG2_SHELL_CODEC_FRAME_LENGTH`
+    // is `iter` for every frame length SILK codes.
     let icdf_offset = (7 * (quant_offset_type + signal_type * 2)) as usize;
-    for i in 0..iter {
+    for (i, block) in pulses.chunks(SHELL_CODEC_FRAME_LENGTH).enumerate() {
         let p = sum_pulses[i];
         if p > 0 {
             let icdf0 = SILK_SIGN_ICDF[icdf_offset + ((p & 0x1F) as usize).min(6)];
             let icdf = [icdf0, 0u8];
-            for j in 0..SHELL_CODEC_FRAME_LENGTH {
-                let pulse = pulses[i * SHELL_CODEC_FRAME_LENGTH + j];
+            for &pulse in block {
                 if pulse != 0 {
                     let mapped = if pulse > 0 { 1i32 } else { 0i32 };
                     ps_range_enc.encode_icdf(mapped, &icdf, 8);

@@ -290,6 +290,9 @@ fn run(case: &Case) -> Measured {
     let mut rs_enc = OpusEncoder::new(sr as i32, CH, Application::Voip).unwrap();
     rs_enc.bitrate_bps = case.bitrate;
     rs_enc.use_cbr = case.cbr;
+    // A stereo stream, as libopus below: both encoders would otherwise code
+    // the input as mono below ~18 kb/s.
+    rs_enc.set_force_channels(Some(CH)).unwrap();
 
     // libopus at opus-rs's settings, pinned to voice and to a stereo stream
     // (below ~18 kb/s it would otherwise switch to mono).

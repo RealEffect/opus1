@@ -382,6 +382,8 @@ fn celt_iir_full_neon(x: &[f32], den: &[f32], y: &mut [f32], start: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use std::vec::Vec;
     use super::*;
     use crate::pitch::tests::{KINDS, Kind, Rng, assert_same, samples};
 
