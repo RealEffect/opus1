@@ -1,3 +1,4 @@
+use crate::mathops::mac;
 use crate::range_coder::RangeCoder;
 use core::mem::MaybeUninit;
 
@@ -163,8 +164,10 @@ fn saturating_add3(a: u32, b: u32, c: u32) -> u32 {
     s.min(u32::MAX as u64) as u32
 }
 
+/// `U(n, k)` (`CELT_PVQ_U` in libopus), read from the table when it holds
+/// the value and computed otherwise. Saturates at `u32::MAX`.
 #[inline(always)]
-pub fn celt_pvq_u_lookup(n: u32, k: u32) -> u32 {
+pub fn celt_pvq_u(n: u32, k: u32) -> u32 {
     let r = n.min(k) as usize;
     let c = n.max(k) as usize;
 
@@ -176,30 +179,6 @@ pub fn celt_pvq_u_lookup(n: u32, k: u32) -> u32 {
     }
     // SAFETY: `r < 15` and `r <= c <= CELT_PVQ_U_CMAX[r]` were checked above.
     unsafe { pvq_u_unchecked(r, c) }
-}
-
-pub fn ncwrs(n: u32, k: u32) -> u32 {
-    if n == 0 {
-        return 0;
-    }
-    if n == 1 {
-        return if k > 0 { 2 } else { 1 };
-    }
-    if k > MAX_PVQ_K as u32 {
-        return u32::MAX;
-    }
-    let mut u = [0u32; MAX_PVQ_U];
-    u[0] = 0;
-    u[1] = 1;
-    for ki in 2..=(k + 1) as usize {
-        u[ki] = ((ki as u32 * 2) as u64).saturating_sub(1) as u32;
-    }
-    let mut curr_n = n;
-    while curr_n > 2 {
-        unext(&mut u[1..], (k + 1) as usize, 1);
-        curr_n -= 1;
-    }
-    u[k as usize].saturating_add(u[k as usize + 1])
 }
 
 fn compute_u(n: u32, k: u32) -> u32 {
@@ -226,14 +205,11 @@ fn compute_u(n: u32, k: u32) -> u32 {
     u[k as usize]
 }
 
-#[inline(always)]
-pub fn celt_pvq_u(n: u32, k: u32) -> u32 {
-    celt_pvq_u_lookup(n, k)
-}
-
+/// `V(n, k) = U(n, k) + U(n, k + 1)` (`CELT_PVQ_V` in libopus), the number
+/// of pulse vectors of `n` values and `k` pulses. Saturates at `u32::MAX`.
 #[inline(always)]
 pub fn celt_pvq_v(n: u32, k: u32) -> u32 {
-    celt_pvq_u_lookup(n, k).saturating_add(celt_pvq_u_lookup(n, k + 1))
+    celt_pvq_u(n, k).saturating_add(celt_pvq_u(n, k + 1))
 }
 
 fn unext(u: &mut [u32], len: usize, mut u0: u32) {
@@ -317,11 +293,11 @@ fn icwrs_checked(n: u32, y: &[i32]) -> u32 {
         j -= 1;
         let yj = y[j];
         let m = n - j as u32;
-        i = i.wrapping_add(celt_pvq_u_lookup(m, k));
+        i = i.wrapping_add(celt_pvq_u(m, k));
         k += yj.unsigned_abs();
 
         let sign_mask = yj >> 31;
-        let lookup = (sign_mask as u32) & celt_pvq_u_lookup(m, k + 1);
+        let lookup = (sign_mask as u32) & celt_pvq_u(m, k + 1);
         i = i.wrapping_add(lookup);
     }
     i
@@ -487,7 +463,7 @@ fn cwrsi_checked(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
 
     while curr_n > 2 {
         if curr_k >= curr_n as i32 {
-            let p_kp1 = celt_pvq_u_lookup(curr_n, (curr_k + 1) as u32);
+            let p_kp1 = celt_pvq_u(curr_n, (curr_k + 1) as u32);
             let s: i32 = if i >= p_kp1 {
                 i -= p_kp1;
                 -1
@@ -495,30 +471,30 @@ fn cwrsi_checked(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
                 0
             };
             let k0 = curr_k;
-            let q = celt_pvq_u_lookup(curr_n, curr_n);
+            let q = celt_pvq_u(curr_n, curr_n);
             let mut p;
             if q > i {
                 curr_k = curr_n as i32;
                 loop {
                     curr_k -= 1;
-                    p = celt_pvq_u_lookup(curr_n, curr_k.max(0) as u32);
+                    p = celt_pvq_u(curr_n, curr_k.max(0) as u32);
                     if p <= i || curr_k <= 0 {
                         break;
                     }
                 }
             } else {
-                p = celt_pvq_u_lookup(curr_n, curr_k as u32);
+                p = celt_pvq_u(curr_n, curr_k as u32);
                 while p > i && curr_k > 0 {
                     curr_k -= 1;
-                    p = celt_pvq_u_lookup(curr_n, curr_k as u32);
+                    p = celt_pvq_u(curr_n, curr_k as u32);
                 }
             }
             i -= p;
             let val = k0 - curr_k;
             y[j] = (val + s) ^ s;
         } else {
-            let p_k = celt_pvq_u_lookup(curr_k as u32, curr_n);
-            let p_kp1 = celt_pvq_u_lookup((curr_k + 1) as u32, curr_n);
+            let p_k = celt_pvq_u(curr_k as u32, curr_n);
+            let p_kp1 = celt_pvq_u((curr_k + 1) as u32, curr_n);
             if p_k <= i && i < p_kp1 {
                 i -= p_k;
                 y[j] = 0;
@@ -537,7 +513,7 @@ fn cwrsi_checked(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
             let mut p;
             loop {
                 curr_k -= 1;
-                p = celt_pvq_u_lookup(curr_k.max(0) as u32, curr_n);
+                p = celt_pvq_u(curr_k.max(0) as u32, curr_n);
                 if p <= i || curr_k <= 0 {
                     break;
                 }
@@ -611,170 +587,6 @@ pub fn decode_pulses(y: &mut [i32], n: u32, k: u32, rc: &mut RangeCoder) {
     let ft = celt_pvq_v(n, k);
     let fl = rc.dec_uint(ft).min(ft.saturating_sub(1));
     cwrsi(n, k, fl, y);
-}
-
-#[allow(non_snake_case)]
-fn op_pvq_refine(
-    Xn: &[f32],
-    iy: &mut [i32],
-    iy0: Option<&[i32]>,
-    K: i32,
-    up: i32,
-    margin: i32,
-    N: usize,
-) -> bool {
-    let K8 = (K as f32) * 256.0;
-
-    let mut iysum = 0i32;
-    for i in 0..N {
-        let tmp = K8 * Xn[i];
-        iy[i] = (tmp + 128.0) as i32 >> 8;
-        iysum += iy[i];
-    }
-
-    if let Some(iy0_ref) = iy0 {
-        for i in 0..N {
-            let min_val = up * iy0_ref[i] - (margin - 1);
-            let max_val = up * iy0_ref[i] + (margin - 1);
-            iy[i] = iy[i].clamp(min_val, max_val);
-        }
-        iysum = iy.iter().sum();
-    }
-
-    if (iysum - K).abs() > 32 {
-        return true;
-    }
-
-    let dir = if iysum < K { 1 } else { -1 };
-    let mut remaining = (K - iysum).abs();
-
-    let mut rounding: [f32; 32] = [0.0; 32];
-    for i in 0..N {
-        rounding[i] = K8 * Xn[i] - ((iy[i] as f32) * 256.0);
-    }
-
-    while remaining > 0 {
-        let mut best_i = 0;
-        let mut best_round = if dir == 1 { -1e30f32 } else { 1e30f32 };
-
-        for i in 0..N {
-            let can_adjust = if dir == 1 {
-                iy0.is_none_or(|iy0_ref| (iy[i] - up * iy0_ref[i]).abs() < (margin - 1))
-            } else {
-                iy[i] != 0
-                    && iy0.is_none_or(|iy0_ref| (iy[i] - up * iy0_ref[i]).abs() < (margin - 1))
-            };
-
-            if can_adjust
-                && ((dir == 1 && rounding[i] > best_round)
-                    || (dir == -1 && rounding[i] < best_round && iy[i] != 0))
-            {
-                best_round = rounding[i];
-                best_i = i;
-            }
-        }
-
-        iy[best_i] += dir;
-        rounding[best_i] -= dir as f32 * 256.0;
-        remaining -= 1;
-    }
-
-    false
-}
-
-pub fn pvq_search_qext(
-    x: &[f32],
-    y: &mut [i32],
-    up_y: &mut [i32],
-    refine: &mut [i32],
-    k: i32,
-    extra_bits: i32,
-    n: usize,
-) -> f32 {
-    debug_assert!(n <= 32);
-    debug_assert!(extra_bits >= 2);
-
-    let mut sum = 0.0f32;
-    for i in 0..n {
-        sum += x[i].abs();
-    }
-
-    if sum < 1e-15 {
-        y[0] = k;
-        up_y[0] = ((1 << extra_bits) - 1) * k;
-        for i in 1..n {
-            y[i] = 0;
-            up_y[i] = 0;
-            refine[i] = 0;
-        }
-        refine[0] = 0;
-        return (up_y[0] as f32) * (up_y[0] as f32);
-    }
-
-    #[allow(non_snake_case)]
-    let mut Xn: [f32; 32] = [0.0; 32];
-    let rcp_sum = 1.0 / sum;
-    for i in 0..n {
-        Xn[i] = x[i].abs() * rcp_sum;
-    }
-
-    let failed1 = op_pvq_refine(&Xn, y, None, k, 1, k + 1, n);
-
-    let up = (1 << extra_bits) - 1;
-    let up_k = up * k;
-    let margin = up;
-    let failed2 = op_pvq_refine(&Xn, up_y, Some(y), up_k, up, margin, n);
-
-    if failed1 || failed2 {
-        y[0] = k;
-        up_y[0] = up_k;
-        for i in 1..n {
-            y[i] = 0;
-            up_y[i] = 0;
-        }
-    }
-
-    for i in 0..n {
-        refine[i] = up_y[i] - up * y[i];
-    }
-
-    let mut yy = 0.0f32;
-    for i in 0..n {
-        yy += (up_y[i] as f32) * (up_y[i] as f32);
-    }
-
-    for i in 0..n {
-        if x[i] < 0.0 {
-            y[i] = -y[i];
-            up_y[i] = -up_y[i];
-            refine[i] = -refine[i];
-        }
-    }
-
-    yy
-}
-
-#[inline(always)]
-fn pvq_search_n2(x: &[f32], y: &mut [i32], k: i32) {
-    debug_assert!(x.len() >= 2 && y.len() >= 2);
-
-    let abs_x0 = x[0].abs();
-    let abs_x1 = x[1].abs();
-    let sum = abs_x0 + abs_x1;
-
-    if sum < 1e-15 {
-        y[0] = k;
-        y[1] = 0;
-        return;
-    }
-
-    let rcp_sum = 1.0 / sum;
-    let y0 = (k as f32 * abs_x0 * rcp_sum + 0.5).floor() as i32;
-    let y0 = y0.clamp(0, k);
-    let y1 = k - y0;
-
-    y[0] = if x[0] >= 0.0 { y0 } else { -y0 };
-    y[1] = if x[1] >= 0.0 { y1 } else { -y1 };
 }
 
 /// Pulse search on x86-64 for bands of four values.
@@ -919,11 +731,9 @@ fn pvq_search_n4(x: &[f32], y: &mut [i32], k: i32) {
 
 #[inline(always)]
 pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
-    // Hard contract: n must fit the fixed-size scratch arrays and the input
-    // slices must hold n samples. In-repo callers are bounded by
-    // MAX_PVQ_N; a direct call violating it would otherwise panic with an
-    // unhelpful index message (or, on aarch64, read out of bounds via raw
-    // pointers) — issue #27 deep scan.
+    // `n` must fit the scratch buffers, and `x` and `y` must hold `n` values.
+    // Checked in release builds too: the vector kernels read and write
+    // through pointers.
     assert!(
         n <= MAX_PVQ_N && x.len() >= n && y.len() >= n,
         "pvq_search: n={} exceeds MAX_PVQ_N={} or slices too short",
@@ -935,7 +745,7 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         return;
     }
     // libopus runs `op_pvq_search_c` on every target but x86, and so does
-    // opus-rs. The kernels below are for x86-64, where libopus runs its own
+    // opus1. The kernels below are for x86-64, where libopus runs its own
     // SSE2 search.
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -970,9 +780,7 @@ fn pvq_search_x86(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     if n == 2 {
         // libopus has no special case for two values: the projection rounds
         // down and the search places the pulses that are left (celt/vq.c,
-        // op_pvq_search_c). `pvq_search_n2` rounds the projection to the
-        // nearest count instead. Its vectors match the input as well, but
-        // they are not the ones libopus writes.
+        // op_pvq_search_c).
         pvq_search_libopus(x, y, k, 2);
         return;
     }
@@ -1329,15 +1137,15 @@ fn pvq_best_position_neon<const SQUARE: bool>(
 /// position is the best one when the scan reaches `m`, `m` beats it, and no
 /// later position beats `m`. When it fails (a tie within the rounding, or a
 /// number that is not a number) the exact scan runs instead. The result is
-/// always the one of `pvq_best_position_scalar::<true>`.
+/// always the one of `pvq_best_position_scalar::<true>`, whichever
+/// candidate pass 1 picks.
 ///
 /// The scan tests each group of four against the best position so far and
 /// redoes a group in order when one of its positions is better, which
 /// happens about ln(n) times per pulse, each time with a mispredicted
 /// branch. This form costs two passes without such branches.
 ///
-/// `abs_x` must hold at least 8 values and at most MAX_PVQ_N, and `y2f` must
-/// be at least as long.
+/// `abs_x` must hold at least 4 values and `y2f` must be at least as long.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -1345,69 +1153,45 @@ fn pvq_best_position_checked_neon(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) 
     use core::arch::aarch64::*;
 
     let n = abs_x.len();
-    // The quotients of pass 1 go to a buffer of MAX_PVQ_N values through a
-    // pointer, so the size is checked in release builds too.
-    assert!((8..=MAX_PVQ_N).contains(&n));
     let y2f = &y2f[..n];
     let (x4, x_tail) = abs_x.as_chunks::<4>();
     let (y4, y_tail) = y2f.as_chunks::<4>();
     let vxy = vdupq_n_f32(xy);
     let vyy = vdupq_n_f32(yy);
+    let lanes = [0u32, 1, 2, 3];
+    // SAFETY: `lanes` holds four values.
+    let lane_idx = unsafe { vld1q_u32(lanes.as_ptr()) };
+    let four = vdupq_n_u32(4);
 
-    // Pass 1: the largest quotient and the first position that has it. The
-    // quotients are kept for the search of that position. A NaN quotient
-    // makes `vmaxq_f32` return NaN, and then no position equals the
-    // maximum; the exact scan below handles that case.
-    let mut q_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let q_ptr = q_mu.as_mut_ptr() as *mut f32;
+    // Pass 1: each lane keeps its largest quotient and the first position
+    // that has it. A larger quotient replaces the kept one only when it is
+    // strictly larger, so the first of equal quotients stays. A NaN quotient
+    // is never larger; pass 2 then fails on it and the exact scan runs.
     let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
-    for (g, (xa, ya)) in x4.iter().zip(y4.iter()).enumerate() {
-        // SAFETY: `xa` and `ya` are references to four values each. The
-        // store writes values `4 * g..4 * g + 4` of `q_mu`, which holds
-        // MAX_PVQ_N >= n values (checked at entry).
-        unsafe {
-            let (vx, vy) = (vld1q_f32(xa.as_ptr()), vld1q_f32(ya.as_ptr()));
-            let vr = vaddq_f32(vxy, vx);
-            let vq = vdivq_f32(vmulq_f32(vr, vr), vaddq_f32(vyy, vy));
-            vst1q_f32(q_ptr.add(4 * g), vq);
-            vmax = vmaxq_f32(vmax, vq);
-        }
+    let mut vbest = lane_idx;
+    let mut vidx = lane_idx;
+    for (xa, ya) in x4.iter().zip(y4.iter()) {
+        // SAFETY: `xa` and `ya` are references to four values each.
+        let (vx, vy) = unsafe { (vld1q_f32(xa.as_ptr()), vld1q_f32(ya.as_ptr())) };
+        let vr = vaddq_f32(vxy, vx);
+        let vq = vdivq_f32(vmulq_f32(vr, vr), vaddq_f32(vyy, vy));
+        let larger = vcgtq_f32(vq, vmax);
+        vmax = vbslq_f32(larger, vq, vmax);
+        vbest = vbslq_u32(larger, vidx, vbest);
+        vidx = vaddq_u32(vidx, four);
     }
+    // The first position over all lanes that has the largest quotient.
     let mut max = vmaxvq_f32(vmax);
+    let top = vceqq_f32(vmax, vdupq_n_f32(max));
+    let mut m = vminvq_u32(vbslq_u32(top, vbest, vdupq_n_u32(u32::MAX))) as usize;
     let done = 4 * x4.len();
     for (l, (&ax, &ay)) in x_tail.iter().zip(y_tail.iter()).enumerate() {
         let r = xy + ax;
         let q = r * r / (yy + ay);
-        // SAFETY: `done + l < n <= MAX_PVQ_N`.
-        unsafe { q_ptr.add(done + l).write(q) };
-        // NaN stays NaN, as in `vmaxq_f32`.
-        max = if q.is_nan() || max.is_nan() { f32::NAN } else { max.max(q) };
-    }
-    let mut m = n;
-    let vtop = vdupq_n_f32(max);
-    for g in 0..x4.len() {
-        // SAFETY: values `4 * g..4 * g + 4` were written in pass 1.
-        let eq = unsafe { vceqq_f32(vld1q_f32(q_ptr.add(4 * g)), vtop) };
-        if vmaxvq_u32(eq) != 0 {
-            let mut lanes = [0u32; 4];
-            // SAFETY: `lanes` holds four values.
-            unsafe { vst1q_u32(lanes.as_mut_ptr(), eq) };
-            m = 4 * g + lanes.iter().position(|&v| v != 0).unwrap_or(0);
-            break;
+        if q > max {
+            max = q;
+            m = done + l;
         }
-    }
-    if m == n {
-        for l in 0..x_tail.len() {
-            // SAFETY: written in pass 1.
-            if unsafe { q_ptr.add(done + l).read() } == max {
-                m = done + l;
-                break;
-            }
-        }
-    }
-    if m == n {
-        rarely_taken();
-        return pvq_best_position_neon::<true>(abs_x, y2f, xy, yy);
     }
 
     // Pass 2: libopus's comparisons against `m`.
@@ -1415,10 +1199,7 @@ fn pvq_best_position_checked_neon(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) 
     let num_m = rm * rm;
     let den_m = yy + y2f[m];
     let vm = vdupq_n_u32(m as u32);
-    let lanes = [0u32, 1, 2, 3];
-    // SAFETY: `lanes` holds four values.
-    let mut vidx = unsafe { vld1q_u32(lanes.as_ptr()) };
-    let four = vdupq_n_u32(4);
+    let mut vidx = lane_idx;
     let mut vok = vdupq_n_u32(u32::MAX);
     for (xa, ya) in x4.iter().zip(y4.iter()) {
         // SAFETY: `xa` and `ya` are references to four values each.
@@ -1468,9 +1249,8 @@ fn pvq_best_position<const SQUARE: bool>(abs_x: &[f32], y2f: &[f32], xy: f32, yy
     // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        // Measured on an Apple M4: the checked form is 1.5 to 2.5 times as
-        // fast for 8 to 32 values, about as fast for 48 and 64, and slower
-        // above, where its division per position costs more than the
+        // Measured on an Apple M4: the checked form is faster for 8 to 64
+        // values. Above 64, its division per position costs as much as the
         // mispredicted branches of the scan.
         if SQUARE && (8..=64).contains(&abs_x.len()) {
             pvq_best_position_checked_neon(abs_x, y2f, xy, yy)
@@ -1893,31 +1673,6 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     }
 }
 
-/// `acc + a * b`, rounded as libopus rounds the C expression on this
-/// processor.
-///
-/// clang builds libopus on 64-bit ARM with `-ffp-contract=on`, its
-/// default. It turns `c + a * b` written in one C expression (`MAC16_16`
-/// of the float build, the steps of a polynomial) into one fused
-/// multiply-add, which rounds once. The arm64 objects of libopus 1.6.1
-/// contain these `fmadd` instructions. x86-64 builds of libopus do not fuse
-/// without `-mfma`, so other targets round the product first.
-#[inline(always)]
-pub(crate) fn mac(acc: f32, a: f32, b: f32) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        // SAFETY: these vector instructions are part of every 64-bit ARM
-        // processor. The compiler turns the three lanes into one scalar
-        // `fmadd`.
-        unsafe { vget_lane_f32::<0>(vfma_f32(vdup_n_f32(acc), vdup_n_f32(a), vdup_n_f32(b))) }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        acc + a * b
-    }
-}
-
 /// One step of the spreading rotation: the new values of `x1` (`x[i]`) and
 /// `x2` (`x[i + stride]`).
 ///
@@ -2126,8 +1881,7 @@ fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) 
 #[inline(always)]
 pub fn exp_rotation(x: &mut [f32], length: usize, dir: i32, stride: usize, k: i32, spread: i32) {
     const SPREAD_FACTOR: [i32; 3] = [15, 10, 5];
-    // stride == 0 would divide by zero in the block-size computation below
-    // (issue #27 deep scan).
+    // A stride of 0 would divide by zero in the block size below.
     if stride == 0 || 2 * k >= length as i32 || spread <= 0 || spread > 3 {
         return;
     }
@@ -2248,66 +2002,6 @@ pub fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
 
 /// # Safety
 ///
-/// `x` must hold at least `n` values, and the CPU must have AVX2 and FMA.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut i = 0;
-
-    while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        acc0 = _mm256_fmadd_ps(v0, v0, acc0);
-        acc1 = _mm256_fmadd_ps(v1, v1, acc1);
-        i += 16;
-    }
-    while i + 8 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        acc0 = _mm256_fmadd_ps(v0, v0, acc0);
-        i += 8;
-    }
-    let acc = _mm256_add_ps(acc0, acc1);
-
-    let lo = _mm256_castps256_ps128(acc);
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let s4 = _mm_add_ps(lo, hi);
-    let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-    let s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
-    let mut e = 1e-15f32 + _mm_cvtss_f32(s1);
-    for j in i..n {
-        e += x[j] * x[j];
-    }
-
-    let g = gain * (1.0 / e.sqrt());
-    let vnorm = _mm256_set1_ps(g);
-    i = 0;
-    while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v0, vnorm));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), _mm256_mul_ps(v1, vnorm));
-        i += 16;
-    }
-    while i + 8 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v0, vnorm));
-        i += 8;
-    }
-    for j in i..n {
-        x[j] *= g;
-    }
-}
-
-/// # Safety
-///
 /// `y` and `x` must hold at least `n` values each, and the CPU must have the
 /// features this function is compiled for.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2407,123 +2101,6 @@ unsafe fn pvq_search_scalar_init_avx2(
         sign_x[j] = (x[j] < 0.0) as i32;
     }
     sum
-}
-
-/// NEON kernel of `renormalise_vector`.
-///
-/// # Safety
-///
-/// `x` must hold at least `n` values. Every load and store covers
-/// `x[i..i + 4]` with `i + 4 <= n`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
-    use core::arch::aarch64::*;
-
-    debug_assert!(x.len() >= n);
-    let mut sum_vec = vdupq_n_f32(0.0);
-    let mut i = 0;
-
-    while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-        sum_vec = vfmaq_f32(sum_vec, x0, x0);
-        sum_vec = vfmaq_f32(sum_vec, x1, x1);
-        sum_vec = vfmaq_f32(sum_vec, x2, x2);
-        sum_vec = vfmaq_f32(sum_vec, x3, x3);
-        i += 16;
-    }
-
-    while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        sum_vec = vfmaq_f32(sum_vec, x0, x0);
-        sum_vec = vfmaq_f32(sum_vec, x1, x1);
-        i += 8;
-    }
-
-    while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        sum_vec = vfmaq_f32(sum_vec, x0, x0);
-        i += 4;
-    }
-
-    let mut e = 1e-15f32 + vaddvq_f32(sum_vec);
-    for j in i..n {
-        e += x[j] * x[j];
-    }
-
-    let g = gain * (1.0 / e.sqrt());
-    let vg = vdupq_n_f32(g);
-
-    i = 0;
-    while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 8), vmulq_f32(x2, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 12), vmulq_f32(x3, vg));
-        i += 16;
-    }
-
-    while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vg));
-        i += 8;
-    }
-
-    while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vg));
-        i += 4;
-    }
-
-    for j in i..n {
-        x[j] *= g;
-    }
-}
-
-/// Scales `x[..n]` so that its energy becomes `gain * gain`.
-///
-/// The codec uses `bands::renormalise_vector`, which rounds the gain in a
-/// different way. Panics when `x` holds fewer than `n` values.
-pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
-    // The only bounds check. The vector kernels read and write `n` values
-    // through pointers.
-    let x = &mut x[..n];
-    // SAFETY: `x` holds exactly `n` values.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        renormalise_vector_neon(x, n, gain);
-    }
-    // SAFETY: `x` holds exactly `n` values, and the kernel runs only when
-    // the CPU has the features it is compiled for.
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if n >= 8 && crate::compat::x86_has_avx2_fma() {
-            renormalise_vector_avx2(x, n, gain);
-            return;
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut e = 1e-15f32;
-        for i in 0..n {
-            e += x[i] * x[i];
-        }
-        let g = gain * (1.0 / e.sqrt());
-        for i in 0..n {
-            x[i] *= g;
-        }
-    }
 }
 
 /// Portable form of `alg_quant_resynth`; `y` and `x` have the same length.
@@ -2645,20 +2222,10 @@ fn alg_quant_resynth(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
     alg_quant_resynth_scalar(y, x, gain);
 }
 
-fn ec_enc_refine(rc: &mut RangeCoder, refine: i32, up: i32, extra_bits: i32) {
-    let half_up = up / 2;
-    let large = refine.abs() > half_up;
-
-    rc.encode_bit_logp(large, 1);
-
-    if large {
-        rc.enc_bits((refine < 0) as u32, 1);
-        rc.enc_bits((refine.abs() - half_up - 1) as u32, (extra_bits - 1) as u32);
-    } else {
-        rc.enc_bits((refine + half_up) as u32, extra_bits as u32);
-    }
-}
-
+/// libopus `alg_quant` (celt/vq.c): codes the band `x[..n]` with `k` pulses.
+/// The band is spread (`exp_rotation`), the pulse vector closest to it is
+/// searched and coded. With `resynth` the band is replaced by what the
+/// decoder will have. Returns the collapse mask of the `stride` blocks.
 #[inline]
 pub fn alg_quant(
     x: &mut [f32],
@@ -2670,154 +2237,25 @@ pub fn alg_quant(
     gain: f32,
     resynth: bool,
 ) -> u32 {
-    if n <= 32 {
-        let mut y_buf = [MaybeUninit::<i32>::uninit(); 32];
-        // SAFETY: `n <= 32` values fit in the buffer. `pvq_search` writes
-        // all `n` values before anything reads them (it panics if `x` is
-        // shorter than `n`).
-        let y = unsafe { core::slice::from_raw_parts_mut(y_buf.as_mut_ptr() as *mut i32, n) };
+    // A band never has more than MAX_PVQ_N values. Checked in release
+    // builds too, because the slice below must fit in the buffer.
+    assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
+    let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
+    // SAFETY: `n` values fit in the buffer (checked above). `pvq_search`
+    // writes all `n` values before anything reads them (it panics if `x` is
+    // shorter than `n`).
+    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
 
-        exp_rotation(x, n, 1, stride, k, spread);
-        pvq_search(x, y, k, n);
-        let mask = extract_collapse_mask(y, n, stride);
+    exp_rotation(x, n, 1, stride, k, spread);
+    pvq_search(x, y, k, n);
+    let mask = extract_collapse_mask(y, n, stride);
+    encode_pulses(y, n as u32, k as u32, rc);
 
-        encode_pulses(y, n as u32, k as u32, rc);
-
-        if resynth {
-            alg_quant_resynth(y, x, n, gain);
-            exp_rotation(x, n, -1, stride, k, spread);
-        }
-        mask
-    } else {
-        // A band never has more than MAX_PVQ_N values. Checked in release
-        // builds too, because the slice below must fit in the buffer.
-        assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
-        let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-        // SAFETY: `n` values fit in the buffer (checked above).
-        // `pvq_search` writes all `n` values before anything reads them.
-        let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
-
-        exp_rotation(x, n, 1, stride, k, spread);
-        pvq_search(x, y, k, n);
-        let mask = extract_collapse_mask(y, n, stride);
-        encode_pulses(y, n as u32, k as u32, rc);
-
-        if resynth {
-            alg_quant_resynth(y, x, n, gain);
-            exp_rotation(x, n, -1, stride, k, spread);
-        }
-        mask
+    if resynth {
+        alg_quant_resynth(y, x, n, gain);
+        exp_rotation(x, n, -1, stride, k, spread);
     }
-}
-
-pub fn alg_quant_qext(
-    x: &mut [f32],
-    n: usize,
-    k: i32,
-    spread: i32,
-    stride: usize,
-    rc: &mut RangeCoder,
-    gain: f32,
-    resynth: bool,
-    extra_bits: Option<i32>,
-) -> u32 {
-    if n <= 32 {
-        let mut y_buf = [0i32; 32];
-        let y = &mut y_buf[..n];
-
-        exp_rotation(x, n, 1, stride, k, spread);
-
-        let use_qext = extra_bits.is_some_and(|eb| eb >= 2);
-
-        if use_qext && n == 2 {
-            let eb = extra_bits.unwrap();
-            pvq_search_n2(x, y, k);
-            let mask = extract_collapse_mask(y, n, stride);
-            encode_pulses(y, n as u32, k as u32, rc);
-
-            let up = (1 << eb) - 1;
-            let abs_x0 = x[0].abs();
-            let abs_x1 = x[1].abs();
-            let sum = abs_x0 + abs_x1;
-            if sum >= 1e-15 {
-                let rcp_sum = 1.0 / sum;
-                let ideal_y0 = k as f32 * abs_x0 * rcp_sum;
-                let actual_y0 = y[0].abs() as f32;
-                let refine = ((ideal_y0 - actual_y0) * up as f32).round() as i32;
-                ec_enc_refine(rc, refine, up, eb);
-            }
-
-            if resynth {
-                alg_quant_resynth(y, x, n, gain);
-                exp_rotation(x, n, -1, stride, k, spread);
-            }
-            return mask;
-        }
-
-        if use_qext && n > 2 && n <= 32 {
-            let eb = extra_bits.unwrap();
-            let mut up_y = [0i32; 32];
-            let mut refine = [0i32; 32];
-            let _yy = pvq_search_qext(x, y, &mut up_y, &mut refine, k, eb, n);
-            let mask = extract_collapse_mask(&up_y, n, stride);
-            encode_pulses(y, n as u32, k as u32, rc);
-
-            let up = (1 << eb) - 1;
-            for i in 0..n - 1 {
-                ec_enc_refine(rc, refine[i], up, eb);
-            }
-
-            if y[n - 1] == 0 {
-                rc.enc_bits((up_y[n - 1] < 0) as u32, 1);
-            }
-
-            if resynth {
-                alg_quant_resynth(&up_y, x, n, gain);
-                exp_rotation(x, n, -1, stride, k, spread);
-            }
-            return mask;
-        }
-
-        pvq_search(x, y, k, n);
-        let mask = extract_collapse_mask(y, n, stride);
-        encode_pulses(y, n as u32, k as u32, rc);
-
-        if resynth {
-            alg_quant_resynth(y, x, n, gain);
-            exp_rotation(x, n, -1, stride, k, spread);
-        }
-        mask
-    } else {
-        // As in `alg_quant`.
-        assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
-        let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-        // SAFETY: `n` values fit in the buffer (checked above).
-        // `pvq_search` writes all `n` values before anything reads them.
-        let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
-
-        exp_rotation(x, n, 1, stride, k, spread);
-        pvq_search(x, y, k, n);
-        let mask = extract_collapse_mask(y, n, stride);
-        encode_pulses(y, n as u32, k as u32, rc);
-
-        if resynth {
-            let mut ryy = 0.0f32;
-            for i in 0..n {
-                let v = y[i] as f32;
-                x[i] = v;
-                ryy += v * v;
-            }
-            // C (normalise_residual): `g = (1.f/sqrt(Ryy)) * gain`, the reciprocal
-            // first. `ryy` is a whole number of at least 1 for a band with pulses,
-            // so the 1e-15 changes nothing there; it keeps an empty vector finite.
-            let g = (1.0 / (1e-15 + ryy).sqrt()) * gain;
-            for i in 0..n {
-                x[i] *= g;
-            }
-            exp_rotation(x, n, -1, stride, k, spread);
-        }
-        mask
-    }
+    mask
 }
 
 #[inline]
@@ -3010,6 +2448,14 @@ mod tests {
             };
             assert_eq!(scalar, want, "scalar: {abs_x:?} {y2f:?} xy {xy} yy {yy}");
             assert_eq!(dispatched, want, "vector: {abs_x:?} {y2f:?} xy {xy} yy {yy}");
+            // The checked form at every length it accepts, not only the
+            // lengths `pvq_best_position` gives it.
+            #[cfg(target_arch = "aarch64")]
+            if square && abs_x.len() >= 4 {
+                // SAFETY: NEON is part of the baseline of every aarch64 target.
+                let checked = unsafe { pvq_best_position_checked_neon(abs_x, y2f, xy, yy) };
+                assert_eq!(checked, want, "checked: {abs_x:?} {y2f:?} xy {xy} yy {yy}");
+            }
         }
     }
 
@@ -3180,9 +2626,9 @@ mod tests {
 
     /// Pairs `(c, s)`: real rotation angles in both directions and extremes.
     const ROTATION_CS: [(f32, f32); 8] = [
-        (0.92387953, 0.38268343),
-        (0.92387953, -0.38268343),
-        (0.38268343, -0.92387953),
+        (0.9238795, 0.38268343),
+        (0.9238795, -0.38268343),
+        (0.38268343, -0.9238795),
         (0.70710677, 0.70710677),
         (1.0, 0.0),
         (0.0, -1.0),
@@ -3292,7 +2738,7 @@ mod tests {
                 let mut y: Vec<i32> = (0..n)
                     .map(|_| {
                         let v = (rng.next_u32() % (2 * top as u32 + 1)) as i32 - top;
-                        if round % 3 == 0 && rng.next_u32() % 4 != 0 { 0 } else { v }
+                        if round % 3 == 0 && !rng.next_u32().is_multiple_of(4) { 0 } else { v }
                     })
                     .collect();
                 if round == 7 {
@@ -3342,8 +2788,8 @@ mod tests {
     }
 
     /// The resynthesis must not write past a band that is shorter than `n`.
-    /// Before the check in `alg_quant_resynth`, `alg_unquant` on aarch64 wrote
-    /// the decoded band through a pointer without looking at `x.len()`.
+    /// The vector kernels write through pointers, so `alg_quant_resynth`
+    /// cuts `x` and `y` to `n` first, which panics when one is shorter.
     #[test]
     fn resynthesis_rejects_a_band_that_is_too_short() {
         let y = [1i32; 16];
@@ -3375,7 +2821,7 @@ mod tests {
         }
         let renorm = std::panic::catch_unwind(|| {
             let mut x = [0.5f32; 15];
-            renormalise_vector(&mut x, 16, 1.0);
+            crate::bands::renormalise_vector(&mut x, 16, 1.0);
         });
         assert!(renorm.is_err(), "renormalise_vector with a short x");
     }
@@ -3397,7 +2843,7 @@ mod tests {
                 for _ in 0..8 {
                     cases.push(
                         (0..n)
-                            .map(|_| if rng.next_u32() % 9 == 0 { (rng.next_u32() % 5) as i32 - 2 } else { 0 })
+                            .map(|_| if rng.next_u32().is_multiple_of(9) { (rng.next_u32() % 5) as i32 - 2 } else { 0 })
                             .collect(),
                     );
                 }
@@ -3427,7 +2873,7 @@ mod tests {
         {
             let n4 = abs_x.len() & !3;
             let mut lanes = [0.0f32; 4];
-            for group in abs_x[..n4].chunks_exact(4) {
+            for group in abs_x[..n4].as_chunks::<4>().0 {
                 for l in 0..4 {
                     lanes[l] += group[l];
                 }
@@ -3577,10 +3023,9 @@ mod tests {
         assert!(too_long.is_err());
     }
 
-    /// The sum of magnitudes as the NEON start-up kernel computed it before
-    /// `pvq_magnitude_sum` replaced it: one register of four running sums
-    /// over the blocks of 16, 8 and 4 values, a pairwise reduction, and the
-    /// last values added one by one.
+    /// The reference for `pvq_magnitude_sum`: a sum of magnitudes with one
+    /// register of four running sums over the blocks of 16, 8 and 4 values,
+    /// a pairwise reduction, and the last values added one by one.
     #[cfg(target_arch = "aarch64")]
     fn magnitude_sum_old_kernel(abs_x: &[f32]) -> f32 {
         use core::arch::aarch64::*;

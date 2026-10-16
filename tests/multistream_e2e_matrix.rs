@@ -18,26 +18,26 @@
 //!   With constant bitrate the packets have the size of the libopus
 //!   packets. With variable bitrate the total stays near the request and
 //!   near libopus.
-//! - Quality: the SNR of every channel with the opus-rs encoder, against
+//! - Quality: the SNR of every channel with the opus1 encoder, against
 //!   the libopus encoder, both decoded by libopus.
-//! - The opus-rs decoder: its output has the SNR of the libopus decoder's
+//! - The opus1 decoder: its output has the SNR of the libopus decoder's
 //!   output, for the packets of either encoder.
 //!
 //! Every test prints the measurements of its layouts; run with
 //! `--nocapture` to see them. With the environment variable `MS_E2E_CASES`
 //! set, it prints one line per setting as well.
 //!
-//! Where opus-rs differs, the cause is in the stream encoder, not in the
+//! Where opus1 differs, the cause is in the stream encoder, not in the
 //! multistream layer: tests/multistream_enc_streams.rs shows that every
 //! stream holds the bytes a single `OpusEncoder` writes. The differences
 //! that the limits below leave room for:
 //!
 //! - A stream that picks its own mode can pick another one than libopus,
 //!   in up to 7 % of its frames. libopus goes by its analysis of the
-//!   signal, which opus-rs does not have
+//!   signal, which opus1 does not have
 //!   (tests/multistream_e2e_modes.rs).
 //! - A stereo stream outside surround mode is coded as mono by libopus at
-//!   12 kb/s per channel. opus-rs always codes two channels.
+//!   12 kb/s per channel. opus1 always codes two channels.
 //! - Single channels are up to 9 dB below libopus. The largest gaps: mono
 //!   CELT streams with 2.5 ms frames at 32 kb/s and 48 kHz (7 to 9 dB), and
 //!   the right channel of a stereo CELT stream with 5 ms frames at 12 kb/s
@@ -45,7 +45,7 @@
 //!   0.9 dB.
 //! - Of the average gap of the stereo streams at 48 kHz, 0.7 to 0.85 dB
 //!   come from the pitch pre-filter: libopus runs it on mono and stereo
-//!   streams from complexity 5 on, opus-rs on mono streams only
+//!   streams from complexity 5 on, opus1 on mono streams only
 //!   (`pf_enabled` in src/celt.rs). Measured on this matrix at 12, 32 and
 //!   64 kb/s per channel: 0.6, 0.0 and 0.2 dB below libopus at complexity
 //!   4, and 1.3, 0.8 and 1.0 dB at complexity 5. At 24 and 16 kHz the two
@@ -65,8 +65,8 @@ mod multistream_enc_common;
 
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
-use opus_rs::multistream::MappingType;
+use opus1::Application;
+use opus1::multistream::MappingType;
 
 /// Signal length per setting in seconds. The first 0.2 s are not measured.
 const SECONDS: f64 = 0.8;
@@ -268,12 +268,12 @@ fn check_setting(m: &Measured, wrong: &mut Vec<String>, audio_in_one_only: &mut 
         // The two decoders give the same SNR for the same packets.
         // Measured: within 0.05 dB in every setting.
         for (ours, theirs, whose) in [
-            (RUST_TO_RUST, RUST_TO_C, "opus-rs"),
+            (RUST_TO_RUST, RUST_TO_C, "opus1"),
             (C_TO_RUST, C_TO_C, "libopus"),
         ] {
             if (row.snr[ours] - row.snr[theirs]).abs() > 0.2 {
                 fail(format!(
-                    "channel {ch}: the opus-rs decoder gives {:.2} dB on {whose} packets, the \
+                    "channel {ch}: the opus1 decoder gives {:.2} dB on {whose} packets, the \
                      libopus decoder {:.2} dB",
                     row.snr[ours], row.snr[theirs]
                 ));
@@ -374,19 +374,19 @@ fn the_layouts_of_the_matrix_have_the_mapping_types_of_libopus() {
 /// noise the signal has nothing above 2.5 kHz. The analysis of libopus then
 /// lowers the bandwidth of a stream that picks its own
 /// (opus_encoder.c:1652-1673), and libopus puts its bits where the signal
-/// is. opus-rs has no analysis and codes the bandwidth the bitrate allows.
+/// is. opus1 has no analysis and codes the bandwidth the bitrate allows.
 ///
 /// Shown on four CELT-only mono streams (family 2) at 24 kHz with 2.5 ms
 /// frames and 32 kb/s per channel. Measured without the noise: libopus
-/// codes narrowband in 964 of 1280 stream packets where opus-rs codes
-/// wideband, and opus-rs is 3.4 dB below libopus on average (8.6 dB when
-/// this test was written; opus-rs has improved since). With the noise: the
-/// same bandwidth in every packet, and opus-rs is 0.8 dB above.
+/// codes narrowband in 964 of 1280 stream packets where opus1 codes
+/// wideband, and opus1 is 3.4 dB below libopus on average (8.6 dB when
+/// this test was written; opus1 has improved since). With the noise: the
+/// same bandwidth in every packet, and opus1 is 0.8 dB above.
 ///
 /// The bound on the gap without the noise is relative to the gap with it,
 /// where both code the same bandwidth: the narrower bandwidth gains libopus
-/// at least 2 dB against opus-rs (measured 4.2 dB). A fixed bound on the gap
-/// itself held opus-rs to being far behind.
+/// at least 2 dB against opus1 (measured 4.2 dB). A fixed bound on the gap
+/// itself held opus1 to being far behind.
 #[test]
 fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
     let fs = 24_000;
@@ -409,7 +409,7 @@ fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
 
     let without = measure_signal(setting, &program_without_noise(fs, &case, samples));
     println!(
-        "without noise: another bandwidth in {} of {} stream packets, opus-rs {:+.1} dB",
+        "without noise: another bandwidth in {} of {} stream packets, opus1 {:+.1} dB",
         without.structure.bandwidth,
         without.structure.compared,
         gap(&without)
@@ -418,7 +418,7 @@ fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
 
     let with = measure_signal(setting, &program(fs, &case, samples));
     println!(
-        "with noise: another bandwidth in {} of {} stream packets, opus-rs {:+.1} dB",
+        "with noise: another bandwidth in {} of {} stream packets, opus1 {:+.1} dB",
         with.structure.bandwidth,
         with.structure.compared,
         gap(&with)
@@ -432,17 +432,17 @@ fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
     );
 }
 
-/// A single CELT stream of opus-rs against libopus where it was furthest
+/// A single CELT stream of opus1 against libopus where it was furthest
 /// behind: mono, 48 kHz, 2.5 ms frames, 32 kb/s. Mode, bandwidth and packet
 /// sizes are those of libopus.
 ///
 /// It is not the multistream layer: the layout is one mono stream.
 ///
 /// Both encoders use the pitch pre-filter of CELT from complexity 5 on.
-/// When this test was written opus-rs was 0.5 dB behind libopus at
+/// When this test was written opus1 was 0.5 dB behind libopus at
 /// complexity 4 and 8 dB behind with the pre-filter (11.5 / 19.3 dB); it was
 /// then ignored because a merge left 17.8 dB at complexity 4. Measured now,
-/// on the integration branch as on this one, opus-rs / libopus:
+/// on the integration branch as on this one, opus1 / libopus:
 ///
 /// - complexity 4, no pre-filter: 20.4 / 20.4 dB;
 /// - complexity 5: 19.3 / 19.3 dB;
@@ -466,7 +466,7 @@ fn mono_2_5_ms_frames_reach_libopus_with_and_without_the_pre_filter() {
         let m = measure(Setting { complexity, ..setting }, 2.0);
         let (rust, c) = (m.channels[0].snr[RUST_TO_C], m.channels[0].snr[C_TO_C]);
         println!(
-            "complexity {complexity}: opus-rs {rust:.1} dB, libopus {c:.1} dB; {:.0} / {:.0} b/s",
+            "complexity {complexity}: opus1 {rust:.1} dB, libopus {c:.1} dB; {:.0} / {:.0} b/s",
             m.rate[RUST], m.rate[C]
         );
         // The same mode and bandwidth in every packet, and the same rate.
@@ -479,7 +479,7 @@ fn mono_2_5_ms_frames_reach_libopus_with_and_without_the_pre_filter() {
         assert!((m.rate[RUST] / m.rate[C] - 1.0).abs() < 0.01);
         assert!(
             rust - c > limit,
-            "complexity {complexity}: opus-rs {rust:.1} dB, libopus {c:.1} dB"
+            "complexity {complexity}: opus1 {rust:.1} dB, libopus {c:.1} dB"
         );
     }
 }

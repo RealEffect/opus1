@@ -19,7 +19,7 @@ fn coarse_distance(a: &Header, b: &Header, from: usize) -> i32 {
 /// After each frame libopus clears the energy history of the bands the
 /// frame did not code: "In case start or end were to change"
 /// (celt_encoder.c 2789). When the bandwidth goes up again, the new bands
-/// are predicted from an energy of zero. opus-rs kept the energies these
+/// are predicted from an energy of zero. opus1 kept the energies these
 /// bands had when they were last coded, and predicted from those.
 ///
 /// The stream here is fullband, then narrowband for half a second, then
@@ -60,7 +60,7 @@ fn bands_outside_the_coded_range_lose_their_history() {
             snr_db_delay(&pcm, &decoded, 1, back * frame, CELT_DELAY)
         };
         println!(
-            "{bitrate} b/s, last part: opus-rs {:.2} dB, libopus {:.2} dB",
+            "{bitrate} b/s, last part: opus1 {:.2} dB, libopus {:.2} dB",
             snr(&rs),
             snr(&c)
         );
@@ -68,7 +68,7 @@ fn bands_outside_the_coded_range_lose_their_history() {
         let hc = parse_header(&c[back], 1, 21, 3);
         let hr = parse_header(&rs[back], 1, 21, 3);
         println!("{bitrate} b/s, libopus: intra {}, coarse {:?}", hc.intra, &hc.coarse[13..]);
-        println!("{bitrate} b/s, opus-rs: intra {}, coarse {:?}", hr.intra, &hr.coarse[13..]);
+        println!("{bitrate} b/s, opus1: intra {}, coarse {:?}", hr.intra, &hr.coarse[13..]);
         assert_eq!(hr.intra, hc.intra);
         let d = coarse_distance(&hc, &hr, 13);
         assert!(d <= 2, "bands 13 to 20 differ by {d} steps in all");
@@ -79,7 +79,7 @@ fn bands_outside_the_coded_range_lose_their_history() {
 /// a transient frame after two or more of them has no anti-collapse. A
 /// frame that cannot signal a transient counts too: every 2.5 ms frame,
 /// and a frame without room for the flag (celt_encoder.c 2809-2812,
-/// `transient_got_disabled`). opus-rs counted only real transients, so
+/// `transient_got_disabled`). opus1 counted only real transients, so
 /// the first transient frame after a run of 2.5 ms frames had the flag on.
 ///
 /// The stream is mono, 48 kHz, 64 kb/s: four 2.5 ms frames of quiet noise,
@@ -113,7 +113,7 @@ fn frames_without_a_transient_flag_count_for_anti_collapse() {
         let c = long.c_frame(&mut c_enc, pcm);
         let rs = long.rs_frame(&mut rs_enc, pcm);
         let (fc, fr) = (anti_collapse_flag(&c, 1, 21, 2), anti_collapse_flag(&rs, 1, 21, 2));
-        println!("10 ms frame {k}: anti-collapse libopus {fc:?}, opus-rs {fr:?}");
+        println!("10 ms frame {k}: anti-collapse libopus {fc:?}, opus1 {fr:?}");
         flags.push((fc, fr));
     }
     // libopus: the first click follows four 2.5 ms frames, the second one
@@ -128,7 +128,7 @@ fn frames_without_a_transient_flag_count_for_anti_collapse() {
 /// When a frame has no room left for the spreading decision, libopus
 /// stores the normal spreading (celt_encoder.c 2349-2351), whatever the
 /// complexity. The next frame that decides by analysis starts its
-/// hysteresis from that value. opus-rs stored "no spreading" for such a
+/// hysteresis from that value. opus1 stored "no spreading" for such a
 /// frame at complexity 0.
 ///
 /// Mono, 48 kHz, 20 ms: ten frames at complexity 0 in packets of 2 bytes,

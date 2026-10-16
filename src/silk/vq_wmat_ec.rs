@@ -244,6 +244,7 @@ pub fn silk_vq_wmat_ec(
 mod neon {
     use super::CorrMatrix;
     use crate::silk::define::LTP_ORDER;
+    use crate::silk::sigproc_fix::smulwb_operand;
     use crate::silk::tables::{
         SILK_LTP_GAIN_BITS_Q5_0, SILK_LTP_GAIN_BITS_Q5_1, SILK_LTP_GAIN_BITS_Q5_2,
         SILK_LTP_GAIN_VQ_0_GAIN, SILK_LTP_GAIN_VQ_1_GAIN, SILK_LTP_GAIN_VQ_2_GAIN,
@@ -258,8 +259,7 @@ mod neon {
     pub(super) struct Group {
         /// `cb_q7[c]` holds coefficient `c` of the four vectors.
         cb_q7: [[i32; 4]; LTP_ORDER],
-        /// The same values shifted left by 15, as the second factor of a
-        /// multiply that keeps the upper half of the doubled product.
+        /// The `smulwb_operand` of each value.
         cb_q22: [[i32; 4]; LTP_ORDER],
         /// Sum of the absolute coefficients of each vector.
         gain_q7: [i32; 4],
@@ -286,7 +286,7 @@ mod neon {
             let mut c = 0;
             while c < LTP_ORDER {
                 out[group].cb_q7[c][lane] = cb_q7[k][c] as i32;
-                out[group].cb_q22[c][lane] = (cb_q7[k][c] as i32) << 15;
+                out[group].cb_q22[c][lane] = smulwb_operand(cb_q7[k][c] as i16);
                 c += 1;
             }
             out[group].gain_q7[lane] = cb_gain_q7[k] as i32;
@@ -319,8 +319,8 @@ mod neon {
     /// or `None` when no vector qualified.
     ///
     /// Every sum of the scalar code wraps around, so the order of the
-    /// additions is free here. `(a * b) >> 16` with a 16-bit `b`
-    /// (`silk_smulwb`) is computed as the upper half of `2 * a * (b << 15)`.
+    /// additions is free here. `silk_smulwb` is `vqdmulhq_s32` with a
+    /// `smulwb_operand`.
     pub(super) fn search(
         xx_q17: &CorrMatrix,
         neg_xx_q24: &[i32; LTP_ORDER],

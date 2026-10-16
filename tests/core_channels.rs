@@ -24,14 +24,14 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{chirp, full_scale, multitone, speech_fullband, to_stereo, toc};
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 
 /// Output rates a decoder can have.
 const DEC_RATES: [usize; 5] = [8000, 12000, 16000, 24000, 48000];
 /// The input rate of every encoder here. Any bandwidth can be coded from it.
 const ENC_RATE: usize = 48000;
 
-/// A libopus decoder and an opus-rs decoder that get the same calls.
+/// A libopus decoder and an opus1 decoder that get the same calls.
 struct Pair {
     c: CDecoder,
     rs: OpusDecoder,
@@ -64,13 +64,13 @@ impl Pair {
 
     fn compare(&mut self, what: &str, expected: Result<Vec<f32>, i32>, got: Result<usize, &'static str>, buf: &[f32]) -> Vec<f32> {
         let expected = expected.unwrap_or_else(|e| panic!("{what}: libopus error {e}"));
-        let n = got.unwrap_or_else(|e| panic!("{what}: opus-rs error: {e}"));
+        let n = got.unwrap_or_else(|e| panic!("{what}: opus1 error: {e}"));
         assert_eq!(n * self.channels, expected.len(), "{what}: number of samples");
         let ours = &buf[..n * self.channels];
         // A call that libopus leaves silent has no SNR. It must be silent
         // here too.
         if expected.iter().all(|v| *v == 0.0) {
-            assert!(ours.iter().all(|v| *v == 0.0), "{what}: libopus is silent, opus-rs is not");
+            assert!(ours.iter().all(|v| *v == 0.0), "{what}: libopus is silent, opus1 is not");
         } else {
             self.worst = self.worst.min(snr(&expected, ours));
         }
@@ -479,7 +479,7 @@ impl Rng {
 
 /// Packets of every mode, bandwidth, frame size and channel count, whole
 /// and damaged, mixed with losses and FEC calls of any duration, through a
-/// libopus decoder and an opus-rs decoder of either channel count.
+/// libopus decoder and an opus1 decoder of either channel count.
 ///
 /// - No call panics.
 /// - Both decoders accept and reject the same calls, and give the same
@@ -551,7 +551,7 @@ fn damaged_packets_losses_and_fec_in_any_order_follow_libopus() {
                     accepted += 1;
                 }
                 (Err(_), Err(_)) => rejected += 1,
-                (expected, got) => panic!("{call}: libopus {:?}, opus-rs {got:?}", expected.map(|v| v.len())),
+                (expected, got) => panic!("{call}: libopus {:?}, opus1 {got:?}", expected.map(|v| v.len())),
             }
         }
     }

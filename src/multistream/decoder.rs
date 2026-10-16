@@ -7,9 +7,9 @@
 //!
 //! Memory is allocated in the constructor only. Decoding allocates nothing.
 
-use super::layout::{ChannelLayout, SILENT_CHANNEL};
-use super::{ChannelMappingTable, ChannelSink};
-use crate::{OpusDecoder, float2int16, packet};
+use super::layout::{ChannelLayout, ChannelsByEntry, SILENT_CHANNEL};
+use super::{ChannelMappingTable, ChannelSink, Sample};
+use crate::{OpusDecoder, packet};
 
 /// Decoder for a multistream Opus stream: libopus `OpusMSDecoder`.
 ///
@@ -17,6 +17,8 @@ use crate::{OpusDecoder, float2int16, packet};
 /// `i * channels + c`. A frame size is always in samples per channel.
 pub struct MultistreamDecoder {
     layout: ChannelLayout,
+    /// The output channels of each decoded channel, and the silent ones.
+    outputs: ChannelsByEntry,
     sampling_rate: i32,
     /// One decoder per stream. The first `layout.coupled_streams()` of them
     /// have 2 channels, the others 1.
@@ -25,13 +27,15 @@ pub struct MultistreamDecoder {
     buf: Vec<f32>,
 }
 
-/// Interleaved `f32` output: libopus `opus_copy_channel_out_float`.
-struct FloatSink<'a> {
-    out: &'a mut [f32],
+/// Interleaved output: libopus `opus_copy_channel_out_float` and
+/// `opus_copy_channel_out_short`. 16-bit samples are rounded and limited to
+/// the 16-bit range.
+struct InterleavedSink<'a, T> {
+    out: &'a mut [T],
     channels: usize,
 }
 
-impl ChannelSink for FloatSink<'_> {
+impl<T: Sample> ChannelSink for InterleavedSink<'_, T> {
     #[inline]
     fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize)>, frame_size: usize) {
         let Some(out) = self.out.get_mut(dst_channel..) else {
@@ -41,40 +45,12 @@ impl ChannelSink for FloatSink<'_> {
         match src {
             Some((samples, stride)) => {
                 for (d, &s) in dst.zip(samples.iter().step_by(stride.max(1))) {
-                    *d = s;
+                    *d = T::from_f32(s);
                 }
             }
             None => {
                 for d in dst {
-                    *d = 0.0;
-                }
-            }
-        }
-    }
-}
-
-/// Interleaved 16-bit output: libopus `opus_copy_channel_out_short`.
-struct I16Sink<'a> {
-    out: &'a mut [i16],
-    channels: usize,
-}
-
-impl ChannelSink for I16Sink<'_> {
-    #[inline]
-    fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize)>, frame_size: usize) {
-        let Some(out) = self.out.get_mut(dst_channel..) else {
-            return;
-        };
-        let dst = out.iter_mut().step_by(self.channels.max(1)).take(frame_size);
-        match src {
-            Some((samples, stride)) => {
-                for (d, &s) in dst.zip(samples.iter().step_by(stride.max(1))) {
-                    *d = float2int16(s);
-                }
-            }
-            None => {
-                for d in dst {
-                    *d = 0;
+                    *d = T::ZERO;
                 }
             }
         }
@@ -129,8 +105,9 @@ impl MultistreamDecoder {
             decoders.push(OpusDecoder::new(sampling_rate, stream_channels)?);
         }
         // `OpusDecoder::new` has checked the sampling rate.
-        let max_frame = sampling_rate as usize / 25 * 3;
+        let max_frame = packet::max_packet_samples(sampling_rate);
         Ok(Self {
+            outputs: ChannelsByEntry::new(&layout),
             layout,
             sampling_rate,
             decoders,
@@ -170,7 +147,7 @@ impl MultistreamDecoder {
     ) -> Result<usize, &'static str> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
-        self.decode_native(packet, frame_size, &mut FloatSink { out, channels }, false, false)
+        self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, false, false)
     }
 
     /// [`decode`](Self::decode) with 16-bit output: libopus
@@ -187,7 +164,7 @@ impl MultistreamDecoder {
     ) -> Result<usize, &'static str> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
-        self.decode_native(packet, frame_size, &mut I16Sink { out, channels }, false, true)
+        self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, false, true)
     }
 
     /// Rebuilds a lost packet from the forward error correction (FEC) data
@@ -211,7 +188,7 @@ impl MultistreamDecoder {
     ) -> Result<usize, &'static str> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
-        self.decode_native(packet, frame_size, &mut FloatSink { out, channels }, true, false)
+        self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, true, false)
     }
 
     /// [`decode_fec`](Self::decode_fec) with 16-bit output: libopus
@@ -224,7 +201,7 @@ impl MultistreamDecoder {
     ) -> Result<usize, &'static str> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
-        self.decode_native(packet, frame_size, &mut I16Sink { out, channels }, true, true)
+        self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, true, true)
     }
 
     /// libopus `OPUS_GET_FINAL_RANGE` of a multistream decoder: the final
@@ -265,7 +242,7 @@ impl MultistreamDecoder {
             return Err("frame_size must not be 0");
         }
         // C: "Limit frame_size to avoid excessive stack allocations."
-        let frame_size = frame_size.min(self.sampling_rate as usize / 25 * 3);
+        let frame_size = frame_size.min(packet::max_packet_samples(self.sampling_rate));
         if out_len / self.layout.channels() < frame_size {
             return Err("output buffer too small for frame_size * channels");
         }
@@ -282,7 +259,7 @@ impl MultistreamDecoder {
         decode_fec: bool,
         soft_clip: bool,
     ) -> Result<usize, &'static str> {
-        let Self { layout, sampling_rate, decoders, buf } = self;
+        let Self { layout, outputs, sampling_rate, decoders, buf } = self;
         let streams = layout.streams();
         let coupled_streams = layout.coupled_streams();
 
@@ -311,11 +288,14 @@ impl MultistreamDecoder {
             let stream_buf = buf
                 .get_mut(..frame_size * stream_channels)
                 .ok_or("Internal error: stream buffer too small")?;
-            let (samples, used) = if soft_clip {
-                dec.decode_native_soft_clip(rest, frame_size, stream_buf, decode_fec, self_delimited)?
-            } else {
-                dec.decode_native(rest, frame_size, stream_buf, decode_fec, self_delimited)?
-            };
+            let (samples, used) = dec.decode_native(
+                rest,
+                frame_size,
+                stream_buf,
+                decode_fec,
+                self_delimited,
+                soft_clip,
+            )?;
             if !do_plc {
                 rest = rest.get(used..).unwrap_or(&[]);
             }
@@ -324,32 +304,25 @@ impl MultistreamDecoder {
             }
             frame_size = samples;
             let stream_buf = &buf[..frame_size * stream_channels];
+            // Copy each decoded channel to every output channel that uses
+            // it: the left and the right channel of a coupled stream, or
+            // the one channel of a mono stream.
             if s < coupled_streams {
-                // Copy the left channel to every output channel that uses it.
-                let mut prev = None;
-                while let Some(chan) = layout.left_channel(s, prev) {
-                    sink.put(chan, Some((stream_buf, 2)), frame_size);
-                    prev = Some(chan);
+                for &chan in outputs.with_entry(2 * s) {
+                    sink.put(chan as usize, Some((stream_buf, 2)), frame_size);
                 }
-                // The same for the right channel.
-                let mut prev = None;
-                while let Some(chan) = layout.right_channel(s, prev) {
-                    sink.put(chan, Some((&stream_buf[1..], 2)), frame_size);
-                    prev = Some(chan);
+                for &chan in outputs.with_entry(2 * s + 1) {
+                    sink.put(chan as usize, Some((&stream_buf[1..], 2)), frame_size);
                 }
             } else {
-                let mut prev = None;
-                while let Some(chan) = layout.mono_channel(s, prev) {
-                    sink.put(chan, Some((stream_buf, 1)), frame_size);
-                    prev = Some(chan);
+                for &chan in outputs.with_entry(s + coupled_streams) {
+                    sink.put(chan as usize, Some((stream_buf, 1)), frame_size);
                 }
             }
         }
         // Channels that no stream feeds are silent.
-        for (c, &m) in layout.mapping().iter().enumerate() {
-            if m == SILENT_CHANNEL {
-                sink.put(c, None, frame_size);
-            }
+        for &chan in outputs.with_entry(SILENT_CHANNEL as usize) {
+            sink.put(chan as usize, None, frame_size);
         }
         Ok(frame_size)
     }
@@ -407,11 +380,11 @@ mod tests {
     fn sinks_write_one_channel_and_leave_the_others() {
         let src = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut out = [9.0f32; 9];
-        let mut sink = FloatSink { out: &mut out, channels: 3 };
+        let mut sink = InterleavedSink { out: &mut out, channels: 3 };
         // Every second sample of `src`, to channel 1.
         sink.put(1, Some((&src, 2)), 3);
         assert_eq!(out, [9.0, 1.0, 9.0, 9.0, 3.0, 9.0, 9.0, 5.0, 9.0]);
-        let mut sink = FloatSink { out: &mut out, channels: 3 };
+        let mut sink = InterleavedSink { out: &mut out, channels: 3 };
         // The same samples starting at the second one, to channel 2.
         sink.put(2, Some((&src[1..], 2)), 3);
         sink.put(0, None, 2);
@@ -419,10 +392,10 @@ mod tests {
 
         let src = [0.5f32, -0.5, 2.0, -2.0];
         let mut out = [7i16; 8];
-        let mut sink = I16Sink { out: &mut out, channels: 2 };
+        let mut sink = InterleavedSink { out: &mut out, channels: 2 };
         sink.put(0, Some((&src, 1)), 4);
         assert_eq!(out, [16384, 7, -16384, 7, 32767, 7, -32768, 7]);
-        let mut sink = I16Sink { out: &mut out, channels: 2 };
+        let mut sink = InterleavedSink { out: &mut out, channels: 2 };
         sink.put(1, None, 3);
         assert_eq!(out, [16384, 0, -16384, 0, 32767, 0, -32768, 7]);
     }
@@ -431,14 +404,14 @@ mod tests {
     fn sinks_do_not_panic_on_arguments_that_do_not_fit() {
         let src = [1.0f32; 4];
         let mut out = [0.0f32; 4];
-        let mut sink = FloatSink { out: &mut out, channels: 2 };
+        let mut sink = InterleavedSink { out: &mut out, channels: 2 };
         // A channel beyond the output, more samples than there are, stride 0.
         sink.put(9, Some((&src, 1)), 4);
         sink.put(1, Some((&src, 1)), 100);
         sink.put(0, Some((&src, 0)), 2);
         sink.put(0, Some((&[], 1)), 2);
         let mut out = [0i16; 4];
-        let mut sink = I16Sink { out: &mut out, channels: 0 };
+        let mut sink = InterleavedSink { out: &mut out, channels: 0 };
         sink.put(9, None, 4);
         sink.put(0, Some((&src, 0)), 100);
     }

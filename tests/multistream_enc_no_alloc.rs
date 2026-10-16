@@ -15,9 +15,9 @@
 //! `heap` feature. It is not called per frame.
 #![cfg(feature = "std")]
 
-use opus_rs::multistream::encoder::{Bitrate, MultistreamEncoder};
-use opus_rs::multistream::layout::MappingType;
-use opus_rs::{Application, Bandwidth};
+use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::multistream::layout::MappingType;
+use opus1::{Application, Bandwidth};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

@@ -1,12 +1,13 @@
 //! Stack-usage and struct-size coverage for the `heap` feature (issue #12).
 //!
 //! Since 0.1.27 the codec state lives inline in `OpusEncoder`/`OpusDecoder`
-//! (~250 KB / ~175 KB without `heap`), so constructing them required ~850 KiB of
-//! stack (Windows main threads default to 1 MiB). With the `heap` feature the
-//! state is `Box`-allocated, the structs shrink to ~1 KB, and construction plus
-//! a full encode/decode round-trip must fit comfortably on a 256 KiB stack.
+//! without `heap`. In 0.1.27 they were ~250 KB / ~175 KB, so constructing them
+//! required ~850 KiB of stack (Windows main threads default to 1 MiB). In 0.2.0
+//! they are ~135 KB / ~67 KB. With the `heap` feature the state is
+//! `Box`-allocated, the structs shrink to a few KB, and construction plus a
+//! full encode/decode round-trip must fit on a 768 KiB stack.
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 /// `size_of` returns bytes.
 #[cfg(feature = "heap")]
@@ -27,17 +28,21 @@ fn encoder_and_decoder_structs_are_small_with_heap() {
 /// Without `heap` the state is inline, so the structs must be large — this
 /// keeps the tradeoff visible and guards against accidentally making the
 /// heap-free build tiny (which would break its `static`-placement model).
+///
+/// The bound is 32 KiB, eight times the bound of the `heap` build. Inline
+/// state is far above it (in 0.2.0, 135,192 and 67,432 bytes on aarch64), a
+/// `Box`ed state far below it.
 #[cfg(not(feature = "heap"))]
 #[test]
 fn structs_are_large_without_heap() {
     assert!(
-        std::mem::size_of::<OpusEncoder>() > 100_000,
-        "OpusEncoder is {} bytes without heap; expected > 100 KiB",
+        std::mem::size_of::<OpusEncoder>() > 32 * 1024,
+        "OpusEncoder is {} bytes without heap; expected > 32 KiB",
         std::mem::size_of::<OpusEncoder>()
     );
     assert!(
-        std::mem::size_of::<OpusDecoder>() > 100_000,
-        "OpusDecoder is {} bytes without heap; expected > 100 KiB",
+        std::mem::size_of::<OpusDecoder>() > 32 * 1024,
+        "OpusDecoder is {} bytes without heap; expected > 32 KiB",
         std::mem::size_of::<OpusDecoder>()
     );
 }

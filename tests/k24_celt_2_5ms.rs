@@ -6,7 +6,7 @@
 //! bits ("folding"). libopus stores it as `SHR32(X[0], 4)`, and in the
 //! floating-point build `SHR32` does nothing: the stored value is +-1.
 //!
-//! opus-rs stored +-1/16, the fixed-point reading of that line. Bands
+//! opus1 stored +-1/16, the fixed-point reading of that line. Bands
 //! folded from a mix of one-bin bands and wider bands then got the wrong
 //! shape. Only 2.5 ms frames have one-bin bands, so 5, 10 and 20 ms frames
 //! were unaffected. Against libopus's decode of the same packets, mono
@@ -33,7 +33,7 @@ fn celt_2_5ms_frames_decode_like_libopus() {
                     assert_eq!(toc(packets[10][0]).frame_tenth_ms, 25);
                     for rate in [24000usize, 48000] {
                         let reference = c_decode_all(&packets, rate, channels);
-                        let ours = rs_decode_all(&packets, rate, channels).expect("opus-rs decode");
+                        let ours = rs_decode_all(&packets, rate, channels).expect("opus1 decode");
                         // Compare in 20 ms windows: a 2.5 ms frame is too
                         // short for a meaningful per-frame ratio in quiet
                         // passages.

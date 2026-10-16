@@ -12,7 +12,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{full_scale, speech_fullband, to_stereo};
-use opus_rs::{OpusDecoder, pcm_soft_clip};
+use opus1::{OpusDecoder, pcm_soft_clip};
 use std::f64::consts::PI;
 
 /// A signal that overshoots full scale in several ways:
@@ -153,7 +153,7 @@ fn float_output_keeps_the_overshoot() {
         rs.extend_from_slice(&buf);
     }
     let peak = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
-    println!("peak libopus {:.3}, opus-rs {:.3}, {:.1} dB", peak(&c), peak(&rs), snr(&c, &rs));
+    println!("peak libopus {:.3}, opus1 {:.3}, {:.1} dB", peak(&c), peak(&rs), snr(&c, &rs));
     assert!(peak(&rs) > 1.5 && (peak(&rs) - peak(&c)).abs() < 1e-3);
     assert!(snr(&c, &rs) > 100.0);
 }
@@ -261,11 +261,11 @@ fn pcm_soft_clip_matches_libopus() {
                 pcm_soft_clip(&mut ours, n, channels, &mut rs_mem);
                 for (i, (a, b)) in expected.iter().zip(&ours).enumerate() {
                     worst = worst.max((a - b).abs());
-                    assert!((a - b).abs() <= 2e-6, "gain {gain}, offset {offset}, {channels} ch, round {round}, sample {i}: libopus {a}, opus-rs {b}");
+                    assert!((a - b).abs() <= 2e-6, "gain {gain}, offset {offset}, {channels} ch, round {round}, sample {i}: libopus {a}, opus1 {b}");
                     assert!(b.abs() <= 1.0, "sample {i} is {b}");
                 }
                 for (a, b) in c_mem.iter().zip(&rs_mem) {
-                    assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "memory: libopus {a}, opus-rs {b}");
+                    assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "memory: libopus {a}, opus1 {b}");
                 }
                 clipped_buffers += (expected != pcm) as usize;
             }

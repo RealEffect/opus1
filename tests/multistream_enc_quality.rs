@@ -1,4 +1,4 @@
-//! Quality and bitrate of the opus-rs multistream encoder against the C
+//! Quality and bitrate of the opus1 multistream encoder against the C
 //! libopus encoder under the same settings.
 //!
 //! Quality: the same signal is encoded by both encoders and both packet
@@ -6,8 +6,8 @@
 //! signal-to-noise ratio (SNR) against the input is measured, at the delay
 //! of the codec. The limits depend on the kind of stream a channel is in:
 //!
-//! - A mono stream: opus-rs is at most 6 dB below libopus.
-//! - A coupled (stereo) stream: opus-rs stereo CELT is behind libopus, by up
+//! - A mono stream: opus1 is at most 6 dB below libopus.
+//! - A coupled (stereo) stream: opus1 stereo CELT is behind libopus, by up
 //!   to 20 dB on pure tones and up to 4 dB on a speech-like signal. The
 //!   limits are those gaps with a small margin, so that they catch a further
 //!   loss. They are a record of where the stereo encoder stands, not a
@@ -25,9 +25,9 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::multistream::encoder::MultistreamEncoder;
-use opus_rs::multistream::surround::SurroundProbe;
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::multistream::encoder::MultistreamEncoder;
+use opus1::multistream::surround::SurroundProbe;
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 const FS: i32 = 48_000;
 /// 20 ms.
@@ -110,7 +110,7 @@ fn measure(case: &Case, bitrate: i32, vbr: bool, pcm: &[f32]) -> Vec<ChannelSnr>
         .collect()
 }
 
-/// Text for the measurements of one case: `kind opus-rs/C (difference)`.
+/// Text for the measurements of one case: `kind opus1/C (difference)`.
 fn table(snrs: &[ChannelSnr]) -> String {
     snrs.iter()
         .map(|s| {
@@ -299,7 +299,7 @@ fn a_coupled_stream_is_what_a_stereo_encoder_with_its_mask_writes() {
 /// allocation, the packet does not depend on it. libopus does the same in
 /// this experiment (`libopus_also_writes_some_packets_without_the_mask`):
 /// without a mask 10 of 150 packets are the same with a variable bitrate,
-/// 25 of 150 with a constant one. opus-rs, measured: 2 and 1 of 150 with a
+/// 25 of 150 with a constant one. opus1, measured: 2 and 1 of 150 with a
 /// variable bitrate (no mask, mask of another stream), 20 and 10 of 150 with
 /// a constant one. The bound was one in ten, below libopus's own figure.
 ///
@@ -386,7 +386,7 @@ fn libopus_also_writes_some_packets_without_the_mask() {
 /// The 80 Hz tone on the LFE channel of 5.1, 6.1 and 7.1.
 ///
 /// libopus codes the LFE stream with a tuning of its own inside CELT, and
-/// so does opus-rs: the stream encoder passes the LFE flag on to its CELT
+/// so does opus1: the stream encoder passes the LFE flag on to its CELT
 /// layer. Measured: 18.2 to 27.8 dB, where libopus has 18.2 to 27.9 dB.
 /// Without the tuning it was 10.8 to 13.4 dB. The limit here is a floor of
 /// 15 dB, which the untuned stream does not reach.
@@ -436,7 +436,7 @@ fn lfe_tone_is_within_2_db_of_libopus() {
 }
 
 /// Average bitrate of a variable-bitrate stream over 5 seconds, both
-/// encoders. Returns bits per second of opus-rs and of libopus.
+/// encoders. Returns bits per second of opus1 and of libopus.
 fn average_rates(case: &Case, bitrate: i32, pcm: &[f32]) -> (f64, f64) {
     let (mut rust, mut c) = encoders(case, FS, Application::Audio);
     configure(&mut rust, &mut c, bitrate, true);
@@ -454,7 +454,7 @@ fn average_rates(case: &Case, bitrate: i32, pcm: &[f32]) -> (f64, f64) {
 /// can be far off. 5.1 at 60 kb/s on the speech-like signal uses 150 kb/s
 /// there, an effect of its surround masking on a Hybrid stream.
 ///
-/// Measured for opus-rs: 9.7 % under to 4.2 % over the request from 16 kb/s
+/// Measured for opus1: 9.7 % under to 4.2 % over the request from 16 kb/s
 /// per channel on, and 17.8 % under to 25.7 % over below that.
 fn check_rates(signal: &str) {
     let cases = [
@@ -478,7 +478,7 @@ fn check_rates(signal: &str) {
             let (rust, c) = average_rates(case, bitrate, &pcm);
             let ratio = rust / bitrate as f64;
             println!(
-                "{} {signal} {bitrate} b/s: opus-rs {rust:.0} ({:+.1} %), libopus {c:.0} ({:+.1} %)",
+                "{} {signal} {bitrate} b/s: opus1 {rust:.0} ({:+.1} %), libopus {c:.0} ({:+.1} %)",
                 case.name,
                 100.0 * (ratio - 1.0),
                 100.0 * (c / bitrate as f64 - 1.0)

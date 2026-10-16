@@ -34,7 +34,7 @@ mod multistream_dec_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_dec_common::*;
-use opus_rs::multistream::MultistreamDecoder;
+use opus1::multistream::MultistreamDecoder;
 use std::f64::consts::PI;
 
 /// The limit for "the same samples as the C decoder", as in
@@ -204,7 +204,7 @@ fn encode_with(
 ///   a redundant CELT frame, the decoder conceals 5 ms of CELT and fades
 ///   from them into the new mode (libopus `opus_decode_frame`, `transition`).
 ///
-/// The CELT concealment of opus-rs is close to libopus but not sample-exact,
+/// The CELT concealment of opus1 is close to libopus but not sample-exact,
 /// so such a packet, and the one after it, cannot be held to the limit of
 /// the others.
 fn celt_concealment_packets(e: &Encoded) -> Vec<bool> {
@@ -242,7 +242,7 @@ fn packet_snrs(e: &Encoded, fs: i32) -> Vec<f64> {
     for (i, packet) in e.packets.iter().enumerate() {
         let what = || format!("{} at {fs} Hz, packet {i} ({})", e.label, describe_packet(packet, e.streams));
         let c = c_dec.decode_float(Some(packet), max_frame, false).unwrap_or_else(|err| panic!("{}: C decoder: {err}", what()));
-        let n = r_dec.decode(packet, max_frame, &mut out).unwrap_or_else(|err| panic!("{}: opus-rs decoder: {err}", what()));
+        let n = r_dec.decode(packet, max_frame, &mut out).unwrap_or_else(|err| panic!("{}: opus1 decoder: {err}", what()));
         assert_eq!(n * e.channels, c.len(), "{}: samples per channel", what());
         assert_eq!(r_dec.final_range(), e.ranges[i], "{}: final range", what());
         let mut worst = f64::INFINITY;
@@ -271,7 +271,7 @@ fn compare_float(e: &Encoded, fs: i32, min_snr: f64) -> f64 {
     for (i, packet) in e.packets.iter().enumerate() {
         let what = || format!("{} at {fs} Hz, packet {i} ({})", e.label, describe_packet(packet, e.streams));
         let c = c_dec.decode_float(Some(packet), max_frame, false).unwrap_or_else(|err| panic!("{}: C decoder: {err}", what()));
-        let n = r_dec.decode(packet, max_frame, &mut out).unwrap_or_else(|err| panic!("{}: opus-rs decoder: {err}", what()));
+        let n = r_dec.decode(packet, max_frame, &mut out).unwrap_or_else(|err| panic!("{}: opus1 decoder: {err}", what()));
         assert_eq!(n * e.channels, c.len(), "{}: samples per channel", what());
         assert_eq!(r_dec.final_range(), e.ranges[i], "{}: final range", what());
         assert_eq!(c_dec.final_range(), e.ranges[i], "{}: final range of the C decoder", what());
@@ -542,7 +542,7 @@ fn sixteen_bit_output_with_losses_matches_libopus() {
             assert_eq!(c.len(), r.len(), "{what}: samples");
             for (&c, &r) in c.iter().zip(r) {
                 let d = (c as i32 - r as i32).abs();
-                assert!(d <= 1, "{what}: C {c}, opus-rs {r}");
+                assert!(d <= 1, "{what}: C {c}, opus1 {r}");
                 differing += (d != 0) as usize;
                 at_full_scale += (c == i16::MAX || c == i16::MIN) as usize;
             }
@@ -613,7 +613,7 @@ fn sixteen_bit_output_routes_and_silences_like_libopus() {
                 assert_eq!(c.len(), n * ch, "{what}");
                 for (c_frame, r_frame) in c.chunks_exact(ch).zip(out[..n * ch].chunks_exact(ch)) {
                     for k in 0..ch {
-                        assert!((c_frame[k] as i32 - r_frame[k] as i32).abs() <= 1, "{what}: channel {k}: C {}, opus-rs {}", c_frame[k], r_frame[k]);
+                        assert!((c_frame[k] as i32 - r_frame[k] as i32).abs() <= 1, "{what}: channel {k}: C {}, opus1 {}", c_frame[k], r_frame[k]);
                     }
                     assert_eq!((r_frame[1], r_frame[5]), (0, 0), "{what}: a silent channel is not zero");
                     assert_eq!(r_frame[0], r_frame[6], "{what}: the right channel differs between its outputs");
@@ -665,7 +665,7 @@ fn float_and_sixteen_bit_calls_alternate_like_libopus() {
                 assert_eq!(c.len(), n * 4, "{what}");
                 for (&c, &r) in c.iter().zip(&out16[..n * 4]) {
                     let d = (c as i32 - r as i32).abs();
-                    assert!(d <= 1, "{what}: C {c}, opus-rs {r}");
+                    assert!(d <= 1, "{what}: C {c}, opus1 {r}");
                     differing += (d != 0) as usize;
                     at_full_scale += (c == i16::MAX || c == i16::MIN) as usize;
                 }
@@ -790,7 +790,7 @@ fn packets_with_damaged_frame_data_decode_like_libopus() {
                         }
                     }
                     (Err(_), Err(_)) => {}
-                    (c, r) => panic!("{what}: C {:?}, opus-rs {r:?}", c.map(|pcm| pcm.len())),
+                    (c, r) => panic!("{what}: C {:?}, opus1 {r:?}", c.map(|pcm| pcm.len())),
                 }
             }
         }
@@ -837,7 +837,7 @@ fn random_frame_data_has_the_final_range_of_libopus() {
                     let len = 2 + rng.below(if long { 300 } else { 60 });
                     let frame: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
                     let mut buf = vec![0u8; len + 8];
-                    let n = opus_rs::packet::write(toc_byte, &[&frame], &mut buf, s + 1 != streams, false).unwrap();
+                    let n = opus1::packet::write(toc_byte, &[&frame], &mut buf, s + 1 != streams, false).unwrap();
                     packet.extend_from_slice(&buf[..n]);
                 }
                 let what = format!("{streams} streams at {fs} Hz, packet {round}, {}", toc(config << 3));
@@ -907,7 +907,7 @@ fn shortest_packets_get_the_verdict_of_libopus() {
                             accepted += 1;
                         }
                         (Err(_), Err(_)) => rejected += 1,
-                        (c, r) => panic!("{streams} streams, packet {packet:02X?}, frame_size {frame_size}, call {kind}: C {c:?}, opus-rs {r:?}"),
+                        (c, r) => panic!("{streams} streams, packet {packet:02X?}, frame_size {frame_size}, call {kind}: C {c:?}, opus1 {r:?}"),
                     }
                 }
             }

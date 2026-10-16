@@ -6,7 +6,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech_fullband, to_stereo};
-use opus_rs::{OpusDecoder, packet};
+use opus1::{OpusDecoder, packet};
 
 /// A stream from the C encoder with the mode and bandwidth forced.
 fn c_stream(rate: usize, channels: usize, mode: i32, bandwidth: i32, bitrate: i32, frame: usize) -> (Vec<Vec<u8>>, Vec<u32>) {
@@ -83,7 +83,7 @@ fn final_range_covers_redundancy_frames() {
 }
 
 /// Decode `packets` with both decoders and return the lowest SNR of any
-/// packet (opus-rs against libopus) and the number of final range
+/// packet (opus1 against libopus) and the number of final range
 /// mismatches.
 fn compare_decoders(rate: usize, channels: usize, packets: &[Vec<u8>], max_frame: usize) -> (f64, usize) {
     let mut c_dec = CDecoder::new(rate, channels);
@@ -146,7 +146,7 @@ fn one_byte_packets_follow_libopus() {
         let ours = dec.decode(input, 6 * frame, &mut out);
         match reference {
             Ok(reference) => {
-                let n = ours.unwrap_or_else(|e| panic!("packet {i} ({input:02x?}): libopus accepts, opus-rs: {e}"));
+                let n = ours.unwrap_or_else(|e| panic!("packet {i} ({input:02x?}): libopus accepts, opus1: {e}"));
                 assert_eq!(n, reference.len(), "packet {i}");
                 let s = snr(&reference, &out[..n]);
                 assert!(s > 90.0, "packet {i}: {s:.1} dB against libopus");
@@ -154,7 +154,7 @@ fn one_byte_packets_follow_libopus() {
             }
             Err(code) => {
                 assert!(input.len() == 1 && input[0] & 3 >= 2, "packet {i}: libopus error {code}");
-                assert!(ours.is_err(), "packet {i} ({input:02x?}): libopus rejects, opus-rs accepts");
+                assert!(ours.is_err(), "packet {i} ({input:02x?}): libopus rejects, opus1 accepts");
             }
         }
     }
@@ -241,10 +241,10 @@ impl Rng {
 /// runs the packets say they code as many channels as the decoder has. In
 /// the last four they say the other count, or either.
 ///
-/// - opus-rs and libopus accept and reject the same packets;
+/// - opus1 and libopus accept and reject the same packets;
 /// - no call panics, and what is decoded is finite;
 /// - the float output is not clipped, in either decoder: as many packets
-///   decode to peaks beyond ±1.0 in opus-rs as in libopus;
+///   decode to peaks beyond ±1.0 in opus1 as in libopus;
 /// - nearly all decoded packets match libopus's samples. The few that do
 ///   not are frames no encoder produces, where the two CELT decoders
 ///   differ. The limit keeps that number from growing.
@@ -286,7 +286,7 @@ fn garbage_packets_decode_like_libopus() {
                 }
                 (Err(_), Err(_)) => rejected += 1,
                 (reference, ours) => panic!(
-                    "{rate} Hz, round {round}: libopus {:?}, opus-rs {ours:?} for {packet:02x?}",
+                    "{rate} Hz, round {round}: libopus {:?}, opus1 {ours:?} for {packet:02x?}",
                     reference.map(|v| v.len())
                 ),
             }

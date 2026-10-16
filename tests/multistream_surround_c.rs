@@ -9,9 +9,9 @@
 //!   streams;
 //! - C single-stream encoders, set up exactly like the streams of the
 //!   surround encoder, code the same channels. They get the mask that
-//!   opus-rs computed, or no mask.
+//!   opus1 computed, or no mask.
 //!
-//! When the opus-rs mask is the mask libopus computed, the single-stream
+//! When the opus1 mask is the mask libopus computed, the single-stream
 //! encoders write the same bytes as the surround encoder. Without a mask
 //! they write other packets.
 //!
@@ -24,12 +24,12 @@
 //! gives the bytes of libopus back.
 //!
 //! One test is a control: it takes the mask from `surround_analysis` of
-//! libopus, called directly, instead of opus-rs. Every packet is then the
+//! libopus, called directly, instead of opus1. Every packet is then the
 //! same. So the single-stream encoders are set up like the streams of the
-//! surround encoder, and a packet that differs with the opus-rs mask
+//! surround encoder, and a packet that differs with the opus1 mask
 //! differs because of the mask.
 //!
-//! The last test hands the mask to opus-rs stream encoders and compares
+//! The last test hands the mask to opus1 stream encoders and compares
 //! their packet sizes with libopus.
 //!
 //! The encoder without a mask is never the C multistream encoder made with
@@ -50,8 +50,8 @@ use ms_support::{
     OPUS_SET_FORCE_MODE_REQUEST, OPUS_SET_LFE_REQUEST, max_packet_bytes, noise, split_streams, toc,
     tones, voiced,
 };
-use opus_rs::multistream::surround::SurroundProbe;
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::multistream::surround::SurroundProbe;
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 use std::os::raw::{c_int, c_void};
 
 const NB_BANDS: usize = 21;
@@ -76,7 +76,7 @@ unsafe extern "C" {
     /// opus_multistream_encoder.c 230. It is not a `static` function, and
     /// libopus is linked as a static library, so the test can call it.
     /// `tests/multistream_surround_c_direct.rs` compares its result with
-    /// the opus-rs mask value by value.
+    /// the opus1 mask value by value.
     fn surround_analysis(
         celt_mode: *const c_void,
         pcm: *const c_void,
@@ -173,7 +173,7 @@ impl CAnalysis {
 /// Where the mask of the single-stream encoders comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaskFrom {
-    /// The analysis of opus-rs, which is what the tests are about.
+    /// The analysis of opus1, which is what the tests are about.
     OpusRs,
     /// `surround_analysis` of libopus, as a control.
     LibOpus,
@@ -331,11 +331,11 @@ struct StreamTotals {
     frames: usize,
     /// Bytes of the stream in the packets of the C surround encoder.
     surround: usize,
-    /// Bytes of a C single-stream encoder that got the opus-rs mask.
+    /// Bytes of a C single-stream encoder that got the opus1 mask.
     with_mask: usize,
     /// Bytes of a C single-stream encoder without a mask.
     without_mask: usize,
-    /// Frames in which the encoder with the opus-rs mask wrote the bytes of
+    /// Frames in which the encoder with the opus1 mask wrote the bytes of
     /// the surround encoder.
     same_with_mask: usize,
     /// The same count for the encoder without a mask.
@@ -517,7 +517,7 @@ fn signal(which: usize, fs: i32, channels: usize, samples: usize) -> Vec<f32> {
 /// single-stream encoders with the mask of `mask_from` write byte for byte.
 fn check_every_layout_rate_and_frame_size(constrained_vbr: bool, mask_from: MaskFrom) {
     // Packets of the streams that use the mask: all of them, those that are
-    // the same with the opus-rs mask, and those that are the same without
+    // the same with the opus1 mask, and those that are the same without
     // a mask.
     let (mut total, mut same, mut same_without) = (0usize, 0usize, 0usize);
     let mut case = 0;
@@ -595,12 +595,12 @@ fn check_every_layout_rate_and_frame_size(constrained_vbr: bool, mask_from: Mask
 }
 
 #[test]
-fn c_encoders_with_the_opus_rs_mask_write_the_streams_of_the_c_surround_encoder() {
+fn c_encoders_with_the_opus1_mask_write_the_streams_of_the_c_surround_encoder() {
     check_every_layout_rate_and_frame_size(true, MaskFrom::OpusRs);
 }
 
 #[test]
-fn c_encoders_with_the_opus_rs_mask_write_the_c_surround_streams_in_unconstrained_vbr() {
+fn c_encoders_with_the_opus1_mask_write_the_c_surround_streams_in_unconstrained_vbr() {
     check_every_layout_rate_and_frame_size(false, MaskFrom::OpusRs);
 }
 
@@ -610,17 +610,17 @@ fn c_encoders_with_the_libopus_mask_write_the_c_surround_streams() {
     // `surround_analysis` of libopus, called with the memories the C
     // surround encoder keeps. Every stream packet is then the same. This
     // shows that the single-stream encoders are set up like the streams of
-    // the surround encoder. The few packets that differ with the opus-rs
+    // the surround encoder. The few packets that differ with the opus1
     // mask therefore differ because of the mask, not because of the setup.
     //
     // Unconstrained VBR is the case in which 4 packets differ with the
-    // opus-rs mask. In constrained VBR the control also gives 21080 of
+    // opus1 mask. In constrained VBR the control also gives 21080 of
     // 21080; it is left out to keep the test short.
     check_every_layout_rate_and_frame_size(false, MaskFrom::LibOpus);
 }
 
 #[test]
-fn c_encoders_with_the_opus_rs_mask_write_the_c_surround_streams_for_long_frames() {
+fn c_encoders_with_the_opus1_mask_write_the_c_surround_streams_for_long_frames() {
     // 80, 100 and 120 ms: the analysis takes the largest band levels of
     // four, five and six MDCTs.
     let (mut total, mut same, mut same_without) = (0usize, 0usize, 0usize);
@@ -655,7 +655,7 @@ fn c_encoders_with_the_opus_rs_mask_write_the_c_surround_streams_for_long_frames
         }
     }
     println!(
-        "{case} cases, {total} stream packets: {same} the same with the opus-rs mask, {same_without} without a mask"
+        "{case} cases, {total} stream packets: {same} the same with the opus1 mask, {same_without} without a mask"
     );
     // Measured: 180 of 180, and 42 without a mask.
     assert!(
@@ -693,7 +693,7 @@ fn a_mask_that_is_off_by_a_little_does_not_reproduce_the_c_streams() {
         }
     }
     println!(
-        "{total} stream packets: {same} the same with the opus-rs mask, {same_changed} with the mask plus 0.05"
+        "{total} stream packets: {same} the same with the opus1 mask, {same_changed} with the mask plus 0.05"
     );
     // Measured: 600 of 600, and 111 of 600 with the changed mask. A band
     // where the mask is outside -2 to 0.25 is limited by the encoder, so a
@@ -702,9 +702,9 @@ fn a_mask_that_is_off_by_a_little_does_not_reproduce_the_c_streams() {
     assert!(same_changed * 3 < total, "{same_changed} of {total}");
 }
 
-/// Bytes that opus-rs stream encoders write for `pcm`, stream by stream,
+/// Bytes that opus1 stream encoders write for `pcm`, stream by stream,
 /// when they are set up like the streams of the C surround encoder with the
-/// stream bitrates `rates`. With `use_mask`, every encoder gets the opus-rs
+/// stream bitrates `rates`. With `use_mask`, every encoder gets the opus1
 /// mask of its channels before each frame.
 ///
 /// Every stream is told to use CELT. libopus tells the stereo streams, and
@@ -763,8 +763,8 @@ fn percent(a: usize, b: usize) -> f64 {
 }
 
 #[test]
-fn opus_rs_stream_sizes_follow_the_mask_as_in_libopus() {
-    // The mask of this package goes to opus-rs stream encoders through
+fn opus1_stream_sizes_follow_the_mask_as_in_libopus() {
+    // The mask of this package goes to opus1 stream encoders through
     // `OpusEncoder::set_energy_mask`, and the stream sizes are compared with
     // libopus. For libopus, "with the mask" is the C surround encoder, and
     // "without" is C single-stream encoders set up like its streams.
@@ -800,7 +800,7 @@ fn opus_rs_stream_sizes_follow_the_mask_as_in_libopus() {
                 let c_change = percent(t.surround, t.without_mask);
                 let rs_change = percent(with[s], without[s]);
                 println!(
-                    "  stream {s}: libopus {} -> {} bytes ({c_change:+.2} %), opus-rs {} -> {} bytes ({rs_change:+.2} %)",
+                    "  stream {s}: libopus {} -> {} bytes ({c_change:+.2} %), opus1 {} -> {} bytes ({rs_change:+.2} %)",
                     t.without_mask, t.surround, without[s], with[s]
                 );
                 assert_eq!(
@@ -810,21 +810,21 @@ fn opus_rs_stream_sizes_follow_the_mask_as_in_libopus() {
                 compared += 1;
                 let mut fail =
                     |what: String| failures.push(format!("{setup}, {name}, stream {s}: {what}"));
-                // With the mask, an opus-rs stream has the size of the
+                // With the mask, an opus1 stream has the size of the
                 // libopus stream. Measured: at most 0.8 % apart.
                 let off = percent(with[s], t.surround);
                 if off.abs() >= 1.0 {
-                    fail(format!("opus-rs is {off:+.2} % off libopus with the mask"));
+                    fail(format!("opus1 is {off:+.2} % off libopus with the mask"));
                 }
                 if c_change.abs() > 1.0 {
                     moved += 1;
                     // Where the mask moves the libopus stream, it does not
-                    // move the opus-rs stream the other way. The two can
-                    // start from different sizes: without a mask opus-rs
+                    // move the opus1 stream the other way. The two can
+                    // start from different sizes: without a mask opus1
                     // does not follow libopus as closely as with one.
                     if rs_change * c_change.signum() < -0.5 {
                         fail(format!(
-                            "the mask changes libopus by {c_change:+.2} % and opus-rs by {rs_change:+.2} %"
+                            "the mask changes libopus by {c_change:+.2} % and opus1 by {rs_change:+.2} %"
                         ));
                     }
                     // Same size without a mask, same change with it.
@@ -838,7 +838,7 @@ fn opus_rs_stream_sizes_follow_the_mask_as_in_libopus() {
         }
     }
     println!(
-        "{compared} streams compared; the mask moved {moved} of them by more than 1 % in libopus, and {moved_alike} of these by the same amount from the same size in opus-rs"
+        "{compared} streams compared; the mask moved {moved} of them by more than 1 % in libopus, and {moved_alike} of these by the same amount from the same size in opus1"
     );
     assert!(
         failures.is_empty(),

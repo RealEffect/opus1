@@ -1,5 +1,5 @@
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
-use opus_rs::{Application as RsApp, OpusDecoder as RsDec, OpusEncoder as RsEnc};
+use opus1::{Application as RsApp, OpusDecoder as RsDec, OpusEncoder as RsEnc};
 
 fn make_sine(sr: i32, ch: usize, frame_size: usize, freq: f32) -> Vec<f32> {
     let mut v = vec![0.0f32; frame_size * ch];
@@ -27,7 +27,7 @@ fn hex_to_bytes(s: &str) -> Vec<u8> {
 // different, equally valid bitstreams. There is a stored fixture for x86_64
 // only; other arches fall back to size/determinism/decode checks.
 //
-// aarch64 had stored fixtures too. They were packets recorded from opus-rs,
+// aarch64 had stored fixtures too. They were packets recorded from opus1,
 // not packets of libopus: the sine fixture equalled the packet of the linked
 // libopus 1.6.1 (arm64) in 124 of 160 bytes, the impulse fixture in the
 // first 7. They went away when the pulse search became the one of libopus
@@ -63,7 +63,7 @@ fn impulse_fixture_hex() -> Option<&'static str> {
 }
 
 /// One 20 ms frame, 48 kHz mono, 64 kb/s constant bitrate, complexity 10,
-/// through opus-rs and through the linked libopus: (opus-rs, libopus).
+/// through opus1 and through the linked libopus: (opus1, libopus).
 #[cfg(target_arch = "aarch64")]
 fn first_packets(pcm: &[f32]) -> (Vec<u8>, Vec<u8>) {
     let mut rs_enc = RsEnc::new(48000, 1, RsApp::Audio).unwrap();
@@ -93,7 +93,7 @@ fn equal_bytes(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
 /// the packet the linked libopus writes for the same input.
 ///
 /// On aarch64 libopus has no kernels of its own for the pulse search, so
-/// there is one right answer. opus-rs reaches it: all 160 bytes are equal
+/// there is one right answer. opus1 reaches it: all 160 bytes are equal
 /// at the tip of integ6 (4726c16). When the test was ignored, 132 were.
 #[test]
 #[cfg(target_arch = "aarch64")]
@@ -108,7 +108,7 @@ fn sine_48k_mono_64k_is_the_packet_of_libopus() {
 /// against the packet the linked libopus writes for the same input.
 #[test]
 #[cfg(target_arch = "aarch64")]
-#[ignore = "the 48 kHz impulse packet equals libopus 1.6.1 in its first 7 bytes only: opus-rs does not run the tonality analysis of libopus (analysis.c), which changes the allocation trim of this frame"]
+#[ignore = "the 48 kHz impulse packet equals libopus 1.6.1 in its first 7 bytes only: opus1 does not run the tonality analysis of libopus (analysis.c), which changes the allocation trim of this frame"]
 fn impulse_48k_mono_64k_is_the_packet_of_libopus() {
     let mut pcm = vec![0.0f32; 960];
     pcm[0] = 1.0;

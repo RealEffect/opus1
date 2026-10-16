@@ -1,8 +1,8 @@
 /// Unit tests for Hybrid mode and CELT fixes
-use opus_rs::celt::{CeltDecoder, CeltEncoder};
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Test that RangeCoder payload is correctly extracted with front + back combination
@@ -38,7 +38,7 @@ fn test_range_coder_payload_extraction() {
 
 /// Test that CELT decoder correctly uses shared RangeCoder for Hybrid mode
 #[test]
-fn test_celt_decode_from_range_coder() {
+fn test_celt_decode_from_shared_range_coder() {
     let mode = default_mode();
     let frame_size = 960;
     let mut encoder = CeltEncoder::new(mode, 1);
@@ -61,15 +61,15 @@ fn test_celt_decode_from_range_coder() {
     payload.extend_from_slice(&rc.buf[..front_len]);
     payload.extend_from_slice(&rc.buf[(rc.storage - rc.end_offs) as usize..rc.storage as usize]);
 
-    // Decode using decode_from_range_coder (Hybrid-style)
+    // Decode from a range coder that the caller made (Hybrid-style)
     let mut output = vec![0.0f32; frame_size];
     let total_bits = (payload.len() * 8) as i32;
     let mut rc_dec = RangeCoder::new_decoder(&payload);
-    decoder.decode_from_range_coder(&mut rc_dec, total_bits, frame_size, &mut output, 0);
+    decoder.decode(&mut rc_dec, total_bits, frame_size, &mut output, PcmLayout::Planar);
 
     // Check that output is not all zeros
     let max_val = output.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-    println!("CELT decode_from_range_coder max output: {:.6}", max_val);
+    println!("CELT decode from a range coder, max output: {:.6}", max_val);
     // Note: Due to MDCT overlap, first frame output is small
 }
 

@@ -1,4 +1,4 @@
-//! Hybrid mode (SILK up to 8 kHz plus CELT from 8 to 12 kHz) from the opus-rs
+//! Hybrid mode (SILK up to 8 kHz plus CELT from 8 to 12 kHz) from the opus1
 //! encoder at a 24 kHz input rate, decoded by C libopus. Hybrid is what
 //! speech at 24 kHz gets from about 14 kb/s up.
 
@@ -38,7 +38,7 @@ fn loudest_top_band(pcm: &[f32]) -> f64 {
 
 /// A Hybrid VBR stream must come out at the bitrate asked for.
 ///
-/// Three things made opus-rs's Hybrid VBR overshoot, the more the lower the
+/// Three things made opus1's Hybrid VBR overshoot, the more the lower the
 /// bitrate (16 kb/s came out at 23.9 kb/s, 12 kb/s at 20.4 kb/s, 24 kb/s at
 /// 28.1 kb/s; libopus's Hybrid: 16.9, 13.0 and 24.7 kb/s):
 ///
@@ -60,13 +60,13 @@ fn vbr_stream_keeps_the_requested_bitrate() {
         for bitrate in [14_000, 16_000, 20_000, 24_000, 32_000, 40_000] {
             let cfg = hybrid_cfg(bitrate, false);
             let (rs, c) = (enc_rs(&cfg, pcm).unwrap(), enc_c(&cfg, pcm));
-            assert_all_hybrid(&rs, "opus-rs");
+            assert_all_hybrid(&rs, "opus1");
             assert_all_hybrid(&c, "libopus");
             let (rs_rate, c_rate) = (mean_bitrate(&rs, cfg.frame), mean_bitrate(&c, cfg.frame));
             let q = |p: &[Vec<u8>]| measure(pcm, &dec_c(p, FS, 1, cfg.frame).unwrap(), FS, FS / 5);
             let (rs_q, c_q) = (q(&rs), q(&c));
             let what = format!(
-                "{name}, {} kb/s: opus-rs {:.1} kb/s at {:.2} dB, libopus {:.1} kb/s at {:.2} dB",
+                "{name}, {} kb/s: opus1 {:.1} kb/s at {:.2} dB, libopus {:.1} kb/s at {:.2} dB",
                 bitrate / 1000,
                 rs_rate / 1000.0,
                 rs_q.snr,
@@ -106,7 +106,7 @@ fn default_voip_stream_keeps_the_requested_bitrate() {
 /// redundant CELT frame follows. libopus writes it only when the packet has
 /// room for the flag and for the redundancy header that could follow, 37
 /// bits in all (opus_encoder.c:2351-2355), and its decoder reads it under
-/// the same test (opus_decoder.c:509-514). opus-rs wrote and read the flag
+/// the same test (opus_decoder.c:509-514). opus1 wrote and read the flag
 /// always. Whenever SILK left fewer than 37 bits, libopus's decoder took
 /// the flag for the first CELT symbol: the 8-12 kHz band of that frame came
 /// out as a burst of noise, up to 35 dB above the input's.
@@ -119,13 +119,13 @@ fn packet_nearly_filled_by_silk_stays_in_sync() {
     for bitrate in [16_000, 17_000, 18_000] {
         let cfg = hybrid_cfg(bitrate, true);
         let (rs, c) = (enc_rs(&cfg, &pcm).unwrap(), enc_c(&cfg, &pcm));
-        assert_all_hybrid(&rs, "opus-rs");
+        assert_all_hybrid(&rs, "opus1");
         assert_all_hybrid(&c, "libopus");
         let top = |p: &[Vec<u8>]| loudest_top_band(&dec_c(p, FS, 1, cfg.frame).unwrap());
         let (rs_top, c_top) = (top(&rs), top(&c));
         assert!(
             rs_top <= c_top + 6.0,
-            "{} kb/s CBR: loudest 8-12 kHz moment {rs_top:.1} dB from opus-rs's packets, {c_top:.1} dB from libopus's",
+            "{} kb/s CBR: loudest 8-12 kHz moment {rs_top:.1} dB from opus1's packets, {c_top:.1} dB from libopus's",
             bitrate / 1000
         );
     }

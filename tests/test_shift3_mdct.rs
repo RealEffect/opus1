@@ -4,7 +4,7 @@
 
 #[test]
 fn test_mdct_shift3() {
-    use opus_rs::modes::default_mode;
+    use opus1::modes::default_mode;
 
     let mode = default_mode();
 

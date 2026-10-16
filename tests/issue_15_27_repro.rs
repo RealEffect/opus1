@@ -10,9 +10,9 @@
 //!   2. The encoder omitted per-frame / LBRR stereo headers -> bitstream desync.
 //!   3. Multi-frame (40/60 ms) SILK packets decoded only their first frame.
 
-use opus_rs::silk::SilkResampler;
-use opus_rs::silk::dec_api::SilkDecoder;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::silk::SilkResampler;
+use opus1::silk::dec_api::SilkDecoder;
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Delay-compensated SNR: SILK decode introduces an algorithmic delay, so
@@ -341,7 +341,7 @@ fn issue_27_3_silk_40ms_resampled_full_decode() {
         // Both halves must match libopus decoding the same packet. (An
         // earlier note here blamed a "~0.2 dB" pre-existing resampler issue;
         // that figure compared 16 kHz input against 48 kHz output sample by
-        // sample.) The lag search absorbs a constant offset: opus-rs's mono
+        // sample.) The lag search absorbs a constant offset: opus1's mono
         // SILK output runs one internal sample (3 samples at 48 kHz) ahead of
         // libopus, because dec_api.rs reads mono from w_silk_buf[0][2..]
         // where libopus reads from [1] (restsend/opus-rs#34).
@@ -398,11 +398,13 @@ fn deep_scan_encode_short_input_returns_err() {
 /// now be rejected cleanly.
 #[test]
 fn deep_scan_celt_decode_oversized_frame_rejected() {
-    use opus_rs::{celt::CeltDecoder, modes};
+    use opus1::celt::{CeltDecoder, PcmLayout};
+    use opus1::{modes, range_coder::RangeCoder};
     let mut dec = CeltDecoder::new(modes::default_mode(), 1, 48000);
     let pkt = [0xABu8; 32];
     let mut pcm = vec![0.0f32; 2160]; // 45 ms: lands in the old guard gap
-    let n = dec.decode(&pkt, 2160, &mut pcm);
+    let mut rc = RangeCoder::new_decoder(&pkt);
+    let n = dec.decode(&mut rc, 32 * 8, 2160, &mut pcm, PcmLayout::Planar);
     assert_eq!(n, 0, "oversized frame must be rejected, not panic");
 }
 
@@ -414,9 +416,9 @@ fn deep_scan_celt_decode_oversized_frame_rejected() {
 fn deep_scan_fixedvec_push_overflow_guarded() {
     // 960 = 2^6 * 3 * 5 is a valid 5-smooth FFT size but exceeds
     // KISS_MAX_N = 480.
-    assert!(opus_rs::kiss_fft::KissFftState::new(960).is_none());
+    assert!(opus1::kiss_fft::KissFftState::new(960).is_none());
     // Sanity: normal sizes still construct.
-    assert!(opus_rs::kiss_fft::KissFftState::new(480).is_some());
+    assert!(opus1::kiss_fft::KissFftState::new(480).is_some());
 }
 
 /// A `SilkDecoder` used without `init()` must fail gracefully instead of

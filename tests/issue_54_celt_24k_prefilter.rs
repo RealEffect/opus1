@@ -6,7 +6,7 @@
 //! pre-filter for a frame when filtering makes it louder (`cancel_pitch`),
 //! but it still fades the *previous* frame's comb filter out over the first
 //! `overlap` samples (celt_encoder.c:1572-1584), because the decoder's
-//! post-filter always cross-fades from the old gain to the new one. opus-rs
+//! post-filter always cross-fades from the old gain to the new one. opus1
 //! restored the unfiltered input over the whole frame instead, so after every
 //! "on" frame that was cancelled, the decoder post-filtered 120 samples the
 //! encoder never pre-filtered: an error burst no bitrate can remove.
@@ -20,13 +20,13 @@
 //! The harness is the issue's: encode in 20 ms `Audio` frames, decode with
 //! libopus (the `opus` dev-dependency) at 48 kHz, drop the 312-sample
 //! pre-skip and take the SNR against the analytic chirp. On the unfixed tree
-//! opus-rs scored ~21 dB at 64 and 128 kbps against libopus's 37-40. libopus
+//! opus1 scored ~21 dB at 64 and 128 kbps against libopus's 37-40. libopus
 //! 1.5.2 has no `cancel_pitch` at all, so it is a reference for quality, not
 //! for bits: the assertions are relative to libopus's own encoder and to
-//! opus-rs's lower bitrates, never absolute dB.
+//! opus1's lower bitrates, never absolute dB.
 
 use opus::{Application as CApp, Bitrate, Channels as CCh, Decoder as CDec, Encoder as CEnc};
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 
 const PRE_SKIP: usize = 312;
 
@@ -51,7 +51,7 @@ fn input(rate: usize, level: f64) -> Vec<f32> {
     x
 }
 
-fn opus_rs_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
+fn opus1_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
     let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
     enc.bitrate_bps = bitrate;
     let frame = rate / 50;
@@ -69,10 +69,10 @@ fn libopus_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
     let mut enc = CEnc::new(rate as u32, CCh::Mono, CApp::Audio).unwrap();
     enc.set_bitrate(Bitrate::Bits(bitrate)).unwrap();
     // Complexity 6 keeps libopus's tonality analysis off (opus_encoder.c:1252).
-    // opus-rs does not port it, and from 24 kHz its leakage boosts are worth
+    // opus1 does not port it, and from 24 kHz its leakage boosts are worth
     // another ~3 dB at 64 kbps; with it off the CELT paths compare like-for-like.
     enc.set_complexity(6).unwrap();
-    // Same look-ahead as opus-rs, so the same pre-skip applies to both.
+    // Same look-ahead as opus1, so the same pre-skip applies to both.
     assert_eq!(
         enc.get_lookahead().unwrap() as usize * 48_000 / rate,
         PRE_SKIP
@@ -115,9 +115,9 @@ fn non_celt_swb(packets: &[Vec<u8>]) -> usize {
 fn celt_24k_tracks_libopus() {
     for level in [0.9, 1.0, 1.1] {
         for bitrate in [64_000, 128_000] {
-            let ours = opus_rs_packets(24_000, bitrate, level);
+            let ours = opus1_packets(24_000, bitrate, level);
             let theirs = libopus_packets(24_000, bitrate, level);
-            assert_eq!(non_celt_swb(&ours), 0, "opus-rs left CELT SWB at {bitrate}");
+            assert_eq!(non_celt_swb(&ours), 0, "opus1 left CELT SWB at {bitrate}");
             assert_eq!(
                 non_celt_swb(&theirs),
                 0,
@@ -126,7 +126,7 @@ fn celt_24k_tracks_libopus() {
             let (rs, c) = (snr(24_000, &ours, level), snr(24_000, &theirs, level));
             assert!(
                 rs >= c - 3.0,
-                "24 kHz CELT at {} kbps (level {level}): opus-rs {rs:.1} dB vs libopus {c:.1} dB",
+                "24 kHz CELT at {} kbps (level {level}): opus1 {rs:.1} dB vs libopus {c:.1} dB",
                 bitrate / 1000
             );
         }
@@ -138,11 +138,11 @@ fn celt_24k_snr_rises_with_bitrate() {
     for level in [0.9, 1.0, 1.1] {
         let mut prev = f64::NEG_INFINITY;
         for bitrate in [32_000, 64_000, 128_000] {
-            let packets = opus_rs_packets(24_000, bitrate, level);
+            let packets = opus1_packets(24_000, bitrate, level);
             assert_eq!(
                 non_celt_swb(&packets),
                 0,
-                "opus-rs left CELT SWB at {bitrate}"
+                "opus1 left CELT SWB at {bitrate}"
             );
             let db = snr(24_000, &packets, level);
             assert!(

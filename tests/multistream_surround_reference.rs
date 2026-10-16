@@ -22,8 +22,8 @@
 mod ms_support;
 
 use ms_support::{noise, silence, tones, voiced};
-use opus_rs::modes;
-use opus_rs::multistream::surround::SurroundProbe;
+use opus1::modes;
+use opus1::multistream::surround::SurroundProbe;
 use std::f64::consts::PI;
 
 const NB_BANDS: usize = 21;

@@ -13,8 +13,8 @@ fn rms_dbfs(x: &[f32]) -> f64 {
     10.0 * p.max(1e-20).log10()
 }
 
-/// Decode with one frame in ten lost. Returns, for libopus and opus-rs,
-/// the mean level of the concealed frames, and the lowest SNR of opus-rs
+/// Decode with one frame in ten lost. Returns, for libopus and opus1,
+/// the mean level of the concealed frames, and the lowest SNR of opus1
 /// against libopus in the concealed frames, in the first good frame after a
 /// loss and in the fifth.
 fn loss_run(mode: i32, bw: i32, bitrate: i32) -> (f64, f64, f64, f64, f64) {
@@ -24,7 +24,7 @@ fn loss_run(mode: i32, bw: i32, bitrate: i32) -> (f64, f64, f64, f64, f64) {
     let packets = enc.encode_all(&pcm, 480);
     let lost: Vec<bool> = (0..packets.len()).map(|i| i % 10 == 7).collect();
     let mut c_dec = CDec::new(24000, 1);
-    let mut rs_dec = opus_rs::OpusDecoder::new(24000, 1).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
     let (mut c, mut r) = (Vec::new(), Vec::new());
     let mut buf = vec![0f32; 480];
     for (i, p) in packets.iter().enumerate() {
@@ -67,18 +67,18 @@ fn loss_run(mode: i32, bw: i32, bitrate: i32) -> (f64, f64, f64, f64, f64) {
 #[test]
 fn celt_only_loss_is_concealed_like_libopus() {
     let (level_c, level_r, in_loss, after1, after5) = loss_run(MODE_CELT, BW_SWB, 48000);
-    println!("CELT-SWB: concealed-frame level libopus {level_c:.1} dBFS, opus-rs {level_r:.1} dBFS; against libopus: concealed {in_loss:.1} dB, first good frame {after1:.1} dB, fifth {after5:.1} dB");
+    println!("CELT-SWB: concealed-frame level libopus {level_c:.1} dBFS, opus1 {level_r:.1} dBFS; against libopus: concealed {in_loss:.1} dB, first good frame {after1:.1} dB, fifth {after5:.1} dB");
     assert!((level_c - level_r).abs() < 3.0, "concealed level differs by {:.1} dB", level_r - level_c);
     assert!(after5 > 40.0, "fifth good frame after a loss is {after5:.1} dB against libopus");
 }
 
 /// Hybrid stream, one frame in ten lost. The SILK layer is concealed
 /// bit-exactly. The CELT layer (above 8 kHz) is concealed with noise drawn
-/// from the decoder's random seed, which libopus and opus-rs share.
+/// from the decoder's random seed, which libopus and opus1 share.
 #[test]
 fn hybrid_loss_is_concealed_like_libopus() {
     let (level_c, level_r, in_loss, after1, after5) = loss_run(MODE_HYBRID, BW_SWB, 32000);
-    println!("Hybrid-SWB: concealed-frame level libopus {level_c:.1} dBFS, opus-rs {level_r:.1} dBFS; against libopus: concealed {in_loss:.1} dB, first good frame {after1:.1} dB, fifth {after5:.1} dB");
+    println!("Hybrid-SWB: concealed-frame level libopus {level_c:.1} dBFS, opus1 {level_r:.1} dBFS; against libopus: concealed {in_loss:.1} dB, first good frame {after1:.1} dB, fifth {after5:.1} dB");
     assert!(in_loss > 40.0 && after1 > 40.0, "concealed {in_loss:.1} dB, next {after1:.1} dB against libopus");
 }
 
@@ -137,7 +137,7 @@ fn lost_frames_are_recovered_from_in_band_fec() {
     let clean = c_decode_all(&packets, 24000, 1);
 
     let mut c_dec = CDec::new(24000, 1);
-    let mut rs_dec = opus_rs::OpusDecoder::new(24000, 1).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
     let (mut c, mut r) = (Vec::new(), Vec::new());
     let mut buf = vec![0f32; 480];
     for (i, p) in packets.iter().enumerate() {
@@ -163,13 +163,13 @@ fn lost_frames_are_recovered_from_in_band_fec() {
     };
     let (fec, ours) = (lost_snr(&c), lost_snr(&r));
     let against_c = compare(&c, &r, 1, 480, 24000);
-    println!("lost frames against the loss-free decode: libopus with FEC {fec:.1} dB, opus-rs with FEC {ours:.1} dB; opus-rs against libopus: {against_c}");
-    assert!(ours > fec - 0.1, "opus-rs {ours:.1} dB, libopus with FEC {fec:.1} dB");
+    println!("lost frames against the loss-free decode: libopus with FEC {fec:.1} dB, opus1 with FEC {ours:.1} dB; opus1 against libopus: {against_c}");
+    assert!(ours > fec - 0.1, "opus1 {ours:.1} dB, libopus with FEC {fec:.1} dB");
     assert!(against_c.worst_frame_snr_db > 80.0, "{against_c}");
 }
 
 /// libopus `opus_decode_float` does not clip: a full-scale signal comes
-/// back with peaks above 1.0. This was a gap while opus-rs limited every
+/// back with peaks above 1.0. This was a gap while opus1 limited every
 /// output sample to [-1, 1]. It only showed on signals near full scale.
 #[test]
 fn float_output_is_not_clipped() {
@@ -181,7 +181,7 @@ fn float_output_is_not_clipped() {
     let ours = rs_decode_all(&packets, 24000, 1).unwrap();
     let peak = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
     let cmp = compare(&reference, &ours, 1, 480, 24000);
-    println!("peak libopus {:.4}, opus-rs {:.4}; {cmp}", peak(&reference), peak(&ours));
+    println!("peak libopus {:.4}, opus1 {:.4}; {cmp}", peak(&reference), peak(&ours));
     assert!(cmp.worst_frame_snr_db > 80.0, "{cmp}");
 }
 
@@ -189,7 +189,7 @@ fn float_output_is_not_clipped() {
 ///
 /// With DTX the encoder sends nothing while the talker pauses, apart from
 /// one frame every 400 ms, and the decoder conceals the missing frames. In
-/// a SILK-only stream opus-rs does that bit-exactly, comfort noise
+/// a SILK-only stream opus1 does that bit-exactly, comfort noise
 /// included (k24_silk_loss_cng.rs). In a CELT-only or Hybrid stream the
 /// missing frames go through the CELT concealment
 /// (`CeltDecoder::decode_lost`), which keeps the background noise going
@@ -227,7 +227,7 @@ fn dtx_pause_with_background_noise_is_concealed_like_libopus() {
         }
         assert!(n > 50.0, "{name}: expected DTX packets, got {n}");
         let (level_c, level_r) = (level_c / n, level_r / n);
-        println!("{name}: {n} missing frames; level in them libopus {level_c:.1} dBFS, opus-rs {level_r:.1} dBFS; first frame after a pause {first_after:.1} dB against libopus");
+        println!("{name}: {n} missing frames; level in them libopus {level_c:.1} dBFS, opus1 {level_r:.1} dBFS; first frame after a pause {first_after:.1} dB against libopus");
         if (level_c - level_r).abs() > 3.0 || first_after < 40.0 {
             failures.push(format!("{name}: pause level {level_r:.1} dBFS against {level_c:.1} dBFS, first frame after a pause {first_after:.1} dB"));
         }

@@ -2,14 +2,14 @@
 //! (`tests/multistream_enc_*.rs`).
 //!
 //! A test file uses it with `mod ms_support; mod multistream_enc_common;`.
-//! The helpers build the opus-rs encoder and the C libopus encoder for the
+//! The helpers build the opus1 encoder and the C libopus encoder for the
 //! same layout and settings, so that a test compares like with like.
 
 #![allow(dead_code)]
 
 use crate::ms_support::*;
-use opus_rs::Application;
-use opus_rs::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::Application;
+use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
 
 /// How the layout of a test case is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +110,7 @@ pub fn c_application(application: Application) -> i32 {
     }
 }
 
-/// The opus-rs encoder of a case.
+/// The opus1 encoder of a case.
 pub fn rust_encoder(case: &Case, fs: i32, application: Application) -> MultistreamEncoder {
     match case.kind {
         Kind::Family(family) => {
@@ -120,7 +120,7 @@ pub fn rust_encoder(case: &Case, fs: i32, application: Application) -> Multistre
             MultistreamEncoder::new(fs, case.channels, streams, coupled, mapping, application)
         }
     }
-    .unwrap_or_else(|e| panic!("{}: opus-rs encoder: {e}", case.name))
+    .unwrap_or_else(|e| panic!("{}: opus1 encoder: {e}", case.name))
 }
 
 /// The C encoder of a case.
@@ -158,7 +158,7 @@ pub fn encoders(
     (rust, c)
 }
 
-/// A C decoder with the layout and sampling rate of the opus-rs encoder.
+/// A C decoder with the layout and sampling rate of the opus1 encoder.
 pub fn c_decoder(enc: &MultistreamEncoder) -> CMsDecoder {
     let layout = enc.layout();
     CMsDecoder::new(
@@ -171,7 +171,7 @@ pub fn c_decoder(enc: &MultistreamEncoder) -> CMsDecoder {
     .unwrap_or_else(|e| panic!("C decoder: {e}"))
 }
 
-/// The bitrate setting of the C API as the opus-rs value.
+/// The bitrate setting of the C API as the opus1 value.
 pub fn rust_bitrate(c_value: i32) -> Bitrate {
     match c_value {
         OPUS_AUTO => Bitrate::Auto,
@@ -190,7 +190,7 @@ pub fn configure(rust: &mut MultistreamEncoder, c: &mut CMsEncoder, bitrate: i32
     c.set_vbr(vbr);
 }
 
-/// Encodes a whole signal with the opus-rs encoder, frame by frame, with
+/// Encodes a whole signal with the opus1 encoder, frame by frame, with
 /// room for the largest packet. A trailing partial frame is dropped.
 pub fn rust_encode_all(
     enc: &mut MultistreamEncoder,
@@ -204,7 +204,7 @@ pub fn rust_encode_all(
         .map(|(f, frame)| {
             let n = enc
                 .encode(frame, frame_size, &mut out)
-                .unwrap_or_else(|e| panic!("frame {f}: opus-rs encode failed: {e}"));
+                .unwrap_or_else(|e| panic!("frame {f}: opus1 encode failed: {e}"));
             out[..n].to_vec()
         })
         .collect()

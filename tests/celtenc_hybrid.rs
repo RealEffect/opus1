@@ -19,7 +19,7 @@ fn headers(st: &Stream, payloads: &[Vec<u8>]) -> Vec<Header> {
 }
 
 /// libopus codes the allocation trim of a Hybrid frame as 5, without
-/// `alloc_trim_analysis` (celt_encoder.c 2414). opus-rs ran the analysis
+/// `alloc_trim_analysis` (celt_encoder.c 2414). opus1 ran the analysis
 /// on the two to four bands of the frame.
 #[test]
 fn hybrid_frames_have_the_neutral_trim() {

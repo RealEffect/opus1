@@ -117,8 +117,8 @@ impl Default for SilkDecoderState {
             resampler_state: SilkResampler::default(),
             resampler_api_hz: 0,
             // Default to the WB codebook so that decoding before an explicit
-            // `silk_decoder_set_fs` cannot panic on `unwrap` (issue #27
-            // deep-scan). `set_fs` always overrides this on the normal path.
+            // `silk_decoder_set_fs` cannot panic on `unwrap`. `set_fs` always
+            // overrides this on the normal path.
             ps_nlsf_cb: Some(&crate::silk::tables_nlsf::SILK_NLSF_CB_WB),
             indices: SideInfoIndices::default(),
             s_cng: SilkCNGState::default(),

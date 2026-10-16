@@ -8,7 +8,7 @@
 //! two memories the function needs (the window memory and the pre-emphasis
 //! memory of every channel), as the C multistream encoder does.
 //!
-//! The opus-rs analysis and the C function compute in `f32` with different
+//! The opus1 analysis and the C function compute in `f32` with different
 //! MDCT code, so their results differ by rounding. `TOLERANCE` says how much
 //! when every band holds signal. The test
 //! `bands_that_hold_only_rounding_noise_differ_more` covers the other case.
@@ -25,7 +25,7 @@ mod ms_support;
 
 use audiopus_sys as sys;
 use ms_support::{APP_AUDIO, CMsEncoder, max_packet_bytes, noise, silence, to_i16, tones, voiced};
-use opus_rs::multistream::surround::SurroundProbe;
+use opus1::multistream::surround::SurroundProbe;
 use std::f64::consts::PI;
 use std::os::raw::{c_int, c_void};
 
@@ -233,7 +233,7 @@ fn check(what: &str, s: &Stats) {
     assert!(s.worst < TOLERANCE_OUTLIER, "{what}: {s}");
 }
 
-/// The differences between the opus-rs mask and the C mask over a signal.
+/// The differences between the opus1 mask and the C mask over a signal.
 #[derive(Default, Clone, Copy)]
 struct Stats {
     /// Number of values compared.
@@ -268,7 +268,7 @@ impl Stats {
         for (k, (&g, &w)) in got.iter().zip(want).enumerate() {
             assert!(
                 g.is_finite() && w.is_finite(),
-                "frame {frame}, value {k}: opus-rs {g}, libopus {w}"
+                "frame {frame}, value {k}: opus1 {g}, libopus {w}"
             );
             let d = (g - w).abs();
             self.values += 1;
@@ -517,7 +517,7 @@ fn mask_is_the_mask_of_libopus_for_every_layout_rate_and_frame_size() {
 #[test]
 fn mask_of_16_bit_input_is_the_mask_of_libopus() {
     // libopus turns a 16-bit sample into `x / 32768` before the analysis
-    // (`opus_copy_channel_in_short`). The opus-rs analysis expects the
+    // (`opus_copy_channel_in_short`). The opus1 analysis expects the
     // caller to do the same.
     let mut total = Stats::default();
     for (channels, rate, frame_size) in [
@@ -814,11 +814,11 @@ fn a_signal_that_fades_to_nothing_matches_libopus() {
 fn bands_that_hold_only_rounding_noise_differ_more() {
     // A sine without a noise floor leaves most bands empty. What the MDCT
     // puts there is its own rounding error, about 1e-7 of the sine. libopus
-    // and opus-rs round differently, so the level of such a band, and with
+    // and opus1 round differently, so the level of such a band, and with
     // it the mask, is not the same on both sides. Neither side is the
     // exact one. Measured against the `f64` reference of
     // `multistream_surround_reference.rs` on signals of this kind, libopus
-    // is off by up to 0.21 and opus-rs by up to 0.27.
+    // is off by up to 0.21 and opus1 by up to 0.27.
     //
     // This is why a few packets differ in `multistream_surround_c.rs` on
     // the speech-like signal, which has no noise floor either.
@@ -846,7 +846,7 @@ fn bands_that_hold_only_rounding_noise_differ_more() {
 #[test]
 fn frame_sizes_are_accepted_as_by_the_c_surround_encoder() {
     // The C surround encoder runs the analysis for every frame size it
-    // accepts. The opus-rs analysis gives a mask for exactly those sizes.
+    // accepts. The opus1 analysis gives a mask for exactly those sizes.
     for (rate, channels) in RATES
         .into_iter()
         .flat_map(|r| (3..=8usize).map(move |c| (r, c)))
@@ -867,7 +867,7 @@ fn frame_sizes_are_accepted_as_by_the_c_surround_encoder() {
             let rs_ok = probe.run(&pcm, frame_size, &mut mask);
             assert_eq!(
                 rs_ok, c_ok,
-                "{channels} channels, {rate} Hz, frame size {frame_size}: opus-rs {rs_ok}, libopus {c_ok}"
+                "{channels} channels, {rate} Hz, frame size {frame_size}: opus1 {rs_ok}, libopus {c_ok}"
             );
             if c_ok {
                 accepted.push(frame_size / unit);

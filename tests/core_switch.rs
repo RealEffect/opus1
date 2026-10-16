@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{aligned_snr, multitone, speech, to_stereo, toc_summary};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder};
 
 const MODES: [(&str, i32, ForcedMode); 3] = [
     ("SILK", MODE_SILK, ForcedMode::SilkOnly),
@@ -31,7 +31,7 @@ fn to_i16(pcm: &[f32]) -> Vec<i16> {
 /// The forced mode changes every half second, through every order of two
 /// modes. For every packet:
 ///
-/// - the C decoder and the opus-rs decoder decode it, and both end in the
+/// - the C decoder and the opus1 decoder decode it, and both end in the
 ///   encoder's final range;
 /// - the TOC byte is libopus's. That includes the first packet after a
 ///   switch to CELT-only, which both encoders still code in the old mode,
@@ -71,12 +71,12 @@ fn mode_changes_in_a_running_stream_keep_the_final_range() {
             assert_eq!(dec.decode(&buf[..n], frame, &mut out), Ok(frame), "{what}");
             assert_ne!(enc.final_range(), 0, "{what}");
             assert_eq!(enc.final_range(), c_dec.final_range(), "{what}: final range, C decoder");
-            assert_eq!(enc.final_range(), dec.final_range(), "{what}: final range, opus-rs decoder");
+            assert_eq!(enc.final_range(), dec.final_range(), "{what}: final range, opus1 decoder");
             assert_eq!(buf[0] & 0xFC, c_packet[0] & 0xFC, "{what}: TOC");
             packets.push(buf[..n].to_vec());
             c_packets.push(c_packet);
         }
-        println!("{rate} Hz: {} packets\n  libopus [{}]\n  opus-rs [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
+        println!("{rate} Hz: {} packets\n  libopus [{}]\n  opus1 [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
         assert!(packets.len() >= 170, "{rate} Hz");
     }
 }
@@ -138,7 +138,7 @@ fn bandwidth_limits_and_lfe_changed_in_a_running_stream() {
         packets.push(buf[..n].to_vec());
     }
     let differ = packets.iter().zip(&c_packets).filter(|(a, b)| a[0] & 0xFC != b[0] & 0xFC).count();
-    println!("{differ} of {} TOC bytes differ\n  libopus [{}]\n  opus-rs [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
+    println!("{differ} of {} TOC bytes differ\n  libopus [{}]\n  opus1 [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
     let kinds = |p: &[Vec<u8>]| p.iter().map(|x| x[0] & 0xFC).collect::<std::collections::BTreeSet<u8>>();
     assert_eq!(kinds(&packets), kinds(&c_packets), "packet configurations used");
     assert!(kinds(&packets).len() >= 4, "the stream changes configuration");
@@ -152,7 +152,7 @@ fn bandwidth_limits_and_lfe_changed_in_a_running_stream() {
 struct CbrRun {
     /// TOC byte of the first packet.
     toc: u8,
-    /// SNR per channel against the input: opus-rs packets, libopus packets.
+    /// SNR per channel against the input: opus1 packets, libopus packets.
     snr: Vec<(f64, f64)>,
 }
 
@@ -196,7 +196,7 @@ fn cbr_run(rate: usize, channels: usize, mode: usize, frame_2_5ms: usize, pcm: &
         packets.push(buf[..n].to_vec());
     }
     let differ = packets.iter().zip(&c_packets).filter(|(a, b)| a[0] & 0xFC != b[0] & 0xFC).count();
-    assert_eq!(differ, 0, "{what}: libopus [{}], opus-rs [{}]", toc_summary(&c_packets), toc_summary(&packets));
+    assert_eq!(differ, 0, "{what}: libopus [{}], opus1 [{}]", toc_summary(&c_packets), toc_summary(&packets));
     let skip = rate / 5;
     let snr = (0..channels)
         .map(|c| {
@@ -238,7 +238,7 @@ fn forced_modes_with_16_bit_input_at_a_constant_bitrate() {
                     for (c, (ours, theirs)) in run.snr.iter().enumerate() {
                         assert!(
                             ours > &(theirs - 2.0),
-                            "{rate} Hz, {channels} ch, forced CELT, {} ms, channel {c}: opus-rs {ours:.1} dB, libopus {theirs:.1} dB",
+                            "{rate} Hz, {channels} ch, forced CELT, {} ms, channel {c}: opus1 {ours:.1} dB, libopus {theirs:.1} dB",
                             frame_2_5ms as f32 * 2.5
                         );
                     }
@@ -271,7 +271,7 @@ fn forced_silk_and_hybrid_on_tonal_input_are_within_2_db_of_libopus() {
                 let run = cbr_run(rate, 1, mode, frame_2_5ms, &pcm);
                 let (ours, theirs) = run.snr[0];
                 if ours <= theirs - 2.0 {
-                    failures.push(format!("{rate} Hz, forced {}, {} ms: opus-rs {ours:.1} dB, libopus {theirs:.1} dB", MODES[mode].0, frame_2_5ms as f32 * 2.5));
+                    failures.push(format!("{rate} Hz, forced {}, {} ms: opus1 {ours:.1} dB, libopus {theirs:.1} dB", MODES[mode].0, frame_2_5ms as f32 * 2.5));
                 }
             }
         }
@@ -337,7 +337,7 @@ fn packets_too_small_to_code_name_the_last_coded_mode() {
                         let c_packet = c_enc.encode(input);
                         let n = enc.encode(input, frame, &mut buf).unwrap_or_else(|e| panic!("{what}, packet {i}: {e}"));
                         let packet = &buf[..n];
-                        let parsed = opus_rs::packet::parse(&c_packet, false).unwrap();
+                        let parsed = opus1::packet::parse(&c_packet, false).unwrap();
                         if parsed.sizes[..parsed.count].iter().all(|&size| size == 0) {
                             assert!(low, "{what}, packet {i}: a placeholder at 32 kb/s");
                             assert_eq!(packet, &c_packet[..], "{what}, packet {i}: placeholder");

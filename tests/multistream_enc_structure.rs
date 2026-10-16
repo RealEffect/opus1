@@ -1,4 +1,4 @@
-//! What the opus-rs multistream encoder puts into a packet, against the C
+//! What the opus1 multistream encoder puts into a packet, against the C
 //! libopus encoder under the same settings.
 //!
 //! - Routing: every input channel comes out of the C decoder on its own
@@ -20,9 +20,9 @@ mod multistream_enc_common;
 use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
-use opus_rs::multistream::encoder::{Bitrate, MultistreamEncoder};
-use opus_rs::multistream::layout::MappingType;
+use opus1::Application;
+use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::multistream::layout::MappingType;
 
 /// The output channel `j` of a decoder with the layout of `case` carries
 /// this input channel, or `None` when it is silent.
@@ -125,30 +125,30 @@ fn surround_bandwidth(
     channels: usize,
     frame_size: usize,
     fs: i32,
-) -> opus_rs::Bandwidth {
+) -> opus1::Bandwidth {
     let channels = channels as i32;
     let mut equiv_rate = bitrate;
     if frame_size as i32 * 50 < fs {
         equiv_rate -= 60 * (fs / frame_size as i32 - 50) * channels;
     }
     if equiv_rate > 10_000 * channels {
-        opus_rs::Bandwidth::Fullband
+        opus1::Bandwidth::Fullband
     } else if equiv_rate > 7_000 * channels {
-        opus_rs::Bandwidth::Superwideband
+        opus1::Bandwidth::Superwideband
     } else if equiv_rate > 5_000 * channels {
-        opus_rs::Bandwidth::Wideband
+        opus1::Bandwidth::Wideband
     } else {
-        opus_rs::Bandwidth::Narrowband
+        opus1::Bandwidth::Narrowband
     }
 }
 
 /// The bandwidth a CELT stream signals when it is asked for `bandwidth` at
 /// the sampling rate `fs`: nothing above what the sampling rate carries.
-fn celt_toc_bandwidth(bandwidth: opus_rs::Bandwidth, fs: i32) -> TocBandwidth {
+fn celt_toc_bandwidth(bandwidth: opus1::Bandwidth, fs: i32) -> TocBandwidth {
     let asked = match bandwidth {
-        opus_rs::Bandwidth::Narrowband => TocBandwidth::Nb,
-        opus_rs::Bandwidth::Mediumband | opus_rs::Bandwidth::Wideband => TocBandwidth::Wb,
-        opus_rs::Bandwidth::Superwideband => TocBandwidth::Swb,
+        opus1::Bandwidth::Narrowband => TocBandwidth::Nb,
+        opus1::Bandwidth::Mediumband | opus1::Bandwidth::Wideband => TocBandwidth::Wb,
+        opus1::Bandwidth::Superwideband => TocBandwidth::Swb,
         _ => TocBandwidth::Fb,
     };
     let widest = match fs {
@@ -167,14 +167,14 @@ fn check_surround_packet(
     enc: &MultistreamEncoder,
     packet: &[u8],
     c_packet: Option<&[u8]>,
-    bandwidth: opus_rs::Bandwidth,
+    bandwidth: opus1::Bandwidth,
     frame_size: usize,
 ) -> Vec<String> {
     let fs = enc.sampling_rate();
     let streams = enc.layout().streams();
     let coupled = enc.layout().coupled_streams();
     let mut wrong = Vec::new();
-    let parts = split_streams(packet, streams).expect("opus-rs packet");
+    let parts = split_streams(packet, streams).expect("opus1 packet");
     let c_parts = c_packet.map(|p| split_streams(p, streams).expect("C packet"));
     for (s, part) in parts.iter().enumerate() {
         let t = toc(part.toc);
@@ -229,7 +229,7 @@ fn check_surround_packet(
                 wrong.push(format!("stream {s} is {t}, C has {ct}"));
             }
             // The mode of a plain mono stream is the stream encoder's own
-            // choice. libopus listens to the signal for it; opus-rs does
+            // choice. libopus listens to the signal for it; opus1 does
             // not. The forced streams must agree.
             if (s < coupled || Some(s) == enc.lfe_stream()) && t.mode != ct.mode {
                 wrong.push(format!("stream {s} is {t}, C has {ct}"));
@@ -298,7 +298,7 @@ fn surround_streams_have_the_structure_of_libopus() {
 
 /// With an automatic or a maximum bitrate libopus codes every stream of a
 /// surround layout narrowband: it compares the raw setting, -1000 or -1,
-/// with the bandwidth thresholds. opus-rs uses the bitrate the allocation
+/// with the bandwidth thresholds. opus1 uses the bitrate the allocation
 /// chose (difference D1 of the design).
 #[test]
 fn automatic_bitrate_in_surround_mode_is_not_narrowband() {
@@ -317,7 +317,7 @@ fn automatic_bitrate_in_surround_mode_is_not_narrowband() {
             .map(|s| rust.stream_encoder(s).unwrap().bitrate_bps)
             .sum();
         let bandwidth = surround_bandwidth(allocated, channels, frame_size, fs);
-        assert_eq!(bandwidth, opus_rs::Bandwidth::Fullband);
+        assert_eq!(bandwidth, opus1::Bandwidth::Fullband);
         for (f, (r, cp)) in rust_packets.iter().zip(&c_packets).enumerate() {
             let wrong = check_surround_packet(&rust, r, None, bandwidth, frame_size);
             assert!(

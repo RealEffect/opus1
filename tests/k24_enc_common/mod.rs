@@ -1,12 +1,12 @@
 //! Shared helpers for the 24 kHz encoder tests (`tests/k24_enc_*.rs`).
 //!
-//! Every measurement puts opus-rs's encoder next to C libopus's encoder under
+//! Every measurement puts opus1's encoder next to C libopus's encoder under
 //! the same settings. Both streams are decoded by C libopus, so a difference
 //! in the numbers comes from the encoder alone.
 #![allow(dead_code)]
 
 use audiopus_sys as sys;
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 use std::os::raw::c_int;
 
 /// The input rate under test.
@@ -269,7 +269,7 @@ pub fn to_i16(pcm: &[f32]) -> Vec<i16> {
         .collect()
 }
 
-/// Encode with opus-rs. `pcm` is interleaved and is cut into whole packets.
+/// Encode with opus1. `pcm` is interleaved and is cut into whole packets.
 pub fn enc_rs(cfg: &Cfg, pcm: &[f32]) -> Result<Vec<Vec<u8>>, String> {
     let mut enc = rs_encoder(cfg);
     enc_rs_with(&mut enc, cfg, pcm)
@@ -290,7 +290,7 @@ pub fn rs_encoder(cfg: &Cfg) -> OpusEncoder {
     enc
 }
 
-/// Encode `pcm` with an existing opus-rs encoder (for mid-stream changes).
+/// Encode `pcm` with an existing opus1 encoder (for mid-stream changes).
 pub fn enc_rs_with(
     enc: &mut OpusEncoder,
     cfg: &Cfg,
@@ -306,7 +306,7 @@ pub fn enc_rs_with(
         } else {
             enc.encode(chunk, cfg.frame, &mut pkt)
         }
-        .map_err(|e| format!("opus-rs encode failed at packet {k}: {e}"))?;
+        .map_err(|e| format!("opus1 encode failed at packet {k}: {e}"))?;
         out.push(pkt[..n].to_vec());
     }
     Ok(out)

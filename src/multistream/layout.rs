@@ -322,6 +322,51 @@ impl ChannelLayout {
     }
 }
 
+/// The channels of a layout grouped by mapping entry. A decoder looks up the
+/// output channels of a decoded channel here instead of searching the
+/// mapping on every frame.
+#[derive(Clone)]
+pub(crate) struct ChannelsByEntry {
+    /// The channel indices sorted by mapping entry. Channels with the same
+    /// entry are in increasing order.
+    channels: [u8; MAX_CHANNELS],
+    /// The channels with mapping entry `m` are `channels[start[m]..start[m + 1]]`.
+    start: [u8; 257],
+}
+
+impl ChannelsByEntry {
+    pub(crate) fn new(layout: &ChannelLayout) -> Self {
+        let mapping = layout.mapping();
+        // Count the channels of each entry, then turn the counts into the
+        // start of each group. A layout has at most 255 channels, so every
+        // value fits in a byte.
+        let mut start = [0u8; 257];
+        for &m in mapping {
+            start[m as usize + 1] += 1;
+        }
+        for m in 0..256 {
+            start[m + 1] += start[m];
+        }
+        let mut next = start;
+        let mut channels = [0u8; MAX_CHANNELS];
+        for (c, &m) in mapping.iter().enumerate() {
+            channels[next[m as usize] as usize] = c as u8;
+            next[m as usize] += 1;
+        }
+        Self { channels, start }
+    }
+
+    /// The channels whose mapping entry is `entry`, in increasing order.
+    /// [`SILENT_CHANNEL`] gives the silent channels.
+    #[inline]
+    pub(crate) fn with_entry(&self, entry: usize) -> &[u8] {
+        match self.start.get(entry..).and_then(|s| s.get(..2)) {
+            Some(&[first, end]) => &self.channels[first as usize..end as usize],
+            _ => &[],
+        }
+    }
+}
+
 impl core::fmt::Debug for ChannelLayout {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ChannelLayout")
@@ -680,6 +725,44 @@ mod tests {
         }
         // Both answers of the encoder check were seen often.
         assert!((200..2800).contains(&encoder_layouts), "{encoder_layouts}");
+    }
+
+    #[test]
+    fn channels_by_entry_lists_what_the_lookups_find() {
+        let mut rng = Rng(0xC0FFEE);
+        for round in 0..2000 {
+            let channels = if round % 10 == 0 { 255 } else { 1 + rng.below(12) };
+            let streams = 1 + rng.below(6);
+            let coupled = rng.below(streams + 1);
+            let mut mapping = [0u8; 255];
+            for m in mapping[..channels].iter_mut() {
+                *m = if rng.below(8) == 0 {
+                    SILENT_CHANNEL
+                } else {
+                    rng.below(streams + coupled) as u8
+                };
+            }
+            let l = ChannelLayout::new(channels, streams, coupled, &mapping[..channels]).unwrap();
+            let by_entry = ChannelsByEntry::new(&l);
+            let mut total = 0;
+            for entry in 0..=255usize {
+                // Every channel after the one before, as the C loop finds them.
+                let mut want = Vec::new();
+                let mut prev = -1;
+                loop {
+                    prev = c_lookup(l.mapping(), entry, prev);
+                    if prev < 0 {
+                        break;
+                    }
+                    want.push(prev as u8);
+                }
+                assert_eq!(by_entry.with_entry(entry), &want[..], "{l:?}, entry {entry}");
+                total += want.len();
+            }
+            assert_eq!(total, channels);
+            assert!(by_entry.with_entry(256).is_empty());
+            assert!(by_entry.with_entry(usize::MAX).is_empty());
+        }
     }
 
     #[test]

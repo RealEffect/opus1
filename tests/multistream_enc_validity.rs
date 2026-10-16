@@ -1,4 +1,4 @@
-//! Every packet of the opus-rs multistream encoder is one C libopus decodes.
+//! Every packet of the opus1 multistream encoder is one C libopus decodes.
 //!
 //! The matrix: every layout of `multistream_enc_common::CASES`, variable and
 //! constant bitrate, 48, 24 and 16 kHz, frames of 2.5 to 60 ms, and three
@@ -29,7 +29,7 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
+use opus1::Application;
 
 /// Bitrates of the matrix in bits per second per input channel. The lowest
 /// brings SILK and narrow bandwidths into play, the highest is CELT fullband.
@@ -226,13 +226,13 @@ fn c_decodes_every_packet_16k_cbr() {
 
 /// The matrix with every coupled stream forced to two channels. Left to
 /// themselves, both encoders code most stereo streams of the matrix as mono
-/// at 8 kb/s per channel, and opus-rs, which has no speech analysis, codes
+/// at 8 kb/s per channel, and opus1, which has no speech analysis, codes
 /// the higher rates as CELT. Measured on this matrix at 48 and 24 kHz,
 /// packets with a stereo Hybrid stream:
 ///
-/// - 8 kb/s per channel: libopus 128, opus-rs 0; forced to two channels,
-///   libopus 310, opus-rs 220.
-/// - 24 kb/s per channel: libopus 111, opus-rs 0, forced or not.
+/// - 8 kb/s per channel: libopus 128, opus1 0; forced to two channels,
+///   libopus 310, opus1 220.
+/// - 24 kb/s per channel: libopus 111, opus1 0, forced or not.
 #[test]
 fn final_range_of_packets_with_a_stereo_hybrid_stream() {
     let mut packets = 0;

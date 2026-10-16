@@ -3,8 +3,8 @@
 //! internal function can be called directly. The function is fixed-point:
 //! every output must be identical.
 
-use opus_rs::silk::gain_quant::silk_quant_ltp_gains;
-use opus_rs::silk::ltp_analysis::silk_find_ltp_fix;
+use opus1::silk::gain_quant::silk_quant_ltp_gains;
+use opus1::silk::ltp_analysis::silk_find_ltp_fix;
 use std::os::raw::c_int;
 
 const LTP_ORDER: usize = 5;

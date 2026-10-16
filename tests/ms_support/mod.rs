@@ -10,7 +10,7 @@
 //!    one signal against another.
 //! 5. A reader that splits a multistream packet into its streams.
 //!
-//! Nothing here uses opus-rs. Every helper is checked against C libopus in
+//! Nothing here uses opus1. Every helper is checked against C libopus in
 //! `tests/multistream_c_selftest.rs`.
 //!
 //! All signals are interleaved `f32`: sample `i` of channel `c` is at index

@@ -3,14 +3,14 @@
 //!
 //! libopus is linked as a static library, so its internal (non-`static`)
 //! functions and tables can be called directly. Each test feeds the same
-//! input to the libopus function and to the opus-rs port and requires
+//! input to the libopus function and to the opus1 port and requires
 //! bit-identical output, as SILK is fixed-point.
 
 mod k24_common;
 
-use opus_rs::silk::nlsf::silk_nlsf2a;
-use opus_rs::silk::nlsf_decode::silk_nlsf_decode;
-use opus_rs::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
+use opus1::silk::nlsf::silk_nlsf2a;
+use opus1::silk::nlsf_decode::silk_nlsf_decode;
+use opus1::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
 use std::os::raw::{c_int, c_void};
 
 unsafe extern "C" {
@@ -54,8 +54,8 @@ unsafe extern "C" {
 /// ones (extra least-significant bits for very large pulses).
 #[test]
 fn decode_pulses_matches_libopus() {
-    use opus_rs::range_coder::RangeCoder;
-    use opus_rs::silk::decode_pulses::silk_decode_pulses as rs_decode_pulses;
+    use opus1::range_coder::RangeCoder;
+    use opus1::silk::decode_pulses::silk_decode_pulses as rs_decode_pulses;
     let mut rng = Lcg(3);
     for trial in 0..20000 {
         // Bias some streams towards 0x00 / 0xFF bytes, which decode to the
@@ -131,14 +131,14 @@ fn resonant_filter(r: f64, angles: &[f64]) -> Vec<i16> {
 /// accepts it, so a different verdict changes the decoded filter.
 ///
 /// The stability limit on each reflection coefficient is 0.99975 in Q24,
-/// which is 16773022 (libopus `A_LIMIT`). opus-rs had 16773043, so it
+/// which is 16773022 (libopus `A_LIMIT`). opus1 had 16773043, so it
 /// accepted filters with a reflection coefficient between the two values
 /// that libopus rejects. A pure tone produces exactly such filters: a
 /// narrowband chirp decoded to -3 dB against libopus from the first such
 /// frame on.
 #[test]
 fn lpc_inverse_pred_gain_matches_libopus() {
-    use opus_rs::silk::lpc_analysis::silk_lpc_inverse_pred_gain;
+    use opus1::silk::lpc_analysis::silk_lpc_inverse_pred_gain;
     // The filter of the first diverging frame of the chirp stream.
     let from_chirp: [i16; 10] = [5782, -8287, 4351, -2408, 157, -223, -45, -302, 104, -250];
     let c = unsafe { silk_LPC_inverse_pred_gain_c(from_chirp.as_ptr(), 10) };
@@ -195,12 +195,12 @@ unsafe extern "C" {
 /// 20 ms calls, on noise and on a loud tone.
 ///
 /// The decoder direction includes down-sampling (12 or 16 kHz SILK frames
-/// into an 8 or 12 kHz decoder). opus-rs set the down-sampler up for the
+/// into an 8 or 12 kHz decoder). opus1 set the down-sampler up for the
 /// encoder only; the decoder's down-sampling ran through the up-sampling
 /// method and produced a different signal.
 #[test]
 fn resampler_matches_libopus_for_every_rate_pair() {
-    use opus_rs::silk::resampler::SilkResampler;
+    use opus1::silk::resampler::SilkResampler;
     let mut rng = Lcg(5);
     let mut pairs = Vec::new();
     for fs_in in [8000, 12000, 16000] {
@@ -360,7 +360,7 @@ fn nlsf2a_matches_libopus_on_resonant_filters() {
 /// The three long-term-prediction gain codebooks.
 #[test]
 fn ltp_gain_codebooks_match_libopus() {
-    use opus_rs::silk::tables::SILK_LTP_VQ_PTRS_Q7;
+    use opus1::silk::tables::SILK_LTP_VQ_PTRS_Q7;
     for (cb, size) in [8usize, 16, 32].into_iter().enumerate() {
         let c = unsafe { std::slice::from_raw_parts(silk_LTP_vq_ptrs_Q7[cb], size * 5) };
         for entry in 0..size {

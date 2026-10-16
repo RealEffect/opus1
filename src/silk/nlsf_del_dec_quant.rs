@@ -652,9 +652,9 @@ mod tests {
     use crate::silk::macros::{silk_limit, silk_smlabb};
     use crate::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
 
-    /// The function as it was before the two versions in this file replaced
-    /// it: a direct port of libopus `silk_NLSF_del_dec_quant`. The tests
-    /// require that every version gives its result.
+    /// A direct port of libopus `silk_NLSF_del_dec_quant`, the reference
+    /// for the two versions in this file. The tests require that every
+    /// version gives its result.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     fn original(
         indices: &mut [i8],

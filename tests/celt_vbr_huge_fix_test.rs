@@ -1,4 +1,4 @@
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 fn max_abs(v: &[f32]) -> f32 {
     v.iter().map(|x| x.abs()).fold(0.0f32, f32::max)

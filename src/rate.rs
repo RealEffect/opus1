@@ -26,60 +26,62 @@ pub fn get_pulses(i: i32) -> i32 {
     }
 }
 
+/// The row of the pulse cache of `band` at frame size index `lm`: -1 to 3,
+/// where -1 stands for half a band of a 2.5 ms frame. Its first entry is
+/// the largest pseudo-pulse count `K` of the row, and entry `q` (1 to `K`)
+/// is the cost of `q` pseudo-pulses in 1/8 bits, less one. `None` when the
+/// band cannot hold pulses at that size.
+///
+/// Indexing is checked: a `band` or `lm` outside the mode's cache panics.
 #[inline(always)]
-pub fn bits2pulses(m: &CeltMode, band: usize, mut lm: i32, bits: i32) -> i32 {
-    lm += 1;
-    let idx = lm as usize * m.nb_ebands + band;
-    let cache_index = unsafe { *m.cache.index.get_unchecked(idx) };
+fn pulse_cache_row(m: &CeltMode, band: usize, lm: i32) -> Option<&[u8]> {
+    let idx = (lm + 1) as usize * m.nb_ebands + band;
+    let cache_index = m.cache.index[idx];
     if cache_index < 0 {
-        return 0;
+        return None;
     }
-    let cache = &m.cache.bits[cache_index as usize..];
-    let cache_ptr = cache.as_ptr();
-
-    let mut lo = 0i32;
-    let mut hi = unsafe { *cache_ptr } as i32;
-    let bits = bits - 1; // bits--
-
-    unsafe {
-        for _ in 0..6 {
-            // LOG_MAX_PSEUDO = 6
-            let mid = (lo + hi + 1) >> 1; // round up, matches C
-            if *cache_ptr.add(mid as usize) as i32 >= bits {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-
-        let lo_val = if lo == 0 {
-            -1i32
-        } else {
-            *cache_ptr.add(lo as usize) as i32
-        };
-        let hi_val = *cache_ptr.add(hi as usize) as i32;
-        if bits - lo_val <= hi_val - bits {
-            lo
-        } else {
-            hi
-        }
-    }
+    Some(&m.cache.bits[cache_index as usize..])
 }
 
+/// libopus `bits2pulses` (rate.h): the pseudo-pulse count whose cost in
+/// the pulse cache lies closest to `bits` (1/8 bits) for `band` at frame
+/// size index `lm`. Panics when `band` or `lm` lies outside the mode's
+/// pulse cache.
 #[inline(always)]
-pub fn pulses2bits(m: &CeltMode, band: usize, mut lm: i32, pulses: i32) -> i32 {
+pub fn bits2pulses(m: &CeltMode, band: usize, lm: i32, bits: i32) -> i32 {
+    let Some(cache) = pulse_cache_row(m, band, lm) else {
+        return 0;
+    };
+    let mut lo = 0usize;
+    let mut hi = cache[0] as usize;
+    let bits = bits - 1;
+    // LOG_MAX_PSEUDO = 6 halvings of the row, rounding the middle up as C
+    // does.
+    for _ in 0..6 {
+        let mid = (lo + hi + 1) >> 1;
+        if cache[mid] as i32 >= bits {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let lo_val = if lo == 0 { -1 } else { cache[lo] as i32 };
+    let hi_val = cache[hi] as i32;
+    if bits - lo_val <= hi_val - bits { lo as i32 } else { hi as i32 }
+}
+
+/// libopus `pulses2bits` (rate.h): the cost in 1/8 bits of `pulses`
+/// pseudo-pulses in `band` at frame size index `lm`. Panics when `band`,
+/// `lm` or `pulses` lies outside the mode's pulse cache.
+#[inline(always)]
+pub fn pulses2bits(m: &CeltMode, band: usize, lm: i32, pulses: i32) -> i32 {
     if pulses == 0 {
         return 0;
     }
-    lm += 1;
-    let idx = lm as usize * m.nb_ebands + band;
-    let cache_index = unsafe { *m.cache.index.get_unchecked(idx) };
-    if cache_index < 0 {
-        return 0;
+    match pulse_cache_row(m, band, lm) {
+        Some(cache) => cache[pulses as usize] as i32 + 1,
+        None => 0,
     }
-    let cache = &m.cache.bits[cache_index as usize..];
-
-    unsafe { (*cache.as_ptr().add(pulses as usize) as i32) + 1 }
 }
 
 #[allow(clippy::too_many_arguments)]

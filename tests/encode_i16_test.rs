@@ -3,7 +3,7 @@
 //! audio converted via `sample as f32 / 32768.0`, across SILK-only,
 //! Hybrid and CELT-only modes.
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 /// Deterministic test signal: speech-like sine + LCG noise, moderate level.
 struct SignalGen {

@@ -155,9 +155,8 @@ impl SilkDecoder {
 
         // libopus (`silk/dec_API.c`) resamples mono and stereo alike from
         // `samplesOut1_tmp[n][1]`: samples [0]/[1] are `sMid`, so index 1 is
-        // the one-sample-delayed position. Mono used to read from
-        // [2..2+fl], which made it one internal-rate sample early versus
-        // libopus (issue #34).
+        // the one-sample-delayed position. Mono reads from there too, not
+        // from index 2.
         let fl = frame.n_samples;
         let channels = control.n_channels_internal as usize;
         if output.len() < channels * fl {

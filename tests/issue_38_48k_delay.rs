@@ -10,7 +10,7 @@
 //!    `delay_matrix_enc[48][16] = 12` plus the down-FIR group delay).
 //! 2. `silk_encode_prefill` was never invoked, so SILK restarts after CELT
 //!    started from a cold encoder state.
-//! 3. The low-bitrate Audio damage was in CELT, not SILK: opus-rs codes
+//! 3. The low-bitrate Audio damage was in CELT, not SILK: opus1 codes
 //!    Audio at 20-24 kbps CELT-only, and its CELT encoder ran `tone_detect`
 //!    and `transient_analysis` on a buffer whose overlap head held the
 //!    previous frame's *prefiltered* samples while the body was unfiltered.
@@ -29,12 +29,12 @@
 //! encoder on the same signal: Voip 32 kbps lags -5..-2 samples at
 //! corr ≥ 0.99 after a weaker first window; Audio 20-24 kbps forced
 //! CELT-only is lag 0, corr 1.00 from the first window. (libopus's mode
-//! choice at Audio 24 kbps depends on its tonality analysis, which opus-rs
+//! choice at Audio 24 kbps depends on its tonality analysis, which opus1
 //! does not port, so only libopus's CELT output is a like-for-like reference.)
 
 use opus::{Channels as CCh, Decoder as CDec};
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::{Application, OpusEncoder};
+use opus1::range_coder::RangeCoder;
+use opus1::{Application, OpusEncoder};
 
 const SR: usize = 48000;
 const FRAME: usize = 960;
@@ -51,7 +51,7 @@ fn chirp(sr: usize, seconds: usize) -> Vec<f32> {
     input
 }
 
-/// Encode the chirp with opus-rs in 20 ms frames; returns input and packets.
+/// Encode the chirp with opus1 in 20 ms frames; returns input and packets.
 fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
     let input = chirp(SR, 13);
     let mut enc = OpusEncoder::new(SR as i32, 1, app).unwrap();
@@ -67,7 +67,7 @@ fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
     (input, packets)
 }
 
-/// Encode the whole stream with opus-rs, decode with libopus, and return the
+/// Encode the whole stream with opus1, decode with libopus, and return the
 /// per-window (best lag, correlation) after the 312-sample pre-skip.
 fn lag_profile(app: Application, bitrate: i32) -> Vec<(i64, f64)> {
     let (input, packets) = encode_chirp(app, bitrate);

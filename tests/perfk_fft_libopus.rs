@@ -12,11 +12,11 @@
 // The loops follow the C code, which steps through its arrays in chunks.
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use opus_rs::kiss_fft::{
+use opus1::kiss_fft::{
     FFT_TWIDDLES_480, KissCpx, KissFftState, opus_fft_impl, opus_fft_impl_fused,
     opus_fft_impl_scalar,
 };
-use opus_rs::modes::default_mode;
+use opus1::modes::default_mode;
 use std::os::raw::{c_int, c_void};
 
 #[repr(C)]
@@ -194,7 +194,7 @@ fn mdct_tables_are_those_of_libopus() {
     let window = unsafe { core::slice::from_raw_parts(mode.window, 120) };
     assert_eq!(rust.window.len(), window.len());
     for (i, (r, c)) in rust.window.iter().zip(window).enumerate() {
-        assert_eq!(r.to_bits(), c.to_bits(), "window, value {i}: opus-rs {r:e}, libopus {c:e}");
+        assert_eq!(r.to_bits(), c.to_bits(), "window, value {i}: opus1 {r:e}, libopus {c:e}");
     }
 
     let mut offset = 0;
@@ -301,7 +301,7 @@ fn radix5_sums_are_in_the_order_of_libopus() {
             );
         }
 
-        // The first output with the sample added first, as opus-rs had it.
+        // The first output with the sample added first, as opus1 had it.
         // It must differ from libopus for some inputs, or this test could
         // not tell the two orders apart.
         let old_r = (x[0].r + (x[1].r + x[4].r)) + (x[2].r + x[3].r);
@@ -867,7 +867,7 @@ fn fft_gives_the_bits_of_libopus() {
 /// of clang, `forward` and `backward` must give the bits of the library
 /// itself.
 ///
-/// opus-rs runs with its own window, the one the codec uses. It is equal to
+/// opus1 runs with its own window, the one the codec uses. It is equal to
 /// the window of libopus (see `mdct_tables_are_those_of_libopus`).
 #[test]
 fn mdct_gives_the_bits_of_libopus() {

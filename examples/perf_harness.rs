@@ -1,4 +1,4 @@
-//! Performance and bit-exactness harness: opus-rs against C libopus.
+//! Performance and bit-exactness harness: opus1 against C libopus.
 //!
 //! ```text
 //! cargo run --release --example perf_harness -- <command> [options]
@@ -24,7 +24,7 @@
 //! The C side is libopus, linked through `audiopus_sys`. Both encoders are
 //! forced to the coding mode, the audio bandwidth and the channel count
 //! that the scenario names (`OPUS_SET_FORCE_MODE`, `OPUS_SET_BANDWIDTH` and
-//! `OPUS_SET_FORCE_CHANNELS`; in opus-rs `set_force_mode`, `set_bandwidth`
+//! `OPUS_SET_FORCE_CHANNELS`; in opus1 `set_force_mode`, `set_bandwidth`
 //! and `set_force_channels`). Both sides then do the same kind of work. The
 //! mode-switching streams of `golden` and `modes` are the exception: there
 //! only the channel count is forced.
@@ -33,11 +33,11 @@
 //! never byte-identical, and:
 //!
 //! * The C library is a float build. Its SILK encoder is the floating-point
-//!   one (`silk/float`); the SILK encoder of opus-rs is a port of the
+//!   one (`silk/float`); the SILK encoder of opus1 is a port of the
 //!   fixed-point one.
-//! * libopus 1.6 runs two encoder steps that opus-rs does not have. They
-//!   are listed at `Scenario::c_only_steps`, and `bench` names them per
-//!   scenario in the column `only C runs`.
+//! * libopus 1.6 runs an encoder step that opus1 does not have, the
+//!   tonality analysis. It is listed at `Scenario::c_only_steps`, and
+//!   `bench` names it per scenario in the column `only C runs`.
 //!
 //! `bench` and `modes` report every scenario in which the two sides differ
 //! in encoder settings, packet configuration, bit rate or decoded audio.
@@ -55,10 +55,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use audiopus_sys as ffi;
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::dec_api::SilkDecoder;
-use opus_rs::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus_rs::{Application, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::range_coder::RangeCoder;
+use opus1::silk::dec_api::SilkDecoder;
+use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+use opus1::{Application, ForcedMode, OpusDecoder, OpusEncoder};
 
 /// Output buffer handed to both encoders. It is larger than any packet, so
 /// it never limits the bit rate.
@@ -186,14 +186,14 @@ impl Bandwidth {
         }
     }
 
-    /// The opus-rs value for this bandwidth.
-    fn rust_value(self) -> opus_rs::Bandwidth {
+    /// The opus1 value for this bandwidth.
+    fn rust_value(self) -> opus1::Bandwidth {
         match self {
-            Bandwidth::Narrow => opus_rs::Bandwidth::Narrowband,
-            Bandwidth::Medium => opus_rs::Bandwidth::Mediumband,
-            Bandwidth::Wide => opus_rs::Bandwidth::Wideband,
-            Bandwidth::SuperWide => opus_rs::Bandwidth::Superwideband,
-            Bandwidth::Full => opus_rs::Bandwidth::Fullband,
+            Bandwidth::Narrow => opus1::Bandwidth::Narrowband,
+            Bandwidth::Medium => opus1::Bandwidth::Mediumband,
+            Bandwidth::Wide => opus1::Bandwidth::Wideband,
+            Bandwidth::SuperWide => opus1::Bandwidth::Superwideband,
+            Bandwidth::Full => opus1::Bandwidth::Fullband,
         }
     }
 }
@@ -321,24 +321,26 @@ impl Scenario {
     }
 
     /// Encoder steps that libopus 1.6 (float build) runs for these settings
-    /// and opus-rs does not have. Checked against the sources of both:
+    /// and opus1 does not have. Checked against the sources of both:
     ///
     /// * `analysis`: the tonality analysis, `run_analysis` in `analysis.c`.
     ///   libopus runs it at complexity 7 and above for input from 16 kHz
-    ///   (`opus_encoder.c`). opus-rs never fills its `AnalysisInfo`.
-    /// * `stereo-angle`: for stereo CELT bands at complexity 8 and above,
-    ///   libopus quantises each band twice and keeps the better stereo angle
-    ///   (`theta_rdo` in `bands.c`). opus-rs keeps `theta_round` at 0.
+    ///   (`opus_encoder.c`). opus1 does not have it.
     ///
-    /// The CELT pitch pre-filter on stereo input is no longer listed: opus-rs
-    /// runs `run_prefilter` for every input channel, as libopus does
-    /// (`src/celt.rs`, the `cc` channels of `in_buf`).
+    /// Two steps of libopus that opus1 also runs are not listed:
+    ///
+    /// * The second quantization pass per stereo CELT band at complexity 8
+    ///   and above, which keeps the better stereo angle (`theta_rdo` in
+    ///   `bands.c`). opus1 runs it in `quant_all_bands_enc` (`src/bands.rs`)
+    ///   for CELT-only and Hybrid frames.
+    /// * The CELT pitch pre-filter on stereo input. opus1 runs
+    ///   `run_prefilter` for every input channel (`src/celt.rs`).
     ///
     /// The C encoder time of a scenario that lists a step includes that
-    /// step, so its Rust/C encode ratio flatters opus-rs.
+    /// step, so its Rust/C encode ratio flatters opus1.
     ///
     /// The list holds the large steps only. `opus_encoder.c` also has small
-    /// per-frame steps without a counterpart in opus-rs: the digital silence
+    /// per-frame steps without a counterpart in opus1: the digital silence
     /// check and the frame energy tracker, which serve discontinuous
     /// transmission. (The stereo width estimate and the gain reduction of
     /// the upper band in Hybrid are ported.)
@@ -346,9 +348,6 @@ impl Scenario {
         let mut steps = Vec::new();
         if self.complexity >= 7 && self.rate >= 16000 {
             steps.push("analysis");
-        }
-        if self.channels == 2 && self.mode != Mode::Silk && self.complexity >= 8 {
-            steps.push("stereo-angle");
         }
         steps
     }
@@ -485,7 +484,7 @@ fn scenarios() -> Vec<Scenario> {
     list.push(s(Silk, 16000, 1, 20_000, 9).frame(10_000).bench());
     list.push(s(Silk, 16000, 2, 32_000, 9).bench());
     list.push(s(Silk, 16000, 1, 24_000, 9).fec(10).bench());
-    // Hybrid is timed at constant bit rate: at variable bit rate opus-rs
+    // Hybrid is timed at constant bit rate: at variable bit rate opus1
     // spends far more bits than libopus in this mode, so the two encoders
     // would not do the same amount of work. The variable bit rate versions
     // are in the golden set below.
@@ -1251,7 +1250,7 @@ impl Fnv {
 
 /// `forced` pins the coding mode, the bandwidth and the channel count to
 /// what the scenario names, as `CEncoder::new` does for libopus. Without it
-/// opus-rs decides by itself.
+/// opus1 decides by itself.
 fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
     let application = match sc.app {
         App::Voip => Application::Voip,
@@ -1316,7 +1315,7 @@ impl CSettings {
     /// "name: expected X, libopus has Y".
     ///
     /// Settings the scenario does not name are expected at the libopus
-    /// default, because opus-rs behaves like that default: constrained
+    /// default, because opus1 behaves like that default: constrained
     /// variable bit rate for CELT, 24-bit input depth, automatic signal
     /// type, no discontinuous transmission, the frame size given per call.
     fn mismatches(&self, sc: &Scenario) -> Vec<String> {
@@ -1356,7 +1355,7 @@ impl CSettings {
     }
 }
 
-/// The settings opus-rs exposes as public fields, read back after encoding:
+/// The settings opus1 exposes as public fields, read back after encoding:
 /// bit rate, complexity, constant bit rate, forward error correction,
 /// expected loss in percent. The encoder clamps them on every call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1570,7 +1569,7 @@ fn rust_encode_all(sc: &Scenario, clip: &Clip) -> Result<Packets, String> {
     rust_encode_all_with_settings(sc, clip).map(|(packets, _)| packets)
 }
 
-/// Encode the clip with opus-rs. Also returns the public encoder settings as
+/// Encode the clip with opus1. Also returns the public encoder settings as
 /// they are after the last frame.
 fn rust_encode_all_with_settings(
     sc: &Scenario,
@@ -1678,7 +1677,7 @@ impl Loss {
     }
 }
 
-/// Decode with opus-rs. A packet that `loss` marks as lost is replaced by an
+/// Decode with opus1. A packet that `loss` marks as lost is replaced by an
 /// empty packet, which makes the decoder conceal one frame.
 fn rust_decode_all(sc: &Scenario, packets: &Packets, loss: Loss) -> Result<Decoded, String> {
     let mut decoder = rust_decoder(sc)?;
@@ -2350,7 +2349,7 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
     let _ = writeln!(header);
     let _ = writeln!(
         header,
-        "- opus-rs {} at git {}, C reference: {}",
+        "- opus1 {} at git {}, C reference: {}",
         env!("CARGO_PKG_VERSION"),
         git_revision(),
         libopus_version()
@@ -2389,11 +2388,11 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
     );
     let _ = writeln!(
         header,
-        "- `only C runs` lists encoder steps that libopus runs for the scenario and opus-rs does not have: `analysis` (tonality analysis), `stereo-angle` (second quantisation pass per stereo band); the C encode time includes them, so the encode ratio of such a row flatters opus-rs"
+        "- `only C runs` lists encoder steps that libopus runs for the scenario and opus1 does not have: `analysis` (tonality analysis); the C encode time includes them, so the encode ratio of such a row flatters opus1"
     );
     let _ = writeln!(
         header,
-        "- the C SILK encoder is the floating-point one of libopus (`silk/float`), the opus-rs SILK encoder is a port of the fixed-point one"
+        "- the C SILK encoder is the floating-point one of libopus (`silk/float`), the opus1 SILK encoder is a port of the fixed-point one"
     );
     let _ = writeln!(
         header,
@@ -2458,7 +2457,7 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
             comparison,
             "(negative = faster now. The C library did not change, so the C columns show how much the machine itself moved between the two runs. \
              `Rust against C` is the change of the Rust time divided by the change of the C time: a slowdown or speed-up of the whole machine cancels out there, \
-             so that is the column to read for a change in opus-rs.)\n"
+             so that is the column to read for a change in opus1.)\n"
         );
         let _ = writeln!(
             comparison,
@@ -2514,7 +2513,7 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
         let mut text = String::new();
         let _ = writeln!(
             text,
-            "{{\"meta\":{{\"opus_rs\":{},\"git\":{},\"libopus\":{},\"clip_seconds\":{seconds},\"reps\":{reps},\"procs\":{procs},\"reps_per_proc\":{reps_per_proc},\"max_rounds\":{max_rounds},\"unix_time\":{unix_time},\"performance_core_requested\":{performance_core},\"layout_pad\":{LAYOUT_PAD}}},",
+            "{{\"meta\":{{\"opus1\":{},\"git\":{},\"libopus\":{},\"clip_seconds\":{seconds},\"reps\":{reps},\"procs\":{procs},\"reps_per_proc\":{reps_per_proc},\"max_rounds\":{max_rounds},\"unix_time\":{unix_time},\"performance_core_requested\":{performance_core},\"layout_pad\":{LAYOUT_PAD}}},",
             json_string(env!("CARGO_PKG_VERSION")),
             json_string(&git_revision()),
             json_string(&libopus_version()),
@@ -2826,7 +2825,7 @@ fn golden_line(sc: &Scenario, clip: &Clip) -> String {
 //
 // * libopus then moves between SILK, Hybrid and CELT and between the
 //   bandwidths. The Rust decoder decodes that stream.
-// * opus-rs moves between SILK or Hybrid and CELT as well. It has no
+// * opus1 moves between SILK or Hybrid and CELT as well. It has no
 //   speech/music detection, so it does not switch on the same packets.
 //
 // For stereo input both encoders also change between stereo and mono
@@ -3575,7 +3574,7 @@ fn c_constant_label(value: i32) -> String {
 /// Encode the clip of every scenario with both libraries and print the
 /// settings each encoder reports afterwards.
 ///
-/// The C values come from the `OPUS_GET_*` requests of libopus. opus-rs has
+/// The C values come from the `OPUS_GET_*` requests of libopus. opus1 has
 /// no such requests: its bit rate, complexity, constant-bit-rate switch,
 /// forward error correction switch and expected loss are public fields, and
 /// the application, sample rate and channel count only go into the

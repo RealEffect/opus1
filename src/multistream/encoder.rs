@@ -28,30 +28,6 @@
 //!   setting, -1000 or -1, and so always ends up with narrowband. This
 //!   encoder uses the bitrate the allocation chose for the frame. With an
 //!   explicit bitrate both do the same.
-//! - **D2, a stream that is left one byte.** libopus hands such a stream a
-//!   1-byte buffer and gets a packet that is only the table-of-contents
-//!   (TOC) byte. [`OpusEncoder::encode`] refuses a buffer below 2 bytes, so
-//!   the stream is handed 2 bytes here. With that little room the stream
-//!   encoder writes a packet without audio as well, and writing it into the
-//!   multistream packet brings it down to the TOC byte. For frames up to
-//!   20 ms the packet has the size of the one libopus writes, down to the
-//!   smallest buffer of `2 * streams - 1` bytes. The TOC byte of a stream
-//!   without audio is the one libopus writes: it names the mode and the
-//!   bandwidth of the last frame the stream coded, or Hybrid fullband when
-//!   it has coded none. Its channel count is also that of the last frame:
-//!   outside surround mode both encoders code a stereo stream as mono at
-//!   low bitrates, and the TOC byte then says mono. The design
-//!   document raised the smallest buffer to `2 * streams` bytes instead;
-//!   that is not needed.
-//!   For 40 and 60 ms frames a stream that is not SILK-only needs a few
-//!   bytes more in [`OpusEncoder`] than in libopus. When it is left fewer,
-//!   this encoder returns "Output buffer too small" where libopus writes a
-//!   packet without audio. Three settings lead there:
-//!   - an output buffer within a few bytes per stream of the smallest one;
-//!   - constant bitrate with an output buffer smaller than the packet the
-//!     bitrate calls for, so that the first streams fill the buffer. With
-//!     [`Bitrate::Max`] that is any buffer the first streams can fill;
-//!   - a constant bitrate of at most 1000 bits per second per channel.
 //! - **D3, frame sizes.** 80, 100 and 120 ms frames and the "expert frame
 //!   duration" control are not offered: [`OpusEncoder`] has neither.
 //! - **D5, controls.** Missing at the multistream level are the LSB depth,
@@ -69,26 +45,16 @@
 //! the channels of the stream, for its analysis of speech against music.
 //! [`OpusEncoder`] has no such analysis.
 
-use super::ChannelSource;
+use super::{ChannelSource, Interleaved, Sample};
 use super::layout::{ChannelLayout, MappingType};
 use super::rate_alloc::{
-    MS_FRAME_TMP, OPUS_AUTO, OPUS_BITRATE_MAX, bits_to_bitrate, cbr_last_stream_bitrate,
-    cbr_max_data_bytes, clamp_user_bitrate, rate_allocation, smallest_packet, stream_max_bytes,
+    MAX_BITRATE_PER_CHANNEL, MS_FRAME_TMP, OPUS_AUTO, OPUS_BITRATE_MAX, bits_to_bitrate,
+    cbr_last_stream_bitrate, cbr_max_data_bytes, clamp_user_bitrate, rate_allocation,
+    smallest_packet, stream_max_bytes,
 };
-use super::surround::SurroundAnalysis;
+use super::surround::{MASK_BANDS, SurroundAnalysis};
 use crate::packet;
-use crate::{Application, Bandwidth, ForcedMode, OpusEncoder};
-
-/// Number of bands of the surround energy mask, per channel.
-const MASK_BANDS: usize = 21;
-
-/// The most a stream encoder accepts per channel, in bits per second
-/// (libopus `opus_encoder_ctl`, `OPUS_SET_BITRATE_REQUEST`).
-const MAX_STREAM_BITRATE_PER_CHANNEL: i32 = 750_000;
-
-/// The largest packet of one frame in bytes. libopus reports a stream's
-/// bitrate limited to what a packet of this size carries.
-const MAX_PACKET_BYTES: i32 = 1276;
+use crate::{Application, Bandwidth, ForcedMode, OPUS_MAX_PACKET_BYTES, OpusEncoder};
 
 const BUFFER_TOO_SMALL: &str = "Output buffer too small";
 
@@ -104,91 +70,19 @@ pub enum Bitrate {
     BitsPerSecond(i32),
 }
 
-/// Interleaved `f32` input. libopus `opus_copy_channel_in_float`.
-struct InterleavedF32<'a> {
-    pcm: &'a [f32],
-    channels: usize,
-}
-
-impl ChannelSource for InterleavedF32<'_> {
-    #[inline]
-    fn copy(&self, dst: &mut [f32], dst_stride: usize, src_channel: usize, frame_size: usize) {
-        copy_channel(
-            self.pcm,
-            self.channels,
-            dst,
-            dst_stride,
-            src_channel,
-            frame_size,
-            |s| s,
-        );
-    }
-}
-
-/// Interleaved 16-bit input. libopus `opus_copy_channel_in_short`.
-struct InterleavedI16<'a> {
-    pcm: &'a [i16],
-    channels: usize,
-}
-
-impl ChannelSource for InterleavedI16<'_> {
-    #[inline]
-    fn copy(&self, dst: &mut [f32], dst_stride: usize, src_channel: usize, frame_size: usize) {
-        // libopus INT16TORES in the float build. Dividing by a power of two
-        // is exact.
-        copy_channel(
-            self.pcm,
-            self.channels,
-            dst,
-            dst_stride,
-            src_channel,
-            frame_size,
-            |s| s as f32 / 32768.0,
-        );
-    }
-}
-
-/// Copies `frame_size` samples of channel `src_channel` of the interleaved
-/// signal `pcm` to `dst[0]`, `dst[dst_stride]`, `dst[2 * dst_stride]` and so
-/// on. Copies fewer samples when `pcm` or `dst` is shorter than that.
-#[inline]
-fn copy_channel<T: Copy>(
-    pcm: &[T],
-    channels: usize,
-    dst: &mut [f32],
-    dst_stride: usize,
-    src_channel: usize,
-    frame_size: usize,
-    convert: impl Fn(T) -> f32,
-) {
-    if dst_stride == 0 || src_channel >= channels {
-        return;
-    }
-    let samples = pcm.chunks_exact(channels).map(|frame| frame[src_channel]);
-    for (d, s) in dst
-        .iter_mut()
-        .step_by(dst_stride)
-        .zip(samples)
-        .take(frame_size)
-    {
-        *d = convert(s);
-    }
-}
-
 /// The bitrate control of a stream encoder (libopus `opus_encoder_ctl`,
 /// `OPUS_SET_BITRATE_REQUEST`): a positive value is limited to 500 bits per
 /// second at least and 750 000 bits per second per channel at most.
 /// [`OpusEncoder`] itself allows more, so the limit is applied here.
 #[inline]
 fn stream_bitrate(value: i32, stream_channels: usize) -> i32 {
-    value.clamp(500, MAX_STREAM_BITRATE_PER_CHANNEL * stream_channels as i32)
+    value.clamp(500, MAX_BITRATE_PER_CHANNEL * stream_channels as i32)
 }
 
 /// The input channels of stream `s` (C `c1` and `c2`): the left and the right
 /// channel of a coupled stream, or the one channel of a mono stream. The
 /// samples and the energy mask of a stream both go by this pair, so the two
 /// cannot disagree on which channel comes first.
-#[inline]
 fn stream_input_channels(
     layout: &ChannelLayout,
     s: usize,
@@ -246,6 +140,8 @@ pub struct MultistreamEncoder {
     max_bandwidth: Bandwidth,
     /// One encoder per stream. The first `coupled_streams` are stereo.
     encoders: Vec<OpusEncoder>,
+    /// The input channels of each stream (`stream_input_channels`).
+    stream_inputs: Vec<(usize, Option<usize>)>,
     /// The bitrate the allocation gave each stream for the current frame.
     rates: Vec<i32>,
     /// Per stream, the duration in samples of one frame of its last packet
@@ -336,6 +232,9 @@ impl MultistreamEncoder {
         let coupled = layout.coupled_streams();
         let channels = layout.channels();
 
+        let stream_inputs = (0..streams)
+            .map(|s| stream_input_channels(&layout, s))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut encoders = Vec::with_capacity(streams);
         for s in 0..streams {
             let stream_channels = if s < coupled { 2 } else { 1 };
@@ -367,6 +266,7 @@ impl MultistreamEncoder {
             user_bandwidth: Bandwidth::Auto,
             max_bandwidth: Bandwidth::Fullband,
             encoders,
+            stream_inputs,
             rates: vec![0; streams],
             stream_frame_size: vec![0; streams],
             rates_assigned: false,
@@ -434,7 +334,7 @@ impl MultistreamEncoder {
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
         self.check_input(pcm.len(), frame_size)?;
-        let src = InterleavedF32 {
+        let src = Interleaved {
             pcm,
             channels: self.layout.channels(),
         };
@@ -453,7 +353,7 @@ impl MultistreamEncoder {
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
         self.check_input(pcm.len(), frame_size)?;
-        let src = InterleavedI16 {
+        let src = Interleaved {
             pcm,
             channels: self.layout.channels(),
         };
@@ -463,20 +363,7 @@ impl MultistreamEncoder {
     /// Checks the frame size (libopus `frame_size_select` without a frame
     /// duration override) and that the input holds one frame.
     fn check_input(&self, pcm_len: usize, frame_size: usize) -> Result<(), &'static str> {
-        let fs = self.sampling_rate as usize;
-        // No valid frame is longer than a second. Checking this first keeps
-        // the products below in range.
-        if frame_size == 0 || frame_size > fs {
-            return Err("Invalid frame size");
-        }
-        let n = frame_size;
-        let valid = 400 * n == fs
-            || 200 * n == fs
-            || 100 * n == fs
-            || 50 * n == fs
-            || 25 * n == fs
-            || 50 * n == 3 * fs;
-        if !valid {
+        if crate::frame_rate_from_params(self.sampling_rate, frame_size).is_none() {
             // D3: libopus also takes 80, 100 and 120 ms.
             return Err("Invalid frame size");
         }
@@ -488,9 +375,9 @@ impl MultistreamEncoder {
 
     /// libopus `opus_multistream_encode_native`. `frame_size` has been
     /// checked, and `src` holds a frame of every input channel.
-    fn encode_native<S: ChannelSource>(
+    fn encode_native<T: Sample>(
         &mut self,
-        src: &S,
+        src: &Interleaved<'_, T>,
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
@@ -510,7 +397,7 @@ impl MultistreamEncoder {
         // Surround masking: how far each band of each channel lies above
         // what the other channels mask (C 910-913). libopus runs the
         // analysis for the surround mapping type only, and only such an
-        // encoder has one here. The analysis reads every input channel once
+        // encoder has one here. The analysis reads the input channels
         // through `src`. It gives a mask for every frame size and sampling
         // rate this function is reached with, so `have_mask` is then true.
         let have_mask = match self.surround.as_mut() {
@@ -597,18 +484,15 @@ impl MultistreamEncoder {
 
         let mut band_log_e = [0.0f32; 2 * MASK_BANDS];
         let mut tot_size = 0usize;
-        for (s, enc) in self.encoders.iter_mut().enumerate() {
+        let streams_and_inputs = self.encoders.iter_mut().zip(&self.stream_inputs);
+        for (s, (enc, &(c1, c2))) in streams_and_inputs.enumerate() {
             let last = s + 1 == streams;
-            let stream_channels = if s < coupled { 2 } else { 1 };
+            let stream_channels = enc.channels();
             // Copy the input of the stream: left and right interleaved for a
             // coupled stream.
-            let (c1, c2) = stream_input_channels(&self.layout, s)?;
             match c2 {
-                Some(c2) => {
-                    src.copy(&mut self.buf, 2, c1, frame_size);
-                    src.copy(&mut self.buf[1..], 2, c2, frame_size);
-                }
-                None => src.copy(&mut self.buf, 1, c1, frame_size),
+                Some(c2) => src.copy_pair(&mut self.buf, c1, c2, frame_size),
+                None => src.copy(&mut self.buf, c1, frame_size),
             }
             if surround_mode {
                 // libopus sets the mask of every stream on every frame in
@@ -634,11 +518,10 @@ impl MultistreamEncoder {
                     stream_channels,
                 );
             }
-            let enc_max = curr_max;
             let len = enc.encode(
                 &self.buf[..frame_size * stream_channels],
                 frame_size,
-                &mut self.tmp[..enc_max],
+                &mut self.tmp[..curr_max],
             )?;
 
             // The stream encoder can return more than one frame (a 60 ms
@@ -722,7 +605,7 @@ impl MultistreamEncoder {
             } else {
                 frame_size
             };
-            let Ok(max_bitrate) = bits_to_bitrate(MAX_PACKET_BYTES * 8, fs, frame_size) else {
+            let Ok(max_bitrate) = bits_to_bitrate(OPUS_MAX_PACKET_BYTES as i32 * 8, fs, frame_size) else {
                 continue;
             };
             let user_bitrate = if self.rates_assigned {
@@ -902,63 +785,6 @@ impl MultistreamEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn copy_channel_reads_one_channel_with_a_stride() {
-        // 3 channels, 4 samples: channel c holds 10 * c + i.
-        let pcm: Vec<f32> = (0..12).map(|k| (10 * (k % 3) + k / 3) as f32).collect();
-        let src = InterleavedF32 {
-            pcm: &pcm,
-            channels: 3,
-        };
-        let mut mono = [-1.0f32; 6];
-        src.copy(&mut mono, 1, 2, 4);
-        assert_eq!(mono, [20.0, 21.0, 22.0, 23.0, -1.0, -1.0]);
-        let mut stereo = [-1.0f32; 8];
-        src.copy(&mut stereo, 2, 0, 4);
-        src.copy(&mut stereo[1..], 2, 1, 4);
-        assert_eq!(stereo, [0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0]);
-    }
-
-    #[test]
-    fn copy_channel_never_reads_or_writes_out_of_range() {
-        let pcm = [1.0f32; 7];
-        let src = InterleavedF32 {
-            pcm: &pcm,
-            channels: 2,
-        };
-        let mut dst = [0.0f32; 2];
-        // More samples asked for than the input and the destination hold.
-        src.copy(&mut dst, 1, 1, 100);
-        assert_eq!(dst, [1.0, 1.0]);
-        // A channel that does not exist, and a stride of 0, copy nothing.
-        let mut dst = [0.0f32; 2];
-        src.copy(&mut dst, 1, 2, 2);
-        src.copy(&mut dst, 0, 0, 2);
-        assert_eq!(dst, [0.0, 0.0]);
-    }
-
-    #[test]
-    fn sixteen_bit_input_is_scaled_by_32768() {
-        let pcm = [i16::MIN, -1, 0, 1, 16384, i16::MAX];
-        let src = InterleavedI16 {
-            pcm: &pcm,
-            channels: 1,
-        };
-        let mut dst = [9.0f32; 6];
-        src.copy(&mut dst, 1, 0, 6);
-        assert_eq!(
-            dst,
-            [
-                -1.0,
-                -1.0 / 32768.0,
-                0.0,
-                1.0 / 32768.0,
-                0.5,
-                32767.0 / 32768.0
-            ]
-        );
-    }
 
     #[test]
     fn stream_mask_holds_the_left_channel_then_the_right() {

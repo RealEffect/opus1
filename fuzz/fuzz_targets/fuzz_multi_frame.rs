@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 32 {
@@ -127,22 +127,21 @@ fuzz_target!(|data: &[u8]| {
             input[i] = input[i].clamp(-1.0, 1.0);
         }
 
-        // Encode
-        match encoder.encode(&input, frame_size, &mut output_buf) {
-            Ok(encoded_len) if encoded_len > 0 => {
-                // Decode
-                let _ = decoder.decode(&output_buf[..encoded_len], frame_size, &mut decoded_buf);
+        // Encode. The frame size is valid and the buffer large enough, so
+        // the frame must be encoded.
+        let encoded_len = encoder
+            .encode(&input, frame_size, &mut output_buf)
+            .expect("a valid frame was not encoded");
 
-                // Verify decoded output doesn't contain NaN/Inf
-                for &sample in &decoded_buf {
-                    if !sample.is_finite() {
-                        // Found invalid sample - this is a bug
-                        return;
-                    }
-                }
-            }
-            _ => {}
-        }
+        // Decode: one frame, in the encoder's final range, with finite
+        // samples.
+        let decoded = decoder.decode(&output_buf[..encoded_len], frame_size, &mut decoded_buf);
+        assert_eq!(decoded, Ok(frame_size), "frame {frame_idx}");
+        assert_eq!(decoder.final_range(), encoder.final_range(), "frame {frame_idx}");
+        assert!(
+            decoded_buf.iter().all(|x| x.is_finite()),
+            "frame {frame_idx}: the decoder returned a sample that is not finite"
+        );
     }
 
     // Reset and do another batch

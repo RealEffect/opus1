@@ -2,7 +2,7 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::mdct::MdctLookup;
+use opus1::mdct::MdctLookup;
 
 #[test]
 fn test_mdct_identity_full() {

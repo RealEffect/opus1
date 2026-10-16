@@ -3,9 +3,9 @@
 //! root at once. These tests compare it with the loop as libopus writes it,
 //! which evaluates one point after the other.
 
-use opus_rs::silk::macros::{silk_add_rshift, silk_smlaww};
-use opus_rs::silk::nlsf::{silk_a2nlsf, silk_bwexpander_32, silk_nlsf2a};
-use opus_rs::silk::tables::{LSF_COS_TAB_SZ_FIX, SILK_LSF_COS_TAB_FIX_Q12};
+use opus1::silk::macros::{silk_add_rshift, silk_smlaww};
+use opus1::silk::nlsf::{silk_a2nlsf, silk_bwexpander_32, silk_nlsf2a};
+use opus1::silk::tables::{LSF_COS_TAB_SZ_FIX, SILK_LSF_COS_TAB_FIX_Q12};
 
 fn trans_poly(p: &mut [i32], dd: usize) {
     for k in 2..=dd {

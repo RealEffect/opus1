@@ -17,10 +17,10 @@ mod core_common;
 mod k24_common;
 
 use core_common::*;
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::dec_api::SilkDecoder;
-use opus_rs::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::range_coder::RangeCoder;
+use opus1::silk::dec_api::SilkDecoder;
+use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL};
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// The first gain index of the SILK frame of a 20 ms wideband mono packet,
 /// decoded as the normal frame or as the LBRR copy it carries.
@@ -42,7 +42,7 @@ fn has_lbrr(packet: &[u8]) -> bool {
 
 /// For each SILK-only packet that follows CELT-only packets: how far the
 /// first gain index of its LBRR copy (in the next packet) lies above the
-/// frame's own, for opus-rs and for libopus.
+/// frame's own, for opus1 and for libopus.
 fn gain_increases(application: (i32, Application), loss: i32) -> Vec<(usize, i32, i32)> {
     let rate = 16000;
     let frame = 320;
@@ -80,7 +80,7 @@ fn gain_increases(application: (i32, Application), loss: i32) -> Vec<(usize, i32
 
 /// At 20 % loss the increase is `7 - (20 * 13107 >> 16) = 4` for the first
 /// SILK packet after CELT-only packets, in libopus's packets and in
-/// opus-rs's. opus-rs ran `silk_setup_LBRR` once for the packet and raised
+/// opus1's. opus1 ran `silk_setup_LBRR` once for the packet and raised
 /// the gain by 7: its LBRR frame was coded about 4 dB coarser than
 /// libopus's. At 10 % loss the increase is 6. A gain index of 63 is the
 /// largest, so an increase that would go beyond it is not compared.
@@ -97,7 +97,7 @@ fn the_first_silk_packet_after_celt_has_the_lbrr_gain_of_libopus() {
                     continue;
                 }
                 assert_eq!(c, want, "{what}: libopus");
-                assert_eq!(got, want, "{what}: opus-rs");
+                assert_eq!(got, want, "{what}: opus1");
             }
         }
     }

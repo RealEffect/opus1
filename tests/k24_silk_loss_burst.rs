@@ -6,7 +6,7 @@
 //! `psPLC->LTPCoef_Q14`), so the next lost frame continues from the lowered
 //! values and the concealed speech keeps fading.
 //!
-//! opus-rs worked on a copy and discarded it, so every lost frame started
+//! opus1 worked on a copy and discarded it, so every lost frame started
 //! again from the full gain. The first lost frame was bit-exact; the second
 //! in a row scored 25 dB against libopus and the third 8 dB.
 
@@ -25,7 +25,7 @@ fn lost_frames_in_a_row_are_bit_exact() {
         let rate = 24000usize;
         let frame = rate / 50;
         let mut c_dec = CDec::new(rate, 1);
-        let mut rs_dec = opus_rs::OpusDecoder::new(rate as i32, 1).unwrap();
+        let mut rs_dec = opus1::OpusDecoder::new(rate as i32, 1).unwrap();
         let mut buf = vec![0f32; frame];
         for (i, p) in packets.iter().enumerate() {
             let lost = (10..13).contains(&i);

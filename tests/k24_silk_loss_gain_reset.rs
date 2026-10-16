@@ -12,7 +12,7 @@
 //! "On packet loss, remove the gain clamping to prevent having the energy
 //! bounce back if we lose packets when the energy is going down").
 //!
-//! opus-rs kept the old index. When a talker stopped during a lost packet,
+//! opus1 kept the old index. When a talker stopped during a lost packet,
 //! the first good packet after it was decoded with a gain only 16 steps
 //! below the last speech gain instead of its own, far lower, gain. The
 //! pause after the speech came back too loud for one to three packets.
@@ -33,7 +33,7 @@ use k24_common::*;
 /// packet against libopus, or `None` if every sample is equal.
 fn first_difference(packets: &[Vec<u8>], lost: usize, frame: usize) -> Option<(usize, f64)> {
     let mut c_dec = CDec::new(24000, 1);
-    let mut rs_dec = opus_rs::OpusDecoder::new(24000, 1).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
     let mut buf = vec![0f32; frame];
     for (i, p) in packets.iter().enumerate() {
         let reference = if i == lost {

@@ -3,7 +3,7 @@
 //! internal function can be called directly. The function is fixed-point:
 //! energy and shift must be identical.
 
-use opus_rs::silk::sigproc_fix::silk_sum_sqr_shift;
+use opus1::silk::sigproc_fix::silk_sum_sqr_shift;
 use std::os::raw::c_int;
 
 unsafe extern "C" {
@@ -120,7 +120,7 @@ fn sum_sqr_shift_matches_libopus_for_every_length_and_level() {
                 assert_eq!(
                     (energy, shift),
                     (c_energy, c_shift),
-                    "opus-rs against libopus: len={len} kind={kind}"
+                    "opus1 against libopus: len={len} kind={kind}"
                 );
                 if c_shift > 0 {
                     shifted_cases += 1;

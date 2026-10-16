@@ -2,8 +2,8 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::bands::{compute_band_energies, denormalise_bands, log2amp, normalise_bands};
-use opus_rs::modes::default_mode;
+use opus1::bands::{compute_band_energies, denormalise_bands, log2amp, normalise_bands};
+use opus1::modes::default_mode;
 
 #[test]
 fn test_energy_norm_denorm() {
@@ -24,7 +24,7 @@ fn test_energy_norm_denorm() {
     compute_band_energies(mode, &freq, &mut band_e, nb_ebands, channels, lm);
 
     let mut band_log_e = vec![0.0f32; nb_ebands * channels];
-    opus_rs::bands::amp2log2(
+    opus1::bands::amp2log2(
         mode,
         0, // start_band=0: compute all bands (CeltOnly mode)
         nb_ebands,

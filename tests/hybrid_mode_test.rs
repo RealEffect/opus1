@@ -4,7 +4,7 @@
 
 /// Tests for Hybrid (SILK + CELT) mode encoding and decoding.
 /// Hybrid mode uses SILK for low-frequency content and CELT for high-frequency content.
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Test that Hybrid mode can be enabled and produces valid packets
@@ -182,9 +182,9 @@ fn test_hybrid_mode_invalid_sample_rates() {
 /// Test CELT start_band functionality with start_band > 0
 #[test]
 fn test_celt_encode_with_start_band() {
-    use opus_rs::celt::CeltEncoder;
-    use opus_rs::modes::default_mode;
-    use opus_rs::range_coder::RangeCoder;
+    use opus1::celt::CeltEncoder;
+    use opus1::modes::default_mode;
+    use opus1::range_coder::RangeCoder;
 
     let mode = default_mode();
     let frame_size = 960;
@@ -206,7 +206,8 @@ fn test_celt_encode_with_start_band() {
 
     // Encode with start_band = 17 (high-frequency only)
     let mut rc_partial = RangeCoder::new_encoder(1500);
-    enc_partial.encode_with_start_band(&input, frame_size, &mut rc_partial, 17);
+    enc_partial.set_start_band(17).unwrap();
+    enc_partial.encode(&input, frame_size, &mut rc_partial);
     rc_partial.done();
     let partial_bits = rc_partial.tell();
 
@@ -218,12 +219,12 @@ fn test_celt_encode_with_start_band() {
     println!("✅ CELT start_band encode test passed");
 }
 
-/// Test CELT decode_with_start_band works without crashing
+/// Test that CELT decoding from start band 17 works without crashing
 #[test]
-fn test_celt_decode_with_start_band() {
-    use opus_rs::celt::{CeltDecoder, CeltEncoder};
-    use opus_rs::modes::default_mode;
-    use opus_rs::range_coder::RangeCoder;
+fn test_celt_decode_from_start_band_17() {
+    use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+    use opus1::modes::default_mode;
+    use opus1::range_coder::RangeCoder;
 
     let mode = default_mode();
     let frame_size = 960;
@@ -239,7 +240,8 @@ fn test_celt_decode_with_start_band() {
 
     // Encode with start_band = 17
     let mut rc = RangeCoder::new_encoder(1500);
-    encoder.encode_with_start_band(&input, frame_size, &mut rc, 17);
+    encoder.set_start_band(17).unwrap();
+    encoder.encode(&input, frame_size, &mut rc);
     rc.done();
 
     // Build the encoded bytes
@@ -248,14 +250,17 @@ fn test_celt_decode_with_start_band() {
 
     // Decode with start_band = 17
     let mut output = vec![0.0f32; frame_size];
-    decoder.decode_with_start_band(&encoded, frame_size, &mut output, 17);
+    decoder.set_start_band(17).unwrap();
+    let mut rc = RangeCoder::new_decoder(&encoded);
+    let bits = (encoded.len() * 8) as i32;
+    decoder.decode(&mut rc, bits, frame_size, &mut output, PcmLayout::Planar);
 
     println!(
         "Encoded {} bytes, decoded {} samples",
         encoded.len(),
         frame_size
     );
-    println!("✅ CELT decode_with_start_band test passed (no crash)");
+    println!("✅ CELT decode from start band 17 passed (no crash)");
 }
 
 fn rms_i16(samples: &[i16]) -> f64 {
@@ -268,7 +273,7 @@ fn rms_i16(samples: &[i16]) -> f64 {
 
 #[test]
 fn test_downsample_48_to_16_sample_count() {
-    use opus_rs::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
+    use opus1::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
 
     let frame_size = 960usize; // 20 ms at 48 kHz
     let input: Vec<i16> = (0..frame_size)
@@ -301,7 +306,7 @@ fn test_downsample_48_to_16_sample_count() {
 /// At 24kHz a 20 ms frame is 480 samples. After ×2/3 we expect 320 samples.
 #[test]
 fn test_downsample_24_to_16_sample_count() {
-    use opus_rs::silk::resampler::silk_resampler_down2_3;
+    use opus1::silk::resampler::silk_resampler_down2_3;
 
     let frame_size = 480usize; // 20 ms at 24 kHz
     let input: Vec<i16> = (0..frame_size).map(|i| i as i16).collect();
@@ -322,7 +327,7 @@ fn test_downsample_24_to_16_sample_count() {
 
 #[test]
 fn test_downsample_48_to_16_antialiasing() {
-    use opus_rs::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
+    use opus1::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
 
     let in_rate = 48000usize;
     // 4 frames = 80 ms – enough to let the IIR filter settle
@@ -371,7 +376,7 @@ fn test_downsample_48_to_16_antialiasing() {
 
 #[test]
 fn test_downsample_48_to_16_passband_preserved() {
-    use opus_rs::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
+    use opus1::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
 
     let in_rate = 48000usize;
     let frame_size = 960 * 4; // 80 ms – let the filter settle

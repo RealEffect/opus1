@@ -122,6 +122,14 @@ impl CeltMode {
             e_means: &E_MEANS,
         }
     }
+
+    /// The size exponent `lm` of a frame of `n` samples at 48 kHz: `n` is
+    /// `short_mdct_size << lm` (120, 240, 480 or 960 samples). `None` for
+    /// any other size.
+    #[inline]
+    pub(crate) fn lm_for(&self, n: usize) -> Option<usize> {
+        (0..=self.max_lm).find(|&lm| self.short_mdct_size << lm == n)
+    }
 }
 
 pub const E_MEANS: [f32; 25] = [

@@ -2,7 +2,7 @@
 //! analysis of speech against music.
 //!
 //! libopus runs that analysis from complexity 7 on (opus_encoder.c:1252).
-//! It then picks modes and bandwidths that opus-rs, which has no such
+//! It then picks modes and bandwidths that opus1, which has no such
 //! analysis, cannot pick. tests/multistream_e2e_matrix.rs runs at the
 //! default complexity 9, so its limits leave room for that. The tests here
 //! run at complexity 6 and below. Both encoders then go by the same rules,
@@ -38,7 +38,7 @@
 //! Differences that remain, all in the stream encoder (`OpusEncoder`):
 //!
 //! - libopus codes a stereo stream as mono at low bitrates, outside
-//!   surround mode. opus-rs always codes two channels. The stereo layout
+//!   surround mode. opus1 always codes two channels. The stereo layout
 //!   and the 6-channel layout of family 2 show it. With one channel
 //!   libopus also picks a wider audio bandwidth.
 //! - A stream that changes between CELT and SILK or Hybrid does so one
@@ -47,7 +47,7 @@
 //! - 40 and 60 ms packets of CELT and Hybrid streams are up to 27 % larger
 //!   than in libopus with variable bitrate (opus_encoder.c:1785).
 //! - A Hybrid stream with an energy mask: libopus codes up to 8.4 times
-//!   the bitrate of the stream, opus-rs up to 1.25 times. See
+//!   the bitrate of the stream, opus1 up to 1.25 times. See
 //!   `OpusEncoder::set_energy_mask`.
 //! - The channels of a stereo CELT stream are 0.5 to 2.0 dB below libopus
 //!   on average on this signal: 0.4 dB at 64 kb/s per channel, 1.5 to
@@ -75,8 +75,8 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
-use opus_rs::multistream::encoder::Bitrate;
-use opus_rs::{Application, ForcedMode};
+use opus1::multistream::encoder::Bitrate;
+use opus1::{Application, ForcedMode};
 
 /// libopus runs its analysis from complexity 7 on.
 const COMPLEXITY: i32 = 6;
@@ -207,7 +207,7 @@ fn check_setting(m: &Measured, wrong: &mut Vec<String>) {
     }
     // A stream with audio in one encoder only. Measured in one setting:
     // 7.1 at 16 kHz, 10 ms, constant bitrate, 12 kb/s per channel, where
-    // the SILK centre stream of opus-rs takes a few bytes more and the LFE
+    // the SILK centre stream of opus1 takes a few bytes more and the LFE
     // stream is left none (23 and 10 of 300 stream packets).
     if s.audio + s.empty_toc != 0 {
         let expected = !m.setting.vbr && per_channel == 12_000;
@@ -243,15 +243,15 @@ fn check_setting(m: &Measured, wrong: &mut Vec<String>) {
         // the bitrate of the stream (see the head of this file). Measured
         // on the centre stream at 12 kb/s per channel with 10 and 20 ms
         // frames: libopus up to 8.4 times the bitrate of the stream,
-        // opus-rs up to 1.25 times. With all channels at one level libopus
-        // reaches 30 times and opus-rs 1.36 times.
+        // opus1 up to 1.25 times. With all channels at one level libopus
+        // reaches 30 times and opus1 1.36 times.
         let libopus_far_above = surround
             && stream.kind == StreamKind::Mono
             && m.setting.frame_size * 100 >= m.setting.fs as usize
             && stream.used[C] > 1.5 * stream.set[C] as f64;
         if libopus_far_above {
             println!(
-                "{label}: stream {i} is set to {} b/s: libopus codes {:.0} b/s, opus-rs {:.0} b/s",
+                "{label}: stream {i} is set to {} b/s: libopus codes {:.0} b/s, opus1 {:.0} b/s",
                 stream.set[C], stream.used[C], stream.used[RUST]
             );
             if stream.used[RUST] > 1.45 * stream.set[RUST] as f64 {
@@ -319,12 +319,12 @@ fn check_setting(m: &Measured, wrong: &mut Vec<String>) {
         }
         // The two decoders give the same SNR for the same packets.
         for (ours, theirs, whose) in [
-            (RUST_TO_RUST, RUST_TO_C, "opus-rs"),
+            (RUST_TO_RUST, RUST_TO_C, "opus1"),
             (C_TO_RUST, C_TO_C, "libopus"),
         ] {
             if (row.snr[ours] - row.snr[theirs]).abs() > 0.2 {
                 fail(format!(
-                    "channel {ch}: the opus-rs decoder gives {:.2} dB on {whose} packets, the \
+                    "channel {ch}: the opus1 decoder gives {:.2} dB on {whose} packets, the \
                      libopus decoder {:.2} dB",
                     row.snr[ours], row.snr[theirs]
                 ));
@@ -510,8 +510,8 @@ struct Walk {
 
 /// Takes both encoders through `frames` frames. About every fourth frame a
 /// setting changes, on both encoders alike. Every frame is coded by both,
-/// and the streams of the two packets are compared. The opus-rs packet is
-/// decoded by libopus and the libopus packet by opus-rs.
+/// and the streams of the two packets are compared. The opus1 packet is
+/// decoded by libopus and the libopus packet by opus1.
 fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
     let mut rng = Lcg(seed);
     let (mut rust, mut c) = encoders(case, fs, Application::Audio);
@@ -582,10 +582,10 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
                     rust.set_force_mode(mode);
                     assert_eq!(c.try_ctl(OPUS_SET_FORCE_MODE_REQUEST, c_mode), 0);
                     let (bandwidth, c_bandwidth) = rng.pick(&[
-                        (opus_rs::Bandwidth::Auto, AUTO),
-                        (opus_rs::Bandwidth::Narrowband, 1101),
-                        (opus_rs::Bandwidth::Wideband, 1103),
-                        (opus_rs::Bandwidth::Fullband, 1105),
+                        (opus1::Bandwidth::Auto, AUTO),
+                        (opus1::Bandwidth::Narrowband, 1101),
+                        (opus1::Bandwidth::Wideband, 1103),
+                        (opus1::Bandwidth::Fullband, 1105),
                     ]);
                     rust.set_bandwidth(bandwidth);
                     assert_eq!(c.try_ctl(OPUS_SET_BANDWIDTH_REQUEST, c_bandwidth), 0);
@@ -607,7 +607,7 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
         // Both encoders write a packet for every frame.
         let n = rust
             .encode(frame, frame_size, &mut out)
-            .unwrap_or_else(|e| panic!("{}: opus-rs encode: {e}", at(&history)));
+            .unwrap_or_else(|e| panic!("{}: opus1 encode: {e}", at(&history)));
         let rust_packet = out[..n].to_vec();
         let c_packet = c
             .encode_float(frame, frame_size, out.len())
@@ -646,7 +646,7 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
             }
         }
 
-        // The opus-rs packet in libopus, with the encoder's final range.
+        // The opus1 packet in libopus, with the encoder's final range.
         let samples = c_dec
             .decode_float(Some(&rust_packet), frame_size, false)
             .unwrap_or_else(|e| panic!("{}: libopus decode: {e}", at(&history)));
@@ -669,14 +669,14 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
                 describe_packet(&rust_packet, streams)
             );
         }
-        // The libopus packet in opus-rs.
+        // The libopus packet in opus1.
         let n = rust_dec
             .decode(&c_packet, frame_size, &mut decoded)
-            .unwrap_or_else(|e| panic!("{}: opus-rs decode: {e}", at(&history)));
+            .unwrap_or_else(|e| panic!("{}: opus1 decode: {e}", at(&history)));
         assert_eq!(n, frame_size, "{}", at(&history));
         assert!(
             decoded[..n * channels].iter().all(|v| v.is_finite()),
-            "{}: opus-rs decoded samples that are not finite",
+            "{}: opus1 decoded samples that are not finite",
             at(&history)
         );
     }
@@ -700,7 +700,7 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
 /// - A stream that chooses its mode differs in up to 6 % of its packets.
 ///   Most layouts have 1 to 4 such packets in 300 frames, at a change of
 ///   mode. The mono layout at 48 kHz has a run of 13: after CELT frames
-///   and a drop to 12 kb/s libopus codes SILK narrowband and opus-rs SILK
+///   and a drop to 12 kb/s libopus codes SILK narrowband and opus1 SILK
 ///   wideband.
 /// - Up to 2 % of the stream packets of a layout have audio in one encoder
 ///   only (25 of 44100 in all), with constant bitrate at 4 to 6 kb/s per

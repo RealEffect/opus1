@@ -1,4 +1,4 @@
-//! The byte budget of the opus-rs multistream encoder, stream by stream,
+//! The byte budget of the opus1 multistream encoder, stream by stream,
 //! against the C libopus encoder.
 //!
 //! tests/multistream_enc_structure.rs compares the size of a whole
@@ -24,7 +24,7 @@ mod multistream_enc_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 
 /// What a C stream encoder reports for `OPUS_GET_BITRATE` when it was set to
 /// `rate` and its last coded frame has `coded_frame` samples: at most what
@@ -42,7 +42,7 @@ fn reported(rate: i32, fs: i32, coded_frame: usize) -> i32 {
 /// constant-bitrate packet (opus_encoder.c:1331). A bitrate of 20 to 23
 /// bits per frame rounds to 3 bytes, so the frame is coded.
 /// `a_cbr_stream_of_three_bytes_is_coded_like_libopus` shows it on a single
-/// stream. opus-rs once tested the bitrate before rounding it and did not
+/// stream. opus1 once tested the bitrate before rounding it and did not
 /// code such a frame.
 fn rounds_up_to_three_bytes(rate: i32, frame_size: usize, fs: i32) -> bool {
     let bits = rate as i64 * frame_size as i64 / fs as i64;
@@ -187,7 +187,7 @@ const BUFFERS: [usize; 7] = [9, 40, 300, 1_500, 4_000, 9_000, 20_000];
 
 /// Encodes three frames at constant bitrate with the maximum bitrate into
 /// buffers of `BUFFERS`. Returns the number of packets both encoders wrote,
-/// and a description of every frame opus-rs refused.
+/// and a description of every frame opus1 refused.
 fn maximum_bitrate_cbr(frame_ms: &[usize], buffers: &[usize]) -> (usize, Vec<String>) {
     let mut packets = 0;
     let mut refused = Vec::new();
@@ -252,7 +252,7 @@ fn maximum_bitrate_cbr(frame_ms: &[usize], buffers: &[usize]) -> (usize, Vec<Str
 fn constant_bitrate_with_the_maximum_bitrate_fills_the_buffer() {
     let (packets, refused) = maximum_bitrate_cbr(&[5, 10, 20], &BUFFERS);
     println!("{packets} packets");
-    assert!(refused.is_empty(), "opus-rs refused: {refused:#?}");
+    assert!(refused.is_empty(), "opus1 refused: {refused:#?}");
     assert!(packets > 2500, "only {packets} packets");
 }
 
@@ -261,13 +261,13 @@ fn constant_bitrate_with_the_maximum_bitrate_fills_the_buffer() {
 fn constant_bitrate_with_the_maximum_bitrate_and_long_frames_in_a_large_buffer() {
     let (packets, refused) = maximum_bitrate_cbr(&[40, 60], &[9_000, 20_000]);
     println!("{packets} packets");
-    assert!(refused.is_empty(), "opus-rs refused: {refused:#?}");
+    assert!(refused.is_empty(), "opus1 refused: {refused:#?}");
     assert!(packets > 500, "only {packets} packets");
 }
 
 /// 40 and 60 ms frames with a buffer the first streams fill. A later stream
 /// is then left one or two bytes. libopus writes a packet without audio for
-/// it; opus-rs refuses the frame, for 5.1 with buffers of up to 4000 bytes.
+/// it; opus1 refuses the frame, for 5.1 with buffers of up to 4000 bytes.
 /// The cause is in the single-stream encoder: see
 /// `tight_output_buffers_with_40_and_60_ms_frames_like_libopus` in
 /// tests/multistream_enc_controls.rs.
@@ -276,7 +276,7 @@ fn constant_bitrate_with_the_maximum_bitrate_and_long_frames_in_any_buffer() {
     let (packets, refused) = maximum_bitrate_cbr(&[40, 60], &BUFFERS);
     assert!(
         refused.is_empty(),
-        "opus-rs refused {} frames and coded {packets}, for example {:#?}",
+        "opus1 refused {} frames and coded {packets}, for example {:#?}",
         refused.len(),
         &refused[..refused.len().min(5)]
     );

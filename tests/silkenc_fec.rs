@@ -5,14 +5,14 @@
 //! bit-rate redundancy) and writes it at the start of the next packet.
 //! libopus writes whatever copies it has stored, whether or not FEC is
 //! still on for the packet that carries them (silk/enc_API.c:355-390).
-//! opus-rs wrote them only while FEC was on, so the last frame before FEC
+//! opus1 wrote them only while FEC was on, so the last frame before FEC
 //! was switched off, or before the bitrate dropped under the FEC threshold,
 //! could not be recovered.
 
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus_rs::{Application, ForcedMode, OpusEncoder};
+use opus1::{Application, ForcedMode, OpusEncoder};
 
 /// A change of settings before packet `at`.
 #[derive(Clone, Copy)]
@@ -160,7 +160,7 @@ fn streams() -> Vec<Stream> {
 }
 
 /// Each packet says in its header whether it carries FEC data for the
-/// previous packet. opus-rs and libopus say the same for every packet of a
+/// previous packet. opus1 and libopus say the same for every packet of a
 /// stream in which FEC is switched on and off and the bitrate changes.
 #[test]
 fn packets_carry_fec_data_where_libopus_packets_do() {
@@ -188,7 +188,7 @@ fn packets_carry_fec_data_where_libopus_packets_do() {
         after_stop += [30, 60].iter().filter(|&&i| c_flags[i][0]).count();
         if !differ.is_empty() || side_differ > differ.len() + 3 {
             failures.push(format!(
-                "{} ch, {} ms: {} packets differ ({} with the side), first {:?} (libopus {:?}, opus-rs {:?})",
+                "{} ch, {} ms: {} packets differ ({} with the side), first {:?} (libopus {:?}, opus1 {:?})",
                 s.channels,
                 s.frame / 16,
                 differ.len(),
@@ -223,7 +223,7 @@ const STEPS_CBR_STEREO: [Step; 4] = [
 /// the frame. libopus writes it whatever room that leaves for the frame
 /// (silk/enc_API.c:365-389). When the two do not fit, the packet carries no
 /// audio and the decoder conceals the frame (opus_encoder.c:2582-2594).
-/// opus-rs left the FEC data out instead when less than 8 bytes would have
+/// opus1 left the FEC data out instead when less than 8 bytes would have
 /// been left for the frame.
 ///
 /// The two encoders do not exceed the size in the same packets, so the
@@ -238,7 +238,7 @@ fn fec_data_is_written_into_small_packets_as_in_libopus() {
             let (rs, c) = (s.encode_rs(&pcm), s.encode_c(&pcm));
             let what = format!("{channels} ch, {ms} ms");
             let mut dec = CDecoder::new(s.fs, channels);
-            // Packets with FEC data and packets without audio, opus-rs and
+            // Packets with FEC data and packets without audio, opus1 and
             // libopus.
             let (mut with_fec, mut empty) = ([0, 0], [0, 0]);
             for (i, (r, c)) in rs.iter().zip(&c).enumerate() {
@@ -251,13 +251,13 @@ fn fec_data_is_written_into_small_packets_as_in_libopus() {
             }
             // Shown with `--nocapture`.
             println!(
-                "{what}: packets with FEC data opus-rs {}, libopus {}; without audio {}, {}",
+                "{what}: packets with FEC data opus1 {}, libopus {}; without audio {}, {}",
                 with_fec[0], with_fec[1], empty[0], empty[1]
             );
             assert!(with_fec[1] >= 15, "{what}: libopus wrote FEC data in {} packets", with_fec[1]);
             if with_fec[0] * 10 < with_fec[1] * 8 || empty[0] > empty[1] + 4 {
                 failures.push(format!(
-                    "{what}: packets with FEC data opus-rs {}, libopus {}; without audio {}, {}",
+                    "{what}: packets with FEC data opus1 {}, libopus {}; without audio {}, {}",
                     with_fec[0], with_fec[1], empty[0], empty[1]
                 ));
             }
@@ -323,7 +323,7 @@ fn lost_frames_are_recovered_as_well_as_libopus_allows() {
         assert!(all[1].frames >= 10, "{} frames with FEC data", all[1].frames);
         // Shown with `--nocapture`.
         println!(
-            "{} ch, {} ms, {} frames: opus-rs {:.2} dB, libopus {:.2} dB",
+            "{} ch, {} ms, {} frames: opus1 {:.2} dB, libopus {:.2} dB",
             s.channels,
             s.frame / 16,
             all[1].frames,
@@ -332,7 +332,7 @@ fn lost_frames_are_recovered_as_well_as_libopus_allows() {
         );
         if all[0].snr_db() < all[1].snr_db() - 1.5 {
             failures.push(format!(
-                "{} ch, {} ms, {} frames: opus-rs {:.2} dB, libopus {:.2} dB",
+                "{} ch, {} ms, {} frames: opus1 {:.2} dB, libopus {:.2} dB",
                 s.channels,
                 s.frame / 16,
                 all[1].frames,
@@ -343,14 +343,14 @@ fn lost_frames_are_recovered_as_well_as_libopus_allows() {
     }
     assert!(last[1].frames >= 5, "{} frames before FEC stops", last[1].frames);
     println!(
-        "last frame before FEC stops, {} frames: opus-rs {:.2} dB, libopus {:.2} dB",
+        "last frame before FEC stops, {} frames: opus1 {:.2} dB, libopus {:.2} dB",
         last[1].frames,
         last[0].snr_db(),
         last[1].snr_db()
     );
     if last[0].snr_db() < last[1].snr_db() - 2.0 {
         failures.push(format!(
-            "last frame before FEC stops, {} frames: opus-rs {:.2} dB, libopus {:.2} dB",
+            "last frame before FEC stops, {} frames: opus1 {:.2} dB, libopus {:.2} dB",
             last[1].frames,
             last[0].snr_db(),
             last[1].snr_db()

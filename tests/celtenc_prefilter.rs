@@ -22,7 +22,7 @@ fn postfilters(st: &Stream, payloads: &[Vec<u8>]) -> Vec<Option<(u32, u32, i32)>
 
 /// libopus looks for a pitch only when the packet has more than 12 bytes
 /// per channel (`enabled` in celt_encode_with_ec). At 32 kb/s a 2.5 ms
-/// frame has 9 bytes: the filter parameters would take 2 of them. opus-rs
+/// frame has 9 bytes: the filter parameters would take 2 of them. opus1
 /// ran the filter there, and the music signal came out 2.8 dB worse than
 /// from libopus.
 #[test]
@@ -38,7 +38,7 @@ fn no_prefilter_in_packets_of_12_bytes_or_less() {
         let c = st.enc_c(&pcm);
         assert_eq!(postfilters(&st, &c).iter().filter(|p| p.is_some()).count(), 0);
         let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
-        println!("{bitrate} b/s: opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB");
+        println!("{bitrate} b/s: opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB");
         assert!(snr_rs > snr_c - 0.5, "{bitrate} b/s: {snr_rs:.2} dB against {snr_c:.2} dB");
     }
 }
@@ -47,7 +47,7 @@ fn no_prefilter_in_packets_of_12_bytes_or_less() {
 #[derive(Debug)]
 struct Agreement {
     frames: usize,
-    /// Frames with the filter on, in the C stream and in the opus-rs stream.
+    /// Frames with the filter on, in the C stream and in the opus1 stream.
     on_c: usize,
     on_rs: usize,
     /// Frames in which both encoders took the same decision, on or off.
@@ -84,7 +84,7 @@ fn stereo_speech(seconds: usize) -> Vec<f32> {
 
 /// libopus runs the pre-filter for one and for two channels
 /// (run_prefilter: a common pitch from the mix of both channels, the comb
-/// filter on each channel). opus-rs ran it for mono only, which cost
+/// filter on each channel). opus1 ran it for mono only, which cost
 /// stereo speech 0.5 to 0.8 dB at complexity 5 and above.
 #[test]
 fn stereo_frames_get_a_prefilter() {
@@ -97,7 +97,7 @@ fn stereo_frames_get_a_prefilter() {
         let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
         println!(
             "{} ms, {per_channel} b/s per channel: filter on in {} (libopus {}) of {} frames, \
-             same decision in {}, same parameters in {}, opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             same decision in {}, same parameters in {}, opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             frame_ms_x2 as f32 / 2.0,
             a.on_rs,
             a.on_c,
@@ -134,7 +134,7 @@ fn weak_pitch(seconds: usize, noise: f64) -> Vec<f32> {
 /// libopus remembers the pitch period of a frame even when it leaves the
 /// filter off (celt_encoder.c 2770). A frame whose pitch continues that
 /// period needs a gain of 0.2 to switch the filter on. Any other pitch
-/// needs 0.4 (run_prefilter: `pf_threshold`). opus-rs forgot the period
+/// needs 0.4 (run_prefilter: `pf_threshold`). opus1 forgot the period
 /// with the filter, so a weak but steady pitch never got above the higher
 /// threshold: the filter stayed off for the whole stream.
 #[test]
@@ -199,7 +199,7 @@ fn a_reset_forgets_the_pitch_period() {
             postfilters(&st, p).iter().map(|x| x.is_some()).collect()
         };
         let (oc, or) = (on(&c), on(&rs));
-        println!("noise {noise}: libopus {:?}, opus-rs {:?}", &oc[at..at + 3], &or[at..at + 3]);
+        println!("noise {noise}: libopus {:?}, opus1 {:?}", &oc[at..at + 3], &or[at..at + 3]);
         assert_eq!(oc[at..at + 3], [false, true, true], "libopus");
         assert_eq!(or[at..at + 3], oc[at..at + 3]);
     }

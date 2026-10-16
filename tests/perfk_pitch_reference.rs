@@ -21,8 +21,8 @@
 // The reference functions repeat the index-based loops of the C code.
 #![allow(clippy::needless_range_loop)]
 
-use opus_rs::celt_lpc::{autocorr, celt_fir, celt_iir};
-use opus_rs::pitch::{
+use opus1::celt_lpc::autocorr;
+use opus1::pitch::{
     dual_inner_prod, inner_prod, pitch_downsample, pitch_search, pitch_xcorr, remove_doubling,
 };
 
@@ -530,14 +530,14 @@ fn ref_flatten(x_lp: &mut [f32]) {
         return;
     }
     let mut ac = [0.0f32; 5];
-    opus_rs::celt_lpc::autocorr(x_lp, &mut ac, None, 0, 4, len);
+    opus1::celt_lpc::autocorr(x_lp, &mut ac, None, 0, 4, len);
     ac[0] *= 1.0001;
     for i in 1..=4 {
         let f = 0.008 * i as f32;
         ac[i] -= ac[i] * f * f;
     }
     let mut coef = [0.0f32; 4];
-    opus_rs::celt_lpc::lpc(&mut coef, &ac, 4);
+    opus1::celt_lpc::lpc(&mut coef, &ac, 4);
     let mut tmp = 1.0f32;
     for c in coef.iter_mut() {
         tmp *= 0.9;
@@ -587,58 +587,6 @@ fn ref_downsample(x: &[&[f32]], len: usize, factor: usize) -> Vec<f32> {
     }
     out[0] = val;
     out
-}
-
-/// `celt_fir`: every target adds the taps in rising order with a separate
-/// multiply and add.
-fn ref_fir(x: &[f32], num: &[f32]) -> Vec<f32> {
-    (0..x.len())
-        .map(|i| {
-            let mut sum = x[i];
-            for (j, &c) in num.iter().enumerate() {
-                if i > j {
-                    sum += c * x[i - j - 1];
-                }
-            }
-            sum
-        })
-        .collect()
-}
-
-/// `celt_iir`. `mem` holds the last outputs, newest first.
-///
-/// aarch64 with four taps or more: four running sums take the taps 4m, 4m+1,
-/// 4m+2 and 4m+3 with fused multiply-add; they are added as
-/// (s0 + s2) + (s1 + s3); the last `ord % 4` products follow with a separate
-/// multiply and add; the total is subtracted from the input.
-/// Otherwise: the products are subtracted from the input one by one.
-fn ref_iir(x: &[f32], den: &[f32], mem: &mut [f32]) -> Vec<f32> {
-    let ord = den.len();
-    x.iter()
-        .map(|&xi| {
-            let out = if NEON && ord >= 4 {
-                let whole = ord / 4 * 4;
-                let mut s = [0.0f32; 4];
-                for j in 0..whole {
-                    s[j % 4] = den[j].mul_add(mem[j], s[j % 4]);
-                }
-                let mut fb = (s[0] + s[2]) + (s[1] + s[3]);
-                for j in whole..ord {
-                    fb += den[j] * mem[j];
-                }
-                xi - fb
-            } else {
-                let mut sum = xi;
-                for j in 0..ord {
-                    sum -= den[j] * mem[j];
-                }
-                sum
-            };
-            mem.copy_within(..ord - 1, 1);
-            mem[0] = out;
-            out
-        })
-        .collect()
 }
 
 /// `autocorr`: the first `n - lag` products of every lag come from
@@ -1106,84 +1054,6 @@ fn remove_doubling_holds_the_energy_at_zero() {
         limit_decides * 10 > cases,
         "the limit changed {limit_decides} of {cases} results"
     );
-}
-
-/// Filter taps of the same kind as the signal. For `Noise` they are small
-/// enough to keep a feedback filter stable.
-fn taps(g: &mut Gen, ord: usize, kind: Fill) -> Vec<f32> {
-    match kind {
-        Fill::Noise => (0..ord).map(|_| g.signed() / (ord as f32 + 1.5)).collect(),
-        _ => fill(g, ord, kind),
-    }
-}
-
-#[test]
-fn celt_fir_matches_the_formula() {
-    let mut g = Gen(0xF12);
-    let (mut rx, mut rnum, mut ry) = (Region::new(), Region::new(), Region::new());
-    for kind in FILLS {
-        // Shorter and longer than the filter, and every remainder of the 16
-        // and 4 outputs the vector code computes per pass.
-        for n in (0..=50).chain([127, 240, 255]) {
-            for ord in (0..=20).chain([24, 31, 32, 33]) {
-                let x = fill(&mut g, n, kind);
-                let num = taps(&mut g, ord, kind);
-                let want = ref_fir(&x, &num);
-                for at_end in [true, false] {
-                    let x = rx.place(&x, at_end);
-                    let num = rnum.place(&num, at_end);
-                    let y = ry.place(&vec![f32::NAN; n], at_end);
-                    celt_fir(x, num, y, n, ord);
-                    assert_same(
-                        y,
-                        &want,
-                        &format!("{kind:?} n {n} ord {ord} at_end {at_end}"),
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn celt_iir_follows_the_order_of_the_target() {
-    let mut g = Gen(0x112);
-    let (mut rx, mut rden, mut ry, mut rmem) =
-        (Region::new(), Region::new(), Region::new(), Region::new());
-    for kind in FILLS {
-        for n in (0..=50).chain([127, 240, 255]) {
-            // With no tap the function still writes mem[0], so the smallest
-            // order here is 1.
-            for ord in (1..=20).chain([24, 31, 32, 33]) {
-                let x = fill(&mut g, n, kind);
-                let den = taps(&mut g, ord, kind);
-                let mem0 = fill(&mut g, ord, kind);
-                let mut want_mem = mem0.clone();
-                let want = ref_iir(&x, &den, &mut want_mem);
-                for at_end in [true, false] {
-                    let what = format!("{kind:?} n {n} ord {ord} at_end {at_end}");
-                    let x = rx.place(&x, at_end);
-                    let den = rden.place(&den, at_end);
-                    let y = ry.place(&vec![f32::NAN; n], at_end);
-                    let mem = rmem.place(&mem0, at_end);
-                    celt_iir(x, den, y, n, ord, mem);
-                    assert_same(y, &want, &what);
-                    assert_same(mem, &want_mem, &what);
-                }
-
-                // Two calls give what one call over both parts gives.
-                let split = g.below(n + 1);
-                let mut mem = mem0.clone();
-                let mut y = vec![f32::NAN; n];
-                let (y_a, y_b) = y.split_at_mut(split);
-                celt_iir(&x[..split], &den, y_a, split, ord, &mut mem);
-                celt_iir(&x[split..], &den, y_b, n - split, ord, &mut mem);
-                let what = format!("{kind:?} n {n} ord {ord} split {split}");
-                assert_same(&y, &want, &what);
-                assert_same(&mem, &want_mem, &what);
-            }
-        }
-    }
 }
 
 #[test]

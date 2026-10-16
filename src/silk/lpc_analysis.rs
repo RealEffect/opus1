@@ -4,10 +4,6 @@ use crate::silk::macros::*;
 use crate::silk::nlsf::*;
 use crate::silk::sigproc_fix::*;
 use crate::silk::structs::*;
-use crate::silk::tuning_parameters::*;
-
-#[cfg(not(feature = "std"))]
-use crate::compat::Math;
 
 pub fn silk_find_lpc_fix(
     ps_enc_c: &mut SilkEncoderStateCommon,
@@ -202,7 +198,7 @@ const BURG_QA: i32 = 25;
 /// Longest subframe the encoder analyses: 5 ms at 16 kHz plus the samples of
 /// the LPC order before it. The vector version handles subframes up to this
 /// length.
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(target_arch = "aarch64")]
 const BURG_MAX_SUBFR_LENGTH: usize = MAX_SUB_FRAME_LENGTH + MAX_LPC_ORDER;
 
 /// Step `n` of the Burg recursion, the part that reads the signal: add the
@@ -214,7 +210,7 @@ const BURG_MAX_SUBFR_LENGTH: usize = MAX_SUB_FRAME_LENGTH + MAX_LPC_ORDER;
 /// above -2 the products keep their upper bits, otherwise the lower ones.
 ///
 /// This is the code for every target and the reference for
-/// `burg_neon::add_subframes`.
+/// `burg_neon::add_subframes`. `BurgSignal::add_step` picks between them.
 #[allow(clippy::too_many_arguments)]
 fn burg_add_subframes_scalar(
     c_first_row: &mut [i32; MAX_LPC_ORDER],
@@ -307,7 +303,7 @@ fn inner_prod16_i64(a: &[i16], b: &[i16]) -> i64 {
     a.iter().zip(b).map(|(&a, &b)| a as i64 * b as i64).sum()
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(target_arch = "aarch64")]
 mod burg_neon {
     use super::BURG_QA as QA;
     use crate::silk::define::MAX_LPC_ORDER;
@@ -393,8 +389,8 @@ mod burg_neon {
     /// together and their sum is added once. All sums wrap around, so the
     /// result is the same.
     ///
-    /// `(a * b) >> 16` with a 16-bit `b` (`silk_smulwb`) is computed as the
-    /// upper half of `2 * a * (b << 15)`.
+    /// `silk_smulwb` is `vqdmulhq_s32` with the samples shifted left by 15,
+    /// which makes their `smulwb_operand`.
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon")]
     pub(super) fn add_subframes(
@@ -487,6 +483,112 @@ mod burg_neon {
     }
 }
 
+/// The signal of the Burg recursion in the layout of the step that reads it.
+/// `new` chooses the step once per call of `silk_burg_modified_fix`.
+///
+/// The value lives on the stack during one call, so the size of the larger
+/// variant does not matter.
+#[allow(clippy::large_enum_variant)]
+enum BurgSignal<'a> {
+    /// `nb_subfr` subframes one after the other, read by
+    /// `burg_add_subframes_scalar`.
+    Scalar {
+        x: &'a [i16],
+        subfr_length: usize,
+        nb_subfr: usize,
+    },
+    /// Up to four subframes side by side, read by `burg_neon::add_subframes`:
+    /// `side_by_side[i]` holds sample `i` of every subframe.
+    #[cfg(target_arch = "aarch64")]
+    SideBySide {
+        side_by_side: [[i16; 4]; BURG_MAX_SUBFR_LENGTH],
+        subfr_length: usize,
+    },
+}
+
+impl<'a> BurgSignal<'a> {
+    /// `x` holds `nb_subfr` subframes of `subfr_length` samples. On aarch64
+    /// the vector step takes up to four subframes of up to
+    /// `BURG_MAX_SUBFR_LENGTH` samples; the scalar step takes the rest.
+    #[inline(always)]
+    fn new(x: &'a [i16], subfr_length: usize, nb_subfr: usize) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        if nb_subfr <= 4 && subfr_length <= BURG_MAX_SUBFR_LENGTH {
+            let mut side_by_side = [[0i16; 4]; BURG_MAX_SUBFR_LENGTH];
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe {
+                burg_neon::lay_side_by_side(
+                    &mut side_by_side[..subfr_length],
+                    &x[..subfr_length * nb_subfr],
+                    nb_subfr,
+                );
+            }
+            return Self::SideBySide {
+                side_by_side,
+                subfr_length,
+            };
+        }
+        Self::Scalar {
+            x,
+            subfr_length,
+            nb_subfr,
+        }
+    }
+
+    /// Step `n` of the recursion, the part that reads the signal; see
+    /// `burg_add_subframes_scalar`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn add_step(
+        &self,
+        c_first_row: &mut [i32; MAX_LPC_ORDER],
+        c_last_row: &mut [i32; MAX_LPC_ORDER],
+        ca_f: &mut [i32; MAX_LPC_ORDER + 1],
+        ca_b: &mut [i32; MAX_LPC_ORDER + 1],
+        af_qa: &[i32; MAX_LPC_ORDER],
+        n: usize,
+        rshifts: i32,
+    ) {
+        match *self {
+            Self::Scalar {
+                x,
+                subfr_length,
+                nb_subfr,
+            } => burg_add_subframes_scalar(
+                c_first_row,
+                c_last_row,
+                ca_f,
+                ca_b,
+                af_qa,
+                x,
+                subfr_length,
+                nb_subfr,
+                n,
+                rshifts,
+            ),
+            #[cfg(target_arch = "aarch64")]
+            Self::SideBySide {
+                ref side_by_side,
+                subfr_length,
+            } => {
+                // SAFETY: NEON is part of the aarch64 baseline.
+                unsafe {
+                    burg_neon::add_subframes(
+                        c_first_row,
+                        c_last_row,
+                        ca_f,
+                        ca_b,
+                        af_qa,
+                        &side_by_side[..subfr_length],
+                        n,
+                        rshifts,
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub fn silk_burg_modified_fix(
     res_nrg: &mut i32,
     res_nrg_q: &mut i32,
@@ -526,9 +628,6 @@ pub fn silk_burg_modified_fix(
         (c0_64 as i32) << (-rshifts)
     };
 
-    ca_f[0] = c0 + silk_smmul(FIND_LPC_COND_FAC_Q32, c0) + 1;
-    ca_b[0] = ca_f[0];
-
     if rshifts > 0 {
         for s in 0..nb_subfr {
             let subframe = &x[s * subfr_length..(s + 1) * subfr_length];
@@ -567,66 +666,14 @@ pub fn silk_burg_modified_fix(
     let mut inv_gain_q30: i32 = 1 << 30;
     let mut reached_max_gain = false;
 
-    // The vector version reads the subframes side by side: `side_by_side[i]`
-    // holds sample `i` of every subframe.
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    let mut side_by_side = [[0i16; 4]; BURG_MAX_SUBFR_LENGTH];
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    let use_neon = nb_subfr <= 4 && subfr_length <= BURG_MAX_SUBFR_LENGTH;
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    if use_neon {
-        // SAFETY: this code is only compiled when NEON is enabled for the
-        // whole build (`cfg(target_feature = "neon")`).
-        unsafe {
-            burg_neon::lay_side_by_side(
-                &mut side_by_side[..subfr_length],
-                &x[..total_len],
-                nb_subfr,
-            );
-        }
-    }
-
+    let signal = BurgSignal::new(x, subfr_length, nb_subfr);
     for n in 0..d {
-        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        if use_neon {
-            // SAFETY: this code is only compiled when NEON is enabled for
-            // the whole build (`cfg(target_feature = "neon")`).
-            unsafe {
-                burg_neon::add_subframes(
-                    &mut c_first_row,
-                    &mut c_last_row,
-                    &mut ca_f,
-                    &mut ca_b,
-                    &af_qa,
-                    &side_by_side[..subfr_length],
-                    n,
-                    rshifts,
-                );
-            }
-        } else {
-            burg_add_subframes_scalar(
-                &mut c_first_row,
-                &mut c_last_row,
-                &mut ca_f,
-                &mut ca_b,
-                &af_qa,
-                x,
-                subfr_length,
-                nb_subfr,
-                n,
-                rshifts,
-            );
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-        burg_add_subframes_scalar(
+        signal.add_step(
             &mut c_first_row,
             &mut c_last_row,
             &mut ca_f,
             &mut ca_b,
             &af_qa,
-            x,
-            subfr_length,
-            nb_subfr,
             n,
             rshifts,
         );
@@ -745,170 +792,6 @@ pub fn silk_burg_modified_fix(
         *res_nrg = silk_smlaww(nrg, silk_smmul(FIND_LPC_COND_FAC_Q32, c0), -tmp1_q16);
         *res_nrg_q = -rshifts;
     }
-}
-
-pub fn energy_flp(x: &[f32]) -> f64 {
-    let mut sum = 0.0;
-    for &val in x {
-        sum += val as f64 * val as f64;
-    }
-    sum
-}
-
-pub fn inner_product_flp(x1: &[f32], x2: &[f32]) -> f64 {
-    let len = x1.len().min(x2.len());
-    let mut sum = 0.0;
-    for i in 0..len {
-        sum += x1[i] as f64 * x2[i] as f64;
-    }
-    sum
-}
-
-pub fn silk_lpc_analysis_filter_flp(
-    r_lpc: &mut [f32],
-    pred_coef: &[f32],
-    s: &[f32],
-    length: usize,
-    order: usize,
-) {
-    assert!(order <= MAX_LPC_ORDER);
-
-    for ix in order..length {
-        let mut lpc_pred = 0.0f32;
-        for j in 0..order {
-            lpc_pred += s[ix - 1 - j] * pred_coef[j];
-        }
-        r_lpc[ix] = s[ix] - lpc_pred;
-    }
-}
-
-pub fn silk_burg_modified_flp(
-    a: &mut [f32],
-    x: &[f32],
-    min_inv_gain: f32,
-    subfr_length: usize,
-    nb_subfr: usize,
-    d: usize,
-) -> f32 {
-    let mut c_first_row = [0.0f64; MAX_LPC_ORDER];
-    let mut c_last_row = [0.0f64; MAX_LPC_ORDER];
-    let mut caf = [0.0f64; MAX_LPC_ORDER + 1];
-    let mut cab = [0.0f64; MAX_LPC_ORDER + 1];
-    let mut af = [0.0f64; MAX_LPC_ORDER];
-
-    let c0 = energy_flp(&x[..nb_subfr * subfr_length]);
-
-    for s in 0..nb_subfr {
-        let x_ptr = &x[s * subfr_length..];
-        for n in 1..d + 1 {
-            c_first_row[n - 1] +=
-                inner_product_flp(&x_ptr[..subfr_length - n], &x_ptr[n..subfr_length]);
-        }
-    }
-    c_last_row[..d].copy_from_slice(&c_first_row[..d]);
-
-    caf[0] = c0 + (FIND_LPC_COND_FAC as f64) * c0 + 1e-9;
-    cab[0] = caf[0];
-
-    let mut inv_gain = 1.0f64;
-    let mut reached_max_gain = false;
-
-    for n in 0..d {
-        for s in 0..nb_subfr {
-            let x_ptr = &x[s * subfr_length..];
-            let mut tmp1 = x_ptr[n] as f64;
-            let mut tmp2 = x_ptr[subfr_length - n - 1] as f64;
-            for k in 0..n {
-                let atmp = af[k];
-                tmp1 += x_ptr[n - k - 1] as f64 * atmp;
-                tmp2 += x_ptr[subfr_length - n + k] as f64 * atmp;
-            }
-            for k in 0..=n {
-                caf[k] -= tmp1 * x_ptr[n - k] as f64;
-                cab[k] -= tmp2 * x_ptr[subfr_length - n + k - 1] as f64;
-            }
-        }
-
-        let mut tmp1 = c_first_row[n];
-        let mut tmp2 = c_last_row[n];
-        for k in 0..n {
-            let atmp = af[k];
-            tmp1 += c_last_row[n - k - 1] * atmp;
-            tmp2 += c_first_row[n - k - 1] * atmp;
-        }
-
-        caf[n + 1] = tmp1;
-        cab[n + 1] = tmp2;
-
-        let mut num = cab[n + 1];
-        let mut nrg_b = cab[0];
-        let mut nrg_f = caf[0];
-        for k in 0..n {
-            let atmp = af[k];
-            num += cab[n - k] * atmp;
-            nrg_b += cab[k + 1] * atmp;
-            nrg_f += caf[k + 1] * atmp;
-        }
-
-        let mut rc = -2.0 * num / (nrg_f + nrg_b);
-
-        let tmp1_rc = inv_gain * (1.0 - rc * rc);
-        if tmp1_rc <= min_inv_gain as f64 {
-            rc = (1.0 - min_inv_gain as f64 / inv_gain).sqrt();
-            if num > 0.0 {
-                rc = -rc;
-            }
-            inv_gain = min_inv_gain as f64;
-            reached_max_gain = true;
-        } else {
-            inv_gain = tmp1_rc;
-        }
-
-        for k in 0..n.div_ceil(2) {
-            let tmp1 = af[k];
-            let tmp2 = af[n - k];
-            af[k] = tmp1 + rc * tmp2;
-            af[n - k] = tmp2 + rc * tmp1;
-        }
-        af[n] = rc;
-
-        if reached_max_gain {
-            for k in n + 1..d {
-                af[k] = 0.0;
-            }
-            break;
-        }
-
-        for k in 0..=n + 1 {
-            let tmp1 = caf[k];
-            caf[k] += rc * cab[n - k + 1];
-            cab[n - k + 1] += rc * tmp1;
-        }
-    }
-
-    let mut final_nrg_f: f64;
-    if reached_max_gain {
-        for k in 0..d {
-            a[k] = (-af[k]) as f32;
-        }
-        let mut c0_mod = c0;
-        for s in 0..nb_subfr {
-            c0_mod -= energy_flp(&x[s * subfr_length..s * subfr_length + d]);
-        }
-        final_nrg_f = c0_mod * inv_gain;
-    } else {
-        final_nrg_f = caf[0];
-        let mut tmp1 = 1.0f64;
-        for k in 0..d {
-            let atmp = af[k];
-            final_nrg_f += caf[k + 1] * atmp;
-            tmp1 += atmp * atmp;
-            a[k] = (-atmp) as f32;
-        }
-        final_nrg_f -= (FIND_LPC_COND_FAC as f64) * c0 * tmp1;
-    }
-
-    final_nrg_f as f32
 }
 
 const QA_INV: i32 = 24;
@@ -1458,7 +1341,7 @@ mod burg_tests {
 
     /// The vector version of the signal-reading step against the scalar one,
     /// for every step `n` and every scaling, from arbitrary array contents.
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_step_matches_scalar_step() {
         let mut rng = XorShift(0x0F1E_2D3C_4B5A_6978);
@@ -1473,7 +1356,7 @@ mod burg_tests {
                 })
                 .collect();
             let mut side_by_side = [[0x5a5ai16; 4]; BURG_MAX_SUBFR_LENGTH];
-            // SAFETY: NEON is enabled for the whole build (see the `cfg`).
+            // SAFETY: NEON is part of the aarch64 baseline.
             unsafe {
                 burg_neon::lay_side_by_side(&mut side_by_side[..subfr_length], &x, nb_subfr);
             }
@@ -1511,7 +1394,7 @@ mod burg_tests {
                     n,
                     rshifts,
                 );
-                // SAFETY: NEON is enabled for the whole build.
+                // SAFETY: NEON is part of the aarch64 baseline.
                 unsafe {
                     burg_neon::add_subframes(
                         &mut neon.0,

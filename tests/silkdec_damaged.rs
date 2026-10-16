@@ -2,7 +2,7 @@
 //! whose payload is random, all zeros or all ones.
 //!
 //! The SILK decoder cannot tell damaged data from good data: every bit
-//! pattern decodes to something. libopus and opus-rs must decode it to the
+//! pattern decodes to something. libopus and opus1 must decode it to the
 //! same thing, sample for sample, and neither may fail. That is a far
 //! stronger check than "it does not panic": damaged data reaches parameter
 //! values and filter states that no encoder produces.
@@ -31,10 +31,10 @@
 mod silkdec_common;
 use silkdec_common::*;
 
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::dec_api::SilkDecoder;
-use opus_rs::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus_rs::silk::decoder_structs::SilkDecControl;
+use opus1::range_coder::RangeCoder;
+use opus1::silk::dec_api::SilkDecoder;
+use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+use opus1::silk::decoder_structs::SilkDecControl;
 
 /// The ways a packet is damaged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +93,7 @@ struct Outcome {
 }
 
 /// Decode a stream in which `kinds` of damage hit about half of the
-/// packets, with C libopus and with opus-rs.
+/// packets, with C libopus and with opus1.
 fn run_damaged(
     packets: &[Vec<u8>],
     rate: usize,
@@ -241,11 +241,11 @@ fn damaged_matrix() -> (Vec<String>, usize, [usize; 7], usize) {
 }
 
 /// Flipped bits, random payloads, payloads of all zeros or all ones, and
-/// random bytes after the payload: libopus and opus-rs both decode every
+/// random bytes after the payload: libopus and opus1 both decode every
 /// packet, to the same number of samples and with the same pitch lag.
 ///
 /// The samples are not compared here. Damaged data makes the synthesis
-/// filter overflow, and opus-rs then drifts away from libopus until
+/// filter overflow, and opus1 then drifts away from libopus until
 /// `silk_lshift_sat32` is corrected (see tests/silkdec_saturation.rs). The
 /// next test compares them.
 #[test]

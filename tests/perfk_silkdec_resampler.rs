@@ -11,7 +11,7 @@
 //! length occurs), and signals at the limits of 16 bits, where the filters
 //! saturate.
 
-use opus_rs::silk::resampler::{
+use opus1::silk::resampler::{
     SilkResampler, silk_resampler_down2, silk_resampler_private_up2_hq,
 };
 use std::os::raw::c_int;

@@ -8,17 +8,17 @@
 //!
 //! | encoder | decoder | what it shows                                   |
 //! |---------|---------|-------------------------------------------------|
-//! | opus-rs | C       | the opus-rs encoder, judged by the reference    |
+//! | opus1 | C       | the opus1 encoder, judged by the reference    |
 //! | C       | C       | the reference for every number                  |
-//! | opus-rs | opus-rs | the path an application of opus-rs uses         |
-//! | C       | opus-rs | the opus-rs decoder on packets of the reference |
+//! | opus1 | opus1 | the path an application of opus1 uses         |
+//! | C       | opus1 | the opus1 decoder on packets of the reference |
 
 #![allow(dead_code)]
 
 use crate::ms_support::*;
 use crate::multistream_enc_common::*;
-use opus_rs::Application;
-use opus_rs::multistream::{MappingType, MultistreamDecoder, MultistreamEncoder};
+use opus1::Application;
+use opus1::multistream::{MappingType, MultistreamDecoder, MultistreamEncoder};
 
 /// The layouts of the end-to-end tests: every channel count of mapping
 /// family 1, two layouts of family 255 and three of family 2.
@@ -108,7 +108,7 @@ pub const NOISE_FLOOR: f32 = 0.002;
 ///
 /// The noise is there because `voiced` has nothing above 2.5 kHz. The
 /// analysis of libopus notices that and codes a narrower audio bandwidth
-/// than the bitrate allows (opus_encoder.c:1652-1673), which opus-rs,
+/// than the bitrate allows (opus_encoder.c:1652-1673), which opus1,
 /// without the analysis, does not. With the noise both encoders code the
 /// same bandwidth, and the tests compare the rest.
 /// `a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus`
@@ -185,7 +185,7 @@ pub struct ChannelSnr {
     pub snr: [f64; 4],
 }
 
-/// How the streams of the opus-rs packets differ from those of the C
+/// How the streams of the opus1 packets differ from those of the C
 /// packets, frame by frame and stream by stream. Every field counts stream
 /// packets.
 #[derive(Debug, Clone, Copy, Default)]
@@ -232,7 +232,7 @@ pub struct StreamRate {
 #[derive(Debug, Clone)]
 pub struct Measured {
     pub setting: Setting,
-    /// Bits per second of the packets, on average: opus-rs, C.
+    /// Bits per second of the packets, on average: opus1, C.
     pub rate: [f64; 2],
     pub streams: Vec<StreamRate>,
     pub structure: Structure,
@@ -241,7 +241,7 @@ pub struct Measured {
     pub examples: Vec<String>,
 }
 
-/// An opus-rs decoder with the layout of the encoder.
+/// An opus1 decoder with the layout of the encoder.
 pub fn rust_decoder(enc: &MultistreamEncoder) -> MultistreamDecoder {
     let layout = enc.layout();
     MultistreamDecoder::with_layout(
@@ -251,10 +251,10 @@ pub fn rust_decoder(enc: &MultistreamEncoder) -> MultistreamDecoder {
         layout.coupled_streams(),
         layout.mapping(),
     )
-    .expect("opus-rs multistream decoder")
+    .expect("opus1 multistream decoder")
 }
 
-/// Decodes a sequence of packets with the opus-rs decoder.
+/// Decodes a sequence of packets with the opus1 decoder.
 pub fn rust_decode_all(
     dec: &mut MultistreamDecoder,
     packets: &[Vec<u8>],
@@ -267,7 +267,7 @@ pub fn rust_decode_all(
     for (f, packet) in packets.iter().enumerate() {
         let n = dec
             .decode(packet, frame_size, &mut frame)
-            .unwrap_or_else(|e| panic!("{label}: frame {f}: opus-rs decode: {e}"));
+            .unwrap_or_else(|e| panic!("{label}: frame {f}: opus1 decode: {e}"));
         assert_eq!(n, frame_size, "{label}: frame {f}: decoded samples");
         out.extend_from_slice(&frame);
     }
@@ -335,7 +335,7 @@ pub fn measure_signal(setting: Setting, pcm: &[f32]) -> Measured {
             structure.compared += 1;
             assert_eq!(r.samples(fs), frame_size, "{label}: frame {f}: stream {s}");
             let (t, ct) = (toc(r.toc), toc(cs.toc));
-            let at = format!("{label}: frame {f}: stream {s}: opus-rs {t}, C {ct}");
+            let at = format!("{label}: frame {f}: stream {s}: opus1 {t}, C {ct}");
             if r.payload_len == 0 || cs.payload_len == 0 {
                 if r.payload_len != cs.payload_len {
                     example(&mut structure.audio, format!("{at}: audio in one only"));
@@ -476,7 +476,7 @@ pub fn summary(name: &str, results: &[Measured]) -> String {
         .unwrap()
     };
     text += &format!(
-        "  rate against the request in %: opus-rs {}, libopus {}\n",
+        "  rate against the request in %: opus1 {}, libopus {}\n",
         percent(RUST),
         percent(C)
     );
@@ -520,7 +520,7 @@ pub fn summary(name: &str, results: &[Measured]) -> String {
             continue;
         };
         text += &format!(
-            "  {} channels, SNR in dB: libopus {:.1} ({:.1} to {:.1}); opus-rs encoder against it {}; opus-rs both ends against it {}; opus-rs decoder on libopus packets against it {}\n",
+            "  {} channels, SNR in dB: libopus {:.1} ({:.1} to {:.1}); opus1 encoder against it {}; opus1 both ends against it {}; opus1 decoder on libopus packets against it {}\n",
             kind.name(),
             c.mean,
             c.min,

@@ -13,7 +13,7 @@ use celtenc_common::*;
 ///
 /// The packets have 20 or 40 bytes. Smaller packets are left to
 /// `celtenc_lfe.rs` and `celtenc_known_gaps.rs`: with 2 to 4 pulses in a
-/// band the pulse search of opus-rs is worse than libopus's.
+/// band the pulse search of opus1 is worse than libopus's.
 ///
 /// Measured: the mean packet size is within 0.1 byte of libopus, and the
 /// SNR within 0.4 dB. Under VBR single packets differ by up to 3 bytes: the
@@ -157,7 +157,7 @@ fn lfe_steady_tones_match_libopus_on_average() {
 /// (celt_encoder.c 2451: 60 bits for a mono frame). libopus then writes the
 /// smallest packet that holds what is coded so far (`min_allowed`).
 ///
-/// opus-rs used to turn the negative target into an unsigned byte count,
+/// opus1 used to turn the negative target into an unsigned byte count,
 /// which gave the largest packet instead: 960 bytes on average, where
 /// libopus writes 11, for an LFE stream of 9.6 kb/s in 2.5 ms frames under
 /// unconstrained VBR. Under constrained VBR the bound hid it.

@@ -6,9 +6,9 @@
 //! (`enc_kernel_tests`), which compare them bit for bit with the plain
 //! loops they replace. The tests here check what a caller can observe.
 
-use opus_rs::celt::{CeltDecoder, CeltEncoder};
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 /// Input rates of the CELT encoder and how many 48 kHz samples one input
 /// sample stands for.
@@ -18,7 +18,7 @@ const RATES: [(i32, usize); 5] = [(48000, 1), (24000, 2), (16000, 3), (12000, 4)
 const OVERLAP: usize = 120;
 
 /// Encodes one frame and returns the packet bytes. `pcm` holds `frame`
-/// samples per channel, one channel after the other.
+/// samples per channel, the channels interleaved.
 fn encode(enc: &mut CeltEncoder, pcm: &[f32], frame: usize, bytes: u32) -> Vec<u8> {
     let mut rc = RangeCoder::new_encoder(bytes);
     enc.encode(pcm, frame, &mut rc);
@@ -69,10 +69,10 @@ fn one_loud_sample_anywhere_ends_the_silence() {
                         // A silent frame first.
                         assert!(silence_flag(&encode(&mut enc, &pcm, n, 200)), "{what}: before");
 
-                        pcm[ch * n + pos] = if pos % 2 == 0 { loud } else { -loud };
+                        pcm[pos * channels + ch] = if pos % 2 == 0 { loud } else { -loud };
                         assert!(!silence_flag(&encode(&mut enc, &pcm, n, 200)), "{what}: frame");
 
-                        pcm[ch * n + pos] = 0.0;
+                        pcm[pos * channels + ch] = 0.0;
                         let next = silence_flag(&encode(&mut enc, &pcm, n, 200));
                         assert_eq!(next, pos < n - tail, "{what}: next frame");
 
@@ -102,7 +102,8 @@ fn silence_threshold_is_exact() {
             for (value, silent) in [(threshold, true), (-threshold, true), (above, false), (-above, false)] {
                 let mut enc = CeltEncoder::new(mode, 2);
                 let mut pcm = vec![0.5 * threshold; 2 * n];
-                pcm[n + pos] = value;
+                // The right channel.
+                pcm[2 * pos + 1] = value;
                 let got = silence_flag(&encode(&mut enc, &pcm, n, 200));
                 assert_eq!(got, silent, "n={n} pos={pos} value={value:e}");
             }
@@ -178,20 +179,23 @@ fn history_survives_changing_frame_sizes() {
             for round in 0..3 {
                 for &lm in &pattern {
                     let n = (120usize << lm) / upsample;
-                    let mut pcm = Vec::with_capacity(n * channels);
+                    let mut pcm = vec![0.0f32; n * channels];
                     for (ch, kept) in all_in.iter_mut().enumerate() {
                         let x = signal(&mut rng, rate, start, n, ch as f32 * 0.7);
+                        for (i, &v) in x.iter().enumerate() {
+                            pcm[i * channels + ch] = v;
+                        }
                         kept.extend_from_slice(&x);
-                        pcm.extend_from_slice(&x);
                     }
                     start += n;
                     // 160 bytes per 2.5 ms: far more than the signal needs.
                     let packet = encode(&mut enc, &pcm, n, 160 << lm);
                     assert!(!silence_flag(&packet), "{rate} Hz round {round}");
-                    // The decoder returns one channel after the other, as
-                    // the encoder takes them.
+                    // The decoder returns one channel after the other.
                     let mut out = vec![0.0f32; n * channels];
-                    assert_eq!(dec.decode(&packet, n, &mut out), n);
+                    let mut rc = RangeCoder::new_decoder(&packet);
+                    let bits = (packet.len() * 8) as i32;
+                    assert_eq!(dec.decode(&mut rc, bits, n, &mut out, PcmLayout::Planar), n);
                     for (ch, kept) in all_out.iter_mut().enumerate() {
                         kept.extend_from_slice(&out[ch * n..(ch + 1) * n]);
                     }

@@ -4,14 +4,14 @@
 //!
 //! The reference is the C libopus encoder with the same settings and the
 //! same buffer. The encoders run at complexity 5, where libopus makes its
-//! decisions without the speech/music analysis that opus-rs does not have.
+//! decisions without the speech/music analysis that opus1 does not have.
 
 mod core_common;
 mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus_rs::{Application, ForcedMode, OpusEncoder, packet};
+use opus1::{Application, ForcedMode, OpusEncoder, packet};
 
 fn signal(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
     let voice = speech(rate, seconds);
@@ -41,7 +41,7 @@ struct Counts {
 }
 
 /// Every buffer size from 1 byte up, for every frame duration: what
-/// libopus writes into the buffer, opus-rs writes too.
+/// libopus writes into the buffer, opus1 writes too.
 ///
 /// - A packet without audio is libopus's byte for byte. That includes the
 ///   1-byte buffer, where a 60 ms frame becomes a SILK packet whatever the
@@ -52,7 +52,7 @@ struct Counts {
 ///
 /// With stereo input the mode, bandwidth and channel count in the first
 /// byte are not compared. libopus codes stereo input as mono at the low
-/// bitrates a small buffer stands for, which opus-rs does not do yet. Mode
+/// bitrates a small buffer stands for, which opus1 does not do yet. Mode
 /// and bandwidth then follow from the mono rate, and a packet without audio
 /// repeats those of the last coded one. Stereo Hybrid packets are left out of the final
 /// range check (a known fault of the CELT layer, see tests/core_encoder.rs).
@@ -92,7 +92,7 @@ fn small_buffers(rate: usize, frame_tenth_ms: &[usize]) -> Counts {
                             let mut buf = vec![0u8; len];
                             let n = enc
                                 .encode(input, frame, &mut buf)
-                                .unwrap_or_else(|e| panic!("{what}: opus-rs: {e}"));
+                                .unwrap_or_else(|e| panic!("{what}: opus1: {e}"));
                             let packet = &buf[..n];
                             counts.packets += 1;
                             if cbr {

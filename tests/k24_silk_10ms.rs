@@ -5,7 +5,7 @@
 //! narrowband variant). libopus `silk_decoder_set_fs` picks the table from
 //! `nb_subfr`, which `silk_Decode` sets from the packet duration first.
 //!
-//! opus-rs's `silk_decoder_set_fs` forced `nb_subfr` to 4 before choosing,
+//! opus1's `silk_decoder_set_fs` forced `nb_subfr` to 4 before choosing,
 //! so a 10 ms frame read its pitch contour with the 20 ms table. The range
 //! decoder lost synchronisation at the first voiced frame and the rest of
 //! the stream was noise: every 10 ms SILK or Hybrid stream scored about
@@ -23,7 +23,7 @@ fn compare_10ms(mode: i32, bw: i32, bitrate: i32, channels: usize, dec_rate: usi
     enc.force_mode(mode).bandwidth(bw).bitrate(bitrate * channels as i32);
     let packets = enc.encode_all(&pcm, 480);
     let reference = c_decode_all(&packets, dec_rate, channels);
-    let ours = rs_decode_all(&packets, dec_rate, channels).expect("opus-rs decode");
+    let ours = rs_decode_all(&packets, dec_rate, channels).expect("opus1 decode");
     assert_eq!(ours.len(), reference.len());
     // Skip the first 80 ms: Hybrid streams carry a separate small start-up
     // difference in the CELT layer (see k24_celt_reset_state.rs).

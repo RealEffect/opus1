@@ -12,8 +12,8 @@
 
 #[cfg(test)]
 mod tests {
-    use opus_rs::silk::define::MAX_PREDICTION_POWER_GAIN;
-    use opus_rs::silk::lpc_analysis::silk_burg_modified_fix;
+    use opus1::silk::define::MAX_PREDICTION_POWER_GAIN;
+    use opus1::silk::lpc_analysis::silk_burg_modified_fix;
     use std::f64::consts::PI;
 
     fn min_inv_gain_q30() -> i32 {
@@ -171,7 +171,7 @@ mod tests {
         let c_a_q16 = [
             69820, 26559, -7459, -23256, -2242, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
-        // The results are integers and opus-rs has the C values exactly.
+        // The results are integers and opus1 has the C values exactly.
         assert_eq!((res_nrg, res_nrg_q), (15780, 7));
         assert_eq!(&a_q16[..16], &c_a_q16);
     }

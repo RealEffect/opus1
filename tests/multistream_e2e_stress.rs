@@ -18,7 +18,7 @@
 //! - 16-bit input.
 //!
 //! No call may panic. An error must be one the buffer explains. Every
-//! packet must decode in C libopus and in opus-rs, to finite samples, with
+//! packet must decode in C libopus and in opus1, to finite samples, with
 //! the final range of the encoder.
 //!
 //! The sequences are random but fixed. Set the environment variable
@@ -32,9 +32,9 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
-use opus_rs::multistream::MultistreamEncoder;
-use opus_rs::multistream::encoder::Bitrate;
-use opus_rs::{Application, Bandwidth, ForcedMode};
+use opus1::multistream::MultistreamEncoder;
+use opus1::multistream::encoder::Bitrate;
+use opus1::{Application, Bandwidth, ForcedMode};
 
 /// A small deterministic random number generator.
 struct Lcg(u32);
@@ -302,19 +302,8 @@ fn stress(case: &Case, fs: i32, application: Application, seed: u32, frames: usi
                     }
                     _ => len,
                 };
-                if frame_size <= fs as usize / 50 {
-                    // Up to 20 ms every packet libopus can write is written.
-                    assert!(limit < smallest, "{}", at(&history));
-                } else {
-                    // 40 and 60 ms: a stream that is left a few bytes can
-                    // fail in the stream encoder (difference D2 of
-                    // src/multistream/encoder.rs).
-                    assert!(
-                        len < largest_packet || limit < 30 * streams,
-                        "{}",
-                        at(&history)
-                    );
-                }
+                // Every packet libopus can write is written.
+                assert!(limit < smallest, "{}", at(&history));
                 refused += 1;
                 // The streams coded before the error moved on by a frame
                 // the decoders never see. Start all sides afresh.
@@ -339,11 +328,11 @@ fn stress(case: &Case, fs: i32, application: Application, seed: u32, frames: usi
         assert!(c_out.iter().all(|v| v.is_finite()), "{}: C output", at(&history));
         let samples = rust_dec
             .decode(packet, frame_size, &mut decoded)
-            .unwrap_or_else(|e| panic!("{}: opus-rs decode error {e}", at(&history)));
+            .unwrap_or_else(|e| panic!("{}: opus1 decode error {e}", at(&history)));
         assert_eq!(samples, frame_size, "{}", at(&history));
         assert!(
             decoded[..samples * channels].iter().all(|v| v.is_finite()),
-            "{}: opus-rs output",
+            "{}: opus1 output",
             at(&history)
         );
         // Two kinds of stream have a wrong final range in the stream
@@ -368,7 +357,7 @@ fn stress(case: &Case, fs: i32, application: Application, seed: u32, frames: usi
             assert_eq!(
                 rust_dec.final_range(),
                 c_dec.final_range(),
-                "{}: final range of the opus-rs decoder",
+                "{}: final range of the opus1 decoder",
                 at(&history)
             );
         }

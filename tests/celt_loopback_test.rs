@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::celt::{CeltDecoder, CeltEncoder};
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 #[test]
 fn test_celt_loopback() {
@@ -35,7 +35,10 @@ fn test_celt_loopback() {
         compressed.copy_from_slice(&rc.buf[..rc_size as usize]);
 
         let mut pcm_out = vec![0.0f32; frame_size * channels];
-        let decoded_len = decoder.decode(&compressed, frame_size, &mut pcm_out);
+        let bits = (compressed.len() * 8) as i32;
+        let mut rc = RangeCoder::new_decoder(&compressed);
+        let layout = PcmLayout::Planar;
+        let decoded_len = decoder.decode(&mut rc, bits, frame_size, &mut pcm_out, layout);
         assert_eq!(decoded_len, frame_size);
         all_out.extend_from_slice(&pcm_out);
 

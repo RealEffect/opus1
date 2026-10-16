@@ -11,7 +11,7 @@
 //! several lengths, against the time for an empty packet (same code, no
 //! bytes to copy) and against a plain copy of the same bytes.
 
-use opus_rs::range_coder::RangeCoder;
+use opus1::range_coder::RangeCoder;
 use std::hint::black_box;
 use std::time::Instant;
 

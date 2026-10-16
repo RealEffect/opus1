@@ -38,6 +38,16 @@
 pub const MAX_FRAMES: usize = 48;
 /// The largest frame the size fields can express.
 pub const MAX_FRAME_BYTES: usize = 1275;
+/// The most audio one packet holds: 120 ms, in samples per channel at
+/// 48 kHz.
+pub(crate) const MAX_PACKET_SAMPLES: usize = max_packet_samples(48000);
+
+/// The most audio one packet holds, 120 ms, in samples per channel at `fs`
+/// samples per second.
+#[inline]
+pub(crate) const fn max_packet_samples(fs: i32) -> usize {
+    fs as usize / 25 * 3
+}
 
 const INVALID_PACKET: &str = "Invalid packet";
 const BUFFER_TOO_SMALL: &str = "Output buffer too small";
@@ -154,7 +164,7 @@ pub fn nb_samples(data: &[u8], sampling_rate: i32) -> Result<usize, &'static str
 
 /// libopus `encode_size` (opus.c): the number of bytes a frame size takes.
 #[inline]
-fn size_field_len(size: u16) -> usize {
+pub(crate) fn size_field_len(size: u16) -> usize {
     1 + (size >= 252) as usize
 }
 
@@ -253,7 +263,7 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
             let ch = data[pos];
             pos += 1;
             count = (ch & 0x3F) as usize;
-            if count == 0 || framesize * count > 5760 {
+            if count == 0 || framesize * count > MAX_PACKET_SAMPLES {
                 return Err(INVALID_PACKET);
             }
             len -= 1;
@@ -501,7 +511,7 @@ fn frame_sizes(toc: u8, frames: &[&[u8]]) -> Result<[u16; MAX_FRAMES], &'static 
     let count = frames.len();
     // The repacketizer takes no more than 120 ms of audio
     // (opus_repacketizer_cat_impl).
-    if count == 0 || count > MAX_FRAMES || count * samples_per_frame(toc, 48000) > 5760 {
+    if count == 0 || count > MAX_FRAMES || count * samples_per_frame(toc, 48000) > MAX_PACKET_SAMPLES {
         return Err(BAD_ARG);
     }
     let mut sizes = [0u16; MAX_FRAMES];

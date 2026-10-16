@@ -7,7 +7,7 @@
 //! the right channel sits after the special case, outside the `N != 2`
 //! test.
 //!
-//! opus-rs returned from the special case before that step, so a two-bin
+//! opus1 returned from the special case before that step, so a two-bin
 //! band with the phase-inversion flag set came out with the right channel
 //! at the wrong sign. The flag is only coded in a narrow range of bit
 //! budgets (about 20 bytes per frame), which is why only 2.5 ms at
@@ -33,7 +33,7 @@ fn stereo_celt_frames_of_every_duration_decode_like_libopus() {
                     .force_channels(2);
                 let packets = enc.encode_all(&pcm, 48000 * frame_tenth_ms / 10000);
                 let reference = c_decode_all(&packets, 24000, 2);
-                let ours = rs_decode_all(&packets, 24000, 2).expect("opus-rs decode");
+                let ours = rs_decode_all(&packets, 24000, 2).expect("opus1 decode");
                 // 20 ms comparison windows whatever the frame duration.
                 let cmp = compare(&reference, &ours, 2, 480, 24000);
                 lowest = lowest.min(cmp.worst_frame_snr_db);

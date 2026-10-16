@@ -1,4 +1,4 @@
-//! In-band forward error correction (FEC) from the opus-rs encoder at a
+//! In-band forward error correction (FEC) from the opus1 encoder at a
 //! 24 kHz input rate, decoded by C libopus.
 //!
 //! With FEC on, each packet also carries a low-bitrate copy of the previous
@@ -18,7 +18,7 @@ fn speech() -> Vec<f32> {
 /// When the bitrate cannot pay for FEC at the current bandwidth, libopus's
 /// `decide_fec` lowers the bandwidth for the frame. libopus then turns
 /// Hybrid at wideband or below into SILK-only (opus_encoder.c:1675-1695).
-/// opus-rs made that mode decision before `decide_fec`, so the frame stayed
+/// opus1 made that mode decision before `decide_fec`, so the frame stayed
 /// Hybrid with a wideband or narrower bandwidth: CELT had no band left to
 /// code and `interp_bits2pulses` divided by zero. From 24 kHz, VoIP with FEC
 /// panicked at 24 kb/s with 10 % loss, and at 16 and 24 kb/s with 20 %.
@@ -50,7 +50,7 @@ fn fec_that_lowers_the_bandwidth_does_not_panic() {
                 let level_limit = c_q.level_db.abs().max(1.0) + 1.0;
                 assert!(
                     rs_q.snr >= c_q.snr - 3.0 && rs_q.level_db.abs() < level_limit,
-                    "{what}: opus-rs {:.2} dB (level {:+.2} dB, {}), libopus {:.2} dB (level {:+.2} dB, {})",
+                    "{what}: opus1 {:.2} dB (level {:+.2} dB, {}), libopus {:.2} dB (level {:+.2} dB, {})",
                     rs_q.snr,
                     rs_q.level_db,
                     toc_summary(&rs),
@@ -84,7 +84,7 @@ fn redundant_frames_recover_lost_audio_like_libopus() {
             let (rs_fec, rs_plc) = fec_recovery_db(&enc_rs(&cfg, &pcm).unwrap(), 1, cfg.frame);
             let (c_fec, _) = fec_recovery_db(&enc_c(&cfg, &pcm), 1, cfg.frame);
             let what = format!(
-                "{} kb/s, {loss} % loss, {}: opus-rs FEC {rs_fec:+.2} dB (concealment {rs_plc:+.2} dB), libopus FEC {c_fec:+.2} dB",
+                "{} kb/s, {loss} % loss, {}: opus1 FEC {rs_fec:+.2} dB (concealment {rs_plc:+.2} dB), libopus FEC {c_fec:+.2} dB",
                 bitrate / 1000,
                 if cbr { "CBR" } else { "VBR" }
             );

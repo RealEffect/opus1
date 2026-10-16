@@ -10,11 +10,11 @@
 //! - Hybrid fed SILK the interleaved L,R,L,R… input as if it were mono, so at
 //!   24/48 kHz even the mid was garbage.
 //!
-//! Each config encodes the same signal with opus-rs and with libopus at the
+//! Each config encodes the same signal with opus1 and with libopus at the
 //! same settings, decodes both with libopus, and measures each decoded
 //! channel against the input: its gain against the input mid must match
-//! libopus's, and its SNR come close. The opus-rs decoder must also agree
-//! with libopus on opus-rs's packets. Since #48 the encoder codes the side as
+//! libopus's, and its SNR come close. The opus1 decoder must also agree
+//! with libopus on opus1's packets. Since #48 the encoder codes the side as
 //! libopus does, so the margins are tight; `issue_48_stereo_side.rs` covers
 //! the content that needs the side most.
 
@@ -22,7 +22,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -168,11 +168,11 @@ struct Config {
 }
 
 struct Measured {
-    /// opus-rs's packets, decoded by libopus.
+    /// opus1's packets, decoded by libopus.
     rs: Channels,
     /// libopus's packets, decoded by libopus.
     c: Channels,
-    /// Per channel, worst-window SNR of opus-rs's decode of opus-rs's packets
+    /// Per channel, worst-window SNR of opus1's decode of opus1's packets
     /// against libopus's decode of the same packets.
     agreement: [f64; 2],
 }
@@ -187,7 +187,7 @@ fn run(cfg: &Config) -> Measured {
     rs_enc.bitrate_bps = 32000;
     rs_enc.use_cbr = cfg.cbr;
 
-    // libopus at opus-rs's settings. A steady harmonic tone can read as music
+    // libopus at opus1's settings. A steady harmonic tone can read as music
     // and pull libopus into CELT, and below ~18 kb/s libopus would switch to
     // a mono stream, so pin the signal type and the channel count.
     let mut c_enc = CEnc::new(sr as u32, CCh::Stereo, CApp::Voip).unwrap();
@@ -209,9 +209,9 @@ fn run(cfg: &Config) -> Measured {
 
         let n = rs_enc
             .encode(pcm, frame, &mut pkt)
-            .unwrap_or_else(|e| panic!("packet {p}: opus-rs encode failed: {e}"));
+            .unwrap_or_else(|e| panic!("packet {p}: opus1 encode failed: {e}"));
         let rs_pkt = &pkt[..n];
-        assert_toc(&format!("opus-rs packet {p}"), rs_pkt, cfg.configs.clone());
+        assert_toc(&format!("opus1 packet {p}"), rs_pkt, cfg.configs.clone());
 
         let got = c_dec_rs.decode_float(rs_pkt, &mut buf, false).unwrap();
         assert_eq!(got, frame);
@@ -244,20 +244,20 @@ fn run(cfg: &Config) -> Measured {
 /// libopus's. The stereo predictor carries the L/R balance: with the mid
 /// alone both channels decoded at +0.85·mid, against libopus's +0.93 / +0.75.
 const GAIN_MARGIN: f64 = 0.08;
-/// How far below libopus's per-channel SNR opus-rs may fall. Coding the mid
+/// How far below libopus's per-channel SNR opus1 may fall. Coding the mid
 /// only cost the channel whose shape differs most from the mid about 1.3 dB
 /// on R here; with the side coded (#48) both channels measure within 0.3 dB
 /// of libopus.
 const CHANNEL_MARGIN_DB: f64 = 1.0;
-/// How far below libopus's mid SNR opus-rs may fall.
+/// How far below libopus's mid SNR opus1 may fall.
 const MID_MARGIN_DB: f64 = 1.0;
-/// Decoder agreement on opus-rs's packets, clean (issue_27's `MATCH_DB`).
+/// Decoder agreement on opus1's packets, clean (issue_27's `MATCH_DB`).
 const MATCH_DB: f64 = 30.0;
 
 fn check(cfg: Config) {
     let m = run(&cfg);
     println!(
-        "{:<22} opus-rs: L {:+.2}·mid  R {:+.2}·mid  SNR L {:+.1} R {:+.1} mid {:+.1} dB",
+        "{:<22} opus1: L {:+.2}·mid  R {:+.2}·mid  SNR L {:+.1} R {:+.1} mid {:+.1} dB",
         cfg.name, m.rs.gain[0], m.rs.gain[1], m.rs.snr[0], m.rs.snr[1], m.rs.mid_snr
     );
     println!(
@@ -265,7 +265,7 @@ fn check(cfg: Config) {
         "", m.c.gain[0], m.c.gain[1], m.c.snr[0], m.c.snr[1], m.c.mid_snr
     );
     println!(
-        "{:<22} opus-rs vs libopus decoder: L {:.1} R {:.1} dB",
+        "{:<22} opus1 vs libopus decoder: L {:.1} R {:.1} dB",
         "", m.agreement[0], m.agreement[1]
     );
 
@@ -295,7 +295,7 @@ fn check(cfg: Config) {
     for (c, name) in ["L", "R"].iter().enumerate() {
         assert!(
             m.agreement[c] > MATCH_DB,
-            "{}: opus-rs and libopus decode opus-rs's {name} differently: {:.1} dB",
+            "{}: opus1 and libopus decode opus1's {name} differently: {:.1} dB",
             cfg.name,
             m.agreement[c]
         );

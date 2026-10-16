@@ -15,8 +15,8 @@
 // The generator repeats the index-based loops of the C program.
 #![allow(clippy::needless_range_loop)]
 
-use opus_rs::silk::nlsf::silk_process_nlsfs;
-use opus_rs::silk::structs::{SilkEncoderControl, SilkEncoderState};
+use opus1::silk::nlsf::silk_process_nlsfs;
+use opus1::silk::structs::{SilkEncoderControl, SilkEncoderState};
 
 /// (checksum of the input, checksum of all outputs, first index, first
 /// quantized value, first prediction coefficient).
@@ -118,7 +118,7 @@ fn process_nlsfs_matches_libopus() {
         );
         if got != *expected {
             failures.push(format!(
-                "case {number} (order {order}, kind {kind}, {} subframes, interpolation {}): opus-rs {:?}, libopus {:?}",
+                "case {number} (order {order}, kind {kind}, {} subframes, interpolation {}): opus1 {:?}, libopus {:?}",
                 enc.s_cmn.nb_subfr, enc.s_cmn.indices.nlsf_interp_coef_q2, got, expected
             ));
         }

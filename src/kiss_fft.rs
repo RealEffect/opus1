@@ -135,17 +135,15 @@ pub struct KissFftState {
     ///
     /// A stage of radix `p` with `m` butterflies per group stores, for each
     /// `k` in `1..p`, the `m` values `w^(k * j)`, `j = 0..m`. `w` is the
-    /// root of unity of that stage. The values are copies of the entries the
-    /// butterflies used to read with a stride from the table of the largest
-    /// FFT size. `StreamTw` describes how the `m` values are laid out.
+    /// root of unity of that stage. The values are copies of entries of the
+    /// table of the largest FFT size, which are a stride apart there.
+    /// `StreamTw` describes how the `m` values are laid out.
     stage_tw: FixedVec<f32, STAGE_TW_MAX>,
 }
 
 fn kf_factor(n_orig: usize, factors: &mut [i16; 2 * MAXFACTORS]) -> bool {
-    // The twiddle table (KissCpx, KISS_MAX_N entries) and the bit-reversal
-    // table are sized for KISS_MAX_N; anything larger would overflow them on
-    // push (fail-fast assert) — reject up front so `KissFftState::new`
-    // returns None gracefully (issue #27 deep scan).
+    // The twiddle and bit-reversal tables hold KISS_MAX_N entries. A larger
+    // size is rejected here, so that `KissFftState::new` returns None.
     if n_orig > KISS_MAX_N {
         return false;
     }
@@ -1455,10 +1453,8 @@ unsafe fn fft_stages_neon(st: &KissFftState, fout: &mut [KissCpx]) {
 /// of the arm64 build of libopus. On every other target it gives the bits of
 /// `opus_fft_impl_scalar`.
 pub fn opus_fft_impl(st: &KissFftState, fout: &mut [KissCpx]) {
-    // The butterfly kernels index up to nfft elements; the SIMD paths read
-    // through raw pointers, so an undersized slice would be out-of-bounds
-    // memory access rather than a panic — check up front (issue #27 deep
-    // scan).
+    // The vector kernels read and write `nfft` values through pointers, so
+    // the length is checked here.
     assert!(
         fout.len() >= st.nfft,
         "opus_fft_impl: fout.len() ({}) < nfft ({})",
@@ -1519,34 +1515,6 @@ pub fn opus_fft_impl_fused(st: &KissFftState, fout: &mut [KissCpx]) {
         st.nfft
     );
     fft_stages_scalar::<Fused>(st, &mut fout[..st.nfft]);
-}
-
-pub fn opus_fft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
-    let scale = st.scale;
-    let nfft = st.nfft;
-
-    for i in 0..nfft {
-        let x = &fin[i];
-        let rev = st.bitrev[i] as usize;
-        fout[rev] = KissCpx::new(x.r * scale, x.i * scale);
-    }
-
-    opus_fft_impl(st, fout);
-}
-
-pub fn opus_ifft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
-    let nfft = st.nfft;
-
-    for i in 0..nfft {
-        let rev = st.bitrev[i] as usize;
-        fout[rev] = KissCpx::new(fin[i].r, -fin[i].i);
-    }
-
-    opus_fft_impl(st, fout);
-
-    for i in 0..nfft {
-        fout[i].i = -fout[i].i;
-    }
 }
 
 /// The twiddle table of the 480-point FFT: entry `i` is
@@ -1943,6 +1911,37 @@ mod tests {
     use super::test_guard::{PLACEMENTS, Region};
     use super::*;
     use core::f32::consts::PI;
+
+    /// libopus `opus_fft_c`: scales the input by `1 / nfft`, puts it in
+    /// bit-reversed order and transforms it.
+    fn opus_fft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
+        let scale = st.scale;
+        let nfft = st.nfft;
+
+        for i in 0..nfft {
+            let x = &fin[i];
+            let rev = st.bitrev[i] as usize;
+            fout[rev] = KissCpx::new(x.r * scale, x.i * scale);
+        }
+
+        opus_fft_impl(st, fout);
+    }
+
+    /// libopus `opus_ifft_c`: the inverse transform, without scaling.
+    fn opus_ifft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
+        let nfft = st.nfft;
+
+        for i in 0..nfft {
+            let rev = st.bitrev[i] as usize;
+            fout[rev] = KissCpx::new(fin[i].r, -fin[i].i);
+        }
+
+        opus_fft_impl(st, fout);
+
+        for i in 0..nfft {
+            fout[i].i = -fout[i].i;
+        }
+    }
 
     fn almost_equal(a: f32, b: f32, tolerance: f32) -> bool {
         (a - b).abs() < tolerance

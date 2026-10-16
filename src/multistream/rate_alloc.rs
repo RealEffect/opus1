@@ -21,14 +21,18 @@ use super::layout::{ChannelLayout, MappingType};
 
 /// libopus `OPUS_AUTO`: the encoder picks the bitrate from the sampling rate
 /// and the channel count.
-pub const OPUS_AUTO: i32 = -1000;
+pub const OPUS_AUTO: i32 = crate::OPUS_AUTO;
 
 /// libopus `OPUS_BITRATE_MAX`: use as many bits as the packet can hold.
-pub const OPUS_BITRATE_MAX: i32 = -1;
+pub const OPUS_BITRATE_MAX: i32 = crate::OPUS_BITRATE_MAX;
 
 /// libopus `MS_FRAME_TMP`: the largest packet one stream can produce, in
 /// bytes. That is six frames of 1275 bytes (120 ms) plus their headers.
-pub const MS_FRAME_TMP: usize = 6 * 1275 + 12;
+pub const MS_FRAME_TMP: usize = 6 * crate::packet::MAX_FRAME_BYTES + 12;
+
+/// The most a stream encoder accepts per channel, in bits per second
+/// (libopus `opus_encoder_ctl`, `OPUS_SET_BITRATE_REQUEST`).
+pub(crate) const MAX_BITRATE_PER_CHANNEL: i32 = 750_000;
 
 /// Clamps a 64-bit result to the range of `i32`.
 #[inline]
@@ -55,30 +59,28 @@ fn check_frame(frame_size: usize, fs: i32) -> Result<(i64, i64), &'static str> {
     Ok((count(frame_size), fs as i64))
 }
 
-/// Six times the number of frames per second. libopus computes with this
-/// value so that 60 ms frames (16.67 per second) are not rounded.
+/// Checks the arguments of `bitrate_to_bits` and `bits_to_bitrate`: on top of
+/// `check_frame`, the frame must be shorter than 6 seconds, because both
+/// divide by six times the number of frames per second.
 #[inline]
-fn frame_rate_x6(frame_size: usize, fs: i32) -> Result<i64, &'static str> {
+fn check_conversion(frame_size: usize, fs: i32) -> Result<(), &'static str> {
     let (frame_size, fs) = check_frame(frame_size, fs)?;
-    let rate = 6 * fs / frame_size;
-    if rate == 0 {
+    if 6 * fs / frame_size == 0 {
         return Err("multistream rate: the frame is longer than 6 seconds");
     }
-    Ok(rate)
+    Ok(())
 }
 
-/// libopus `bitrate_to_bits` (celt.h): bits per second to bits per frame.
+/// libopus `bitrate_to_bits`: bits per second to bits per frame.
 pub fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: usize) -> Result<i32, &'static str> {
-    let rate = frame_rate_x6(frame_size, fs)?;
-    Ok(to_i32(bitrate as i64 * 6 / rate))
+    check_conversion(frame_size, fs)?;
+    Ok(crate::bitrate_to_bits(bitrate, fs, frame_size))
 }
 
-/// libopus `bits_to_bitrate` (celt.h): bits per frame to bits per second.
+/// libopus `bits_to_bitrate`: bits per frame to bits per second.
 pub fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> Result<i32, &'static str> {
-    let rate = frame_rate_x6(frame_size, fs)?;
-    // The product leaves 64 bits only for values far outside what a packet
-    // can hold. It saturates there, and the result is then clamped anyway.
-    Ok(to_i32((bits as i64).saturating_mul(rate) / 6))
+    check_conversion(frame_size, fs)?;
+    Ok(crate::bits_to_bitrate(bits, fs, frame_size))
 }
 
 /// The bitrate control of the multistream encoder (libopus
@@ -101,7 +103,9 @@ pub fn clamp_user_bitrate(value: i32, channels: usize) -> Result<i32, &'static s
     }
     let channels = count(channels);
     Ok(to_i32(
-        (value as i64).max(500 * channels).min(750_000 * channels),
+        (value as i64)
+            .max(500 * channels)
+            .min(i64::from(MAX_BITRATE_PER_CHANNEL) * channels),
     ))
 }
 
@@ -164,7 +168,7 @@ pub fn surround_rate_allocation(
     let bitrate = if user_bitrate == OPUS_AUTO {
         nb_normal * (channel_offset + fs + 10000) + 8000 * nb_lfe
     } else if user_bitrate == OPUS_BITRATE_MAX {
-        nb_normal * 750000 + nb_lfe * 128000
+        nb_normal * i64::from(MAX_BITRATE_PER_CHANNEL) + nb_lfe * 128000
     } else {
         user_bitrate as i64
     };
@@ -225,7 +229,7 @@ pub fn ambisonics_rate_allocation(
     let total_rate = if user_bitrate == OPUS_AUTO {
         (nb_coupled_streams + nb_streams) * (fs + 60 * fs / frame_size) + nb_streams * 15000
     } else if user_bitrate == OPUS_BITRATE_MAX {
-        nb_channels * 750000
+        nb_channels * i64::from(MAX_BITRATE_PER_CHANNEL)
     } else {
         user_bitrate as i64
     };
@@ -284,7 +288,9 @@ pub fn rate_allocation(
 }
 
 /// Whether the frame lasts 100 ms. libopus keeps one more byte per stream
-/// for such a frame, because its table-of-contents needs two bytes.
+/// for such a frame, because its table-of-contents needs two bytes. The
+/// multistream encoder takes no 100 ms frames, but the functions here follow
+/// libopus for every frame size.
 #[inline]
 fn is_100_ms(frame_size: i64, fs: i64) -> bool {
     fs / frame_size == 10

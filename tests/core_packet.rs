@@ -1,4 +1,4 @@
-//! `opus_rs::packet` against the packet functions of C libopus.
+//! `opus1::packet` against the packet functions of C libopus.
 //!
 //! The reference is the public C API only:
 //!
@@ -10,7 +10,7 @@
 //!   stream before it decodes anything.
 
 use audiopus_sys as sys;
-use opus_rs::packet;
+use opus1::packet;
 
 /// Frame sizes around the points where the size field changes: one byte up
 /// to 251, two bytes from 252, and the largest frame, 1275 bytes.
@@ -449,7 +449,7 @@ fn mutate(rng: &mut Rng, data: &mut Vec<u8>) {
     }
 }
 
-/// Mutated single packets: opus-rs and `opus_packet_parse` accept the same
+/// Mutated single packets: opus1 and `opus_packet_parse` accept the same
 /// ones and find the same frames. `pad` agrees with `opus_packet_pad` when
 /// the packet holds no padding with content.
 #[test]
@@ -476,11 +476,11 @@ fn mutated_packets_parse_like_libopus() {
         }
         match c_parse(&data) {
             Err(code) => {
-                assert!(ours.is_err(), "round {round}: C rejects ({code}), opus-rs accepts {data:02x?}");
+                assert!(ours.is_err(), "round {round}: C rejects ({code}), opus1 accepts {data:02x?}");
                 rejected += 1;
             }
             Ok((c_toc, c_sizes, c_offset)) => {
-                let p = ours.unwrap_or_else(|e| panic!("round {round}: C accepts, opus-rs: {e}: {data:02x?}"));
+                let p = ours.unwrap_or_else(|e| panic!("round {round}: C accepts, opus1: {e}: {data:02x?}"));
                 let sizes: Vec<usize> = p.sizes[..p.count].iter().map(|&s| s as usize).collect();
                 assert_eq!((p.toc, sizes, p.payload_offset), (c_toc, c_sizes, c_offset), "round {round}: {data:02x?}");
                 assert!(p.packet_offset <= data.len() && p.padding_len <= p.packet_offset);
@@ -543,7 +543,7 @@ fn mutated_multistream_packets_validate_like_libopus() {
                 accepted += 1;
             }
             Err(code) => {
-                assert!(ours.is_err(), "round {round}, {read_as} streams: C rejects ({code}), opus-rs gives {ours:?}: {data:02x?}");
+                assert!(ours.is_err(), "round {round}, {read_as} streams: C rejects ({code}), opus1 gives {ours:?}: {data:02x?}");
                 rejected += 1;
             }
         }

@@ -11,7 +11,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo, toc};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// What an LFE channel carries: tones at 38 and 71 Hz that swell twice a
 /// second, and a little noise.
@@ -76,7 +76,7 @@ fn total_bytes(packets: &[Vec<u8>]) -> usize {
 
 /// Whether a packet codes nothing: every frame in it is empty.
 fn is_placeholder(packet: &[u8]) -> bool {
-    let parsed = opus_rs::packet::parse(packet, false).expect("a valid packet");
+    let parsed = opus1::packet::parse(packet, false).expect("a valid packet");
     parsed.sizes[..parsed.count].iter().all(|&size| size == 0)
 }
 
@@ -103,7 +103,7 @@ fn is_placeholder(packet: &[u8]) -> bool {
 ///
 /// One known difference is left out: packets of 40 and 60 ms with a
 /// variable bitrate. libopus 1.6 limits each 20 ms part of such a packet to
-/// its share of the bitrate. opus-rs does not, on purpose (see
+/// its share of the bitrate. opus1 does not, on purpose (see
 /// `OpusEncoder::encode_multiframe`), so its packets are larger there.
 #[test]
 fn lfe_streams_have_libopus_first_bytes_sizes_and_quality() {
@@ -132,7 +132,7 @@ fn lfe_streams_have_libopus_first_bytes_sizes_and_quality() {
                         if is_placeholder(c) {
                             placeholders += 1;
                             if c != r {
-                                failures.push(format!("{what}: placeholder {c:02x?} in libopus, {r:02x?} in opus-rs"));
+                                failures.push(format!("{what}: placeholder {c:02x?} in libopus, {r:02x?} in opus1"));
                                 break;
                             }
                             continue;
@@ -210,8 +210,8 @@ fn lfe_tones_come_back_like_from_libopus() {
             plain.set_force_mode(Some(ForcedMode::CeltOnly));
             plain.set_bandwidth(Bandwidth::Narrowband);
             let plain_snr = c_decoded_snr(&encode_all(&mut plain, &pcm, frame), &pcm, rate, frame);
-            println!("{rate} Hz, {bitrate} b/s: opus-rs {rs_snr:.1} dB, libopus {c_snr:.1} dB; opus-rs without the LFE flag {plain_snr:.1} dB");
-            assert!(rs_snr > 12.0 && rs_snr > c_snr - 2.0, "{rate} Hz, {bitrate} b/s: opus-rs {rs_snr:.1} dB, libopus {c_snr:.1} dB");
+            println!("{rate} Hz, {bitrate} b/s: opus1 {rs_snr:.1} dB, libopus {c_snr:.1} dB; opus1 without the LFE flag {plain_snr:.1} dB");
+            assert!(rs_snr > 12.0 && rs_snr > c_snr - 2.0, "{rate} Hz, {bitrate} b/s: opus1 {rs_snr:.1} dB, libopus {c_snr:.1} dB");
             assert!(rs_snr > plain_snr + 3.0, "{rate} Hz, {bitrate} b/s: {rs_snr:.1} dB with the LFE flag, {plain_snr:.1} dB without");
         }
     }
@@ -251,7 +251,7 @@ struct Stream {
 }
 
 impl Stream {
-    /// The packets of libopus and of opus-rs.
+    /// The packets of libopus and of opus1.
     fn packets(&self, pcm: &[f32], cbr: bool, mask: Option<&[f32]>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let frame = self.rate * self.frame_ms / 1000;
         let mut c_enc = CEncoder::new(self.rate, self.channels, APP_AUDIO);
@@ -265,7 +265,7 @@ impl Stream {
         (c_enc.encode_all(pcm, frame), encode_all(&mut enc, pcm, frame))
     }
 
-    /// Bytes of the whole stream from libopus and from opus-rs.
+    /// Bytes of the whole stream from libopus and from opus1.
     fn bytes(&self, pcm: &[f32], cbr: bool, mask: Option<&[f32]>) -> (usize, usize) {
         let (c_packets, packets) = self.packets(pcm, cbr, mask);
         (total_bytes(&c_packets), total_bytes(&packets))
@@ -439,7 +439,7 @@ fn energy_mask_in_hybrid_streams_follows_libopus() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// The one place where opus-rs does not follow libopus with a mask, on
+/// The one place where opus1 does not follow libopus with a mask, on
 /// purpose.
 ///
 /// In a Hybrid packet CELT's bitrate is the total less SILK's
@@ -448,7 +448,7 @@ fn energy_mask_in_hybrid_streams_follows_libopus() {
 /// lowest bitrate CELT takes. libopus's request to CELT fails, CELT keeps
 /// the maximum bitrate it was given just before (C 2286), and the packets
 /// grow to the size of the buffer: a 10 kb/s stream comes out at about
-/// 500 kb/s. opus-rs gives CELT 501 b/s in that case, and the stream stays
+/// 500 kb/s. opus1 gives CELT 501 b/s in that case, and the stream stays
 /// near its bitrate.
 #[test]
 fn a_mask_cannot_make_a_hybrid_stream_run_away() {
@@ -521,7 +521,7 @@ fn high_band_power(x: &[f32]) -> f64 {
 /// it is (the offset is `16000 * (mask + 0.2)`), so the gain is all that
 /// changes. Decoded by libopus:
 ///
-/// - without a mask, the band above 8 kHz of the opus-rs stream is as loud
+/// - without a mask, the band above 8 kHz of the opus1 stream is as loud
 ///   as that of the libopus stream, to within 0.5 dB;
 /// - with the mask it is louder by what libopus gains, to within 0.5 dB:
 ///   3 dB at 11 kb/s, where the gain is 0.70, and 1.7 dB at 16 kb/s.
@@ -540,7 +540,7 @@ fn a_mask_keeps_the_hybrid_high_band_at_full_level() {
         let db = |ratio: f64| 10.0 * ratio.log10();
         let (c_gain, rs_gain) = (db(masked.0 / plain.0), db(masked.1 / plain.1));
         let (level_plain, level_masked) = (db(plain.1 / plain.0), db(masked.1 / masked.0));
-        println!("Hybrid-FB mono {bitrate} b/s: the mask raises the band above 8 kHz by {rs_gain:.2} dB (libopus {c_gain:.2} dB); opus-rs against libopus {level_plain:+.2} dB without and {level_masked:+.2} dB with the mask");
+        println!("Hybrid-FB mono {bitrate} b/s: the mask raises the band above 8 kHz by {rs_gain:.2} dB (libopus {c_gain:.2} dB); opus1 against libopus {level_plain:+.2} dB without and {level_masked:+.2} dB with the mask");
         assert!(c_gain > least_gain_db, "{bitrate} b/s: libopus gains {c_gain:.2} dB");
         assert!((rs_gain - c_gain).abs() < 0.5, "{bitrate} b/s: the mask raises the high band by {rs_gain:.2} dB, in libopus by {c_gain:.2} dB");
         assert!(level_plain.abs() < 0.5 && level_masked.abs() < 0.5, "{bitrate} b/s: high band against libopus {level_plain:+.2} dB without and {level_masked:+.2} dB with the mask");

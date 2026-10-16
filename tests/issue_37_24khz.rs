@@ -14,7 +14,7 @@
 //! libopus (which scores ~0.9 on the same signal).
 
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::TAU;
 
 const PRE_SKIP: usize = 312;
@@ -201,6 +201,6 @@ fn libopus_24k_packets_still_decode() {
     let best = libopus_enc_rust_dec(24_000, 1, 64_000);
     assert!(
         best > 0.85,
-        "opus-rs no longer decodes libopus 24 kHz packets: best corr {best:.2}"
+        "opus1 no longer decodes libopus 24 kHz packets: best corr {best:.2}"
     );
 }

@@ -35,7 +35,7 @@ fn out_of_phase_signal(frames: usize) -> Vec<f32> {
 /// of two opposite channels is close to zero, and the band is coded from
 /// rounding noise: its level is right, its content is not.
 ///
-/// Measured per bitrate: the signal-to-noise ratio of the opus-rs stream and
+/// Measured per bitrate: the signal-to-noise ratio of the opus1 stream and
 /// of the libopus stream, both decoded by libopus, from 3 to 12 kHz, where
 /// the encoder uses intensity stereo at these bitrates.
 ///
@@ -57,7 +57,7 @@ fn out_of_phase_stereo_keeps_its_high_bands() {
             let rs_snr = range_snr_db(&pcm, &rs, 2, channel, 10, &edges)[0];
             let c_snr = range_snr_db(&pcm, &c, 2, channel, 10, &edges)[0];
             println!(
-                "{bitrate} b/s, channel {channel}, 3 to 12 kHz: SNR opus-rs {rs_snr:.2} dB, \
+                "{bitrate} b/s, channel {channel}, 3 to 12 kHz: SNR opus1 {rs_snr:.2} dB, \
                  libopus {c_snr:.2} dB"
             );
             gap = gap.max(c_snr - rs_snr);

@@ -7,7 +7,7 @@
 //! unchecked indexing below `storage`, and `encode_icdf` read the caller's
 //! table with an unchecked symbol.
 
-use opus_rs::range_coder::{BITRES, RANGE_BUF_MAX, RangeCoder};
+use opus1::range_coder::{BITRES, RANGE_BUF_MAX, RangeCoder};
 
 /// Small deterministic pseudo-random generator.
 struct Lcg(u64);
@@ -139,7 +139,7 @@ fn tell_frac_inline_matches_tell_frac() {
     for rng_value in ranges {
         rc.rng = rng_value;
         rc.nbits_total = 33 + (rng.next() % 10_000) as i32;
-        let inline = opus_rs::tell_frac_inline!(rc);
+        let inline = opus1::tell_frac_inline!(rc);
         assert_eq!(inline, rc.tell_frac(), "rng {rng_value:#x}");
     }
 }
@@ -155,7 +155,7 @@ fn tell_frac_inline_stays_inside_its_table_for_any_range() {
         rc.rng = rng_value;
         let result = std::panic::catch_unwind(|| {
             let rc = rc.clone();
-            opus_rs::tell_frac_inline!(rc)
+            opus1::tell_frac_inline!(rc)
         });
         if cfg!(not(debug_assertions)) {
             assert!(result.is_ok(), "rng {rng_value:#x}");

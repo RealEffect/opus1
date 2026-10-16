@@ -2,11 +2,15 @@
 //!
 //! `FixedVec<T, N>` stores its elements in a `[core::mem::MaybeUninit<T>; N]` with a
 //! tracked length — no global allocator is required. It mirrors the subset of the
-//! `Vec` API used throughout opus-rs (`resize`, `push`, `truncate`, `len`,
-//! indexing, and `Deref<Target = [T]>` over the *initialized* range), so it can be
-//! dropped in as a heap-free replacement field-for-field.
+//! `Vec` API used throughout opus1 (`resize`, `push`, `truncate`, `len`,
+//! indexing, and `Deref<Target = [T]>` over the *initialized* range), so it can
+//! replace a `Vec` field for field without the heap.
 //!
-//! This is what lets opus-rs be `#![no_std]` with **no `alloc`** at all.
+//! Elements are never dropped, so the element type must not have a
+//! destructor; building a buffer of any other type fails to compile. The codec
+//! stores numbers, slices and plain structs of them.
+//!
+//! This is what lets opus1 be `#![no_std]` with **no `alloc`** at all.
 
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
@@ -21,6 +25,12 @@ impl<T, const N: usize> FixedVec<T, N> {
     /// The compile-time capacity (number of elements that can be stored).
     pub const CAPACITY: usize = N;
 
+    /// Evaluated by every constructor: the buffer never drops its elements.
+    const NO_DESTRUCTOR: () = assert!(
+        !core::mem::needs_drop::<T>(),
+        "FixedVec elements must not have a destructor"
+    );
+
     /// Whether `from_value` and `from_slice` fill the buffer through a
     /// separate call (see `init_from_value`). Below 1 kB the move of the
     /// result costs no more than a call, so the buffer is built inline.
@@ -29,6 +39,7 @@ impl<T, const N: usize> FixedVec<T, N> {
     /// Create an empty buffer. `const`-constructible so it can initialize `static`s
     /// and struct fields in `const` contexts.
     pub const fn new() -> Self {
+        let () = Self::NO_DESTRUCTOR;
         Self {
             len: 0,
             buf: [const { MaybeUninit::uninit() }; N],
@@ -77,6 +88,7 @@ impl<T, const N: usize> FixedVec<T, N> {
     where
         T: Clone,
     {
+        let () = Self::NO_DESTRUCTOR;
         // SAFETY: the caller guarantees that `this` is valid for writes. The
         // element array holds `MaybeUninit`, so a reference to it is valid
         // before any element is written.
@@ -138,6 +150,7 @@ impl<T, const N: usize> FixedVec<T, N> {
     where
         T: Clone,
     {
+        let () = Self::NO_DESTRUCTOR;
         // SAFETY: the caller guarantees that `this` is valid for writes; see
         // `init_from_value` for the reference to the element array.
         let buf = unsafe { &mut (*this).buf };
@@ -192,14 +205,14 @@ impl<T, const N: usize> FixedVec<T, N> {
     pub fn push(&mut self, value: T) {
         // `assert!` (not `debug_assert!`): in release builds a silent overflow
         // here would be out-of-bounds UB, e.g. `KissFftState::new(nfft)` with
-        // nfft > KISS_MAX_N (issue #27 deep-scan).
+        // nfft > KISS_MAX_N.
         assert!(self.len < N, "FixedVec push past capacity");
         self.buf[self.len].write(value);
         self.len += 1;
     }
 
     /// Resize the logical length. When growing, new slots are filled with clones of
-    /// `value`; when shrinking, dropped elements are properly dropped.
+    /// `value`.
     #[inline]
     pub fn resize(&mut self, new_len: usize, value: T)
     where
@@ -216,16 +229,7 @@ impl<T, const N: usize> FixedVec<T, N> {
 
     #[inline]
     pub fn truncate(&mut self, new_len: usize) {
-        if new_len < self.len {
-            let tail: *mut [T] = &mut self.as_mut_slice()[new_len..];
-            // The length is set first: if dropping an element panics, the
-            // buffer no longer claims the elements that were being dropped.
-            self.len = new_len;
-            // SAFETY: `tail` covers initialized elements that the buffer no
-            // longer owns after the length update. For a type without a
-            // destructor this is no code at all.
-            unsafe { core::ptr::drop_in_place(tail) };
-        }
+        self.len = self.len.min(new_len);
     }
 
     #[inline]
@@ -313,15 +317,6 @@ impl<T: Clone, const N: usize> Clone for FixedVec<T, N> {
     }
 }
 
-impl<T, const N: usize> Drop for FixedVec<T, N> {
-    #[inline]
-    fn drop(&mut self) {
-        // SAFETY: `buf[..len]` is initialized and is not used again. For a
-        // type without a destructor this is no code at all.
-        unsafe { core::ptr::drop_in_place(self.as_mut_slice() as *mut [T]) };
-    }
-}
-
 // `FixedVec<T, N>` is `Send` and `Sync` exactly when `T` is: its fields are a
 // `usize` and an array of `MaybeUninit<T>`, and the compiler derives both
 // traits from them. `auto_traits_follow_the_element_type` checks it.
@@ -332,38 +327,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    /// Counts clones and drops, to check that no element is lost or dropped
-    /// twice.
-    #[derive(Debug)]
-    struct Counted {
-        id: u32,
-        live: Rc<Cell<i32>>,
-    }
-
-    impl Counted {
-        fn new(id: u32, live: &Rc<Cell<i32>>) -> Self {
-            live.set(live.get() + 1);
-            Counted {
-                id,
-                live: live.clone(),
-            }
-        }
-    }
-
-    impl Clone for Counted {
-        fn clone(&self) -> Self {
-            Counted::new(self.id, &self.live)
-        }
-    }
-
-    impl Drop for Counted {
-        fn drop(&mut self) {
-            self.live.set(self.live.get() - 1);
-        }
-    }
-
-    /// `Send` and `Sync` come from the element type. They used to be two
-    /// `unsafe impl`s with the same bounds.
+    /// `Send` and `Sync` come from the element type.
     #[test]
     fn auto_traits_follow_the_element_type() {
         fn is_send<T: Send>() {}
@@ -483,55 +447,6 @@ mod tests {
         f.resize(5, 0);
     }
 
-    /// Every element that is created is dropped exactly once, for the inline
-    /// construction (small capacity) and for the one through a call.
-    #[test]
-    fn elements_with_destructors_are_dropped_once() {
-        fn run<const N: usize>() {
-            let live = Rc::new(Cell::new(0));
-            {
-                let seed: Vec<Counted> = (0..5).map(|i| Counted::new(i, &live)).collect();
-                assert_eq!(live.get(), 5);
-
-                let mut a = FixedVec::<Counted, N>::from_slice(&seed);
-                assert_eq!(live.get(), 10);
-                let b = a.clone();
-                assert_eq!(live.get(), 15);
-                assert_eq!(b.iter().map(|c| c.id).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
-
-                a.truncate(2);
-                assert_eq!(live.get(), 12);
-                // `resize` clones the value for each new slot and drops the
-                // value it was given.
-                a.resize(6, Counted::new(9, &live));
-                assert_eq!(live.get(), 16);
-                assert_eq!(
-                    a.iter().map(|c| c.id).collect::<Vec<_>>(),
-                    [0, 1, 9, 9, 9, 9]
-                );
-                a.resize(1, Counted::new(8, &live));
-                assert_eq!(live.get(), 11);
-                a.extend_from_slice(&seed[3..]);
-                assert_eq!(live.get(), 13);
-                a.push(Counted::new(7, &live));
-                assert_eq!(a.iter().map(|c| c.id).collect::<Vec<_>>(), [0, 3, 4, 7]);
-
-                let c = FixedVec::<Counted, N>::from_value(Counted::new(6, &live), 3);
-                assert_eq!(c.len(), 3);
-                assert_eq!(live.get(), 17);
-                a.clear();
-                assert_eq!(live.get(), 13);
-            }
-            assert_eq!(live.get(), 0, "capacity {N}");
-        }
-        // `Counted` is 16 bytes: 8 elements are built inline, 64 elements
-        // (1032 bytes with the length) through a call.
-        run::<8>();
-        run::<64>();
-        assert!(!FixedVec::<Counted, 8>::FILL_IN_PLACE);
-        assert!(FixedVec::<Counted, 64>::FILL_IN_PLACE);
-    }
-
     /// Linear congruential generator (Knuth's MMIX constants), high bits.
     struct Lcg(u64);
 
@@ -597,171 +512,5 @@ mod tests {
         // An array element: 6 bytes with 2-byte alignment.
         check::<[i16; 3], 11>(|r| [r as i16, (r >> 16) as i16, (r >> 32) as i16], &mut rng);
         check::<[i16; 3], 333>(|r| [r as i16, (r >> 16) as i16, (r >> 32) as i16], &mut rng);
-    }
-
-    /// An element whose `clone` panics on a chosen call.
-    struct PanicsOnClone {
-        live: Rc<Cell<i32>>,
-        clones_left: Rc<Cell<i32>>,
-    }
-
-    impl PanicsOnClone {
-        fn new(live: &Rc<Cell<i32>>, clones_left: &Rc<Cell<i32>>) -> Self {
-            live.set(live.get() + 1);
-            PanicsOnClone {
-                live: live.clone(),
-                clones_left: clones_left.clone(),
-            }
-        }
-    }
-
-    impl Clone for PanicsOnClone {
-        fn clone(&self) -> Self {
-            if self.clones_left.get() == 0 {
-                panic!("clone refused");
-            }
-            self.clones_left.set(self.clones_left.get() - 1);
-            PanicsOnClone::new(&self.live, &self.clones_left)
-        }
-    }
-
-    impl Drop for PanicsOnClone {
-        fn drop(&mut self) {
-            self.live.set(self.live.get() - 1);
-        }
-    }
-
-    /// When `clone` panics in the middle of a fill, no element is dropped
-    /// twice and no slot that was never written is dropped. The clones made
-    /// before the panic are not dropped at all (they leak), which is allowed.
-    /// The count of live elements shows both: a second drop of an element or
-    /// a drop of an unwritten slot would make it differ from the expected
-    /// number.
-    #[test]
-    fn panic_in_clone_drops_nothing_twice() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        fn run<const N: usize>() {
-            let live = Rc::new(Cell::new(0));
-            let clones_left = Rc::new(Cell::new(i32::MAX));
-            let seed: Vec<PanicsOnClone> = (0..6)
-                .map(|_| PanicsOnClone::new(&live, &clones_left))
-                .collect();
-            let mut leaked = 0;
-
-            // from_slice: the fourth clone panics, three clones leak.
-            clones_left.set(3);
-            let r = catch_unwind(AssertUnwindSafe(|| {
-                FixedVec::<PanicsOnClone, N>::from_slice(&seed)
-            }));
-            assert!(r.is_err());
-            leaked += 3;
-            assert_eq!(live.get(), 6 + leaked, "from_slice, capacity {N}");
-
-            // from_value: two clones are made, the third panics. The value
-            // that was passed in is dropped during the unwinding.
-            clones_left.set(i32::MAX);
-            let value = seed[0].clone();
-            clones_left.set(2);
-            let r = catch_unwind(AssertUnwindSafe(|| {
-                FixedVec::<PanicsOnClone, N>::from_value(value, 5)
-            }));
-            assert!(r.is_err());
-            leaked += 2;
-            assert_eq!(live.get(), 6 + leaked, "from_value, capacity {N}");
-
-            // A buffer that exists keeps its elements and its length.
-            clones_left.set(i32::MAX);
-            let mut a = FixedVec::<PanicsOnClone, N>::from_slice(&seed[..2]);
-            assert_eq!(live.get(), 6 + leaked + 2);
-
-            clones_left.set(1);
-            let r = catch_unwind(AssertUnwindSafe(|| a.extend_from_slice(&seed[..4])));
-            assert!(r.is_err());
-            leaked += 1;
-            assert_eq!(a.len(), 2, "extend_from_slice, capacity {N}");
-            assert_eq!(
-                live.get(),
-                6 + leaked + 2,
-                "extend_from_slice, capacity {N}"
-            );
-
-            clones_left.set(i32::MAX);
-            let value = seed[1].clone();
-            clones_left.set(2);
-            let r = catch_unwind(AssertUnwindSafe(|| a.resize(6, value)));
-            assert!(r.is_err());
-            leaked += 2;
-            assert_eq!(a.len(), 2, "resize, capacity {N}");
-            assert_eq!(live.get(), 6 + leaked + 2, "resize, capacity {N}");
-
-            clones_left.set(1);
-            let r = catch_unwind(AssertUnwindSafe(|| a.clone()));
-            assert!(r.is_err());
-            leaked += 1;
-            assert_eq!(live.get(), 6 + leaked + 2, "clone, capacity {N}");
-
-            drop(a);
-            assert_eq!(live.get(), 6 + leaked, "capacity {N}");
-            drop(seed);
-            assert_eq!(live.get(), leaked, "capacity {N}");
-        }
-        // `PanicsOnClone` is 16 bytes: 8 elements are built inline, 64
-        // through a call.
-        run::<8>();
-        run::<64>();
-        assert!(!FixedVec::<PanicsOnClone, 8>::FILL_IN_PLACE);
-        assert!(FixedVec::<PanicsOnClone, 64>::FILL_IN_PLACE);
-    }
-
-    /// An element that records its drop and panics in it if told to.
-    struct PanicsOnDrop {
-        id: usize,
-        panics: bool,
-        drops: Rc<std::cell::RefCell<Vec<u32>>>,
-    }
-
-    impl Drop for PanicsOnDrop {
-        fn drop(&mut self) {
-            self.drops.borrow_mut()[self.id] += 1;
-            if self.panics {
-                panic!("drop refused");
-            }
-        }
-    }
-
-    /// When the destructor of one element panics in `truncate`, the other
-    /// elements of the removed part are still dropped, each exactly once, and
-    /// the buffer does not drop any of them again later.
-    #[test]
-    fn panic_in_drop_during_truncate_drops_each_element_once() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        for panicking in 0..7usize {
-            for new_len in 0..=7usize {
-                let drops = Rc::new(std::cell::RefCell::new(vec![0u32; 7]));
-                let mut v = FixedVec::<PanicsOnDrop, 9>::new();
-                for id in 0..7 {
-                    v.push(PanicsOnDrop {
-                        id,
-                        panics: id == panicking,
-                        drops: drops.clone(),
-                    });
-                }
-                let r = catch_unwind(AssertUnwindSafe(|| v.truncate(new_len)));
-                assert_eq!(r.is_err(), panicking >= new_len);
-                assert_eq!(v.len(), new_len);
-                for id in 0..7 {
-                    let want = u32::from(id >= new_len);
-                    assert_eq!(drops.borrow()[id], want, "element {id} after truncate");
-                }
-                // Dropping the buffer drops what is left. The element that
-                // panics must not panic a second time here unless it is
-                // still in the buffer.
-                let r = catch_unwind(AssertUnwindSafe(move || drop(v)));
-                assert_eq!(r.is_err(), panicking < new_len);
-                assert!(drops.borrow().iter().all(|&n| n == 1));
-            }
-        }
     }
 }

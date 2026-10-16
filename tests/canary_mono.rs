@@ -1,4 +1,4 @@
-use opus_rs::{Application as RsApp, OpusDecoder as RsDec, OpusEncoder as RsEnc};
+use opus1::{Application as RsApp, OpusDecoder as RsDec, OpusEncoder as RsEnc};
 
 #[test]
 fn mono_impulse_48k_64k_finite_small_packet() {

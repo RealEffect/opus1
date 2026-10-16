@@ -2,7 +2,7 @@
 //!
 //! Each test encodes a signal with the C libopus multistream encoder and
 //! decodes the packets twice: with the C multistream decoder and with
-//! `opus_rs::multistream::MultistreamDecoder`. The helpers here build the
+//! `opus1::multistream::MultistreamDecoder`. The helpers here build the
 //! encoder, describe the layouts under test, and compare two decoded signals.
 //!
 //! Use with `mod ms_support; mod multistream_dec_common;`.
@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use crate::ms_support::*;
-use opus_rs::multistream::MultistreamDecoder;
+use opus1::multistream::MultistreamDecoder;
 
 /// Sampling rate of every encoder in these tests.
 pub const FS: i32 = 48_000;
@@ -113,12 +113,12 @@ impl Encoded {
         })
     }
 
-    /// A C decoder and an opus-rs decoder for these packets at `fs`.
+    /// A C decoder and an opus1 decoder for these packets at `fs`.
     pub fn decoders(&self, fs: i32) -> (CMsDecoder, MultistreamDecoder) {
         let c = CMsDecoder::new(fs, self.channels, self.streams, self.coupled, &self.mapping)
             .unwrap_or_else(|e| panic!("{}: C decoder: {e}", self.label));
         let r = MultistreamDecoder::with_layout(fs, self.channels, self.streams, self.coupled, &self.mapping)
-            .unwrap_or_else(|e| panic!("{}: opus-rs decoder: {e}", self.label));
+            .unwrap_or_else(|e| panic!("{}: opus1 decoder: {e}", self.label));
         (c, r)
     }
 }

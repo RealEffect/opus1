@@ -2,13 +2,13 @@
 //! same settings: 5.1 and 7.1 at 48 kHz with 20 ms frames, with surround
 //! masking, the LFE tuning and the forced modes all active.
 //!
-//! Both encoders code the same 2 seconds. A round times opus-rs and then
+//! Both encoders code the same 2 seconds. A round times opus1 and then
 //! libopus, or the other way round in every second round, so that a change
 //! in the load of the machine hits both alike. The smallest time over all
 //! rounds counts: it is the run that was disturbed least.
 //!
 //! Measured on an Apple M4 Pro (aarch64), libopus 1.6.1 from Homebrew,
-//! variable bitrate, microseconds per frame, opus-rs / libopus:
+//! variable bitrate, microseconds per frame, opus1 / libopus:
 //!
 //! - 5.1 at 256 kb/s, complexity 9: 124 / 272, ratio 0.46;
 //! - 5.1 at 96 kb/s, complexity 9: 92 / 241, ratio 0.38;
@@ -19,15 +19,15 @@
 //!
 //! A 20 ms frame of 7.1 thus takes 0.8 % of real time. The two encoders do
 //! not do the same work. From complexity 7 on libopus runs its analysis of
-//! speech against music in every stream, which opus-rs does not have; the
+//! speech against music in every stream, which opus1 does not have; the
 //! rows at complexity 6 are without it. The single-stream encoder of
-//! opus-rs also leaves out other steps of libopus (see the reports on the
+//! opus1 also leaves out other steps of libopus (see the reports on the
 //! CELT encoder). So the numbers say what a call costs, not that one
 //! implementation of the same steps is faster.
 //!
-//! The limit is what the name of the test says: opus-rs must not take
+//! The limit is what the name of the test says: opus1 must not take
 //! longer than libopus. Measured, it takes 0.38 to 0.54 times as long, so
-//! the limit is reached when opus-rs gets about twice as slow. Both
+//! the limit is reached when opus1 gets about twice as slow. Both
 //! encoders are timed in turns and the fastest round counts, so load on a
 //! shared machine moves the ratio little. The limit applies to optimized
 //! builds only.
@@ -40,7 +40,7 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
+use opus1::Application;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -51,7 +51,7 @@ const FRAME: usize = 960;
 const FRAMES: usize = 100;
 const ROUNDS: usize = 12;
 
-/// Codes the signal once with a new opus-rs encoder. Returns the time of
+/// Codes the signal once with a new opus1 encoder. Returns the time of
 /// the encode calls and the bytes written.
 fn time_rust(
     case: &Case,
@@ -92,7 +92,7 @@ fn time_c(
     (start.elapsed(), black_box(bytes))
 }
 
-/// Microseconds per frame of the fastest round: opus-rs, libopus.
+/// Microseconds per frame of the fastest round: opus1, libopus.
 fn measure_cost(case: &Case, bitrate: i32, complexity: i32) -> (f64, f64) {
     let pcm = program(FS, case, FRAMES * FRAME);
     let mut out = vec![0u8; max_packet_bytes(8)];
@@ -113,7 +113,7 @@ fn measure_cost(case: &Case, bitrate: i32, complexity: i32) -> (f64, f64) {
     }
     // Both did the work that was asked for: within 6 % of the request.
     let request = bitrate as f64 * FRAMES as f64 / 50.0 / 8.0;
-    for (who, bytes) in [("opus-rs", rust_bytes), ("libopus", c_bytes)] {
+    for (who, bytes) in [("opus1", rust_bytes), ("libopus", c_bytes)] {
         assert!(
             (bytes as f64 / request - 1.0).abs() < 0.06,
             "{}, {bitrate} b/s: {who} wrote {bytes} bytes, the request is {request:.0}",
@@ -140,7 +140,7 @@ fn one_encode_call_does_not_cost_more_than_in_libopus() {
         let (rust, c) = measure_cost(&case, bitrate, complexity);
         let label = format!("{} at {bitrate} b/s, complexity {complexity}", case.name);
         println!(
-            "{label}: opus-rs {rust:.0} us per frame, libopus {c:.0} us, ratio {:.2}; {:.2} % of \
+            "{label}: opus1 {rust:.0} us per frame, libopus {c:.0} us, ratio {:.2}; {:.2} % of \
              real time",
             rust / c,
             rust / 20_000.0 * 100.0
@@ -150,7 +150,7 @@ fn one_encode_call_does_not_cost_more_than_in_libopus() {
         }
         assert!(
             rust < c,
-            "{label}: opus-rs {rust:.0} us per frame, libopus {c:.0} us"
+            "{label}: opus1 {rust:.0} us per frame, libopus {c:.0} us"
         );
     }
 }

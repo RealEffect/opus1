@@ -1,4 +1,4 @@
-//! Report: the opus-rs CELT encoder against the CELT encoder of C libopus.
+//! Report: the opus1 CELT encoder against the CELT encoder of C libopus.
 //!
 //! Both encoders get the same samples and settings (`c_celt::Stream`), and
 //! C libopus decodes both streams. The table shows the signal-to-noise

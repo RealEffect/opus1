@@ -1,14 +1,14 @@
 //! Issue #27 checked against libopus (the `opus` dev-dependency).
 //!
-//! `issue_15_27_repro.rs` covers #27 with opus-rs on both ends of the wire,
+//! `issue_15_27_repro.rs` covers #27 with opus1 on both ends of the wire,
 //! which cannot see a bug the encoder and decoder share (the original part 2
 //! desync was found with the C decoder). These tests put libopus on one side:
 //!
-//! - libopus encodes 40/60 ms SILK packets and opus-rs decodes them at 48 kHz
+//! - libopus encodes 40/60 ms SILK packets and opus1 decodes them at 48 kHz
 //!   with a 120 ms output buffer — what a Discord voice receiver does. Every
 //!   20 ms window must match libopus's own decode of the same packets, so a
 //!   silent or garbled 2nd/3rd SILK frame fails on its own window.
-//! - opus-rs encodes 40 ms stereo SILK, and 20 ms SILK with in-band FEC, and
+//! - opus1 encodes 40 ms stereo SILK, and 20 ms SILK with in-band FEC, and
 //!   libopus decodes it: each window must track the input as well as plain
 //!   20 ms packets do, and libopus must recover lost frames from the LBRR
 //!   section.
@@ -17,7 +17,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -143,11 +143,11 @@ fn min(v: &[f64]) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Part 3: libopus-encoded multi-frame SILK -> opus-rs decoder at 48 kHz
+// Part 3: libopus-encoded multi-frame SILK -> opus1 decoder at 48 kHz
 // ---------------------------------------------------------------------------
 
 /// Encode ~1 s with libopus at `ms` frames, decode each packet with libopus
-/// and with opus-rs (48 kHz, 120 ms output buffer), and return opus-rs's
+/// and with opus1 (48 kHz, 120 ms output buffer), and return opus1's
 /// per-20 ms-window SNR against libopus.
 fn c_enc_rust_dec(ch: usize, ms: usize) -> Vec<f64> {
     let sr = 48000;
@@ -176,9 +176,9 @@ fn c_enc_rust_dec(ch: usize, ms: usize) -> Vec<f64> {
         let c_n = c_dec.decode_float(&pkt[..n], &mut c_buf, false).unwrap();
         let rs_n = rs_dec
             .decode(&pkt[..n], MAX_FRAME, &mut rs_buf)
-            .unwrap_or_else(|e| panic!("packet {p}: opus-rs decode failed: {e}"));
+            .unwrap_or_else(|e| panic!("packet {p}: opus1 decode failed: {e}"));
         assert_eq!(c_n, frame, "libopus decoded length");
-        assert_eq!(rs_n, frame, "packet {p}: opus-rs decoded length");
+        assert_eq!(rs_n, frame, "packet {p}: opus1 decoded length");
         c_pcm.extend_from_slice(&c_buf[..c_n * ch]);
         rs_pcm.extend_from_slice(&rs_buf[..rs_n * ch]);
     }
@@ -190,16 +190,16 @@ fn check_matches_libopus(ch: usize, ms: usize) {
     let snrs = c_enc_rust_dec(ch, ms);
     let worst = min(&snrs);
     println!(
-        "C enc {ms} ms {ch}ch -> opus-rs dec @48k: {} windows, worst {worst:.1} dB",
+        "C enc {ms} ms {ch}ch -> opus1 dec @48k: {} windows, worst {worst:.1} dB",
         snrs.len()
     );
     assert!(
         worst > MATCH_DB,
-        "{ms} ms {ch}ch: opus-rs output diverges from libopus; per-window SNR: {snrs:.1?}"
+        "{ms} ms {ch}ch: opus1 output diverges from libopus; per-window SNR: {snrs:.1?}"
     );
 }
 
-/// How closely opus-rs must match libopus when both decode the same packets.
+/// How closely opus1 must match libopus when both decode the same packets.
 /// Set with margin under the 20 ms baseline measured by
 /// `libopus_20ms_baseline_matches` below. A dropped or garbled SILK frame
 /// scores around 0 dB, far below this.
@@ -232,22 +232,22 @@ fn libopus_60ms_stereo_decodes_every_silk_frame() {
 }
 
 // ---------------------------------------------------------------------------
-// Parts 1 and 2: opus-rs-encoded SILK -> libopus decoder
+// Parts 1 and 2: opus1-encoded SILK -> libopus decoder
 // ---------------------------------------------------------------------------
 
-/// Per-window SNRs from one opus-rs-encoded stream decoded by libopus.
+/// Per-window SNRs from one opus1-encoded stream decoded by libopus.
 struct RustEncoded {
     /// Normal decode against the input (mid channel).
     normal: Vec<f64>,
     /// libopus `decode_fec` output (the previous packet recovered from LBRR)
     /// against the input; empty without FEC.
     lbrr: Vec<f64>,
-    /// opus-rs's own decode of the same packets against libopus's.
+    /// opus1's own decode of the same packets against libopus's.
     agreement: Vec<f64>,
 }
 
-/// Encode ~1 s with opus-rs at 16 kHz and `ms` frames, and decode it with
-/// libopus and with opus-rs. With `fec`, also decode every packet through a
+/// Encode ~1 s with opus1 at 16 kHz and `ms` frames, and decode it with
+/// libopus and with opus1. With `fec`, also decode every packet through a
 /// second libopus decoder with `fec = true`.
 fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
     let sr = 16000;
@@ -276,12 +276,12 @@ fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
                 frame,
                 &mut pkt,
             )
-            .unwrap_or_else(|e| panic!("packet {p}: opus-rs encode failed: {e}"));
+            .unwrap_or_else(|e| panic!("packet {p}: opus1 encode failed: {e}"));
         assert_silk_toc(&pkt[..n], ch, ms);
 
         let got = c_dec
             .decode_float(&pkt[..n], &mut buf, false)
-            .unwrap_or_else(|e| panic!("packet {p}: libopus rejected opus-rs packet: {e}"));
+            .unwrap_or_else(|e| panic!("packet {p}: libopus rejected opus1 packet: {e}"));
         assert_eq!(got, frame);
         pcm.extend_from_slice(&buf[..got * ch]);
 
@@ -313,7 +313,7 @@ fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
     }
 }
 
-/// Floor for opus-rs-encoded audio decoded by libopus, against the input.
+/// Floor for opus1-encoded audio decoded by libopus, against the input.
 /// SILK is not a waveform-matching codec, so this sits well below the
 /// codec-agreement bar: clean 20 ms packets score 5-8 dB here; a desynced
 /// frame scores around 0 dB or below.
@@ -321,16 +321,16 @@ const INPUT_FLOOR_DB: f64 = 3.0;
 
 /// Part 2a: a 40 ms stereo packet must decode in libopus as well as 20 ms
 /// packets do (the stereo header used to be written for frame 0 only).
-/// opus-rs rejects 60 ms at the encoder (`Invalid frame size`), so 40 ms is
+/// opus1 rejects 60 ms at the encoder (`Invalid frame size`), so 40 ms is
 /// the only multi-frame SILK packet it can produce.
 #[test]
-fn opus_rs_40ms_stereo_decodes_in_libopus() {
+fn opus1_40ms_stereo_decodes_in_libopus() {
     let base = rust_enc_c_dec(2, 20, false, true);
     let multi = rust_enc_c_dec(2, 40, false, true);
     let (base_worst, worst) = (min(&base.normal), min(&multi.normal));
     println!(
-        "opus-rs enc 40 ms stereo -> libopus dec: worst {worst:.1} dB \
-         (20 ms baseline {base_worst:.1} dB); opus-rs vs libopus {:.1} dB",
+        "opus1 enc 40 ms stereo -> libopus dec: worst {worst:.1} dB \
+         (20 ms baseline {base_worst:.1} dB); opus1 vs libopus {:.1} dB",
         min(&multi.agreement)
     );
     assert!(
@@ -379,14 +379,14 @@ fn check_fec_decodes_in_libopus(ch: usize, cbr: bool) {
         .filter(|s| **s > 2.0)
         .count();
     println!(
-        "opus-rs enc 20 ms {ch}ch + FEC({}) -> libopus: normal {worst:.1} dB \
+        "opus1 enc 20 ms {ch}ch + FEC({}) -> libopus: normal {worst:.1} dB \
          (no-FEC {plain_worst:.1} dB), LBRR median {lbrr_median:.1} dB, {above2}/{} windows > 2 dB",
         if cbr { "CBR" } else { "VBR" },
         fec.lbrr.len()
     );
     if cbr {
         // CBR + FEC is a squeezed regime: the LBRR section and the main frame
-        // share a fixed packet. Since opus-rs takes the LBRR bits out of the
+        // share a fixed packet. Since opus1 takes the LBRR bits out of the
         // frame target as libopus does (enc_API.c nBitsUsedLBRR, issue #51),
         // packets no longer bust into concealed frames, and the main frame
         // keeps its quality. Across input levels 0.90-1.10x, mono's worst
@@ -418,7 +418,7 @@ fn check_fec_decodes_in_libopus(ch: usize, cbr: bool) {
         // with gaps in stereo (11-16 of 50 packets carried it, 6-13 busted):
         // 0.5-2.1 dB, 7-23 windows. Mono measured 2.3-3.8 dB, 26-35
         // windows. libopus's own streams recover more, 5.1-6.2 dB with 41-44
-        // windows, from as many LBRR packets as opus-rs now codes (28-31),
+        // windows, from as many LBRR packets as opus1 now codes (28-31),
         // so the gap is in the LBRR payload, not the budget.
         let (median_floor, frac) = if ch == 1 { (1.8, 0.45) } else { (1.5, 0.40) };
         assert!(
@@ -436,7 +436,7 @@ fn check_fec_decodes_in_libopus(ch: usize, cbr: bool) {
             fec.lbrr
         );
         println!(
-            "opus-rs enc 20 ms {ch}ch + FEC(CBR) -> libopus: normal {worst:.1} dB \
+            "opus1 enc 20 ms {ch}ch + FEC(CBR) -> libopus: normal {worst:.1} dB \
              (no-FEC {plain_worst:.1} dB), LBRR median {lbrr_median:.1} dB, {above2}/{} \
              windows > 2 dB, agreement {:.1} dB",
             fec.lbrr.len(),
@@ -449,8 +449,8 @@ fn check_fec_decodes_in_libopus(ch: usize, cbr: bool) {
         "{ch}ch + FEC: normal decode desynced in libopus; per-window SNR: {:.1?}",
         fec.normal
     );
-    // Recovery floors, anchored below the measured opus-rs values with margin.
-    // opus-rs measures: VBR mono 4.0 median / 40 of 47 windows; stereo
+    // Recovery floors, anchored below the measured opus1 values with margin.
+    // opus1 measures: VBR mono 4.0 median / 40 of 47 windows; stereo
     // mid-only recovery behaves like libopus's own stereo FEC on equal
     // content (libopus L=R reference: median 0.6 dB).
     let (median_floor, frac) = if ch == 1 { (3.0, 0.70) } else { (1.0, 0.30) };
@@ -478,21 +478,21 @@ fn check_fec_decodes_in_libopus(ch: usize, cbr: bool) {
 }
 
 #[test]
-fn opus_rs_mono_fec_decodes_in_libopus() {
+fn opus1_mono_fec_decodes_in_libopus() {
     check_fec_decodes_in_libopus(1, false);
 }
 
 #[test]
-fn opus_rs_stereo_fec_decodes_in_libopus() {
+fn opus1_stereo_fec_decodes_in_libopus() {
     check_fec_decodes_in_libopus(2, false);
 }
 
 #[test]
-fn opus_rs_mono_fec_cbr_decodes_in_libopus() {
+fn opus1_mono_fec_cbr_decodes_in_libopus() {
     check_fec_decodes_in_libopus(1, true);
 }
 
 #[test]
-fn opus_rs_stereo_fec_cbr_decodes_in_libopus() {
+fn opus1_stereo_fec_cbr_decodes_in_libopus() {
     check_fec_decodes_in_libopus(2, true);
 }

@@ -1,11 +1,11 @@
-//! Robustness of the SILK encoder's packet functions, driven directly.
+//! Robustness of the SILK encoder, driven directly.
 //!
-//! `OpusEncoder` reaches only part of them: it never passes odd lengths.
-//! Here the functions are
-//! called the way `OpusEncoder` calls them, with settings that change at
-//! random between packets, in every packet duration and at every internal
-//! rate, into buffers from one byte up. Nothing may panic, and every packet
-//! that fits its buffer must be read to its end by the libopus decoder: the
+//! `OpusEncoder` reaches only part of it: it never passes odd lengths. Here
+//! `SilkEncoder` is called the way `OpusEncoder` calls it, with settings that
+//! change at random between packets, in every packet duration and at every
+//! internal rate, into buffers from one byte up. The packet functions below
+//! it get odd lengths and states. Nothing may panic, and every packet that
+//! fits its buffer must be read to its end by the libopus decoder: the
 //! decoder's final range is the encoder's.
 // `RangeCoder::finish` needs the `std` feature.
 #![cfg(feature = "std")]
@@ -13,20 +13,19 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::control_codec::{
-    SilkBandwidthControl, silk_control_audio_bandwidth, silk_control_encoder, silk_setup_lbrr,
+use opus1::range_coder::RangeCoder;
+use opus1::silk::control_codec::{
+    SilkBandwidthControl, silk_control_audio_bandwidth, silk_control_encoder,
 };
-use opus_rs::silk::decode_pulses::silk_decode_pulses;
-use opus_rs::silk::define::MAX_FRAMES_PER_PACKET;
-use opus_rs::silk::enc_api::{
-    silk_average_first_mono_frame, silk_downmix_stereo, silk_encode, silk_encode_prefill,
-    silk_encode_prefill_stereo, silk_encode_stereo_packet_to_mono, silk_prev_channels_internal,
+use opus1::silk::decode_pulses::silk_decode_pulses;
+use opus1::silk::enc_api::{
+    SilkControl, SilkEncoder, SilkInput, SilkPrefill, silk_average_first_mono_frame,
+    silk_downmix_stereo, silk_encode_packet, silk_encode_prefill,
 };
-use opus_rs::silk::encode_pulses::silk_encode_pulses;
-use opus_rs::silk::init_encoder::silk_init_encoder;
-use opus_rs::silk::resampler::SilkResampler;
-use opus_rs::silk::structs::SilkEncoderState;
+use opus1::silk::encode_pulses::silk_encode_pulses;
+use opus1::silk::init_encoder::silk_init_encoder;
+use opus1::silk::resampler::SilkResampler;
+use opus1::silk::structs::SilkEncoderState;
 
 const API_FS: usize = 48_000;
 
@@ -42,8 +41,8 @@ impl Rng {
     }
 }
 
-/// Two SILK encoders and the two input resamplers, used the way
-/// `OpusEncoder` uses them for SILK-only packets of 48 kHz stereo input.
+/// A SILK encoder for 48 kHz stereo input and the settings of its packets,
+/// used the way `OpusEncoder` uses it for SILK-only packets.
 struct Driver {
     fs_khz: i32,
     ms: i32,
@@ -51,9 +50,7 @@ struct Driver {
     complexity: i32,
     fec: bool,
     loss: i32,
-    mid: Box<SilkEncoderState>,
-    side: Box<SilkEncoderState>,
-    resamplers: [SilkResampler; 2],
+    silk: SilkEncoder,
 }
 
 struct Packet {
@@ -61,78 +58,24 @@ struct Packet {
     final_range: u32,
 }
 
+/// A restart before a packet: after CELT-only packets (`clear_all`) or for
+/// a rate switch.
+struct Restart<'a> {
+    clear_all: bool,
+    /// The 10 ms before the packet, interleaved stereo.
+    pcm: &'a [i16],
+}
+
 impl Driver {
     fn new(fs_khz: i32, ms: i32, bitrate: i32, complexity: i32) -> Self {
-        let mut d = Self {
+        Self {
             fs_khz,
             ms,
             bitrate,
             complexity,
             fec: false,
             loss: 0,
-            mid: Box::new(SilkEncoderState::default()),
-            side: Box::new(SilkEncoderState::default()),
-            resamplers: [SilkResampler::default(), SilkResampler::default()],
-        };
-        assert_eq!(silk_init_encoder(&mut d.mid, 0), 0);
-        assert_eq!(silk_init_encoder(&mut d.side, 0), 0);
-        d.control();
-        d.start_resamplers();
-        d
-    }
-
-    fn start_resamplers(&mut self) {
-        assert_eq!(self.resamplers[0].init_for_enc(API_FS as i32, self.fs_khz * 1000), 0);
-        self.resamplers[1] = self.resamplers[0].clone();
-    }
-
-    /// What `OpusEncoder` does when the rate, the packet size or the
-    /// complexity changes.
-    fn control(&mut self) {
-        for enc in [&mut self.mid, &mut self.side] {
-            assert_eq!(silk_control_encoder(enc, self.fs_khz, self.ms, self.bitrate, self.complexity), 0);
-            enc.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
-        }
-    }
-
-    /// The settings of every packet.
-    fn per_packet(&mut self) {
-        let coded = (self.fec && self.loss > 0) as i32;
-        for enc in [&mut self.mid, &mut self.side] {
-            enc.s_cmn.use_in_band_fec = self.fec as i32;
-            enc.s_cmn.packet_loss_perc = self.loss;
-            silk_setup_lbrr(enc, coded);
-        }
-    }
-
-    fn internal_len(&self, api_len: usize) -> usize {
-        api_len * self.fs_khz as usize * 1000 / API_FS
-    }
-
-    /// Restart the encoders and feed them 10 ms, as after CELT-only packets
-    /// (`clear_all`) or for a rate switch.
-    fn prefill(&mut self, pcm: &[i16], channels: usize, clear_all: bool, activity: i32) {
-        if clear_all {
-            *self.mid = SilkEncoderState::default();
-            *self.side = SilkEncoderState::default();
-        }
-        silk_init_encoder(&mut self.mid, 0);
-        silk_init_encoder(&mut self.side, 0);
-        self.control();
-        self.per_packet();
-        self.start_resamplers();
-        let n_api = API_FS / 100;
-        let n = self.internal_len(n_api);
-        let mut internal = [vec![0i16; n], vec![0i16; n]];
-        for c in 0..2 {
-            let channel: Vec<i16> = pcm[..2 * n_api].as_chunks::<2>().0.iter().map(|lr| lr[c]).collect();
-            assert_eq!(self.resamplers[c].process(&mut internal[c], &channel, n_api as i32), 0);
-        }
-        if channels == 2 {
-            let (l, r) = (&internal[0], &internal[1]);
-            silk_encode_prefill_stereo(&mut self.mid, &mut self.side, l, r, self.bitrate, activity);
-        } else {
-            silk_encode_prefill(&mut self.mid, &internal[0], activity);
+            silk: SilkEncoder::new(API_FS as i32, 2),
         }
     }
 
@@ -148,52 +91,38 @@ impl Driver {
         max_bits: i32,
         cbr: bool,
         activity: i32,
+        restart: Option<Restart<'_>>,
     ) -> Option<Packet> {
-        self.per_packet();
-        let frame = pcm.len() / 2;
-        let n = self.internal_len(frame);
-        let prev = silk_prev_channels_internal(&self.mid);
-        let mut rc = RangeCoder::new_encoder(buffer as u32);
-        let mut n_bytes = 0;
-        let ret = if channels == 2 {
-            if prev == 1 {
-                self.resamplers[1] = self.resamplers[0].clone();
-            }
-            let mut internal = [vec![0i16; n], vec![0i16; n]];
-            for c in 0..2 {
-                let channel: Vec<i16> = pcm.as_chunks::<2>().0.iter().map(|lr| lr[c]).collect();
-                assert_eq!(self.resamplers[c].process(&mut internal[c], &channel, frame as i32), 0);
-            }
-            silk_encode_stereo_packet_to_mono(
-                &mut self.mid,
-                &mut self.side,
-                &internal[0],
-                &internal[1],
-                n,
-                &mut rc,
-                &mut n_bytes,
-                self.bitrate,
-                max_bits,
-                cbr as i32,
-                activity,
-                to_mono,
-            )
-        } else {
-            let mut mono_api = vec![0i16; frame];
-            silk_downmix_stereo(pcm, &mut mono_api);
-            let mut mono = vec![0i16; n];
-            assert_eq!(self.resamplers[0].process(&mut mono, &mono_api, frame as i32), 0);
-            if prev == 2 {
-                let fl = self.mid.s_cmn.frame_length as usize;
-                let first_api = &mono_api[..fl * API_FS / (self.fs_khz as usize * 1000)];
-                silk_average_first_mono_frame(&mut self.resamplers[1], &mut mono[..fl], first_api);
-            }
-            silk_encode(&mut self.mid, &mono, n, &mut rc, &mut n_bytes, self.bitrate, max_bits, cbr as i32, activity)
+        // The rate asked for is the only one allowed: a change takes effect
+        // at once.
+        let mut ctl = SilkControl {
+            channels_internal: channels,
+            payload_size_ms: self.ms,
+            min_khz: self.fs_khz,
+            max_khz: self.fs_khz,
+            desired_khz: self.fs_khz,
+            bit_rate: self.bitrate,
+            max_bits,
+            use_cbr: cbr,
+            complexity: self.complexity,
+            packet_loss_perc: self.loss,
+            lbrr_coded: self.fec && self.loss > 0,
+            activity,
+            to_mono,
+            ..SilkControl::default()
         };
-        assert_eq!(ret, 0, "SILK error");
+        let prefill = restart.map(|r| {
+            if r.clear_all {
+                self.silk.reset();
+            }
+            SilkPrefill { rate_switch: !r.clear_all, input: Some(SilkInput::Int16(&r.pcm[..2 * API_FS / 100])) }
+        });
+        let mut rc = RangeCoder::new_encoder(buffer as u32);
+        self.silk.encode(&mut ctl, SilkInput::Int16(pcm), prefill, &mut rc).expect("SILK error");
         if rc.error != 0 || rc.tell() > 8 * buffer as i32 {
             return None;
         }
+        assert_eq!(ctl.internal_khz, self.fs_khz);
         let final_range = rc.rng;
         // SILK-only configurations: narrowband 0 to 3, mediumband 4 to 7,
         // wideband 8 to 11, each for 10, 20, 40 and 60 ms.
@@ -202,6 +131,17 @@ impl Driver {
         bytes.extend(rc.finish());
         Some(Packet { bytes, final_range })
     }
+}
+
+/// Two SILK channel states at `fs_khz`, set up for packets of `ms`.
+fn channels(fs_khz: i32, ms: i32) -> (Box<SilkEncoderState>, Box<SilkEncoderState>) {
+    let mut mid = Box::new(SilkEncoderState::default());
+    let mut side = Box::new(SilkEncoderState::default());
+    for enc in [&mut mid, &mut side] {
+        assert_eq!(silk_init_encoder(enc, 0), 0);
+        assert_eq!(silk_control_encoder(enc, fs_khz, ms, 24_000, 5), 0);
+    }
+    (mid, side)
 }
 
 /// 48 kHz stereo input for the walks: speech in several shapes.
@@ -262,19 +202,9 @@ fn every_packet_of_a_random_walk_is_valid_for_the_libopus_decoder() {
                             _ => 6_000 + rng.below(60_000) as i32,
                         }
                     }
-                    2 => {
-                        d.ms = rng.pick(&[10, 20, 40, 60]);
-                        d.control();
-                    }
-                    3 => {
-                        d.fs_khz = rng.pick(&[8, 12, 16]);
-                        d.control();
-                        d.start_resamplers();
-                    }
-                    4 => {
-                        d.complexity = rng.below(11) as i32;
-                        d.control();
-                    }
+                    2 => d.ms = rng.pick(&[10, 20, 40, 60]),
+                    3 => d.fs_khz = rng.pick(&[8, 12, 16]),
+                    4 => d.complexity = rng.below(11) as i32,
                     5 | 6 => d.fec = !d.fec,
                     7 => d.loss = rng.pick(&[0, 1, 5, 10, 25, 60, 100]),
                     8 | 9 => want = 3 - want,
@@ -286,10 +216,7 @@ fn every_packet_of_a_random_walk_is_valid_for_the_libopus_decoder() {
             if pos + frame + API_FS / 100 > pcm.len() / 2 {
                 pos = 0;
             }
-            if rng.chance(6) {
-                let clear_all = rng.chance(50);
-                d.prefill(&pcm[2 * pos..], want, clear_all, rng.below(2) as i32);
-            }
+            let restart = rng.chance(6).then(|| Restart { clear_all: rng.chance(50), pcm: &pcm[2 * pos..] });
             // libopus's rule for the change to one channel
             // (opus_encoder.c:1560-1571), broken now and then.
             let mut channels = want;
@@ -315,7 +242,8 @@ fn every_packet_of_a_random_walk_is_valid_for_the_libopus_decoder() {
                  fec {} at {} %, cbr {cbr}, buffer {buffer}, max_bits {max_bits}, complexity {}",
                 d.fs_khz, d.ms, d.bitrate, d.fec, d.loss, d.complexity
             );
-            let packet = d.encode(chunk, channels, to_mono, buffer, max_bits, cbr, rng.below(8).min(1) as i32);
+            let activity = rng.below(8).min(1) as i32;
+            let packet = d.encode(chunk, channels, to_mono, buffer, max_bits, cbr, activity, restart);
             prev_stream_channels = channels;
             packets += 1;
             one_channel += (channels == 1) as usize;
@@ -400,46 +328,56 @@ fn the_pulse_coder_takes_any_length() {
 fn calls_that_make_no_sense_do_not_panic() {
     let pcm = vec![1000i16; 4000];
     let mut rc = RangeCoder::new_encoder(1275);
-    let mut n_bytes = 0;
 
     // Not set up.
     let mut mid = Box::new(SilkEncoderState::default());
     let mut side = Box::new(SilkEncoderState::default());
-    assert!(silk_encode(&mut mid, &pcm, 320, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1) < 0);
-    assert!(
-        silk_encode_stereo_packet_to_mono(&mut mid, &mut side, &pcm, &pcm, 320, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1, true)
-            < 0
-    );
-    silk_encode_prefill(&mut mid, &pcm, 1);
-    silk_encode_prefill_stereo(&mut mid, &mut side, &pcm, &pcm, 20_000, 1);
+    assert!(silk_encode_packet(&mut mid, None, [&pcm, &[]], &mut rc, 20_000, 8000, false, 1, false) < 0);
+    assert!(silk_encode_packet(&mut mid, Some(&mut side), [&pcm, &pcm], &mut rc, 20_000, 8000, false, 1, true) < 0);
+    silk_encode_prefill(&mut mid, None, [&pcm, &[]], 20_000, 1);
+    silk_encode_prefill(&mut mid, Some(&mut side), [&pcm, &pcm], 20_000, 1);
 
     // Set up, with too little input.
-    let mut d = Driver::new(16, 40, 24_000, 5);
+    let (mut mid, mut side) = channels(16, 40);
     for n in [0usize, 1, 319, 320, 639] {
-        assert!(silk_encode(&mut d.mid, &pcm[..n], n, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1) < 0);
-        assert!(silk_encode(&mut d.mid, &pcm[..n], 640, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1) < 0);
-        assert!(silk_encode(&mut d.mid, &pcm, n, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1) < 0);
-        let (mid, side) = (&mut d.mid, &mut d.side);
-        assert!(
-            silk_encode_stereo_packet_to_mono(mid, side, &pcm[..n], &pcm, 640, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1, false)
-                < 0
-        );
-        silk_encode_prefill(&mut d.mid, &pcm[..n.min(159)], 1);
-        silk_encode_prefill_stereo(&mut d.mid, &mut d.side, &pcm[..n.min(159)], &pcm, 20_000, 1);
+        assert!(silk_encode_packet(&mut mid, None, [&pcm[..n], &[]], &mut rc, 20_000, 8000, false, 1, false) < 0);
+        assert!(silk_encode_packet(&mut mid, Some(&mut side), [&pcm[..n], &pcm], &mut rc, 20_000, 8000, false, 1, false) < 0);
+        assert!(silk_encode_packet(&mut mid, Some(&mut side), [&pcm, &pcm[..n]], &mut rc, 20_000, 8000, false, 1, false) < 0);
+        silk_encode_prefill(&mut mid, None, [&pcm[..n.min(159)], &[]], 20_000, 1);
+        silk_encode_prefill(&mut mid, Some(&mut side), [&pcm[..n.min(159)], &pcm], 20_000, 1);
     }
     // With more than a packet: the packet is coded.
-    for n in [640usize, 641, 4000, usize::MAX] {
+    let (mut mid, _) = channels(16, 40);
+    for n in [640usize, 641, 4000] {
         let mut rc = RangeCoder::new_encoder(1275);
-        assert_eq!(silk_encode(&mut d.mid, &pcm, n, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1), 0, "{n} samples");
+        assert_eq!(silk_encode_packet(&mut mid, None, [&pcm[..n], &[]], &mut rc, 20_000, 8000, false, 1, false), 0, "{n} samples");
     }
     // A side encoder at another rate than the mid.
-    let mut d = Driver::new(16, 20, 24_000, 5);
-    let (mid, side) = (&mut d.mid, &mut d.side);
-    assert_eq!(silk_encode_stereo_packet_to_mono(mid, side, &pcm, &pcm, 320, &mut rc, &mut n_bytes, 30_000, 8000, 0, 1, false), 0);
-    assert_eq!(silk_control_encoder(&mut d.side, 8, 20, 20_000, 5), 0);
-    let (mid, side) = (&mut d.mid, &mut d.side);
-    assert!(silk_encode_stereo_packet_to_mono(mid, side, &pcm, &pcm, 320, &mut rc, &mut n_bytes, 30_000, 8000, 0, 1, false) < 0);
-    silk_encode_prefill_stereo(&mut d.mid, &mut d.side, &pcm, &pcm, 20_000, 1);
+    let (mut mid, mut side) = channels(16, 20);
+    assert_eq!(silk_encode_packet(&mut mid, Some(&mut side), [&pcm, &pcm], &mut rc, 30_000, 8000, false, 1, false), 0);
+    assert_eq!(silk_control_encoder(&mut side, 8, 20, 20_000, 5), 0);
+    assert!(silk_encode_packet(&mut mid, Some(&mut side), [&pcm, &pcm], &mut rc, 30_000, 8000, false, 1, false) < 0);
+    silk_encode_prefill(&mut mid, Some(&mut side), [&pcm, &pcm], 20_000, 1);
+
+    // The whole encoder with input longer than a packet, and with input
+    // that is not a whole number of milliseconds.
+    for n in [2 * 2881usize, 10, 0] {
+        let mut silk = SilkEncoder::new(48_000, 2);
+        let mut ctl = SilkControl {
+            channels_internal: 2,
+            payload_size_ms: 20,
+            min_khz: 16,
+            max_khz: 16,
+            desired_khz: 16,
+            bit_rate: 30_000,
+            max_bits: 8000,
+            complexity: 5,
+            activity: 1,
+            ..SilkControl::default()
+        };
+        let input = vec![1000i16; n];
+        assert!(silk.encode(&mut ctl, SilkInput::Int16(&input), None, &mut rc).is_err(), "{n} samples");
+    }
 
     // The downmix and the average of the first mono frame with odd lengths.
     for (n_in, n_out) in [(0usize, 0usize), (1, 1), (7, 9), (960, 0), (0, 960), (961, 480), (4000, 4000)] {
@@ -456,12 +394,11 @@ fn calls_that_make_no_sense_do_not_panic() {
 /// A rate that SILK does not have and a packet duration that it does not
 /// have are refused, and the encoder stays as it was. libopus refuses them
 /// in silk/check_control_input.c and silk_setup_fs (silk/control_codec.c).
-/// opus-rs set the encoder up for them: for one subframe per frame, or for
+/// opus1 set the encoder up for them: for one subframe per frame, or for
 /// frames longer than its buffers.
 #[test]
 fn settings_that_libopus_refuses_leave_the_encoder_as_it_was() {
     let pcm = vec![1000i16; 4000];
-    let mut n_bytes = 0;
     let refused = [(0, 20), (24, 20), (-8, 20), (16, 0), (16, 5), (16, 30), (16, 100), (16, -20), (i32::MAX, i32::MAX)];
     for (fs_khz, ms) in refused {
         let mut enc = Box::new(SilkEncoderState::default());
@@ -469,14 +406,14 @@ fn settings_that_libopus_refuses_leave_the_encoder_as_it_was() {
         // A new encoder stays unusable.
         assert!(silk_control_encoder(&mut enc, fs_khz, ms, 20_000, 5) < 0, "{fs_khz} kHz, {ms} ms");
         let mut rc = RangeCoder::new_encoder(1275);
-        assert!(silk_encode(&mut enc, &pcm, 320, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1) < 0);
+        assert!(silk_encode_packet(&mut enc, None, [&pcm, &[]], &mut rc, 20_000, 8000, false, 1, false) < 0);
         // A running one keeps its settings.
         assert_eq!(silk_control_encoder(&mut enc, 16, 20, 20_000, 5), 0);
         assert!(silk_control_encoder(&mut enc, fs_khz, ms, 20_000, 9) < 0, "{fs_khz} kHz, {ms} ms");
         let cmn = &enc.s_cmn;
         assert_eq!((cmn.fs_khz, cmn.packet_size_ms, cmn.frame_length, cmn.nb_subfr, cmn.complexity), (16, 20, 320, 4, 5));
         let mut rc = RangeCoder::new_encoder(1275);
-        assert_eq!(silk_encode(&mut enc, &pcm, 320, &mut rc, &mut n_bytes, 20_000, 8000, 0, 1), 0);
+        assert_eq!(silk_encode_packet(&mut enc, None, [&pcm, &[]], &mut rc, 20_000, 8000, false, 1, false), 0);
     }
     // Every pair that libopus accepts is accepted.
     for fs_khz in [8, 12, 16] {
@@ -493,14 +430,13 @@ fn settings_that_libopus_refuses_leave_the_encoder_as_it_was() {
 /// overflow nothing and divide by nothing.
 ///
 /// libopus computes with them in 32 bits and wraps. In a build with overflow
-/// checks (`cargo test` without `--release`) opus-rs stopped with a panic on
+/// checks (`cargo test` without `--release`) opus1 stopped with a panic on
 /// the first product, and in every build the rate switch state machine
 /// divided by zero for a packet duration of -5 ms.
 #[test]
 fn extreme_rates_and_limits_do_not_overflow() {
     let pcm = vec![1000i16; 4000];
     let ramp: Vec<i16> = (0..4000).map(|i| (i * 37 % 20_000 - 10_000) as i16).collect();
-    let mut n_bytes = 0;
     for complexity in [i32::MIN, -1, 11, 1000, i32::MAX] {
         for bitrate in [i32::MIN, -1, 0, 1, i32::MAX] {
             let mut enc = Box::new(SilkEncoderState::default());
@@ -508,19 +444,17 @@ fn extreme_rates_and_limits_do_not_overflow() {
             assert_eq!(silk_control_encoder(&mut enc, 12, 60, bitrate, complexity), 0);
             for max_bits in [i32::MIN, 0, i32::MAX] {
                 let mut rc = RangeCoder::new_encoder(1275);
-                assert_eq!(silk_encode(&mut enc, &pcm, 720, &mut rc, &mut n_bytes, bitrate, max_bits, 1, 1), 0);
+                assert_eq!(silk_encode_packet(&mut enc, None, [&pcm, &[]], &mut rc, bitrate, max_bits, true, 1, false), 0);
             }
             // The same with two channels.
             let mut side = Box::new(SilkEncoderState::default());
             silk_init_encoder(&mut side, 0);
             for max_bits in [i32::MIN, 0, i32::MAX] {
                 let mut rc = RangeCoder::new_encoder(1275);
-                let ret = silk_encode_stereo_packet_to_mono(
-                    &mut enc, &mut side, &pcm, &ramp, 720, &mut rc, &mut n_bytes, bitrate, max_bits, 1, 1, false,
-                );
+                let ret = silk_encode_packet(&mut enc, Some(&mut side), [&pcm, &ramp], &mut rc, bitrate, max_bits, true, 1, false);
                 assert_eq!(ret, 0);
             }
-            silk_encode_prefill_stereo(&mut enc, &mut side, &pcm, &ramp, bitrate, 1);
+            silk_encode_prefill(&mut enc, Some(&mut side), [&pcm, &ramp], bitrate, 1);
         }
     }
 

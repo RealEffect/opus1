@@ -1,4 +1,4 @@
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 fn make_sine(
     freq: f64,

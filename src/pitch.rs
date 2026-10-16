@@ -176,12 +176,9 @@ pub fn dual_inner_prod(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32
 }
 
 pub fn pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
-    // Every lag window reads y[i..i+len]; the SIMD kernels peek up to 3
-    // elements past the window. The combined contract is
-    // y.len() >= len + max_pitch - 1; clamp so that direct callers with a
-    // short `y` degrade gracefully instead of reading past the slice
-    // (issue #27 deep scan). In-repo callers always satisfy the contract and
-    // are unaffected.
+    // Lag `i` reads y[i..i + len], so `y` must hold len + max_pitch - 1
+    // samples. With a shorter `y`, only the lags it holds are computed. The
+    // callers in the codec always pass a long enough `y`.
     let max_pitch = if len > 0 {
         max_pitch.min((y.len() + 1).saturating_sub(len))
     } else {
@@ -1245,10 +1242,9 @@ fn window_energy_plus_one(y: &[f32]) -> f32 {
 /// Their lanes are added pairwise, 1.0 is added to that, and the last
 /// `len % 8` squares follow one by one.
 ///
-/// This code used to sit inside `find_best_pitch`, which does not enable AVX.
-/// Every intrinsic was then a call to a separate function. Here it is
-/// compiled with AVX enabled, so the intrinsics become single instructions.
-/// The operations and their order are the same.
+/// It is a separate function so that it can be compiled with AVX enabled:
+/// in `find_best_pitch`, which does not enable AVX, every intrinsic would be
+/// a call to a separate function.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 fn window_energy_plus_one_avx(y: &[f32]) -> f32 {
@@ -1491,9 +1487,9 @@ const MAX_DOUBLING_CANDS: usize = 14;
 /// the products of `target` with the signal `t1` and `t1b` samples earlier.
 ///
 /// On aarch64 all of them (up to 30) are computed eight at a time. Each has
-/// the same bits as the separate call it replaces. Other targets make the
-/// same calls as before, because their kernels for one product and for a
-/// pair of products round differently.
+/// the same bits as a separate call of `inner_prod` or `dual_inner_prod`.
+/// Other targets make those separate calls, because their kernels for one
+/// product and for a pair of products round differently.
 fn doubling_products(
     x: &[f32],
     max_period: usize,
@@ -1782,6 +1778,7 @@ pub(crate) mod tests {
         acc
     }
 
+    #[cfg(target_arch = "aarch64")]
     /// One lag in the four-lane order of `inner_prod_neon`, written as plainly
     /// as possible: fused additions in the lanes, then (s0 + s1) + (s2 + s3),
     /// then the last `n % 4` products with a separate multiply and add.
@@ -1830,9 +1827,9 @@ pub(crate) mod tests {
     mod neon {
         use super::*;
 
-        /// The kernel `pitch_xcorr` used before `xcorr_by_sample_neon`: four
-        /// lags per pass with one running sum. Kept here unchanged, as proof
-        /// that the new kernel gives the same bits.
+        /// The reference for `xcorr_by_sample_neon`: four lags per pass
+        /// with one running sum. The tests require that
+        /// `xcorr_by_sample_neon` gives the same bits.
         #[allow(unsafe_op_in_unsafe_fn)]
         unsafe fn xcorr_kernel_neon_old(x: &[f32], y: &[f32], sum: &mut [f32; 4], mut len: usize) {
             use core::arch::aarch64::*;

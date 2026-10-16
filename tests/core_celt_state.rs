@@ -2,7 +2,7 @@
 //! (opus_encoder.c): what it is told before every frame, and how it starts
 //! again when the mode changes.
 //!
-//! The CELT layer of opus-rs does not code the same bytes as libopus (its
+//! The CELT layer of opus1 does not code the same bytes as libopus (its
 //! band shapes differ), but the first flags of a CELT frame are decided
 //! the same way. These tests read them from the packets of both encoders:
 //! the silence flag, the pitch post-filter flag, the transient flag and the
@@ -14,8 +14,8 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech, to_stereo};
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::{Application, ForcedMode, OpusEncoder};
+use opus1::range_coder::RangeCoder;
+use opus1::{Application, ForcedMode, OpusEncoder};
 
 /// The first flags of a CELT-only frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +74,7 @@ fn signal(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
 }
 
 /// A CELT-only stream from both encoders at complexity 10, with `setup`
-/// applied to each. Returns the flags of every packet, opus-rs and libopus.
+/// applied to each. Returns the flags of every packet, opus1 and libopus.
 fn celt_flags(
     rate: usize,
     channels: usize,
@@ -103,7 +103,7 @@ fn celt_flags(
 /// `OPUS_SET_PREDICTION_DISABLED`: libopus sets `CELT_SET_PREDICTION(0)`
 /// before every CELT frame (opus_encoder.c:2288-2294). Every frame is then
 /// coded without the pitch post-filter and with intra coarse energy, so
-/// that a decoder can start with any packet. Before opus-rs passed the
+/// that a decoder can start with any packet. Before opus1 passed the
 /// setting on, its frames used the post-filter and inter energy like
 /// those of a stream with prediction.
 #[test]
@@ -124,7 +124,7 @@ fn prediction_disabled_codes_every_celt_frame_alone_like_libopus() {
 /// `OPUS_SET_PACKET_LOSS_PERC` goes to the CELT encoder too
 /// (opus_encoder.c:2979-2989). Above 8 % loss the CELT encoder turns the
 /// pitch pre-filter off (celt_encoder.c `run_prefilter`). Without the
-/// setting, opus-rs used the post-filter in these frames as it does
+/// setting, opus1 used the post-filter in these frames as it does
 /// without loss.
 #[test]
 fn packet_loss_turns_the_celt_pitch_filter_off_like_libopus() {
@@ -169,7 +169,7 @@ fn celt_after_silk_starts_afresh_without_prediction_like_libopus() {
             // 300 ms of SILK-only, then 100 ms of 5 ms CELT-only frames.
             c_enc.force_mode(MODE_SILK).bandwidth(BW_WB);
             enc.set_force_mode(Some(ForcedMode::SilkOnly));
-            enc.set_bandwidth(opus_rs::Bandwidth::Wideband);
+            enc.set_bandwidth(opus1::Bandwidth::Wideband);
             for _ in 0..15 {
                 let input = &pcm[at * channels..(at + long) * channels];
                 at += long;

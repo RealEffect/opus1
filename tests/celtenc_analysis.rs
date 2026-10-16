@@ -65,7 +65,7 @@ fn compare_all() -> Vec<(String, Agreement)> {
         .collect()
 }
 
-/// libopus `dynalloc_analysis`, which opus-rs had in a simplified form:
+/// libopus `dynalloc_analysis`, which opus1 had in a simplified form:
 /// - it runs before the coarse energy is quantized, so the 2.5 ms rule
 ///   compares with the energies of the frame before, not of this one;
 /// - `last` carries over from the first channel to the second;
@@ -83,7 +83,7 @@ fn dynamic_allocation_and_spreading_follow_libopus() {
     for (label, a) in compare_all() {
         assert!(a.at_least(a.spread, 97), "{label}: spread {} of {}", a.spread, a.frames);
         // The boosts come from the band energies, which differ slightly
-        // where the MDCT of opus-rs rounds differently (src/mdct.rs,
+        // where the MDCT of opus1 rounds differently (src/mdct.rs,
         // src/kiss_fft.rs). With the rounding of libopus there, at least
         // 95 % of the frames are the same.
         assert!(a.at_least(a.boost, 80), "{label}: boost {} of {}", a.boost, a.frames);
@@ -111,7 +111,7 @@ fn soft_bursts(seconds: usize, attack_ms: f64) -> Vec<f32> {
 /// libopus looks once more for a transient after the band energies are
 /// known: a frame whose energies are on average more than 6 dB above
 /// those of the frame before is coded with short blocks
-/// (`patch_transient_decision`, celt_encoder.c 2215-2232). opus-rs had only
+/// (`patch_transient_decision`, celt_encoder.c 2215-2232). opus1 had only
 /// the time-domain analysis, which misses an attack spread over several
 /// milliseconds.
 #[test]
@@ -132,7 +132,7 @@ fn energy_jumps_make_a_transient() {
             let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
             println!(
                 "attack {attack_ms} ms, complexity {complexity}: transient in {} frames \
-                 (libopus {}), same flag in {} of {}; opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+                 (libopus {}), same flag in {} of {}; opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
                 count(&rs),
                 count(&c),
                 a.transient,
@@ -148,7 +148,7 @@ fn energy_jumps_make_a_transient() {
 /// (`lastCodedBands`): bands below it are kept with a lower threshold, so
 /// that they do not drop in and out from frame to frame. That number moves
 /// by at most one band per frame (celt_encoder.c 2620-2633). The allocator
-/// may keep bands up to `end - 1` (`signalBandwidth`). opus-rs gave it 0
+/// may keep bands up to `end - 1` (`signalBandwidth`). opus1 gave it 0
 /// and 20 instead. On noise the bands at the top then dropped out in some
 /// frames, and the noise bursts below came out 1.4 dB worse than from
 /// libopus.
@@ -169,15 +169,15 @@ fn coded_bands_follow_libopus() {
     let (c, rs) = (st.enc_c(&pcm), st.enc_rs(&pcm));
     let a = st.agreement(&c, &rs);
     let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
-    println!("noise bursts: {a:?}, opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB");
+    println!("noise bursts: {a:?}, opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB");
     assert!(a.at_least(a.coded_bands, 97), "{a:?}");
     assert!(snr_rs > snr_c - 0.2, "{snr_rs:.2} dB against {snr_c:.2} dB");
 }
 
 /// libopus takes the logarithm of a band energy as it is (`amp2Log2`): an
 /// empty band, whose energy is the square root of 1e-27, gets about -45.
-/// opus-rs raised the energy to 1e-10 first (-33). At 16 kHz the bands above
-/// 8 kHz are empty, so opus-rs spent bits on coding a level that libopus
+/// opus1 raised the energy to 1e-10 first (-33). At 16 kHz the bands above
+/// 8 kHz are empty, so opus1 spent bits on coding a level that libopus
 /// does not code, and lost up to 3 dB with 2.5 ms frames.
 #[test]
 fn empty_bands_have_the_energy_of_libopus() {
@@ -190,7 +190,7 @@ fn empty_bands_have_the_energy_of_libopus() {
         let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
         println!(
             "{} ms, {bitrate} b/s: coarse energy the same in {} of {} frames; \
-             opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             frame_ms_x2 as f32 / 2.0,
             a.coarse,
             a.frames
@@ -210,7 +210,7 @@ fn vbr_streams(channels: usize) -> Vec<(String, Stream, Vec<f32>)> {
 
 /// libopus raises the VBR target of a frame whose spectrum is above a slow
 /// average of the spectra before it, and lowers it below (temporal VBR,
-/// celt_encoder.c 2189-2206 and `compute_vbr`). opus-rs passed 0, so its
+/// celt_encoder.c 2189-2206 and `compute_vbr`). opus1 passed 0, so its
 /// packets had the size of libopus in about half or less of the frames.
 #[test]
 fn vbr_follows_the_spectral_level() {
@@ -221,7 +221,7 @@ fn vbr_follows_the_spectral_level() {
         let bytes = |p: &[Vec<u8>]| p.iter().map(|x| x.len()).sum::<usize>() as f64 / p.len() as f64;
         println!(
             "{label}: same size in {} of {} frames, {:.1} bytes (libopus {:.1}); \
-             opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             a.size,
             a.frames,
             bytes(&rs),
@@ -235,7 +235,7 @@ fn vbr_follows_the_spectral_level() {
 /// (celt_encoder.c 1606-1700 and 2427-2534):
 /// - the target goes by the rate the allocation goes by (`equiv_rate`),
 ///   not by the bitrate setting;
-/// - the noise-floor limit (`maxDepth`) applies to every frame; opus-rs
+/// - the noise-floor limit (`maxDepth`) applies to every frame; opus1
 ///   skipped it when the loudest band was less than 1 above its floor;
 /// - a stereo saving below 0.1 raises the target;
 /// - the drift of the target is updated with the float arithmetic of
@@ -257,7 +257,7 @@ fn vbr_target_follows_libopus() {
 /// libopus estimates from frame to frame how many bits mid/side coding
 /// saves (`st->stereo_saving`): the estimate may rise by 0.25 per frame and
 /// the VBR target goes down by up to 1.0 of it (alloc_trim_analysis,
-/// compute_vbr). opus-rs started from 0 in every frame, so the estimate
+/// compute_vbr). opus1 started from 0 in every frame, so the estimate
 /// never got above 0.25, and a stereo signal with two similar channels got
 /// more bits than from libopus.
 #[test]
@@ -277,7 +277,7 @@ fn stereo_saving_builds_up_over_frames() {
         let a = st.agreement(&c, &rs);
         println!(
             "{:.1} bytes per frame, libopus {:.1}; same size in {} of {}; \
-             opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             bytes(&rs),
             bytes(&c),
             a.size,
@@ -291,7 +291,7 @@ fn stereo_saving_builds_up_over_frames() {
 /// libopus leans the coarse energy of a band towards what its quantizer
 /// left over in the frame before, when the energy of the band changed by
 /// less than 2 (12 dB): "a constant offset is better than fluctuations"
-/// (celt_encoder.c 2283-2297, `energyError`). opus-rs did not, and wrote
+/// (celt_encoder.c 2283-2297, `energyError`). opus1 did not, and wrote
 /// other coarse energy steps than libopus in about half of the frames.
 #[test]
 fn coarse_energy_leans_towards_the_last_error() {
@@ -307,10 +307,10 @@ fn coarse_energy_leans_towards_the_last_error() {
 
 /// libopus `transient_analysis` sums a table of about 6*64/x over the
 /// energy envelope of each channel (`inv_table`, celt_encoder.c 288-297).
-/// opus-rs had five entries of that table one too low: 71, 72, 83, 84 and
+/// opus1 had five entries of that table one too low: 71, 72, 83, 84 and
 /// 109. The sum decides the transient flag, `tf_estimate`, and which
 /// channel of a stereo frame the time-frequency analysis looks at
-/// (`tf_chan`). On this stereo speech, the wrong table made opus-rs look
+/// (`tf_chan`). On this stereo speech, the wrong table made opus1 look
 /// at the other channel in 49 of 300 frames, and the time-frequency
 /// resolution differed from libopus in 37.
 ///
@@ -378,7 +378,7 @@ fn short_vbr_frames_stay_below_510_kbps() {
         let largest = |p: &[Vec<u8>]| p.iter().map(|x| x.len()).max().unwrap_or(0);
         let same = c.iter().zip(&rs).filter(|(a, b)| a.len() == b.len()).count();
         println!(
-            "{} ms: largest packet libopus {}, opus-rs {}; same size in {same} of {}",
+            "{} ms: largest packet libopus {}, opus1 {}; same size in {same} of {}",
             frame_ms_x2 as f32 / 2.0,
             largest(&c),
             largest(&rs),

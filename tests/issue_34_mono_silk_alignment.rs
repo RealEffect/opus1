@@ -3,11 +3,11 @@
 //! `SilkDecoder::decode` copied mono output from `w_silk_buf[0][2..]`, while
 //! libopus (`silk/dec_API.c`, the resample call) reads mono and stereo alike
 //! from `samplesOut1_tmp[n][1]` — the same one-sample-delayed position. The
-//! opus-rs mono output was therefore one internal-rate sample early (3 samples
+//! opus1 mono output was therefore one internal-rate sample early (3 samples
 //! at a 48 kHz API rate, 1 at 16 kHz).
 //!
 //! These tests decode libopus-encoded mono WB SILK packets with both libopus
-//! and opus-rs and require agreement at **lag 0** (no lag search). Before the
+//! and opus1 and require agreement at **lag 0** (no lag search). Before the
 //! fix the best agreement at lag 0 is only ~19 dB at 48 kHz; the samples line
 //! up only after shifting 3 samples (or 1 at 16 kHz).
 
@@ -15,7 +15,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Channels as CCh, Decoder as CDec, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -54,7 +54,7 @@ fn snr_at_lag0(reference: &[f32], test: &[f32], start: usize, len: usize) -> f64
 }
 
 /// Encode ~1 s of mono WB SILK at 16 kHz with libopus, decode each packet with
-/// libopus and with opus-rs at `api_rate`, and return the worst 20 ms-window
+/// libopus and with opus1 at `api_rate`, and return the worst 20 ms-window
 /// SNR at lag 0 (after a one-packet warm-up).
 fn worst_window_snr(api_rate: u32) -> f64 {
     let sr = 16000usize;
@@ -84,9 +84,9 @@ fn worst_window_snr(api_rate: u32) -> f64 {
         let c_n = c_dec.decode_float(&pkt[..n], &mut c_buf, false).unwrap();
         let rs_n = rs_dec
             .decode(&pkt[..n], MAX_FRAME, &mut rs_buf)
-            .unwrap_or_else(|e| panic!("packet {p}: opus-rs decode failed: {e}"));
+            .unwrap_or_else(|e| panic!("packet {p}: opus1 decode failed: {e}"));
         assert_eq!(c_n, out_per_pkt, "libopus decoded length");
-        assert_eq!(rs_n, out_per_pkt, "opus-rs decoded length");
+        assert_eq!(rs_n, out_per_pkt, "opus1 decoded length");
         c_pcm.extend_from_slice(&c_buf[..c_n]);
         rs_pcm.extend_from_slice(&rs_buf[..rs_n]);
     }

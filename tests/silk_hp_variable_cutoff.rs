@@ -11,14 +11,14 @@
 //!
 //! The sequence found one constant: the smoothing coefficient
 //! `SILK_FIX_CONST( VARIABLE_HP_SMTH_COEF1, 16 )` is 6554 in libopus, and
-//! opus-rs had 6553 (the product cut off instead of rounded). 23 of the
+//! opus1 had 6553 (the product cut off instead of rounded). 23 of the
 //! 240 calls below then gave another value than libopus, each call starting
 //! from the state of libopus.
 
-use opus_rs::silk::define::{TYPE_UNVOICED, TYPE_VOICED};
-use opus_rs::silk::hp_variable_cutoff::silk_hp_variable_cutoff;
-use opus_rs::silk::lin2log::silk_lin2log;
-use opus_rs::silk::structs::SilkEncoderState;
+use opus1::silk::define::{TYPE_UNVOICED, TYPE_VOICED};
+use opus1::silk::hp_variable_cutoff::silk_hp_variable_cutoff;
+use opus1::silk::lin2log::silk_lin2log;
+use opus1::silk::structs::SilkEncoderState;
 
 /// The generator of hp_gen.c.
 struct Lcg(u32);

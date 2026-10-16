@@ -1,4 +1,4 @@
-//! `opus_rs::multistream::layout` against C libopus.
+//! `opus1::multistream::layout` against C libopus.
 //!
 //! - `ChannelLayout::surround` against `opus_multistream_surround_encoder_create`:
 //!   same accept or reject, same streams, coupled streams and mapping. The
@@ -15,7 +15,7 @@ mod ms_support;
 
 use audiopus_sys as sys;
 use ms_support::*;
-use opus_rs::multistream::layout::{
+use opus1::multistream::layout::{
     ChannelLayout, MappingType, SILENT_CHANNEL, validate_ambisonics,
 };
 
@@ -31,7 +31,7 @@ fn check_surround(channels: usize, family: u8) -> bool {
     assert_eq!(
         rs.is_ok(),
         c.is_ok(),
-        "family {family}, {channels} channels: opus-rs {:?}, libopus error {:?}",
+        "family {family}, {channels} channels: opus1 {:?}, libopus error {:?}",
         rs.as_ref().err(),
         c.as_ref().err()
     );

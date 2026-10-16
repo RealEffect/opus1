@@ -1,6 +1,6 @@
 //! Shared helpers for the `silkdec_*` tests.
 //!
-//! These tests check the SILK decoder of opus-rs (`SilkDecoder`) against
+//! These tests check the SILK decoder of opus1 (`SilkDecoder`) against
 //! C libopus, without going through `OpusDecoder`. The stream always comes
 //! from the C encoder with the coding mode forced to SILK-only, so that
 //! `opus_decode` in C is the SILK decoder and nothing else. SILK is
@@ -18,11 +18,11 @@
 #![allow(dead_code)]
 
 use audiopus_sys as sys;
-use opus_rs::SilkResampler;
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::dec_api::SilkDecoder;
-use opus_rs::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus_rs::silk::decoder_structs::SilkDecControl;
+use opus1::SilkResampler;
+use opus1::range_coder::RangeCoder;
+use opus1::silk::dec_api::SilkDecoder;
+use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+use opus1::silk::decoder_structs::SilkDecControl;
 
 // ---------------------------------------------------------------------------
 // Signals
@@ -449,7 +449,7 @@ pub fn stream_summary(packets: &[Vec<u8>]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// opus-rs SILK decoder, driven like libopus drives silk_Decode
+// opus1 SILK decoder, driven like libopus drives silk_Decode
 // ---------------------------------------------------------------------------
 
 /// Counts of what the decoder did, so that a test can check that the case
@@ -943,7 +943,7 @@ pub fn random_fates(seed: u32, packets: usize, fec: bool) -> Vec<Fate> {
         .collect()
 }
 
-/// Decode `packets` with C libopus and with opus-rs through
+/// Decode `packets` with C libopus and with opus1 through
 /// `decode_with_control`, treating packet `i` as `fate(i)` says, and compare
 /// every packet's output. `rate` and `channels` are the decoder's.
 pub fn run(
@@ -955,10 +955,10 @@ pub fn run(
     run_with(RsDec::new(rate, channels), packets, rate, channels, fate)
 }
 
-/// `run` with a given opus-rs decoder, which must be new.
+/// `run` with a given opus1 decoder, which must be new.
 ///
 /// The stream may contain CELT-only packets. The C decoder decodes them and
-/// the SILK decoder of opus-rs is reset after them, as libopus resets its
+/// the SILK decoder of opus1 is reset after them, as libopus resets its
 /// own. In the first SILK frame after a CELT-only packet libopus cross-fades
 /// the first 5 ms with CELT concealment, so those 5 ms are not compared.
 /// A CELT-only packet and the packet after it are always received.

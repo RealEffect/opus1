@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::bands::compute_band_energies;
-use opus_rs::bands::normalise_bands;
-use opus_rs::modes::default_mode;
+use opus1::bands::compute_band_energies;
+use opus1::bands::normalise_bands;
+use opus1::modes::default_mode;
 
 #[test]
 fn test_bands_match() {

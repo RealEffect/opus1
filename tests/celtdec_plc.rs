@@ -1,7 +1,7 @@
 //! CELT loss concealment against C libopus.
 //!
 //! Both decoders get the same packets with the same losses. A lost packet is
-//! `opus_decode_float(NULL)` for libopus and `decode(&[])` for opus-rs. The
+//! `opus_decode_float(NULL)` for libopus and `decode(&[])` for opus1. The
 //! outputs are compared frame by frame.
 //!
 //! libopus conceals a lost CELT frame in one of two ways
@@ -67,7 +67,7 @@ struct Limits {
 }
 
 /// The limits for pitch repetition were measured on 64-bit ARM. There
-/// opus-rs rounds the sums of the concealment the way libopus does (see
+/// opus1 rounds the sums of the concealment the way libopus does (see
 /// `plc_mac` in src/celt.rs). On other processors the two round differently,
 /// so more frames are badly matched. The limits are wider there. They have
 /// not been measured.
@@ -102,7 +102,7 @@ const NOISE: Limits = Limits {
     recovered_worst: 110.0,
 };
 
-/// Lowest SNR of a single frame that libopus and opus-rs conceal with noise.
+/// Lowest SNR of a single frame that libopus and opus1 conceal with noise.
 const NOISE_FRAME_DB: f64 = 110.0;
 /// SNR below which a pitch-concealed frame counts as badly matched.
 const POOR_DB: f64 = 40.0;
@@ -379,7 +379,7 @@ fn long_burst_ends_in_noise_like_libopus() {
         );
         let db = snr(cf, rf);
         println!(
-            "lost frame {} of a burst: libopus {:.1} dBFS, opus-rs {:.1} dBFS, {db:.1} dB",
+            "lost frame {} of a burst: libopus {:.1} dBFS, opus1 {:.1} dBFS, {db:.1} dB",
             before + 1,
             dbfs(cf),
             dbfs(rf)
@@ -405,7 +405,7 @@ fn long_burst_ends_in_noise_like_libopus() {
 ///
 /// The lost packet after a single good one must be noise in both decoders.
 /// Noise is reproduced to the last bits and pitch repetition is not, so the
-/// SNR of that frame tells which of the two opus-rs used.
+/// SNR of that frame tells which of the two opus1 used.
 #[test]
 fn pitch_concealment_returns_after_two_good_packets() {
     let (rate, frame) = (48000, 960);
@@ -544,7 +544,7 @@ fn hybrid_concealment_keeps_the_high_band() {
             &r[i * frame..(i + 1) * frame],
         );
         println!(
-            "lost frame {i}: high band libopus {:.1} dB, opus-rs {:.1} dB",
+            "lost frame {i}: high band libopus {:.1} dB, opus1 {:.1} dB",
             high(cf),
             high(rf)
         );

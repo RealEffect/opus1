@@ -1,4 +1,4 @@
-//! The range decoder of opus-rs against the range decoder of libopus
+//! The range decoder of opus1 against the range decoder of libopus
 //! (celt/entdec.c, celt/laplace.c), on packets that no encoder wrote.
 //!
 //! libopus is linked as a static library, so its internal functions can be
@@ -11,8 +11,8 @@
 //! whose two parts combine to more than its limit, raw bits read past the
 //! start of the packet, range coder bytes read past its end.
 
-use opus_rs::quant_bands::E_PROB_MODEL;
-use opus_rs::range_coder::RangeCoder;
+use opus1::quant_bands::E_PROB_MODEL;
+use opus1::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uint};
 
 /// `ec_ctx` of libopus (celt/entcode.h).

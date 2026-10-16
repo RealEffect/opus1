@@ -2,8 +2,8 @@
 //! than libopus writes them, so that each filter state waits for fewer
 //! operations. These tests compare it with the loop in the order of libopus.
 
-use opus_rs::silk::ana_filt_bank_1::silk_ana_filt_bank_1;
-use opus_rs::silk::macros::{silk_sat16, silk_smlawb, silk_smulwb};
+use opus1::silk::ana_filt_bank_1::silk_ana_filt_bank_1;
+use opus1::silk::macros::{silk_sat16, silk_smlawb, silk_smulwb};
 
 const A_FB1_20: i32 = 5394 << 1;
 const A_FB1_21: i32 = -24290;

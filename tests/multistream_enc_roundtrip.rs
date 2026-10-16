@@ -1,4 +1,4 @@
-//! Round trip inside opus-rs: `MultistreamEncoder` to `MultistreamDecoder`,
+//! Round trip inside opus1: `MultistreamEncoder` to `MultistreamDecoder`,
 //! for 5.1 and 7.1.
 //!
 //! The decoder is the one in src/multistream/mod.rs; only its `new` and
@@ -15,13 +15,13 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
-use opus_rs::multistream::encoder::MultistreamEncoder;
-use opus_rs::multistream::{ChannelMappingTable, MultistreamDecoder};
+use opus1::Application;
+use opus1::multistream::encoder::MultistreamEncoder;
+use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
 
 const FS: i32 = 48_000;
 
-/// The opus-rs decoder for the layout of `enc`, built from the bytes an Ogg
+/// The opus1 decoder for the layout of `enc`, built from the bytes an Ogg
 /// Opus header carries after the mapping family: stream count, coupled
 /// stream count, and the mapping.
 fn rust_decoder(enc: &MultistreamEncoder) -> MultistreamDecoder {
@@ -30,10 +30,10 @@ fn rust_decoder(enc: &MultistreamEncoder) -> MultistreamDecoder {
     tail.extend_from_slice(layout.mapping());
     let table = ChannelMappingTable::parse(1, layout.channels() as u8, &tail)
         .expect("channel mapping table");
-    MultistreamDecoder::new(enc.sampling_rate(), table).expect("opus-rs multistream decoder")
+    MultistreamDecoder::new(enc.sampling_rate(), table).expect("opus1 multistream decoder")
 }
 
-/// Encodes `pcm` and decodes every packet with the opus-rs decoder and with
+/// Encodes `pcm` and decodes every packet with the opus1 decoder and with
 /// the C decoder. Returns both outputs.
 fn round_trip(
     enc: &mut MultistreamEncoder,
@@ -51,7 +51,7 @@ fn round_trip(
         let n = enc.encode(frame, frame_size, &mut packet).unwrap();
         let decoded = rust_dec
             .decode(&packet[..n], frame_size, &mut frame_out)
-            .unwrap_or_else(|e| panic!("{label}: frame {f}: opus-rs decode: {e}"));
+            .unwrap_or_else(|e| panic!("{label}: frame {f}: opus1 decode: {e}"));
         assert_eq!(decoded, frame_size, "{label}: frame {f}: decoded samples");
         rust_out.extend_from_slice(&frame_out);
         c_out.extend(
@@ -112,7 +112,7 @@ fn surround_round_trip_routes_every_channel() {
                     0,
                     0,
                 );
-                println!("{label}: channel {ch}: opus-rs decoder against C decoder {snr:.1} dB");
+                println!("{label}: channel {ch}: opus1 decoder against C decoder {snr:.1} dB");
                 assert!(
                     snr >= 90.0,
                     "{label}: channel {ch}: {snr:.1} dB against the C decoder"

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 {
@@ -62,11 +62,16 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let mut encoded = vec![0u8; 4000];
-    let encoded_len = match encoder.encode(&input, frame_size, &mut encoded) {
-        Ok(len) => len,
-        Err(_) => return,
-    };
+    // A valid frame size and enough room: the frame must be encoded.
+    let encoded_len = encoder
+        .encode(&input, frame_size, &mut encoded)
+        .expect("a valid frame was not encoded");
 
+    // The decoder reads the whole frame, and exactly the bits the encoder
+    // wrote: both end in the same range coder state.
     let mut decoded = vec![0.0f32; frame_size * channels];
-    let _ = decoder.decode(&encoded[..encoded_len], frame_size, &mut decoded);
+    let decoded_len = decoder.decode(&encoded[..encoded_len], frame_size, &mut decoded);
+    assert_eq!(decoded_len, Ok(frame_size));
+    assert_eq!(decoder.final_range(), encoder.final_range());
+    assert!(decoded.iter().all(|x| x.is_finite()));
 });

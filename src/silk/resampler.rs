@@ -1,4 +1,5 @@
 use crate::silk::macros::*;
+use crate::silk::sigproc_fix::smulwb_operand;
 use core::mem::MaybeUninit;
 
 pub const SILK_RESAMPLER_1_3_COEFS: [i16; 20] = [
@@ -333,7 +334,7 @@ impl SilkResampler {
         let out_id = rate_id(fs_hz_out);
 
         if in_id > 2 || out_id > 5 || fs_hz_out <= 0 {
-            // fs_hz_out <= 0 would divide by zero below (issue #27 deep scan).
+            // fs_hz_out <= 0 would divide by zero below.
             return -1;
         }
 
@@ -366,8 +367,7 @@ impl SilkResampler {
     /// any other up-sampling (IIR + FIR), down-sampling (AR2 + FIR with one
     /// coefficient table per ratio), or a plain copy. The decoder also
     /// down-samples: an 8 or 12 kHz decoder receives 12 or 16 kHz SILK
-    /// frames. The down-sampler used to be set up for the encoder only, and
-    /// the decoder's down-sampling went through the up-sampling method.
+    /// frames, and uses the same down-sampler as the encoder.
     fn init_common(&mut self, fs_hz_in: i32, fs_hz_out: i32) -> i32 {
         self.fs_in_khz = fs_hz_in / 1000;
         self.fs_out_khz = fs_hz_out / 1000;
@@ -429,8 +429,8 @@ impl SilkResampler {
             ResamplerMode::Copy => {
                 // Clamp writes to the caller-provided output capacity. Well-formed
                 // callers always pass an output of at least `in_len * fs_out/fs_in`
-                // samples; the clamps only prevent a panic on mis-sized buffers
-                // (issue #15 hardening).
+                // samples; the clamps only prevent a panic on mis-sized
+                // buffers.
                 let head = (self.fs_in_khz as usize).min(out.len());
                 out[..head].copy_from_slice(&self.delay_buf[..head]);
                 let remaining = (in_len - self.fs_in_khz) as usize;
@@ -443,7 +443,7 @@ impl SilkResampler {
             }
             ResamplerMode::Up2HQ => {
                 // 2x upsampling writes 2*n samples for n inputs; clamp `n` to what
-                // the output slice can hold (issue #15 hardening).
+                // the output slice can hold.
                 let first_len = (self.fs_in_khz as usize).min(out.len() / 2);
                 silk_resampler_private_up2_hq(
                     &mut self.s_iir,
@@ -525,11 +525,10 @@ struct DownFirTaps {
     /// long, so that a position masked with 3 is a valid index without a
     /// bounds check.
     taps: [[i16; RESAMPLER_DOWN_ORDER_FIR0]; 4],
-    /// The same taps as operands of the vector kernel, shifted left by 15:
-    /// vqdmulhq_s32(x, t << 15) is (x * t) >> 16. Each row holds taps 0 to
-    /// 15 and then taps 14 to 17 with the first two set to zero. A fifth
-    /// vector, loaded at sample 14, then covers the last two taps without
-    /// reading past the 18 samples.
+    /// The same taps as operands of the vector kernel (`smulwb_operand`).
+    /// Each row holds taps 0 to 15 and then taps 14 to 17 with the first two
+    /// set to zero. A fifth vector, loaded at sample 14, then covers the last
+    /// two taps without reading past the 18 samples.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     wide: [[i32; 20]; 4],
 }
@@ -548,11 +547,11 @@ const fn down_fir_taps(coefs: &[i16], fracs: usize) -> DownFirTaps {
         }
         let mut k = 0;
         while k < 16 {
-            wide[i][k] = (taps[i][k] as i32) << 15;
+            wide[i][k] = smulwb_operand(taps[i][k]);
             k += 1;
         }
-        wide[i][18] = (taps[i][16] as i32) << 15;
-        wide[i][19] = (taps[i][17] as i32) << 15;
+        wide[i][18] = smulwb_operand(taps[i][16]);
+        wide[i][19] = smulwb_operand(taps[i][17]);
         i += 1;
     }
     DownFirTaps { taps, wide }
@@ -868,10 +867,9 @@ fn down_fir_symmetric_neon<const HALF: usize>(
     const MAX_VECTORS: usize = 5;
     let vectors = HALF.div_ceil(4);
     assert!(vectors <= MAX_VECTORS && 4 * vectors <= 2 * HALF);
-    // vqdmulhq_s32(x, c << 15) is (x * c) >> 16.
     let mut wide = [0i32; 4 * MAX_VECTORS];
     for (w, &c) in wide.iter_mut().zip(coefs.iter()) {
-        *w = (c as i32) << 15;
+        *w = smulwb_operand(c);
     }
 
     let mut index_q16 = 0i32;
@@ -1169,7 +1167,8 @@ fn up2_hq_neon(s: &mut [i32; 6], out: &mut [MaybeUninit<i16>], input: &[i16]) {
     // elements of 2-element arrays, the first store writes the 4 elements
     // of a 4-element array, and the last one the first 2 of the 6 states.
     unsafe {
-        // vqdmulh_s32(y, c << 15) is (y * c) >> 16.
+        // The shift makes the `smulwb_operand` of each coefficient, so
+        // vqdmulh_s32(y, c) is silk_smulwb(y, coefficient).
         let c0 = vshl_n_s32::<15>(vld1_s32(UP2_HQ_COEFS[0].as_ptr()));
         let c1 = vshl_n_s32::<15>(vld1_s32(UP2_HQ_COEFS[1].as_ptr()));
         let c2 = vshl_n_s32::<15>(vld1_s32(UP2_HQ_COEFS[2].as_ptr()));

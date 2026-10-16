@@ -22,18 +22,18 @@
 #![allow(clippy::all)]
 #![allow(dead_code)]
 
-use opus_rs::silk::define::*;
-use opus_rs::silk::nsq::silk_nsq;
-use opus_rs::silk::nsq_del_dec::silk_nsq_del_dec;
-use opus_rs::silk::structs::*;
+use opus1::silk::define::*;
+use opus1::silk::nsq::silk_nsq;
+use opus1::silk::nsq_del_dec::silk_nsq_del_dec;
+use opus1::silk::structs::*;
 
 /// `src/silk/nsq_del_dec.rs` before the rewrite.
 mod reference_del_dec {
-    use opus_rs::silk::define::*;
-    use opus_rs::silk::macros::*;
-    use opus_rs::silk::sigproc_fix::*;
-    use opus_rs::silk::structs::*;
-    use opus_rs::silk::tables::*;
+    use opus1::silk::define::*;
+    use opus1::silk::macros::*;
+    use opus1::silk::sigproc_fix::*;
+    use opus1::silk::structs::*;
+    use opus1::silk::tables::*;
 
     #[derive(Copy, Clone)]
     pub struct NSQDelDecStruct {
@@ -850,11 +850,11 @@ mod reference_del_dec {
 /// `src/silk/nsq.rs` before the rewrite, with the libopus branch on the lag
 /// in the loop for subframes that are not voiced.
 mod reference_nsq {
-    use opus_rs::silk::define::*;
-    use opus_rs::silk::macros::*;
-    use opus_rs::silk::sigproc_fix::*;
-    use opus_rs::silk::structs::*;
-    use opus_rs::silk::tables::*;
+    use opus1::silk::define::*;
+    use opus1::silk::macros::*;
+    use opus1::silk::sigproc_fix::*;
+    use opus1::silk::structs::*;
+    use opus1::silk::tables::*;
 
     pub fn silk_nsq(
         ps_enc_c: &SilkEncoderStateCommon,
@@ -2460,7 +2460,7 @@ fn plain_quantizer_matches_on_extreme_values() {
 /// part of `s_ar2_q14` above the shaping order.
 #[test]
 fn subframe_function_matches_previous_implementation() {
-    use opus_rs::silk::nsq_del_dec::{NSQDelDecStruct, silk_noise_shape_quantizer_del_dec};
+    use opus1::silk::nsq_del_dec::{NSQDelDecStruct, silk_noise_shape_quantizer_del_dec};
 
     let mut rng = Rng(0xA000);
     for case in 0..200 {

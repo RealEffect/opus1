@@ -97,7 +97,7 @@ fn lfe_frame_header_follows_the_rules_of_libopus() {
                             r,
                             effective_bytes,
                             lm,
-                            &format!("opus-rs, {what}, frame {k}"),
+                            &format!("opus1, {what}, frame {k}"),
                         );
                         check_lfe_header(
                             c,

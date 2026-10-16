@@ -216,8 +216,9 @@ struct ShortPredictionCoefs<'a> {
     /// The coefficients as given: `a_q12[j]` multiplies the sample `j` steps
     /// back. Its length is the prediction order.
     a_q12: &'a [i16],
-    /// Entry `15 - j` holds `a_q12[j] << 15`; the entries of taps at and above
-    /// the prediction order are zero. This is the form the NEON kernel reads.
+    /// Entry `15 - j` holds `smulwb_operand(a_q12[j])`; the entries of taps at
+    /// and above the prediction order are zero. This is the form the NEON
+    /// kernel reads.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     reversed_q27: [i32; MAX_LPC_ORDER],
 }
@@ -231,7 +232,7 @@ impl<'a> ShortPredictionCoefs<'a> {
         let a_q12 = &a_q12[..order];
         let mut reversed_q27 = [0i32; MAX_LPC_ORDER];
         for (dst, &a) in reversed_q27.iter_mut().rev().zip(a_q12) {
-            *dst = (a as i32) << 15;
+            *dst = smulwb_operand(a);
         }
         Self {
             a_q12,
@@ -277,10 +278,9 @@ fn short_prediction_scalar(window: &[i32; MAX_LPC_ORDER], a_q12: &[i16]) -> i32 
 /// The 16 products of the NEON short-term prediction, added up to 4 partial
 /// sums. The prediction is the sum of the 4 lanes plus half the order.
 ///
-/// `vqdmulhq_s32(x, a << 15)` is `(2 * x * (a << 15)) >> 32`, which equals
-/// `(x * a) >> 16` exactly: the doubled product only saturates when both
-/// factors are `i32::MIN`, and `a << 15` never is. The additions wrap around,
-/// so their order does not change the result.
+/// The coefficients are `smulwb_operand` values, so each `vqdmulhq_s32` is
+/// `(x * a) >> 16` exactly. The additions wrap around, so their order does
+/// not change the result.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -1128,11 +1128,11 @@ mod neon {
     }
 
     /// The constant `c` for which `vqdmulhq_s32(x, c)` is `silk_smulwb(x, b)`:
-    /// `(x * (b as i16)) >> 16`. See `short_prediction_products_neon`.
+    /// `(x * (b as i16)) >> 16`.
     #[target_feature(enable = "neon")]
     #[inline]
     fn smulwb_factor(b: i32) -> int32x4_t {
-        vdupq_n_s32((b as i16 as i32) << 15)
+        vdupq_n_s32(smulwb_operand(b as i16))
     }
 
     /// The constant `c` for which `vqdmulhq_s32(x, c)` is `silk_smulwt(x, b)`:
@@ -1140,7 +1140,7 @@ mod neon {
     #[target_feature(enable = "neon")]
     #[inline]
     fn smulwt_factor(b: i32) -> int32x4_t {
-        vdupq_n_s32((b >> 16) << 15)
+        vdupq_n_s32(smulwb_operand((b >> 16) as i16))
     }
 
     /// The two candidates of every state for one sample, the cheaper one
@@ -1346,9 +1346,9 @@ mod neon {
     /// after the 4-byte stores of the same values would have to wait until
     /// the stores have reached the cache.
     pub(super) struct FeedbackHead {
-        /// `coef_q28[j][i]` is `ar_shp_q13[4 * j + i] << 15`, the constant
-        /// for which `vqdmulhq_s32` gives `(t * coef) >> 16`. Entries of
-        /// taps that are not summed here are zero.
+        /// `coef_q28[j][i]` is `smulwb_operand(ar_shp_q13[4 * j + i])`, so
+        /// that `vqdmulhq_s32` gives `(t * coef) >> 16`. Entries of taps that
+        /// are not summed here are zero.
         coef_q28: [[i32; 4]; MAX_SHAPE_LPC_ORDER / 4],
         /// Number of vectors of 4 taps that are summed here.
         vectors: usize,
@@ -1373,7 +1373,7 @@ mod neon {
                 .iter_mut()
                 .zip(ar_shp_q13)
             {
-                *dst = (c as i32) << 15;
+                *dst = smulwb_operand(c);
             }
             Self { coef_q28, vectors }
         }

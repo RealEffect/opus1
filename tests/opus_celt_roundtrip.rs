@@ -2,7 +2,7 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 fn snr_with_delay(input: &[f32], output: &[f32], delay: usize) -> f32 {
     let mut signal = 0.0f64;

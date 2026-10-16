@@ -2,8 +2,8 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::pvq::{alg_quant, alg_unquant};
-use opus_rs::range_coder::RangeCoder;
+use opus1::pvq::{alg_quant, alg_unquant};
+use opus1::range_coder::RangeCoder;
 
 #[test]
 fn test_pvq_match() {
@@ -86,8 +86,8 @@ fn test_pvq_match() {
 
 #[test]
 fn test_pvq_complex_match() {
-    use opus_rs::pvq::alg_quant;
-    use opus_rs::range_coder::RangeCoder;
+    use opus1::pvq::alg_quant;
+    use opus1::range_coder::RangeCoder;
 
     let n = 16;
     let k = 10;

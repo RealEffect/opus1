@@ -12,7 +12,7 @@
 //! The function is fixed-point: the residual energy, its Q value and every
 //! coefficient must be identical.
 
-use opus_rs::silk::lpc_analysis::silk_burg_modified_fix;
+use opus1::silk::lpc_analysis::silk_burg_modified_fix;
 
 /// (checksum of the input, residual energy, its Q value, checksum of all
 /// coefficients, coefficients 0, 1 and the last one).
@@ -144,7 +144,7 @@ fn burg_modified_matches_libopus_fixed_point() {
         let got: Expected = (checksum, res_nrg, res_nrg_q, a_checksum, [a_q16[0], a_q16[1], a_q16[d - 1]]);
         if got != *expected {
             failures.push(format!(
-                "case {number} (order {d}, {} subframes of {}): opus-rs {:?}, libopus {:?}",
+                "case {number} (order {d}, {} subframes of {}): opus1 {:?}, libopus {:?}",
                 case.nb_subfr, case.subfr_length, got, expected
             ));
         }

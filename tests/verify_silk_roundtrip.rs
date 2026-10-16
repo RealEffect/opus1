@@ -1,5 +1,5 @@
 /// Test SILK encoder-decoder roundtrip consistency
-use opus_rs::silk::dec_api::SilkDecoder;
+use opus1::silk::dec_api::SilkDecoder;
 
 /// Test decoder initialization at different sample rates
 #[test]

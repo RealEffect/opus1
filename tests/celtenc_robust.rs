@@ -4,12 +4,12 @@
 
 mod celtenc_common;
 use celtenc_common::*;
-use opus_rs::celt::CeltEncoder;
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::CeltEncoder;
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
-/// One 20 ms test frame per channel, one channel after the other.
-fn planar_frame(channels: usize, frame: usize) -> Vec<f32> {
+/// One test frame of `frame` samples per channel, the channels interleaved.
+fn test_frame(channels: usize, frame: usize) -> Vec<f32> {
     (0..frame * channels)
         .map(|i| 0.3 * (i as f32 * 0.013).sin())
         .collect()
@@ -19,7 +19,7 @@ fn planar_frame(channels: usize, frame: usize) -> Vec<f32> {
 /// VBR, with LFE mode, with a mask, and with both.
 ///
 /// The C CELT encoder takes 2 bytes or more (celt_encoder.c:
-/// `nbCompressedBytes<2` is an argument error). From 2 bytes on, opus-rs
+/// `nbCompressedBytes<2` is an argument error). From 2 bytes on, opus1
 /// must write a packet that libopus decodes. Below that it must not panic
 /// and must not write more than it was given.
 #[test]
@@ -32,7 +32,7 @@ fn tiny_budgets_do_not_panic_and_decode() {
             frame: 120 << lm,
         };
         for channels in [1usize, 2] {
-            let pcm = planar_frame(channels, fmt.frame);
+            let pcm = test_frame(channels, fmt.frame);
             for (lfe, masked) in [(true, false), (false, true), (true, true)] {
                 for vbr in [false, true] {
                     for payload in 0..=6usize {
@@ -40,7 +40,7 @@ fn tiny_budgets_do_not_panic_and_decode() {
                             CeltEncoder::with_sampling_rate(default_mode(), channels, FS as i32);
                         enc.complexity = COMPLEXITY;
                         enc.set_end_band(13);
-                        enc.set_bitrate(8000);
+                        enc.set_bitrate(8000).unwrap();
                         enc.set_vbr(vbr);
                         enc.set_lfe(lfe);
                         if masked {
@@ -49,14 +49,7 @@ fn tiny_budgets_do_not_panic_and_decode() {
                         let mut packets = Vec::new();
                         for _ in 0..6 {
                             let mut rc = RangeCoder::new_encoder(payload as u32);
-                            enc.encode_with_budget_vbr(
-                                &pcm,
-                                fmt.frame,
-                                &mut rc,
-                                0,
-                                (payload * 8) as i32,
-                                vbr,
-                            );
+                            enc.encode(&pcm, fmt.frame, &mut rc);
                             rc.done();
                             let n = rc.storage as usize;
                             assert!(n <= payload.max(1), "{n} bytes from a budget of {payload}");
@@ -123,8 +116,8 @@ fn mask_slices_of_any_length() {
 /// of bytes, and their frame headers keep to the LFE rules.
 ///
 /// Measured: for mono the SNR is within 0.1 dB of libopus. For stereo
-/// opus-rs is 2.6 dB (constrained VBR) and 5 dB (CBR) above libopus. The
-/// reason was not looked for; the test only asks that opus-rs is not worse.
+/// opus1 is 2.6 dB (constrained VBR) and 5 dB (CBR) above libopus. The
+/// reason was not looked for; the test only asks that opus1 is not worse.
 #[test]
 fn lfe_on_a_stereo_encoder() {
     let mono = lfe_signal(30);
@@ -161,7 +154,7 @@ fn lfe_on_a_stereo_encoder() {
                 rs_snr >= c_snr - 1.5,
                 "{what}: SNR {rs_snr:.2}, libopus {c_snr:.2}"
             );
-            for (who, packets) in [("opus-rs", &rs), ("libopus", &c)] {
+            for (who, packets) in [("opus1", &rs), ("libopus", &c)] {
                 for (k, h) in headers(packets, channels, 13, 3).iter().enumerate() {
                     let frame = format!("{who}, {what}, frame {k}");
                     assert!(!h.transient, "{frame}: transient");
@@ -212,7 +205,7 @@ fn non_finite_input_does_not_panic() {
         for (lfe, masked) in [(true, false), (false, true)] {
             let mut enc = CeltEncoder::with_sampling_rate(default_mode(), 1, FS as i32);
             enc.complexity = COMPLEXITY;
-            enc.set_bitrate(32_000);
+            enc.set_bitrate(32_000).unwrap();
             enc.set_vbr(true);
             enc.set_lfe(lfe);
             if lfe {
@@ -221,12 +214,12 @@ fn non_finite_input_does_not_panic() {
             if masked {
                 enc.set_energy_mask(Some(&[-1.0f32; 21]));
             }
-            let mut pcm = planar_frame(1, FRAME);
+            let mut pcm = test_frame(1, FRAME);
             for k in 0..6 {
                 // Bad samples in the frames 1 and 2, clean frames after.
                 pcm[100] = if k == 1 || k == 2 { bad } else { 0.1 };
                 let mut rc = RangeCoder::new_encoder(200);
-                enc.encode_with_budget_vbr(&pcm, FRAME, &mut rc, 0, 1600, true);
+                enc.encode(&pcm, FRAME, &mut rc);
                 rc.done();
                 assert!(rc.storage <= 200);
             }
@@ -270,7 +263,7 @@ fn lfe_and_mask_switched_during_a_stream() {
     let c = enc_c_schedule(&cfg, Format::DEFAULT, &pcm, Some(&masks), Some(&lfe));
     let (rs_out, c_out) = (dec_c(&rs, 1), dec_c(&c, 1));
 
-    for (who, packets) in [("opus-rs", &rs), ("libopus", &c)] {
+    for (who, packets) in [("opus1", &rs), ("libopus", &c)] {
         for (k, h) in headers(packets, 1, 13, 3).iter().enumerate() {
             if lfe[k] {
                 assert!(!h.transient, "{who}, frame {k}: transient");
@@ -323,7 +316,7 @@ fn lfe_and_mask_switched_during_a_stream() {
 /// the least a CELT frame can have.
 ///
 /// The Opus encoder of libopus does not call CELT at such rates, so this
-/// checks opus-rs against that rule and lets libopus decode the result.
+/// checks opus1 against that rule and lets libopus decode the result.
 #[test]
 fn constrained_vbr_gives_an_empty_packet_2_bytes_at_any_rate() {
     for lm in 0..=3usize {
@@ -331,28 +324,26 @@ fn constrained_vbr_gives_an_empty_packet_2_bytes_at_any_rate() {
             fs: FS,
             frame: 120 << lm,
         };
-        let pcm = planar_frame(1, fmt.frame);
+        let pcm = test_frame(1, fmt.frame);
         for lfe in [true, false] {
             // 1, 1.5 and 2 bytes per frame.
             for bits_per_frame in [8usize, 12, 16] {
                 let mut enc = CeltEncoder::with_sampling_rate(default_mode(), 1, FS as i32);
                 enc.complexity = COMPLEXITY;
                 enc.set_end_band(13);
-                enc.set_bitrate((bits_per_frame * FS / fmt.frame) as i32);
+                // CELT, like libopus, takes no bitrate of 500 b/s or less.
+                let bitrate = (bits_per_frame * FS / fmt.frame) as i32;
+                if enc.set_bitrate(bitrate).is_err() {
+                    assert!(bitrate <= 500, "{bitrate} b/s refused");
+                    continue;
+                }
                 enc.set_vbr(true);
                 enc.set_constrained_vbr(true);
                 enc.set_lfe(lfe);
                 let mut packets = Vec::new();
                 for k in 0..40 {
                     let mut rc = RangeCoder::new_encoder(MAX_PAYLOAD as u32);
-                    enc.encode_with_budget_vbr(
-                        &pcm,
-                        fmt.frame,
-                        &mut rc,
-                        0,
-                        (MAX_PAYLOAD * 8) as i32,
-                        true,
-                    );
+                    enc.encode(&pcm, fmt.frame, &mut rc);
                     rc.done();
                     let n = rc.storage as usize;
                     let what = format!(

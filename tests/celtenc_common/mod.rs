@@ -3,15 +3,15 @@
 //! These tests drive `CeltEncoder` directly, through its public functions.
 //! The CELT payload gets the matching CELT-only TOC byte in front, which
 //! makes it a valid Opus packet. C libopus decodes every packet, from
-//! opus-rs and from the C encoder alike, so a difference in the numbers
+//! opus1 and from the C encoder alike, so a difference in the numbers
 //! comes from the encoder alone.
 #![allow(dead_code)]
 
-use opus_rs::celt::CeltEncoder;
-use opus_rs::hp_cutoff::dc_reject_float;
-use opus_rs::modes::{SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF, default_mode};
-use opus_rs::quant_bands::E_PROB_MODEL;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::CeltEncoder;
+use opus1::hp_cutoff::dc_reject_float;
+use opus1::modes::{SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF, default_mode};
+use opus1::quant_bands::E_PROB_MODEL;
+use opus1::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uchar};
 
 pub mod c_celt;
@@ -168,14 +168,14 @@ impl Cfg {
 }
 
 /// Complexity of both encoders. From 7 up libopus runs its tonality
-/// analysis, which opus-rs does not have. CELT itself works the same at
+/// analysis, which opus1 does not have. CELT itself works the same at
 /// complexity 5, 6 and 7.
 pub const COMPLEXITY: i32 = 6;
 
 /// Encode `pcm` (interleaved) with C libopus in CELT-only mode, 20 ms frames.
 ///
 /// The application is "restricted low delay": the input reaches CELT without
-/// the 4 ms delay the other applications add, as it does in the opus-rs half
+/// the 4 ms delay the other applications add, as it does in the opus1 half
 /// of each test.
 pub fn enc_c(cfg: &Cfg, pcm: &[f32]) -> Vec<Vec<u8>> {
     enc_c_fmt(cfg, Format::DEFAULT, pcm, None)
@@ -270,7 +270,7 @@ pub fn enc_c_schedule(
 }
 
 // ---------------------------------------------------------------------------
-// The opus-rs CELT encoder
+// The opus1 CELT encoder
 // ---------------------------------------------------------------------------
 
 /// TOC byte of a CELT-only packet with one 20 ms frame (RFC 6716 section 3.1).
@@ -301,7 +301,7 @@ pub fn rs_encoder_fmt(cfg: &Cfg, fmt: Format) -> CeltEncoder {
     let mut enc = CeltEncoder::with_sampling_rate(default_mode(), cfg.channels, fmt.fs as i32);
     enc.complexity = COMPLEXITY;
     enc.set_end_band(cfg.end_band);
-    enc.set_bitrate(cfg.bitrate);
+    enc.set_bitrate(cfg.bitrate).expect("CELT bitrate");
     enc.set_vbr(cfg.vbr);
     enc.set_constrained_vbr(cfg.constrained_vbr);
     enc.set_lfe(cfg.lfe);
@@ -329,22 +329,8 @@ pub fn rs_encode_frame_fmt(
     frame: &[f32],
     payload_bytes: usize,
 ) -> Vec<u8> {
-    // `CeltEncoder` takes one channel after the other.
-    let mut planar = vec![0.0f32; fmt.frame * cfg.channels];
-    for i in 0..fmt.frame {
-        for c in 0..cfg.channels {
-            planar[c * fmt.frame + i] = frame[i * cfg.channels + c];
-        }
-    }
     let mut rc = RangeCoder::new_encoder(payload_bytes as u32);
-    enc.encode_with_budget_vbr(
-        &planar,
-        fmt.frame,
-        &mut rc,
-        0,
-        (payload_bytes * 8) as i32,
-        cfg.vbr,
-    );
+    enc.encode(frame, fmt.frame, &mut rc);
     rc.done();
     assert_eq!(rc.error, 0, "range coder error");
     let n = rc.storage as usize;
@@ -355,7 +341,7 @@ pub fn rs_encode_frame_fmt(
     pkt
 }
 
-/// Encode `pcm` (interleaved) with the opus-rs CELT encoder, 20 ms frames.
+/// Encode `pcm` (interleaved) with the opus1 CELT encoder, 20 ms frames.
 ///
 /// The input first passes the 3 Hz DC filter that libopus and `OpusEncoder`
 /// put in front of CELT.
@@ -782,7 +768,7 @@ struct FrameRest {
 /// has no room for it.
 ///
 /// The flag comes after the shapes of all bands, so they are decoded here
-/// with the band decoder of opus-rs.
+/// with the band decoder of opus1.
 pub fn anti_collapse_flag(payload: &[u8], channels: usize, end: usize, lm: usize) -> Option<bool> {
     let mode = default_mode();
     let (h, rest) = parse_frame_rc(payload, channels, end, lm);
@@ -802,7 +788,7 @@ pub fn anti_collapse_flag(payload: &[u8], channels: usize, end: usize, lm: usize
     let mut masks = vec![0u32; mode.nb_ebands * channels];
     let band_e = vec![1.0f32; mode.nb_ebands * channels];
     let mut dual_stereo = a.dual_stereo;
-    opus_rs::bands::quant_all_bands(
+    opus1::bands::quant_all_bands(
         false,
         mode,
         0,
@@ -869,7 +855,7 @@ fn parse_frame_rc(
     };
     let mut fine_priority = vec![0i32; nb];
     let (mut dual_stereo, mut balance) = (0, 0);
-    a.coded_bands = opus_rs::rate::clt_compute_allocation(
+    a.coded_bands = opus1::rate::clt_compute_allocation(
         mode,
         0,
         end,

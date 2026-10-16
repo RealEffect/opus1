@@ -10,10 +10,10 @@
 mod celtenc_common;
 use celtenc_common::Noise;
 
-use opus_rs::bands;
-use opus_rs::modes::{CeltMode, default_mode};
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::rate::clt_compute_allocation;
+use opus1::bands;
+use opus1::modes::{CeltMode, default_mode};
+use opus1::range_coder::RangeCoder;
+use opus1::rate::clt_compute_allocation;
 use std::os::raw::{c_int, c_uchar, c_void};
 
 /// libopus `ec_ctx` (celt/entcode.h).
@@ -136,7 +136,7 @@ fn c_mode() -> *const c_void {
 ///
 /// libopus 1.6 starts both energies at 0 and returns
 /// `floor(0.5 + 2^30 * theta)`, which `compute_theta` shifts down by 16.
-/// opus-rs started at 1e-15 and rounded `0.5 + 16384 * theta`: a silent
+/// opus1 started at 1e-15 and rounded `0.5 + 16384 * theta`: a silent
 /// band got 8192 instead of 0, and one angle in two was one step too high.
 #[test]
 fn stereo_angles_are_the_ones_libopus_computes() {
@@ -176,7 +176,7 @@ fn stereo_angles_are_the_ones_libopus_computes() {
 ///
 /// On 64-bit ARM libopus sums each band with `celt_inner_prod_neon`: one
 /// accumulator of four lanes with fused multiply-adds, the lanes added low
-/// half plus high half, a fused tail, then `1e-27 + sum`. opus-rs summed in
+/// half plus high half, a fused tail, then `1e-27 + sum`. opus1 summed in
 /// four accumulators and started at 1e-27; about one amplitude in five was
 /// one step off, enough to change the dynamic allocation and the
 /// time-frequency decisions of some frames.
@@ -334,7 +334,7 @@ fn run_rs(f: &Frame, x_in: &[f32]) -> Coded {
         );
     }
     rc.done();
-    assert_eq!(rc.error, 0, "opus-rs range coder error");
+    assert_eq!(rc.error, 0, "opus1 range coder error");
     Coded {
         bytes: rc.buf[..f.bytes].to_vec(),
         x,
@@ -585,7 +585,7 @@ fn agreement(
 /// tones) with an allocation from `clt_compute_allocation`, and the
 /// time-frequency changes and spreading decisions libopus can choose.
 /// Without resynthesis libopus leaves the collapse mask of a band without
-/// pulses at 0; opus-rs gave it the mask of a filled band.
+/// pulses at 0; opus1 gave it the mask of a filled band.
 #[test]
 fn mono_bands_are_coded_as_libopus_codes_them() {
     for (lm, bytes) in [(3usize, 160usize), (3, 60), (2, 80), (1, 40), (0, 30)] {
@@ -679,7 +679,7 @@ fn bands_of_hybrid_and_narrow_frames_are_coded_as_libopus_codes_them() {
     println!("{frames} frames, all equal to libopus's");
 }
 
-/// Decodes `bytes` with libopus's `quant_all_bands` and with opus-rs's, for
+/// Decodes `bytes` with libopus's `quant_all_bands` and with opus1's, for
 /// the frame `f`. Returns the decoded bands, collapse masks and seeds.
 fn decode_both(f: &Frame, bytes: &[u8]) -> (Coded, Coded) {
     let n = 120 << f.lm;
@@ -725,7 +725,7 @@ fn decode_both(f: &Frame, bytes: &[u8]) -> (Coded, Coded) {
             0,
         );
     }
-    // opus-rs.
+    // opus1.
     let mut xr = vec![0f32; n * f.channels];
     let mut masks_r = vec![0u32; 21 * f.channels];
     let mut seed_r = f.seed;
@@ -781,7 +781,7 @@ fn decode_both(f: &Frame, bytes: &[u8]) -> (Coded, Coded) {
 ///
 /// libopus merges mid and side (stereo_merge) with energies from
 /// `celt_inner_prod` (on arm64 the NEON form) and `mid * mid + side` fused;
-/// opus-rs summed one value at a time without fusing.
+/// opus1 summed one value at a time without fusing.
 #[test]
 fn bands_are_decoded_as_libopus_decodes_them() {
     for channels in [1usize, 2] {
@@ -820,7 +820,7 @@ fn bands_are_decoded_as_libopus_decodes_them() {
 ///
 /// The level is `min(0.5 * 2^(-depth / 8), 2 * 2^(-Ediff))` with libopus's
 /// `celt_exp2`: in the float build with `FLOAT_APPROX` a polynomial whose
-/// steps clang fuses on arm64. opus-rs used the exact `exp2` of the
+/// steps clang fuses on arm64. opus1 used the exact `exp2` of the
 /// standard library.
 #[test]
 fn anti_collapse_is_the_one_of_libopus() {
@@ -879,7 +879,7 @@ fn anti_collapse_is_the_one_of_libopus() {
 /// computes, to the bit.
 ///
 /// The gain is `celt_exp2(min(32, log energy + mean))`, with the
-/// polynomial `celt_exp2` of the float build with `FLOAT_APPROX`. opus-rs
+/// polynomial `celt_exp2` of the float build with `FLOAT_APPROX`. opus1
 /// took `2^x` from `powf`.
 #[test]
 fn bands_are_denormalised_as_libopus_does() {
@@ -954,7 +954,7 @@ fn same_bits(a: &[f32], b: &[f32]) -> bool {
 ///
 /// libopus computes the rotation angle with `cos` in double precision for
 /// `theta` and for `1 - theta` (celt_cos_norm), and clang fuses the products
-/// with `c` into the adds of each step on 64-bit ARM. opus-rs used `cos` and
+/// with `c` into the adds of each step on 64-bit ARM. opus1 used `cos` and
 /// `sin` in single precision, and fused other products in some passes.
 #[test]
 fn spreading_rotation_is_the_one_of_libopus() {
@@ -973,7 +973,7 @@ fn spreading_rotation_is_the_one_of_libopus() {
                         unsafe {
                             exp_rotation(xc.as_mut_ptr(), n as c_int, dir, b as c_int, k, spread)
                         };
-                        opus_rs::pvq::exp_rotation(&mut xr, n, dir, b, k, spread);
+                        opus1::pvq::exp_rotation(&mut xr, n, dir, b, k, spread);
                         checked += 1;
                         differ += !same_bits(&xc, &xr) as usize;
                     }
@@ -991,7 +991,7 @@ fn spreading_rotation_is_the_one_of_libopus() {
 /// collapse masks and bands, to the bit.
 ///
 /// libopus scales the pulses by `(1 / sqrt(Ryy)) * gain`
-/// (normalise_residual); opus-rs divided the gain by the square root, which
+/// (normalise_residual); opus1 divided the gain by the square root, which
 /// rounds differently when the gain is not 1.
 #[test]
 fn pulses_are_resynthesised_as_libopus_does() {
@@ -1027,14 +1027,14 @@ fn pulses_are_resynthesised_as_libopus_does() {
                         ec_dec_init(&mut dc, buf.as_mut_ptr(), 200);
                         alg_unquant(yc.as_mut_ptr(), n as c_int, k, spread, b as c_int, &mut dc, gain)
                     };
-                    // opus-rs: the same.
+                    // opus1: the same.
                     let mut rc = RangeCoder::new_encoder(200);
                     let mut xr = x.clone();
-                    let cm_r = opus_rs::pvq::alg_quant(&mut xr, n, k, spread, b, &mut rc, gain, true);
+                    let cm_r = opus1::pvq::alg_quant(&mut xr, n, k, spread, b, &mut rc, gain, true);
                     rc.done();
                     let mut rd = RangeCoder::new_decoder(&rc.buf[..200]);
                     let mut yr = vec![0f32; n];
-                    let dm_r = opus_rs::pvq::alg_unquant(&mut yr, n, k, spread, b, &mut rd, gain);
+                    let dm_r = opus1::pvq::alg_unquant(&mut yr, n, k, spread, b, &mut rd, gain);
                     checked += 1;
                     let ok = cm_c == cm_r
                         && dm_c == dm_r
@@ -1148,7 +1148,7 @@ fn coder_state(rc: &RangeCoder) -> (Vec<i64>, Vec<u8>) {
 
 /// Replays the calls of `quant_all_bands` that an instrumented libopus
 /// encoder wrote to `QAB_REPLAY` (inputs, range coder before and after),
-/// through opus-rs, and counts the calls with the same result.
+/// through opus1, and counts the calls with the same result.
 #[test]
 #[ignore = "tool"]
 fn replay_libopus_calls() {
@@ -1217,7 +1217,7 @@ fn replay_libopus_calls() {
     println!("{same} of {calls} calls of quant_all_bands give libopus's result");
 }
 
-/// opus-rs's `quant_all_bands` as the encoder calls it.
+/// opus1's `quant_all_bands` as the encoder calls it.
 #[allow(clippy::too_many_arguments)]
 fn rs_quant_all_bands(
     m: &CeltMode,

@@ -12,7 +12,7 @@
 //!   order, left out, repeated and silent.
 //!
 //! libopus codes a stereo stream as mono at low bitrates. The single-stream
-//! decoder of opus-rs does not decode such a packet into two channels yet.
+//! decoder of opus1 does not decode such a packet into two channels yet.
 //! The cases with such packets are in tests of their own, which are ignored
 //! until it does.
 // The multistream API needs the `std` feature.
@@ -23,7 +23,7 @@ mod multistream_dec_common;
 
 use ms_support::*;
 use multistream_dec_common::*;
-use opus_rs::multistream::MultistreamDecoder;
+use opus1::multistream::MultistreamDecoder;
 
 /// The limit for "the same samples as the C decoder". Measured: 124 dB or
 /// more in every case of this file.
@@ -52,7 +52,7 @@ fn check_float(e: &Encoded, fs: i32) -> f64 {
             .unwrap_or_else(|err| panic!("{}: C decoder: {err}", what()));
         let n = r_dec
             .decode(packet, max_frame, &mut out)
-            .unwrap_or_else(|err| panic!("{}: opus-rs decoder: {err}", what()));
+            .unwrap_or_else(|err| panic!("{}: opus1 decoder: {err}", what()));
         assert_eq!(n * e.channels, c.len(), "{}: samples per channel", what());
         assert_eq!(r_dec.final_range(), e.ranges[i], "{}: final range", what());
         assert_eq!(c_dec.final_range(), e.ranges[i], "{}: final range of the C decoder", what());
@@ -403,7 +403,7 @@ fn sixteen_bit_output_matches_libopus() {
                         let hard_clipped = to_i16(&out_float[..n * e.channels]);
                         for ((&c, &r), &h) in c.iter().zip(&out[..c.len()]).zip(&hard_clipped) {
                             let d = (c as i32 - r as i32).abs();
-                            assert!(d <= 1, "{} at {fs} Hz, gain {gain}, packet {i}: C {c}, opus-rs {r}", e.label);
+                            assert!(d <= 1, "{} at {fs} Hz, gain {gain}, packet {i}: C {c}, opus1 {r}", e.label);
                             differing += (d != 0) as usize;
                             at_full_scale += (c == i16::MAX || c == i16::MIN) as usize;
                             unlike_hard_clip += (r != h) as usize;

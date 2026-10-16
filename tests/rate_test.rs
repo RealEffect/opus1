@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::rate::{BITRES, clt_compute_allocation, pulses2bits};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
+use opus1::rate::{BITRES, clt_compute_allocation, pulses2bits};
 
 #[test]
 fn test_rate_allocation_constraints() {
@@ -60,7 +60,7 @@ fn test_rate_allocation_constraints() {
         // not an actual pulse count. Verify it is non-negative and within the cap.
         assert!(pulses[i] >= 0, "Negative pulses in band {}", i);
         // Convert bits -> pulse count, then verify round-trip bits are consistent.
-        let pulse_count = opus_rs::rate::bits2pulses(mode, i, 3, pulses[i]);
+        let pulse_count = opus1::rate::bits2pulses(mode, i, 3, pulses[i]);
         let _bits_calc = pulses2bits(mode, i, 3, pulse_count);
     }
 

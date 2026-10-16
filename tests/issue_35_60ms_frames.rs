@@ -6,14 +6,14 @@
 //! CELT and Hybrid cap a frame at 20 ms and repacketize 20 ms sub-frames into a
 //! code 1/2/3 packet.
 //!
-//! Every case is checked against libopus: opus-rs's packet must decode in
+//! Every case is checked against libopus: opus1's packet must decode in
 //! libopus with the full duration and track the input, and libopus's own
-//! 40/60 ms packet must decode in opus-rs.
+//! 40/60 ms packet must decode in opus1.
 
 use opus::{
     Application as CApp, Channels as CCh, Decoder as CDec, Encoder as CEnc,
 };
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 const MAX_FRAME: usize = 5760; // 120 ms @ 48 kHz, per channel
@@ -95,7 +95,7 @@ fn expected(rate: usize, ms: usize) -> usize {
     rate * ms / 1000
 }
 
-/// opus-rs encodes `ms` frames; libopus decodes them. Returns the worst 20 ms
+/// opus1 encodes `ms` frames; libopus decodes them. Returns the worst 20 ms
 /// window SNR against the input (mid channel).
 fn rust_enc_c_dec(
     rate: usize,
@@ -119,7 +119,7 @@ fn rust_enc_c_dec(
     for p in 0..packets {
         let n = enc
             .encode(&input[p * frame * ch..(p + 1) * frame * ch], frame, &mut pkt)
-            .unwrap_or_else(|e| panic!("{rate} {app:?} {ms}ms p{p}: opus-rs encode failed: {e}"));
+            .unwrap_or_else(|e| panic!("{rate} {app:?} {ms}ms p{p}: opus1 encode failed: {e}"));
         let got = dec
             .decode_float(&pkt[..n], &mut buf, false)
             .unwrap_or_else(|e| panic!("{rate} {app:?} {ms}ms p{p}: libopus rejected packet: {e}"));
@@ -135,7 +135,7 @@ fn rust_enc_c_dec(
     worst_window_snr(&mid(&ref_pcm, ch), &mid(&out_pcm, ch), rate / 50, frame, (rate * 40 / 1000) as isize)
 }
 
-/// libopus encodes `ms` frames; opus-rs decodes them.
+/// libopus encodes `ms` frames; opus1 decodes them.
 fn c_enc_rust_dec(
     rate: usize,
     ch: usize,
@@ -156,11 +156,11 @@ fn c_enc_rust_dec(
             .unwrap();
         let got = dec
             .decode(&pkt[..n], MAX_FRAME, &mut buf)
-            .unwrap_or_else(|e| panic!("{rate} {ms}ms p{p}: opus-rs decode failed: {e}"));
+            .unwrap_or_else(|e| panic!("{rate} {ms}ms p{p}: opus1 decode failed: {e}"));
         assert_eq!(
             got,
             frame,
-            "{rate} {ms}ms p{p}: opus-rs decoded {got}, want {frame}"
+            "{rate} {ms}ms p{p}: opus1 decoded {got}, want {frame}"
         );
         ref_pcm.extend_from_slice(&input[p * frame * ch..(p + 1) * frame * ch]);
         out_pcm.extend_from_slice(&buf[..got * ch]);
@@ -185,12 +185,12 @@ fn check_all(
         let snr = rust_enc_c_dec(rate, ch, app, capp, br, ms, cbr);
         assert!(
             snr > FLOOR_DB,
-            "opus-rs->libopus {rate} {ch}ch {app:?} {br} cbr={cbr} {ms}ms: worst {snr:.1} dB"
+            "opus1->libopus {rate} {ch}ch {app:?} {br} cbr={cbr} {ms}ms: worst {snr:.1} dB"
         );
         let snr = c_enc_rust_dec(rate, ch, capp, ms);
         assert!(
             snr > FLOOR_DB,
-            "libopus->opus-rs {rate} {ch}ch {capp:?} {ms}ms: worst {snr:.1} dB"
+            "libopus->opus1 {rate} {ch}ch {capp:?} {ms}ms: worst {snr:.1} dB"
         );
     }
 }
@@ -224,7 +224,7 @@ fn celt_40ms_mono_and_stereo() {
 fn hybrid_60ms_mono_and_stereo() {
     // 48 kHz Voip at 32-48 kbps selects Hybrid (SILK + CELT above band 17).
     // VBR only: Hybrid *stereo* CBR is already broken at 20 ms on `main`
-    // (opus-rs->libopus ~0 dB), a pre-existing bug independent of frame size
+    // (opus1->libopus ~0 dB), a pre-existing bug independent of frame size
     // and out of scope for #35.
     check_all(48000, 1, Application::Voip, CApp::Voip, 32000, 60, &[false, true]);
     check_all(48000, 2, Application::Voip, CApp::Voip, 48000, 60, &[false]);
@@ -238,7 +238,7 @@ fn issue_repro_exact_config() {
     let mut out = vec![0u8; 4000];
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
-    // The bitrate of a new opus-rs encoder is 64 kb/s. At that rate the
+    // The bitrate of a new opus1 encoder is 64 kb/s. At that rate the
     // automatic mode is CELT-only, in libopus too: the packet holds three
     // 20 ms CELT wideband frames (TOC config 23, frame count code 3).
     let mut c_enc = CEnc::new(16000, CCh::Stereo, CApp::Voip).unwrap();

@@ -13,8 +13,8 @@
 //! The quantizer is fixed-point: the pulses and the whole state after every
 //! frame must be identical.
 
-use opus_rs::silk::nsq::silk_nsq;
-use opus_rs::silk::structs::{SideInfoIndices, SilkEncoderStateCommon, SilkNSQState};
+use opus1::silk::nsq::silk_nsq;
+use opus1::silk::structs::{SideInfoIndices, SilkEncoderStateCommon, SilkNSQState};
 
 const MAX_LPC_ORDER: usize = 16;
 const MAX_SHAPE_LPC_ORDER: usize = 24;
@@ -200,7 +200,7 @@ fn plain_quantizer_matches_libopus() {
             let got: Expected = (expected.0, h.0 & 0xffff_ffff_ffff, sum_abs, ind.signal_type as i32);
             if got != *expected {
                 failures.push(format!(
-                    "stream {stream} ({fs_khz} kHz, {nb_subfr} subframes, shaping order {shp_order}), frame {frame}: opus-rs {:?}, libopus {:?}",
+                    "stream {stream} ({fs_khz} kHz, {nb_subfr} subframes, shaping order {shp_order}), frame {frame}: opus1 {:?}, libopus {:?}",
                     got, expected
                 ));
                 // The state has left libopus's and the generator would get
@@ -210,7 +210,7 @@ fn plain_quantizer_matches_libopus() {
         }
     }
     assert!(failures.is_empty(), "first difference from libopus: {}", failures.join("\n"));
-    // The case libopus handles and opus-rs did not: an unvoiced frame after
+    // The case libopus handles and opus1 did not: an unvoiced frame after
     // a voiced one, with harmonic shaping still on.
     assert!(unvoiced_with_lag_and_shaping > 50, "{unvoiced_with_lag_and_shaping}");
 }

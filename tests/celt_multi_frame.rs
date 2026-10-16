@@ -1,6 +1,6 @@
-use opus_rs::celt::{CeltDecoder, CeltEncoder};
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 #[test]
 fn test_celt_multi_frame() {
@@ -31,7 +31,9 @@ fn test_celt_multi_frame() {
 
         // Decode
         let mut output = vec![0.0f32; frame_size];
-        decoder.decode(&encoded, frame_size, &mut output);
+        let bits = (encoded.len() * 8) as i32;
+        let mut rc_dec = RangeCoder::new_decoder(&encoded);
+        decoder.decode(&mut rc_dec, bits, frame_size, &mut output, PcmLayout::Planar);
 
         // Check
         let input_rms = pcm.iter().map(|&x| x * x).sum::<f32>().sqrt() / frame_size as f32;

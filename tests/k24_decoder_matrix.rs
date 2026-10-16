@@ -1,5 +1,5 @@
 //! Decoder matrix: every coding mode and bandwidth libopus can produce,
-//! decoded by opus-rs and by libopus at every output rate, compared sample
+//! decoded by opus1 and by libopus at every output rate, compared sample
 //! by sample.
 //!
 //! Streams: SILK-only narrowband / mediumband / wideband, Hybrid

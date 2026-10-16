@@ -4,7 +4,7 @@
 //!
 //! A damaged CELT frame is still a frame that can be decoded: the range
 //! decoder reads whatever bits there are. libopus decodes such a frame
-//! without an error, and so does opus-rs. The two must then read the same
+//! without an error, and so does opus1. The two must then read the same
 //! symbols, which shows as an equal final range, and produce the same
 //! samples.
 //!
@@ -15,9 +15,21 @@ mod k24_common;
 use audiopus_sys as sys;
 use celtdec_common::*;
 use k24_common::*;
-use opus_rs::celt::CeltDecoder;
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
+
+/// Decode all of `payload` as one CELT frame of `frame` samples per channel.
+fn decode_all(
+    dec: &mut CeltDecoder,
+    payload: &[u8],
+    frame: usize,
+    out: &mut [f32],
+    layout: PcmLayout,
+) -> usize {
+    let mut rc = RangeCoder::new_decoder(payload);
+    dec.decode(&mut rc, (payload.len() * 8) as i32, frame, out, layout)
+}
 
 /// A small deterministic random number generator.
 struct Rng(u32);
@@ -34,7 +46,7 @@ impl Rng {
 
 /// A band range without a band is a bad argument: libopus accepts a start
 /// band of 0 to 20 and an end band of 1 to 21, and decodes only when the
-/// first is below the second. opus-rs used to divide by zero in the bit
+/// first is below the second. opus1 used to divide by zero in the bit
 /// allocation for such a range.
 #[test]
 fn empty_band_range_is_rejected() {
@@ -42,36 +54,22 @@ fn empty_band_range_is_rejected() {
     for channels in [1usize, 2] {
         let mut dec = CeltDecoder::new(default_mode(), channels, 48000);
         let mut pcm = vec![0f32; 960 * channels];
-        for (start, end) in [
-            (17usize, 17usize),
-            (17, 13),
-            (0, 0),
-            (5, 3),
-            (20, 20),
-            (21, 21),
-        ] {
-            let mut rc = RangeCoder::new_decoder(&frame);
-            let n = dec.decode_from_range_coder_with_band_range(
-                &mut rc,
-                (frame.len() * 8) as i32,
-                960,
-                &mut pcm,
-                start,
-                end,
-            );
+        // Bands out of range: the setters refuse them.
+        assert!(dec.set_start_band(21).is_err());
+        assert!(dec.set_end_band(0).is_err());
+        assert!(dec.set_end_band(22).is_err());
+        // A range without a band: decoding refuses it.
+        for (start, end) in [(17usize, 17usize), (17, 13), (5, 3), (20, 20)] {
+            dec.set_start_band(start).unwrap();
+            dec.set_end_band(end).unwrap();
+            let n = decode_all(&mut dec, &frame, 960, &mut pcm, PcmLayout::Planar);
             assert_eq!(n, 0, "bands {start}..{end}");
         }
         // The decoder still works, and a range of one band is accepted.
         for (start, end) in [(0usize, 21usize), (17, 21), (20, 21), (0, 1), (17, 18)] {
-            let mut rc = RangeCoder::new_decoder(&frame);
-            let n = dec.decode_from_range_coder_with_band_range(
-                &mut rc,
-                (frame.len() * 8) as i32,
-                960,
-                &mut pcm,
-                start,
-                end,
-            );
+            dec.set_start_band(start).unwrap();
+            dec.set_end_band(end).unwrap();
+            let n = decode_all(&mut dec, &frame, 960, &mut pcm, PcmLayout::Planar);
             assert_eq!(n, 960, "bands {start}..{end}");
             assert!(pcm.iter().all(|v| v.is_finite()));
         }
@@ -79,7 +77,7 @@ fn empty_band_range_is_rejected() {
 }
 
 /// A frame length that no frame can have is a bad argument (libopus
-/// `celt_decode_with_ec`: `len < 0 || len > 1275`). opus-rs accepts what
+/// `celt_decode_with_ec`: `len < 0 || len > 1275`). opus1 accepts what
 /// its range coder can hold, 2048 bytes.
 #[test]
 fn impossible_frame_length_is_rejected() {
@@ -96,7 +94,7 @@ fn impossible_frame_length_is_rejected() {
     ] {
         let mut rc = RangeCoder::new_decoder(&frame);
         assert_eq!(
-            dec.decode_from_range_coder(&mut rc, bits, 960, &mut pcm, 0),
+            dec.decode(&mut rc, bits, 960, &mut pcm, PcmLayout::Planar),
             0,
             "{bits} bits"
         );
@@ -105,19 +103,20 @@ fn impossible_frame_length_is_rejected() {
     for bits in [0i32, 8, 9, 480, 481, 1275 * 8, 2048 * 8] {
         let mut rc = RangeCoder::new_decoder(&frame);
         assert_eq!(
-            dec.decode_from_range_coder(&mut rc, bits, 960, &mut pcm, 0),
+            dec.decode(&mut rc, bits, 960, &mut pcm, PcmLayout::Planar),
             960,
             "{bits} bits"
         );
         assert!(pcm.iter().all(|v| v.is_finite()));
     }
-    assert_eq!(dec.decode(&[0u8; 2049], 960, &mut pcm), 0);
-    assert_eq!(dec.decode(&[0u8; 2048], 960, &mut pcm), 960);
+    assert_eq!(decode_all(&mut dec, &[0u8; 2049], 960, &mut pcm, PcmLayout::Planar), 0);
+    assert_eq!(decode_all(&mut dec, &[0u8; 2048], 960, &mut pcm, PcmLayout::Planar), 960);
 }
 
-/// Every public decode function with arguments drawn at random from valid,
-/// borderline and absurd values, in any order, on one decoder. A call
-/// returns the frame size or reports the bad argument, and never panics.
+/// Every public decode function and band setter with arguments drawn at
+/// random from valid, borderline and absurd values, in any order, on one
+/// decoder, for every output layout. A call returns the frame size or
+/// reports the bad argument, and never panics.
 /// Run this test without `--release` as well: it then also catches
 /// arithmetic overflow.
 #[test]
@@ -185,23 +184,37 @@ fn extreme_arguments_do_not_panic() {
                 let out = &mut pcm[..out_lengths[rng.below(out_lengths.len())]];
                 // Stream channel counts 0 and 3 are errors and change nothing.
                 let _ = dec.set_stream_channels(rng.below(4));
+                // A band out of range is an error and changes nothing.
                 let n = match rng.below(6) {
-                    0 => dec.decode_lost(frame, out, start).unwrap_or(0),
-                    1 => dec.decode(&bytes, frame, out),
-                    2 => dec.decode_with_start_band(&bytes, frame, out, start),
+                    0 => {
+                        let _ = dec.set_start_band(start);
+                        dec.decode_lost(frame, out, PcmLayout::Planar).unwrap_or(0)
+                    }
+                    1 => {
+                        dec.set_start_band(0).unwrap();
+                        dec.set_end_band(21).unwrap();
+                        decode_all(&mut dec, &bytes, frame, out, PcmLayout::Planar)
+                    }
+                    2 => {
+                        let _ = dec.set_start_band(start);
+                        dec.set_end_band(21).unwrap();
+                        decode_all(&mut dec, &bytes, frame, out, PcmLayout::Interleaved)
+                    }
                     3 => {
+                        let _ = dec.set_start_band(start);
+                        dec.set_end_band(21).unwrap();
                         let mut rc = RangeCoder::new_decoder(&bytes);
-                        dec.decode_from_range_coder(&mut rc, bits, frame, out, start)
+                        dec.decode(&mut rc, bits, frame, out, PcmLayout::InterleavedAdd)
                     }
                     4 => {
                         dec.reset_state();
                         0
                     }
                     _ => {
+                        let _ = dec.set_start_band(start);
+                        let _ = dec.set_end_band(end);
                         let mut rc = RangeCoder::new_decoder(&bytes);
-                        dec.decode_from_range_coder_with_band_range(
-                            &mut rc, bits, frame, out, start, end,
-                        )
+                        dec.decode(&mut rc, bits, frame, out, PcmLayout::Planar)
                     }
                 };
                 assert!(n == 0 || n == frame);
@@ -324,20 +337,12 @@ fn damaged_stream(
             packet.clone()
         };
         let c = if lost {
-            assert_eq!(dec.decode_lost(frame, &mut planar, 0), Ok(frame));
+            assert_eq!(dec.decode_lost(frame, &mut planar, PcmLayout::Planar), Ok(frame));
             c_dec.decode(None, frame)
         } else {
             dec.set_stream_channels(stream_channels).unwrap();
-            let payload = &p[1..];
-            let mut rc = RangeCoder::new_decoder(payload);
-            let n = dec.decode_from_range_coder_with_band_range(
-                &mut rc,
-                (payload.len() * 8) as i32,
-                frame,
-                &mut planar,
-                0,
-                end_band(p[0]),
-            );
+            dec.set_end_band(end_band(p[0])).unwrap();
+            let n = decode_all(&mut dec, &p[1..], frame, &mut planar, PcmLayout::Planar);
             assert_eq!(n, frame, "packet {i}");
             c_dec.decode(Some(&p), frame)
         };
@@ -505,7 +510,7 @@ fn damaged_packets_and_losses_in_the_opus_decoder() {
                 let st =
                     unsafe { sys::opus_decoder_create(rate as i32, channels as i32, &mut err) };
                 assert_eq!(err, 0);
-                let mut rs = opus_rs::OpusDecoder::new(rate as i32, channels).unwrap();
+                let mut rs = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
                 let mut c_out = vec![0f32; frame * channels];
                 let mut r_out = vec![0f32; frame * channels];
                 let (mut accepted, mut rejected) = (0, 0);
@@ -531,7 +536,7 @@ fn damaged_packets_and_losses_in_the_opus_decoder() {
                     assert_eq!(
                         c_ret >= 0,
                         r_ret.is_ok(),
-                        "{case}: packet {i} of {} bytes: libopus returns {c_ret}, opus-rs {r_ret:?}",
+                        "{case}: packet {i} of {} bytes: libopus returns {c_ret}, opus1 {r_ret:?}",
                         p.len()
                     );
                     if c_ret < 0 {
@@ -624,18 +629,10 @@ fn damaged_frames_read_the_same_symbols_as_libopus() {
     let mut dec = CeltDecoder::new(default_mode(), 2, 48000);
     let mut planar = vec![0f32; 2 * 960];
     let c = c_dec.decode(Some(&packet), 960);
-    let mut rc = RangeCoder::new_decoder(&packet[1..]);
-    let n = dec.decode_from_range_coder_with_band_range(
-        &mut rc,
-        ((packet.len() - 1) * 8) as i32,
-        960,
-        &mut planar,
-        0,
-        21,
-    );
+    let n = decode_all(&mut dec, &packet[1..], 960, &mut planar, PcmLayout::Planar);
     assert_eq!(n, 960);
     assert_eq!(c_dec.final_range(), 0x159e_9700, "libopus");
-    assert_eq!(dec.final_range(), 0x159e_9700, "opus-rs");
+    assert_eq!(dec.final_range(), 0x159e_9700, "opus1");
     let db = snr(&c, &interleave(&planar, 2));
     assert!(db > 100.0, "{db:.1} dB");
 
@@ -692,15 +689,7 @@ fn output_far_above_full_scale_is_not_limited() {
             let mut packet = vec![toc_byte];
             packet.extend((0..len).map(|_| rng.next() as u8));
             let c = c_dec.decode(Some(&packet), frame);
-            let mut rc = RangeCoder::new_decoder(&packet[1..]);
-            let n = dec.decode_from_range_coder_with_band_range(
-                &mut rc,
-                (len * 8) as i32,
-                frame,
-                &mut planar,
-                0,
-                21,
-            );
+            let n = decode_all(&mut dec, &packet[1..], frame, &mut planar, PcmLayout::Planar);
             assert_eq!(n, frame);
             assert_eq!(
                 dec.final_range(),

@@ -11,11 +11,11 @@
 mod celtenc_common;
 
 use celtenc_common::Noise;
-use opus_rs::celt::CeltEncoder;
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::CeltEncoder;
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
-/// One frame of `n` samples per channel, one channel after the other.
+/// One frame of `n` samples per channel, the channels interleaved.
 fn signal(kind: u32, n: usize, channels: usize, noise: &mut Noise, phase: &mut f32) -> Vec<f32> {
     let mut x = vec![0.0f32; n * channels];
     for i in 0..n {
@@ -50,20 +50,20 @@ fn signal(kind: u32, n: usize, channels: usize, noise: &mut Noise, phase: &mut f
                 }
             }
         };
-        x[i] = s;
+        x[i * channels] = s;
         if channels == 2 {
             // The second channel is the first turned upside down for the
             // even kinds: all side, no mid.
-            x[n + i] = if kind % 2 == 0 { -s } else { 0.5 * s };
+            x[2 * i + 1] = if kind % 2 == 0 { -s } else { 0.5 * s };
         }
     }
     x
 }
 
 /// Encode one frame. Returns the payload and the final range.
-fn encode(enc: &mut CeltEncoder, pcm: &[f32], n: usize, bytes: usize, vbr: bool) -> (Vec<u8>, u32) {
+fn encode(enc: &mut CeltEncoder, pcm: &[f32], n: usize, bytes: usize) -> (Vec<u8>, u32) {
     let mut rc = RangeCoder::new_encoder(bytes as u32);
-    enc.encode_with_budget_vbr(pcm, n, &mut rc, 0, (bytes * 8) as i32, vbr);
+    enc.encode(pcm, n, &mut rc);
     rc.done();
     assert_eq!(rc.error, 0, "range coder error");
     let len = rc.storage as usize;
@@ -104,7 +104,8 @@ fn settings_changed_between_frames() {
                 }
             };
             enc.set_vbr(vbr);
-            enc.set_bitrate(if vbr { bitrate as i32 } else { -1 });
+            let celt_bitrate = if vbr { bitrate as i32 } else { -1 };
+            enc.set_bitrate(celt_bitrate).unwrap();
             enc.set_constrained_vbr(pick(2) == 0);
             enc.complexity = pick(11) as i32;
             let end = [13usize, 17, 19, 21][pick(4)];
@@ -119,7 +120,7 @@ fn settings_changed_between_frames() {
             }
             let kind = pick(8) as u32;
             let pcm = signal(kind, n, channels, &mut noise, &mut phase);
-            let (payload, range) = encode(&mut enc, &pcm, n, bytes, vbr);
+            let (payload, range) = encode(&mut enc, &pcm, n, bytes);
 
             let toc = celtenc_common::celt_toc_lm(end, stream_channels, lm);
             let mut packet = vec![toc];

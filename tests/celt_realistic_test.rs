@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::celt::{CeltDecoder, CeltEncoder};
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 /// Test CELT loopback at a realistic bitrate (160 bytes per frame @ 960 samples)
 /// to isolate whether the CELT codec itself works, vs the OpusEncoder wrapper.
@@ -41,7 +41,9 @@ fn test_celt_realistic_bitrate() {
         let compressed = rc.buf[..budget].to_vec();
 
         let mut pcm_out = vec![0.0f32; frame_size * channels];
-        decoder.decode(&compressed, frame_size, &mut pcm_out);
+        let bits = (compressed.len() * 8) as i32;
+        let mut rc = RangeCoder::new_decoder(&compressed);
+        decoder.decode(&mut rc, bits, frame_size, &mut pcm_out, PcmLayout::Planar);
         all_out.extend_from_slice(&pcm_out);
     }
 

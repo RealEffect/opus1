@@ -63,8 +63,7 @@ pub fn silk_nsq(
 
             if (k & (3 - (lsf_interpolation_flag << 1) as usize)) == 0 {
                 // Clamp: lag/order are geometry-bounded for valid streams; a
-                // corrupted state must not yield a negative start index
-                // (issue #27 deep-scan).
+                // corrupted state must not yield a negative start index.
                 let start_idx_signed = (ps_enc_c.ltp_mem_length
                     - lag as i32
                     - ps_enc_c.predict_lpc_order

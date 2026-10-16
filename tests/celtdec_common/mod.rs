@@ -1,6 +1,6 @@
 //! Shared helpers for the `celtdec_*` tests.
 //!
-//! These tests compare opus-rs's CELT decoder with C libopus on the same
+//! These tests compare opus1's CELT decoder with C libopus on the same
 //! packets: loss concealment, and decoding with a channel count that
 //! differs from the packet's. The signals and the C encoder wrapper come
 //! from `k24_common`. This module adds what those tests need on top.
@@ -136,7 +136,7 @@ impl std::fmt::Display for Group {
     }
 }
 
-/// How opus-rs compares with libopus over a stream with lost packets.
+/// How opus1 compares with libopus over a stream with lost packets.
 #[derive(Debug, Clone, Copy)]
 pub struct LossStats {
     /// Number of lost frames.
@@ -173,7 +173,7 @@ impl std::fmt::Display for LossStats {
     }
 }
 
-/// Decode `packets` with libopus and with opus-rs, treating the packets
+/// Decode `packets` with libopus and with opus1, treating the packets
 /// marked in `lost` as lost. Both decoders produce `frame` samples per
 /// channel for every packet. Returns the two outputs, interleaved.
 ///
@@ -190,7 +190,7 @@ pub fn decode_with_loss(
     frame: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let mut c_dec = CDecoder::new(rate, channels);
-    let mut rs_dec = opus_rs::OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
     let (mut c, mut r) = (Vec::new(), Vec::new());
     let mut buf = vec![0f32; frame * channels];
     for (i, p) in packets.iter().enumerate() {

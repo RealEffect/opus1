@@ -30,7 +30,7 @@ mod multistream_dec_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_dec_common::*;
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 use std::f64::consts::PI;
 
 const OPUS_SET_FORCE_CHANNELS_REQUEST: i32 = 4022;
@@ -192,7 +192,7 @@ fn mono_silk_stream_has_fec(stream: &StreamPacket) -> bool {
     let t = toc(stream.toc);
     assert!(t.mode == Mode::Silk && !t.stereo);
     let silk_frames = (t.frame_48k / 960).max(1);
-    let parsed = opus_rs::packet::parse(&stream.packet, false).unwrap();
+    let parsed = opus1::packet::parse(&stream.packet, false).unwrap();
     let first = parsed.frame(&stream.packet, 0);
     !first.is_empty() && first[0] & (0x80 >> silk_frames) != 0
 }
@@ -363,12 +363,12 @@ fn run_steps_against_c(e: &Encoded, fs: i32, steps: &[Step]) -> Tally {
         if spec.sixteen {
             let c = c_dec.decode_i16(packet, frame_size, spec.fec);
             let r = if spec.fec { r_dec.decode_fec_i16(packet, frame_size, &mut out16) } else { r_dec.decode_i16(packet, frame_size, &mut out16) };
-            assert_eq!((c.is_ok(), r.is_ok()), (spec.ok, spec.ok), "{}: C {:?}, opus-rs {r:?}", what(), c.as_ref().map(|pcm| pcm.len() / ch));
+            assert_eq!((c.is_ok(), r.is_ok()), (spec.ok, spec.ok), "{}: C {:?}, opus1 {r:?}", what(), c.as_ref().map(|pcm| pcm.len() / ch));
             if let (Ok(c), Ok(n)) = (c, r) {
                 assert_eq!(c.len(), n * ch, "{}: samples", what());
                 for (&c, &r) in c.iter().zip(&out16[..n * ch]) {
                     let d = (c as i32 - r as i32).abs();
-                    assert!(d <= 1, "{}: C {c}, opus-rs {r}", what());
+                    assert!(d <= 1, "{}: C {c}, opus1 {r}", what());
                     tally.differing_16 += (d != 0) as usize;
                     tally.full_scale_16 += (c == i16::MAX || c == i16::MIN) as usize;
                 }
@@ -377,7 +377,7 @@ fn run_steps_against_c(e: &Encoded, fs: i32, steps: &[Step]) -> Tally {
         } else {
             let c = c_dec.decode_float(packet, frame_size, spec.fec);
             let r = if spec.fec { r_dec.decode_fec(packet, frame_size, &mut out) } else { r_dec.decode(packet, frame_size, &mut out) };
-            assert_eq!((c.is_ok(), r.is_ok()), (spec.ok, spec.ok), "{}: C {:?}, opus-rs {r:?}", what(), c.as_ref().map(|pcm| pcm.len() / ch));
+            assert_eq!((c.is_ok(), r.is_ok()), (spec.ok, spec.ok), "{}: C {:?}, opus1 {r:?}", what(), c.as_ref().map(|pcm| pcm.len() / ch));
             if let (Ok(c), Ok(n)) = (c, r) {
                 assert_eq!(c.len(), n * ch, "{}: samples", what());
                 for channel in 0..ch {
@@ -517,7 +517,7 @@ fn run_steps_against_stream_decoders(e: &Encoded, fs: i32, steps: &[Step]) -> us
             let r = if spec.fec { ms.decode_fec(packet, frame_size, &mut out) } else { ms.decode(packet, frame_size, &mut out) };
             (c, r)
         };
-        assert_eq!((c.is_ok(), r.is_ok()), (spec.ok, spec.ok), "{}: C {c:?}, opus-rs {r:?}", what());
+        assert_eq!((c.is_ok(), r.is_ok()), (spec.ok, spec.ok), "{}: C {c:?}, opus1 {r:?}", what());
         let Ok(n) = r else {
             // A call that fails writes nothing.
             assert!(out.iter().all(|&v| v == 0.25) && out16.iter().all(|&v| v == 77), "{}: a rejected call wrote samples", what());
@@ -622,11 +622,11 @@ fn join_packets(e: &Encoded, group: &[Vec<u8>]) -> Option<Vec<u8>> {
         let mut frames: Vec<&[u8]> = Vec::new();
         for parts in &split {
             let stream = &parts[s].packet;
-            let parsed = opus_rs::packet::parse(stream, false).unwrap();
+            let parsed = opus1::packet::parse(stream, false).unwrap();
             frames.extend(parsed.frames(stream));
         }
         let mut buf = vec![0u8; 6 * 1277 + 8];
-        let len = opus_rs::packet::write(toc_byte, &frames, &mut buf, s + 1 != e.streams, false).unwrap();
+        let len = opus1::packet::write(toc_byte, &frames, &mut buf, s + 1 != e.streams, false).unwrap();
         joined.extend_from_slice(&buf[..len]);
     }
     Some(joined)
@@ -853,7 +853,7 @@ fn damaged_packets_on_the_widest_layouts_get_the_verdict_of_libopus() {
                     accepted += 1;
                 }
                 (Err(_), Err(_)) => rejected += 1,
-                (c, r) => panic!("{what}: C {c:?}, opus-rs {r:?}"),
+                (c, r) => panic!("{what}: C {c:?}, opus1 {r:?}"),
             }
         }
     }
@@ -958,7 +958,7 @@ fn made_up_packets_get_the_verdict_of_libopus() {
                         accepted += 1;
                     }
                     (Err(_), Err(_)) => rejected += 1,
-                    (c, r) => panic!("{what}: C {c:?}, opus-rs {r:?}"),
+                    (c, r) => panic!("{what}: C {c:?}, opus1 {r:?}"),
                 }
             }
         }

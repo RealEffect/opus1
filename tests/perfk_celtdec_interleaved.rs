@@ -1,15 +1,15 @@
-//! The CELT decoder's functions with interleaved output
-//! (`CeltDecoder::decode_interleaved`, `decode_lost_interleaved`) must give
-//! the same samples as the functions with planar output, bit for bit, in
-//! the other layout. With `add` they must give the sum of those samples and
-//! what the buffer held.
+//! The CELT decoder's interleaved output layouts
+//! (`PcmLayout::Interleaved`, `PcmLayout::InterleavedAdd`) must give the
+//! same samples as the planar layout, bit for bit, in the other order. With
+//! `InterleavedAdd` they must give the sum of those samples and what the
+//! buffer held.
 //!
 //! Two decoders are fed the same packets. One writes planar, the other
 //! interleaved. Their states stay equal, so every frame can be compared.
 
-use opus_rs::celt::{CeltDecoder, CeltEncoder};
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 /// A tone with noise bursts and pauses, different in the two channels.
 fn test_signal(channels: usize, samples: usize) -> Vec<f32> {
@@ -47,11 +47,12 @@ fn encode(
     let mode = default_mode();
     let pcm = test_signal(channels, frames * n);
     let mut enc = CeltEncoder::new(mode, channels);
+    enc.set_start_band(start_band).unwrap();
     (0..frames)
         .map(|k| {
             let frame = &pcm[k * n * channels..(k + 1) * n * channels];
             let mut rc = RangeCoder::new_encoder(bytes as u32);
-            enc.encode_with_budget(frame, n, &mut rc, start_band, (bytes * 8) as i32);
+            enc.encode(frame, n, &mut rc);
             rc.done();
             rc.buf[..bytes].to_vec()
         })
@@ -80,8 +81,16 @@ fn compare(
     let frame_size = n * rate as usize / 48000;
     let mut planar_dec = CeltDecoder::new(mode, channels, rate);
     let mut inter_dec = CeltDecoder::new(mode, channels, rate);
-    planar_dec.set_stream_channels(stream_channels).unwrap();
-    inter_dec.set_stream_channels(stream_channels).unwrap();
+    for dec in [&mut planar_dec, &mut inter_dec] {
+        dec.set_stream_channels(stream_channels).unwrap();
+        dec.set_start_band(start_band).unwrap();
+        dec.set_end_band(mode.nb_ebands).unwrap();
+    }
+    let layout = if add {
+        PcmLayout::InterleavedAdd
+    } else {
+        PcmLayout::Interleaved
+    };
     let mut planar = vec![0.0f32; frame_size * channels];
     // Two extra samples show a write past the frame.
     let mut inter = vec![0.0f32; frame_size * channels + 2];
@@ -96,33 +105,16 @@ fn compare(
         let bits = (packet.len() * 8) as i32;
         if lost(k) {
             planar_dec
-                .decode_lost(frame_size, &mut planar, start_band)
+                .decode_lost(frame_size, &mut planar, PcmLayout::Planar)
                 .unwrap();
-            let got = inter_dec
-                .decode_lost_interleaved(frame_size, &mut inter, start_band, add)
-                .unwrap();
+            let got = inter_dec.decode_lost(frame_size, &mut inter, layout).unwrap();
             assert_eq!(got, frame_size, "{what}: frame {k}");
         } else {
             let mut rc = RangeCoder::new_decoder(packet);
-            let got = planar_dec.decode_from_range_coder_with_band_range(
-                &mut rc,
-                bits,
-                frame_size,
-                &mut planar,
-                start_band,
-                mode.nb_ebands,
-            );
+            let got = planar_dec.decode(&mut rc, bits, frame_size, &mut planar, PcmLayout::Planar);
             assert_eq!(got, frame_size, "{what}: frame {k}");
             let mut rc = RangeCoder::new_decoder(packet);
-            let got = inter_dec.decode_interleaved(
-                &mut rc,
-                bits,
-                frame_size,
-                &mut inter,
-                start_band,
-                mode.nb_ebands,
-                add,
-            );
+            let got = inter_dec.decode(&mut rc, bits, frame_size, &mut inter, layout);
             assert_eq!(got, frame_size, "{what}: frame {k}");
         }
         assert_eq!(
@@ -220,16 +212,16 @@ fn interleaved_output_matches_planar_output_when_channel_counts_differ() {
 }
 
 #[test]
-fn interleaved_functions_reject_a_short_buffer() {
+fn interleaved_layouts_reject_a_short_buffer() {
     let mode = default_mode();
     let packets = encode(2, 960, 1, 60, 0);
     let mut dec = CeltDecoder::new(mode, 2, 48000);
     let mut short = vec![0.0f32; 2 * 960 - 1];
     let mut rc = RangeCoder::new_decoder(&packets[0]);
-    let got = dec.decode_interleaved(&mut rc, 480, 960, &mut short, 0, mode.nb_ebands, false);
+    let got = dec.decode(&mut rc, 480, 960, &mut short, PcmLayout::Interleaved);
     assert_eq!(got, 0);
     assert!(
-        dec.decode_lost_interleaved(960, &mut short, 0, true)
+        dec.decode_lost(960, &mut short, PcmLayout::InterleavedAdd)
             .is_err()
     );
     assert!(short.iter().all(|&v| v == 0.0));

@@ -18,7 +18,7 @@
 //!
 //! Decode errors are fine; panics are not.
 
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 
 /// xorshift64* — deterministic, dependency-free.
 struct Lcg(u64);

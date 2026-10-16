@@ -10,7 +10,7 @@
 //!   CELT payload's tail bits differ from libopus's (deeper CELT-encoder
 //!   divergence, tracked for follow-up).
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 #[test]
 fn issue45_starved_cbr() {
@@ -75,7 +75,7 @@ fn issue46_low_cbr() {
 
 /// Issue #46 acceptance: at CBR below the CELT-only threshold the packets are
 /// small CELT (not PLC placeholders) and decode to real audio through both
-/// opus-rs and libopus.
+/// opus1 and libopus.
 #[test]
 fn issue46_low_cbr_decodes_as_celt() {
     use opus::{Channels as CCh, Decoder as CDec};
@@ -139,7 +139,7 @@ fn issue46_low_cbr_decodes_as_celt() {
         let worst_rs = snr_stream(&rs_pcm);
         let worst_c = snr_stream(&c_pcm);
         println!(
-            "{sr} {ms}ms {bps}bps: best-lag SNR opus-rs {worst_rs:.1} dB, libopus {worst_c:.1} dB"
+            "{sr} {ms}ms {bps}bps: best-lag SNR opus1 {worst_rs:.1} dB, libopus {worst_c:.1} dB"
         );
         // The structural fix: small valid CELT-only packets instead of PLC
         // placeholders, decoding consistently in both decoders. Known
@@ -148,7 +148,7 @@ fn issue46_low_cbr_decodes_as_celt() {
         // for follow-up.
         assert!(
             worst_rs > floor,
-            "{sr} {bps}: opus-rs CELT SNR {worst_rs:.1} < {floor} — packets do not decode as CELT audio"
+            "{sr} {bps}: opus1 CELT SNR {worst_rs:.1} < {floor} — packets do not decode as CELT audio"
         );
         assert!(
             (worst_rs - worst_c).abs() < 0.5,

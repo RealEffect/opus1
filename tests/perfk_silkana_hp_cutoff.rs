@@ -1,8 +1,8 @@
-//! `hp_cutoff` converts and filters its float input in blocks of 480 samples.
-//! These tests require that the result equals one pass over the whole input:
-//! the 16-bit entry point `hp_cutoff_i16` on the converted samples.
+//! `hp_cutoff` rounds its float input to 16 bits and filters it. These tests
+//! require that the result equals the 16-bit entry point `hp_cutoff_i16` on
+//! the rounded samples, for every length.
 
-use opus_rs::hp_cutoff::{hp_cutoff, hp_cutoff_i16};
+use opus1::hp_cutoff::{hp_cutoff, hp_cutoff_i16};
 
 /// xorshift64 generator with a fixed seed, so the test data never changes.
 struct XorShift(u64);

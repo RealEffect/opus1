@@ -1,7 +1,7 @@
 //! Self-test of `tests/ms_support`.
 //!
 //! Every test here runs C libopus against C libopus, or a helper against a C
-//! function or a known value. Nothing uses opus-rs. When this file passes, a
+//! function or a known value. Nothing uses opus1. When this file passes, a
 //! failure in another multistream test is not a fault of the helpers.
 //!
 //! What is checked:

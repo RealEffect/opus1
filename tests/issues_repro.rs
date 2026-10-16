@@ -2,7 +2,7 @@
 //!
 //! Each test mirrors the minimal reproducer from the corresponding issue.
 
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 
 fn try_decode(label: &str, pkt: &[u8], frame_size: usize, channels: usize) {
     let mut dec = OpusDecoder::new(48000, channels).unwrap();
@@ -189,14 +189,14 @@ fn issue_7_decode_returns_actual_sample_count() {
 // ---------------------------------------------------------------------------
 // Issue #7 sub-item 3: Stereo SILK must decode M/S, not replicate mono.
 //
-// libopus encodes these streams: opus-rs's own encoder codes stereo as the
+// libopus encodes these streams: opus1's own encoder codes stereo as the
 // mid only (issue #42), so its packets cannot show whether the decoder
 // applies the predictor and the side channel.
 // ---------------------------------------------------------------------------
 
 /// Encode 0.5 s of 16 kHz stereo SILK with libopus, with `l`/`r` giving each
-/// channel's sample at time `t`, and decode it with opus-rs and with libopus.
-/// Returns both interleaved outputs, opus-rs's first.
+/// channel's sample at time `t`, and decode it with opus1 and with libopus.
+/// Returns both interleaved outputs, opus1's first.
 fn libopus_stereo_silk(l: impl Fn(f64) -> f32, r: impl Fn(f64) -> f32) -> (Vec<f32>, Vec<f32>) {
     use opus::{
         Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh,
@@ -241,7 +241,7 @@ fn channel_snr(reference: &[f32], test: &[f32], c: usize) -> f64 {
     10.0 * (sig / err.max(1e-30)).log10()
 }
 
-/// opus-rs's SILK decoder is fixed-point like libopus's, so the two agree
+/// opus1's SILK decoder is fixed-point like libopus's, so the two agree
 /// to float rounding (~190 dB measured). A predictor dequantized one step
 /// off (the old 6553 constant) or a stereo state wrongly reset shows as a
 /// small but systematic error, far below this.
@@ -252,7 +252,7 @@ fn assert_matches_libopus(rs: &[f32], c: &[f32]) {
         let snr = channel_snr(c, rs, ch);
         assert!(
             snr > SILK_MATCH_DB,
-            "{name}: opus-rs vs libopus {snr:.1} dB"
+            "{name}: opus1 vs libopus {snr:.1} dB"
         );
     }
 }
@@ -310,7 +310,7 @@ fn _dbg() {
 // ---------------------------------------------------------------------------
 #[test]
 fn silk_plc_produces_concealment_audio() {
-    use opus_rs::{Application, OpusDecoder, OpusEncoder};
+    use opus1::{Application, OpusDecoder, OpusEncoder};
     let sr = 16000;
     let fs = 320;
     let mut enc = OpusEncoder::new(sr, 1, Application::Voip).unwrap();

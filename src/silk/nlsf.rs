@@ -199,7 +199,7 @@ fn silk_a2nlsf_mid(x0: i32, x1: i32) -> i32 {
 /// times. libopus evaluates the polynomial one point after the other.
 /// Here the values at all table points are computed first, and the three
 /// halving steps use the values at all seven points they can reach. Every
-/// value is computed by the same operations as before, so the result is
+/// value is computed by the same operations as in libopus, so the result is
 /// the same.
 pub fn silk_a2nlsf(nlsf: &mut [i16], a_q16: &mut [i32], d: usize) {
     let mut polys = [[0i32; MAX_LPC_ORDER / 2 + 1]; 2];
@@ -393,7 +393,7 @@ pub fn silk_nlsf_stabilize(nlsf_q15: &mut [i16], n_delta_min_q15: &[i16], l: usi
     }
 
     if loops == MAX_LOOPS {
-        crate::compat::sort(&mut nlsf_q15[..l]);
+        nlsf_q15[..l].sort_unstable();
 
         nlsf_q15[0] = nlsf_q15[0].max(n_delta_min_q15[0]);
 

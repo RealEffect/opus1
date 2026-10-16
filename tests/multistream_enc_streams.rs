@@ -29,10 +29,10 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::multistream::encoder::MultistreamEncoder;
-use opus_rs::multistream::layout::MappingType;
-use opus_rs::multistream::surround::SurroundProbe;
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::multistream::encoder::MultistreamEncoder;
+use opus1::multistream::layout::MappingType;
+use opus1::multistream::surround::SurroundProbe;
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// A rising sine with a little noise, different on every channel.
 fn sweeps(fs: i32, channels: usize, samples: usize) -> Vec<f32> {
@@ -260,9 +260,8 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                     }
                 }
                 // The stream may use what the streams before it left,
-                // less the room kept for those after it. A stream that is
-                // left one byte is handed two (difference D2).
-                let room = stream_limit(limit, used, streams, s).clamp(2, single_out.len());
+                // less the room kept for those after it.
+                let room = stream_limit(limit, used, streams, s).clamp(1, single_out.len());
                 used += parts[s].used;
                 let m = single
                     .encode(

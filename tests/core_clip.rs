@@ -9,7 +9,7 @@
 mod core_common;
 
 use core_common::*;
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 use std::f64::consts::PI;
 
 /// A low tone far beyond full scale: every 2.5 ms frame ends inside a

@@ -1,16 +1,16 @@
 //! Issue #43: SILK-only VBR must code at `bitrate_bps`, not at the size of
 //! the output buffer.
 //!
-//! opus-rs used to derive the SILK target rate from the packet budget, which
+//! opus1 used to derive the SILK target rate from the packet budget, which
 //! under VBR is the caller's output buffer (capped at 1276 bytes): a 1500-byte
 //! buffer asked SILK for ~510 kb/s, `silk_control_snr` saturated, and every
 //! bitrate from 12 to 64 kb/s coded the same ~87-byte packets. libopus derives
 //! the rate from the bitrate and only caps it by the buffer
 //! (opus_encoder.c `bits_target` / `total_bitRate`).
 //!
-//! These tests put libopus (the `opus` dev-dependency) beside opus-rs at the
+//! These tests put libopus (the `opus` dev-dependency) beside opus1 at the
 //! same settings and compare packet sizes. They stay mono and FEC-free:
-//! opus-rs codes stereo as the mid only (#48), and its SILK encoder does not
+//! opus1 codes stereo as the mid only (#48), and its SILK encoder does not
 //! yet subtract the LBRR bits from the frame target, so neither regime is
 //! comparable on size.
 
@@ -18,7 +18,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus_rs::{Application, ForcedMode, OpusEncoder};
+use opus1::{Application, ForcedMode, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Packets per stream, and how many leading packets are warm-up.
@@ -96,7 +96,7 @@ fn assert_silk_toc(setup: Setup, pkt: &[u8], who: &str, p: usize) {
     );
 }
 
-/// opus-rs packets for `setup`, encoded into an output buffer of `buf_len`.
+/// opus1 packets for `setup`, encoded into an output buffer of `buf_len`.
 fn rs_packets(setup: Setup, cbr: bool, buf_len: usize) -> Vec<Vec<u8>> {
     let frame = setup.frame();
     let input = voiced(setup.sr, frame * PACKETS);
@@ -113,14 +113,14 @@ fn rs_packets(setup: Setup, cbr: bool, buf_len: usize) -> Vec<Vec<u8>> {
         .map(|p| {
             let n = enc
                 .encode(&input[p * frame..(p + 1) * frame], frame, &mut out)
-                .unwrap_or_else(|e| panic!("packet {p}: opus-rs encode failed: {e}"));
-            assert_silk_toc(setup, &out[..n], "opus-rs", p);
+                .unwrap_or_else(|e| panic!("packet {p}: opus1 encode failed: {e}"));
+            assert_silk_toc(setup, &out[..n], "opus1", p);
             out[..n].to_vec()
         })
         .collect()
 }
 
-/// libopus VBR packets for `setup`, pinned to opus-rs's settings.
+/// libopus VBR packets for `setup`, pinned to opus1's settings.
 fn c_packets(setup: Setup) -> Vec<Vec<u8>> {
     let frame = setup.frame();
     let input = voiced(setup.sr, frame * PACKETS);
@@ -154,10 +154,10 @@ fn mean_bytes(packets: &[Vec<u8>]) -> f64 {
     tail.iter().map(Vec::len).sum::<usize>() as f64 / tail.len() as f64
 }
 
-/// The band opus-rs's mean VBR packet must sit in, as a ratio to libopus's at
+/// The band opus1's mean VBR packet must sit in, as a ratio to libopus's at
 /// the same settings. Before the fix it was 2.3-3.2x at 12-24 kb/s.
 ///
-/// Measured against libopus 1.5.2 (opus-rs / libopus):
+/// Measured against libopus 1.5.2 (opus1 / libopus):
 /// - 16 kHz WB, 20 ms: 0.78 at 12 kb/s, 0.82 at 16k, 0.87 at 24k, 0.89 at
 ///   32k, 0.94 at 64k.
 /// - 24 kb/s WB: 0.84 at 10 ms, 0.88 at 60 ms.
@@ -166,7 +166,7 @@ fn mean_bytes(packets: &[Vec<u8>]) -> f64 {
 /// The band is asymmetric because the WB shortfall is not a rate error.
 /// Both encoders get the same SILK target, and pick near-identical side
 /// info: signal types, quantizer offsets, LTP scale and gains. libopus then
-/// codes ~140 bits of excitation pulses a frame at 12 kb/s, where opus-rs
+/// codes ~140 bits of excitation pulses a frame at 12 kb/s, where opus1
 /// codes ~93. That is a separate SILK encoder divergence, and it grows with
 /// the internal rate (NB 1.01, MB 0.96, WB 0.78). Raise `MIN_RATIO` once
 /// it's fixed.
@@ -175,7 +175,7 @@ const MIN_RATIO: f64 = 0.70;
 
 /// libopus 1.5.2 and older compute the 60 ms SILK rate with an integer frame
 /// rate (`8*bytes_target*frame_rate`, frame_rate = 16, not 16.67), so their
-/// target sits ~4% under libopus 1.6.1's `bits_to_bitrate`, which opus-rs
+/// target sits ~4% under libopus 1.6.1's `bits_to_bitrate`, which opus1
 /// follows. 10/20/40 ms agree exactly at multiples of 400 b/s.
 const MAX_RATIO_60MS_EXTRA: f64 = 0.04;
 
@@ -184,9 +184,9 @@ const MAX_RATIO_60MS_EXTRA: f64 = 0.04;
 /// is the check that would catch a drift.
 const MAX_OVER_TARGET: f64 = 1.05;
 
-/// Encode `setup` with both encoders and check opus-rs's VBR packet sizes
+/// Encode `setup` with both encoders and check opus1's VBR packet sizes
 /// against libopus's and against the bitrate's own target. Returns
-/// opus-rs's mean.
+/// opus1's mean.
 fn check_tracks_libopus(setup: Setup) -> f64 {
     let rs = rs_packets(setup, false, 1500);
     let c = c_packets(setup);
@@ -194,7 +194,7 @@ fn check_tracks_libopus(setup: Setup) -> f64 {
     let ratio = rs_mean / c_mean;
     let target = setup.target_bytes();
     println!(
-        "{:>5} Hz {:>2} ms {:>5} b/s: opus-rs {rs_mean:6.1} B (max {:3}), \
+        "{:>5} Hz {:>2} ms {:>5} b/s: opus1 {rs_mean:6.1} B (max {:3}), \
          libopus {c_mean:6.1} B, ratio {ratio:.3}, target {target:5.1} B",
         setup.sr,
         setup.ms,
@@ -209,7 +209,7 @@ fn check_tracks_libopus(setup: Setup) -> f64 {
     let max_ratio = MAX_RATIO + extra;
     assert!(
         (MIN_RATIO..=max_ratio).contains(&ratio),
-        "{} Hz {} ms {} b/s: opus-rs mean {rs_mean:.1} B is {ratio:.3}x libopus's \
+        "{} Hz {} ms {} b/s: opus1 mean {rs_mean:.1} B is {ratio:.3}x libopus's \
          {c_mean:.1} B (allowed {MIN_RATIO}..={max_ratio})",
         setup.sr,
         setup.ms,
@@ -217,7 +217,7 @@ fn check_tracks_libopus(setup: Setup) -> f64 {
     );
     assert!(
         rs_mean <= MAX_OVER_TARGET * target,
-        "{} Hz {} ms {} b/s: opus-rs mean {rs_mean:.1} B overshoots the {target:.1} B \
+        "{} Hz {} ms {} b/s: opus1 mean {rs_mean:.1} B overshoots the {target:.1} B \
          target",
         setup.sr,
         setup.ms,
@@ -236,7 +236,7 @@ fn silk_vbr_size_tracks_bitrate_like_libopus() {
         .collect();
     assert!(
         means.windows(2).all(|w| w[0] < w[1]),
-        "opus-rs VBR packet size does not rise with bitrate_bps: {means:.1?}"
+        "opus1 VBR packet size does not rise with bitrate_bps: {means:.1?}"
     );
 }
 

@@ -8,7 +8,7 @@
 //! with the wider bandwidth then predicts the bands that come back from
 //! zero on both sides.
 //!
-//! The CELT encoder of opus-rs (src/celt.rs, `CeltEncoder::encode_impl`)
+//! The CELT encoder of opus1 (src/celt.rs, `CeltEncoder::encode_impl`)
 //! clears them too since 1947a49. Before, it predicted the bands that come
 //! back from the energies they had before the bandwidth narrowed, and the
 //! decoder from zero. From then on the encoder's picture of the decoder
@@ -23,7 +23,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech};
-use opus_rs::{Application, Bandwidth, OpusEncoder};
+use opus1::{Application, Bandwidth, OpusEncoder};
 
 fn energy_db(x: &[f32]) -> f64 {
     let e = x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64;
@@ -33,7 +33,7 @@ fn energy_db(x: &[f32]) -> f64 {
 /// A constant-bitrate stream of 2.5 ms frames. Every 16th packet gets a
 /// buffer of 1 byte and carries no audio, and the one after it gets `small`
 /// bytes: that packet is narrowband, the others are super-wideband.
-/// Returns the largest distance in level, in dB, between the opus-rs
+/// Returns the largest distance in level, in dB, between the opus1
 /// stream and the libopus stream over the three packets after each narrow
 /// one.
 fn level_distance_after_a_narrow_packet(small: usize) -> f64 {

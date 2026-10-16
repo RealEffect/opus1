@@ -2,11 +2,11 @@
 //! `silk_stereo_LR_to_MS` and a second SILK channel for the side, checked per
 //! channel against libopus (the `opus` dev-dependency).
 //!
-//! Each case encodes one stereo signal with opus-rs and with libopus at the
+//! Each case encodes one stereo signal with opus1 and with libopus at the
 //! same settings, decodes both streams with libopus, and compares what comes
 //! out against the input, channel by channel. Assertions are relative to
-//! libopus's own encoder. The opus-rs decoder must agree with libopus on
-//! opus-rs's packets.
+//! libopus's own encoder. The opus1 decoder must agree with libopus on
+//! opus1's packets.
 //!
 //! Coding the mid alone gives both channels the same signal. The cases where
 //! that loses most: content that isn't amplitude-panned (two independent
@@ -16,7 +16,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -226,10 +226,10 @@ struct Case {
     bandwidth: CBw,
     /// In-band FEC at this packet-loss percentage.
     fec_loss: Option<i32>,
-    /// How far below libopus's per-channel SNR opus-rs may fall.
+    /// How far below libopus's per-channel SNR opus1 may fall.
     snr_margin_db: f64,
-    /// Whether to require opus-rs's decoder to agree with libopus's on
-    /// opus-rs's packets.
+    /// Whether to require opus1's decoder to agree with libopus's on
+    /// opus1's packets.
     check_decoder: bool,
     signal: fn(usize, usize) -> Vec<f32>,
 }
@@ -272,11 +272,11 @@ struct Stream {
 
 struct Measured {
     input: Vec<f32>,
-    /// opus-rs's packets, decoded by libopus.
+    /// opus1's packets, decoded by libopus.
     rs: Stream,
     /// libopus's packets, decoded by libopus.
     c: Stream,
-    /// Per channel, worst-window SNR of opus-rs's decode of opus-rs's packets
+    /// Per channel, worst-window SNR of opus1's decode of opus1's packets
     /// against libopus's decode of the same packets.
     agreement: [f64; 2],
 }
@@ -294,7 +294,7 @@ fn run(case: &Case) -> Measured {
     // the input as mono below ~18 kb/s.
     rs_enc.set_force_channels(Some(CH)).unwrap();
 
-    // libopus at opus-rs's settings, pinned to voice and to a stereo stream
+    // libopus at opus1's settings, pinned to voice and to a stereo stream
     // (below ~18 kb/s it would otherwise switch to mono).
     let mut c_enc = CEnc::new(sr as u32, CCh::Stereo, CApp::Voip).unwrap();
     c_enc.set_bitrate(CBitrate::Bits(case.bitrate)).unwrap();
@@ -338,7 +338,7 @@ fn run(case: &Case) -> Measured {
         for (k, (dec, fec_dec, stream)) in streams.iter_mut().enumerate() {
             let n = if k == 0 {
                 rs_enc.encode(pcm, frame, &mut pkt).unwrap_or_else(|e| {
-                    panic!("{}: packet {p}: opus-rs encode failed: {e}", case.name)
+                    panic!("{}: packet {p}: opus1 encode failed: {e}", case.name)
                 })
             } else {
                 c_enc.encode_float(pcm, &mut pkt).unwrap()
@@ -384,7 +384,7 @@ fn run(case: &Case) -> Measured {
     }
 }
 
-/// Decoder agreement on opus-rs's packets (issue_27's `MATCH_DB`).
+/// Decoder agreement on opus1's packets (issue_27's `MATCH_DB`).
 const MATCH_DB: f64 = 30.0;
 /// How far each decoded channel's gain against the input mid may stray from
 /// libopus's.
@@ -400,7 +400,7 @@ fn check(case: &Case) -> (Measured, Channels, Channels) {
     );
     let kbps = |bytes: usize| bytes as f64 * 8.0 / SECONDS as f64 / 1000.0;
     println!(
-        "{:<30} opus-rs: L {:+.2}·mid  R {:+.2}·mid  SNR L {:+.1} R {:+.1} dB  L·R {:+.2}  {:.1} kb/s",
+        "{:<30} opus1: L {:+.2}·mid  R {:+.2}·mid  SNR L {:+.1} R {:+.1} dB  L·R {:+.2}  {:.1} kb/s",
         case.name,
         rs.gain[0],
         rs.gain[1],
@@ -420,7 +420,7 @@ fn check(case: &Case) -> (Measured, Channels, Channels) {
         kbps(m.c.bytes)
     );
     println!(
-        "{:<30} opus-rs vs libopus decoder: L {:.1} R {:.1} dB",
+        "{:<30} opus1 vs libopus decoder: L {:.1} R {:.1} dB",
         "", m.agreement[0], m.agreement[1]
     );
     for (ch, name) in ["L", "R"].iter().enumerate() {
@@ -440,7 +440,7 @@ fn check(case: &Case) -> (Measured, Channels, Channels) {
         );
         assert!(
             !case.check_decoder || m.agreement[ch] > MATCH_DB,
-            "{}: opus-rs and libopus decode opus-rs's {name} differently: {:.1} dB",
+            "{}: opus1 and libopus decode opus1's {name} differently: {:.1} dB",
             case.name,
             m.agreement[ch]
         );
@@ -541,7 +541,7 @@ fn every_silk_frame_size_codes_the_side() {
             check(&Case {
                 frame_ms,
                 cbr,
-                // opus-rs's decoder doesn't match libopus on 10 ms SILK
+                // opus1's decoder doesn't match libopus on 10 ms SILK
                 // frames, libopus's own included, mono or stereo; the
                 // encoder is judged through libopus's decoder.
                 check_decoder: frame_ms != 10,
@@ -557,7 +557,7 @@ fn every_silk_frame_size_codes_the_side() {
 /// as before #48); recovered from both channels they stay as far apart as in
 /// the normal decode.
 ///
-/// Both encoders narrow this image (normal decode L·R +0.57 for opus-rs,
+/// Both encoders narrow this image (normal decode L·R +0.57 for opus1,
 /// +0.54 for libopus): the LBRR bits come out of SILK's target (#51), and the
 /// width control sees the lower rate. The recovery measures +0.66, libopus's
 /// +0.68. Hybrid VBR, because SILK-only VBR doesn't follow the bitrate yet
@@ -576,7 +576,7 @@ fn stereo_fec_recovers_both_channels() {
         lr_correlation(&m.c.recovered, case.sr),
     );
     println!(
-        "{:<30} FEC-recovered L·R: opus-rs {rs_rec:+.2} (normal {:+.2}), libopus {c_rec:+.2} \
+        "{:<30} FEC-recovered L·R: opus1 {rs_rec:+.2} (normal {:+.2}), libopus {c_rec:+.2} \
          (normal {:+.2})",
         "", rs.corr, c.corr
     );
@@ -593,9 +593,9 @@ fn stereo_fec_recovers_both_channels() {
 /// side encoder and the stereo state are reset and prefilled with both
 /// channels.
 ///
-/// The transitions themselves cost opus-rs about 1.3 dB per channel against
+/// The transitions themselves cost opus1 about 1.3 dB per channel against
 /// libopus here, coding the mid only or not (mid-only: L +4.3, R +4.2 dB),
-/// and opus-rs's decoder doesn't match libopus across these transitions,
+/// and opus1's decoder doesn't match libopus across these transitions,
 /// libopus's own stream included. So the margin is wider and the encoder is
 /// judged through libopus's decoder.
 #[test]

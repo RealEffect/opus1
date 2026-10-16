@@ -4,7 +4,7 @@
 //! busts the packet, and the encoder falls back to an empty frame that every
 //! decoder conceals: a 20 ms dropout, and no LBRR for the next packet.
 //!
-//! Each case encodes the same voiced signal with opus-rs and with libopus (the
+//! Each case encodes the same voiced signal with opus1 and with libopus (the
 //! `opus` dev-dependency) at the same settings, and counts per stream:
 //! - PLC frames: packets whose frame is at most 1 byte;
 //! - LBRR packets: packets whose SILK header sets an LBRR flag.
@@ -18,7 +18,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 use std::f32::consts::PI;
 
 const SR: usize = 16000;
@@ -105,7 +105,7 @@ impl Counts {
     }
 }
 
-/// opus-rs's and libopus's counts for one second of CBR with in-band FEC.
+/// opus1's and libopus's counts for one second of CBR with in-band FEC.
 fn measure(ch: usize, rate: i32) -> (Counts, Counts) {
     let input = voiced(ch, FRAME * PACKETS);
 
@@ -115,7 +115,7 @@ fn measure(ch: usize, rate: i32) -> (Counts, Counts) {
     rs_enc.use_inband_fec = true;
     rs_enc.packet_loss_perc = LOSS_PERC;
 
-    // libopus at opus-rs's settings, pinned to voice, wideband and (for two
+    // libopus at opus1's settings, pinned to voice, wideband and (for two
     // channels) a stereo stream, which it would otherwise drop at low rates.
     let c_ch = if ch == 2 { CCh::Stereo } else { CCh::Mono };
     let mut c_enc = CEnc::new(SR as u32, c_ch, CApp::Voip).unwrap();
@@ -136,7 +136,7 @@ fn measure(ch: usize, rate: i32) -> (Counts, Counts) {
         let pcm = &input[p * FRAME * ch..(p + 1) * FRAME * ch];
         let n = rs_enc
             .encode(pcm, FRAME, &mut pkt)
-            .unwrap_or_else(|e| panic!("{ch}ch {rate}: packet {p}: opus-rs encode failed: {e}"));
+            .unwrap_or_else(|e| panic!("{ch}ch {rate}: packet {p}: opus1 encode failed: {e}"));
         rs.add(&pkt[..n], ch);
         let n = c_enc.encode_float(pcm, &mut pkt).unwrap();
         c.add(&pkt[..n], ch);
@@ -145,7 +145,7 @@ fn measure(ch: usize, rate: i32) -> (Counts, Counts) {
 }
 
 fn check(ch: usize) {
-    let mut table = String::from("rate   | opus-rs PLC LBRR | libopus PLC LBRR\n");
+    let mut table = String::from("rate   | opus1 PLC LBRR | libopus PLC LBRR\n");
     let mut failures = Vec::new();
     for rate in RATES {
         let (rs, c) = measure(ch, rate);
@@ -162,11 +162,11 @@ fn check(ch: usize) {
         if rs.plc > c.plc + 1 {
             failures.push(format!("{rate}: {} PLC frames, libopus {}", rs.plc, c.plc));
         }
-        // Where libopus codes LBRR, opus-rs must too, and not drop it for
+        // Where libopus codes LBRR, opus1 must too, and not drop it for
         // want of room: at least 2/3 as many packets (the closest case,
         // stereo at 20 kb/s, measures 19-27 against libopus's ~30 across
         // input levels 0.90-1.10x). At 16 kb/s libopus's `decide_fec` turns
-        // FEC off and opus-rs's doesn't, a separate gap.
+        // FEC off and opus1's doesn't, a separate gap.
         if c.lbrr > 0 && 3 * rs.lbrr < 2 * c.lbrr {
             failures.push(format!(
                 "{rate}: {} LBRR packets, libopus {}",
@@ -177,7 +177,7 @@ fn check(ch: usize) {
     println!("{ch}ch, 20 ms, CBR, in-band FEC at {LOSS_PERC}% loss, {PACKETS} packets:\n{table}");
     assert!(
         failures.is_empty(),
-        "{ch}ch: opus-rs busts packets or drops LBRR: {failures:?}\n{table}"
+        "{ch}ch: opus1 busts packets or drops LBRR: {failures:?}\n{table}"
     );
 }
 

@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 
 fn mean(pcm: &[f32]) -> f64 {
     pcm.iter().map(|&v| v as f64).sum::<f64>() / pcm.len() as f64

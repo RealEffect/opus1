@@ -1,4 +1,4 @@
-//! Measurement tables for the opus-rs encoder at a 24 kHz input rate, next to
+//! Measurement tables for the opus1 encoder at a 24 kHz input rate, next to
 //! C libopus under the same settings. Both streams are decoded by C libopus.
 //!
 //! These print tables and assert nothing, so they are `#[ignore]`d. Run one
@@ -147,7 +147,7 @@ fn bands_text(reference: &[f32], packets: &[Vec<u8>], frame: usize) -> String {
 }
 
 /// Hybrid super-wideband against Hybrid super-wideband: libopus is forced to
-/// the mode and bandwidth opus-rs uses, so the coding itself is compared.
+/// the mode and bandwidth opus1 uses, so the coding itself is compared.
 #[test]
 #[ignore = "report: prints a table"]
 fn hybrid_like_for_like() {
@@ -380,7 +380,7 @@ fn i16_entry_point() {
                 let ci = enc_c(&cfg, &pcm);
                 let c_same = cf.iter().zip(&ci).filter(|(a, b)| a == b).count();
                 println!(
-                    "{} {} kb/s {ch} ch: opus-rs {verdict}; libopus {c_same} of {}",
+                    "{} {} kb/s {ch} ch: opus1 {verdict}; libopus {c_same} of {}",
                     app.name(),
                     b / 1000,
                     cf.len()
@@ -628,7 +628,7 @@ fn issue54_gap() {
                 "== audio mono 20 ms {}, {name}; libopus forced to CELT-only",
                 if cbr { "CBR" } else { "VBR" }
             );
-            println!("   kb/s  cx | opus-rs: SNR dB, actual kb/s | libopus: SNR dB, actual kb/s");
+            println!("   kb/s  cx | opus1: SNR dB, actual kb/s | libopus: SNR dB, actual kb/s");
             for b in [32_000, 64_000, 128_000] {
                 for cx in [5, 6, 7, 9, 10] {
                     let mut cfg = Cfg::new(App::Audio, b);
@@ -676,7 +676,7 @@ fn fec() {
                 cfg.fec = true;
                 cfg.loss = loss;
                 cfg.cbr = cbr;
-                // The opus-rs encoder can panic here; keep the table going.
+                // The opus1 encoder can panic here; keep the table going.
                 let rs = std::panic::catch_unwind(|| enc_rs(&cfg, &speech));
                 if rs.is_err() {
                     println!("{:>3} kb/s\n    rs: PANIC in the encoder", b / 1000);

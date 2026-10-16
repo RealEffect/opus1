@@ -1,7 +1,7 @@
 //! Packets of `OpusEncoder` against the fixed-point build of libopus 1.6.
 //!
 //! With the `Voip` application and 16-bit input, the SILK-only packets of
-//! opus-rs are byte for byte those of the fixed-point build: its SILK
+//! opus1 are byte for byte those of the fixed-point build: its SILK
 //! encoder is a port of `silk/fixed`, and it filters the input with the
 //! integer `hp_cutoff` (see `OpusEncoder::encode_i16`). The tests here hold
 //! a 32-bit hash (FNV-1a) of every packet that build wrote for the same
@@ -14,9 +14,9 @@
 
 mod k24_common;
 
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::dec_api::SilkDecoder;
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::range_coder::RangeCoder;
+use opus1::silk::dec_api::SilkDecoder;
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// FNV-1a, 32 bits.
 fn fnv1a(bytes: &[u8]) -> u32 {
@@ -62,7 +62,7 @@ fn first_difference(channels: usize, pcm: &[i16], script: &[Packet], want: &[u32
 /// libopus `silk_Encode` calls `silk_control_encoder` for every packet
 /// (enc_API.c:253-260), so a new complexity takes effect with the next
 /// packet. Here it changes every 20 packets: 10, 2, 0, 6, 1, 9, 4.
-/// opus-rs called the control function only when SILK's rate or packet
+/// opus1 called the control function only when SILK's rate or packet
 /// duration changed: from packet 20 on its packets differed.
 #[test]
 fn a_new_complexity_takes_effect_with_the_next_packet_like_libopus() {
@@ -142,7 +142,7 @@ const STEREO_WITH_MONO_STRETCHES: [u32; 140] = [
 /// The SILK layer of each packet, decoded at 16 kHz by the SILK decoder of
 /// this crate: a hash of the decoded samples and of the number of bits the
 /// layer takes. A CELT layer or a redundant CELT frame is not compared: the
-/// fixed-point build's CELT encoder is not the float one of opus-rs.
+/// fixed-point build's CELT encoder is not the float one of opus1.
 ///
 /// `channels` is the number of channels the packets code. A packet must
 /// hold one 20 ms SILK frame at 16 kHz.
@@ -167,7 +167,7 @@ fn silk_layers(packets: &[Vec<u8>], channels: usize) -> Vec<u32> {
 /// variable bitrate with a cap, and clears SILK's `useCBR`
 /// (opus_encoder.c:2163-2177). SILK's noise shaping reads that flag: with
 /// a variable bitrate it lowers the quality of frames with little speech
-/// activity (noise_shape_analysis_FIX.c:171). opus-rs passed the cap but
+/// activity (noise_shape_analysis_FIX.c:171). opus1 passed the cap but
 /// left the flag set: from packet 32 on, in 108 of 140 packets, the SILK
 /// layer was not libopus's.
 ///
@@ -227,14 +227,14 @@ const HYBRID_CBR_SILK_LAYERS: [u32; 140] = [
 /// report that they are ready to switch. libopus runs
 /// `silk_control_audio_bandwidth` for each channel on the same
 /// `maxBits`, so each takes room for the redundant frame of the switch out
-/// of it (control_audio_bandwidth.c:88-116). opus-rs took that room once:
+/// of it (control_audio_bandwidth.c:88-116). opus1 took that room once:
 /// its SILK layer of packet 317 was not libopus's, and the packet had 100
 /// bytes where libopus's has 89.
 ///
 /// Packets 0 to 316 are byte for byte the fixed-point build's; packet 317
 /// ends with a CELT frame, so the SILK layers are compared. The packets
 /// after the switch are not: the prefill of SILK at the new rate reads the
-/// float delay buffer in opus-rs (see `OpusEncoder::encode_impl`).
+/// float delay buffer in opus1 (see `OpusEncoder::encode_impl`).
 #[test]
 fn both_stereo_channels_make_room_for_the_redundant_frame_of_a_rate_switch() {
     let pcm: Vec<i16> = k24_common::to_stereo(&k24_common::speech(16000, 7.0), 16000)
@@ -318,8 +318,8 @@ const STEREO_SWITCH_SILK_LAYERS: [u32; 318] = [
 /// (enc_API.c:222-236). Both channels then run the same low-pass
 /// transition.
 ///
-/// In opus-rs the side encoder is started afresh after that reset, inside
-/// `silk_encode_prefill_stereo` (`enter_stereo`). Without the copy of the
+/// In opus1 the side encoder is started afresh after that reset, inside
+/// `silk_encode_prefill` (`enter_stereo`). Without the copy of the
 /// mid's low-pass state after `enter_stereo`, its side signal skips the
 /// transition filter, and from packet 171 on 430 of the 600 packets are
 /// not libopus's. With the copy only packets 170 and 171 differ, for the

@@ -1,14 +1,4 @@
-use crate::fixedvec::FixedVec;
 use crate::silk::define::*;
-
-/// SILK maximum frame length in samples (`5 * 4 * 16`). Used to size the
-/// heap-free stereo side buffer.
-///
-/// The buffer must hold a whole *packet* worth of side samples at the internal
-/// rate, not just one 20 ms frame (issue #27): 40/60 ms packets at 16 kHz need
-/// 640/960 samples respectively, which exceeded the old 320 capacity and
-/// panicked in `FixedVec::resize`.
-const SILK_SIDE_MAX: usize = 3 * MAX_FRAME_LENGTH;
 
 /// Stereo encoder state: libopus `stereo_enc_state` plus the fields of the
 /// packet-level `silk_encoder` that say how many channels are coded
@@ -22,12 +12,6 @@ pub struct SilkStereoState {
 
     /// Last two side samples of the previous frame.
     pub s_side: [i16; 2],
-
-    /// Unused.
-    pub left: i16,
-
-    /// Unused; kept because it is a public field.
-    pub side: FixedVec<i16, SILK_SIDE_MAX>,
 
     /// Quantized predictors of the previous frame (Q13).
     pub pred_prev_q13: [i16; 2],
@@ -62,8 +46,6 @@ impl Default for SilkStereoState {
         Self {
             s_mid: [0; 2],
             s_side: [0; 2],
-            left: 0,
-            side: FixedVec::new(),
             pred_prev_q13: [0; 2],
             mid_side_amp_q0: [0, 1, 0, 1],
             smth_width_q14: 1 << 14,
@@ -110,18 +92,12 @@ pub struct SideInfoIndices {
     pub lag_index: i16,
     pub contour_index: i8,
     pub signal_type: i8,
-    pub voicing_idx: i8,
     pub quant_offset_type: i8,
     pub nlsf_interp_coef_q2: i8,
     pub per_index: i8,
     pub ltp_scale_index: i8,
     pub seed: i8,
 
-    pub pred_idx: i8,
-
-    pub side_idx: i8,
-
-    pub only_middle: i8,
 }
 
 impl Default for SideInfoIndices {
@@ -133,15 +109,11 @@ impl Default for SideInfoIndices {
             lag_index: 0,
             contour_index: 0,
             signal_type: 0,
-            voicing_idx: 0,
             quant_offset_type: 0,
             nlsf_interp_coef_q2: 4,
             per_index: 0,
             ltp_scale_index: 0,
             seed: 0,
-            pred_idx: 0,
-            side_idx: 0,
-            only_middle: 0,
         }
     }
 }
@@ -149,7 +121,6 @@ impl Default for SideInfoIndices {
 #[derive(Clone, Copy, Default)]
 pub struct SilkShapeState {
     pub last_gain_index: i8,
-    pub harm_boost_smth_q16: i32,
     pub harm_shape_gain_smth_q16: i32,
     pub tilt_smth_q16: i32,
 }
@@ -195,7 +166,6 @@ pub struct SilkLPState {
 
 pub struct SilkEncoderStateCommon {
     pub indices: SideInfoIndices,
-    pub in_hp_state: [i32; 2],
     pub snr_db_q7: i32,
     pub input_quality_bands_q15: [i32; VAD_N_BANDS],
     pub speech_activity_q8: i32,
@@ -220,12 +190,9 @@ pub struct SilkEncoderStateCommon {
     pub n_states_delayed_decision: i32,
     pub prev_lag: i32,
     pub x_buf: [i16; 2 * MAX_FRAME_LENGTH + LA_SHAPE_MAX],
-    pub x_buf_idx: i32,
     pub prev_nlsf_q15: [i16; MAX_LPC_ORDER],
-    pub nlsf_mu_q20: i32,
     pub n_nlsf_survivors: i32,
     pub variable_hp_smth1_q15: i32,
-    pub variable_hp_smth2_q15: i32,
     pub s_lp: SilkLPState,
     pub s_vad: SilkVADState,
     pub lbrr_enabled: i32,
@@ -244,31 +211,21 @@ pub struct SilkEncoderStateCommon {
     /// `sShape.LastGainIndex` chain (silk_LBRR_encode_FIX).
     pub lbrr_prev_last_gain_index: i8,
     pub no_speech_counter: i32,
-    pub in_dtx: i32,
     pub vad_flags: [i32; MAX_FRAMES_PER_PACKET],
 
     pub frame_counter: i32,
     pub ec_prev_signal_type: i32,
     pub ec_prev_lag_index: i16,
-    pub frames_since_onset: i32,
-    pub input_buf: [i16; MAX_FRAME_LENGTH + 2],
-    pub input_buf_ix: i32,
-    pub controlled_since_last_payload: i32,
     pub use_interpolated_nlsfs: i32,
-    pub use_dtx: i32,
-    pub use_in_band_fec: i32,
     pub lbrr_gain_increases: i32,
     pub lbrr_flags: [i32; MAX_FRAMES_PER_PACKET],
-    pub prefill_flag: i32,
 
-    pub n_channels: i32,
 }
 
 impl Default for SilkEncoderStateCommon {
     fn default() -> Self {
         Self {
             indices: SideInfoIndices::default(),
-            in_hp_state: [0; 2],
             snr_db_q7: 0,
             input_quality_bands_q15: [0; VAD_N_BANDS],
             speech_activity_q8: 0,
@@ -293,12 +250,9 @@ impl Default for SilkEncoderStateCommon {
             n_states_delayed_decision: 0,
             prev_lag: 0,
             x_buf: [0; 2 * MAX_FRAME_LENGTH + LA_SHAPE_MAX],
-            x_buf_idx: 0,
             prev_nlsf_q15: [0; MAX_LPC_ORDER],
-            nlsf_mu_q20: 0,
             n_nlsf_survivors: 0,
             variable_hp_smth1_q15: 0,
-            variable_hp_smth2_q15: 0,
             s_lp: SilkLPState::default(),
             s_vad: SilkVADState::default(),
             lbrr_enabled: 0,
@@ -314,22 +268,13 @@ impl Default for SilkEncoderStateCommon {
             lbrr_flag: 0,
             lbrr_prev_last_gain_index: 0,
             no_speech_counter: 0,
-            in_dtx: 0,
             vad_flags: [0; MAX_FRAMES_PER_PACKET],
             frame_counter: 0,
             ec_prev_signal_type: 0,
             ec_prev_lag_index: 0,
-            frames_since_onset: 0,
-            input_buf: [0; MAX_FRAME_LENGTH + 2],
-            input_buf_ix: 0,
-            controlled_since_last_payload: 0,
             use_interpolated_nlsfs: 0,
-            use_dtx: 0,
-            use_in_band_fec: 0,
             lbrr_gain_increases: 0,
             lbrr_flags: [0; MAX_FRAMES_PER_PACKET],
-            prefill_flag: 0,
-            n_channels: 1,
         }
     }
 }
@@ -340,7 +285,6 @@ pub struct SilkEncoderState {
     pub pulses: [i8; MAX_FRAME_LENGTH],
     pub s_nsq: SilkNSQState,
     pub ltp_corr_q15: i32,
-    pub res_nrg_smth: i32,
     pub pitch_estimation_lpc_order: i32,
     pub ps_nlsf_cb: Option<&'static NLSFCodebook>,
 
@@ -350,14 +294,13 @@ pub struct SilkEncoderState {
     /// out of the frame target (libopus `nBitsUsedLBRR`).
     ///
     /// This and `n_bits_exceeded` belong to libopus's packet-level
-    /// `silk_encoder`, which spans both channels; opus-rs keeps them in the
+    /// `silk_encoder`, which spans both channels; opus1 keeps them in the
     /// mono or mid channel's state, next to the stereo state.
     pub n_bits_used_lbrr: i32,
     /// Bits by which the coded packets have overshot the target rate, which
     /// the next frames pay back (libopus `nBitsExceeded`, 0..=10000).
     pub n_bits_exceeded: i32,
 
-    pub resampler_delay_buf: [i16; 48],
 }
 
 impl Default for SilkEncoderState {
@@ -368,13 +311,11 @@ impl Default for SilkEncoderState {
             pulses: [0; MAX_FRAME_LENGTH],
             s_nsq: SilkNSQState::default(),
             ltp_corr_q15: 0,
-            res_nrg_smth: 0,
             pitch_estimation_lpc_order: 0,
             ps_nlsf_cb: None,
             stereo: SilkStereoState::default(),
             n_bits_used_lbrr: 0,
             n_bits_exceeded: 0,
-            resampler_delay_buf: [0; 48],
         }
     }
 }

@@ -3,7 +3,7 @@
 //! into a decoder, and around a decoder reset.
 //!
 //! Most streams are SILK-only: SILK conceals with integer arithmetic, so
-//! opus-rs has to give libopus's samples exactly. The CELT layer of a Hybrid
+//! opus1 has to give libopus's samples exactly. The CELT layer of a Hybrid
 //! stream is concealed with noise from a random state that both decoders
 //! keep alike, and agrees to rounding. A CELT-only stream is concealed by
 //! repeating the last pitch period, which agrees less closely
@@ -14,7 +14,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 
 /// Packets from the C encoder: speech (the 16 kHz recording, resampled),
 /// with the mode and bandwidth forced.
@@ -242,7 +242,7 @@ fn reset_state_between_modes_matches_libopus() {
 ///
 /// The concealment of a CELT-only frame does not match libopus sample for
 /// sample (tests/celtdec_plc.rs), so the samples are compared with a second
-/// opus-rs decoder that is told of a plain loss. libopus supplies what it
+/// opus1 decoder that is told of a plain loss. libopus supplies what it
 /// can: the call succeeds there too and leaves a final range of 0.
 #[test]
 fn fec_decode_after_celt_only_packets_conceals() {

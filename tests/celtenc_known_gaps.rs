@@ -101,7 +101,7 @@ fn match_quality(x: &[f32], y: &[i32]) -> f64 {
 /// bitrates, so this cost every CELT stream quality, not only LFE.
 #[test]
 fn pulse_search_with_few_pulses_matches_libopus() {
-    use opus_rs::pvq::pvq_search;
+    use opus1::pvq::pvq_search;
     let mut noise = Noise(5);
     let mut worst = 0f64;
     for n in [3usize, 6, 8, 12, 16] {
@@ -157,7 +157,7 @@ fn lfe_quality_matches_libopus_in_packets_of_11_to_13_bytes() {
         let rs_snr = snr_db(&pcm, &dec_c(&enc_rs(&cfg, &pcm), 1), 1, 5);
         let c_snr = snr_db(&pcm, &dec_c(&enc_c(&cfg, &pcm), 1), 1, 5);
         println!(
-            "LFE CBR {rate} b/s ({} bytes): SNR opus-rs {rs_snr:.2} dB, libopus {c_snr:.2} dB",
+            "LFE CBR {rate} b/s ({} bytes): SNR opus1 {rs_snr:.2} dB, libopus {c_snr:.2} dB",
             cfg.cbr_packet_bytes()
         );
         largest_gap = largest_gap.max(c_snr - rs_snr);
@@ -168,7 +168,7 @@ fn lfe_quality_matches_libopus_in_packets_of_11_to_13_bytes() {
     );
 }
 
-/// On a steady tone the LFE packets of opus-rs are the ones libopus writes.
+/// On a steady tone the LFE packets of opus1 are the ones libopus writes.
 ///
 /// Measured on a 50 Hz tone in 40-byte packets, when this test was written:
 /// the frame headers (energy, post-filter, allocation) are the same in 99

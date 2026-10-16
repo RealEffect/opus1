@@ -4,13 +4,13 @@
 
 /// SILK end-to-end encode test
 /// Tests that silk_encode_frame runs without crashing and produces valid output
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::control_codec::*;
-use opus_rs::silk::define::*;
-use opus_rs::silk::enc_api::silk_encode_frame;
-use opus_rs::silk::init_encoder::silk_init_encoder;
-use opus_rs::silk::structs::*;
-use opus_rs::{Application, OpusEncoder};
+use opus1::range_coder::RangeCoder;
+use opus1::silk::control_codec::*;
+use opus1::silk::define::*;
+use opus1::silk::enc_api::silk_encode_frame;
+use opus1::silk::init_encoder::silk_init_encoder;
+use opus1::silk::structs::*;
+use opus1::{Application, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Helper: generate a voiced-like sine wave at ~200 Hz for 16 kHz

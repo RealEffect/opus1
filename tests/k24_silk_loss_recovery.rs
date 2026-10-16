@@ -4,7 +4,7 @@
 //! the factor `BWE_AFTER_LOSS_Q16` = 63570 (0.97 in Q16, silk/define.h),
 //! which damps the filter while the decoder state recovers.
 //!
-//! opus-rs had 64738 (0.988). The filter coefficients of that frame were
+//! opus1 had 64738 (0.988). The filter coefficients of that frame were
 //! therefore different, and so was every sample of it and, through the
 //! decoder state, the frames after it: 9 to 16 dB against libopus in the
 //! frame after each loss, although the concealed frame itself was
@@ -26,7 +26,7 @@ fn frame_after_a_single_loss_is_bit_exact() {
         for rate in [16000usize, 24000] {
             let frame = rate / 50;
             let mut c_dec = CDec::new(rate, 1);
-            let mut rs_dec = opus_rs::OpusDecoder::new(rate as i32, 1).unwrap();
+            let mut rs_dec = opus1::OpusDecoder::new(rate as i32, 1).unwrap();
             let mut buf = vec![0f32; frame];
             for (i, p) in packets.iter().enumerate() {
                 let reference = if lost[i] {

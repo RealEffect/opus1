@@ -1,5 +1,5 @@
 use crate::silk::define::*;
-use crate::silk::macros::silk_smulwb;
+use crate::silk::macros::{silk_fix_const, silk_smulwb};
 use crate::silk::structs::*;
 use crate::silk::tables_nlsf::*;
 
@@ -10,13 +10,6 @@ pub const LA_SHAPE_MAX: i32 = LA_SHAPE_MS as i32 * MAX_FS_KHZ as i32;
 pub const SHAPE_LPC_WIN_MAX: i32 = 15 * MAX_FS_KHZ as i32;
 
 pub const WARPING_MULTIPLIER_Q16: i32 = 983;
-
-/// libopus `SILK_FIX_CONST( c, 16 )` (silk/SigProc_FIX.h): `c` in Q16,
-/// rounded to the nearest integer. The C macro is
-/// `(opus_int32)( c * ( 1 << 16 ) + 0.5 )`, computed in double precision.
-const fn fix_const_q16(c: f64) -> i32 {
-    (c * 65536.0 + 0.5) as i32
-}
 
 pub fn silk_setup_fs(ps_enc: &mut SilkEncoderState, fs_khz: i32, packet_size_ms: i32) -> i32 {
     // Set the internal sampling rate and the packet size. Port of
@@ -56,7 +49,6 @@ pub fn silk_setup_fs(ps_enc: &mut SilkEncoderState, fs_khz: i32, packet_size_ms:
         ps_enc.s_nsq = SilkNSQState::default();
         cmn.prev_nlsf_q15 = [0; MAX_LPC_ORDER];
         cmn.s_lp.in_lp_state = [0; 2];
-        cmn.input_buf_ix = 0;
         cmn.n_frames_encoded = 0;
         // "trigger new SNR computation"
         cmn.target_rate_bps = 0;
@@ -108,7 +100,7 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
 
     if complexity < 1 {
         cmn.pitch_estimation_complexity = SILK_PE_MIN_COMPLEX as i32;
-        cmn.pitch_estimation_threshold_q16 = fix_const_q16(0.8);
+        cmn.pitch_estimation_threshold_q16 = silk_fix_const(0.8, 16);
         ps_enc.pitch_estimation_lpc_order = 6;
         cmn.shaping_lpc_order = 12;
         cmn.la_shape = 3 * cmn.fs_khz;
@@ -118,7 +110,7 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
         cmn.warping_q16 = 0;
     } else if complexity < 2 {
         cmn.pitch_estimation_complexity = SILK_PE_MID_COMPLEX as i32;
-        cmn.pitch_estimation_threshold_q16 = fix_const_q16(0.76);
+        cmn.pitch_estimation_threshold_q16 = silk_fix_const(0.76, 16);
         ps_enc.pitch_estimation_lpc_order = 8;
         cmn.shaping_lpc_order = 14;
         cmn.la_shape = 5 * cmn.fs_khz;
@@ -128,7 +120,7 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
         cmn.warping_q16 = 0;
     } else if complexity < 3 {
         cmn.pitch_estimation_complexity = SILK_PE_MIN_COMPLEX as i32;
-        cmn.pitch_estimation_threshold_q16 = fix_const_q16(0.8);
+        cmn.pitch_estimation_threshold_q16 = silk_fix_const(0.8, 16);
         ps_enc.pitch_estimation_lpc_order = 6;
         cmn.shaping_lpc_order = 12;
         cmn.la_shape = 3 * cmn.fs_khz;
@@ -138,7 +130,7 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
         cmn.warping_q16 = 0;
     } else if complexity < 4 {
         cmn.pitch_estimation_complexity = SILK_PE_MID_COMPLEX as i32;
-        cmn.pitch_estimation_threshold_q16 = fix_const_q16(0.76);
+        cmn.pitch_estimation_threshold_q16 = silk_fix_const(0.76, 16);
         ps_enc.pitch_estimation_lpc_order = 8;
         cmn.shaping_lpc_order = 14;
         cmn.la_shape = 5 * cmn.fs_khz;
@@ -148,7 +140,7 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
         cmn.warping_q16 = 0;
     } else if complexity < 6 {
         cmn.pitch_estimation_complexity = SILK_PE_MID_COMPLEX as i32;
-        cmn.pitch_estimation_threshold_q16 = fix_const_q16(0.74);
+        cmn.pitch_estimation_threshold_q16 = silk_fix_const(0.74, 16);
         ps_enc.pitch_estimation_lpc_order = 10;
         cmn.shaping_lpc_order = 16;
         cmn.la_shape = 5 * cmn.fs_khz;
@@ -158,7 +150,7 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
         cmn.warping_q16 = cmn.fs_khz * WARPING_MULTIPLIER_Q16;
     } else if complexity < 8 {
         cmn.pitch_estimation_complexity = SILK_PE_MID_COMPLEX as i32;
-        cmn.pitch_estimation_threshold_q16 = fix_const_q16(0.72);
+        cmn.pitch_estimation_threshold_q16 = silk_fix_const(0.72, 16);
         ps_enc.pitch_estimation_lpc_order = 12;
         cmn.shaping_lpc_order = 20;
         cmn.la_shape = 5 * cmn.fs_khz;
@@ -168,7 +160,7 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
         cmn.warping_q16 = cmn.fs_khz * WARPING_MULTIPLIER_Q16;
     } else {
         cmn.pitch_estimation_complexity = SILK_PE_MAX_COMPLEX as i32;
-        cmn.pitch_estimation_threshold_q16 = fix_const_q16(0.7);
+        cmn.pitch_estimation_threshold_q16 = silk_fix_const(0.7, 16);
         ps_enc.pitch_estimation_lpc_order = 16;
         cmn.shaping_lpc_order = 24;
         cmn.la_shape = 5 * cmn.fs_khz;
@@ -224,7 +216,7 @@ pub fn silk_setup_lbrr(ps_enc: &mut SilkEncoderState, lbrr_coded: i32) -> i32 {
             // minimum of 2 here, which gives LBRR frames smaller gains and
             // so more bits than libopus 1.6 spends on them.
             ps_enc.s_cmn.lbrr_gain_increases =
-                (7 - silk_smulwb(ps_enc.s_cmn.packet_loss_perc, fix_const_q16(0.2))).max(3);
+                (7 - silk_smulwb(ps_enc.s_cmn.packet_loss_perc, silk_fix_const(0.2, 16))).max(3);
         }
     }
 

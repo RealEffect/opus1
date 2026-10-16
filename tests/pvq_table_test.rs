@@ -13,7 +13,7 @@
 //! Every `(n, k)` in the supported domain is checked against an exact u128
 //! recurrence; out-of-domain results must saturate to `u32::MAX`.
 
-use opus_rs::pvq::{MAX_PVQ_K, celt_pvq_u, celt_pvq_v, ncwrs};
+use opus1::pvq::{MAX_PVQ_K, celt_pvq_u, celt_pvq_v};
 
 /// Exact U(N,K) via the recurrence, computed in u128.
 fn build_u_table(n_max: usize, k_max: usize) -> Vec<Vec<u128>> {
@@ -57,13 +57,13 @@ fn pvq_u_v_match_exact_recurrence() {
 }
 
 #[test]
-fn pvq_ncwrs_matches_v() {
+fn pvq_v_matches_v_from_u() {
     let u = build_u_table(64, MAX_PVQ_K);
     for n in 2..=64 {
         for k in 0..=MAX_PVQ_K {
             let v_exact = u[n][k].saturating_add(u[n][k + 1]);
             let expected = v_exact.min(u32::MAX as u128) as u32;
-            assert_eq!(ncwrs(n as u32, k as u32), expected, "ncwrs({n},{k})");
+            assert_eq!(celt_pvq_v(n as u32, k as u32), expected, "V({n},{k})");
         }
     }
 }

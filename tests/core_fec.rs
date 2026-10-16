@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 
 /// One stream to test: how the C encoder is set up and how it is decoded.
 #[derive(Clone, Copy, Debug)]
@@ -66,12 +66,12 @@ fn fates(n: usize, double: bool) -> Vec<Fate> {
 }
 
 struct Run {
-    /// Output of libopus and of opus-rs, interleaved.
+    /// Output of libopus and of opus1, interleaved.
     c: Vec<f32>,
     rs: Vec<f32>,
     /// The loss-free decode by libopus.
     clean: Vec<f32>,
-    /// Final range after every call, for libopus and opus-rs.
+    /// Final range after every call, for libopus and opus1.
     ranges: Vec<(u32, u32)>,
     /// Sample ranges (per channel) that came out of an FEC call.
     recovered: Vec<std::ops::Range<usize>>,
@@ -253,8 +253,8 @@ fn fec_recovers_what_concealment_cannot() {
     let with_fec = r.recovered_snr(&r.clean, &r.rs, 1);
     let c_with_fec = r.recovered_snr(&r.clean, &r.c, 1);
     let with_plc = r.recovered_snr(&r.clean, &concealed, 1);
-    println!("lost frames against the loss-free decode: opus-rs FEC {with_fec:.1} dB, libopus FEC {c_with_fec:.1} dB, opus-rs concealment {with_plc:.1} dB");
-    assert!(with_fec > c_with_fec - 0.1, "opus-rs {with_fec:.1} dB, libopus {c_with_fec:.1} dB");
+    println!("lost frames against the loss-free decode: opus1 FEC {with_fec:.1} dB, libopus FEC {c_with_fec:.1} dB, opus1 concealment {with_plc:.1} dB");
+    assert!(with_fec > c_with_fec - 0.1, "opus1 {with_fec:.1} dB, libopus {c_with_fec:.1} dB");
     assert!(with_fec > with_plc + 3.0, "FEC {with_fec:.1} dB, concealment {with_plc:.1} dB");
 }
 
@@ -286,7 +286,7 @@ fn hybrid_fec_matches_libopus() {
             // The calls that recovered a frame leave a final range that is
             // not 0: the CELT decoder's.
             let after_fec = r.fec_calls.iter().filter(|&&call| r.ranges[call].1 != 0).count();
-            println!("{} (double loss: {double}): recovered frames against the loss-free decode: opus-rs {ours:.1} dB, libopus {theirs:.1} dB; opus-rs against libopus: recovered frames {against_c:.1} dB, whole stream {whole:.1} dB; final range differs after {bad} of {} calls", case.name, r.ranges.len());
+            println!("{} (double loss: {double}): recovered frames against the loss-free decode: opus1 {ours:.1} dB, libopus {theirs:.1} dB; opus1 against libopus: recovered frames {against_c:.1} dB, whole stream {whole:.1} dB; final range differs after {bad} of {} calls", case.name, r.ranges.len());
             assert!(against_c > 100.0 && whole > 100.0, "{}: recovered frames {against_c:.1} dB, whole stream {whole:.1} dB against libopus", case.name);
             assert_eq!(bad, 0, "{}: final range differs after {bad} of {} calls", case.name, r.ranges.len());
             assert_eq!(after_fec, r.fec_calls.len(), "{}: final range is 0 after an FEC call", case.name);

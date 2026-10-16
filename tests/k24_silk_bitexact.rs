@@ -1,6 +1,6 @@
 //! SILK-only packets from libopus must decode bit-exactly at 24 kHz.
 //!
-//! SILK is fixed-point, so opus-rs and libopus must produce the same 16-bit
+//! SILK is fixed-point, so opus1 and libopus must produce the same 16-bit
 //! samples from the same packets. The streams here cover narrowband,
 //! mediumband and wideband SILK at bitrates from 6 to 64 kb/s, encoder
 //! complexity 0 and 10, and four kinds of signal. The decoder runs at
@@ -34,7 +34,7 @@ fn silk_only_streams_decode_bit_exactly_at_24k() {
                         .complexity(complexity);
                     let packets = enc.encode_all(pcm, 320);
                     let reference = c_decode_all(&packets, 24000, 1);
-                    let ours = rs_decode_all(&packets, 24000, 1).expect("opus-rs decode");
+                    let ours = rs_decode_all(&packets, 24000, 1).expect("opus1 decode");
                     let cmp = compare(&reference, &ours, 1, 480, 24000);
                     rows += 1;
                     if cmp.max_abs_diff != 0.0 {

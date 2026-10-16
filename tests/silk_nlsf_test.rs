@@ -2,11 +2,11 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::silk::define::*;
-use opus_rs::silk::nlsf_decode::silk_nlsf_decode;
-use opus_rs::silk::nlsf_encode::silk_nlsf_encode;
-use opus_rs::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
-use opus_rs::{Application, OpusEncoder};
+use opus1::silk::define::*;
+use opus1::silk::nlsf_decode::silk_nlsf_decode;
+use opus1::silk::nlsf_encode::silk_nlsf_encode;
+use opus1::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
+use opus1::{Application, OpusEncoder};
 use std::f32::consts::PI;
 
 #[test]

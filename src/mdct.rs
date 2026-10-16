@@ -189,10 +189,9 @@ impl MdctLookup {
         let p = self.plan(shift);
         let n2 = p.n2;
         let overlap2 = overlap / 2;
-        // Validate all buffer contracts up front: the pre-rotation reads
-        // input[2*i*stride] and input[stride*(n2-1-2*i)], and the TDAC stage
-        // reads window[..overlap] — failing after the FFT has run would waste
-        // the whole transform (issue #27 deep scan).
+        // All buffer sizes are checked before the transform starts. The
+        // pre-rotation reads input[2*i*stride] and input[stride*(n2-1-2*i)],
+        // and the windowing of the overlap reads window[..overlap].
         assert!(
             stride >= 1 && holds_strided(input.len(), stride, n2),
             "MDCT backward: input too small (need {}, have {})",
@@ -205,8 +204,8 @@ impl MdctLookup {
             overlap,
             window.len()
         );
-        // The rotation writes output[overlap2..overlap2 + n2], the TDAC stage
-        // rewrites output[..overlap].
+        // The rotation writes output[overlap2..overlap2 + n2]. The windowing
+        // of the overlap rewrites output[..overlap].
         assert!(
             output.len() >= overlap2 + n2 && output.len() >= overlap,
             "MDCT backward: output too small (need {}, have {})",
@@ -1804,7 +1803,7 @@ mod bit_exact_tests {
             .find(|&i| a[i].to_bits() != b[i].to_bits() && !(a[i].is_nan() && b[i].is_nan()))
     }
 
-    /// The forward MDCT as it was before the rewrite: the loops of libopus
+    /// The reference forward MDCT: the loops of libopus
     /// (`clt_mdct_forward_c`, float build) with plain indexing. `fft` must
     /// round like `A`.
     fn reference_forward<A: Arith>(
@@ -1895,7 +1894,7 @@ mod bit_exact_tests {
         }
     }
 
-    /// The inverse MDCT as it was before the rewrite: the loops of libopus
+    /// The reference inverse MDCT: the loops of libopus
     /// (`clt_mdct_backward_c`, float build) with plain indexing. `fft` must
     /// round like `A`.
     fn reference_backward<A: Arith>(
@@ -2242,6 +2241,7 @@ mod bit_exact_tests {
         l.backward(&input, &mut output, &window, 64, 0, wrapping_stride());
     }
 
+    #[cfg(target_arch = "aarch64")]
     /// `n` values of test data of one input class.
     fn data(rng: &mut Lcg, n: usize, class: usize) -> Vec<f32> {
         let mut v = vec![0f32; n];
@@ -2249,6 +2249,7 @@ mod bit_exact_tests {
         v
     }
 
+    #[cfg(target_arch = "aarch64")]
     /// A permutation of `0..n`.
     fn permutation(rng: &mut Lcg, n: usize) -> Vec<i16> {
         let mut v: Vec<i16> = (0..n as i16).collect();
@@ -2258,22 +2259,28 @@ mod bit_exact_tests {
         v
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn complex_data(rng: &mut Lcg, n: usize, class: usize) -> Vec<KissCpx> {
         data(rng, 2 * n, class)
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| KissCpx::new(c[0], c[1]))
             .collect()
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn flat(c: &[KissCpx]) -> Vec<f32> {
         c.iter().flat_map(|c| [c.r, c.i]).collect()
     }
 
+    #[cfg(target_arch = "aarch64")]
     /// A buffer of `n` complex values with nothing written yet.
     fn unwritten(n: usize) -> Vec<MaybeUninit<KissCpx>> {
         vec![MaybeUninit::uninit(); n]
     }
 
+    #[cfg(target_arch = "aarch64")]
     /// The numbers of butterflies the step tests run: every count from the
     /// smallest a vector step takes up to 41, so that every number of
     /// butterflies left over after the full steps occurs several times, and

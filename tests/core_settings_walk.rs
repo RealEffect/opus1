@@ -5,9 +5,9 @@
 //!
 //! The reference is the C libopus encoder, fed the same input with the same
 //! settings and the same buffer, at a complexity below 7, where libopus
-//! decides without the speech/music analysis that opus-rs does not have.
+//! decides without the speech/music analysis that opus1 does not have.
 //! The C encoder is told to keep stereo input stereo
-//! (`OPUS_SET_FORCE_CHANNELS(2)`), because opus-rs does not code stereo
+//! (`OPUS_SET_FORCE_CHANNELS(2)`), because opus1 does not code stereo
 //! input as mono yet.
 //!
 //! What is compared, and what is not:
@@ -29,7 +29,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder, packet};
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder, packet};
 
 /// A small deterministic generator (the 64-bit LCG of Knuth's MMIX).
 struct Rng(u64);
@@ -288,12 +288,12 @@ fn walk(
         let n = match result {
             Ok(n) => n,
             Err(e) => {
-                assert!(c_len < 0, "{what}: opus-rs: {e}, libopus writes {c_len} bytes");
+                assert!(c_len < 0, "{what}: opus1: {e}, libopus writes {c_len} bytes");
                 tally.errors += 1;
                 continue;
             }
         };
-        assert!(c_len > 0, "{what}: libopus fails with {c_len}, opus-rs writes {n} bytes");
+        assert!(c_len > 0, "{what}: libopus fails with {c_len}, opus1 writes {n} bytes");
         let c_len = c_len as usize;
         assert!(n >= 1 && n <= s.buffer, "{what}: {n} bytes");
         let (packet, c_packet) = (&buf[..n], &c_buf[..c_len]);

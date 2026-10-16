@@ -99,13 +99,13 @@ impl<T: Sync> Default for OnceCell<T> {
 }
 
 // ---------------------------------------------------------------------------
-// No-std slice sorting (`alloc` provides `[T]::sort*` as inherent methods; since
-// this crate does not depend on `alloc`, we provide small insertion sorts here).
+// Stable sort without `alloc`. `core` has only the unstable sorts
+// (`sort_unstable*`); the stable ones need `alloc`, which this crate does not
+// use.
 // ---------------------------------------------------------------------------
 
-/// Sort a slice by a comparator (insertion sort). Intended for the small slices
-/// used in this crate (energy bands, NLSF coefficients, median-of-3/5); O(n²) is
-/// fine because `n` is tiny.
+/// Sort a slice by a comparator (insertion sort, so stable). Intended for the
+/// small slices used in this crate; O(n²) is fine because `n` is tiny.
 pub fn sort_by<T>(slice: &mut [T], mut cmp: impl FnMut(&T, &T) -> core::cmp::Ordering) {
     for i in 1..slice.len() {
         let mut j = i;
@@ -114,11 +114,6 @@ pub fn sort_by<T>(slice: &mut [T], mut cmp: impl FnMut(&T, &T) -> core::cmp::Ord
             j -= 1;
         }
     }
-}
-
-/// Sort a slice in ascending order (`Ord` version). See [`sort_by`].
-pub fn sort<T: Ord>(slice: &mut [T]) {
-    sort_by(slice, |a, b| a.cmp(b));
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +180,7 @@ pub fn x86_has_avx2_fma() -> bool {
 #[cfg(not(feature = "std"))]
 #[cfg(not(feature = "libm"))]
 compile_error!(
-    "opus-rs no_std builds require the `libm` feature (or the `std` feature). \
+    "opus1 no_std builds require the `libm` feature (or the `std` feature). \
      Set features = [\"libm\"] (or re-enable default-features)."
 );
 

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
@@ -148,8 +148,12 @@ fuzz_target!(|data: &[u8]| {
                 Err(_) => return,
             };
 
+            // Whatever the settings, the packet decodes to one frame and
+            // the decoder ends in the encoder's final range.
             let mut decoded = vec![0.0f32; frame_size * channels];
-            let _ = decoder.decode(&output[..encoded_len], frame_size, &mut decoded);
+            let got = decoder.decode(&output[..encoded_len], frame_size, &mut decoded);
+            assert_eq!(got, Ok(frame_size));
+            assert_eq!(decoder.final_range(), encoder.final_range());
         }
     }
 });

@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::celt::{CeltDecoder, CeltEncoder};
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 fn snr_with_delay(input: &[f32], output: &[f32], delay: usize) -> f32 {
     let len = input.len().min(output.len().saturating_sub(delay));
@@ -53,7 +53,9 @@ fn celt_loopback_160bytes() {
         let compressed: Vec<u8> = rc.buf[..n_bytes].to_vec();
 
         let pcm_out = &mut all_out[f * frame_size..(f + 1) * frame_size];
-        decoder.decode(&compressed, frame_size, pcm_out);
+        let bits = (compressed.len() * 8) as i32;
+        let mut rc = RangeCoder::new_decoder(&compressed);
+        decoder.decode(&mut rc, bits, frame_size, pcm_out, PcmLayout::Planar);
     }
 
     let start_idx = 4 * frame_size;

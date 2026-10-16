@@ -27,7 +27,7 @@ mod multistream_dec_common;
 
 use ms_support::*;
 use multistream_dec_common::*;
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 
 /// Which packets of a stream of `count` packets are lost: every 10th, a
 /// burst of 3 and a burst of 6. Nothing is lost in the last `tail` packets.
@@ -213,7 +213,7 @@ fn check_voiced(layout: Layout) {
 }
 
 /// A steady tone fits several pitch periods equally well, and libopus and
-/// opus-rs do not always pick the same one for the concealment. The first
+/// opus1 do not always pick the same one for the concealment. The first
 /// two lost frames of a burst have the same level either way. Later in a
 /// burst the level falls at a speed that depends on the period, so it is
 /// not compared (measured: up to 18.9 dB apart in the sixth lost frame;
@@ -226,7 +226,7 @@ fn check_voiced(layout: Layout) {
 /// 240, 360, 480 and 600 fit just as well. Over the 13 losses of the stream
 /// libopus takes 120, 240 and 480 in turn, and its 16 kHz and 48 kHz
 /// decoders take different periods at 3 of the 13 losses for the same
-/// packets. opus-rs differs from libopus at 5 to 7 of the 13. When the two
+/// packets. opus1 differs from libopus at 5 to 7 of the 13. When the two
 /// differ at the start of the burst of 6, the sixth frame is 18.5 dB apart
 /// and its largest step 2.1 times libopus's, and the first loss after the
 /// burst 1.2 dB apart: the same numbers as between libopus's own two

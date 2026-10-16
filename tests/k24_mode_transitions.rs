@@ -12,7 +12,7 @@
 //! - A switch to or from CELT-only without that frame is bridged with 5 ms
 //!   of concealment in the previous mode.
 //!
-//! opus-rs treated every change of mode as the third kind, and skipped the
+//! opus1 treated every change of mode as the third kind, and skipped the
 //! CELT layer of a frame that carried a redundancy frame instead of
 //! decoding the redundancy frame. The concealment call also advanced the
 //! SILK state as if a packet had been lost. Result: 0.5 to 12 dB against
@@ -55,7 +55,7 @@ fn count_switches(packets: &[Vec<u8>]) -> usize {
 
 fn check(packets: &[Vec<u8>], channels: usize, dec_rate: usize, frame_ms: usize, label: &str) {
     let reference = c_decode_all(packets, dec_rate, channels);
-    let ours = rs_decode_all(packets, dec_rate, channels).expect("opus-rs decode");
+    let ours = rs_decode_all(packets, dec_rate, channels).expect("opus1 decode");
     assert_eq!(ours.len(), reference.len(), "{label}");
     let cmp = compare(&reference, &ours, channels, dec_rate / 1000 * frame_ms, dec_rate);
     println!("{label}: {cmp}");

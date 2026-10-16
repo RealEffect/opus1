@@ -13,8 +13,8 @@
 //!                   mapping[channels] — i.e. OpusHead byte 9 + bytes 19..
 //! Tests are skipped if the reference files are not present.
 
-use opus_rs::multistream::{split_self_delimited, ChannelMappingTable, MultistreamDecoder};
-use opus_rs::OpusDecoder;
+use opus1::multistream::{split_self_delimited, ChannelMappingTable, MultistreamDecoder};
+use opus1::OpusDecoder;
 use std::fs;
 
 const OPUS_DECODE_RATE: i32 = 48_000;

@@ -84,7 +84,7 @@ fn prediction_modes() {
         let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
         println!(
             "prediction {prediction}: intra {} (libopus {}), filtered {} (libopus {}) of {}; \
-             opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             count(&hr, intra),
             count(&hc, intra),
             count(&hr, filtered),
@@ -117,7 +117,7 @@ fn prediction_modes() {
 /// `OPUS_SET_PACKET_LOSS_PERC` reaches the CELT encoder of libopus. With
 /// loss, the pitch pre-filter gets weaker and is off from 9 %, and the
 /// coarse energy is coded intra more often (quant_coarse_energy:
-/// `intra_bias`). opus-rs had no such setting; its CELT encoder always
+/// `intra_bias`). opus1 had no such setting; its CELT encoder always
 /// coded as for no loss.
 #[test]
 fn packet_loss_changes_filter_and_intra_frames() {
@@ -134,7 +134,7 @@ fn packet_loss_changes_filter_and_intra_frames() {
         let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
         println!(
             "loss {loss} %: intra {} (libopus {}), filtered {} (libopus {}) of {}; \
-             opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             count(&hr, intra),
             count(&hc, intra),
             count(&hr, filtered),
@@ -173,7 +173,7 @@ fn a_stereo_encoder_codes_a_mono_stream() {
         let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
         println!(
             "{} ms: same transient flag in {transient}, same filter decision in {filtered} \
-             of {} frames; opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             of {} frames; opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             frame_ms_x2 as f32 / 2.0,
             hc.len()
         );
@@ -207,7 +207,7 @@ fn a_stereo_encoder_codes_a_mono_stream() {
     // The part after the switch back to two channels.
     let snr = |d: &[f32]| snr_db_delay(&pcm, d, 2, 100 * 960, CELT_DELAY);
     let (snr_rs, snr_c) = (snr(&decode(&rs)), snr(&decode(&c)));
-    println!("after switching back: opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB");
+    println!("after switching back: opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB");
     assert!(snr_rs > snr_c - 0.5, "{snr_rs:.2} dB against {snr_c:.2} dB");
     let mut enc = st.rs_encoder();
     assert!(enc.set_stream_channels(0).is_err());
@@ -243,7 +243,7 @@ fn the_second_channel_continues_from_the_mono_energies() {
     // The first stereo frame after the mono part.
     let (hc, hr) = (parse_header(&c[100], 2, 21, 3), parse_header(&rs[100], 2, 21, 3));
     println!("libopus: intra {}, second channel {:?}", hc.intra, &hc.coarse[21..]);
-    println!("opus-rs: intra {}, second channel {:?}", hr.intra, &hr.coarse[21..]);
+    println!("opus1: intra {}, second channel {:?}", hr.intra, &hr.coarse[21..]);
     assert_eq!(hr.intra, hc.intra);
     let d: i32 = hc.coarse[21..].iter().zip(&hr.coarse[21..]).map(|(a, b)| (a - b).abs()).sum();
     assert!(d <= 2, "the second channel differs by {d} steps in all");

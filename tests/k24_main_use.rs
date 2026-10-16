@@ -12,7 +12,7 @@
 //! 1. libopus encoder at a fixed bitrate.
 //! 2. libopus encoder whose bitrate changes every 250 ms, which makes it
 //!    switch modes on its own.
-//! 3. opus-rs's own encoder, through both of its entry points (`f32` and
+//! 3. opus1's own encoder, through both of its entry points (`f32` and
 //!    16-bit integer input).
 //!
 //! Measured: above 132 dB in the worst 20 ms frame of every stream (the
@@ -49,7 +49,7 @@ fn check(label: &str, packets: &[Vec<u8>]) -> Cmp {
     let reference = c_decode_all(packets, 24000, 1);
     let ours = rs_decode_all(packets, 24000, 1).unwrap_or_else(|(i, e)| panic!("{label}: packet {i}: {e}"));
     assert_eq!(ours.len(), reference.len(), "{label}");
-    // The speech here stays below full scale, so the clamp of opus-rs's
+    // The speech here stays below full scale, so the clamp of opus1's
     // float output to [-1, 1] (see k24_known_gaps.rs) plays no part.
     assert!(reference.iter().all(|v| v.abs() <= 1.0), "{label}: reference clips");
     let cmp = compare(&reference, &ours, 1, 480, 24000);
@@ -99,8 +99,8 @@ fn own_encoder_stream_decodes_like_libopus() {
         let pcm_i16: Vec<i16> = pcm.iter().map(|v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16).collect();
         let pcm_f32: Vec<f32> = pcm_i16.iter().map(|v| *v as f32 / 32768.0).collect();
         for bitrate in [16000, 24000, 32000, 40000] {
-            let mut enc_f = opus_rs::OpusEncoder::new(24000, 1, opus_rs::Application::Voip).unwrap();
-            let mut enc_i = opus_rs::OpusEncoder::new(24000, 1, opus_rs::Application::Voip).unwrap();
+            let mut enc_f = opus1::OpusEncoder::new(24000, 1, opus1::Application::Voip).unwrap();
+            let mut enc_i = opus1::OpusEncoder::new(24000, 1, opus1::Application::Voip).unwrap();
             enc_f.bitrate_bps = bitrate;
             enc_i.bitrate_bps = bitrate;
             let mut out_f = vec![0u8; 4000];
@@ -112,7 +112,7 @@ fn own_encoder_stream_decodes_like_libopus() {
                 assert_eq!(out_f[..n], out_i[..m], "{signal}, {bitrate} b/s: encode and encode_i16 differ");
                 packets.push(out_f[..n].to_vec());
             }
-            check(&format!("opus-rs encoder, {signal}, {bitrate} b/s"), &packets);
+            check(&format!("opus1 encoder, {signal}, {bitrate} b/s"), &packets);
         }
     }
 }

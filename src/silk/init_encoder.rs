@@ -19,13 +19,10 @@ pub fn silk_init_encoder(ps_enc: &mut SilkEncoderState, _arch: i32) -> i32 {
     ps_enc.pulses = [0; MAX_FRAME_LENGTH];
     ps_enc.s_nsq = SilkNSQState::default();
     ps_enc.ltp_corr_q15 = 0;
-    ps_enc.res_nrg_smth = 0;
     ps_enc.pitch_estimation_lpc_order = 0;
     ps_enc.ps_nlsf_cb = None;
-    ps_enc.resampler_delay_buf = [0; 48];
 
     ps_enc.s_cmn.variable_hp_smth1_q15 = silk_lin2log(VARIABLE_HP_MIN_CUTOFF_HZ) << 8;
-    ps_enc.s_cmn.variable_hp_smth2_q15 = ps_enc.s_cmn.variable_hp_smth1_q15;
 
     ps_enc.s_cmn.first_frame_after_reset = 1;
 

@@ -9,35 +9,28 @@
 //! are zero and its width falls to zero. The first packet that codes two
 //! channels again starts the side encoder and the stereo state afresh.
 //!
-//! The test drives the SILK encoder directly, the way `OpusEncoder` drives
-//! it for SILK-only packets.
+//! The test drives `SilkEncoder` directly, the way `OpusEncoder` drives it
+//! for SILK-only packets.
 // `RangeCoder::finish` needs the `std` feature.
 #![cfg(feature = "std")]
 
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus_rs::hp_cutoff::dc_reject_float;
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::control_codec::{silk_control_encoder, silk_setup_lbrr};
-use opus_rs::silk::decode_indices::{silk_stereo_decode_mid_only, silk_stereo_decode_pred};
-use opus_rs::silk::enc_api::{
-    silk_average_first_mono_frame, silk_downmix_stereo, silk_encode,
-    silk_encode_stereo_packet_to_mono, silk_prev_channels_internal, silk_stereo_width_q14,
-};
-use opus_rs::silk::init_encoder::silk_init_encoder;
-use opus_rs::silk::resampler::SilkResampler;
-use opus_rs::silk::structs::SilkEncoderState;
+use opus1::hp_cutoff::dc_reject_float;
+use opus1::range_coder::RangeCoder;
+use opus1::silk::decode_indices::{silk_stereo_decode_mid_only, silk_stereo_decode_pred};
+use opus1::silk::enc_api::{SilkControl, SilkEncoder, SilkInput, silk_downmix_stereo};
 
 /// C `FLOAT2INT16`.
 fn float2int16(x: f32) -> i16 {
     (x * 32768.0).clamp(-32768.0, 32767.0).round_ties_even() as i16
 }
 
-/// A SILK-only wideband encoder for stereo input, built from the SILK
-/// functions the way `OpusEncoder` uses them (application "audio", variable
-/// bitrate, complexity 9), plus libopus's rule for the number of coded
-/// channels (opus_encoder.c:1560-1571).
+/// A SILK-only wideband encoder for stereo input, used the way `OpusEncoder`
+/// uses it (application "audio", variable bitrate, complexity 9), plus
+/// libopus's rule for the number of coded channels
+/// (opus_encoder.c:1560-1571).
 struct StereoSilk {
     fs: usize,
     /// Samples per channel in a packet, at `fs`.
@@ -45,11 +38,8 @@ struct StereoSilk {
     bitrate: i32,
     /// Packet loss in percent; in-band FEC is on when it is not 0.
     loss: i32,
-    mid: Box<SilkEncoderState>,
-    side: Box<SilkEncoderState>,
-    resamplers: [SilkResampler; 2],
+    silk: SilkEncoder,
     hp_mem: [f32; 4],
-    started: bool,
     prev_stream_channels: usize,
     to_mono: bool,
 }
@@ -70,11 +60,8 @@ impl StereoSilk {
             frame,
             bitrate,
             loss,
-            mid: Box::new(SilkEncoderState::default()),
-            side: Box::new(SilkEncoderState::default()),
-            resamplers: [SilkResampler::default(), SilkResampler::default()],
+            silk: SilkEncoder::new(fs as i32, 2),
             hp_mem: [0.0; 4],
-            started: false,
             prev_stream_channels: 2,
             to_mono: false,
         }
@@ -102,83 +89,23 @@ impl StereoSilk {
 
         // opus_encoder.c: the packet's bits less the first byte.
         let total_rate = (self.bitrate * frame_ms / 1000 - 8) * 1000 / frame_ms;
-        if !self.started {
-            assert_eq!(silk_init_encoder(&mut self.mid, 0), 0);
-            assert_eq!(silk_control_encoder(&mut self.mid, 16, frame_ms, total_rate, 9), 0);
-            self.mid.s_cmn.n_channels = 2;
-            assert_eq!(self.resamplers[0].init_for_enc(fs as i32, 16_000), 0);
-            self.resamplers[1] = self.resamplers[0].clone();
-            self.started = true;
-        }
-        let prev_internal = silk_prev_channels_internal(&self.mid);
-        let lbrr_coded = (self.loss > 0) as i32;
-        for (n, enc) in [&mut self.mid, &mut self.side].into_iter().enumerate().take(stream) {
-            // The side encoder of the first packet with two channels is set
-            // up by the packet function.
-            if n == 1 && prev_internal != 2 {
-                continue;
-            }
-            enc.s_cmn.use_in_band_fec = lbrr_coded;
-            enc.s_cmn.packet_loss_perc = self.loss;
-            silk_setup_lbrr(enc, lbrr_coded);
-        }
-
-        let n_internal = frame * 16_000 / fs;
-        let mut rc = RangeCoder::new_encoder(1275);
-        let mut n_bytes = 0;
-        let max_bits = 1274 * 8;
-        let ret = if stream == 2 {
-            if prev_internal == 1 {
-                // enc_API.c:296-299.
-                self.resamplers[1] = self.resamplers[0].clone();
-            }
-            let mut internal = [vec![0i16; n_internal], vec![0i16; n_internal]];
-            for c in 0..2 {
-                let channel: Vec<i16> = pcm16.as_chunks::<2>().0.iter().map(|lr| lr[c]).collect();
-                assert_eq!(self.resamplers[c].process(&mut internal[c], &channel, frame as i32), 0);
-            }
-            silk_encode_stereo_packet_to_mono(
-                &mut self.mid,
-                &mut self.side,
-                &internal[0],
-                &internal[1],
-                n_internal,
-                &mut rc,
-                &mut n_bytes,
-                total_rate,
-                max_bits,
-                0,
-                1,
-                self.to_mono,
-            )
-        } else {
-            let mut mono_api = vec![0i16; frame];
-            silk_downmix_stereo(&pcm16, &mut mono_api);
-            let mut mono = vec![0i16; n_internal];
-            assert_eq!(self.resamplers[0].process(&mut mono, &mono_api, frame as i32), 0);
-            if prev_internal == 2 {
-                // enc_API.c:316-331.
-                let fl = self.mid.s_cmn.frame_length as usize;
-                let first_api = &mono_api[..fl * fs / 16_000];
-                let side_resampler = &mut self.resamplers[1];
-                assert_eq!(
-                    silk_average_first_mono_frame(side_resampler, &mut mono[..fl], first_api),
-                    0
-                );
-            }
-            silk_encode(
-                &mut self.mid,
-                &mono,
-                n_internal,
-                &mut rc,
-                &mut n_bytes,
-                total_rate,
-                max_bits,
-                0,
-                1,
-            )
+        let mut ctl = SilkControl {
+            channels_internal: stream,
+            payload_size_ms: frame_ms,
+            min_khz: 16,
+            max_khz: 16,
+            desired_khz: 16,
+            bit_rate: total_rate,
+            max_bits: 1274 * 8,
+            complexity: 9,
+            packet_loss_perc: self.loss,
+            lbrr_coded: self.loss > 0,
+            activity: 1,
+            to_mono: self.to_mono,
+            ..SilkControl::default()
         };
-        assert_eq!(ret, 0, "SILK error");
+        let mut rc = RangeCoder::new_encoder(1275);
+        self.silk.encode(&mut ctl, SilkInput::Int16(&pcm16), None, &mut rc).expect("SILK error");
         assert_eq!(rc.error, 0, "range coder overflow");
         let final_range = rc.rng;
         // SILK wideband: configurations 8 to 11 are 10, 20, 40 and 60 ms.
@@ -196,7 +123,7 @@ impl StereoSilk {
             final_range,
             channels: stream,
             to_mono: self.to_mono,
-            stereo_width_q14: silk_stereo_width_q14(&self.mid, self.to_mono),
+            stereo_width_q14: ctl.stereo_width_q14,
         }
     }
 }
@@ -426,10 +353,10 @@ fn decoded_quality_matches_libopus_also_around_the_changes() {
         let (c_snr, c_delay) = best_snr(&reference, &c_mid, 1, fs / 40);
         // The best alignment may fall on either side of a half sample.
         assert!(rs_delay.abs_diff(c_delay) <= 1, "{what}: delay {rs_delay}, libopus {c_delay}");
-        // On this recording the SILK encoder of opus-rs is 1 to 2.5 dB under
+        // On this recording the SILK encoder of opus1 is 1 to 2.5 dB under
         // libopus at these rates, with or without changes of the channel
         // count (`OpusEncoder` shows the same for plain mono and stereo).
-        assert!(rs_snr > c_snr - 3.0, "{what}: opus-rs {rs_snr:.2} dB, libopus {c_snr:.2} dB");
+        assert!(rs_snr > c_snr - 3.0, "{what}: opus1 {rs_snr:.2} dB, libopus {c_snr:.2} dB");
 
         // Around the changes: from the packet before to the fourth after.
         let (mut rs_e, mut c_e, mut sig) = (0f64, 0f64, 0f64);
@@ -448,12 +375,12 @@ fn decoded_quality_matches_libopus_also_around_the_changes() {
         // of the whole stream, for each encoder.
         assert!(
             rs_change - rs_snr > c_change - c_snr - 2.0,
-            "{what}: around the changes opus-rs {rs_change:.2} dB (stream {rs_snr:.2} dB), \
+            "{what}: around the changes opus1 {rs_change:.2} dB (stream {rs_snr:.2} dB), \
              libopus {c_change:.2} dB (stream {c_snr:.2} dB)"
         );
         // Shown with `--nocapture`.
         println!(
-            "{what}: stream opus-rs {rs_snr:.2} dB, libopus {c_snr:.2} dB; \
+            "{what}: stream opus1 {rs_snr:.2} dB, libopus {c_snr:.2} dB; \
              around the changes {rs_change:.2} dB, {c_change:.2} dB"
         );
     }

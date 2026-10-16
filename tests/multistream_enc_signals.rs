@@ -1,4 +1,4 @@
-//! The opus-rs multistream encoder on signals and settings the other test
+//! The opus1 multistream encoder on signals and settings the other test
 //! files do not use, against C libopus.
 //!
 //! - One channel sounds at a time, at all five sampling rates and with
@@ -15,8 +15,8 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
-use opus_rs::multistream::encoder::MultistreamEncoder;
+use opus1::Application;
+use opus1::multistream::encoder::MultistreamEncoder;
 
 /// Sum of squares.
 fn energy(x: &[f32]) -> f64 {
@@ -357,7 +357,7 @@ fn inband_fec_of_silk_streams_rebuilds_a_lost_frame_in_libopus() {
 }
 
 /// Average bitrate over 5 s of 20 ms frames with variable bitrate, as a
-/// fraction of the request: opus-rs, libopus.
+/// fraction of the request: opus1, libopus.
 fn rate_ratio(
     case: &Case,
     fs: i32,
@@ -403,7 +403,7 @@ fn rate_grid() -> Vec<(Case, i32, Application, i32)> {
 }
 
 /// Runs the grid on the speech-like signal of ms_support. Returns the
-/// lowest and the highest fraction of the request opus-rs used, and prints
+/// lowest and the highest fraction of the request opus1 used, and prints
 /// every measurement.
 fn measure_rates() -> Vec<(String, f64, f64)> {
     let mut rows = Vec::new();
@@ -413,7 +413,7 @@ fn measure_rates() -> Vec<(String, f64, f64)> {
         let (rust, c) = rate_ratio(&case, fs, application, bitrate, &pcm);
         let label = format!("{} {fs} Hz {application:?} {bitrate} b/s", case.name);
         println!(
-            "{label}: opus-rs {:+.1} %, libopus {:+.1} %",
+            "{label}: opus1 {:+.1} %, libopus {:+.1} %",
             100.0 * (rust - 1.0),
             100.0 * (c - 1.0)
         );
@@ -422,7 +422,7 @@ fn measure_rates() -> Vec<(String, f64, f64)> {
     rows
 }
 
-/// At 16 kHz and 16 kb/s a mono stream of opus-rs codes this signal with
+/// At 16 kHz and 16 kb/s a mono stream of opus1 codes this signal with
 /// SILK. At 48 kHz with the application `Voip` it codes it with Hybrid at
 /// 16 and 32 kb/s. SILK does not spend more than it needs for the signal,
 /// so the average rate falls below the request: by up to 34 % at 16 kHz
@@ -444,7 +444,7 @@ fn average_rate_at_16_khz_and_for_voip_stays_below_the_request() {
     let lowest = rows.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
     let highest = rows.iter().map(|r| r.1).fold(0.0, f64::max);
     println!(
-        "opus-rs uses {:.0} % to {:.0} % of the request",
+        "opus1 uses {:.0} % to {:.0} % of the request",
         100.0 * lowest,
         100.0 * highest
     );

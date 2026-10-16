@@ -6,15 +6,15 @@
 //! `opus_encode` calls for a CELT-only or Hybrid frame, without the Opus
 //! layer in front of it: no DC filter, no mode decision, no analysis.
 //!
-//! `CeltEncoder` of opus-rs is the port of exactly this code. Both get the
+//! `CeltEncoder` of opus1 is the port of exactly this code. Both get the
 //! same samples and the same settings, so their packets can be compared
 //! byte by byte.
 #![allow(dead_code)]
 
 use super::{Cfg, Format, celt_toc_lm, parse_frame};
-use opus_rs::celt::CeltEncoder;
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::CeltEncoder;
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uchar, c_void};
 
 unsafe extern "C" {
@@ -237,24 +237,26 @@ impl Stream {
         );
     }
 
-    /// The opus-rs encoder with the same settings.
+    /// The opus1 encoder with the same settings.
     pub fn rs_encoder(&self) -> CeltEncoder {
         let mut enc = CeltEncoder::with_sampling_rate(default_mode(), self.channels, self.fs as i32);
         self.rs_settings(&mut enc);
         enc
     }
 
-    /// Apply the settings to an opus-rs encoder.
+    /// Apply the settings to an opus1 encoder.
     pub fn rs_settings(&self, enc: &mut CeltEncoder) {
         enc.complexity = self.complexity;
         enc.set_end_band(self.end_band);
-        enc.set_bitrate(if self.vbr { self.bitrate } else { BITRATE_MAX });
+        enc.set_bitrate(if self.vbr { self.bitrate } else { BITRATE_MAX })
+            .expect("bitrate");
         enc.set_vbr(self.vbr);
         enc.set_constrained_vbr(self.constrained_vbr);
         enc.set_prediction(self.prediction).expect("prediction");
         enc.set_packet_loss_perc(self.loss).expect("packet loss");
         enc.set_stream_channels(self.stream_channels)
             .expect("stream channels");
+        enc.set_start_band(self.start_band).expect("start band");
     }
 
     /// One frame of interleaved samples through the C encoder.
@@ -262,25 +264,11 @@ impl Stream {
         enc.encode(frame, self.frame, self.max_bytes())
     }
 
-    /// One frame of interleaved samples through the opus-rs encoder.
+    /// One frame of interleaved samples through the opus1 encoder.
     pub fn rs_frame(&self, enc: &mut CeltEncoder, frame: &[f32]) -> Vec<u8> {
-        // `CeltEncoder` takes one channel after the other.
-        let mut planar = vec![0.0f32; self.frame * self.channels];
-        for i in 0..self.frame {
-            for c in 0..self.channels {
-                planar[c * self.frame + i] = frame[i * self.channels + c];
-            }
-        }
         let bytes = self.max_bytes();
         let mut rc = RangeCoder::new_encoder(bytes as u32);
-        enc.encode_with_budget_vbr(
-            &planar,
-            self.frame,
-            &mut rc,
-            self.start_band,
-            (bytes * 8) as i32,
-            self.vbr,
-        );
+        enc.encode(frame, self.frame, &mut rc);
         rc.done();
         assert_eq!(rc.error, 0, "range coder error");
         rc.buf[..rc.storage as usize].to_vec()
@@ -295,7 +283,7 @@ impl Stream {
             .collect()
     }
 
-    /// Encode interleaved `pcm` with opus-rs. Returns the CELT payloads.
+    /// Encode interleaved `pcm` with opus1. Returns the CELT payloads.
     pub fn enc_rs(&self, pcm: &[f32]) -> Vec<Vec<u8>> {
         let mut enc = self.rs_encoder();
         pcm.chunks_exact(self.frame * self.channels)
@@ -306,7 +294,7 @@ impl Stream {
     /// Encode interleaved `pcm` with both encoders. `before` is called
     /// ahead of every frame with the frame number and the two encoders, so
     /// it can change their settings in the middle of the stream. Returns
-    /// the payloads of libopus and of opus-rs.
+    /// the payloads of libopus and of opus1.
     pub fn enc_both_with(
         &self,
         pcm: &[f32],

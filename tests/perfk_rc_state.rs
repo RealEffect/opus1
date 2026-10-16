@@ -4,7 +4,7 @@
 //! None of them copies the whole 2048-byte buffer, so each test checks that
 //! the copy still behaves like the original.
 
-use opus_rs::range_coder::{RANGE_BUF_MAX, RangeCoder};
+use opus1::range_coder::{RANGE_BUF_MAX, RangeCoder};
 
 /// Small deterministic generator (xorshift64*), so the tests need no crate.
 struct Rng(u64);

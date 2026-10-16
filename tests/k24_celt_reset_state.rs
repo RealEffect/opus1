@@ -2,7 +2,7 @@
 //! way libopus does it.
 //!
 //! libopus keeps the log-energy of each band for the two previous frames
-//! (`oldLogE`, `oldLogE2`). Two rules were missing in opus-rs:
+//! (`oldLogE`, `oldLogE2`). Two rules were missing in opus1:
 //!
 //! 1. After creation or a reset both histories are -28 (silence), not 0.
 //!    The anti-collapse step fills a band that lost its energy in a
@@ -18,10 +18,10 @@
 mod k24_common;
 use k24_common::*;
 
-/// Per-frame SNR of opus-rs against libopus for one packet stream.
+/// Per-frame SNR of opus1 against libopus for one packet stream.
 fn snrs(packets: &[Vec<u8>], rate: usize, channels: usize, frame: usize) -> Vec<f64> {
     let reference = c_decode_all(packets, rate, channels);
-    let ours = rs_decode_all(packets, rate, channels).expect("opus-rs decode");
+    let ours = rs_decode_all(packets, rate, channels).expect("opus1 decode");
     assert_eq!(ours.len(), reference.len());
     frame_snrs(&reference, &ours, channels, frame)
         .iter()

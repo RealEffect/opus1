@@ -5,7 +5,7 @@
 //! 32768. The lengths are the ones the encoder passes for a 20 ms frame.
 
 use audiopus_sys as _;
-use opus_rs::pitch::{pitch_downsample, pitch_search, remove_doubling};
+use opus1::pitch::{pitch_downsample, pitch_search, remove_doubling};
 use std::os::raw::c_int;
 
 unsafe extern "C" {
@@ -252,7 +252,7 @@ fn remove_doubling_matches_libopus() {
             trials += 1;
             if t0 == c_t0 as usize {
                 same_period += 1;
-                // libopus can return a gain below zero where opus-rs returns
+                // libopus can return a gain below zero where opus1 returns
                 // zero. The encoder treats both as "no pre-filter".
                 let diff = (gain - c_gain.max(0.0)).abs();
                 worst_gain = worst_gain.max(diff);

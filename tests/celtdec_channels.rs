@@ -19,9 +19,9 @@ mod celtdec_common;
 mod k24_common;
 use celtdec_common::*;
 use k24_common::*;
-use opus_rs::celt::CeltDecoder;
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 /// Lowest SNR against libopus of any decoded (not concealed) frame, in dB.
 /// A stream as a whole reaches about 135 dB, the same as with matching
@@ -46,7 +46,7 @@ fn end_band(toc_byte: u8) -> usize {
 struct RsCelt {
     dec: CeltDecoder,
     channels: usize,
-    planar: Vec<f32>,
+    pcm: Vec<f32>,
 }
 
 impl RsCelt {
@@ -54,14 +54,14 @@ impl RsCelt {
         Self {
             dec: CeltDecoder::new(default_mode(), channels, rate as i32),
             channels,
-            planar: vec![0.0; 960 * channels],
+            pcm: vec![0.0; 960 * channels],
         }
     }
 
     /// Decode one packet, or conceal a lost one (`None`), into `frame`
     /// samples per channel. Returns the interleaved samples.
     fn decode(&mut self, packet: Option<&[u8]>, frame: usize) -> Vec<f32> {
-        let out = &mut self.planar[..frame * self.channels];
+        let out = &mut self.pcm[..frame * self.channels];
         let n = match packet {
             Some(p) => {
                 let t = toc(p[0]);
@@ -73,21 +73,16 @@ impl RsCelt {
                 self.dec
                     .set_stream_channels(if t.stereo { 2 } else { 1 })
                     .unwrap();
+                self.dec.set_end_band(end_band(p[0])).unwrap();
                 let payload = &p[1..];
                 let mut rc = RangeCoder::new_decoder(payload);
-                self.dec.decode_from_range_coder_with_band_range(
-                    &mut rc,
-                    (payload.len() * 8) as i32,
-                    frame,
-                    out,
-                    0,
-                    end_band(p[0]),
-                )
+                let bits = (payload.len() * 8) as i32;
+                self.dec.decode(&mut rc, bits, frame, out, PcmLayout::Interleaved)
             }
-            None => self.dec.decode_lost(frame, out, 0).unwrap(),
+            None => self.dec.decode_lost(frame, out, PcmLayout::Interleaved).unwrap(),
         };
         assert_eq!(n, frame);
-        interleave(out, self.channels)
+        out.to_vec()
     }
 }
 
@@ -128,7 +123,7 @@ fn celt_encoder(rate: usize, channels: usize, bandwidth: i32, bitrate: i32) -> C
     enc
 }
 
-/// Decode `packets` with a C decoder and an opus-rs CELT decoder, both with
+/// Decode `packets` with a C decoder and an opus1 CELT decoder, both with
 /// `dec_channels` channels at `rate`. Checks the final range of every
 /// packet and returns the lowest frame SNR and the SNR of the whole stream.
 fn compare_stream(
@@ -450,18 +445,23 @@ fn bad_arguments_are_errors() {
     assert_eq!(dec.stream_channels(), 1);
 
     let mut pcm = vec![0f32; 2 * 960];
+    let planar = PcmLayout::Planar;
     // Not a CELT frame size.
-    assert!(dec.decode_lost(100, &mut pcm, 0).is_err());
-    assert!(dec.decode_lost(0, &mut pcm, 0).is_err());
-    assert!(dec.decode_lost(1920, &mut pcm, 0).is_err());
+    assert!(dec.decode_lost(100, &mut pcm, planar).is_err());
+    assert!(dec.decode_lost(0, &mut pcm, planar).is_err());
+    assert!(dec.decode_lost(1920, &mut pcm, planar).is_err());
     // Output too small for two channels.
-    assert!(dec.decode_lost(960, &mut pcm[..960], 0).is_err());
+    assert!(dec.decode_lost(960, &mut pcm[..960], planar).is_err());
     // Not a band.
-    assert!(dec.decode_lost(960, &mut pcm, 21).is_err());
+    assert!(dec.set_start_band(21).is_err());
+    assert!(dec.set_end_band(0).is_err());
+    assert!(dec.set_end_band(22).is_err());
     // Valid calls still work, for every frame size and both start bands.
     for frame in [120usize, 240, 480, 960] {
-        assert_eq!(dec.decode_lost(frame, &mut pcm, 0), Ok(frame));
-        assert_eq!(dec.decode_lost(frame, &mut pcm, 17), Ok(frame));
+        dec.set_start_band(0).unwrap();
+        assert_eq!(dec.decode_lost(frame, &mut pcm, planar), Ok(frame));
+        dec.set_start_band(17).unwrap();
+        assert_eq!(dec.decode_lost(frame, &mut pcm, planar), Ok(frame));
     }
     assert!(pcm.iter().all(|v| v.is_finite()));
 }
@@ -484,22 +484,17 @@ fn garbage_frames_do_not_panic() {
                 let frame = frame48 * rate as usize / 48000;
                 dec.set_stream_channels(1 + next() as usize % 2).unwrap();
                 let start = if next() % 4 == 0 { 17 } else { 0 };
+                dec.set_start_band(start).unwrap();
                 let out = &mut pcm[..frame * dec_channels];
                 if next() % 5 == 0 {
-                    assert_eq!(dec.decode_lost(frame, out, start), Ok(frame));
+                    assert_eq!(dec.decode_lost(frame, out, PcmLayout::Planar), Ok(frame));
                 } else {
                     let len = next() as usize % 200;
                     let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
                     let end = [13usize, 17, 19, 21][next() as usize % 4].max(start + 1);
+                    dec.set_end_band(end).unwrap();
                     let mut rc = RangeCoder::new_decoder(&bytes);
-                    let n = dec.decode_from_range_coder_with_band_range(
-                        &mut rc,
-                        (len * 8) as i32,
-                        frame,
-                        out,
-                        start,
-                        end,
-                    );
+                    let n = dec.decode(&mut rc, (len * 8) as i32, frame, out, PcmLayout::Planar);
                     assert_eq!(n, frame);
                 }
                 assert!(out.iter().all(|v| v.is_finite()), "non-finite output");

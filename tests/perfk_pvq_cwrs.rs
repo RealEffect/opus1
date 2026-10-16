@@ -7,8 +7,8 @@
 //! pulses than dimensions and the opposite), the ends of every row of the
 //! lookup table, and pairs outside the table.
 
-use opus_rs::pvq::{MAX_PVQ_K, celt_pvq_v, cwrsi, decode_pulses, encode_pulses, icwrs};
-use opus_rs::range_coder::RangeCoder;
+use opus1::pvq::{MAX_PVQ_K, celt_pvq_v, cwrsi, decode_pulses, encode_pulses, icwrs};
+use opus1::range_coder::RangeCoder;
 
 /// `u[n][k]` is U(n, k) of libopus `celt/cwrs.c`, from its recurrence.
 /// V(n, k) = U(n, k) + U(n, k + 1) is the number of pulse vectors with `n`

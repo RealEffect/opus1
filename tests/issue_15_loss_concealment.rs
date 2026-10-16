@@ -11,7 +11,7 @@
 //! taken from the placeholder TOC (or from `frame_size` for an empty packet).
 //! These tests pin that behaviour down, plus a randomized no-panic sweep.
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use proptest::prelude::*;
 use std::f32::consts::PI;
 

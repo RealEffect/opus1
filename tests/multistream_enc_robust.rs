@@ -12,8 +12,8 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::multistream::encoder::{Bitrate, MultistreamEncoder};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// A small deterministic random number generator.
 struct Lcg(u32);

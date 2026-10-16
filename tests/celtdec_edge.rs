@@ -18,9 +18,9 @@ mod celtdec_common;
 mod k24_common;
 use celtdec_common::*;
 use k24_common::*;
-use opus_rs::celt::CeltDecoder;
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::{CeltDecoder, PcmLayout};
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 const ARM64: bool = cfg!(target_arch = "aarch64");
 /// Lowest median SNR of pitch-concealed frames against libopus, in dB.
@@ -59,7 +59,7 @@ fn median_and_poor(mut snrs: Vec<f64>) -> (f64, usize, f64) {
 /// Both decoders, driven call by call.
 struct Pair {
     c: CDecoder,
-    rs: opus_rs::OpusDecoder,
+    rs: opus1::OpusDecoder,
     channels: usize,
     buf: Vec<f32>,
 }
@@ -68,14 +68,14 @@ impl Pair {
     fn new(rate: usize, channels: usize) -> Self {
         Self {
             c: CDecoder::new(rate, channels),
-            rs: opus_rs::OpusDecoder::new(rate as i32, channels).unwrap(),
+            rs: opus1::OpusDecoder::new(rate as i32, channels).unwrap(),
             channels,
             buf: vec![0.0; 5760 * channels],
         }
     }
 
     /// Decode a packet, or conceal `frame` samples per channel (`None`).
-    /// Returns the output of libopus and of opus-rs, limited to [-1, 1] (see
+    /// Returns the output of libopus and of opus1, limited to [-1, 1] (see
     /// `decode_with_loss` in celtdec_common).
     fn decode(&mut self, packet: Option<&[u8]>, frame: usize) -> (Vec<f32>, Vec<f32>) {
         let mut c = self.c.decode(packet, frame);
@@ -652,23 +652,17 @@ fn loss_at_a_change_between_mono_and_stereo() {
                     let (c, n) = if lost {
                         (
                             c_dec.decode(None, frame),
-                            dec.decode_lost(frame, &mut planar, 0).unwrap(),
+                            dec.decode_lost(frame, &mut planar, PcmLayout::Planar).unwrap(),
                         )
                     } else {
                         dec.set_stream_channels(if toc(p[0]).stereo { 2 } else { 1 })
                             .unwrap();
                         let payload = &p[1..];
                         let mut rc = RangeCoder::new_decoder(payload);
+                        let bits = (payload.len() * 8) as i32;
                         (
                             c_dec.decode(Some(p), frame),
-                            dec.decode_from_range_coder_with_band_range(
-                                &mut rc,
-                                (payload.len() * 8) as i32,
-                                frame,
-                                &mut planar,
-                                0,
-                                21,
-                            ),
+                            dec.decode(&mut rc, bits, frame, &mut planar, PcmLayout::Planar),
                         )
                     };
                     assert_eq!(n, frame);
@@ -982,26 +976,28 @@ fn celt_frame_of_one_byte_is_concealed() {
     let mut c_dec = CDecoder::new(rate, 1);
     let mut dec = CeltDecoder::new(default_mode(), 1, rate as i32);
     let mut out = vec![0f32; frame];
+    // Decode all of `payload` into `out`.
+    let decode = |dec: &mut CeltDecoder, payload: &[u8], out: &mut [f32]| {
+        let mut rc = RangeCoder::new_decoder(payload);
+        let bits = (payload.len() * 8) as i32;
+        dec.decode(&mut rc, bits, frame, out, PcmLayout::Planar)
+    };
     let (mut one_byte, mut no_byte) = (Vec::new(), Vec::new());
     for (i, p) in packets.iter().enumerate() {
         let short = [p[0], 0x5a];
         let c = match i % 7 {
             5 => {
                 // One payload byte.
-                assert_eq!(dec.decode(&short[1..], frame, &mut out), frame);
+                assert_eq!(decode(&mut dec, &short[1..], &mut out), frame);
                 c_dec.decode(Some(&short), frame)
             }
             2 => {
                 // No payload byte.
-                let mut rc = RangeCoder::new_decoder(&[]);
-                assert_eq!(
-                    dec.decode_from_range_coder_with_band_range(&mut rc, 0, frame, &mut out, 0, 21),
-                    frame
-                );
+                assert_eq!(decode(&mut dec, &[], &mut out), frame);
                 c_dec.decode(Some(&short[..1]), frame)
             }
             _ => {
-                assert_eq!(dec.decode(&p[1..], frame, &mut out), frame);
+                assert_eq!(decode(&mut dec, &p[1..], &mut out), frame);
                 c_dec.decode(Some(p), frame)
             }
         };

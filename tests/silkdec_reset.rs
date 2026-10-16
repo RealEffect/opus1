@@ -8,7 +8,7 @@
 //! channel count change depends on both facts.
 //!
 //! C libopus has no call for this reset alone, so the streams here contain
-//! CELT-only packets. The C decoder decodes them. The opus-rs SILK decoder
+//! CELT-only packets. The C decoder decodes them. The opus1 SILK decoder
 //! never sees them and is reset instead. In the first SILK frame after a
 //! CELT-only packet libopus cross-fades 5 ms with CELT concealment; those
 //! 5 ms are left out, everything else must be identical.

@@ -17,7 +17,7 @@
 //! (tests/perfk_silkdec_down2_3.rs compares it with the linked libopus),
 //! 137 of the 12 kHz cases differed.
 
-use opus_rs::silk::pitch_analysis::silk_pitch_analysis_core;
+use opus1::silk::pitch_analysis::silk_pitch_analysis_core;
 
 /// (checksum of the input, return value, pitch lags, lag index, contour
 /// index, LTPCorr_Q15).
@@ -168,7 +168,7 @@ fn pitch_analysis_core_matches_libopus_fixed_point() {
         let got: Expected = (checksum, unvoiced, pitch_out, lag_index, contour_index, ltp_corr);
         if got != *expected {
             failures.push(format!(
-                "case {number} ({} kHz, {} subframes, complexity {}, signal {}, previous lag {}): opus-rs {:?}, libopus {:?}",
+                "case {number} ({} kHz, {} subframes, complexity {}, signal {}, previous lag {}): opus1 {:?}, libopus {:?}",
                 case.fs_khz, case.nb_subfr, case.complexity, case.kind, case.prev_lag, got, expected
             ));
         }

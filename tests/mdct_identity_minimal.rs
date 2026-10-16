@@ -1,4 +1,4 @@
-use opus_rs::modes::default_mode;
+use opus1::modes::default_mode;
 
 #[test]
 fn test_mdct_identity_minimal() {

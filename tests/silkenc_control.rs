@@ -4,23 +4,20 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::decode_indices::silk_decode_indices;
-use opus_rs::silk::decode_pulses::silk_decode_pulses;
-use opus_rs::silk::define::CODE_INDEPENDENTLY;
-use opus_rs::silk::control_codec::{
+use opus1::range_coder::RangeCoder;
+use opus1::silk::decode_indices::silk_decode_indices;
+use opus1::silk::decode_pulses::silk_decode_pulses;
+use opus1::silk::define::CODE_INDEPENDENTLY;
+use opus1::silk::control_codec::{
     SilkBandwidthControl, silk_control_audio_bandwidth, silk_control_encoder,
 };
-use opus_rs::silk::define::TRANSITION_FRAMES;
-use opus_rs::silk::enc_api::{
-    silk_encode, silk_encode_do_vad, silk_encode_prefill, silk_encode_prefill_stereo,
-    silk_encode_stereo_packet,
-};
-use opus_rs::silk::stereo_lr_to_ms::silk_stereo_lr_to_ms;
-use opus_rs::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus_rs::silk::init_encoder::silk_init_encoder;
-use opus_rs::silk::structs::SilkEncoderState;
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::silk::define::TRANSITION_FRAMES;
+use opus1::silk::enc_api::{silk_encode_do_vad, silk_encode_packet, silk_encode_prefill};
+use opus1::silk::stereo_lr_to_ms::silk_stereo_lr_to_ms;
+use opus1::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
+use opus1::silk::init_encoder::silk_init_encoder;
+use opus1::silk::structs::SilkEncoderState;
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 const FS: usize = 16_000;
 const FRAME: usize = 320;
@@ -86,7 +83,7 @@ fn most_common(values: &[i32]) -> i32 {
 /// The FEC copy of a frame is coded with a larger gain, so that it takes
 /// fewer bits. libopus 1.6 raises the gain index by
 /// `max(7 - 0.2 * loss, 3)` (silk/control_codec.c, `silk_setup_LBRR`).
-/// opus-rs used the constants of older releases, `max(7 - 0.4 * loss, 2)`:
+/// opus1 used the constants of older releases, `max(7 - 0.4 * loss, 2)`:
 /// its copies took more bits than libopus's and left fewer for the frame.
 #[test]
 fn fec_copies_are_coded_with_libopus_gain_increase() {
@@ -116,7 +113,7 @@ fn fec_copies_are_coded_with_libopus_gain_increase() {
         assert_eq!(most_common(&c_steps), formula, "{loss} % loss: libopus packets");
         if most_common(&rs_steps) != formula {
             failures.push(format!(
-                "{loss} % loss: opus-rs raises the gain index by {}, libopus by {formula}",
+                "{loss} % loss: opus1 raises the gain index by {}, libopus by {formula}",
                 most_common(&rs_steps)
             ));
         }
@@ -131,7 +128,6 @@ fn running_encoder() -> Box<SilkEncoderState> {
     assert_eq!(silk_init_encoder(&mut enc, 0), 0);
     assert_eq!(silk_control_encoder(&mut enc, 16, 20, 20_000, 9), 0);
     enc.s_shape.last_gain_index = 33;
-    enc.s_shape.harm_boost_smth_q16 = 111;
     enc.s_shape.harm_shape_gain_smth_q16 = 222;
     enc.s_shape.tilt_smth_q16 = -333;
     enc.s_nsq.s_lf_ar_q14 = 444;
@@ -150,7 +146,7 @@ fn running_encoder() -> Box<SilkEncoderState> {
 /// A change of the internal sampling rate resets the part of the encoder
 /// state that libopus's `silk_setup_fs` resets (silk/control_codec.c:254-271):
 /// the noise shaping smoothers (the whole `sShape`), the quantizer state, the
-/// previous NLSFs and the state of the input low-pass filter. opus-rs kept
+/// previous NLSFs and the state of the input low-pass filter. opus1 kept
 /// the smoothers and the filter state of the old rate.
 #[test]
 fn a_rate_change_resets_what_libopus_resets() {
@@ -161,7 +157,6 @@ fn a_rate_change_resets_what_libopus_resets() {
         assert_eq!(enc.s_cmn.predict_lpc_order, order);
         // memset( &psEnc->sShape, 0, ... ), then LastGainIndex = 10.
         assert_eq!(enc.s_shape.last_gain_index, 10);
-        assert_eq!(enc.s_shape.harm_boost_smth_q16, 0);
         assert_eq!(enc.s_shape.harm_shape_gain_smth_q16, 0);
         assert_eq!(enc.s_shape.tilt_smth_q16, 0);
         // memset( &psEnc->sCmn.sNSQ, 0, ... ), then lagPrev and prev_gain_Q16.
@@ -205,7 +200,6 @@ fn encoders(packet_ms: i32, channels: usize) -> Vec<Box<SilkEncoderState>> {
             let mut enc = Box::new(SilkEncoderState::default());
             assert_eq!(silk_init_encoder(&mut enc, 0), 0);
             assert_eq!(silk_control_encoder(&mut enc, 16, packet_ms, 24_000, 9), 0);
-            enc.s_cmn.n_channels = channels as i32;
             enc
         })
         .collect()
@@ -221,13 +215,12 @@ fn hp_tracker_every_60_ms(pcm: &[Vec<i16>], packet_ms: i32) -> Vec<i32> {
     let mut track = Vec::new();
     for (i, start) in (0..pcm[0].len() - n + 1).step_by(n).enumerate() {
         let mut rc = RangeCoder::new_encoder(1275);
-        let mut bytes = 0;
         let ret = if let [mid, side] = &mut enc[..] {
             let (l, r) = (&pcm[0][start..start + n], &pcm[1][start..start + n]);
-            silk_encode_stereo_packet(mid, side, l, r, n, &mut rc, &mut bytes, 40_000, 8000, 0, 1)
+            silk_encode_packet(mid, Some(side), [l, r], &mut rc, 40_000, 8000, false, 1, false)
         } else {
             let x = &pcm[0][start..start + n];
-            silk_encode(&mut enc[0], x, n, &mut rc, &mut bytes, 24_000, 8000, 0, 1)
+            silk_encode_packet(&mut enc[0], None, [x, &[]], &mut rc, 24_000, 8000, false, 1, false)
         };
         assert_eq!(ret, 0);
         if ((i + 1) * packet_ms as usize).is_multiple_of(60) {
@@ -239,7 +232,7 @@ fn hp_tracker_every_60_ms(pcm: &[Vec<i16>], packet_ms: i32) -> Vec<i32> {
 
 /// libopus updates the pitch tracker behind the high-pass cutoff once per
 /// SILK frame (silk/enc_API.c:392, inside the frame loop), so a 40 or 60 ms
-/// packet updates it two or three times. opus-rs updated it once per packet.
+/// packet updates it two or three times. opus1 updated it once per packet.
 ///
 /// The update depends on the pitch analysis and the voice activity alone,
 /// not on how frames are grouped into packets. So the same input coded as
@@ -291,7 +284,7 @@ fn bandwidth_control(desired_khz: i32, max_bits: i32) -> SilkBandwidthControl {
 ///
 /// The figures are those of the fixed-point build of libopus for a 48 kb/s
 /// constant bitrate stereo stream with 20 ms packets, on the packet before a
-/// switch from 16 to 12 kHz: 952 bits become 762, then 610. opus-rs, whose
+/// switch from 16 to 12 kHz: 952 bits become 762, then 610. opus1, whose
 /// caller reduces the bits once, gave SILK 762.
 #[test]
 fn each_channel_that_is_ready_to_switch_takes_room_out_of_max_bits() {
@@ -398,13 +391,13 @@ fn vad_state(enc: &SilkEncoderState) -> impl PartialEq + std::fmt::Debug {
 /// libopus prefills a restarted SILK encoder with a call of `silk_Encode`
 /// that codes nothing (silk/enc_API.c, `prefillFlag`). That call runs the
 /// voice activity detector on the 10 ms it is given, with the encoder set up
-/// for 10 ms packets. opus-rs did not run the detector when one channel is
+/// for 10 ms packets. opus1 did not run the detector when one channel is
 /// coded, so the detector's noise estimates lagged one frame behind
 /// libopus's for the first frames after a restart.
 ///
 /// Measured against the fixed-point build of libopus on quiet speech, 8 kHz,
 /// for the frames 3 to 5 after the restart: speech activity 20, 26, 6 in
-/// libopus; 5, 9, 3 in opus-rs before and 21, 27, 7 now.
+/// libopus; 5, 9, 3 in opus1 before and 21, 27, 7 now.
 ///
 /// Here the state that a prefill leaves must be the state that the detector
 /// leaves when it runs on the same 10 ms in an encoder set up for 10 ms.
@@ -415,7 +408,7 @@ fn a_prefill_runs_the_voice_activity_detector() {
         pcm[8000..8160].iter().map(|&x| (x * 3000.0).round() as i16).collect();
     for packet_ms in [20, 10, 60] {
         let mut prefilled = encoders(packet_ms, 1).remove(0);
-        silk_encode_prefill(&mut prefilled, &frame, 1);
+        silk_encode_prefill(&mut prefilled, None, [&frame, &[]], 0, 1);
 
         // The detector reads the frame behind one sample of history, which
         // is 0 in a new encoder.
@@ -435,7 +428,7 @@ fn a_prefill_runs_the_voice_activity_detector() {
 /// The stereo prefill splits the bits between mid and side from the target
 /// rate that libopus computes for the prefill frame (silk/enc_API.c:395-423):
 /// the bitrate less the payback of the bits that earlier packets used beyond
-/// their share. opus-rs passed the bitrate itself.
+/// their share. opus1 passed the bitrate itself.
 ///
 /// With 10000 bits to pay back, 36 kb/s become 16 kb/s. That is under what
 /// a wideband mid alone needs, so the prefill frame has no stereo width.
@@ -449,7 +442,7 @@ fn the_stereo_prefill_pays_back_the_bit_reservoir() {
         let mut enc = encoders(20, 2);
         enc[0].n_bits_exceeded = exceeded;
         let [mid, side] = &mut enc[..] else { unreachable!() };
-        silk_encode_prefill_stereo(mid, side, &left, &right, 36_000, 1);
+        silk_encode_prefill(mid, Some(side), [&left, &right], 36_000, 1);
 
         // What silk_stereo_LR_to_MS makes of the frame at libopus's target.
         let mut want = encoders(20, 1).remove(0);
@@ -473,7 +466,7 @@ fn the_stereo_prefill_pays_back_the_bit_reservoir() {
         let mut enc = encoders(20, 2);
         enc[0].n_bits_exceeded = exceeded;
         let [mid, side] = &mut enc[..] else { unreachable!() };
-        silk_encode_prefill_stereo(mid, side, &left, &right, 36_000, 1);
+        silk_encode_prefill(mid, Some(side), [&left, &right], 36_000, 1);
         enc[0].stereo.width_prev_q14
     };
     assert_eq!((width(0), width(10_000)), (1 << 14, 0));

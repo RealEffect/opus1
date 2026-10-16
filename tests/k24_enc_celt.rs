@@ -1,4 +1,4 @@
-//! CELT-only coding from the opus-rs encoder at a 24 kHz input rate, decoded
+//! CELT-only coding from the opus1 encoder at a 24 kHz input rate, decoded
 //! by C libopus and compared with libopus's own encoder.
 
 mod k24_enc_common;
@@ -39,7 +39,7 @@ fn quality(pcm: &[f32], packets: &[Vec<u8>], lag: usize) -> (f64, f64) {
 /// 42.0 dB (41.6 dB), and a 100 Hz - 11 kHz chirp 35.9 dB against 41.6 dB.
 ///
 /// Complexity 5 keeps libopus's tonality analysis off (it starts at
-/// complexity 7 and opus-rs does not port it), so both sides run the same
+/// complexity 7 and opus1 does not port it), so both sides run the same
 /// algorithms.
 #[test]
 fn comb_filter_tap_shape_matches_the_decoder() {
@@ -50,7 +50,7 @@ fn comb_filter_tap_shape_matches_the_decoder() {
         let (rs, rs_worst) = quality(&pcm, &enc_rs(&cfg, &pcm).unwrap(), lag);
         let (c, c_worst) = quality(&pcm, &enc_c(&cfg, &pcm), lag);
         let what = format!(
-            "{hz} Hz tone, {}: opus-rs {rs:.1} dB (worst 20 ms {rs_worst:.1}), libopus {c:.1} dB (worst 20 ms {c_worst:.1})",
+            "{hz} Hz tone, {}: opus1 {rs:.1} dB (worst 20 ms {rs_worst:.1}), libopus {c:.1} dB (worst 20 ms {c_worst:.1})",
             app.name()
         );
         assert!(rs >= c - 2.0, "{what}");
@@ -64,14 +64,14 @@ fn comb_filter_tap_shape_matches_the_decoder() {
     let (c, _) = quality(&pcm, &enc_c(&cfg, &pcm), 156);
     assert!(
         rs >= c - 3.0,
-        "100 Hz - 11 kHz chirp at 128 kb/s: opus-rs {rs:.1} dB, libopus {c:.1} dB"
+        "100 Hz - 11 kHz chirp at 128 kb/s: opus1 {rs:.1} dB, libopus {c:.1} dB"
     );
 }
 
 /// 2.5 ms frames must decode as well as libopus's.
 ///
 /// A 2.5 ms CELT frame has no transient flag, so libopus drops the transient
-/// decision for it (`isTransient = 0`, celt_encoder.c:2071-2074). opus-rs
+/// decision for it (`isTransient = 0`, celt_encoder.c:2071-2074). opus1
 /// kept it and coded the time-frequency resolution as for a transient frame,
 /// which the decoder parses as non-transient: every such frame lost sync.
 /// 2.5 ms speech at 64 kb/s measured 12-17 dB (worst 100 ms correlation
@@ -83,7 +83,7 @@ fn frames_of_2_5_ms_stay_in_sync() {
         for bitrate in [64_000, 96_000] {
             let mut cfg = Cfg::new(app, bitrate);
             cfg.frame = 60;
-            // Keep libopus in CELT super-wideband, which is what opus-rs codes.
+            // Keep libopus in CELT super-wideband, which is what opus1 codes.
             cfg.c_bandwidth = Some(audiopus_sys::OPUS_BANDWIDTH_SUPERWIDEBAND);
             let q = |packets: &[Vec<u8>]| {
                 for p in packets {
@@ -95,7 +95,7 @@ fn frames_of_2_5_ms_stay_in_sync() {
             };
             let (rs, c) = (q(&enc_rs(&cfg, &pcm).unwrap()), q(&enc_c(&cfg, &pcm)));
             let what = format!(
-                "{} {} kb/s 2.5 ms: opus-rs {:.1} dB (worst 100 ms correlation {:.3}), libopus {:.1} dB ({:.3})",
+                "{} {} kb/s 2.5 ms: opus1 {:.1} dB (worst 100 ms correlation {:.3}), libopus {:.1} dB ({:.3})",
                 app.name(),
                 bitrate / 1000,
                 rs.snr,
@@ -115,7 +115,7 @@ fn frames_of_2_5_ms_stay_in_sync() {
 /// 6 kb/s in 2.5 ms packets is 15 bits a packet: two bytes. Nothing can be
 /// coded in that, so the encoder sends a packet with an empty frame, which a
 /// decoder conceals, and pads it to the constant size (opus_encoder.c:
-/// 1339-1392). At exactly two bytes there is nothing to pad. opus-rs still
+/// 1339-1392). At exactly two bytes there is nothing to pad. opus1 still
 /// set the "padding follows" bit in the second byte, with no padding length
 /// behind it. libopus's decoder rejects such a packet as corrupt
 /// (OPUS_INVALID_PACKET), where it should play a concealed frame.
@@ -147,7 +147,7 @@ fn two_byte_cbr_packets_are_valid() {
 /// from complexity 7 up (opus_encoder.c:1252) and no other CELT-only
 /// decision changes between complexity 6 and 7. Both streams are CELT-only
 /// at the same bitrate, so the gain comes from where the bits go, not from
-/// more bits. With the analysis off, opus-rs is level with libopus.
+/// more bits. With the analysis off, opus1 is level with libopus.
 #[test]
 fn issue_54_gap_is_the_tonality_analysis() {
     // The issue's chirp: 200 Hz rising at 1200 Hz/s for 1.3 s, amplitude 0.4.
@@ -173,18 +173,18 @@ fn issue_54_gap_is_the_tonality_analysis() {
         (snr(&rs), snr(&c), mean_bitrate(&rs, 480), mean_bitrate(&c, 480))
     };
 
-    // Analysis off in libopus (complexity 6): opus-rs is not behind.
+    // Analysis off in libopus (complexity 6): opus1 is not behind.
     let (rs6, c6, rs6_rate, c6_rate) = run(6, 6);
     assert!((rs6_rate - c6_rate).abs() < 1000.0, "bitrates {rs6_rate} / {c6_rate}");
     assert!(
         rs6 >= c6 - 0.5,
-        "analysis off: opus-rs {rs6:.2} dB, libopus {c6:.2} dB"
+        "analysis off: opus1 {rs6:.2} dB, libopus {c6:.2} dB"
     );
     // Analysis on in libopus (complexity 7): libopus gains about 4 dB at the
-    // same bitrate; opus-rs has no analysis and does not move.
+    // same bitrate; opus1 has no analysis and does not move.
     let (rs7, c7, rs7_rate, c7_rate) = run(7, 7);
     assert!((rs7_rate - c7_rate).abs() < 1000.0, "bitrates {rs7_rate} / {c7_rate}");
-    assert!((rs7 - rs6).abs() < 0.1, "opus-rs changed at complexity 7: {rs6:.2} -> {rs7:.2}");
+    assert!((rs7 - rs6).abs() < 0.1, "opus1 changed at complexity 7: {rs6:.2} -> {rs7:.2}");
     assert!(
         c7 >= c6 + 2.5,
         "libopus's analysis no longer explains the gap: {c6:.2} dB -> {c7:.2} dB"
@@ -192,6 +192,6 @@ fn issue_54_gap_is_the_tonality_analysis() {
     // The gap that remains is no larger than what the analysis gives libopus.
     assert!(
         c7 - rs7 <= c7 - c6 + 0.5,
-        "opus-rs {rs7:.2} dB is further behind libopus {c7:.2} dB than the analysis explains ({c6:.2} dB without it)"
+        "opus1 {rs7:.2} dB is further behind libopus {c7:.2} dB than the analysis explains ({c6:.2} dB without it)"
     );
 }

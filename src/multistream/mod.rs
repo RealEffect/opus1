@@ -44,8 +44,8 @@
 //! own.
 //!
 //! ```
-//! use opus_rs::Application;
-//! use opus_rs::multistream::{Bitrate, MultistreamEncoder};
+//! use opus1::Application;
+//! use opus1::multistream::{Bitrate, MultistreamEncoder};
 //!
 //! // 5.1 at 48 kHz: front left, centre, front right, rear left, rear
 //! // right, LFE.
@@ -80,8 +80,8 @@
 //! it wrongly or rejects it.
 //!
 //! ```
-//! use opus_rs::Application;
-//! use opus_rs::multistream::{MultistreamDecoder, MultistreamEncoder};
+//! use opus1::Application;
+//! use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
 //!
 //! // A packet to decode: one 20 ms frame of quadraphonic sound.
 //! let mut encoder = MultistreamEncoder::new_surround(48_000, 4, 1, Application::Audio)?;
@@ -128,14 +128,96 @@ pub use decoder::MultistreamDecoder;
 pub use encoder::{Bitrate, MultistreamEncoder};
 pub use layout::{ChannelLayout, MappingType, SILENT_CHANNEL};
 
-use crate::packet;
+use crate::{float2int16, int16_to_res, packet};
 
 /// Source of the input samples of one frame, by input channel.
 /// libopus calls this `opus_copy_channel_in_func`.
 pub(crate) trait ChannelSource {
-    /// Writes `frame_size` samples of input channel `src_channel` to
-    /// `dst[0]`, `dst[dst_stride]`, `dst[2 * dst_stride]` and so on.
-    fn copy(&self, dst: &mut [f32], dst_stride: usize, src_channel: usize, frame_size: usize);
+    /// Writes `frame_size` samples of input channel `channel` to
+    /// `dst[..frame_size]`.
+    fn copy(&self, dst: &mut [f32], channel: usize, frame_size: usize);
+}
+
+/// A sample type of the encoder input and the decoder output: `f32` with
+/// full scale 1.0, or `i16`.
+pub(crate) trait Sample: Copy {
+    /// Silence.
+    const ZERO: Self;
+    /// The sample as `f32` with full scale 1.0.
+    fn to_f32(self) -> f32;
+    /// An `f32` sample with full scale 1.0 as this type.
+    fn from_f32(v: f32) -> Self;
+}
+
+impl Sample for f32 {
+    const ZERO: f32 = 0.0;
+
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        self
+    }
+
+    #[inline(always)]
+    fn from_f32(v: f32) -> f32 {
+        v
+    }
+}
+
+impl Sample for i16 {
+    const ZERO: i16 = 0;
+
+    /// libopus `INT16TORES` in the float build.
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        int16_to_res(self)
+    }
+
+    /// libopus `FLOAT2INT16`: rounded to the nearest integer and limited to
+    /// the 16-bit range.
+    #[inline(always)]
+    fn from_f32(v: f32) -> i16 {
+        float2int16(v)
+    }
+}
+
+/// Interleaved input: sample `i` of channel `c` is `pcm[i * channels + c]`.
+/// libopus `opus_copy_channel_in_float` and `opus_copy_channel_in_short`.
+///
+/// A copy writes fewer samples when `pcm` or the destination is shorter
+/// than the frame. It writes nothing for a channel the input does not have.
+pub(crate) struct Interleaved<'a, T> {
+    pub(crate) pcm: &'a [T],
+    pub(crate) channels: usize,
+}
+
+impl<T: Sample> Interleaved<'_, T> {
+    /// Writes `frame_size` samples of channels `left` and `right` to `dst`,
+    /// interleaved: sample `i` of `left` to `dst[2 * i]` and of `right` to
+    /// `dst[2 * i + 1]`. This is the input of a coupled stream.
+    #[inline]
+    pub(crate) fn copy_pair(&self, dst: &mut [f32], left: usize, right: usize, frame_size: usize) {
+        if left >= self.channels || right >= self.channels {
+            return;
+        }
+        let pairs = dst.as_chunks_mut::<2>().0.iter_mut();
+        let frames = self.pcm.chunks_exact(self.channels);
+        for (d, frame) in pairs.zip(frames).take(frame_size) {
+            *d = [frame[left].to_f32(), frame[right].to_f32()];
+        }
+    }
+}
+
+impl<T: Sample> ChannelSource for Interleaved<'_, T> {
+    #[inline]
+    fn copy(&self, dst: &mut [f32], channel: usize, frame_size: usize) {
+        if channel >= self.channels {
+            return;
+        }
+        let frames = self.pcm.chunks_exact(self.channels);
+        for (d, frame) in dst.iter_mut().zip(frames).take(frame_size) {
+            *d = frame[channel].to_f32();
+        }
+    }
 }
 
 /// Destination of the decoded samples of one frame, by output channel.
@@ -211,9 +293,8 @@ pub fn split_self_delimited<'a>(
     const INVALID: &str = "Invalid packet";
     let parsed = packet::parse(data, true)?;
     // The extra field is the last thing before the first frame. It holds the
-    // size of the last frame. A size below 252 takes 1 byte, any other 2.
-    let last_size = parsed.sizes[parsed.count - 1];
-    let field_len = if last_size < 252 { 1 } else { 2 };
+    // size of the last frame.
+    let field_len = packet::size_field_len(parsed.sizes[parsed.count - 1]);
     let header_end = parsed.payload_offset.checked_sub(field_len).ok_or(INVALID)?;
     let header = data.get(..header_end).ok_or(INVALID)?;
     let frames_and_padding = data.get(parsed.payload_offset..parsed.packet_offset).ok_or(INVALID)?;
@@ -229,6 +310,69 @@ mod tests {
 
     fn toc_byte(config: u8, stereo: bool, code: u8) -> u8 {
         (config << 3) | ((stereo as u8) << 2) | (code & 0x03)
+    }
+
+    #[test]
+    fn interleaved_input_gives_one_channel_or_a_pair() {
+        // 3 channels, 4 samples: channel c holds 10 * c + i.
+        let pcm: Vec<f32> = (0..12).map(|k| (10 * (k % 3) + k / 3) as f32).collect();
+        let src = Interleaved {
+            pcm: &pcm,
+            channels: 3,
+        };
+        let mut mono = [-1.0f32; 6];
+        src.copy(&mut mono, 2, 4);
+        assert_eq!(mono, [20.0, 21.0, 22.0, 23.0, -1.0, -1.0]);
+        let mut stereo = [-1.0f32; 10];
+        src.copy_pair(&mut stereo, 0, 1, 4);
+        assert_eq!(stereo, [0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0, -1.0, -1.0]);
+        // The right channel of a pair may come before the left one.
+        src.copy_pair(&mut stereo, 2, 0, 2);
+        assert_eq!(&stereo[..4], [20.0, 0.0, 21.0, 1.0]);
+    }
+
+    #[test]
+    fn interleaved_input_never_reads_or_writes_out_of_range() {
+        let pcm = [1.0f32; 7];
+        let src = Interleaved {
+            pcm: &pcm,
+            channels: 2,
+        };
+        // More samples asked for than the input and the destination hold.
+        let mut dst = [0.0f32; 2];
+        src.copy(&mut dst, 1, 100);
+        assert_eq!(dst, [1.0, 1.0]);
+        let mut dst = [0.0f32; 5];
+        src.copy_pair(&mut dst, 0, 1, 100);
+        assert_eq!(dst, [1.0, 1.0, 1.0, 1.0, 0.0]);
+        // A channel that does not exist copies nothing.
+        let mut dst = [0.0f32; 4];
+        src.copy(&mut dst, 2, 2);
+        src.copy_pair(&mut dst, 0, 2, 2);
+        src.copy_pair(&mut dst, 2, 1, 2);
+        assert_eq!(dst, [0.0; 4]);
+    }
+
+    #[test]
+    fn sixteen_bit_input_is_scaled_by_32768() {
+        let pcm = [i16::MIN, -1, 0, 1, 16384, i16::MAX];
+        let src = Interleaved {
+            pcm: &pcm,
+            channels: 1,
+        };
+        let mut dst = [9.0f32; 6];
+        src.copy(&mut dst, 0, 6);
+        assert_eq!(
+            dst,
+            [
+                -1.0,
+                -1.0 / 32768.0,
+                0.0,
+                1.0 / 32768.0,
+                0.5,
+                32767.0 / 32768.0
+            ]
+        );
     }
 
     #[test]

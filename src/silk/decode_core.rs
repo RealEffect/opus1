@@ -97,7 +97,7 @@ pub fn silk_decode_core(
             // loss-recovery path above can surface `lag_prev` from a previous
             // higher-bandwidth frame (e.g. 288 at 16 kHz); without this clamp
             // the re-whitening and the predictor below index out of bounds
-            // after a WB -> NB switch under packet loss (issue #27 deep scan).
+            // after a WB -> NB switch under packet loss.
             // libopus keeps this invariant via the lagPrev reset in
             // silk_decoder_set_fs.
             let lag =
@@ -127,8 +127,8 @@ pub fn silk_decode_core(
                 // libopus filters `lpc_order` more samples in front of it,
                 // only to have the filter memory. Here the kernel reads that
                 // memory straight from `out_buf`. Where the history is too
-                // short for a full memory the result is zero, as before
-                // (this needs a lag that the clamp above rules out).
+                // short for a full memory the result is zero. This needs a
+                // lag that the clamp above rules out.
                 let first = ltp_mem_length - hist_len;
                 let zeros = lpc_order.saturating_sub(first).min(hist_len);
                 // Both calls together write every element of `state`.
@@ -372,7 +372,8 @@ fn rewhiten_neon<const ORDER: usize>(
             let res_q12 = vsubq_s32(vshll_n_s16::<12>(vld1_s16(x.add(ORDER))), pred_q12);
             // Round to Q0 and saturate to 16 bits.
             let res = vqmovn_s32(vrshrq_n_s32::<12>(res_q12));
-            // vqdmulhq_s32(g, r << 15) is (g * r) >> 16.
+            // silk_smulwb(gain, res) per lane: `vshll_n_s16::<15>` makes
+            // `smulwb_operand(res)`.
             let scaled = vqdmulhq_s32(gain, vshll_n_s16::<15>(res));
             vst1q_s32(out.as_mut_ptr().add(m) as *mut i32, scaled);
             m += 4;
@@ -479,6 +480,7 @@ fn ltp_block_neon(
     res_q14: &mut [i32],
     new_state: &mut [MaybeUninit<i32>],
 ) {
+    use crate::silk::sigproc_fix::smulwb_operand;
     use core::arch::aarch64::*;
 
     let n = exc_q14.len();
@@ -491,12 +493,11 @@ fn ltp_block_neon(
     // reads `exc_q14[i..i + 4]` and writes `res_q14[i..i + 4]` and
     // `new_state[i..i + 4]`, which all have `n` elements.
     unsafe {
-        // vqdmulhq_s32(x, b << 15) is (x * b) >> 16.
-        let b0 = vdupq_n_s32((b_q14[0] as i32) << 15);
-        let b1 = vdupq_n_s32((b_q14[1] as i32) << 15);
-        let b2 = vdupq_n_s32((b_q14[2] as i32) << 15);
-        let b3 = vdupq_n_s32((b_q14[3] as i32) << 15);
-        let b4 = vdupq_n_s32((b_q14[4] as i32) << 15);
+        let b0 = vdupq_n_s32(smulwb_operand(b_q14[0]));
+        let b1 = vdupq_n_s32(smulwb_operand(b_q14[1]));
+        let b2 = vdupq_n_s32(smulwb_operand(b_q14[2]));
+        let b3 = vdupq_n_s32(smulwb_operand(b_q14[3]));
+        let b4 = vdupq_n_s32(smulwb_operand(b_q14[4]));
         let bias = vdupq_n_s32(2);
         let mut i = 0;
         while i < n4 {
@@ -635,6 +636,7 @@ fn lpc_synthesis_neon<const ORDER: usize>(
     a_q12: &[i16; MAX_LPC_ORDER],
     bias: i32,
 ) {
+    use crate::silk::sigproc_fix::smulwb_operand;
     use core::arch::aarch64::*;
 
     let n = res_q14.len();
@@ -648,13 +650,13 @@ fn lpc_synthesis_neon<const ORDER: usize>(
     const IN_VECTORS: usize = MAX_LPC_ORDER - NEWEST;
 
     let c_high: [i64; NEWEST] = core::array::from_fn(|k| (a_q12[k] as i64) << 48);
-    // Lane `k` of the vector registers holds the sample `16 - k` steps back.
-    // Its coefficient is shifted left by 15: vqdmulhq_s32(x, c << 15) is
-    // (x * c) >> 16. Order 10 has no taps 11 to 16; their coefficients stay
-    // zero, and the first vector is not used at all.
+    // Lane `k` of the vector registers holds the sample `16 - k` steps back,
+    // and lane `k` of `c_vec` the `smulwb_operand` of its coefficient. Order
+    // 10 has no taps 11 to 16; their coefficients stay zero, and the first
+    // vector is not used at all.
     let mut c_vec = [0i32; IN_VECTORS];
     for k in MAX_LPC_ORDER - ORDER..IN_VECTORS {
-        c_vec[k] = (a_q12[MAX_LPC_ORDER - 1 - k] as i32) << 15;
+        c_vec[k] = smulwb_operand(a_q12[MAX_LPC_ORDER - 1 - k]);
     }
     // SAFETY: each load reads 4 elements; `c_vec` has 12 and `state` has 16.
     let (c0, c1, c2, mut h0, mut h1, mut h2) = unsafe {
@@ -1122,8 +1124,8 @@ mod tests {
 
     // -- the whole function ----------------------------------------------------
 
-    /// `silk_decode_core` as it was before the kernels above replaced its
-    /// loops: a direct port of libopus `silk_decode_core`.
+    /// A direct port of libopus `silk_decode_core`, the reference for the
+    /// kernels above.
     fn decode_core_reference(
         ps_dec: &mut SilkDecoderState,
         ps_dec_ctrl: &mut SilkDecoderControl,

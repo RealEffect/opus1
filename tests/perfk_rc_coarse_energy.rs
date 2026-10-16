@@ -14,9 +14,9 @@
 //! drop fast in many bands, which is where the limit on the decay applies
 //! and where the count of `badness` matters.
 
-use opus_rs::modes::default_mode;
-use opus_rs::quant_bands::quant_coarse_energy_advanced;
-use opus_rs::range_coder::RangeCoder;
+use opus1::modes::default_mode;
+use opus1::quant_bands::quant_coarse_energy_advanced;
+use opus1::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uint, c_void};
 
 /// `ec_ctx` of libopus (celt/entcode.h).
@@ -213,7 +213,7 @@ fn compare(mode: *const c_void, case: &Case) -> (Option<String>, Option<bool>) {
         );
     }
 
-    // opus-rs.
+    // opus1.
     let mut enc = RangeCoder::new_encoder(case.size);
     for &(bit, logp) in &case.header_bits {
         enc.encode_bit_logp(bit, logp);

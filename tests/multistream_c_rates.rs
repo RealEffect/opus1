@@ -1,4 +1,4 @@
-//! `opus_rs::multistream::rate_alloc` against C libopus.
+//! `opus1::multistream::rate_alloc` against C libopus.
 //!
 //! The C multistream encoder gives every stream encoder a bitrate before it
 //! encodes a frame. That bitrate can be read back from the stream encoder
@@ -14,8 +14,8 @@
 mod ms_support;
 
 use ms_support::*;
-use opus_rs::multistream::layout::{ChannelLayout, MappingType};
-use opus_rs::multistream::rate_alloc::{
+use opus1::multistream::layout::{ChannelLayout, MappingType};
+use opus1::multistream::rate_alloc::{
     MS_FRAME_TMP, cbr_last_stream_bitrate, cbr_max_data_bytes, clamp_user_bitrate, rate_allocation,
     smallest_packet, stream_max_bytes,
 };
@@ -111,12 +111,12 @@ fn compare_rates_for_signal(
     let total = enc.bitrate();
     if got != want {
         return Some(format!(
-            "C streams {got:?}, opus-rs {want:?} (before limits {:?})",
+            "C streams {got:?}, opus1 {want:?} (before limits {:?})",
             &rate[..streams]
         ));
     }
     if total as i64 != want.iter().map(|&r| r as i64).sum::<i64>() {
-        return Some(format!("C total {total}, opus-rs streams {want:?}"));
+        return Some(format!("C total {total}, opus1 streams {want:?}"));
     }
     None
 }
@@ -562,7 +562,7 @@ fn rate_allocation_above_the_32_bit_range_of_libopus() {
     // stream encoder ends at its own limit of 750 000 b/s per channel. A
     // product that wrapped around in 32 bits would give a few kb/s instead.
     // If this test fails with another build of libopus while the checks on
-    // `rate` hold, that build wraps, and opus-rs is still right.
+    // `rate` hold, that build wraps, and opus1 is still right.
     let mut above = 0;
     for channels in [12usize, 16, 64, 255] {
         let mut mapping = vec![255u8; channels];

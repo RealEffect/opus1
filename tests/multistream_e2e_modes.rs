@@ -11,21 +11,21 @@
 //!
 //! That choice goes by the bitrate and by an estimate of how likely the
 //! input is speech. From complexity 7 on libopus takes the estimate from
-//! its analysis of the signal (analysis.c). opus-rs has no such analysis
+//! its analysis of the signal (analysis.c). opus1 has no such analysis
 //! and uses the fixed estimate libopus uses without it. The tests show:
 //!
 //! - Without the analysis of libopus (complexity 6) every stream of
-//!   opus-rs has the mode of the libopus stream in every frame.
+//!   opus1 has the mode of the libopus stream in every frame.
 //! - With it (complexity 9) libopus starts in the same mode and, on the
 //!   test signal, changes the stream to CELT after about 0.4 s. CELT fills
-//!   the bitrate; SILK and Hybrid do not. opus-rs stays where it started.
+//!   the bitrate; SILK and Hybrid do not. opus1 stays where it started.
 //!
 //! So the multistream layer has nothing to follow here. Forcing CELT on
 //! these streams would not be what libopus does: on a signal its analysis
 //! takes for speech, libopus stays with SILK as well.
 //!
 //! A second difference shows in the same numbers and has nothing to do
-//! with the analysis: in the same mode, a SILK or Hybrid stream of opus-rs
+//! with the analysis: in the same mode, a SILK or Hybrid stream of opus1
 //! uses up to 19 % fewer bits than the libopus stream.
 #![cfg(feature = "std")]
 
@@ -36,7 +36,7 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
+use opus1::Application;
 
 /// 20 ms frames per run: 2 seconds.
 const FRAMES: usize = 100;
@@ -45,7 +45,7 @@ const FRAMES: usize = 100;
 struct Run {
     label: String,
     /// Bits per second of the packets as a fraction of the request:
-    /// opus-rs, libopus.
+    /// opus1, libopus.
     rate: [f64; 2],
     /// Stream packets of streams that choose their own mode.
     compared: usize,
@@ -53,7 +53,7 @@ struct Run {
     mode_differs: usize,
     /// Per stream that chooses its own mode: the first frame from which
     /// libopus codes CELT to the end, if it does not code CELT from the
-    /// start, and whether opus-rs codes the same mode in every frame.
+    /// start, and whether opus1 codes the same mode in every frame.
     to_celt: Vec<(Option<usize>, bool)>,
 }
 
@@ -171,15 +171,15 @@ fn run_all(complexity: i32) -> Vec<Run> {
 }
 
 /// libopus runs its analysis from complexity 7 (opus_encoder.c:1252). At
-/// complexity 6 it goes by the application alone, as opus-rs always does.
+/// complexity 6 it goes by the application alone, as opus1 always does.
 ///
 /// Measured over 52 settings: no stream packet of 7800 has another mode.
 /// Also at 16 kHz with the VoIP application and 64 kb/s per channel, where
 /// both encoders code SILK and use about half of the request (one mono
-/// stream: libopus 50 %, opus-rs 45 %).
+/// stream: libopus 50 %, opus1 45 %).
 ///
-/// The rate of opus-rs is 81 to 100 % of the rate of libopus. The low end
-/// is SILK at 16 kHz: in the same mode, the SILK encoder of opus-rs spends
+/// The rate of opus1 is 81 to 100 % of the rate of libopus. The low end
+/// is SILK at 16 kHz: in the same mode, the SILK encoder of opus1 spends
 /// fewer bits. That is a difference inside the stream encoder.
 ///
 /// In one setting libopus uses about twice what was asked for: 5.1
@@ -188,7 +188,7 @@ fn run_all(complexity: i32) -> Vec<Run> {
 /// stream's whole bitrate (opus_encoder.c:2069-2104). The CELT part is
 /// set to what is left (opus_encoder.c:2454). The CELT encoder refuses a
 /// bitrate of 500 b/s or less (celt_encoder.c:3008) and keeps the one it
-/// started with, the maximum. opus-rs deliberately does not follow that
+/// started with, the maximum. opus1 deliberately does not follow that
 /// and stays at the request, so the rates are not compared there.
 #[test]
 fn without_the_analysis_of_libopus_every_stream_has_the_mode_of_libopus() {
@@ -221,7 +221,7 @@ fn without_the_analysis_of_libopus_every_stream_has_the_mode_of_libopus() {
         );
     }
     println!(
-        "{compared} stream packets; opus-rs uses {:.0} to {:.0} % of the bits of libopus; \
+        "{compared} stream packets; opus1 uses {:.0} to {:.0} % of the bits of libopus; \
          libopus far above the request in {libopus_far_above} settings",
         100.0 * lowest,
         100.0 * highest
@@ -234,23 +234,23 @@ fn without_the_analysis_of_libopus_every_stream_has_the_mode_of_libopus() {
 /// that starts in SILK or Hybrid then changes to CELT, which uses the whole
 /// bitrate. Measured: in 24 of the 52 settings libopus changes streams to
 /// CELT, 36 streams in all, at frame 17 to 21, which is 0.34 to 0.42 s.
-/// A stream of opus-rs codes the mode of its first frame in every frame.
+/// A stream of opus1 codes the mode of its first frame in every frame.
 ///
-/// - In 16 of the 24 settings opus-rs starts in SILK or Hybrid, as libopus
+/// - In 16 of the 24 settings opus1 starts in SILK or Hybrid, as libopus
 ///   does, and stays there. Its packets then hold less than was asked for:
 ///   49 % of the request at worst (three mono streams at 16 kHz, VoIP,
 ///   32 kb/s each), where libopus has 94 %.
-/// - In the other 8 opus-rs codes CELT from the first frame, where libopus
+/// - In the other 8 opus1 codes CELT from the first frame, where libopus
 ///   codes SILK or Hybrid for its first 17 or 18 frames.
 ///
 /// At 48 kHz with 12 kb/s per channel the analysis has another effect: it
 /// finds no signal above 8 kHz, so libopus codes SILK wideband where
-/// opus-rs codes Hybrid.
+/// opus1 codes Hybrid.
 ///
 /// libopus itself is at 78 to 110 % of the request, apart from 5.1 at
 /// 48 kHz and 12 kb/s per channel (146 %, see the test above).
 #[test]
-fn the_analysis_of_libopus_moves_streams_to_celt_and_opus_rs_stays() {
+fn the_analysis_of_libopus_moves_streams_to_celt_and_opus1_stays() {
     let runs = run_all(9);
     let (mut moved, mut settings_moved) = (0, 0);
     let (mut first, mut last) = (FRAMES, 0);
@@ -263,7 +263,7 @@ fn the_analysis_of_libopus_moves_streams_to_celt_and_opus_rs_stays() {
         for &(frame, rust_keeps_its_mode) in &r.to_celt {
             assert!(
                 rust_keeps_its_mode,
-                "{}: opus-rs changed its mode; is the analysis ported?",
+                "{}: opus1 changed its mode; is the analysis ported?",
                 r.label
             );
             let Some(frame) = frame else { continue };
@@ -287,7 +287,7 @@ fn the_analysis_of_libopus_moves_streams_to_celt_and_opus_rs_stays() {
     }
     println!(
         "libopus changed {moved} streams to CELT in {settings_moved} settings, at frame {first} \
-         to {last}; opus-rs uses {:.0} % of the request at worst, libopus {:.0} %",
+         to {last}; opus1 uses {:.0} % of the request at worst, libopus {:.0} %",
         100.0 * lowest,
         100.0 * libopus_lowest
     );

@@ -1,4 +1,4 @@
-//! Which mode and audio bandwidth the opus-rs encoder picks at a 24 kHz
+//! Which mode and audio bandwidth the opus1 encoder picks at a 24 kHz
 //! input rate, against C libopus.
 //!
 //! An Opus packet is SILK-only (speech, up to 8 kHz), CELT-only, or Hybrid
@@ -9,7 +9,7 @@
 //!
 //! libopus also runs a tonality analysis from complexity 7 up that detects
 //! music and the bandwidth actually present in the input, and can move these
-//! choices. opus-rs does not port it, so the comparisons here use complexity
+//! choices. opus1 does not port it, so the comparisons here use complexity
 //! 5, where libopus decides from the bitrate alone.
 
 mod k24_enc_common;
@@ -39,7 +39,7 @@ fn agreement(a: &[Vec<u8>], b: &[Vec<u8>]) -> f64 {
 
 /// The mode and bandwidth must be libopus's at every bitrate.
 ///
-/// opus-rs coded 24 kHz input super-wideband at every bitrate: Hybrid or
+/// opus1 coded 24 kHz input super-wideband at every bitrate: Hybrid or
 /// CELT, never SILK-only, never narrowband or wideband. At 6 and 8 kb/s
 /// that spread the bits over 12 kHz where libopus codes 4 kHz: speech
 /// measured 0.8 and 2.2 dB against libopus's 3.9 and 5.2 dB while the
@@ -58,7 +58,7 @@ fn mode_and_bandwidth_are_libopus_s_at_every_bitrate() {
                 let share = agreement(&rs, &c);
                 assert!(
                     share >= 0.97,
-                    "{} {} kb/s {}: {:.0} % of packets agree; opus-rs {}; libopus {}",
+                    "{} {} kb/s {}: {:.0} % of packets agree; opus1 {}; libopus {}",
                     app.name(),
                     bitrate / 1000,
                     if cbr { "CBR" } else { "VBR" },
@@ -85,7 +85,7 @@ fn mode_and_bandwidth_are_libopus_s_at_every_packet_duration() {
                 let share = agreement(&rs, &c);
                 assert!(
                     share >= 0.95,
-                    "{} {} kb/s {} ms: {:.0} % of packets agree; opus-rs {}; libopus {}",
+                    "{} {} kb/s {} ms: {:.0} % of packets agree; opus1 {}; libopus {}",
                     app.name(),
                     bitrate / 1000,
                     frame / 24,
@@ -114,7 +114,7 @@ fn low_bitrates_are_coded_narrower_and_as_well_as_libopus() {
             // does not move the choice.
             let mut cfg = Cfg::new(app, bitrate);
             if app == App::Audio && bitrate == 12_000 {
-                // Here libopus without its analysis codes Hybrid, as opus-rs does.
+                // Here libopus without its analysis codes Hybrid, as opus1 does.
                 cfg.c_complexity = Some(5);
                 cfg.complexity = 5;
             }
@@ -127,7 +127,7 @@ fn low_bitrates_are_coded_narrower_and_as_well_as_libopus() {
             let (rs_q, c_q) = (q(&rs), q(&c));
             let (rs_rate, c_rate) = (mean_bitrate(&rs, cfg.frame), mean_bitrate(&c, cfg.frame));
             let what = format!(
-                "{} {} kb/s: opus-rs {:.1} kb/s at {:.2} dB, libopus {:.1} kb/s at {:.2} dB",
+                "{} {} kb/s: opus1 {:.1} kb/s at {:.2} dB, libopus {:.1} kb/s at {:.2} dB",
                 app.name(),
                 bitrate / 1000,
                 rs_rate / 1000.0,
@@ -178,7 +178,7 @@ fn bandwidth_follows_a_bitrate_change() {
         }
         assert!(
             same_seconds >= 11,
-            "{what}: only {same_seconds} of 12 seconds agree; opus-rs {}; libopus {}",
+            "{what}: only {same_seconds} of 12 seconds agree; opus1 {}; libopus {}",
             toc_summary(&rs),
             toc_summary(&c)
         );
@@ -190,7 +190,7 @@ fn bandwidth_follows_a_bitrate_change() {
         let (rs_q, c_q) = (q(&rs), q(&c));
         assert!(
             rs_q.snr >= c_q.snr - 1.0 && rs_q.worst_snr20 >= c_q.worst_snr20 - 3.0,
-            "{what}: opus-rs {:.2} dB (worst 20 ms {:.2}), libopus {:.2} dB (worst 20 ms {:.2})",
+            "{what}: opus1 {:.2} dB (worst 20 ms {:.2}), libopus {:.2} dB (worst 20 ms {:.2})",
             rs_q.snr,
             rs_q.worst_snr20,
             c_q.snr,
@@ -227,7 +227,7 @@ fn celt_only_frames_end_a_rate_switch() {
     let (rs_end, c_end) = (&rs[500..], &c[500..]);
     assert!(
         rs_end.iter().all(|p| toc(p).mode == "HYB") && c_end.iter().all(|p| toc(p).mode == "HYB"),
-        "back at 32 kb/s: opus-rs {}; libopus {}",
+        "back at 32 kb/s: opus1 {}; libopus {}",
         toc_summary(rs_end),
         toc_summary(c_end)
     );
@@ -251,7 +251,7 @@ fn celt_only_frames_end_a_rate_switch() {
 /// When SILK takes over from CELT-only, libopus restarts the SILK encoder and
 /// feeds it the last 10 ms of input (opus_encoder.c:1575-1580, 2191-2210).
 /// It does so once: `prev_mode` is set at the end of every coded frame
-/// (opus_encoder.c:2555-2558). opus-rs did not record the mode of a
+/// (opus_encoder.c:2555-2558). opus1 did not record the mode of a
 /// variable-bitrate SILK-only packet, so the mode before it stayed
 /// "CELT-only" and SILK restarted on every packet from then on. The speech
 /// below at 12 kb/s decoded at 0.3 dB (worst 20 ms window -6.9 dB) and cost
@@ -309,7 +309,7 @@ fn silk_only_after_celt_only_restarts_once() {
         let (rs_q, c_q) = (q(&rs), q(&c));
         let (rs_rate, c_rate) = (mean_bitrate(&rs_last, 480), mean_bitrate(&c_last, 480));
         let numbers = format!(
-            "{what}: opus-rs {:.1} kb/s at {:.2} dB (worst 20 ms {:.2}), libopus {:.1} kb/s at {:.2} dB (worst 20 ms {:.2})",
+            "{what}: opus1 {:.1} kb/s at {:.2} dB (worst 20 ms {:.2}), libopus {:.1} kb/s at {:.2} dB (worst 20 ms {:.2})",
             rs_rate / 1000.0,
             rs_q.snr,
             rs_q.worst_snr20,
@@ -328,7 +328,7 @@ fn silk_only_after_celt_only_restarts_once() {
 /// CELT and Hybrid frames are 20 ms at most, so such a packet carries two or
 /// three 20 ms parts. libopus sizes the parts so that they and the packet
 /// header fill the constant size exactly, padding the rest
-/// (opus_encoder.c:1735-1840, repacketizer.c). opus-rs coded each part at
+/// (opus_encoder.c:1735-1840, repacketizer.c). opus1 coded each part at
 /// the full 20 ms size and put the header on top: a 60 ms packet came out
 /// 1 byte over the constant size (121 bytes at 16 kb/s), and 3 bytes over
 /// when a part reached 252 bytes (963 bytes at 128 kb/s).
@@ -359,12 +359,12 @@ fn cbr_packets_of_40_and_60_ms_have_the_constant_size() {
             );
             let nominal = bitrate as usize * frame / FS / 8;
             assert_eq!(size_range(&c), (nominal, nominal), "{what}: libopus");
-            assert_eq!(size_range(&rs), (nominal, nominal), "{what}: opus-rs");
+            assert_eq!(size_range(&rs), (nominal, nominal), "{what}: opus1");
             let q = |p: &[Vec<u8>]| measure(&pcm, &dec_c(p, FS, 1, frame).unwrap(), FS, FS / 5);
             let (rs_q, c_q) = (q(&rs), q(&c));
             assert!(
                 rs_q.snr >= c_q.snr - 1.0,
-                "{what}: opus-rs {:.2} dB, libopus {:.2} dB",
+                "{what}: opus1 {:.2} dB, libopus {:.2} dB",
                 rs_q.snr,
                 c_q.snr
             );
@@ -381,7 +381,7 @@ fn cbr_packets_of_40_and_60_ms_have_the_constant_size() {
 ///
 /// The bitrate itself is not compared with libopus here. libopus 1.6 limits
 /// each part to the size the bitrate gives 20 ms under variable bitrate too,
-/// and so comes out 8 to 11 % under the bitrate asked for. opus-rs does not
+/// and so comes out 8 to 11 % under the bitrate asked for. opus1 does not
 /// port that limit; see `encode_multiframe`.
 #[test]
 fn vbr_packets_of_40_and_60_ms_fit_the_buffer() {
@@ -416,7 +416,7 @@ fn vbr_packets_of_40_and_60_ms_fit_the_buffer() {
 /// 2.5 and 5 ms packets are CELT-only whatever the application.
 ///
 /// SILK frames are 10 ms or longer, so libopus switches to CELT-only for
-/// shorter packets (opus_encoder.c:1532-1537). opus-rs kept SILK or Hybrid
+/// shorter packets (opus_encoder.c:1532-1537). opus1 kept SILK or Hybrid
 /// and failed with "Unsupported frame size for Hybrid mode" for VoIP at any
 /// bitrate up to about 64 kb/s and for Audio up to about 24 kb/s.
 #[test]
@@ -435,7 +435,7 @@ fn short_packets_are_celt_only() {
                 let share = agreement(&rs, &c);
                 assert!(
                     share >= 0.95,
-                    "{what}: {:.0} % of packets agree; opus-rs {}; libopus {}",
+                    "{what}: {:.0} % of packets agree; opus1 {}; libopus {}",
                     100.0 * share,
                     toc_summary(&rs),
                     toc_summary(&c)
@@ -450,7 +450,7 @@ fn short_packets_are_celt_only() {
 ///
 /// Only SILK carries in-band FEC, so libopus keeps SILK when FEC is on and
 /// the declared loss is high enough for the application
-/// (opus_encoder.c:1515-1518). opus-rs went CELT-only from about 64 kb/s
+/// (opus_encoder.c:1515-1518). opus1 went CELT-only from about 64 kb/s
 /// (VoIP) or 24 kb/s (Audio) and sent no FEC at all there.
 #[test]
 fn fec_keeps_the_stream_in_silk_or_hybrid() {
@@ -463,7 +463,7 @@ fn fec_keeps_the_stream_in_silk_or_hybrid() {
             cfg.loss = loss;
             let (rs, c) = (enc_rs(&cfg, &pcm).unwrap(), enc_c(&cfg, &pcm));
             let what = format!(
-                "{} {} kb/s, {loss} % loss: opus-rs {}; libopus {}",
+                "{} {} kb/s, {loss} % loss: opus1 {}; libopus {}",
                 app.name(),
                 bitrate / 1000,
                 toc_summary(&rs),

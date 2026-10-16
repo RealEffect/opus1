@@ -5,9 +5,9 @@
 //! frequency range. Those follow libopus within about 10 %, which leaves
 //! room for a wrong constant. The tests here are sharper:
 //!
-//! - From 96 kb/s per channel up, the VBR target of opus-rs without a mask
+//! - From 96 kb/s per channel up, the VBR target of opus1 without a mask
 //!   is within a few bytes of libopus's in every frame (below that rate
-//!   libopus adds its temporal VBR, which opus-rs does not have). The
+//!   libopus adds its temporal VBR, which opus1 does not have). The
 //!   number of bytes a mask adds to or takes from each packet must then be
 //!   the same in both encoders.
 //! - The allocation trim and the dynamic allocation boosts are written at
@@ -19,9 +19,9 @@
 
 mod celtenc_common;
 use celtenc_common::*;
-use opus_rs::celt::CeltEncoder;
-use opus_rs::modes::default_mode;
-use opus_rs::range_coder::RangeCoder;
+use opus1::celt::CeltEncoder;
+use opus1::modes::default_mode;
+use opus1::range_coder::RangeCoder;
 
 /// A mask: its name and the value for (channel, band).
 type Mask = (&'static str, fn(usize, usize) -> f32);
@@ -37,7 +37,7 @@ fn packet_sizes(packets: &[Vec<u8>]) -> Vec<i32> {
 }
 
 /// Largest difference, over the frames, between the bytes a mask adds to a
-/// packet of opus-rs and the bytes it adds to the packet of libopus.
+/// packet of opus1 and the bytes it adds to the packet of libopus.
 /// Also returns the mean number of bytes it adds in libopus.
 fn size_effect(rs_none: &[i32], c_none: &[i32], rs_mask: &[i32], c_mask: &[i32]) -> (i32, f64) {
     let mut largest = 0;
@@ -108,7 +108,7 @@ const SIZE_MASKS: [Mask; 20] = [
 /// bytes for stereo.
 ///
 /// Two stereo masks are left out, "flat -3" and "flat -2". They halve the
-/// rate. opus-rs, whose stereo packets are about 9 bytes smaller than
+/// rate. opus1, whose stereo packets are about 9 bytes smaller than
 /// libopus's without any mask, then drops the highest band in frames where
 /// libopus keeps it, and the next frame's target follows the number of
 /// coded bands. That difference is not one of the mask.
@@ -131,7 +131,7 @@ fn mask_changes_each_packet_size_as_in_libopus() {
             let (largest, c_mean) = size_effect(&rs_none, &c_none, &rs, &c);
             println!(
                 "{channels} ch, {name}: libopus packets change by {c_mean:+.1} bytes, \
-                 opus-rs differs from that by at most {largest} in any frame"
+                 opus1 differs from that by at most {largest} in any frame"
             );
             assert!(
                 largest <= 4,
@@ -287,7 +287,7 @@ fn unmasked_bands_get_the_boost_libopus_gives_them() {
             let same = rs.iter().zip(&c).filter(|(a, b)| a == b).count();
             println!(
                 "{channels} ch, vbr {vbr}, {name}: boosts the same in {same} of {} frames\n    \
-                 opus-rs {:?}\n    libopus {:?}",
+                 opus1 {:?}\n    libopus {:?}",
                 rs.len(),
                 total(&rs),
                 total(&c)
@@ -364,7 +364,7 @@ fn mask_given_frame_by_frame_is_followed_frame_by_frame() {
         let (largest, _) = size_effect(&rs_none, &c_none, &rs, &c);
         let c_effect: Vec<i32> = c.iter().zip(&c_none).map(|(a, b)| a - b).collect();
         println!(
-            "{channels} ch: libopus packets change by {} to {} bytes, opus-rs differs from that \
+            "{channels} ch: libopus packets change by {} to {} bytes, opus1 differs from that \
              by at most {largest} in any frame",
             c_effect.iter().min().unwrap(),
             c_effect.iter().max().unwrap()
@@ -416,7 +416,7 @@ fn mask_changes_packet_sizes_as_in_libopus_at_shorter_frames() {
             let c = packet_sizes(&enc_c_fmt(&cfg, fmt, &pcm, None));
             let (largest, c_mean) = size_effect(&rs_none, &c_none, &rs, &c);
             println!(
-                "{} samples, {name}: libopus packets change by {c_mean:+.1} bytes, opus-rs \
+                "{} samples, {name}: libopus packets change by {c_mean:+.1} bytes, opus1 \
                  differs from that by at most {largest} in any frame",
                 fmt.frame
             );
@@ -484,20 +484,21 @@ fn lfe_ignores_the_mask_in_every_rate_mode() {
 /// does not use `compute_vbr` for Hybrid.
 ///
 /// A Hybrid frame cannot be made with the C encoder at this level, so this
-/// checks opus-rs against itself.
+/// checks opus1 against itself.
 #[test]
 fn mask_has_no_effect_on_hybrid_frames() {
     let pcm = broadband(20, 1);
     let encode = |mask: Option<&[f32]>, start_band: usize, vbr: bool| -> Vec<Vec<u8>> {
         let mut enc = CeltEncoder::with_sampling_rate(default_mode(), 1, FS as i32);
         enc.complexity = COMPLEXITY;
-        enc.set_bitrate(24_000);
+        enc.set_bitrate(24_000).unwrap();
         enc.set_vbr(vbr);
         enc.set_energy_mask(mask);
+        enc.set_start_band(start_band).unwrap();
         pcm.chunks_exact(FRAME)
             .map(|frame| {
                 let mut rc = RangeCoder::new_encoder(60);
-                enc.encode_with_budget_vbr(frame, FRAME, &mut rc, start_band, 60 * 8, vbr);
+                enc.encode(frame, FRAME, &mut rc);
                 rc.done();
                 assert_eq!(rc.error, 0);
                 rc.buf[..rc.storage as usize].to_vec()

@@ -11,9 +11,9 @@
 //! * `new_decoder` against a model of libopus's range decoder, for every
 //!   packet length from 0 to 300 bytes and around the largest buffer.
 
-use opus_rs::modes::default_mode;
-use opus_rs::quant_bands::{quant_coarse_energy_advanced, unquant_coarse_energy};
-use opus_rs::range_coder::{RANGE_BUF_MAX, RangeCoder};
+use opus1::modes::default_mode;
+use opus1::quant_bands::{quant_coarse_energy_advanced, unquant_coarse_energy};
+use opus1::range_coder::{RANGE_BUF_MAX, RangeCoder};
 
 /// SplitMix64.
 struct SplitMix(u64);

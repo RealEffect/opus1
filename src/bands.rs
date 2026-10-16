@@ -1,3 +1,4 @@
+use crate::mathops::{celt_exp2, mac};
 use crate::modes::CeltMode;
 use crate::pvq::*;
 use crate::range_coder::RangeCoder;
@@ -22,9 +23,12 @@ pub struct BandCtx<'a> {
     pub intensity: usize,
     pub theta_round: i32,
     pub avoid_split_noise: bool,
-    pub arch: i32,
     pub disable_inv: bool,
     pub seed: u32,
+    /// The encoder's angle of the stereo band in Q30, once computed. Both
+    /// passes of `quant_band_stereo_rdo` start from the same input, so the
+    /// second pass takes the angle of the first.
+    pub stereo_angle: Option<i32>,
 }
 
 #[inline]
@@ -215,11 +219,8 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     // runs for `stride == 1` only, on a CPU with AVX2.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        // NOTE: the previous AVX1 kernel loaded its second vector at +4
-        // (overlapping the first) and deinterleaved into quartet-swapped
-        // order, corrupting every other 8-sample block. The corrected kernel
-        // needs a 64-bit lane permute, which is AVX2-only; pre-AVX2 CPUs use
-        // the portable path.
+        // The kernel needs a 64-bit lane permute, which only AVX2 has.
+        // Processors without AVX2 use the portable code.
         if stride == 1 && n0 >= 16 && crate::compat::x86_has_avx2() {
             haar1_avx2(x, n0);
             return;
@@ -535,7 +536,6 @@ pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
 #[inline(always)]
 fn celt_atan_norm(x: f32) -> f32 {
     // The values of the C constants, written as short as each float allows.
-    // A09 and A13 were one float step off before.
     const ATAN2_2_OVER_PI: f32 = core::f32::consts::FRAC_2_PI;
     const A03: f32 = -3.333_166e-1;
     const A05: f32 = 1.996_270_4e-1;
@@ -587,10 +587,7 @@ pub struct SplitCtx {
 ///
 /// The stereo encoder also changes the band in place, as libopus does. After
 /// the call `x` holds the mid signal and `y` the side signal, or `x` holds
-/// the intensity-stereo mix. This is why both slices are `&mut`. They were
-/// `&[f32]` before, and the function wrote through pointers taken from them.
-/// That is undefined behaviour: the compiler is allowed to remove such
-/// writes, and it did remove some of them, depending on what was inlined.
+/// the intensity-stereo mix. This is why both slices are `&mut`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub fn compute_theta(
@@ -617,7 +614,12 @@ pub fn compute_theta(
     let mut itheta = 0;
     if ctx.encode {
         // C (bands.c 741-742): the angle in Q30, rounded down to Q14.
-        itheta = stereo_itheta(x, y, stereo, n) >> 16;
+        let q30 = if stereo {
+            *ctx.stereo_angle.get_or_insert_with(|| stereo_itheta(x, y, true, n))
+        } else {
+            stereo_itheta(x, y, false, n)
+        };
+        itheta = q30 >> 16;
     }
 
     let tell_start = tell_frac_inline!(ctx.rc);
@@ -794,140 +796,6 @@ pub fn compute_theta(
     }
 }
 
-#[inline(always)]
-fn quant_partition_n2_encode(
-    ctx: &mut BandCtx,
-    x: &mut [f32],
-    b: i32,
-    b_blocks: i32,
-    lowband: Option<&mut [f32]>,
-    lm: i32,
-    gain: f32,
-    fill: u32,
-) -> u32 {
-    let mut q = bits2pulses(ctx.m, ctx.i, lm, b);
-    let mut curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-    ctx.remaining_bits -= curr_bits;
-
-    while ctx.remaining_bits < 0 && q > 0 {
-        ctx.remaining_bits += curr_bits;
-        q -= 1;
-        curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-        ctx.remaining_bits -= curr_bits;
-    }
-
-    if q != 0 {
-        let k = get_pulses(q);
-        alg_quant(x, 2, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
-    } else {
-        // C (quant_partition): without pulses and without resynthesis the
-        // band is not filled and its collapse mask stays 0.
-        let _ = (lowband, fill);
-        0
-    }
-}
-
-#[inline(always)]
-fn quant_partition_n4_encode(
-    ctx: &mut BandCtx,
-    x: &mut [f32],
-    b: i32,
-    b_blocks: i32,
-    lowband: Option<&mut [f32]>,
-    lm: i32,
-    gain: f32,
-    fill: u32,
-) -> u32 {
-    let mut q = bits2pulses(ctx.m, ctx.i, lm, b);
-    let mut curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-    ctx.remaining_bits -= curr_bits;
-
-    while ctx.remaining_bits < 0 && q > 0 {
-        ctx.remaining_bits += curr_bits;
-        q -= 1;
-        curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-        ctx.remaining_bits -= curr_bits;
-    }
-
-    if q != 0 {
-        let k = get_pulses(q);
-        alg_quant(x, 4, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
-    } else {
-        // C (quant_partition): without pulses and without resynthesis the
-        // band is not filled and its collapse mask stays 0.
-        let _ = (lowband, fill);
-        0
-    }
-}
-
-#[inline(always)]
-fn quant_partition_n8_encode(
-    ctx: &mut BandCtx,
-    x: &mut [f32],
-    b: i32,
-    b_blocks: i32,
-    lowband: Option<&mut [f32]>,
-    lm: i32,
-    gain: f32,
-    fill: u32,
-) -> u32 {
-    let mut q = bits2pulses(ctx.m, ctx.i, lm, b);
-    let mut curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-    ctx.remaining_bits -= curr_bits;
-
-    while ctx.remaining_bits < 0 && q > 0 {
-        ctx.remaining_bits += curr_bits;
-        q -= 1;
-        curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-        ctx.remaining_bits -= curr_bits;
-    }
-
-    if q != 0 {
-        let k = get_pulses(q);
-        alg_quant(x, 8, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
-    } else {
-        // C (quant_partition): without pulses and without resynthesis the
-        // band is not filled and its collapse mask stays 0.
-        let _ = (lowband, fill);
-        0
-    }
-}
-
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn quant_partition_direct_encode(
-    ctx: &mut BandCtx,
-    x: &mut [f32],
-    n: usize,
-    b: i32,
-    b_blocks: i32,
-    lowband: Option<&mut [f32]>,
-    lm: i32,
-    gain: f32,
-    fill: u32,
-) -> u32 {
-    let mut q = bits2pulses(ctx.m, ctx.i, lm, b);
-    let mut curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-    ctx.remaining_bits -= curr_bits;
-
-    while ctx.remaining_bits < 0 && q > 0 {
-        ctx.remaining_bits += curr_bits;
-        q -= 1;
-        curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-        ctx.remaining_bits -= curr_bits;
-    }
-
-    if q != 0 {
-        let k = get_pulses(q);
-        alg_quant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
-    } else {
-        // C (quant_partition): without pulses and without resynthesis the
-        // band is not filled and its collapse mask stays 0.
-        let _ = (lowband, fill);
-        0
-    }
-}
-
 /// Whether a band part of `n` values with `b` bits (in 1/8 bit) is split in
 /// two. It is when `b` exceeds, by more than 12, the cost of the largest
 /// pulse count the mode's table has for this band size (libopus:
@@ -959,211 +827,6 @@ fn band_should_split(m: &CeltMode, band: usize, lm: i32, n: usize, b: i32) -> bo
         let max_q = *cache_ptr as usize;
         debug_assert!(cache_base + max_q < m.cache.bits.len());
         b > (*cache_ptr.add(max_q) as i32) + 12
-    }
-}
-
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn quant_partition_encode(
-    ctx: &mut BandCtx,
-    x: &mut [f32],
-    n: usize,
-    b: i32,
-    b_blocks: i32,
-    lowband: Option<&mut [f32]>,
-    lm: i32,
-    gain: f32,
-    fill: u32,
-) -> u32 {
-    // N==2 can never split (should_split requires n>2), dispatch immediately
-    if n == 2 {
-        return quant_partition_n2_encode(ctx, x, b, b_blocks, lowband, lm, gain, fill);
-    }
-
-    // Check split condition FIRST (matching C's quant_partition which checks this before dispatch)
-    let should_split = band_should_split(ctx.m, ctx.i, lm, n, b);
-
-    if should_split {
-        let mut sctx = SplitCtx {
-            inv: false,
-            imid: 0,
-            iside: 0,
-            delta: 0,
-            itheta: 0,
-            qalloc: 0,
-        };
-        let mut b_mut = b;
-        let mut fill_mut = fill;
-        let mid = n / 2;
-        let lm = lm - 1;
-        let b0 = b_blocks;
-        if b_blocks == 1 {
-            fill_mut = (fill_mut & 1) | (fill_mut << 1);
-        }
-        let b_blocks = (b_blocks + 1) >> 1;
-        let (x_mid, x_side) = x.split_at_mut(mid);
-
-        compute_theta(
-            ctx,
-            &mut sctx,
-            x_mid,
-            x_side,
-            mid,
-            &mut b_mut,
-            b_blocks,
-            b0,
-            lm,
-            false,
-            &mut fill_mut,
-        );
-
-        ctx.remaining_bits -= sctx.qalloc;
-        let mut delta = sctx.delta;
-        /* Give more bits to low-energy MDCTs than they would otherwise deserve */
-        if b0 > 1 && (sctx.itheta & 0x3fff) != 0 {
-            if sctx.itheta > 8192 {
-                delta -= delta >> (4 - lm);
-            } else {
-                delta = 0.min(delta + ((mid as i32) << BITRES >> (5 - lm)));
-            }
-        }
-        let mbits = (0).max((b_mut - delta) / 2).min(b_mut);
-        let mut sbits = b_mut - mbits;
-        let mut mbits = mbits;
-
-        let mut rebalance = ctx.remaining_bits;
-        let mut cm;
-        let mid_gain = gain * (sctx.imid as f32 / 32768.0);
-        let side_gain = gain * (sctx.iside as f32 / 32768.0);
-
-        if mbits >= sbits {
-            if let Some(lb) = lowband {
-                let (lb_mid, lb_side) = lb.split_at_mut(mid);
-                cm = quant_partition_encode(
-                    ctx,
-                    x_mid,
-                    mid,
-                    mbits,
-                    b_blocks,
-                    Some(lb_mid),
-                    lm,
-                    mid_gain,
-                    fill_mut,
-                );
-                rebalance = mbits - (rebalance - ctx.remaining_bits);
-                if rebalance > (3 << 3) && sctx.itheta != 0 {
-                    sbits += rebalance - (3 << 3);
-                }
-                cm |= quant_partition_encode(
-                    ctx,
-                    x_side,
-                    mid,
-                    sbits,
-                    b_blocks,
-                    Some(lb_side),
-                    lm,
-                    side_gain,
-                    fill_mut >> b_blocks,
-                ) << (b0 >> 1);
-            } else {
-                cm = quant_partition_encode(
-                    ctx, x_mid, mid, mbits, b_blocks, None, lm, mid_gain, fill_mut,
-                );
-                rebalance = mbits - (rebalance - ctx.remaining_bits);
-                if rebalance > (3 << 3) && sctx.itheta != 0 {
-                    sbits += rebalance - (3 << 3);
-                }
-                cm |= quant_partition_encode(
-                    ctx,
-                    x_side,
-                    mid,
-                    sbits,
-                    b_blocks,
-                    None,
-                    lm,
-                    side_gain,
-                    fill_mut >> b_blocks,
-                ) << (b0 >> 1);
-            }
-        } else if let Some(lb) = lowband {
-            let (lb_mid, lb_side) = lb.split_at_mut(mid);
-            cm = quant_partition_encode(
-                ctx,
-                x_side,
-                mid,
-                sbits,
-                b_blocks,
-                Some(lb_side),
-                lm,
-                side_gain,
-                fill_mut >> b_blocks,
-            ) << (b0 >> 1);
-            rebalance = sbits - (rebalance - ctx.remaining_bits);
-            if rebalance > (3 << 3) && sctx.itheta != 16384 {
-                mbits += rebalance - (3 << 3);
-            }
-            cm |= quant_partition_encode(
-                ctx,
-                x_mid,
-                mid,
-                mbits,
-                b_blocks,
-                Some(lb_mid),
-                lm,
-                mid_gain,
-                fill_mut,
-            );
-        } else {
-            cm = quant_partition_encode(
-                ctx,
-                x_side,
-                mid,
-                sbits,
-                b_blocks,
-                None,
-                lm,
-                side_gain,
-                fill_mut >> b_blocks,
-            ) << (b0 >> 1);
-            rebalance = sbits - (rebalance - ctx.remaining_bits);
-            if rebalance > (3 << 3) && sctx.itheta != 16384 {
-                mbits += rebalance - (3 << 3);
-            }
-            cm |= quant_partition_encode(
-                ctx, x_mid, mid, mbits, b_blocks, None, lm, mid_gain, fill_mut,
-            );
-        }
-        cm
-    } else {
-        // No split — dispatch to small-N specialized encoders or direct path
-        if n == 4 {
-            return quant_partition_n4_encode(ctx, x, b, b_blocks, lowband, lm, gain, fill);
-        }
-        if n == 8 {
-            return quant_partition_n8_encode(ctx, x, b, b_blocks, lowband, lm, gain, fill);
-        }
-        if n == 16 {
-            return quant_partition_direct_encode(ctx, x, n, b, b_blocks, lowband, lm, gain, fill);
-        }
-        let mut q = bits2pulses(ctx.m, ctx.i, lm, b);
-        let mut curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-        ctx.remaining_bits -= curr_bits;
-
-        while ctx.remaining_bits < 0 && q > 0 {
-            ctx.remaining_bits += curr_bits;
-            q -= 1;
-            curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-            ctx.remaining_bits -= curr_bits;
-        }
-
-        if q != 0 {
-            let k = get_pulses(q);
-            alg_quant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain, false)
-        } else {
-            // C (quant_partition): without pulses and without resynthesis
-            // the band is not filled and its collapse mask stays 0.
-            0
-        }
     }
 }
 
@@ -1349,9 +1012,17 @@ fn fill_with_noise(x: &mut [f32], seed: u32) -> u32 {
     }
 }
 
+/// libopus `quant_partition` (celt/bands.c): codes or decodes one band part
+/// of `n` values with `b` bits (in 1/8 bit). A part with more bits than its
+/// largest pulse count needs is split in two halves, recursively; the angle
+/// between the halves decides how the bits are shared.
+///
+/// `ENCODE_ONLY` is the encoder without resynthesis (`ctx.encode` set and
+/// `ctx.resynth` not set). With it set, the compiler knows both flags, and
+/// the leaves of the sizes 2, 4, 8 and 16 get a pulse search for that size.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub fn quant_partition(
+fn quant_partition<const ENCODE_ONLY: bool>(
     ctx: &mut BandCtx,
     x: &mut [f32],
     n: usize,
@@ -1362,225 +1033,182 @@ pub fn quant_partition(
     gain: f32,
     fill: u32,
 ) -> u32 {
-    /* Check split condition FIRST, before dispatching to specialized handlers.
-    This matches the C code which checks this at the top of quant_partition. */
-    let should_split = band_should_split(ctx.m, ctx.i, lm, n, b);
-    if should_split {
-        let mut sctx = SplitCtx {
-            inv: false,
-            imid: 0,
-            iside: 0,
-            delta: 0,
-            itheta: 0,
-            qalloc: 0,
-        };
-        let mut b_mut = b;
-        let mut fill_mut = fill;
-        let mid = n / 2;
-        let lm = lm - 1;
-        let b0 = b_blocks; // Save original B0
-        if b_blocks == 1 {
-            fill_mut = (fill_mut & 1) | (fill_mut << 1);
+    if !band_should_split(ctx.m, ctx.i, lm, n, b) {
+        if !ENCODE_ONLY {
+            return quant_partition_leaf::<false>(ctx, x, n, b, b_blocks, lowband, lm, gain, fill);
         }
-        let b_blocks = (b_blocks + 1) >> 1;
-        let (x_mid, x_side) = x.split_at_mut(mid);
+        let leaf = quant_partition_leaf::<true>;
+        return match n {
+            2 => leaf(ctx, x, 2, b, b_blocks, lowband, lm, gain, fill),
+            4 => leaf(ctx, x, 4, b, b_blocks, lowband, lm, gain, fill),
+            8 => leaf(ctx, x, 8, b, b_blocks, lowband, lm, gain, fill),
+            16 => leaf(ctx, x, 16, b, b_blocks, lowband, lm, gain, fill),
+            _ => leaf(ctx, x, n, b, b_blocks, lowband, lm, gain, fill),
+        };
+    }
 
-        compute_theta(
+    let mut sctx = SplitCtx {
+        inv: false,
+        imid: 0,
+        iside: 0,
+        delta: 0,
+        itheta: 0,
+        qalloc: 0,
+    };
+    let mut b = b;
+    let mut fill = fill;
+    let mid = n / 2;
+    let lm = lm - 1;
+    let b0 = b_blocks;
+    if b_blocks == 1 {
+        fill = (fill & 1) | (fill << 1);
+    }
+    let b_blocks = (b_blocks + 1) >> 1;
+    let (x_mid, x_side) = x.split_at_mut(mid);
+
+    compute_theta(
+        ctx, &mut sctx, x_mid, x_side, mid, &mut b, b_blocks, b0, lm, false, &mut fill,
+    );
+
+    ctx.remaining_bits -= sctx.qalloc;
+    let mut delta = sctx.delta;
+    // C: "Give more bits to low-energy MDCTs than they would otherwise
+    // deserve".
+    if b0 > 1 && (sctx.itheta & 0x3fff) != 0 {
+        if sctx.itheta > 8192 {
+            delta -= delta >> (4 - lm);
+        } else {
+            delta = 0.min(delta + ((mid as i32) << BITRES >> (5 - lm)));
+        }
+    }
+    let mut mbits = 0.max((b - delta) / 2).min(b);
+    let mut sbits = b - mbits;
+    let mid_gain = gain * (sctx.imid as f32 / 32768.0);
+    let side_gain = gain * (sctx.iside as f32 / 32768.0);
+    let (lb_mid, lb_side) = match lowband {
+        Some(lb) => {
+            let (lb_mid, lb_side) = lb.split_at_mut(mid);
+            (Some(lb_mid), Some(lb_side))
+        }
+        None => (None, None),
+    };
+
+    // The half with more bits goes first. The bits it leaves unused go to
+    // the other half.
+    let rebalance = ctx.remaining_bits;
+    if mbits >= sbits {
+        let mut cm = quant_partition::<ENCODE_ONLY>(
+            ctx, x_mid, mid, mbits, b_blocks, lb_mid, lm, mid_gain, fill,
+        );
+        let rebalance = mbits - (rebalance - ctx.remaining_bits);
+        if rebalance > (3 << 3) && sctx.itheta != 0 {
+            sbits += rebalance - (3 << 3);
+        }
+        cm |= quant_partition::<ENCODE_ONLY>(
             ctx,
-            &mut sctx,
-            x_mid,
             x_side,
             mid,
-            &mut b_mut,
+            sbits,
             b_blocks,
-            b0,
+            lb_side,
             lm,
-            false,
-            &mut fill_mut,
-        );
-
-        ctx.remaining_bits -= sctx.qalloc;
-        let mut delta = sctx.delta;
-        /* Give more bits to low-energy MDCTs than they would otherwise deserve
-        (matches C quant_partition's B0>1 adjustment) */
-        if b0 > 1 && (sctx.itheta & 0x3fff) != 0 {
-            if sctx.itheta > 8192 {
-                delta -= delta >> (4 - lm);
-            } else {
-                delta = 0.min(delta + ((mid as i32) << BITRES >> (5 - lm)));
-            }
-        }
-        let mbits = (0).max((b_mut - delta) / 2).min(b_mut);
-        let mut sbits = b_mut - mbits;
-        let mut mbits = mbits;
-
-        let mut rebalance = ctx.remaining_bits;
-        let mut cm;
-
-        if mbits >= sbits {
-            if let Some(lb) = lowband {
-                let (lb_mid, lb_side) = lb.split_at_mut(mid);
-                cm = quant_partition(
-                    ctx,
-                    x_mid,
-                    mid,
-                    mbits,
-                    b_blocks,
-                    Some(lb_mid),
-                    lm,
-                    gain * (sctx.imid as f32 / 32768.0),
-                    fill_mut,
-                );
-                rebalance = mbits - (rebalance - ctx.remaining_bits);
-                if rebalance > (3 << 3) && sctx.itheta != 0 {
-                    sbits += rebalance - (3 << 3);
-                }
-                cm |= quant_partition(
-                    ctx,
-                    x_side,
-                    mid,
-                    sbits,
-                    b_blocks,
-                    Some(lb_side),
-                    lm,
-                    gain * (sctx.iside as f32 / 32768.0),
-                    fill_mut >> b_blocks,
-                ) << (b0 >> 1);
-            } else {
-                cm = quant_partition(
-                    ctx,
-                    x_mid,
-                    mid,
-                    mbits,
-                    b_blocks,
-                    None,
-                    lm,
-                    gain * (sctx.imid as f32 / 32768.0),
-                    fill_mut,
-                );
-                rebalance = mbits - (rebalance - ctx.remaining_bits);
-                if rebalance > (3 << 3) && sctx.itheta != 0 {
-                    sbits += rebalance - (3 << 3);
-                }
-                cm |= quant_partition(
-                    ctx,
-                    x_side,
-                    mid,
-                    sbits,
-                    b_blocks,
-                    None,
-                    lm,
-                    gain * (sctx.iside as f32 / 32768.0),
-                    fill_mut >> b_blocks,
-                ) << (b0 >> 1);
-            }
-        } else if let Some(lb) = lowband {
-            let (lb_mid, lb_side) = lb.split_at_mut(mid);
-            cm = quant_partition(
-                ctx,
-                x_side,
-                mid,
-                sbits,
-                b_blocks,
-                Some(lb_side),
-                lm,
-                gain * (sctx.iside as f32 / 32768.0),
-                fill_mut >> b_blocks,
-            ) << (b0 >> 1);
-            rebalance = sbits - (rebalance - ctx.remaining_bits);
-            if rebalance > (3 << 3) && sctx.itheta != 16384 {
-                mbits += rebalance - (3 << 3);
-            }
-            cm |= quant_partition(
-                ctx,
-                x_mid,
-                mid,
-                mbits,
-                b_blocks,
-                Some(lb_mid),
-                lm,
-                gain * (sctx.imid as f32 / 32768.0),
-                fill_mut,
-            );
-        } else {
-            cm = quant_partition(
-                ctx,
-                x_side,
-                mid,
-                sbits,
-                b_blocks,
-                None,
-                lm,
-                gain * (sctx.iside as f32 / 32768.0),
-                fill_mut >> b_blocks,
-            ) << (b0 >> 1);
-            rebalance = sbits - (rebalance - ctx.remaining_bits);
-            if rebalance > (3 << 3) && sctx.itheta != 16384 {
-                mbits += rebalance - (3 << 3);
-            }
-            cm |= quant_partition(
-                ctx,
-                x_mid,
-                mid,
-                mbits,
-                b_blocks,
-                None,
-                lm,
-                gain * (sctx.imid as f32 / 32768.0),
-                fill_mut,
-            );
-        }
+            side_gain,
+            fill >> b_blocks,
+        ) << (b0 >> 1);
         cm
     } else {
-        let mut q = bits2pulses(ctx.m, ctx.i, lm, b);
-        let mut curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
+        let mut cm = quant_partition::<ENCODE_ONLY>(
+            ctx,
+            x_side,
+            mid,
+            sbits,
+            b_blocks,
+            lb_side,
+            lm,
+            side_gain,
+            fill >> b_blocks,
+        ) << (b0 >> 1);
+        let rebalance = sbits - (rebalance - ctx.remaining_bits);
+        if rebalance > (3 << 3) && sctx.itheta != 16384 {
+            mbits += rebalance - (3 << 3);
+        }
+        cm |= quant_partition::<ENCODE_ONLY>(
+            ctx, x_mid, mid, mbits, b_blocks, lb_mid, lm, mid_gain, fill,
+        );
+        cm
+    }
+}
+
+/// A band part that `quant_partition` does not split: the pulses its bits
+/// pay for are coded or decoded. Without pulses and with resynthesis, the
+/// part is filled from the folded band `lowband` or with noise. Returns the
+/// collapse mask of the part. See `quant_partition` for `ENCODE_ONLY`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn quant_partition_leaf<const ENCODE_ONLY: bool>(
+    ctx: &mut BandCtx,
+    x: &mut [f32],
+    n: usize,
+    b: i32,
+    b_blocks: i32,
+    lowband: Option<&mut [f32]>,
+    lm: i32,
+    gain: f32,
+    fill: u32,
+) -> u32 {
+    let (encode, resynth) = if ENCODE_ONLY {
+        (true, false)
+    } else {
+        (ctx.encode, ctx.resynth)
+    };
+    let mut q = bits2pulses(ctx.m, ctx.i, lm, b);
+    let mut curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
+    ctx.remaining_bits -= curr_bits;
+    // C: "Ensures we can never bust the budget".
+    while ctx.remaining_bits < 0 && q > 0 {
+        ctx.remaining_bits += curr_bits;
+        q -= 1;
+        curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
         ctx.remaining_bits -= curr_bits;
+    }
 
-        while ctx.remaining_bits < 0 && q > 0 {
-            ctx.remaining_bits += curr_bits;
-            q -= 1;
-            curr_bits = pulses2bits(ctx.m, ctx.i, lm, q);
-            ctx.remaining_bits -= curr_bits;
-        }
-
-        if q != 0 {
-            let k = get_pulses(q);
-            if ctx.encode {
-                alg_quant(
-                    x,
-                    n,
-                    k,
-                    ctx.spread,
-                    b_blocks as usize,
-                    ctx.rc,
-                    gain,
-                    ctx.resynth,
-                )
-            } else {
-                alg_unquant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain)
-            }
+    if q != 0 {
+        let k = get_pulses(q);
+        return if encode {
+            alg_quant(
+                x,
+                n,
+                k,
+                ctx.spread,
+                b_blocks as usize,
+                ctx.rc,
+                gain,
+                resynth,
+            )
         } else {
-            let mut cm = 0u32;
-            if ctx.resynth {
-                let cm_mask = (1u32 << b_blocks) - 1;
-                let fill_masked = fill & cm_mask;
-                if fill_masked == 0 {
-                    x[..n].fill(0.0);
-                } else if let Some(lb) = lowband {
-                    // One bounds check per slice; the kernels need none.
-                    let x = &mut x[..n];
-                    ctx.seed = fold_with_noise(x, &lb[..n], ctx.seed);
-                    renormalise_vector(x, n, gain);
-                    cm = fill_masked;
-                } else {
-                    let x = &mut x[..n];
-                    ctx.seed = fill_with_noise(x, ctx.seed);
-                    renormalise_vector(x, n, gain);
-                    cm = cm_mask;
-                }
-            }
-            cm
-        }
+            alg_unquant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain)
+        };
+    }
+    // Without resynthesis the part is not filled and its collapse mask
+    // stays 0.
+    if !resynth {
+        return 0;
+    }
+    let cm_mask = (1u32 << b_blocks) - 1;
+    let fill = fill & cm_mask;
+    // One bounds check; the kernels need none.
+    let x = &mut x[..n];
+    if fill == 0 {
+        x.fill(0.0);
+        0
+    } else if let Some(lb) = lowband {
+        ctx.seed = fold_with_noise(x, &lb[..n], ctx.seed);
+        renormalise_vector(x, n, gain);
+        fill
+    } else {
+        ctx.seed = fill_with_noise(x, ctx.seed);
+        renormalise_vector(x, n, gain);
+        cm_mask
     }
 }
 
@@ -1899,13 +1527,10 @@ pub fn quant_band(
         }
     }
 
-    // `quant_partition_encode` is the encoder without resynthesis.
-    // `quant_partition` is libopus's function as it is: it decodes, and it
-    // encodes with resynthesis (theta_rdo).
     let cm = if ctx.encode && !ctx.resynth {
-        quant_partition_encode(ctx, x, n, b, b_blocks, lowband_buf, lm, gain, fill)
+        quant_partition::<true>(ctx, x, n, b, b_blocks, lowband_buf, lm, gain, fill)
     } else {
-        quant_partition(ctx, x, n, b, b_blocks, lowband_buf, lm, gain, fill)
+        quant_partition::<false>(ctx, x, n, b, b_blocks, lowband_buf, lm, gain, fill)
     };
 
     if ctx.resynth {
@@ -1961,7 +1586,7 @@ pub fn quant_band(
 /// `mid * mid + side` (`MULT32_32_Q31(mid, mid) + side`, the shift is none in
 /// the float build); `2 * xp` is exact, so the second step rounds alike
 /// either way.
-pub fn stereo_merge(x: &mut [f32], y: &mut [f32], mid: f32, _side: f32, n: usize) {
+pub fn stereo_merge(x: &mut [f32], y: &mut [f32], mid: f32, n: usize) {
     // One bounds check per slice; the loops below need none.
     let x = &mut x[..n];
     let y = &mut y[..n];
@@ -2115,7 +1740,6 @@ pub fn quant_band_stereo(
     lowband: Option<&mut [f32]>,
     lm: i32,
     lowband_out: Option<&mut [f32]>,
-    _gain: f32,
     fill: u32,
 ) -> u32 {
     if n == 1 {
@@ -2318,7 +1942,7 @@ pub fn quant_band_stereo(
     }
 
     if ctx.resynth {
-        stereo_merge(x, y, mid_gain, side_gain, n);
+        stereo_merge(x, y, mid_gain, n);
         if sctx.inv {
             for yv in y[..n].iter_mut() {
                 *yv = -*yv;
@@ -2343,7 +1967,8 @@ fn compute_channel_weights(ex: f32, ey: f32) -> [f32; 2] {
 ///
 /// The first pass codes the band with `theta_round = -1`. Its bytes, its
 /// coder state, its decoded band and its folding output are kept. The
-/// second pass starts from the same state with `theta_round = 1`. When the
+/// second pass starts from the same state with `theta_round = 1`. It takes
+/// the angle that the first pass computed (`BandCtx::stereo_angle`). When the
 /// first pass has the smaller or equal distortion, its result is put back.
 ///
 /// libopus copies the coder bytes from the start offset to the end of the
@@ -2410,7 +2035,7 @@ fn quant_band_stereo_rdo(
         n,
         !last,
     );
-    let cm_down = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, 1.0, fill);
+    let cm_down = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, fill);
     let dist_down = distortion(x, y, x_save, y_save);
 
     // Keep the first result.
@@ -2469,7 +2094,7 @@ fn quant_band_stereo_rdo(
         n,
         !last,
     );
-    let cm_up = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, 1.0, fill);
+    let cm_up = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, fill);
     let dist_up = distortion(x, y, x_save, y_save);
 
     if dist_down >= dist_up {
@@ -2764,9 +2389,9 @@ fn quant_all_bands_impl(
             intensity,
             theta_round: 0,
             avoid_split_noise,
-            arch: 0,
             disable_inv,
             seed: ctx_seed,
+            stereo_angle: None,
         };
 
         let x_slice = &mut x[offset..offset + n];
@@ -2869,7 +2494,6 @@ fn quant_all_bands_impl(
                     lb,
                     lm,
                     lb_out,
-                    1.0,
                     x_cm | y_cm,
                 );
             }
@@ -3279,33 +2903,6 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     renormalise_vector_libopus(x, gain);
 }
 
-/// libopus `celt_exp2` of the float build with `FLOAT_APPROX`
-/// (celt/mathops.h 315-345): `2^x` from a polynomial of degree 5 for the
-/// fraction, put into the exponent bits. Each step `a + frac * p` is one
-/// fused multiply-add on arm64 (see `mac`). src/celt.rs has the same port
-/// for the encoder's analysis.
-#[inline]
-fn celt_exp2(x: f32) -> f32 {
-    let integer = x.floor() as i32;
-    if integer < -50 {
-        return 0.0;
-    }
-    let frac = x - integer as f32;
-    const A0: f32 = 9.999_999_4e-1;
-    const A1: f32 = 6.931_531e-1;
-    const A2: f32 = 2.401_536_1e-1;
-    const A3: f32 = 5.582_631_8e-2;
-    const A4: f32 = 8.989_34e-3;
-    const A5: f32 = 1.877_576_7e-3;
-    let p = mac(A4, frac, A5);
-    let p = mac(A3, frac, p);
-    let p = mac(A2, frac, p);
-    let p = mac(A1, frac, p);
-    let p = mac(A0, frac, p);
-    let bits = (p.to_bits() as i32).wrapping_add(((integer as u32) << 23) as i32) as u32 & 0x7fff_ffff;
-    f32::from_bits(bits)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn anti_collapse(
     m: &CeltMode,
@@ -3415,7 +3012,7 @@ mod tests {
             .map(|_| {
                 *seed = celt_lcg_rand(*seed);
                 let pick = (*seed >> 8) as usize;
-                if extremes && pick % 7 == 0 {
+                if extremes && pick.is_multiple_of(7) {
                     EXTREMES[(pick / 7) % EXTREMES.len()]
                 } else {
                     (*seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
@@ -3521,7 +3118,7 @@ mod tests {
 
                     let (mut x, mut y) = (x0.clone(), y0.clone());
                     let (mut xr, mut yr) = (x0.clone(), y0.clone());
-                    stereo_merge(&mut x, &mut y, mid, 0.0, n);
+                    stereo_merge(&mut x, &mut y, mid, n);
                     stereo_merge_reference(&mut xr, &mut yr, mid, n);
                     assert_same_bits(&x, &xr, &format!("stereo_merge x, {what}"));
                     assert_same_bits(&y, &yr, &format!("stereo_merge y, {what}"));
@@ -3784,8 +3381,8 @@ mod tests {
     }
 
     /// With a row count that has no Hadamard order the two functions must
-    /// panic. Before, some of these counts made `deinterleave_hadamard` copy
-    /// scratch values that it had never written.
+    /// panic. Otherwise some of these counts would make
+    /// `deinterleave_hadamard` copy scratch values that it never wrote.
     #[test]
     fn hadamard_reorder_rejects_a_row_count_without_an_order() {
         for stride in [1usize, 3, 5, 6, 7, 9, 12, 15, 17, 32] {

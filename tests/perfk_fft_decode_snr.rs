@@ -1,9 +1,9 @@
-//! How close the opus-rs decoder is to the libopus decoder on streams with a
+//! How close the opus1 decoder is to the libopus decoder on streams with a
 //! CELT part.
 //!
 //! libopus encodes a music-like test signal with the settings of the CELT
 //! and Hybrid bench scenarios. Both decoders then decode the same packets.
-//! The test prints, per stream, the signal-to-noise ratio of the opus-rs
+//! The test prints, per stream, the signal-to-noise ratio of the opus1
 //! output against the libopus output (libopus power divided by the power of
 //! the difference, in decibels), the largest difference, and the share of
 //! samples that are equal bit for bit. Run with `--nocapture` to see them.
@@ -12,7 +12,7 @@
 //! change of their rounding does to the decoded signal.
 
 use audiopus_sys as ffi;
-use opus_rs::OpusDecoder;
+use opus1::OpusDecoder;
 use std::os::raw::c_int;
 
 const OPUS_SET_FORCE_MODE_REQUEST: c_int = 11002;
@@ -182,7 +182,7 @@ fn decode_c(stream: &Stream, packets: &[Vec<u8>]) -> Vec<f32> {
     out
 }
 
-/// The samples the opus-rs decoder makes of the packets.
+/// The samples the opus1 decoder makes of the packets.
 fn decode_rust(stream: &Stream, packets: &[Vec<u8>]) -> Vec<f32> {
     let mut dec = OpusDecoder::new(RATE as i32, stream.channels).unwrap();
     let mut out = Vec::new();
@@ -195,7 +195,7 @@ fn decode_rust(stream: &Stream, packets: &[Vec<u8>]) -> Vec<f32> {
     out
 }
 
-/// The opus-rs decoder may differ from the libopus decoder in the last bits
+/// The opus1 decoder may differ from the libopus decoder in the last bits
 /// only: at least 100 dB below the signal on every stream.
 const MIN_SNR_DB: f64 = 100.0;
 

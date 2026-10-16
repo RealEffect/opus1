@@ -12,7 +12,8 @@
 //! Inputs for which the C macro has no defined meaning at all (a shift count
 //! out of range, a division by zero) are left out and named at the test.
 
-use opus_rs::silk::macros::*;
+use opus1::silk::log2lin::silk_log2lin;
+use opus1::silk::macros::*;
 
 // ---------------------------------------------------------------------------
 // Inputs

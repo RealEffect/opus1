@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus_rs::silk::define::*;
-use opus_rs::silk::lpc_analysis::{silk_burg_modified_fix, silk_find_lpc_fix};
-use opus_rs::silk::structs::SilkEncoderStateCommon;
+use opus1::silk::define::*;
+use opus1::silk::lpc_analysis::{silk_burg_modified_fix, silk_find_lpc_fix};
+use opus1::silk::structs::SilkEncoderStateCommon;
 use std::f32::consts::PI;
 
 /// Create a test encoder state with typical parameters

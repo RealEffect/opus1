@@ -33,12 +33,12 @@ fn sizes(pcm: &[f32], channels: usize, bitrate: i32, energy_mask: Option<Vec<f32
 /// The same mask on every band changes the packet size as it does in
 /// libopus: the deeper the mask, the smaller the packets.
 ///
-/// Measured, mono 64 kb/s, opus-rs / libopus mean bytes: mask -2: 70 / 65,
+/// Measured, mono 64 kb/s, opus1 / libopus mean bytes: mask -2: 70 / 65,
 /// -1: 108 / 105, -0.5: 142 / 144, 0: 190 / 191, +0.5: 202 / 204.
 /// Stereo 96 kb/s: 98 / 90, 145 / 149, 213 / 218, 282 / 296, 311 / 316.
 ///
 /// The largest difference, 9 %, is at the deepest mask. There the size
-/// depends most on how many bands the previous frame coded, and opus-rs
+/// depends most on how many bands the previous frame coded, and opus1
 /// does not smooth that count over frames as libopus does.
 #[test]
 fn flat_mask_scales_the_vbr_packet_size_like_libopus() {
@@ -50,7 +50,7 @@ fn flat_mask_scales_the_vbr_packet_size_like_libopus() {
         for level in levels {
             let (rs, c) = sizes(&pcm, channels, bitrate, mask(channels, |_| level));
             println!(
-                "{channels} ch, {bitrate} b/s, mask {level:+.1}: opus-rs {rs:.1} bytes, \
+                "{channels} ch, {bitrate} b/s, mask {level:+.1}: opus1 {rs:.1} bytes, \
                  libopus {c:.1} (no mask: {rs_none:.1}, {c_none:.1})"
             );
             assert!(
@@ -93,7 +93,7 @@ fn shaped_mask_scales_the_vbr_packet_size_like_libopus() {
         for (name, shape) in shapes {
             let (rs, c) = sizes(&pcm, channels, bitrate, mask(channels, shape));
             println!(
-                "{channels} ch, {bitrate} b/s, {name}: opus-rs {rs:.1} bytes, libopus {c:.1}"
+                "{channels} ch, {bitrate} b/s, {name}: opus1 {rs:.1} bytes, libopus {c:.1}"
             );
             assert!(
                 (rs - c).abs() <= 0.10 * c,
@@ -129,8 +129,8 @@ fn sloped_mask_moves_bits_between_low_and_high_bands_like_libopus() {
         };
         let (rs_low, c_low) = measure(true);
         let (rs_high, c_high) = measure(false);
-        println!("{channels} ch, low bands masked:  opus-rs {rs_low:.1?}, libopus {c_low:.1?}");
-        println!("{channels} ch, high bands masked: opus-rs {rs_high:.1?}, libopus {c_high:.1?}");
+        println!("{channels} ch, low bands masked:  opus1 {rs_low:.1?}, libopus {c_low:.1?}");
+        println!("{channels} ch, high bands masked: opus1 {rs_high:.1?}, libopus {c_high:.1?}");
 
         // The error in each range is close to libopus's.
         for r in 0..4 {
@@ -144,7 +144,7 @@ fn sloped_mask_moves_bits_between_low_and_high_bands_like_libopus() {
         let (bottom, top) = (0, 3);
         let rs_shift = [rs_low[bottom] - rs_high[bottom], rs_low[top] - rs_high[top]];
         let c_shift = [c_low[bottom] - c_high[bottom], c_low[top] - c_high[top]];
-        println!("{channels} ch, shift: opus-rs {rs_shift:.1?}, libopus {c_shift:.1?}");
+        println!("{channels} ch, shift: opus1 {rs_shift:.1?}, libopus {c_shift:.1?}");
         assert!(rs_shift[0] < -3.0 && c_shift[0] < -3.0, "{channels} ch: low range");
         assert!(rs_shift[1] > 0.0 && c_shift[1] > 0.0, "{channels} ch: high range");
         assert!(

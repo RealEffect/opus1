@@ -2,7 +2,7 @@
 //! samples: 10 ms at 12 kHz, 120 samples in 8 shell blocks of 16.
 //!
 //! libopus's `silk_encode_pulses` zeroes the 8 samples after the frame
-//! before it codes the last block (silk/encode_pulses.c). opus-rs coded the
+//! before it codes the last block (silk/encode_pulses.c). opus1 coded the
 //! least significant bits and the signs of whatever an earlier, longer frame
 //! had left there. The decoder reads those 8 samples as well and then drops
 //! them, so the packet decoded, but the encoder's final range was not the
@@ -13,9 +13,9 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::encode_pulses::silk_encode_pulses;
-use opus_rs::{Application, Bandwidth, OpusEncoder};
+use opus1::range_coder::RangeCoder;
+use opus1::silk::encode_pulses::silk_encode_pulses;
+use opus1::{Application, Bandwidth, OpusEncoder};
 
 /// Mediumband 10 ms packets after a longer frame have the final range that
 /// the libopus decoder reaches.

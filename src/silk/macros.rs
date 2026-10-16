@@ -166,6 +166,13 @@ pub fn silk_smlawb(a: i32, b: i32, c: i32) -> i32 {
     a.wrapping_add(silk_smulwb(b, c))
 }
 
+/// libopus `silk_SMULTT`: the top 16 bits of `a` times the top 16 bits of
+/// `b`. The product wraps at 32 bits.
+#[inline(always)]
+pub(crate) fn silk_smultt(a: i32, b: i32) -> i32 {
+    (a >> 16).wrapping_mul(b >> 16)
+}
+
 #[inline(always)]
 pub fn silk_smulwt(a: i32, b: i32) -> i32 {
     ((a as i64 * (b as i64 >> 16)) >> 16) as i32
@@ -446,21 +453,36 @@ pub fn silk_lin2log(in_lin: i32) -> i32 {
     )
 }
 
+/// libopus `SILK_FIX_CONST( c, q )` (silk/SigProc_FIX.h): `c` in Q`q`,
+/// rounded to the nearest integer. The C macro is
+/// `(opus_int32)( c * ( (opus_int64)1 << q ) + 0.5 )`, computed in double
+/// precision.
+///
+/// The 0.5 matters: `VARIABLE_HP_SMTH_COEF1` (0.1) in Q16 is 6554 with it
+/// and 6553 without, and the input high-pass filter of the encoder then
+/// changes its cutoff in other frames than libopus.
 #[inline(always)]
-pub fn silk_log2lin(log_gain_q7: i32) -> i32 {
-    if log_gain_q7 < 0 {
-        return 0;
-    }
-    if log_gain_q7 >= 3967 {
-        return i32::MAX;
-    }
-    let out = silk_lshift(1, log_gain_q7 >> 7);
-    let frac_q7 = log_gain_q7 & 0x7F;
+pub(crate) const fn silk_fix_const(c: f64, q: u32) -> i32 {
+    (c * (1i64 << q) as f64 + 0.5) as i32
+}
 
-    let val = silk_smlawb(frac_q7, silk_smulbb(frac_q7, 128 - frac_q7), -174);
-    if log_gain_q7 < 2048 {
-        silk_add_rshift32(out, silk_mul(out, val), 7)
-    } else {
-        out + silk_mul(out >> 7, val)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The integers libopus's `SILK_FIX_CONST` gives for the constants this
+    /// crate converts with `silk_fix_const`.
+    #[test]
+    fn fix_const_gives_the_libopus_integers() {
+        assert_eq!(silk_fix_const(0.8, 16), 52429);
+        assert_eq!(silk_fix_const(0.7, 16), 45875);
+        assert_eq!(silk_fix_const(0.2, 16), 13107);
+        assert_eq!(silk_fix_const(0.1f32 as f64, 16), 6554);
+        assert_eq!(silk_fix_const(0.4f32 as f64, 7), 51);
+        assert_eq!(silk_fix_const(60.0, 16), 3932160);
+        assert_eq!(silk_fix_const(250.0f32 as f64 / 6.0, 7), 5333);
+        assert_eq!(silk_fix_const(1.5 * core::f64::consts::PI / 1000.0, 19), 2471);
+        // C converts to an integer by cutting off the fraction.
+        assert_eq!(silk_fix_const(-0.004, 13), -32);
     }
 }

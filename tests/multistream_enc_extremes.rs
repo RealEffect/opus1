@@ -1,4 +1,4 @@
-//! The opus-rs multistream encoder at the ends of what its arguments allow,
+//! The opus1 multistream encoder at the ends of what its arguments allow,
 //! against C libopus.
 //!
 //! - The largest layouts: 255 mono streams, 127 stereo streams, and the
@@ -13,8 +13,8 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::Application;
-use opus_rs::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::Application;
+use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
 
 /// The channels 0 to 253 in pairs: 127 stereo streams and no mono stream.
 static PAIRS_254: [u8; 254] = {
@@ -162,7 +162,7 @@ fn layouts_beyond_the_largest_are_rejected_like_libopus() {
             assert_eq!(
                 rust.is_ok(),
                 c.is_ok(),
-                "{channels} channels, {streams} streams, {coupled} coupled: opus-rs {:?}, C {:?}",
+                "{channels} channels, {streams} streams, {coupled} coupled: opus1 {:?}, C {:?}",
                 rust.as_ref().err(),
                 c.as_ref().err()
             );

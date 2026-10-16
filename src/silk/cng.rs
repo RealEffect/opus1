@@ -21,11 +21,6 @@ const CNG_GAIN_SMTH_THRESHOLD_Q16: i32 = 46396;
 /// Smoothing of the noise spectrum per frame: 0.25 in Q16.
 const CNG_NLSF_SMTH_Q16: i32 = 16348;
 
-#[inline(always)]
-fn silk_smultt(a: i32, b: i32) -> i32 {
-    (a >> 16).wrapping_mul(b >> 16)
-}
-
 /// Draw `length` excitation samples at random from the noise buffer
 /// (`silk_CNG_exc`).
 fn silk_cng_exc(exc_q14: &mut [i32], exc_buf_q14: &[i32], length: usize, rand_seed: &mut i32) {

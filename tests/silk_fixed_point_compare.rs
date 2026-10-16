@@ -26,7 +26,7 @@ fn gen_pcm(fs: i32, num_samples: usize) -> Vec<f32> {
 }
 
 fn run_config(fs: i32, bitrate: i32, complexity: i32, c_ref_hex: &[&str], label: &str) {
-    use opus_rs::{Application, OpusEncoder};
+    use opus1::{Application, OpusEncoder};
     let frame_size = fs as usize / 50;
     let total_samples = frame_size * c_ref_hex.len();
     let pcm = gen_pcm(fs, total_samples);
@@ -579,7 +579,7 @@ fn voiced_signal(samples: usize) -> Vec<i16> {
 /// 238 with the first one corrected (the first eight blocks), 300 with both.
 #[test]
 fn long_voiced_stream_is_the_stream_of_fixed_point_libopus() {
-    use opus_rs::{Application, OpusEncoder};
+    use opus1::{Application, OpusEncoder};
     const C_BLOCK_HASHES: [u64; 12] = [
         0x4919c56ab5c5a233,
         0x99c741894692a57d,

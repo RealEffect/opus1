@@ -5,14 +5,14 @@
 //!
 //! The reference is the C libopus encoder with the same settings, at
 //! complexity 5, where libopus decides without the speech/music analysis
-//! that opus-rs does not have. Both streams are decoded by libopus.
+//! that opus1 does not have. Both streams are decoded by libopus.
 
 mod core_common;
 mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 
 /// Stereo test inputs, interleaved.
 #[derive(Clone, Copy, Debug)]
@@ -52,13 +52,13 @@ fn snr(reference: &[f32], test: &[f32]) -> f64 {
 }
 
 struct Sweep {
-    /// Channel count in the first byte of each packet, opus-rs and libopus.
+    /// Channel count in the first byte of each packet, opus1 and libopus.
     channels: Vec<(usize, usize)>,
-    /// Mode of each packet (0 SILK-only, 1 Hybrid, 2 CELT-only), opus-rs and
+    /// Mode of each packet (0 SILK-only, 1 Hybrid, 2 CELT-only), opus1 and
     /// libopus.
     modes: Vec<(u8, u8)>,
     /// Configuration of each packet (mode, bandwidth and frame duration, the
-    /// upper five bits of the first byte), opus-rs and libopus.
+    /// upper five bits of the first byte), opus1 and libopus.
     configs: Vec<(u8, u8)>,
     /// Signal-to-noise ratio of the two decoded streams against the input.
     snr: (f64, f64),
@@ -127,7 +127,7 @@ fn down_and_up(frame_ms_x10: usize) -> impl Fn(usize) -> i32 {
 /// mode and the bandwidth libopus's has. The streams decode within 1 dB of
 /// libopus's.
 ///
-/// What goes on in libopus, and now in opus-rs:
+/// What goes on in libopus, and now in opus1:
 ///
 /// - Stereo input is coded as mono when the rate for two channels is under
 ///   17 kb/s for music and 19 kb/s for speech, with 1 kb/s of hysteresis.
@@ -136,7 +136,7 @@ fn down_and_up(frame_ms_x10: usize) -> impl Fn(usize) -> i32 {
 ///   faded out (`toMono`).
 /// - CELT codes the mean of the two channels as one.
 ///
-/// Before the port opus-rs coded every packet in stereo: the channel count
+/// Before the port opus1 coded every packet in stereo: the channel count
 /// differed in 30 to 60 % of the packets.
 #[test]
 fn a_bitrate_sweep_codes_the_channel_count_of_libopus() {
@@ -187,7 +187,7 @@ fn celt_only_streams_code_the_channel_count_of_libopus() {
     const LOWDELAY: (i32, Application) = (APP_LOWDELAY, Application::RestrictedLowDelay);
     const AUDIO: (i32, Application) = (APP_AUDIO, Application::Audio);
     let force_celt = |enc: &mut OpusEncoder, c_enc: &mut CEncoder| {
-        enc.set_force_mode(Some(opus_rs::ForcedMode::CeltOnly));
+        enc.set_force_mode(Some(opus1::ForcedMode::CeltOnly));
         c_enc.force_mode(MODE_CELT);
     };
     for kind in [Source::MonoLike, Source::Wide, Source::Delayed] {
@@ -224,7 +224,7 @@ fn celt_only_streams_code_the_channel_count_of_libopus() {
 /// SILK's fade and sets its own `force_channels` to mono
 /// (opus_encoder.c:1763-1765): from the next packet on the stream is mono,
 /// whatever the bitrate, until the caller sets the channel count again.
-/// opus-rs does the same, and reports the setting.
+/// opus1 does the same, and reports the setting.
 #[test]
 fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libopus() {
     let rate = 48000;
@@ -235,8 +235,8 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
         c_enc.complexity(5).force_mode(MODE_HYBRID).bandwidth(BW_FB);
         let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
         enc.complexity = 5;
-        enc.set_force_mode(Some(opus_rs::ForcedMode::Hybrid));
-        enc.set_bandwidth(opus_rs::Bandwidth::Fullband);
+        enc.set_force_mode(Some(opus1::ForcedMode::Hybrid));
+        enc.set_bandwidth(opus1::Bandwidth::Fullband);
         let mut buf = vec![0u8; 4000];
         let mut channels = Vec::new();
         for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
@@ -274,7 +274,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
 /// coded a frame. libopus starts it afresh for the first stereo packet
 /// (enc_API.c:194-211) and its control call then sets up its resampler
 /// rather than carrying a history over to the new rate
-/// (control_codec.c:140-142). opus-rs carried the side's history from a
+/// (control_codec.c:140-142). opus1 carried the side's history from a
 /// rate of 0 and failed the packet ("Unsupported SILK rate switch").
 #[test]
 fn stereo_after_mono_with_a_new_silk_rate_codes_like_libopus() {
@@ -290,14 +290,14 @@ fn stereo_after_mono_with_a_new_silk_rate_codes_like_libopus() {
         for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
             let what = format!("{rate} Hz, {frame_ms} ms, packet {i}");
             let (bitrate, bandwidth) = if i * frame_ms < 1000 {
-                (10000, (BW_NB, opus_rs::Bandwidth::Narrowband))
+                (10000, (BW_NB, opus1::Bandwidth::Narrowband))
             } else {
-                (64000, (BW_FB, opus_rs::Bandwidth::Fullband))
+                (64000, (BW_FB, opus1::Bandwidth::Fullband))
             };
             c_enc.bitrate(bitrate).bandwidth(bandwidth.0).force_mode(if bitrate > 10000 { MODE_HYBRID } else { MODE_SILK });
             enc.bitrate_bps = bitrate;
             enc.set_bandwidth(bandwidth.1);
-            enc.set_force_mode(Some(if bitrate > 10000 { opus_rs::ForcedMode::Hybrid } else { opus_rs::ForcedMode::SilkOnly }));
+            enc.set_force_mode(Some(if bitrate > 10000 { opus1::ForcedMode::Hybrid } else { opus1::ForcedMode::SilkOnly }));
             let n = enc.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("{what}: {e}"));
             let c_packet = c_enc.encode(pcm);
             assert_eq!(buf[0] & 0xFC, c_packet[0] & 0xFC, "{what}: first byte");
@@ -321,7 +321,7 @@ fn peak_and_level_db(x: &[f32]) -> (f64, f64) {
 /// of it. The input here has the same speech, peaking at 0.9, in both
 /// channels: libopus's decoded stream peaks at -4.3 dB (16 kHz, 20 ms).
 ///
-/// opus-rs halved the sum of the 16-bit channels, as the fixed-point build
+/// opus1 halved the sum of the 16-bit channels, as the fixed-point build
 /// does, which does not clip: its stream peaked at -0.1 dB, 4.2 dB above
 /// libopus's. The VoIP application keeps the fixed-point rule: SILK's input
 /// for it is the fixed-point build's (see `OpusEncoder::encode_impl`).
@@ -349,8 +349,8 @@ fn loud_stereo_coded_as_mono_clips_the_sum_like_libopus() {
 
 /// SILK-only wideband in both encoders.
 fn silk_wideband(enc: &mut OpusEncoder, c_enc: &mut CEncoder) {
-    enc.set_force_mode(Some(opus_rs::ForcedMode::SilkOnly));
-    enc.set_bandwidth(opus_rs::Bandwidth::Wideband);
+    enc.set_force_mode(Some(opus1::ForcedMode::SilkOnly));
+    enc.set_bandwidth(opus1::Bandwidth::Wideband);
     c_enc.force_mode(MODE_SILK).bandwidth(BW_WB);
 }
 
@@ -384,7 +384,7 @@ fn decode_both(rate: usize, frame: usize, bitrate: i32, input: &[f32]) -> (Vec<f
 /// Wide stereo input is coded with mono forced for 3 s, over a bitrate
 /// ramp through those thresholds, then with the bitrate deciding again.
 /// Every packet has libopus's mode and channel count. With the width
-/// measured while mono was forced, opus-rs chose CELT below libopus's
+/// measured while mono was forced, opus1 chose CELT below libopus's
 /// threshold, and its smoothed width was not libopus's after the setting
 /// was cleared.
 #[test]

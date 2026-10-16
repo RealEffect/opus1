@@ -3,15 +3,15 @@
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
 // WAV file encoder/decoder test using OpusEncoder/OpusDecoder
-use opus_rs::silk::resampler::SilkResampler;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::silk::resampler::SilkResampler;
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-// Tag output files by which opus-rs build produced them so std / no_std runs
+// Tag output files by which opus1 build produced them so std / no_std runs
 // can coexist for A/B listening. The example binary itself always links std
-// (for WAV I/O); only the opus-rs crate flips between std and `#![no_std]`.
+// (for WAV I/O); only the opus1 crate flips between std and `#![no_std]`.
 #[cfg(feature = "std")]
 const BUILD_TAG: &str = "std";
 #[cfg(not(feature = "std"))]
@@ -378,12 +378,12 @@ fn process_mode(config: ModeConfig, src_samples: &[i16], src_rate: u32) {
 
 fn main() {
     let build_desc = if cfg!(feature = "std") {
-        "opus-rs built with std"
+        "opus1 built with std"
     } else {
-        "opus-rs built #![no_std] + libm (heap-free; this binary provides I/O)"
+        "opus1 built #![no_std] + libm (heap-free; this binary provides I/O)"
     };
     println!("############################################################");
-    println!("#  opus-rs WAV round-trip — BUILD_TAG = {}", BUILD_TAG);
+    println!("#  opus1 WAV round-trip — BUILD_TAG = {}", BUILD_TAG);
     println!("#  ({})", build_desc);
     println!("############################################################");
 

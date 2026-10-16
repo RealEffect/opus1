@@ -8,15 +8,15 @@
 //! `MIN_LPC_ORDER` alongside `silk_NLSF_CB_NB_MB`.
 //!
 //! These tests decode mediumband SILK from libopus's encoder and from
-//! opus-rs's with both decoders, and require agreement at lag 0. Before the
+//! opus1's with both decoders, and require agreement at lag 0. Before the
 //! fix every window after the first packet sat near 0 dB.
 
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus_rs::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -89,9 +89,9 @@ fn libopus_packets(ch: usize, ms: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// ~1 s of opus-rs-encoded 20 ms packets from 12 kHz input, which the
+/// ~1 s of opus1-encoded 20 ms packets from 12 kHz input, which the
 /// encoder codes as mediumband SILK (the issue's own path).
-fn opus_rs_packets(ch: usize) -> Vec<Vec<u8>> {
+fn opus1_packets(ch: usize) -> Vec<Vec<u8>> {
     let frame = MB_RATE / 50;
     let input = voiced(MB_RATE, ch, MB_RATE);
     let mut enc = OpusEncoder::new(MB_RATE as i32, ch, Application::Voip).unwrap();
@@ -101,14 +101,14 @@ fn opus_rs_packets(ch: usize) -> Vec<Vec<u8>> {
         .chunks_exact(frame * ch)
         .map(|f| {
             let n = enc.encode(f, frame, &mut pkt).unwrap();
-            assert_mediumband_silk(&pkt[..n], ch, "opus-rs");
+            assert_mediumband_silk(&pkt[..n], ch, "opus1");
             pkt[..n].to_vec()
         })
         .collect()
 }
 
-/// Decode `packets` with libopus and with opus-rs at `api_rate`, and return
-/// the worst lag-0 SNR (dB) of opus-rs against libopus over 20 ms windows
+/// Decode `packets` with libopus and with opus1 at `api_rate`, and return
+/// the worst lag-0 SNR (dB) of opus1 against libopus over 20 ms windows
 /// and channels, after skipping the first packet (`ms` long) as warm-up.
 fn worst_window_snr(packets: &[Vec<u8>], ch: usize, ms: usize, api_rate: usize) -> f64 {
     let mut c_dec = CDec::new(api_rate as u32, c_channels(ch)).unwrap();
@@ -121,9 +121,9 @@ fn worst_window_snr(packets: &[Vec<u8>], ch: usize, ms: usize, api_rate: usize) 
         let c_n = c_dec.decode_float(pkt, &mut c_buf, false).unwrap();
         let rs_n = rs_dec
             .decode(pkt, MAX_FRAME, &mut rs_buf)
-            .unwrap_or_else(|e| panic!("packet {p}: opus-rs decode failed: {e}"));
+            .unwrap_or_else(|e| panic!("packet {p}: opus1 decode failed: {e}"));
         assert_eq!(c_n, frame, "packet {p}: libopus decoded length");
-        assert_eq!(rs_n, frame, "packet {p}: opus-rs decoded length");
+        assert_eq!(rs_n, frame, "packet {p}: opus1 decoded length");
         c_pcm.extend_from_slice(&c_buf[..c_n * ch]);
         rs_pcm.extend_from_slice(&rs_buf[..rs_n * ch]);
     }
@@ -172,14 +172,14 @@ fn libopus_mediumband_decodes_like_libopus() {
 }
 
 #[test]
-fn opus_rs_mediumband_decodes_like_libopus() {
+fn opus1_mediumband_decodes_like_libopus() {
     for ch in [1, 2] {
-        let packets = opus_rs_packets(ch);
+        let packets = opus1_packets(ch);
         let snr = worst_window_snr(&packets, ch, 20, 48000);
-        println!("opus-rs MB, {ch} ch, decoded at 48000 Hz: {snr:.1} dB");
+        println!("opus1 MB, {ch} ch, decoded at 48000 Hz: {snr:.1} dB");
         assert!(
             snr > AGREE_DB,
-            "opus-rs MB, {ch} ch, at 48000 Hz: worst window {snr:.1} dB"
+            "opus1 MB, {ch} ch, at 48000 Hz: worst window {snr:.1} dB"
         );
     }
 }

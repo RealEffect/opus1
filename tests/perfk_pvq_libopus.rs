@@ -19,7 +19,7 @@
 //! difference is allowed.
 
 use audiopus_sys as _;
-use opus_rs::pvq::pvq_search;
+use opus1::pvq::pvq_search;
 use std::os::raw::c_int;
 
 unsafe extern "C" {
@@ -84,7 +84,7 @@ fn band(rng: &mut Lcg, n: usize, trial: usize) -> Vec<f32> {
 }
 
 /// How many of `trials` vectors may differ from libopus by a tie: none where
-/// the library and opus-rs round the same sums once (see the top of this
+/// the library and opus1 round the same sums once (see the top of this
 /// file), one in 200 elsewhere.
 fn allowed_ties(trials: usize) -> usize {
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
@@ -145,7 +145,7 @@ fn two_values_give_the_vector_of_libopus() {
 
 /// Two inputs where the last bit of the correlation sum decides between two
 /// pulse vectors that match equally well. With product and sum rounded
-/// separately in the projection step, opus-rs gave [-7, 7] and [-12, 10]
+/// separately in the projection step, opus1 gave [-7, 7] and [-12, 10]
 /// here; the libopus build for Apple silicon gives [-8, 6] and [-13, 9]
 /// (6 such cases in 8.4 million random bands of two values).
 #[test]
@@ -185,7 +185,7 @@ fn codable(n: usize, k: usize) -> bool {
 /// Every band size and every number of pulses the codec can code give the
 /// vector of libopus, outside x86-64.
 ///
-/// opus-rs had kernels of its own on aarch64: bands of four values without
+/// opus1 had kernels of its own on aarch64: bands of four values without
 /// the projection step, bands of up to 16 values scored with an estimate of
 /// `1 / sqrt`, bands of 32 and more with four pulses per pass. Measured
 /// before the change: 608 of the 7640 vectors of this test differed.

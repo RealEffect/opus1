@@ -6,7 +6,7 @@
 //!
 //! The reference is the C libopus encoder with the same settings, at
 //! complexity 5, where libopus decides without the speech/music analysis
-//! that opus-rs does not have. Every packet is decoded by the C decoder.
+//! that opus1 does not have. Every packet is decoded by the C decoder.
 //!
 //! What a missing or wrong redundant frame looks like here:
 //!
@@ -23,10 +23,10 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech, to_stereo};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// Speech, mono or stereo. No steady tones: on those the SILK encoder of
-/// opus-rs is known to be several dB below libopus (tests/core_switch.rs),
+/// opus1 is known to be several dB below libopus (tests/core_switch.rs),
 /// which would hide what a switch does.
 ///
 /// The recording is repeated when `seconds` is more than the 12 s used of it.
@@ -70,7 +70,7 @@ const AUDIO: (i32, Application) = (APP_AUDIO, Application::Audio);
 const VOIP: (i32, Application) = (APP_VOIP, Application::Voip);
 
 struct Outcome {
-    /// First bytes of the opus-rs and of the libopus packets, without the
+    /// First bytes of the opus1 and of the libopus packets, without the
     /// frame count code.
     tocs: Vec<u8>,
     c_tocs: Vec<u8>,
@@ -79,12 +79,12 @@ struct Outcome {
     /// Packets at which the mode or the bandwidth in the first byte changes.
     switches: Vec<usize>,
     /// For each switch: the lowest signal-to-noise ratio of the 20 ms
-    /// windows from 40 ms before it to 60 ms after it, for the opus-rs
+    /// windows from 40 ms before it to 60 ms after it, for the opus1
     /// stream and for the libopus stream, both decoded by libopus.
     worst_window: Vec<(f64, f64)>,
     /// Signal-to-noise ratio of the two decoded streams over everything.
     snr: (f64, f64),
-    /// Packet sizes in bytes, opus-rs and libopus.
+    /// Packet sizes in bytes, opus1 and libopus.
     sizes: Vec<usize>,
     c_sizes: Vec<usize>,
 }
@@ -219,7 +219,7 @@ const MODE_SWITCH: Margins = Margins { window: 6.0, mean: 2.0, stream: 1.5 };
 /// - The C decoder ends every packet in the encoder's final range.
 /// - The stream decodes within `margins` of libopus's own stream. What is
 ///   left around a switch comes from the first SILK frame after a restart,
-///   which the SILK encoder of opus-rs codes up to 5 dB worse than libopus,
+///   which the SILK encoder of opus1 codes up to 5 dB worse than libopus,
 ///   also at the start of a stream.
 fn check(what: &str, outcome: &Outcome, min_switches: usize, margins: &Margins) {
     assert!(outcome.range_mismatches.is_empty(), "{what}: final range of packets {:?}", outcome.range_mismatches);
@@ -440,7 +440,7 @@ fn silk_bandwidth_switches_match_libopus() {
                 assert!(differ * 100 <= outcome.tocs.len(), "{what}: {differ} first bytes differ");
                 // SILK changes its rate in a pause, where the level is low and
                 // the signal-to-noise ratio says little. libopus restarts
-                // SILK there, and so does opus-rs. Measured against libopus:
+                // SILK there, and so does opus1. Measured against libopus:
                 // 6.7 dB at most around a switch (16 kHz, CBR), 0.8 dB on
                 // average, 0.1 dB over the stream.
                 //
@@ -459,7 +459,7 @@ fn silk_bandwidth_switches_match_libopus() {
 /// A stream that moves between SILK-only (Hybrid above 16 kHz) and
 /// CELT-only every 500 ms, coded from input with a constant `offset`.
 /// Returns, for every step from the second on, the mean of what the C
-/// decoder gives for the opus-rs stream and for the libopus stream. The
+/// decoder gives for the opus1 stream and for the libopus stream. The
 /// first 100 ms of a step are left out: the switch itself is not the
 /// subject here.
 fn step_means(application: (i32, Application), rate: usize, offset: f32) -> Vec<(bool, f32, f32)> {

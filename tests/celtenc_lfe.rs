@@ -39,8 +39,8 @@ fn lfe_bit_use_and_quality_match_libopus() {
                 snr_db(&pcm, &dec_c(&c, 1), 1, 5),
             );
             println!(
-                "{what}: bytes opus-rs {rs_mean:.2} {:?}, libopus {c_mean:.2} {:?}; \
-                 SNR opus-rs {rs_snr:.2} dB, libopus {c_snr:.2} dB",
+                "{what}: bytes opus1 {rs_mean:.2} {:?}, libopus {c_mean:.2} {:?}; \
+                 SNR opus1 {rs_snr:.2} dB, libopus {c_snr:.2} dB",
                 size_range(&rs),
                 size_range(&c),
             );
@@ -75,7 +75,7 @@ fn lfe_frame_that_does_not_fill_its_packet_decodes() {
         cfg.vbr = false;
         let rs_snr = snr_db(&pcm, &dec_c(&enc_rs(&cfg, &pcm), 1), 1, 5);
         let c_snr = snr_db(&pcm, &dec_c(&enc_c(&cfg, &pcm), 1), 1, 5);
-        println!("LFE CBR {rate} b/s: SNR opus-rs {rs_snr:.2} dB, libopus {c_snr:.2} dB");
+        println!("LFE CBR {rate} b/s: SNR opus1 {rs_snr:.2} dB, libopus {c_snr:.2} dB");
         assert!(
             rs_snr >= c_snr - 1.0,
             "LFE CBR {rate} b/s: SNR {rs_snr:.2} dB, libopus {c_snr:.2} dB"
@@ -108,12 +108,12 @@ fn lfe_holds_down_the_bands_above_band_1_like_libopus() {
     plain.lfe = false;
     let rs_plain = high_to_low(&enc_rs(&plain, &pcm));
     println!(
-        "above 400 Hz against below: LFE opus-rs {rs:.1} dB, LFE libopus {c:.1} dB, \
-         opus-rs without LFE {rs_plain:.1} dB"
+        "above 400 Hz against below: LFE opus1 {rs:.1} dB, LFE libopus {c:.1} dB, \
+         opus1 without LFE {rs_plain:.1} dB"
     );
     assert!(
         (rs - c).abs() < 2.0,
-        "above 400 Hz: opus-rs {rs:.1} dB, libopus {c:.1} dB"
+        "above 400 Hz: opus1 {rs:.1} dB, libopus {c:.1} dB"
     );
     assert!(
         rs_plain > rs + 15.0,
@@ -145,8 +145,8 @@ fn lfe_tiny_packets_decode_like_libopus() {
         let peak = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
         let (rs_snr, c_snr) = (snr_db(&pcm, &rs_out, 1, 5), snr_db(&pcm, &c_out, 1, 5));
         println!(
-            "LFE {packet_bytes}-byte packets: SNR opus-rs {rs_snr:.2} dB, libopus {c_snr:.2} dB; \
-             peak opus-rs {:.2}, libopus {:.2}",
+            "LFE {packet_bytes}-byte packets: SNR opus1 {rs_snr:.2} dB, libopus {c_snr:.2} dB; \
+             peak opus1 {:.2}, libopus {:.2}",
             peak(&rs_out),
             peak(&c_out)
         );
@@ -158,7 +158,7 @@ fn lfe_tiny_packets_decode_like_libopus() {
             peak(&c_out)
         );
         // 4 dB, not 1: with 2 to 4 pulses in a band the pulse search of
-        // opus-rs is worse than libopus's, which costs up to 2.8 dB in the
+        // opus1 is worse than libopus's, which costs up to 2.8 dB in the
         // packets of 11 to 13 bytes (see celtenc_known_gaps.rs).
         assert!(
             rs_snr >= c_snr - 4.0,

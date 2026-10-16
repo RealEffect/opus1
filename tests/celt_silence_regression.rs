@@ -11,7 +11,7 @@
 //! - VBR shrink behavior
 //! - hybrid mode sanity
 //! - known bad pattern regression (fc 7f fe) not produced for true silence
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::process::Command;
 
 const FRAME_SIZE: usize = 960;
@@ -213,8 +213,6 @@ fn celt_only_zero_pcm_cross_decode() {
 #[test]
 fn audio_to_silence_to_audio_transition() {
     // D-2: sine -> zero -> sine, checks overlap_max handling
-    let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc.bitrate_bps = 192000;
     let sine_frame = {
         let mut v = vec![0.0f32; FRAME_SIZE * 2];
         for i in 0..FRAME_SIZE {
@@ -243,7 +241,6 @@ fn audio_to_silence_to_audio_transition() {
     }
     let mut packets = Vec::new();
     let mut out = vec![0u8; 1500];
-    // Need fresh encoder
     let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
     enc.bitrate_bps = 192000;
     for f in 0..total {

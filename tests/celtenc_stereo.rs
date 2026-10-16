@@ -28,7 +28,7 @@ fn two_sources(seconds: usize) -> Vec<f32> {
 /// number of coded bands, or sets it to 0 when the packet has no room to
 /// signal it (rate.c, interp_bits2pulses; celt_encoder.c passes
 /// `&st->intensity`). The hysteresis of the next frame starts from that
-/// value. opus-rs gave the allocator a copy, so its next frame started from
+/// value. opus1 gave the allocator a copy, so its next frame started from
 /// the unlowered band.
 #[test]
 fn the_allocator_lowers_the_intensity_band_for_the_next_frame() {
@@ -41,7 +41,7 @@ fn the_allocator_lowers_the_intensity_band_for_the_next_frame() {
     let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs), st.snr_db(&pcm, &c));
     println!(
         "intensity band and dual stereo the same in {} of {} frames; \
-         opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+         opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
         a.stereo, a.frames
     );
     assert!(a.at_least(a.stereo, 80), "{a:?}");
@@ -50,7 +50,7 @@ fn the_allocator_lowers_the_intensity_band_for_the_next_frame() {
 /// libopus decides between left/right and mid/side coding with
 /// `stereo_analysis`, but only for frames longer than 2.5 ms: "Always use MS
 /// for 2.5 ms frames until we can do a better analysis" (celt_encoder.c
-/// 2401). opus-rs ran the analysis for 2.5 ms frames too, and coded some
+/// 2401). opus1 ran the analysis for 2.5 ms frames too, and coded some
 /// frames of two unrelated channels as left and right.
 #[test]
 fn frames_of_2_5_ms_are_coded_as_mid_and_side() {
@@ -64,7 +64,7 @@ fn frames_of_2_5_ms_are_coded_as_mid_and_side() {
         let (snr_rs, snr_c) = (st.snr_db(&pcm, &rs_bytes), st.snr_db(&pcm, &c_bytes));
         println!(
             "{per_channel} b/s per channel: left/right in {} frames of {}, libopus {}; \
-             opus-rs {snr_rs:.2} dB, libopus {snr_c:.2} dB",
+             opus1 {snr_rs:.2} dB, libopus {snr_c:.2} dB",
             dual(&rs),
             rs.len(),
             dual(&c)

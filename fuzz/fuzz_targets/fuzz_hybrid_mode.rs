@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
@@ -105,9 +105,13 @@ fuzz_target!(|data: &[u8]| {
             let mut encoded = vec![0u8; 4000];
             if let Ok(encoded_len) = encoder.encode(&input, *frame_size, &mut encoded) {
                 if encoded_len > 0 {
-                    // Decode
+                    // Decode: one frame, in the encoder's final range. The
+                    // decoder may have decoded other packets before, which
+                    // does not change how it reads this one.
                     let mut decoded = vec![0.0f32; frame_size * channels];
-                    let _ = decoder.decode(&encoded[..encoded_len], *frame_size, &mut decoded);
+                    let got = decoder.decode(&encoded[..encoded_len], *frame_size, &mut decoded);
+                    assert_eq!(got, Ok(*frame_size));
+                    assert_eq!(decoder.final_range(), encoder.final_range());
 
                     // Multiple decode passes to test state
                     for _ in 0..3 {

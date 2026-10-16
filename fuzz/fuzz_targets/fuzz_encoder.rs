@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus_rs::{Application, OpusEncoder};
+use opus1::{Application, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {
@@ -57,7 +57,9 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Encode
+    // Encode. 10, 20 and 40 ms frames must be encoded; 30 ms is not a
+    // frame size of Opus and must be refused.
     let mut output = vec![0u8; 4000];
-    let _ = encoder.encode(&input, frame_size, &mut output);
+    let result = encoder.encode(&input, frame_size, &mut output);
+    assert_eq!(result.is_ok(), frame_size_multiplier != 3, "{result:?}");
 });

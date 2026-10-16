@@ -1,6 +1,6 @@
 //! Shared helpers for the `k24_*` tests.
 //!
-//! These tests check opus-rs's decoder against C libopus when the decoder
+//! These tests check opus1's decoder against C libopus when the decoder
 //! output rate is 24 kHz (and, for contrast, 8 / 12 / 16 / 48 kHz). The
 //! helpers here do three things:
 //!
@@ -682,14 +682,14 @@ pub fn aligned_snr(reference: &[f32], test: &[f32], max_lag: isize) -> (f64, isi
 // Decoding a packet stream with both decoders
 // ---------------------------------------------------------------------------
 
-/// Decode `packets` with opus-rs at `rate` / `channels`. Stops at the first
+/// Decode `packets` with opus1 at `rate` / `channels`. Stops at the first
 /// error and returns it together with the index of the failing packet.
 pub fn rs_decode_all(
     packets: &[Vec<u8>],
     rate: usize,
     channels: usize,
 ) -> Result<Vec<f32>, (usize, &'static str)> {
-    let mut dec = opus_rs::OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut dec = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
     let max = rate * 120 / 1000;
     let mut pcm = vec![0f32; max * channels];
     let mut out = Vec::new();

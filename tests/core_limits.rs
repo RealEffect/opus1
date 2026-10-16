@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{chirp, to_stereo};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder, packet, pcm_soft_clip};
+use opus1::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder, packet, pcm_soft_clip};
 
 /// Frame sizes no buffer can hold. Several are chosen so that
 /// `frame_size * 2` overflows to a small number, or so that their lowest 32
@@ -168,13 +168,13 @@ fn frames_longer_than_1275_bytes_are_rejected_like_libopus() {
         let ours = packet::parse(data, false);
         match c_parse_sizes(data) {
             Some(sizes) => {
-                let p = ours.unwrap_or_else(|e| panic!("libopus accepts {:02x?} + {} bytes, opus-rs: {e}", &data[..4], data.len() - 4));
+                let p = ours.unwrap_or_else(|e| panic!("libopus accepts {:02x?} + {} bytes, opus1: {e}", &data[..4], data.len() - 4));
                 assert_eq!(p.sizes[..p.count].iter().map(|&s| s as usize).collect::<Vec<_>>(), sizes);
                 assert!(sizes.iter().all(|&s| s <= packet::MAX_FRAME_BYTES));
                 accepted += 1;
             }
             None => {
-                assert!(ours.is_err(), "libopus rejects {:02x?} + {} bytes, opus-rs accepts", &data[..4], data.len() - 4);
+                assert!(ours.is_err(), "libopus rejects {:02x?} + {} bytes, opus1 accepts", &data[..4], data.len() - 4);
                 rejected += 1;
             }
         }
@@ -364,7 +364,7 @@ enum Insane {
 /// 2016-2028). Both coders then code silence.
 ///
 /// For each case the test returns the level of every decoded frame of the
-/// opus-rs stream and of the libopus stream, both decoded by libopus.
+/// opus1 stream and of the libopus stream, both decoded by libopus.
 fn insane_frames(application: (i32, Application), mode: Option<(i32, ForcedMode)>, rate: usize, insane: Insane) -> Vec<(f64, f64)> {
     let frame = rate / 50;
     let mut pcm = chirp(rate, frame * 12);
@@ -413,7 +413,7 @@ fn insane_frames(application: (i32, Application), mode: Option<(i32, ForcedMode)
 /// one decodes as silence when the frames were cleared.
 ///
 /// The sums 0.995e9 and 1.005e9 lie on either side of the limit, within the
-/// 1 % where opus-rs adds the squares up a second time, one after the other.
+/// 1 % where opus1 adds the squares up a second time, one after the other.
 ///
 /// The cleared frame is a silent CELT frame, the same 3 bytes as libopus's.
 /// What it decodes to is the tail of the frame before. With the CELT

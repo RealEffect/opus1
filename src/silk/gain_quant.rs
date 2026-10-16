@@ -134,7 +134,7 @@ pub fn silk_quant_ltp_gains(
         sum_log_gain_tmp_q7 = *sum_log_gain_q7;
         for j in 0..nb_subfr {
             max_gain_q7 = silk_log2lin(
-                (silk_float_to_fixed_q7(MAX_SUM_LOG_GAIN_dB / 6.0) - sum_log_gain_tmp_q7) + 896,
+                (silk_fix_const(MAX_SUM_LOG_GAIN_dB as f64 / 6.0, 7) - sum_log_gain_tmp_q7) + 896,
             ) - gain_safety;
 
             // Correlation matrix and vector of subframe `j`.
@@ -153,8 +153,11 @@ pub fn silk_quant_ltp_gains(
                 gain_q7 = found_gain_q7;
             }
 
-            res_nrg_total_q15 = add_pos_sat32(res_nrg_total_q15, choice.res_nrg_q15);
-            rate_dist_total_q7 = add_pos_sat32(rate_dist_total_q7, choice.rate_dist_q7);
+            // The bit count of a subframe is negative when the predictor
+            // works well. A negative sum then turns into `i32::MAX`, as in
+            // libopus, which chooses its codebook from these sums.
+            res_nrg_total_q15 = silk_add_pos_sat32(res_nrg_total_q15, choice.res_nrg_q15);
+            rate_dist_total_q7 = silk_add_pos_sat32(rate_dist_total_q7, choice.rate_dist_q7);
             sum_log_gain_tmp_q7 =
                 0.max(sum_log_gain_tmp_q7 + silk_lin2log(gain_q7 + gain_safety) - 896);
         }
@@ -187,28 +190,6 @@ pub fn silk_quant_ltp_gains(
         silk_rshift32(res_nrg_total_q15, 2)
     };
     *pred_gain_db_q7 = silk_smulbb(-3, silk_lin2log(res_nrg_shift) - 1920);
-}
-
-/// libopus `silk_ADD_POS_SAT32`: the sum of two numbers, or `i32::MAX` when
-/// the 32-bit sum has its top bit set.
-///
-/// The macro is meant for two positive numbers, where this is an addition
-/// that saturates. `silk_quant_ltp_gains` also calls it with the bit count of
-/// a subframe, which is negative when the predictor works well. A negative
-/// sum then turns into `i32::MAX`. libopus chooses its codebook from these
-/// sums, so the same is done here.
-#[inline(always)]
-fn add_pos_sat32(a: i32, b: i32) -> i32 {
-    let sum = (a as u32).wrapping_add(b as u32);
-    if sum & 0x8000_0000 != 0 {
-        i32::MAX
-    } else {
-        sum as i32
-    }
-}
-
-fn silk_float_to_fixed_q7(f: f32) -> i32 {
-    (f * 128.0 + 0.5) as i32
 }
 
 #[inline(always)]

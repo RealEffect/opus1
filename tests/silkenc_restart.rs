@@ -5,7 +5,7 @@
 //! (`prefillFlag`). That call goes through `silk_encode_frame_FIX`, which
 //! takes a seed for the frame and advances the frame counter before it
 //! leaves (silk/fixed/encode_frame_FIX.c:120). The first coded frame after a
-//! restart therefore has seed 1. opus-rs did not count the prefill frame
+//! restart therefore has seed 1. opus1 did not count the prefill frame
 //! and coded seed 0.
 //!
 //! The seed is written into the packet. At complexity 0 the plain quantizer
@@ -15,14 +15,14 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus_rs::range_coder::RangeCoder;
-use opus_rs::silk::decode_indices::{
+use opus1::range_coder::RangeCoder;
+use opus1::silk::decode_indices::{
     silk_decode_indices, silk_stereo_decode_mid_only, silk_stereo_decode_pred,
 };
-use opus_rs::silk::decode_pulses::silk_decode_pulses;
-use opus_rs::silk::define::{CODE_CONDITIONALLY, CODE_INDEPENDENTLY};
-use opus_rs::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::silk::decode_pulses::silk_decode_pulses;
+use opus1::silk::define::{CODE_CONDITIONALLY, CODE_INDEPENDENTLY};
+use opus1::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
+use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 const MODE_CELT: i32 = 1002;
 

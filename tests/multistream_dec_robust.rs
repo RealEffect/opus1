@@ -25,7 +25,7 @@ mod multistream_dec_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_dec_common::*;
-use opus_rs::multistream::{ChannelMappingTable, MultistreamDecoder};
+use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
 
 /// Checks one set of constructor arguments against the C constructor.
 /// Returns whether both accepted them.
@@ -35,7 +35,7 @@ fn same_verdict(fs: i32, channels: usize, streams: usize, coupled: usize, mappin
     assert_eq!(
         c.is_ok(),
         r.is_ok(),
-        "{fs} Hz, {channels} channels, {streams} streams, {coupled} coupled, mapping {:?}: C {:?}, opus-rs {:?}",
+        "{fs} Hz, {channels} channels, {streams} streams, {coupled} coupled, mapping {:?}: C {:?}, opus1 {:?}",
         &mapping[..channels.min(mapping.len()).min(12)],
         c.as_ref().err(),
         r.as_ref().err()
@@ -209,7 +209,7 @@ impl Pair {
             }
             (Err(_), Err(_)) => verdicts.rejected += 1,
             (c, r) => panic!(
-                "{what}: C {c:?}, opus-rs {r:?}; {} bytes, frame_size {frame_size}, fec {fec}, 16 bits {sixteen}: {}",
+                "{what}: C {c:?}, opus1 {r:?}; {} bytes, frame_size {frame_size}, fec {fec}, 16 bits {sixteen}: {}",
                 packet.len(),
                 describe_packet(packet, self.streams)
             ),
@@ -474,14 +474,14 @@ fn join_packets(e: &Encoded, group: &[Vec<u8>], padding: usize) -> Option<Vec<u8
         let mut frames: Vec<&[u8]> = Vec::new();
         for parts in &split {
             let stream = &parts[s].packet;
-            let parsed = opus_rs::packet::parse(stream, false).unwrap();
+            let parsed = opus1::packet::parse(stream, false).unwrap();
             frames.extend(parsed.frames(stream));
         }
         let self_delimited = s + 1 != e.streams;
         let mut buf = vec![0u8; 48 * 1277 + 8];
-        let len = opus_rs::packet::write(toc_byte, &frames, &mut buf, self_delimited, false).unwrap();
+        let len = opus1::packet::write(toc_byte, &frames, &mut buf, self_delimited, false).unwrap();
         let len = if padding > 0 {
-            opus_rs::packet::write(toc_byte, &frames, &mut buf[..len + padding], self_delimited, true).unwrap()
+            opus1::packet::write(toc_byte, &frames, &mut buf[..len + padding], self_delimited, true).unwrap()
         } else {
             len
         };

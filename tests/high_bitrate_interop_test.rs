@@ -9,7 +9,7 @@
 //! The issue reports the stream decodes to garbage in libopus above ~160 kbps
 //! even though the encoder output looks fine in self-loopback.
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::process::Command;
 
 const FRAME_SIZE: usize = 960; // 20 ms @ 48 kHz

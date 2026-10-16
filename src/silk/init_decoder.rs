@@ -17,9 +17,8 @@ pub fn silk_decoder_set_fs(dec: &mut SilkDecoderState, fs_khz: i32, fs_api_hz: i
 
     // libopus decoder_set_fs.c: the caller sets `nb_subfr` first (4 for a
     // 20 ms SILK frame, 2 for a 10 ms one) and the frame length and the
-    // pitch contour table below follow from it. Forcing 4 here, as this
-    // used to, read the pitch contour of every 10 ms frame with the 20 ms
-    // table. A state whose `nb_subfr` was never set counts as 20 ms.
+    // pitch contour table below follow from it, so a 10 ms frame gets the
+    // 10 ms table. A state whose `nb_subfr` was never set counts as 20 ms.
     if dec.nb_subfr != (MAX_NB_SUBFR / 2) as i32 {
         dec.nb_subfr = MAX_NB_SUBFR as i32;
     }
@@ -51,14 +50,14 @@ pub fn silk_decoder_set_fs(dec: &mut SilkDecoderState, fs_khz: i32, fs_api_hz: i
 
         if dec.fs_khz != fs_khz {
             // Bandwidth switch (libopus decoder_set_fs.c): reset the state that
-            // is tied to the old rate. Without this, a stale `lag_prev` (e.g.
-            // 288 at 16 kHz) survives a switch to 8 kHz and drives
-            // out-of-bounds indexing in silk_decode_core (issue #27 deep scan).
+            // is tied to the old rate. A `lag_prev` from the old rate (e.g.
+            // 288 at 16 kHz) would index out of bounds in silk_decode_core
+            // at 8 kHz.
             dec.ltp_mem_length = (LTP_MEM_LENGTH_MS as i32) * fs_khz;
             // NB and MB share the order-10 NLSF codebook; only WB codes 16
             // coefficients. Set both from one branch, as libopus does: the
             // decoder reads `ps_nlsf_cb.order` NLSF indices and filters with
-            // `lpc_order` coefficients (issue #53: 12 kHz had 16 against 10).
+            // `lpc_order` coefficients, so the two must match.
             let (lpc_order, nlsf_cb) = if fs_khz == 8 || fs_khz == 12 {
                 (MIN_LPC_ORDER, &SILK_NLSF_CB_NB_MB)
             } else {

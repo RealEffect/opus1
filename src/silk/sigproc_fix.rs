@@ -1,6 +1,17 @@
 use crate::silk::define::*;
 use crate::silk::macros::*;
 
+/// The second operand that makes the NEON multiply `vqdmulhq_s32` compute
+/// `silk_smulwb`: `vqdmulhq_s32(a, smulwb_operand(b))` is `(a * b) >> 16`.
+///
+/// The instruction returns the upper half of `2 * a * (b << 15)`, which is
+/// exactly `(a * b) >> 16`. The doubled product saturates only when both
+/// factors are `i32::MIN`, and `b << 15` never is.
+#[inline(always)]
+pub(crate) const fn smulwb_operand(b: i16) -> i32 {
+    (b as i32) << 15
+}
+
 #[inline]
 pub fn silk_k2a_q16(a_q24: &mut [i32], rc_q16: &[i32], order: usize) {
     for k in 0..order {
@@ -80,6 +91,9 @@ pub fn silk_schur64(rc_q16: &mut [i32], c: &[i32], order: usize) -> i32 {
     den.max(1)
 }
 
+/// Second-order filter on one channel (libopus `silk_biquad_alt_stride1`),
+/// in place on the first `len` samples of `input_output`. `s` holds the two
+/// state values.
 pub fn silk_biquad_alt_stride1(
     input_output: &mut [i16],
     b_q28: &[i32],
@@ -87,6 +101,10 @@ pub fn silk_biquad_alt_stride1(
     s: &mut [i32],
     len: usize,
 ) {
+    // Fixed sizes, so that the loop has no bounds checks.
+    let b_q28: &[i32; 3] = b_q28[..3].try_into().unwrap();
+    let a_q28: &[i32; 2] = a_q28[..2].try_into().unwrap();
+    let s: &mut [i32; 2] = (&mut s[..2]).try_into().unwrap();
     let a0_l_q28 = (-a_q28[0]) & 0x00003FFF;
     let a0_u_q28 = -a_q28[0] >> 14;
     let a1_l_q28 = (-a_q28[1]) & 0x00003FFF;
@@ -448,12 +466,6 @@ pub fn silk_sum_sqr_shift(energy: &mut i32, shift: &mut i32, x: &[i16], len: usi
 
     *shift = shft;
     *energy = nrg;
-}
-
-/// The same as [`silk_sum_sqr_shift`]. It dates from the time when that
-/// function did not give the libopus result on every target.
-pub(crate) fn silk_sum_sqr_shift_exact(energy: &mut i32, shift: &mut i32, x: &[i16], len: usize) {
-    silk_sum_sqr_shift(energy, shift, x, len);
 }
 
 /// One pass of libopus's `silk_sum_sqr_shift`: squares summed in pairs, each
@@ -1331,23 +1343,6 @@ pub fn silk_scale_copy_vector16(
     }
 }
 
-#[inline(always)]
-pub fn silk_pshr32(a: i32, shift: i32) -> i32 {
-    if shift <= 0 {
-        return a;
-    }
-    let round = 1i32 << (shift - 1);
-    (a + round) >> shift
-}
-
-#[inline(always)]
-pub fn silk_shr32(a: i32, shift: i32) -> i32 {
-    if shift <= 0 {
-        return a;
-    }
-    a >> shift
-}
-
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
@@ -2155,10 +2150,6 @@ mod tests {
                 let (mut energy, mut shift) = (-1, -1);
                 silk_sum_sqr_shift(&mut energy, &mut shift, &x, len);
                 assert_eq!((energy, shift), (nrg, shft), "len={len} kind={kind}");
-
-                let (mut energy, mut shift) = (-1, -1);
-                silk_sum_sqr_shift_exact(&mut energy, &mut shift, &x, len);
-                assert_eq!((energy, shift), (nrg, shft), "exact: len={len} kind={kind}");
             }
         }
     }

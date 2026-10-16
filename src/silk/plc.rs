@@ -7,9 +7,7 @@ use crate::silk::decoder_structs::{SilkDecoderControl, SilkDecoderState};
 use crate::silk::define::*;
 use crate::silk::lpc_analysis::silk_lpc_inverse_pred_gain;
 use crate::silk::macros::*;
-use crate::silk::sigproc_fix::{
-    silk_bwexpander, silk_lpc_analysis_filter, silk_sum_sqr_shift_exact,
-};
+use crate::silk::sigproc_fix::{silk_bwexpander, silk_lpc_analysis_filter, silk_sum_sqr_shift};
 
 /// Reset PLC state (silk_PLC_Reset).
 pub fn silk_plc_reset(ps_dec: &mut SilkDecoderState) {
@@ -141,10 +139,9 @@ fn silk_plc_energy(
         }
     }
     // The energies must be the ones libopus computes: which of the two
-    // subframes supplies the noise depends on comparing them. The SIMD
-    // version of this sum rounds differently.
-    silk_sum_sqr_shift_exact(energy1, shift1, &exc_buf[..subfr], subfr);
-    silk_sum_sqr_shift_exact(energy2, shift2, &exc_buf[subfr..], subfr);
+    // subframes supplies the noise depends on comparing them.
+    silk_sum_sqr_shift(energy1, shift1, &exc_buf[..subfr], subfr);
+    silk_sum_sqr_shift(energy2, shift2, &exc_buf[subfr..], subfr);
 }
 
 /// Generate concealment audio for a lost frame (silk_PLC_conceal).
@@ -243,7 +240,7 @@ fn silk_plc_conceal(
     // Rewhiten LTP state.
     // Clamp to a valid range: for well-formed state `lag` is bounded by the
     // decoder geometry so the expression is positive, but a corrupted PLC
-    // state must not produce a negative index (issue #27 deep-scan).
+    // state must not produce a negative index.
     let idx =
         (ltp_mem_length as i32 - lag - ps_dec.lpc_order - LTP_ORDER as i32 / 2).max(0) as usize;
     // silk_LPC_analysis_filter(&sLTP[idx], &psDec->outBuf[idx], A_Q12, ltp_mem_length - idx, LPC_order)
@@ -348,12 +345,7 @@ pub fn silk_plc_glue_frames(ps_dec: &mut SilkDecoderState, frame: &mut [i16], le
     // the fade-in follows from their ratio.
     if ps_dec.loss_cnt != 0 {
         let mut energy_shift = 0;
-        silk_sum_sqr_shift_exact(
-            &mut ps_dec.s_plc.conc_energy,
-            &mut energy_shift,
-            frame,
-            length,
-        );
+        silk_sum_sqr_shift(&mut ps_dec.s_plc.conc_energy, &mut energy_shift, frame, length);
         ps_dec.s_plc.conc_energy_shift = energy_shift;
         ps_dec.s_plc.last_frame_lost = 1;
     } else {
@@ -361,7 +353,7 @@ pub fn silk_plc_glue_frames(ps_dec: &mut SilkDecoderState, frame: &mut [i16], le
             // Calculate residual in decoded signal if last frame was lost.
             let mut energy = 0;
             let mut energy_shift = 0;
-            silk_sum_sqr_shift_exact(&mut energy, &mut energy_shift, frame, length);
+            silk_sum_sqr_shift(&mut energy, &mut energy_shift, frame, length);
 
             // Normalize energies.
             if energy_shift > ps_dec.s_plc.conc_energy_shift {

@@ -6,7 +6,7 @@
 //! back. `SilkDecoder` does the same with `FLAG_DECODE_LBRR`.
 //!
 //! Every test decodes one stream from the C encoder twice, with C libopus
-//! and with opus-rs, under the same loss pattern, and requires identical
+//! and with opus1, under the same loss pattern, and requires identical
 //! 16-bit output for every packet: received, concealed and recovered.
 
 mod silkdec_common;

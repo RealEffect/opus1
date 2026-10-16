@@ -4,7 +4,7 @@
 //!
 //! The first byte of a packet (the table-of-contents or TOC byte) names the
 //! mode, the audio bandwidth, the frame duration and mono or stereo. Where
-//! this file says that the TOC bytes are equal, opus-rs made the same
+//! this file says that the TOC bytes are equal, opus1 made the same
 //! decisions as libopus for every packet.
 
 mod core_common;
@@ -12,7 +12,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{aligned_snr, speech_fullband, to_stereo, toc_summary};
-use opus_rs::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder};
 
 const MODES: [(&str, i32, ForcedMode); 3] = [
     ("SILK", MODE_SILK, ForcedMode::SilkOnly),
@@ -102,7 +102,7 @@ fn is_mode(toc: u8, mode: i32) -> bool {
 /// - every packet has the TOC byte libopus writes under the same forcing;
 /// - that is the forced mode wherever the format has it (Hybrid needs
 ///   super-wideband, so 24 or 48 kHz input; below that libopus codes
-///   SILK-only, and so does opus-rs);
+///   SILK-only, and so does opus1);
 /// - the C decoder decodes the packets, to a quality within 2 dB of what
 ///   it gets from the C encoder's packets.
 fn forced_modes_at(rate: usize) {
@@ -132,15 +132,15 @@ fn forced_modes_at(rate: usize) {
             let packets = encode_all(&mut enc, &pcm, frame);
             let what = format!("{rate} Hz, {channels} ch, forced {name}");
 
-            assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus-rs [{}]", toc_summary(&c_packets), toc_summary(&packets));
+            assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus1 [{}]", toc_summary(&c_packets), toc_summary(&packets));
             let reachable = c_mode != MODE_HYBRID || rate >= 24000;
             assert_eq!(packets.iter().all(|p| is_mode(p[0], c_mode)), reachable, "{what}: [{}]", toc_summary(&packets));
 
             let c_snr = channel_snrs(&pcm, &c_decode_all(&c_packets, rate, channels, frame), rate, channels);
             let snr = channel_snrs(&pcm, &c_decode_all(&packets, rate, channels, frame), rate, channels);
-            println!("{what} [{}]: SNR libopus {c_snr:.1?} dB, opus-rs {snr:.1?} dB", toc_summary(&packets));
+            println!("{what} [{}]: SNR libopus {c_snr:.1?} dB, opus1 {snr:.1?} dB", toc_summary(&packets));
             for c in 0..channels {
-                assert!(snr[c] > c_snr[c] - 2.0, "{what}, channel {c}: opus-rs {:.1} dB, libopus {:.1} dB", snr[c], c_snr[c]);
+                assert!(snr[c] > c_snr[c] - 2.0, "{what}, channel {c}: opus1 {:.1} dB, libopus {:.1} dB", snr[c], c_snr[c]);
             }
         }
     }
@@ -188,7 +188,7 @@ fn forced_mode_yields_to_the_frame_size_and_the_application() {
                 let c_packets = c_enc.encode_all(&pcm, frame);
                 let packets = encode_all(&mut enc, &pcm, frame);
                 let what = format!("forced {name}, {} ms, {app_name}", frame_2_5ms as f32 * 2.5);
-                assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus-rs [{}]", toc_summary(&c_packets), toc_summary(&packets));
+                assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus1 [{}]", toc_summary(&c_packets), toc_summary(&packets));
                 c_decode_all(&packets, rate, 1, frame);
             }
         }
@@ -236,15 +236,15 @@ fn forced_silk_bandwidths_from_24_and_48_khz_input() {
                     let packets = encode_all(&mut enc, &pcm, frame);
                     let what = format!("{rate} Hz, {channels} ch, SILK, {} {bw_name}", if use_max { "maximum" } else { "bandwidth" });
 
-                    assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus-rs [{}]", toc_summary(&c_packets), toc_summary(&packets));
+                    assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus1 [{}]", toc_summary(&c_packets), toc_summary(&packets));
                     let expected = format!("SILK-{bw_name}");
                     assert!(toc_summary(&packets).starts_with(&expected), "{what}: [{}]", toc_summary(&packets));
 
                     let c_snr = channel_snrs(&pcm, &c_decode_all(&c_packets, rate, channels, frame), rate, channels);
                     let snr = channel_snrs(&pcm, &c_decode_all(&packets, rate, channels, frame), rate, channels);
-                    println!("{what}: SNR libopus {c_snr:.1?} dB, opus-rs {snr:.1?} dB");
+                    println!("{what}: SNR libopus {c_snr:.1?} dB, opus1 {snr:.1?} dB");
                     for c in 0..channels {
-                        assert!(snr[c] > c_snr[c] - 2.0, "{what}, channel {c}: opus-rs {:.1} dB, libopus {:.1} dB", snr[c], c_snr[c]);
+                        assert!(snr[c] > c_snr[c] - 2.0, "{what}, channel {c}: opus1 {:.1} dB, libopus {:.1} dB", snr[c], c_snr[c]);
                     }
                 }
             }
@@ -260,7 +260,7 @@ fn forced_silk_bandwidths_from_24_and_48_khz_input() {
 /// SILK, and a forced bandwidth is not limited by the maximum.
 ///
 /// Both encoders run at complexity 5. From complexity 7 libopus also
-/// listens to the signal (speech or music, and how wide), which opus-rs
+/// listens to the signal (speech or music, and how wide), which opus1
 /// does not do.
 ///
 /// Returns the number of cases compared.
@@ -297,7 +297,7 @@ fn bandwidth_settings_at(rate: usize, with_automatic_mode: bool) -> usize {
                             assert_eq!(
                                 toc_mismatches(&c_packets, &packets),
                                 0,
-                                "{rate} Hz, {channels} ch, {app_name}, {mode_name} mode, {bitrate} b/s per channel, {} {bw_name}: libopus [{}], opus-rs [{}]",
+                                "{rate} Hz, {channels} ch, {app_name}, {mode_name} mode, {bitrate} b/s per channel, {} {bw_name}: libopus [{}], opus1 [{}]",
                                 if use_max { "maximum" } else { "bandwidth" },
                                 toc_summary(&c_packets),
                                 toc_summary(&packets)
@@ -336,7 +336,7 @@ fn bandwidth_settings_at_48_khz() {
 /// The automatic mode choice from 8, 12 and 16 kHz input. libopus takes
 /// CELT-only when the bitrate is high for speech (`opus_encoder.c:1513`,
 /// `st->mode = (equiv_rate >= threshold) ? MODE_CELT_ONLY : MODE_SILK_ONLY`),
-/// at any input rate, and so does opus-rs. The forced modes are not
+/// at any input rate, and so does opus1. The forced modes are not
 /// affected.
 #[test]
 fn automatic_mode_below_24_khz_input_follows_libopus() {
@@ -355,7 +355,7 @@ fn automatic_mode_below_24_khz_input_follows_libopus() {
                     let c_packets = c_enc.encode_all(&pcm, frame);
                     let packets = encode_all(&mut enc, &pcm, frame);
                     if toc_mismatches(&c_packets, &packets) != 0 {
-                        failures.push(format!("{rate} Hz, {channels} ch, {app_name}, {bitrate} b/s per channel: libopus [{}], opus-rs [{}]", toc_summary(&c_packets), toc_summary(&packets)));
+                        failures.push(format!("{rate} Hz, {channels} ch, {app_name}, {bitrate} b/s per channel: libopus [{}], opus1 [{}]", toc_summary(&c_packets), toc_summary(&packets)));
                     }
                 }
             }
@@ -379,7 +379,7 @@ fn automatic_mode_below_24_khz_input_follows_libopus() {
 ///
 /// The packets have libopus's first byte, but for the packet at the change:
 /// libopus keeps the old mode for one packet more and appends a 5 ms CELT
-/// frame, which opus-rs does not write yet.
+/// frame, which opus1 does not write yet.
 #[test]
 fn automatic_mode_follows_the_stereo_width() {
     let mut failures = Vec::new();
@@ -402,7 +402,7 @@ fn automatic_mode_follows_the_stereo_width() {
             let first_celt = |p: &[Vec<u8>]| p.iter().position(|x| is_mode(x[0], MODE_CELT));
             let mismatches = toc_mismatches(&c_packets, &packets);
             let what = format!(
-                "{rate} Hz, {name}: {mismatches} first bytes differ; CELT-only from packet {:?} (libopus {:?})\n  libopus [{}]\n  opus-rs [{}]",
+                "{rate} Hz, {name}: {mismatches} first bytes differ; CELT-only from packet {:?} (libopus {:?})\n  libopus [{}]\n  opus1 [{}]",
                 first_celt(&packets),
                 first_celt(&c_packets),
                 toc_summary(&c_packets),
@@ -463,7 +463,7 @@ fn a_small_output_buffer_lowers_the_bitrate_the_decisions_go_by() {
                             (lowest, highest) = (lowest.min(ratio), highest.max(ratio));
                             if toc_mismatches(&c_packets, &packets) != 0 || !(0.9..=1.1).contains(&ratio) {
                                 failures.push(format!(
-                                    "{rate} Hz, {channels} ch, {app_name}, {bitrate} b/s, {frame_ms} ms, {max_bytes} bytes: libopus [{}] {:.1} bytes, opus-rs [{}] {:.1} bytes",
+                                    "{rate} Hz, {channels} ch, {app_name}, {bitrate} b/s, {frame_ms} ms, {max_bytes} bytes: libopus [{}] {:.1} bytes, opus1 [{}] {:.1} bytes",
                                     toc_summary(&c_packets), mean(&c_packets), toc_summary(&packets), mean(&packets)
                                 ));
                             }
@@ -482,7 +482,7 @@ fn a_small_output_buffer_lowers_the_bitrate_the_decisions_go_by() {
 
 /// The bandwidth is changed while the stream runs. A running SILK encoder
 /// does not jump: it moves one step (16, 12, 8 kHz) at a time, and only in
-/// a pause or after 5 seconds. opus-rs follows the requests the way libopus
+/// a pause or after 5 seconds. opus1 follows the requests the way libopus
 /// does. The step can come a few packets earlier or later, because it
 /// hangs on SILK's speech activity measure, so a small share of the packets
 /// may differ.
@@ -512,7 +512,7 @@ fn bandwidth_changes_in_a_running_stream_follow_libopus() {
             packets.push(buf[..n].to_vec());
         }
         let differ = toc_mismatches(&c_packets, &packets);
-        println!("{rate} Hz, {channels} ch: {differ} of {} TOC bytes differ\n  libopus [{}]\n  opus-rs [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
+        println!("{rate} Hz, {channels} ch: {differ} of {} TOC bytes differ\n  libopus [{}]\n  opus1 [{}]", packets.len(), toc_summary(&c_packets), toc_summary(&packets));
         assert!(differ * 100 <= 8 * packets.len(), "{rate} Hz, {channels} ch: {differ} of {} TOC bytes differ", packets.len());
         // Both streams use the same bandwidths, and more than one.
         let kinds = |p: &[Vec<u8>]| p.iter().map(|x| x[0]).collect::<std::collections::BTreeSet<u8>>();
@@ -570,7 +570,7 @@ fn lfe_is_celt_only_narrowband() {
                     let c_packets = c_enc.encode_all(&pcm, frame);
                     let packets = encode_all(&mut enc, &pcm, frame);
                     let what = format!("{rate} Hz, {app_name}, forced {mode_name}, {} ms", frame_2_5ms as f32 * 2.5);
-                    assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus-rs [{}]", toc_summary(&c_packets), toc_summary(&packets));
+                    assert_eq!(toc_mismatches(&c_packets, &packets), 0, "{what}: libopus [{}], opus1 [{}]", toc_summary(&c_packets), toc_summary(&packets));
                     // CELT-only narrowband mono is configuration 16 to 19.
                     assert!(packets.iter().all(|p| (16..20).contains(&(p[0] >> 3)) && p[0] & 4 == 0), "{what}: [{}]", toc_summary(&packets));
                     let decoded = c_decode_all(&packets, rate, 1, frame);
@@ -624,9 +624,9 @@ fn energy_mask_is_stored() {
 type RangeStream = (usize, usize, ForcedMode, Bandwidth, i32, usize, bool, bool);
 
 /// Encode a stream and decode every packet with the C decoder and with the
-/// opus-rs decoder. Returns the number of packets, and for how many of them
+/// opus1 decoder. Returns the number of packets, and for how many of them
 /// the encoder's final range differs from the C decoder's and from the
-/// opus-rs decoder's.
+/// opus1 decoder's.
 fn final_range_run(stream: RangeStream) -> (usize, usize, usize) {
     let (rate, channels, mode, bandwidth, bitrate, frame_2_5ms, cbr, fec) = stream;
     let pcm = speech(rate, channels, 1.5);
@@ -657,7 +657,7 @@ fn final_range_run(stream: RangeStream) -> (usize, usize, usize) {
     (packets, differs_from_c, differs_from_rs)
 }
 
-/// The encoder's final range equals what the C decoder and the opus-rs
+/// The encoder's final range equals what the C decoder and the opus1
 /// decoder report after decoding the packet, for every packet: the decoders
 /// read exactly the symbols the encoder wrote. SILK-only, Hybrid and
 /// CELT-only; 2.5 to 60 ms, which includes packets of several frames; VBR
@@ -681,7 +681,7 @@ fn final_range_equals_the_decoders() {
     for stream in streams {
         let (packets, differs_from_c, differs_from_rs) = final_range_run(stream);
         assert!(packets >= 25, "{stream:?}");
-        assert_eq!((differs_from_c, differs_from_rs), (0, 0), "{stream:?}: the final range differs from the C decoder's on {differs_from_c} and from the opus-rs decoder's on {differs_from_rs} of {packets} packets");
+        assert_eq!((differs_from_c, differs_from_rs), (0, 0), "{stream:?}: the final range differs from the C decoder's on {differs_from_c} and from the opus1 decoder's on {differs_from_rs} of {packets} packets");
     }
 }
 
@@ -692,7 +692,7 @@ fn final_range_equals_the_decoders() {
 /// The cause was in the CELT encoder (src/celt.rs). It limited the first
 /// intensity-stereo band to `0..end`. libopus limits it to the coded bands,
 /// `IMIN(end, IMAX(start, st->intensity))` (celt_encoder.c line 2408), and
-/// so does opus-rs now. A Hybrid frame starts at band 17, so a band below
+/// so does opus1 now. A Hybrid frame starts at band 17, so a band below
 /// 17 was written as a negative offset and the rest of the frame decoded to
 /// noise (see the next test).
 #[test]
@@ -705,7 +705,7 @@ fn final_range_equals_the_decoders_for_stereo_hybrid() {
     ];
     for stream in streams {
         let (packets, differs_from_c, differs_from_rs) = final_range_run(stream);
-        assert_eq!((differs_from_c, differs_from_rs), (0, 0), "{stream:?}: the final range differs from the C decoder's on {differs_from_c} and from the opus-rs decoder's on {differs_from_rs} of {packets} packets");
+        assert_eq!((differs_from_c, differs_from_rs), (0, 0), "{stream:?}: the final range differs from the C decoder's on {differs_from_c} and from the opus1 decoder's on {differs_from_rs} of {packets} packets");
     }
 }
 
@@ -725,7 +725,7 @@ fn tone_power(x: &[f32], rate: usize, freq: f64) -> f64 {
 /// the left channel. With the intensity band limited as in libopus it is
 /// within 2 dB of libopus (measured: both keep the level of the input).
 /// Only the left channel is measured: the right one also depends on where
-/// intensity stereo starts, which opus-rs still chooses differently.
+/// intensity stereo starts, which opus1 still chooses differently.
 #[test]
 fn stereo_hybrid_keeps_the_band_above_8_khz() {
     let rate = 48000;
@@ -752,8 +752,8 @@ fn stereo_hybrid_keeps_the_band_above_8_khz() {
     };
     let c_level = level(&c_enc.encode_all(&pcm, frame));
     let rs_level = level(&encode_all(&mut enc, &pcm, frame));
-    println!("9 kHz tone, left channel, against the input: libopus {c_level:+.1} dB, opus-rs {rs_level:+.1} dB");
-    assert!(rs_level > c_level - 2.0, "9 kHz tone: libopus {c_level:+.1} dB, opus-rs {rs_level:+.1} dB");
+    println!("9 kHz tone, left channel, against the input: libopus {c_level:+.1} dB, opus1 {rs_level:+.1} dB");
+    assert!(rs_level > c_level - 2.0, "9 kHz tone: libopus {c_level:+.1} dB, opus1 {rs_level:+.1} dB");
 }
 
 /// A packet too small to code anything carries no range-coded data: its

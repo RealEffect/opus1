@@ -3,8 +3,8 @@
 //! loop for the others. These tests compare both with the function as it was
 //! before: one loop that checks every sample.
 
-use opus_rs::silk::ltp_analysis::silk_ltp_analysis_filter_fix;
-use opus_rs::silk::macros::{silk_sat16, silk_smlabb, silk_smulbb, silk_smulwb};
+use opus1::silk::ltp_analysis::silk_ltp_analysis_filter_fix;
+use opus1::silk::macros::{silk_sat16, silk_smlabb, silk_smulbb, silk_smulwb};
 
 const LTP_ORDER: usize = 5;
 

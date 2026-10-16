@@ -1,5 +1,6 @@
 use crate::silk::define::*;
 use crate::silk::gain_quant::*;
+use crate::silk::log2lin::silk_log2lin;
 use crate::silk::lpc_analysis::*;
 use crate::silk::ltp_analysis::*;
 use crate::silk::macros::*;

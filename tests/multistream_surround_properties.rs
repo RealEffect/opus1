@@ -22,7 +22,7 @@
 mod ms_support;
 
 use ms_support::{noise, silence};
-use opus_rs::multistream::surround::SurroundProbe;
+use opus1::multistream::surround::SurroundProbe;
 
 const NB_BANDS: usize = 21;
 const RATES: [i32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
@@ -109,7 +109,7 @@ fn the_pre_emphasis_memory_alone_changes_the_next_frame() {
     // filter memory alone: with it the first sample is a small step, and
     // after a reset the frame is the silence of a new analysis.
     let (channels, rate, frame_size) = (6usize, 48_000, 960usize);
-    let preemph = opus_rs::modes::default_mode().preemph[0];
+    let preemph = opus1::modes::default_mode().preemph[0];
     let mut first = silence(channels, frame_size);
     // From sample 838 on, every sample is what the filter predicts from the
     // sample before it. The filter output is then exactly 0 from sample 839

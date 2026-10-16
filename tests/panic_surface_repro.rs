@@ -8,10 +8,10 @@
 //!
 //! P1: guards for direct calls into the low-level public components.
 
-use opus_rs::silk::SilkResampler;
-use opus_rs::silk::dec_api::SilkDecoder;
-use opus_rs::silk::init_decoder::silk_decoder_set_fs;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus1::silk::SilkResampler;
+use opus1::silk::dec_api::SilkDecoder;
+use opus1::silk::init_decoder::silk_decoder_set_fs;
+use opus1::{Application, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 // ---------------------------------------------------------------------------
@@ -74,9 +74,9 @@ fn p0_cross_bandwidth_plc_lag_no_panic() {
 /// switch (libopus decoder_set_fs.c) and leave it untouched otherwise.
 #[test]
 fn p0_set_fs_resets_state_on_bandwidth_change() {
-    use opus_rs::silk::define::TYPE_NO_VOICE_ACTIVITY;
+    use opus1::silk::define::TYPE_NO_VOICE_ACTIVITY;
 
-    let mut dec = opus_rs::silk::dec_api::SilkDecoder::new();
+    let mut dec = opus1::silk::dec_api::SilkDecoder::new();
     assert_eq!(dec.init(16000, 1), 0);
 
     // Simulate voiced WB state with a maximal lag.
@@ -110,8 +110,8 @@ fn p0_set_fs_resets_state_on_bandwidth_change() {
 /// `silk_decode_core`. This test crashes on the pre-fix code.
 #[test]
 fn p0_silk_layer_cross_bandwidth_recovery() {
-    use opus_rs::range_coder::RangeCoder;
-    use opus_rs::silk::decode_frame::{FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+    use opus1::range_coder::RangeCoder;
+    use opus1::silk::decode_frame::{FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
 
     let wb_frame = 320usize;
     let nb_frame = 160usize;
@@ -189,7 +189,7 @@ fn p1_hp_cutoff_invalid_fs_no_panic() {
     let input = vec![0.5f32; 160];
     let mut output = vec![0i16; 160];
     let mut hp_mem = [0i32; 2];
-    opus_rs::hp_cutoff::hp_cutoff(
+    opus1::hp_cutoff::hp_cutoff(
         &input,
         60,
         &mut output,
@@ -205,7 +205,7 @@ fn p1_hp_cutoff_invalid_fs_no_panic() {
 #[test]
 fn p1_exp_rotation_zero_stride_no_panic() {
     let mut x = vec![0.5f32; 64];
-    opus_rs::pvq::exp_rotation(&mut x, 64, -1, 0, 2, 1);
+    opus1::pvq::exp_rotation(&mut x, 64, -1, 0, 2, 1);
 }
 
 /// CELT constructors reject invalid channel counts with a clear message
@@ -213,13 +213,13 @@ fn p1_exp_rotation_zero_stride_no_panic() {
 #[test]
 #[should_panic(expected = "channels must be 1 or 2")]
 fn p1_celt_encoder_new_rejects_channels() {
-    let _ = opus_rs::celt::CeltEncoder::new(opus_rs::modes::default_mode(), 3);
+    let _ = opus1::celt::CeltEncoder::new(opus1::modes::default_mode(), 3);
 }
 
 #[test]
 #[should_panic(expected = "channels must be 1 or 2")]
 fn p1_celt_decoder_new_rejects_channels() {
-    let _ = opus_rs::celt::CeltDecoder::new(opus_rs::modes::default_mode(), 3, 48000);
+    let _ = opus1::celt::CeltDecoder::new(opus1::modes::default_mode(), 3, 48000);
 }
 
 /// CELT decode with a frame size that does not match the MDCT geometry is
@@ -227,14 +227,16 @@ fn p1_celt_decoder_new_rejects_channels() {
 /// panicking deep inside the transform.
 #[test]
 fn p1_celt_decode_invalid_frame_size_rejected() {
-    let mut dec = opus_rs::celt::CeltDecoder::new(opus_rs::modes::default_mode(), 1, 48000);
+    use opus1::celt::PcmLayout::Planar;
+    use opus1::range_coder::RangeCoder;
+    let mut dec = opus1::celt::CeltDecoder::new(opus1::modes::default_mode(), 1, 48000);
     let pkt = [0xABu8; 64];
     // 100 samples @ 48 kHz matches no `120 << lm` geometry.
     let mut pcm = vec![0.0f32; 100];
-    assert_eq!(dec.decode(&pkt, 100, &mut pcm), 0);
+    assert_eq!(dec.decode(&mut RangeCoder::new_decoder(&pkt), 64 * 8, 100, &mut pcm, Planar), 0);
     // Undersized output buffer: rejected before decoding.
     let mut tiny = vec![0.0f32; 8];
-    assert_eq!(dec.decode(&pkt, 960, &mut tiny), 0);
+    assert_eq!(dec.decode(&mut RangeCoder::new_decoder(&pkt), 64 * 8, 960, &mut tiny, Planar), 0);
 }
 
 /// Range coder encode/decode reject ft == 0 with an assert instead of an
@@ -242,7 +244,7 @@ fn p1_celt_decode_invalid_frame_size_rejected() {
 #[test]
 #[should_panic(expected = "encode: ft must be > 0")]
 fn p1_range_coder_encode_ft_zero_panics() {
-    use opus_rs::range_coder::RangeCoder;
+    use opus1::range_coder::RangeCoder;
     let mut rc = RangeCoder::new_encoder(16);
     rc.encode(0, 0, 0);
 }
@@ -255,7 +257,7 @@ fn p1_pitch_xcorr_short_y_no_panic() {
     let x = vec![0.25f32; 40];
     let y = vec![0.5f32; 50]; // contract would need len + max_pitch - 1 = 99
     let mut xcorr = vec![0.0f32; 60];
-    opus_rs::pitch::pitch_xcorr(&x, &y, &mut xcorr, 40, 60);
+    opus1::pitch::pitch_xcorr(&x, &y, &mut xcorr, 40, 60);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-//! The controls of the opus-rs multistream encoder, against C libopus.
+//! The controls of the opus1 multistream encoder, against C libopus.
 //!
 //! - Settings changed in a running stream: every packet still decodes in C
 //!   with the encoder's final range, and the change shows in the packets.
@@ -16,8 +16,8 @@ use audiopus_sys as sys;
 use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus_rs::multistream::encoder::{Bitrate, MultistreamEncoder};
-use opus_rs::{Application, ForcedMode};
+use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::{Application, ForcedMode};
 
 /// Whether a stream of the packet is stereo and in Hybrid mode. The final
 /// range of such a packet is not compared: see the note on the fault in
@@ -162,8 +162,8 @@ fn settings_change_in_a_running_surround_stream() {
 
         // In surround mode the encoder sets the bandwidth of every stream
         // on every frame. A bandwidth the caller asks for does not hold.
-        enc.set_bandwidth(opus_rs::Bandwidth::Narrowband);
-        assert_eq!(enc.bandwidth(), opus_rs::Bandwidth::Narrowband);
+        enc.set_bandwidth(opus1::Bandwidth::Narrowband);
+        assert_eq!(enc.bandwidth(), opus1::Bandwidth::Narrowband);
         let streams = enc.layout().streams();
         for p in encode_checked(&mut enc, &mut dec, &pcm, &mut next, 5, 960, name) {
             let parts = split_streams(&p, streams).unwrap();
@@ -176,7 +176,7 @@ fn settings_change_in_a_running_surround_stream() {
                 assert_eq!(toc(part.toc).bandwidth, want, "{name}: stream {s}");
             }
         }
-        enc.set_bandwidth(opus_rs::Bandwidth::Auto);
+        enc.set_bandwidth(opus1::Bandwidth::Auto);
 
         // A reset in the middle of the stream.
         enc.reset_state();
@@ -200,9 +200,9 @@ fn bandwidth_settings_reach_the_streams_of_a_plain_layout() {
     let pcm = voiced(fs, 3, 2 * fs as usize);
     let mut next = 0;
 
-    // Each step: the opus-rs setting, the same setting on the C encoder,
+    // Each step: the opus1 setting, the same setting on the C encoder,
     // and the bandwidth every stream must signal afterwards.
-    use opus_rs::Bandwidth as Bw;
+    use opus1::Bandwidth as Bw;
     let steps: [(&str, Option<Bw>, Option<Bw>, TocBandwidth); 6] = [
         ("default", None, None, TocBandwidth::Fb),
         ("wideband", Some(Bw::Wideband), None, TocBandwidth::Wb),
@@ -323,8 +323,8 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
         );
         assert_eq!(rust.lookahead() as i32, c.lookahead());
         assert_eq!(rust.bitrate_setting(), Bitrate::Auto);
-        assert_eq!(rust.bandwidth(), opus_rs::Bandwidth::Auto);
-        assert_eq!(rust.max_bandwidth(), opus_rs::Bandwidth::Fullband);
+        assert_eq!(rust.bandwidth(), opus1::Bandwidth::Auto);
+        assert_eq!(rust.max_bandwidth(), opus1::Bandwidth::Fullband);
         assert_eq!(rust.application(), Application::Audio);
 
         rust.set_complexity(3).unwrap();
@@ -400,7 +400,7 @@ fn out_of_range_settings_are_rejected_like_libopus() {
         );
     }
     // A bitrate must be positive. The automatic and the maximum bitrate
-    // have their own values in opus-rs, so the numbers libopus uses for
+    // have their own values in opus1, so the numbers libopus uses for
     // them, -1000 and -1, are not bitrates here.
     for bitrate in [
         i32::MIN,
@@ -465,7 +465,7 @@ fn surround_constructor_accepts_what_libopus_accepts() {
                 assert_eq!(
                     rust.is_ok(),
                     c.is_ok(),
-                    "{fs} Hz, {channels} channels, family {family}: opus-rs {:?}, C {:?}",
+                    "{fs} Hz, {channels} channels, family {family}: opus1 {:?}, C {:?}",
                     rust.as_ref().err(),
                     c.as_ref().err()
                 );
@@ -516,7 +516,7 @@ fn generic_constructor_accepts_what_libopus_accepts() {
             rust.is_ok(),
             c.is_ok(),
             "{fs} Hz, {channels} channels, {streams} streams, {coupled} coupled, {mapping:?}: \
-             opus-rs {:?}, C {:?}",
+             opus1 {:?}, C {:?}",
             rust.as_ref().err(),
             c.as_ref().err()
         );
@@ -582,7 +582,7 @@ fn frame_sizes_and_buffers_are_checked_like_libopus() {
         for frame_size in sizes {
             let c_ok = c.encode_float(&pcm, frame_size, out.len()).is_ok();
             let rust_ok = rust.encode(&pcm, frame_size, &mut out).is_ok();
-            // 80, 100 and 120 ms: libopus takes them, opus-rs does not
+            // 80, 100 and 120 ms: libopus takes them, opus1 does not
             // (difference D3 of the design).
             let long = [32, 40, 48].map(|k| k * unit).contains(&frame_size);
             assert_eq!(rust_ok, c_ok && !long, "{fs} Hz: frame size {frame_size}");
@@ -640,12 +640,12 @@ fn frame_sizes_and_buffers_are_checked_like_libopus() {
 struct Tight {
     /// Frames both encoders coded.
     both: usize,
-    /// Frames libopus coded and opus-rs refused.
+    /// Frames libopus coded and opus1 refused.
     only_c: Vec<String>,
 }
 
 /// Encodes with output buffers from two bytes below the smallest packet
-/// upwards, with both encoders. Whatever opus-rs writes, C must decode.
+/// upwards, with both encoders. Whatever opus1 writes, C must decode.
 fn tight_buffers(frame_sizes: &[usize]) -> Tight {
     let fs = 48_000;
     let mut tight = Tight::default();
@@ -715,20 +715,20 @@ fn tight_buffers(frame_sizes: &[usize]) -> Tight {
     tight
 }
 
-/// For frames up to 20 ms every buffer libopus can use, opus-rs can use.
+/// For frames up to 20 ms every buffer libopus can use, opus1 can use.
 #[test]
 fn tight_output_buffers_up_to_20_ms() {
     let tight = tight_buffers(&[120, 240, 480, 960]);
     println!("{} frames coded by both encoders", tight.both);
     assert!(
         tight.only_c.is_empty(),
-        "opus-rs refused: {:?}",
+        "opus1 refused: {:?}",
         tight.only_c
     );
     assert!(tight.both > 5000);
 }
 
-/// 40 and 60 ms frames: opus-rs codes the frames it accepts correctly, but
+/// 40 and 60 ms frames: opus1 codes the frames it accepts correctly, but
 /// refuses buffers libopus can use. The cause is in the stream encoder
 /// (src/lib.rs): a 40 or 60 ms frame that is not SILK-only is split into
 /// 20 ms parts before the rule "too few bytes: write a packet without
@@ -738,7 +738,7 @@ fn tight_output_buffers_up_to_20_ms() {
 fn tight_output_buffers_with_40_and_60_ms_frames() {
     let tight = tight_buffers(&[1920, 2880]);
     println!(
-        "{} frames coded by both encoders, {} refused by opus-rs",
+        "{} frames coded by both encoders, {} refused by opus1",
         tight.both,
         tight.only_c.len()
     );
@@ -756,7 +756,7 @@ fn tight_output_buffers_with_40_and_60_ms_frames_like_libopus() {
     let tight = tight_buffers(&[1920, 2880]);
     assert!(
         tight.only_c.is_empty(),
-        "opus-rs refused {} buffers libopus used, for example {:?}",
+        "opus1 refused {} buffers libopus used, for example {:?}",
         tight.only_c.len(),
         &tight.only_c[..tight.only_c.len().min(5)]
     );
@@ -881,7 +881,7 @@ fn surround_mode_sets_the_energy_mask_of_every_stream() {
         enc.set_bitrate(Bitrate::BitsPerSecond(32_000 * case.channels as i32))
             .unwrap();
         let streams = enc.layout().streams();
-        let surround = enc.mapping_type() == opus_rs::multistream::layout::MappingType::Surround;
+        let surround = enc.mapping_type() == opus1::multistream::layout::MappingType::Surround;
         let pcm = voiced(fs, case.channels, 3 * frame_size);
         let mut out = vec![0u8; max_packet_bytes(streams)];
         for frame in pcm.chunks_exact(frame_size * case.channels) {

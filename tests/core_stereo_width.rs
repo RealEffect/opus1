@@ -5,14 +5,14 @@
 //!
 //! The reference is the C libopus encoder with the same settings, at
 //! complexity 5, where libopus decides without the speech/music analysis
-//! that opus-rs does not have.
+//! that opus1 does not have.
 
 mod core_common;
 mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus_rs::{Application, ForcedMode, OpusEncoder};
+use opus1::{Application, ForcedMode, OpusEncoder};
 
 /// Level of the side signal (left minus right) against the mid signal (left
 /// plus right), in dB. It goes down as a stereo image gets narrower.
@@ -42,7 +42,7 @@ struct Decoded {
     packets: usize,
 }
 
-/// Encode with opus-rs and with libopus, CELT-only, and decode both streams
+/// Encode with opus1 and with libopus, CELT-only, and decode both streams
 /// with libopus.
 fn celt_streams(rate: usize, bitrate: i32, cbr: bool, input: &[f32]) -> (Decoded, Decoded) {
     let frame = rate / 50;
@@ -93,7 +93,7 @@ fn celt_stereo_width_follows_the_bitrate_like_libopus() {
                 let what = format!("{rate} Hz, {bitrate} b/s, CBR {cbr}");
                 let (rust, c) = celt_streams(rate, bitrate, cbr, &input);
                 // At 18 kb/s with a constant bitrate libopus codes mono, and
-                // so does opus-rs (see the test below).
+                // so does opus1 (see the test below).
                 assert_eq!(rust.stereo_packets, c.stereo_packets, "{what}: stereo packets");
                 if c.stereo_packets == 0 {
                     assert!(cbr && bitrate == 18000, "{what}: libopus codes mono");
@@ -114,7 +114,7 @@ fn celt_stereo_width_follows_the_bitrate_like_libopus() {
     }
 }
 
-/// A bitrate sweep over stereo input: opus-rs codes the channel count
+/// A bitrate sweep over stereo input: opus1 codes the channel count
 /// libopus codes. libopus goes to mono below about 17 kb/s for music and
 /// 19 kb/s for speech, with 1 kb/s of hysteresis, and SILK takes two frames
 /// to fade the side signal out before the first mono packet.

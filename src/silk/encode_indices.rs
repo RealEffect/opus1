@@ -172,10 +172,10 @@ const NEUTRAL_PRED_IX: [[i8; 3]; 2] = [[1, 2, 2], [1, 2, 2]];
 /// predictors, then the mid-only flag.
 ///
 /// The decoder applies the predictors to mid-only frames too (side = pred *
-/// mid in `silk_stereo_ms_to_lr`), so a non-zero one skews the channels:
-/// index 0, which this used to write, is pred (0, -13364) and decodes as
-/// L = -0.63 * mid, R = 2.63 * mid (issue #42). `_side_idx` and `_pred_idx`
-/// are ignored; the stereo encoder writes its real predictors with
+/// mid in `silk_stereo_ms_to_lr`), so a non-zero one skews the channels.
+/// Index 0, for example, is pred (0, -13364) and decodes as
+/// L = -0.63 * mid, R = 2.63 * mid. `_side_idx` and `_pred_idx` are
+/// ignored. The stereo encoder writes its real predictors with
 /// [`silk_stereo_encode_pred`].
 pub fn silk_encode_stereo(
     ps_range_enc: &mut RangeCoder,

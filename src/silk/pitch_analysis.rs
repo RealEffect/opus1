@@ -20,12 +20,6 @@ const D_COMP_MIN: isize = (MIN_LAG_8KHZ as isize) - 3;
 const D_COMP_MAX: isize = (MAX_LAG_8KHZ as isize) + 4;
 const D_COMP_STRIDE: usize = (D_COMP_MAX - D_COMP_MIN) as usize;
 
-static SILK_NB_CBK_SEARCHS_STAGE3: [usize; SILK_PE_MAX_COMPLEX + 1] = [
-    PE_NB_CBKS_STAGE3_MIN,
-    PE_NB_CBKS_STAGE3_MID,
-    PE_NB_CBKS_STAGE3_MAX,
-];
-
 /// `out[i] = silk_div32_varq(a[i], b[i], qres)` for every `i`: the
 /// approximate quotient `a / b` in the fixed-point format `qres`.
 ///
@@ -90,9 +84,9 @@ mod div_neon {
     /// The steps are those of the scalar function, in the same order:
     /// normalise both numbers, take the reciprocal of the upper 16 bits of
     /// the divisor, multiply, correct once with the remainder, shift into
-    /// the result format. `(x * y) >> 16` with a 16-bit `y` is the upper
-    /// half of `2 * x * (y << 15)`; `(x * y) >> 32` is half of the upper
-    /// half of `2 * x * y`.
+    /// the result format. `silk_smulwb` is `vqdmulhq_s32` with a
+    /// `smulwb_operand` (the reciprocal shifted left by 15); `(x * y) >> 32`
+    /// is half of the upper half of `2 * x * y`.
     #[target_feature(enable = "neon")]
     pub(super) fn div32_varq_x4(a: &[i32; 4], b: &[i32; 4], qres: i32) -> [i32; 4] {
         // SAFETY: each pointer comes from a `[i32; 4]`, which is what
@@ -620,15 +614,20 @@ pub fn silk_pitch_analysis_core(
         }
 
         let lag_log2_q7 = silk_lin2log(d);
-        let mut cc_max_new_b =
-            cc0_max_new - silk_rshift(silk_smulbb((nb_subfr * 1638) as i32, lag_log2_q7), 7);
+        let mut cc_max_new_b = cc0_max_new
+            - silk_rshift(
+                silk_smulbb(nb_subfr as i32 * PE_SHORTLAG_BIAS_Q13, lag_log2_q7),
+                7,
+            );
 
         if prev_lag_8khz > 0 {
             let mut delta_lag_log2_sqr_q7 = lag_log2_q7 - prev_lag_log2_q7;
             delta_lag_log2_sqr_q7 =
                 silk_rshift(silk_smulbb(delta_lag_log2_sqr_q7, delta_lag_log2_sqr_q7), 7);
-            let mut prev_lag_bias_q13 =
-                silk_rshift(silk_smulbb((nb_subfr * 1638) as i32, *ltp_corr_q15), 15);
+            let mut prev_lag_bias_q13 = silk_rshift(
+                silk_smulbb(nb_subfr as i32 * PE_PREVLAG_BIAS_Q13, *ltp_corr_q15),
+                15,
+            );
             prev_lag_bias_q13 = silk_div32(
                 silk_mul(prev_lag_bias_q13, delta_lag_log2_sqr_q7),
                 delta_lag_log2_sqr_q7 + 64,
@@ -714,7 +713,7 @@ pub fn silk_pitch_analysis_core(
             fs_khz as usize,
         );
 
-        let contour_bias_q15 = silk_div32_16(1638, (lag as i16).into());
+        let contour_bias_q15 = silk_div32_16(PE_FLATCONTOUR_BIAS_Q15, (lag as i16).into());
 
         let energy_target = silk_inner_prod_aligned(
             &frame[PE_LTP_MEM_LENGTH_MS * fs_khz as usize..],

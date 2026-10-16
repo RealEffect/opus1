@@ -8,13 +8,13 @@
 //!    level to every concealed frame. With discontinuous transmission
 //!    (DTX) the encoder stops sending during silence and the decoder
 //!    conceals for seconds, so this noise is all the listener hears.
-//!    opus-rs had no comfort noise: concealed frames after the first pause
+//!    opus1 had no comfort noise: concealed frames after the first pause
 //!    scored about 4 dB against libopus, and the frames after a DTX gap
 //!    15 dB.
 //! 2. Voiced concealment followed by an unvoiced frame. libopus decodes the
 //!    first two subframes of that frame as voiced, with one prediction tap
 //!    of 0.25 at the concealment's pitch lag, to avoid an abrupt change.
-//!    opus-rs switched the frame type but left the taps at zero (14 dB in
+//!    opus1 switched the frame type but left the taps at zero (14 dB in
 //!    the affected frame).
 
 mod k24_common;
@@ -26,7 +26,7 @@ use k24_common::*;
 fn compare_with_losses(packets: &[Vec<u8>], lost: &[bool], rate: usize, channels: usize) -> (usize, Option<usize>) {
     let frame = rate / 50;
     let mut c_dec = CDec::new(rate, channels);
-    let mut rs_dec = opus_rs::OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
     let mut buf = vec![0f32; frame * channels];
     let (mut differing, mut first) = (0, None);
     for (i, p) in packets.iter().enumerate() {
@@ -89,7 +89,7 @@ fn dtx_stream_is_bit_exact() {
         let dtx_packets = packets.iter().filter(|p| p.len() <= 2).count();
         assert!(dtx_packets > 10, "expected DTX packets, got {dtx_packets}");
         let reference = c_decode_all(&packets, 24000, 1);
-        let ours = rs_decode_all(&packets, 24000, 1).expect("opus-rs decode");
+        let ours = rs_decode_all(&packets, 24000, 1).expect("opus1 decode");
         let cmp = compare(&reference, &ours, 1, 480, 24000);
         println!("SILK-{name} DTX, {dtx_packets} of {} packets empty: {cmp}", packets.len());
         assert_eq!(cmp.max_abs_diff, 0.0, "SILK-{name} DTX: {cmp}");
