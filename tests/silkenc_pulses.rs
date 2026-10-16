@@ -13,9 +13,9 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::encode_pulses::silk_encode_pulses;
-use opus1::{Application, Bandwidth, OpusEncoder};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::encode_pulses::silk_encode_pulses;
+use opus1::{Application, Bandwidth, Bitrate, OpusEncoder};
 
 /// Mediumband 10 ms packets after a longer frame have the final range that
 /// the libopus decoder reaches.
@@ -31,8 +31,8 @@ fn mediumband_10_ms_after_a_longer_frame_has_the_decoders_final_range() {
         for application in [Application::Voip, Application::Audio] {
             for bitrate in [12_000, 20_000, 32_000] {
                 let mut enc = OpusEncoder::new(fs as i32, 1, application).unwrap();
-                enc.bitrate_bps = bitrate;
-                enc.complexity = 3;
+                enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                enc.set_complexity(3).unwrap();
                 let mut dec = CDecoder::new(fs, 1);
                 let pcm = speech_like(fs, 1, fs, 7);
                 let mut out = vec![0u8; 1500];

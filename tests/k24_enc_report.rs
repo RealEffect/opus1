@@ -10,6 +10,7 @@
 
 mod k24_enc_common;
 use k24_enc_common::*;
+use opus1::Bitrate;
 
 /// One table row: the stream of each encoder decoded at `rate`.
 fn row(label: &str, cfg: &Cfg, pcm: &[f32], rate: usize) -> String {
@@ -421,7 +422,7 @@ fn bitrate_switch() {
                 let mut enc = rs_encoder(&cfg);
                 let mut all = Vec::new();
                 for (k, &b) in schedule.iter().enumerate() {
-                    enc.bitrate_bps = b;
+                    enc.set_bitrate(Bitrate::BitsPerSecond(b)).unwrap();
                     all.extend(enc_rs_with(&mut enc, &cfg, &speech[k * FS..(k + 1) * FS])?);
                 }
                 Ok(all)

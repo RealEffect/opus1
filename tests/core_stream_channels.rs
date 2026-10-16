@@ -12,7 +12,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 /// Stereo test inputs, interleaved.
 #[derive(Clone, Copy, Debug)]
@@ -89,8 +89,8 @@ fn sweep(
     let mut c_enc = CEncoder::new(rate, 2, application.0);
     c_enc.complexity(5).vbr(!cbr);
     let mut enc = OpusEncoder::new(rate as i32, 2, application.1).unwrap();
-    enc.complexity = 5;
-    enc.use_cbr = cbr;
+    enc.set_complexity(5).unwrap();
+    enc.set_vbr(!cbr);
     setup(&mut enc, &mut c_enc);
     let (mut dec, mut c_dec) = (CDecoder::new(rate, 2), CDecoder::new(rate, 2));
     let mut buf = vec![0u8; 4000];
@@ -98,7 +98,7 @@ fn sweep(
     let (mut channels, mut modes, mut configs) = (Vec::new(), Vec::new(), Vec::new());
     for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
         c_enc.bitrate(bitrate(i));
-        enc.bitrate_bps = bitrate(i);
+        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate(i))).unwrap();
         let n = enc.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("packet {i}: {e}"));
         let c_packet = c_enc.encode(pcm);
         out.extend(dec.decode(Some(&buf[..n]), frame, false).unwrap());
@@ -234,7 +234,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
         let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
         c_enc.complexity(5).force_mode(MODE_HYBRID).bandwidth(BW_FB);
         let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
-        enc.complexity = 5;
+        enc.set_complexity(5).unwrap();
         enc.set_force_mode(Some(opus1::ForcedMode::Hybrid));
         enc.set_bandwidth(opus1::Bandwidth::Fullband);
         let mut buf = vec![0u8; 4000];
@@ -244,7 +244,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
             let ms = i * frame_ms;
             let bitrate = if ms < 1200 { 40000 } else if ms < 2400 { 12000 } else { 64000 };
             c_enc.bitrate(bitrate);
-            enc.bitrate_bps = bitrate;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             if ms == 4800 {
                 // The caller lets the bitrate decide again.
                 c_enc.force_channels(-1000);
@@ -284,7 +284,7 @@ fn stereo_after_mono_with_a_new_silk_rate_codes_like_libopus() {
         let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
         c_enc.complexity(5);
         let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
-        enc.complexity = 5;
+        enc.set_complexity(5).unwrap();
         let mut dec = CDecoder::new(rate, 2);
         let mut buf = vec![0u8; 4000];
         for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
@@ -295,7 +295,7 @@ fn stereo_after_mono_with_a_new_silk_rate_codes_like_libopus() {
                 (64000, (BW_FB, opus1::Bandwidth::Fullband))
             };
             c_enc.bitrate(bitrate).bandwidth(bandwidth.0).force_mode(if bitrate > 10000 { MODE_HYBRID } else { MODE_SILK });
-            enc.bitrate_bps = bitrate;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             enc.set_bandwidth(bandwidth.1);
             enc.set_force_mode(Some(if bitrate > 10000 { opus1::ForcedMode::Hybrid } else { opus1::ForcedMode::SilkOnly }));
             let n = enc.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -360,8 +360,8 @@ fn decode_both(rate: usize, frame: usize, bitrate: i32, input: &[f32]) -> (Vec<f
     let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
     c_enc.complexity(5).bitrate(bitrate);
     let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
-    enc.complexity = 5;
-    enc.bitrate_bps = bitrate;
+    enc.set_complexity(5).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     silk_wideband(&mut enc, &mut c_enc);
     let (mut dec, mut c_dec) = (CDecoder::new(rate, 2), CDecoder::new(rate, 2));
     let mut buf = vec![0u8; 1500];
@@ -399,7 +399,7 @@ fn forced_mono_turns_the_stereo_width_off_like_libopus() {
         let mut c_enc = CEncoder::new(rate, 2, application.0);
         c_enc.complexity(5);
         let mut enc = OpusEncoder::new(rate as i32, 2, application.1).unwrap();
-        enc.complexity = 5;
+        enc.set_complexity(5).unwrap();
         let mut buf = vec![0u8; 4000];
         let packets = input.len() / (2 * frame);
         for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
@@ -416,7 +416,7 @@ fn forced_mono_turns_the_stereo_width_off_like_libopus() {
                 enc.set_force_channels(None).unwrap();
             }
             c_enc.bitrate(bitrate);
-            enc.bitrate_bps = bitrate;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             enc.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("{what}: {e}"));
             let c_packet = c_enc.encode(pcm);
             assert_eq!(mode_of(buf[0]), mode_of(c_packet[0]), "{what}: mode at {bitrate} b/s");

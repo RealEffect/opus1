@@ -4,8 +4,16 @@
 
 /// Tests for Hybrid (SILK + CELT) mode encoding and decoding.
 /// Hybrid mode uses SILK for low-frequency content and CELT for high-frequency content.
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 use std::f32::consts::PI;
+
+/// Asks the encoder for Hybrid packets of `bandwidth`. The bandwidth keeps
+/// the rate-dependent choice from falling back to wideband SILK at low
+/// bitrates.
+fn force_hybrid(encoder: &mut OpusEncoder, bandwidth: Bandwidth) {
+    encoder.set_force_mode(Some(ForcedMode::Hybrid));
+    encoder.set_bandwidth(bandwidth);
+}
 
 /// Test that Hybrid mode can be enabled and produces valid packets
 #[test]
@@ -16,13 +24,9 @@ fn test_hybrid_mode_encode_basic() {
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
 
-    // Enable Hybrid mode
-    encoder
-        .enable_hybrid_mode()
-        .expect("Failed to enable Hybrid mode");
-    // Use bitrate below the ~17.6kbps mode-switching threshold so the encoder
-    // actually uses Hybrid mode (not CeltOnly).
-    encoder.bitrate_bps = 16000;
+    // Ask for Hybrid fullband.
+    force_hybrid(&mut encoder, Bandwidth::Fullband);
+    encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
 
     let mut input = vec![0.0f32; frame_size];
     for i in 0..frame_size {
@@ -62,10 +66,8 @@ fn test_hybrid_mode_24khz_swb() {
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
 
-    encoder
-        .enable_hybrid_mode()
-        .expect("Failed to enable Hybrid mode at 24kHz");
-    encoder.bitrate_bps = 28000;
+    force_hybrid(&mut encoder, Bandwidth::Superwideband);
+    encoder.set_bitrate(Bitrate::BitsPerSecond(28000)).unwrap();
 
     let mut input = vec![0.0f32; frame_size];
     for i in 0..frame_size {
@@ -80,6 +82,9 @@ fn test_hybrid_mode_24khz_swb() {
 
     assert!(n >= 3, "24kHz Hybrid packet too short: {}", n);
     println!("24kHz Hybrid packet: {} bytes", n);
+    // Configurations 12 and 13 are Hybrid super-wideband.
+    let config = output[0] >> 3;
+    assert!((12..=13).contains(&config), "config {config}");
 
     println!("✅ Hybrid mode 24kHz SWB test passed");
 }
@@ -93,10 +98,8 @@ fn test_hybrid_mode_bitrate_range() {
     for bitrate in [24000, 32000, 48000, 64000, 96000] {
         let mut encoder =
             OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
-        encoder
-            .enable_hybrid_mode()
-            .expect("Failed to enable Hybrid mode");
-        encoder.bitrate_bps = bitrate;
+        force_hybrid(&mut encoder, Bandwidth::Fullband);
+        encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
 
         let mut input = vec![0.0f32; frame_size];
         for i in 0..frame_size {
@@ -124,10 +127,8 @@ fn test_hybrid_mode_consecutive_frames() {
 
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
-    encoder
-        .enable_hybrid_mode()
-        .expect("Failed to enable Hybrid mode");
-    encoder.bitrate_bps = 32000;
+    force_hybrid(&mut encoder, Bandwidth::Fullband);
+    encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
 
     let mut frame_sizes = Vec::new();
 
@@ -152,39 +153,31 @@ fn test_hybrid_mode_consecutive_frames() {
     println!("✅ Hybrid mode consecutive frames test passed");
 }
 
-/// Test that Hybrid mode fails gracefully for invalid sample rates
+/// Hybrid needs more than wideband: at 8 and 16 kHz a forced Hybrid gives
+/// SILK-only packets, as in libopus.
 #[test]
-fn test_hybrid_mode_invalid_sample_rates() {
-    // 8kHz: SILK-only rate, cannot use Hybrid
-    let mut enc_8k =
-        OpusEncoder::new(8000, 1, Application::Audio).expect("Encoder creation failed");
-    assert!(enc_8k.enable_hybrid_mode().is_err(), "Should fail for 8kHz");
-
-    // 16kHz: SILK NB/WB rate, cannot use Hybrid
-    let mut enc_16k =
-        OpusEncoder::new(16000, 1, Application::Audio).expect("Encoder creation failed");
-    assert!(
-        enc_16k.enable_hybrid_mode().is_err(),
-        "Should fail for 16kHz"
-    );
-
-    // 48kHz: Valid for Hybrid
-    let mut enc_48k =
-        OpusEncoder::new(48000, 1, Application::Audio).expect("Encoder creation failed");
-    assert!(
-        enc_48k.enable_hybrid_mode().is_ok(),
-        "Should succeed for 48kHz"
-    );
-
-    println!("✅ Hybrid mode invalid sample rate test passed");
+fn test_forced_hybrid_at_low_sample_rates_is_silk() {
+    for (sample_rate, frame_size) in [(8000, 160), (16000, 320)] {
+        let mut encoder =
+            OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
+        force_hybrid(&mut encoder, Bandwidth::Fullband);
+        encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
+        let input: Vec<f32> = (0..frame_size)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin() * 0.5)
+            .collect();
+        let mut output = vec![0u8; 1500];
+        encoder.encode(&input, frame_size, &mut output).unwrap();
+        // Configurations 0-11 are SILK-only.
+        assert!(output[0] >> 3 <= 11, "{sample_rate} Hz: config {}", output[0] >> 3);
+    }
 }
 
 /// Test CELT start_band functionality with start_band > 0
 #[test]
 fn test_celt_encode_with_start_band() {
-    use opus1::celt::CeltEncoder;
-    use opus1::modes::default_mode;
-    use opus1::range_coder::RangeCoder;
+    use opus1::internals::celt::CeltEncoder;
+    use opus1::internals::modes::default_mode;
+    use opus1::internals::range_coder::RangeCoder;
 
     let mode = default_mode();
     let frame_size = 960;
@@ -222,9 +215,9 @@ fn test_celt_encode_with_start_band() {
 /// Test that CELT decoding from start band 17 works without crashing
 #[test]
 fn test_celt_decode_from_start_band_17() {
-    use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
-    use opus1::modes::default_mode;
-    use opus1::range_coder::RangeCoder;
+    use opus1::internals::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+    use opus1::internals::modes::default_mode;
+    use opus1::internals::range_coder::RangeCoder;
 
     let mode = default_mode();
     let frame_size = 960;
@@ -273,7 +266,7 @@ fn rms_i16(samples: &[i16]) -> f64 {
 
 #[test]
 fn test_downsample_48_to_16_sample_count() {
-    use opus1::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
+    use opus1::internals::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
 
     let frame_size = 960usize; // 20 ms at 48 kHz
     let input: Vec<i16> = (0..frame_size)
@@ -306,7 +299,7 @@ fn test_downsample_48_to_16_sample_count() {
 /// At 24kHz a 20 ms frame is 480 samples. After ×2/3 we expect 320 samples.
 #[test]
 fn test_downsample_24_to_16_sample_count() {
-    use opus1::silk::resampler::silk_resampler_down2_3;
+    use opus1::internals::silk::resampler::silk_resampler_down2_3;
 
     let frame_size = 480usize; // 20 ms at 24 kHz
     let input: Vec<i16> = (0..frame_size).map(|i| i as i16).collect();
@@ -327,7 +320,7 @@ fn test_downsample_24_to_16_sample_count() {
 
 #[test]
 fn test_downsample_48_to_16_antialiasing() {
-    use opus1::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
+    use opus1::internals::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
 
     let in_rate = 48000usize;
     // 4 frames = 80 ms – enough to let the IIR filter settle
@@ -376,7 +369,7 @@ fn test_downsample_48_to_16_antialiasing() {
 
 #[test]
 fn test_downsample_48_to_16_passband_preserved() {
-    use opus1::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
+    use opus1::internals::silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
 
     let in_rate = 48000usize;
     let frame_size = 960 * 4; // 80 ms – let the filter settle
@@ -426,11 +419,9 @@ fn test_hybrid_downsampler_state_continuity() {
 
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
-    encoder
-        .enable_hybrid_mode()
-        .expect("Failed to enable Hybrid mode");
-    encoder.bitrate_bps = 32000;
-    encoder.use_cbr = true; // CBR → packet sizes should be equal
+    force_hybrid(&mut encoder, Bandwidth::Fullband);
+    encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    encoder.set_vbr(false); // CBR → packet sizes should be equal
 
     let mut sizes = Vec::new();
     for frame_idx in 0..8 {

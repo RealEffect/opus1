@@ -21,6 +21,7 @@ opus1 follows libopus 1.6, the reference implementation of Opus in C. This docum
 ## What the figures were measured against
 
 - The reference is **libopus 1.6.1 as built by Homebrew**, on Apple M4 Pro (64-bit ARM, macOS). It is a floating-point build.
+- The C source of libopus's main branch differs from 1.6.1 in a few places. opus1 follows 1.6.1, checked against the arm64 object code of the Homebrew build. Two examples: `remove_doubling` has no second check of very short periods, and `dynalloc_analysis` gives band 0 no extra boost above 320 bytes per frame.
 - Comparisons of the SILK encoder at the packet level also use **libopus 1.6.1 built with `-DFIXED_POINT`** (see [Testing](09-testing.md#checks-against-the-fixed-point-build-of-libopus)).
 - Most figures come from `perf_harness modes` (see [Performance](08-performance.md#the-harness)) over its 129 scenarios with 5 s clips, at the final integration state of this release. In those runs, "SNR" is the decoded audio against the encoder input. The opus1 encoder is compared with the libopus encoder under the same forced settings, and libopus decodes both streams.
 - Figures marked **(earlier)** come from earlier stages of the work and were not measured again in the final state.
@@ -46,8 +47,6 @@ This causes several of the differences listed below: in CELT packets at complexi
 - **Phase inversion cannot be disabled.** CELT's intensity stereo codes one band for both channels and may invert the sign of one of them. libopus documents that disabling this improves a mono downmix of the stream and slightly lowers normal stereo quality. libopus has `OPUS_SET_PHASE_INVERSION_DISABLED` for it. opus1's CELT encoder always allows phase inversion: it calls `quant_all_bands_enc` with `disable_inv` set to `false`.
 - These libopus encoder controls have no equivalent in `OpusEncoder`:
   - the signal type (`OPUS_SET_SIGNAL`),
-  - `OPUS_AUTO` and `OPUS_BITRATE_MAX` as bitrate values (the multistream encoder has them as `Bitrate::Auto` and `Bitrate::Max`),
-  - unconstrained VBR for CELT-only packets (`OPUS_SET_VBR_CONSTRAINT(0)`). CELT-only VBR is always constrained, which is libopus's default,
   - the input bit depth (`OPUS_SET_LSB_DEPTH`; see [Deliberate differences](#deliberate-differences)).
 
 The encoder refuses an 80 ms frame with an error:
@@ -80,7 +79,7 @@ The decoder decodes every valid packet, up to 120 ms. These libopus decoder cont
 
 - **Mapping family 3** (ambisonics mixed through a matrix, libopus's `opus_projection_*` functions) is not implemented. Families 0, 1, 2 and 255 are.
 - The multistream encoder offers no 80, 100 and 120 ms frames and no expert frame duration control. The source names this difference D3. The labels used here (D1, D3, D5) are those of the module documentation in `src/multistream/encoder.rs`.
-- The multistream encoder does not forward these controls: input bit depth, the constrained-VBR switch, signal type, DTX, forced channel count, prediction and phase inversion (D5). The forced channel count and the prediction switch can be set on each stream's encoder through `MultistreamEncoder::stream_encoder_mut`.
+- The multistream encoder does not forward these controls: input bit depth, signal type, DTX, forced channel count, prediction and phase inversion (D5). The forced channel count and the prediction switch can be set on each stream's encoder through `MultistreamEncoder::stream_encoder_mut`.
 
 ### Packet padding extensions
 
@@ -121,15 +120,18 @@ These differences are intended. Most are listed in the comment above `OpusEncode
 
 ### CELT encoder
 
+- **The CELT encoder alone** (`CeltEncoder`, without the speech and music analysis that libopus's Opus layer adds): every packet is identical to libopus. `celtenc_gap_report` has 960 streams with 1,080,000 packets: mono and stereo, 16 and 48 kHz input, frames of 2.5 to 20 ms, 24 to 96 kb/s per channel, CBR and VBR, complexity 4, 5 and 9. `celtenc_rate_rules` adds VBR at bitrates that are not a whole number of bits per frame, bitrates above 750 kb/s per channel, and silent frames. Before this release round 91.2 % of the 1,080,000 packets were identical.
+- **Stereo input whose two channels are scaled copies of each other** (one source panned to one side), at 128 kb/s per channel and more: a few packets still differ from libopus. Found in the verification of this release round with tones from -134 to -40 dBFS, at 128 to 750 kb/s per channel and frames of 2.5 to 20 ms: up to 3 of 50 to 400 packets per stream differ. With the right channel inverted, or with another tone in it, no packet differed in the cases tried. The streams of `celtenc_gap_report` do not have such input: their right channel is delayed. Before this release round most of these streams differed in many packets.
 - **Complexity 0 to 5:** packets are identical to libopus, 250 of 250 per stream.
 - **Complexity 7 and above, 16 to 48 kHz:** identical packets drop to 4 of 250 (stereo 128 kb/s at c7 and c10) and 24 of 250 (mono 64 kb/s at c10). At 8 and 12 kHz, where libopus runs no analysis, the c9 low-delay streams stay at 250 of 250. SNR difference over the CELT streams: mean +0.08 dB, worst -0.2 dB.
-- **Stereo at c9 and c10** (with `theta_rdo`, the second quantization pass per stereo band): identical packets range from 0 of 250 (510 kb/s VBR) and 4 of 250 (128 kb/s VBR, c10) to 151 of 250 (128 kb/s CBR, c9). SNR difference: mean +0.04 dB, worst -0.2 dB. The rest of the difference comes from before the band coding, mostly from the missing analysis.
+- **Stereo at c9 and c10** (with `theta_rdo`, the second quantization pass per stereo band): identical packets range from 4 of 250 (128 kb/s VBR, c10) to 151 of 250 (128 kb/s CBR, c9) and 185 of 250 (510 kb/s VBR). SNR difference: mean +0.04 dB, worst -0.2 dB. The difference comes from the missing analysis: without it, the CELT encoder writes the packets of libopus (see the first item).
 - **Impulse at 48 kHz, mono, 64 kb/s CBR, c10:** 7 of 160 bytes equal libopus. The first difference is at byte 7. The allocation trim differs, because the analysis is missing. Test: `oracle_celt::impulse_48k_mono_64k_is_the_packet_of_libopus` (ignored).
-- **Rounding on 64-bit ARM.** clang fuses some products and sums in libopus into one FMA. A few such places are not copied in opus1. No case was found where they change a packet:
+- **Rounding on 64-bit ARM.** clang fuses some products and sums in libopus into one FMA. opus1 copies this in the pitch analysis of the pre-filter (`src/pitch.rs`, `src/celt_lpc.rs`), the comb filter and the prediction of the coarse energy, among others. A few such places are not copied in opus1. No case was found where they change a packet:
   - `transient_analysis` rounds products separately and uses single precision. In libopus 1.6.1 on arm64 the high-pass filter, the energy of two samples and the smoothing are fused, and two square-root arguments are computed in double precision. Its decisions matched libopus in 300 of 300 frames (earlier).
   - `intensity_stereo` has no `EPSILON` terms and clamps with `max(1e-10)`. A 4000-frame probe found 0 differences (earlier).
   - The fused rounding of the two-bin side-sign product is not ported. It matters only at the angles 0 and 16384, where no sign is coded (earlier).
   - Others, for example `importance` (0.5 + 13 * exp2): no case found where they change a packet (earlier).
+  - The pre-filter compares the sum of the absolute sample values before and after filtering. opus1 adds them in four lanes, libopus one value after the other.
 
 ### SILK
 
@@ -143,6 +145,12 @@ These differences are intended. Most are listed in the comment above `OpusEncode
   - 24 kHz, VoIP, 40 ms, CBR, float input, after a step from 64 to 10 kb/s: 5.14 against 5.73 dB (two packets). With 16-bit input it equals the fixed-point build.
   - Low bitrates, largest excess of a decoded packet over the input, opus1 against libopus: 8.9 against 3.0 dB at 8 kb/s with 10 ms frames, 4.7 against 1.6 dB at 6 kb/s with 20 ms frames.
   - Input at -40 dB, wideband, 24 kb/s, 60 ms: 11.1 against 16.0 dB. This was measured before later changes to the pitch analysis.
+  - Stereo tones at 12 kHz with a constant bitrate (found by the fuzz target `fuzz_channel_order`): the stereo image can collapse. The signal is a 300 Hz tone on the left and an 1800 Hz tone on the right, each at amplitude 0.3 (-16.5 dB), coded as SILK in 20 ms frames for 0.5 s. The tone levels are measured over the last 0.3 s, and mid and side over the last 0.25 s.
+    - 160 kb/s, complexity 9 or 10: in opus1 the right output holds the left tone at -9.8 dB and its own tone at -25.3 dB. In the fixed-point build of libopus the left output holds the right tone at -9.1 dB and its own tone at -17.8 dB. The float build keeps every foreign tone at least 78 dB below the own one. Mid and side SNR: 19.7 and -10.8 dB in opus1, 8.5 and -14.7 dB in the fixed-point build, 42.8 and 42.9 dB in the float build.
+    - 33 kb/s, complexity 10, own tone minus foreign tone in the left and the right output: -1.0 and 2.2 dB in opus1, 1.7 and 46.4 dB in the fixed-point build, 26.6 and 28.9 dB in the float build.
+    - 25.5 kb/s, complexity 2, the same measure: -4.1 and 2.2 dB in opus1, -3.6 and 8.6 dB in the fixed-point build, 33.0 and 42.4 dB in the float build.
+    - With a variable bitrate the image stays. At 160 kb/s the own tone is at least 52 dB above the foreign one in opus1, 50 dB in the fixed-point build and 67 dB in the float build.
+    - The cause lies in the rate control of the fixed-point SILK encoder, which opus1 ports. At 33 and 25.5 kb/s opus1 keeps the channels apart less well than the fixed-point build.
 - **Bandwidth switches** (test `core_redundancy::silk_bandwidth_switches_match_libopus`), deficit in the worst window around each switch:
   - 48 kHz: mean -1.0 dB with CBR and -0.7 dB with VBR, so opus1 is closer to the input than libopus.
   - 16 kHz: mean +0.8 dB with CBR, worst switch 6.7 dB. Mean -1.2 dB with VBR, worst switch 3.6 dB.
@@ -173,6 +181,7 @@ These differences are intended. Most are listed in the comment above `OpusEncode
 
 ### Multistream
 
+- **Surround masking:** the band levels are taken with libopus's approximation of the logarithm (`celt_log2`), as libopus does. 98.7 % of the mask values are the bits of libopus's `surround_analysis` (`multistream_surround_c_direct`, 1,247,400 values; 72.8 % with the exact logarithm used before). The others differ by at most 3.8e-6, from the rounding of the MDCT.
 - **Bitrate at 16 kHz and for VoIP:** opus1 uses 65 % to 80 % of the requested bitrate in four cases where libopus uses 101 % to 102 %. The cause is the missing speech and music analysis. Test: `multistream_enc_signals::average_rate_at_16_khz_and_for_voip_is_within_the_design_limits` (ignored).
 - **Stereo Hybrid streams** in the matrix of `tests/multistream_enc_validity.rs` (48 and 24 kHz, VBR and CBR), counted in packets that contain a stereo Hybrid stream:
   - At 8 kb/s per channel: libopus 128, opus1 0. Both code most of them as mono. With two channels forced: libopus 310, opus1 220.
@@ -180,23 +189,24 @@ These differences are intended. Most are listed in the comment above `OpusEncode
 
 ### Decoder
 
-The decoder is not bit-exact for most CELT streams. On the packets of libopus:
+On 64-bit ARM the decoder gives the samples of libopus for the packets of libopus:
 
-- **CELT:** 8 of 51 streams give identical output (complexity 0 and 2, super-wideband stereo 96 kb/s, and narrowband 8 kHz low delay). The others agree with libopus's output to 136 to 146 dB. Earlier work traced this to the streams that use the post-filter.
-- **Hybrid:** 25 of 29 streams are identical. Three 10 ms streams and one FEC stream agree to 167 to 221 dB.
+- **CELT:** 51 of 51 streams of `perf_harness modes` are identical. Before this release round 8 were; the others agreed to 136 to 146 dB. The causes were four filter taps of the post-filter written with too few digits, the rounding of the post-filter, and the rounding of the coarse energy prediction in frames shorter than 20 ms.
+- **Hybrid:** 28 of 29 streams are identical. One FEC stream agrees to 185 dB.
 - **SILK:** 48 of 49 streams are identical. One FEC stream agrees to 186 dB.
 
-An agreement of 136 dB means the difference is 136 dB below the signal. That is smaller than the error of rounding to 16-bit samples, which alone limits the SNR of a full-scale sine to about 98 dB.
+An agreement of 185 dB means the difference is 185 dB below the signal. That is far smaller than the error of rounding to 16-bit samples, which alone limits the SNR of a full-scale sine to about 98 dB.
 
-Concealment can make such a small difference large. To conceal audio, the decoder searches the decoded signal for its pitch, and a small difference can change the pitch it finds. Fuzzing found a case ([Testing](09-testing.md#fuzzing)). An 8 kHz stream switched from CELT-only to SILK without a redundant CELT frame. The decoder then conceals 5 ms in CELT and fades them into the SILK frame. Those 5 ms agreed with libopus to 27 dB, after CELT packets that agreed to 127 dB or better. The other 15 ms of the SILK frame agreed to 294 dB.
+Concealment is identical too. The concealed frames of all 127 loss cases of `celtdec_plc` (2.5 to 20 ms, decoders at 8 to 48 kHz, CELT and Hybrid) are libopus's to the last bit, and so are the concealed frames of `multistream_dec_loss` for every layout. (Its streams with FEC agree with libopus to 156 to 200 dB.) Before, a small difference in the decoded signal could change the pitch the concealment found. Fuzzing found such a case ([Testing](09-testing.md#fuzzing)): an 8 kHz stream that switched from CELT-only to SILK without a redundant CELT frame, where the 5 ms that the decoder conceals in CELT agreed with libopus to 27 dB. That was measured before the CELT decoder became bit-exact.
 
 ## Platforms
 
-- **x86-64 was only compiled in this release, not run.** Its vector kernels for the pulse search, the band energies and the renormalization are not ports of libopus's SSE2 code. SSE2 (Streaming SIMD Extensions 2, where SIMD means single instruction, multiple data) is the baseline vector instruction set of x86-64. The [README](../README.md) keeps an older x86-64 speed measurement of opus-rs 0.1.x.
-- **64-bit ARM rounding follows clang.** clang compiles C with `-ffp-contract=on` by default. Where a product and a sum stand in one expression, it emits one fused multiply-add. opus1 copies this in its FFT, its MDCT and several other places. So on 64-bit ARM they give the same bits as the arm64 build of libopus. A libopus built without contraction, or built by GCC (the GNU Compiler Collection) with `-ffp-contract=fast`, rounds differently. On other targets, the FFT of opus1 rounds each product before the addition.
+- **x86-64 was only compiled in this release, not run.** Its vector kernels for the pulse search, the band energies and the renormalization are not ports of libopus's SSE2 code. Its kernels for the inner products and correlations of the pitch analysis do not follow libopus's x86 kernels in every detail either. SSE2 (Streaming SIMD Extensions 2, where SIMD means single instruction, multiple data) is the baseline vector instruction set of x86-64. The [README](../README.md) keeps an older x86-64 speed measurement of opus-rs 0.1.x.
+- **64-bit ARM rounding follows clang.** clang compiles C with `-ffp-contract=on` by default. Where a product and a sum stand in one expression, it emits one fused multiply-add. opus1 copies this in its FFT, its MDCT, the pitch analysis and the comb filter of CELT, the coarse energy and several other places. So on 64-bit ARM they give the same bits as the arm64 build of libopus. A libopus built without contraction, or built by GCC (the GNU Compiler Collection) with `-ffp-contract=fast`, rounds differently. On other targets, the FFT of opus1 rounds each product before the addition.
 - **Speed cost of following libopus:**
   - `theta_rdo` adds 34 % to 73 % encode time on the six stereo bench scenarios at c9 and c10. The opus1 / libopus encode time ratio stays 0.53 to 0.63.
   - The exact pulse search of libopus costs 3 % to 11 % CELT encode time (earlier).
+  - The pitch analysis of the pre-filter adds its sums in libopus's order. The autocorrelation of `pitch_downsample` and the window energies of `remove_doubling` are then chains of fused multiply-adds in which each step waits for the one before. With 20 ms frames the new kernels make up for that: the three functions take about as long as before (4.0 to 4.1 µs per frame). With 2.5 ms frames they take 0.25 to 0.34 µs (13 % to 18 %) longer per frame, and with 5 ms frames 0.19 to 0.23 µs (9 % to 10 %). Encoding stereo 128 kb/s c9 with 2.5 ms frames took 0.6 % longer than before this release round (six alternating bench runs), even though the comb filter became faster.
 
 ## Tests that track these gaps
 

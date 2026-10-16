@@ -101,7 +101,7 @@ fn match_quality(x: &[f32], y: &[i32]) -> f64 {
 /// bitrates, so this cost every CELT stream quality, not only LFE.
 #[test]
 fn pulse_search_with_few_pulses_matches_libopus() {
-    use opus1::pvq::pvq_search;
+    use opus1::internals::pvq::pvq_search;
     let mut noise = Noise(5);
     let mut worst = 0f64;
     for n in [3usize, 6, 8, 12, 16] {

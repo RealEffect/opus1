@@ -266,7 +266,7 @@ After a lost SILK frame the decoder sets its last gain index back to the start v
 A lost CELT frame goes through `CeltDecoder::decode_lost` (`conceal` in `src/celt.rs`, the port of `celt_decode_lost` without the neural concealment of libopus). It uses one of two methods:
 
 - **Pitch repetition** (CELT-only, for the first 100 ms of a loss):
-  1. On the first lost frame, it searches the pitch period of the last output (`plc_pitch_search`, 100 to 720 samples at 48 kHz). It also fits a linear predictor of order 24 to the last 1024 output samples.
+  1. On the first lost frame, it searches the pitch period of the last output (`plc_pitch_search`, 100 to 720 samples at 48 kHz). It also fits a linear predictor of order 24 to the last 1024 output samples. The search and the fit use the functions of the encoder's pre-filter in `src/pitch.rs` and `src/celt_lpc.rs`, which round as libopus does on 64-bit ARM.
   2. It filters the last output with that predictor to get its excitation, and repeats the last pitch period of the excitation.
   3. If the excitation was getting quieter, the repetition keeps getting quieter at the same rate. Each later lost frame is also multiplied by 0.8.
   4. It filters the result back with the predictor, starting from the last decoded samples, so that the signal stays continuous.
@@ -330,7 +330,7 @@ assert_eq!(output.len(), 10 * frame);
 
 ## 9. In-band FEC: `decode_fec`
 
-A SILK-only or Hybrid packet can carry a low-bitrate copy (LBRR) of the SILK frames of the packet before it. The encoder adds it when `use_inband_fec` is on and `packet_loss_perc` is above 0 (see [03-encoder.md](03-encoder.md), section 2.9). When packet `n` is lost and packet `n + 1` has arrived, the receiver can rebuild packet `n`:
+A SILK-only or Hybrid packet can carry a low-bitrate copy (LBRR) of the SILK frames of the packet before it. The encoder adds it when `set_inband_fec(true)` turned FEC on and the packet loss percentage (`set_packet_loss_perc`) is above 0 (see [03-encoder.md](03-encoder.md), section 2.9). When packet `n` is lost and packet `n + 1` has arrived, the receiver can rebuild packet `n`:
 
 1. Call `decode_fec(packet_n_plus_1, frame_size, out)`, with `frame_size` the duration of the lost packet. It writes exactly `frame_size` samples.
 2. Then call `decode(packet_n_plus_1, ...)` as usual for packet `n + 1`.
@@ -351,14 +351,14 @@ When the next packet has not arrived yet, a receiver conceals with an empty pack
 ### Example: using FEC when the next packet has arrived
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 let rate = 16_000;
 let frame = 320; // 20 ms
 let mut encoder = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 24_000; // SILK at 16 kHz
-encoder.use_inband_fec = true; // OPUS_SET_INBAND_FEC(1)
-encoder.packet_loss_perc = 20; // OPUS_SET_PACKET_LOSS_PERC(20)
+encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap(); // SILK at 16 kHz
+encoder.set_inband_fec(true); // OPUS_SET_INBAND_FEC(1)
+encoder.set_packet_loss_perc(20).unwrap(); // OPUS_SET_PACKET_LOSS_PERC(20)
 
 let mut packets = Vec::new();
 for k in 0..20 {
@@ -427,10 +427,10 @@ The range coder ends every frame in a state, a 32-bit number. An encoder and a d
 The value is for testing. Comparing it with `OpusEncoder::final_range()` for the same packet shows whether the decoder read every symbol as the encoder wrote it. libopus's test tool `opus_demo` stores the encoder's final range with each packet. It reports "Range coder state mismatch" when the decoder ends in another state. A mismatch means a corrupted packet or a bug, even when the audio sounds right.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 20_000;
+encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
 let mut decoder = OpusDecoder::new(16_000, 1).unwrap();
 let mut packet = vec![0u8; 1276];
 let mut pcm16 = vec![0i16; 320];

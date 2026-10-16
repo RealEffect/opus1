@@ -9,8 +9,8 @@
 //! for 0.74, 47186 for 0.72 and 45875 for 0.7 in Q16, and 983 for the
 //! warping multiplier 0.015.
 
-use opus1::silk::control_codec::{silk_control_encoder, silk_setup_lbrr};
-use opus1::silk::structs::SilkEncoderState;
+use opus1::internals::silk::control_codec::{silk_control_encoder, silk_setup_lbrr};
+use opus1::internals::silk::structs::SilkEncoderState;
 
 /// The gain increase of the low-bitrate redundancy (LBRR, the in-band FEC)
 /// frames, against libopus 1.6.1 silk/control_codec.c, silk_setup_LBRR,

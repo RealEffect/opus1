@@ -3,9 +3,9 @@
 //! compare it with the loop as libopus writes it, which carries a value from
 //! one coefficient to the next.
 
-use opus1::silk::macros::silk_smulbb;
-use opus1::silk::nlsf::silk_nlsf_vq;
-use opus1::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
+use opus1::internals::silk::macros::silk_smulbb;
+use opus1::internals::silk::nlsf::silk_nlsf_vq;
+use opus1::internals::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
 
 /// libopus `silk_NLSF_VQ`, line by line.
 fn reference(

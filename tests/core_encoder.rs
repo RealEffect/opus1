@@ -12,7 +12,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{aligned_snr, speech_fullband, to_stereo, toc_summary};
-use opus1::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
 
 const MODES: [(&str, i32, ForcedMode); 3] = [
     ("SILK", MODE_SILK, ForcedMode::SilkOnly),
@@ -123,7 +123,7 @@ fn forced_modes_at(rate: usize) {
             c_enc.force_mode(c_mode).bitrate(bitrate);
             let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
             enc.set_force_mode(Some(mode));
-            enc.bitrate_bps = bitrate;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             if limit_to_wideband {
                 c_enc.bandwidth(BW_WB);
                 enc.set_bandwidth(Bandwidth::Wideband);
@@ -183,8 +183,8 @@ fn forced_mode_yields_to_the_frame_size_and_the_application() {
                 c_enc.force_mode(c_mode).bitrate(32000).complexity(5);
                 let mut enc = OpusEncoder::new(rate as i32, 1, app).unwrap();
                 enc.set_force_mode(Some(mode));
-                enc.bitrate_bps = 32000;
-                enc.complexity = 5;
+                enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+                enc.set_complexity(5).unwrap();
                 let c_packets = c_enc.encode_all(&pcm, frame);
                 let packets = encode_all(&mut enc, &pcm, frame);
                 let what = format!("forced {name}, {} ms, {app_name}", frame_2_5ms as f32 * 2.5);
@@ -224,7 +224,7 @@ fn forced_silk_bandwidths_from_24_and_48_khz_input() {
                     c_enc.force_mode(MODE_SILK).bitrate(bitrate);
                     let mut enc = OpusEncoder::new(rate as i32, channels, Application::Voip).unwrap();
                     enc.set_force_mode(Some(ForcedMode::SilkOnly));
-                    enc.bitrate_bps = bitrate;
+                    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                     if use_max {
                         c_enc.max_bandwidth(*c_bw);
                         enc.set_max_bandwidth(*bw).unwrap();
@@ -279,8 +279,8 @@ fn bandwidth_settings_at(rate: usize, with_automatic_mode: bool) -> usize {
                             let mut c_enc = CEncoder::new(rate, channels, *c_app);
                             c_enc.bitrate(bitrate * channels as i32).complexity(5);
                             let mut enc = OpusEncoder::new(rate as i32, channels, *app).unwrap();
-                            enc.bitrate_bps = bitrate * channels as i32;
-                            enc.complexity = 5;
+                            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate * channels as i32)).unwrap();
+                            enc.set_complexity(5).unwrap();
                             enc.set_force_mode(mode);
                             if let Some(c_mode) = c_mode {
                                 c_enc.force_mode(c_mode);
@@ -350,8 +350,8 @@ fn automatic_mode_below_24_khz_input_follows_libopus() {
                     let mut c_enc = CEncoder::new(rate, channels, *c_app);
                     c_enc.bitrate(bitrate * channels as i32).complexity(5);
                     let mut enc = OpusEncoder::new(rate as i32, channels, *app).unwrap();
-                    enc.bitrate_bps = bitrate * channels as i32;
-                    enc.complexity = 5;
+                    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate * channels as i32)).unwrap();
+                    enc.set_complexity(5).unwrap();
                     let c_packets = c_enc.encode_all(&pcm, frame);
                     let packets = encode_all(&mut enc, &pcm, frame);
                     if toc_mismatches(&c_packets, &packets) != 0 {
@@ -394,8 +394,8 @@ fn automatic_mode_follows_the_stereo_width() {
             let mut c_enc = CEncoder::new(rate, 2, APP_VOIP);
             c_enc.bitrate(56000).complexity(5);
             let mut enc = OpusEncoder::new(rate as i32, 2, Application::Voip).unwrap();
-            enc.bitrate_bps = 56000;
-            enc.complexity = 5;
+            enc.set_bitrate(Bitrate::BitsPerSecond(56000)).unwrap();
+            enc.set_complexity(5).unwrap();
             let c_packets = c_enc.encode_all(pcm, frame);
             let packets = encode_all(&mut enc, pcm, frame);
             let celt = |p: &[Vec<u8>]| p.iter().filter(|x| is_mode(x[0], MODE_CELT)).count();
@@ -447,8 +447,8 @@ fn a_small_output_buffer_lowers_the_bitrate_the_decisions_go_by() {
                             let mut c_enc = CEncoder::new(rate, channels, *c_app);
                             c_enc.bitrate(bitrate).complexity(5);
                             let mut enc = OpusEncoder::new(rate as i32, channels, *app).unwrap();
-                            enc.bitrate_bps = bitrate;
-                            enc.complexity = 5;
+                            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                            enc.set_complexity(5).unwrap();
                             let mut buf = vec![0u8; max_bytes];
                             let (mut c_packets, mut packets) = (Vec::new(), Vec::new());
                             for f in pcm.chunks_exact(frame * channels) {
@@ -496,8 +496,8 @@ fn bandwidth_changes_in_a_running_stream_follow_libopus() {
         c_enc.force_mode(MODE_SILK).bitrate(20000 * channels as i32).complexity(5);
         let mut enc = OpusEncoder::new(rate as i32, channels, Application::Voip).unwrap();
         enc.set_force_mode(Some(ForcedMode::SilkOnly));
-        enc.bitrate_bps = 20000 * channels as i32;
-        enc.complexity = 5;
+        enc.set_bitrate(Bitrate::BitsPerSecond(20000 * channels as i32)).unwrap();
+        enc.set_complexity(5).unwrap();
         let (mut c_packets, mut packets) = (Vec::new(), Vec::new());
         let mut buf = vec![0u8; 4000];
         for (i, f) in pcm.chunks_exact(frame * channels).enumerate() {
@@ -566,7 +566,7 @@ fn lfe_is_celt_only_narrowband() {
                     assert!(enc.lfe());
                     enc.set_force_mode(Some(mode));
                     enc.set_bandwidth(Bandwidth::Fullband);
-                    enc.bitrate_bps = 16000;
+                    enc.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
                     let c_packets = c_enc.encode_all(&pcm, frame);
                     let packets = encode_all(&mut enc, &pcm, frame);
                     let what = format!("{rate} Hz, {app_name}, forced {mode_name}, {} ms", frame_2_5ms as f32 * 2.5);
@@ -634,10 +634,10 @@ fn final_range_run(stream: RangeStream) -> (usize, usize, usize) {
     let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
     enc.set_force_mode(Some(mode));
     enc.set_bandwidth(bandwidth);
-    enc.bitrate_bps = bitrate;
-    enc.use_cbr = cbr;
-    enc.use_inband_fec = fec;
-    enc.packet_loss_perc = if fec { 15 } else { 0 };
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_vbr(!cbr);
+    enc.set_inband_fec(fec);
+    enc.set_packet_loss_perc(if fec { 15 } else { 0 }).unwrap();
     assert_eq!(enc.final_range(), 0, "before the first packet");
     let mut c_dec = CDecoder::new(rate, channels);
     let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
@@ -744,7 +744,7 @@ fn stereo_hybrid_keeps_the_band_above_8_khz() {
     let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
     enc.set_force_mode(Some(ForcedMode::Hybrid));
     enc.set_bandwidth(Bandwidth::Fullband);
-    enc.bitrate_bps = 64000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     let left = |x: &[f32]| x.iter().step_by(2).copied().collect::<Vec<f32>>();
     let level = |packets: &[Vec<u8>]| {
         let decoded = c_decode_all(packets, rate, 2, frame);
@@ -762,14 +762,14 @@ fn stereo_hybrid_keeps_the_band_above_8_khz() {
 fn final_range_is_zero_without_coded_data() {
     for cbr in [false, true] {
         let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-        enc.use_cbr = cbr;
+        enc.set_vbr(!cbr);
         let pcm = speech(16000, 1, 0.4);
         let mut c_dec = CDecoder::new(16000, 1);
         let mut buf = vec![0u8; 400];
         for (i, f) in pcm.as_chunks::<320>().0.iter().enumerate() {
             // Normal packets first, then packets of 1 or 2 bytes.
             let starved = i >= 10;
-            enc.bitrate_bps = if starved { 600 } else { 24000 };
+            enc.set_bitrate(Bitrate::BitsPerSecond(if starved { 600 } else { 24000 })).unwrap();
             let n = enc.encode(f, 320, &mut buf).unwrap();
             c_dec.decode(Some(&buf[..n]), 320, false).unwrap();
             assert_eq!(enc.final_range(), c_dec.final_range(), "CBR {cbr}, packet {i} ({n} bytes)");
@@ -794,11 +794,11 @@ fn reset_state_gives_a_new_encoder_with_the_same_settings() {
             (Some(ForcedMode::Hybrid), Bandwidth::Auto, Bandwidth::Fullband, channels == 1),
         ] {
             let setup = |enc: &mut OpusEncoder| {
-                enc.bitrate_bps = 28000 * channels as i32;
-                enc.complexity = 7;
-                enc.use_cbr = rate == 16000;
-                enc.use_inband_fec = true;
-                enc.packet_loss_perc = 10;
+                enc.set_bitrate(Bitrate::BitsPerSecond(28000 * channels as i32)).unwrap();
+                enc.set_complexity(7).unwrap();
+                enc.set_vbr(!(rate == 16000));
+                enc.set_inband_fec(true);
+                enc.set_packet_loss_perc(10).unwrap();
                 enc.set_force_mode(mode);
                 enc.set_bandwidth(bandwidth);
                 enc.set_max_bandwidth(max).unwrap();
@@ -841,10 +841,10 @@ fn fec_decision_after_a_reset_matches_libopus() {
         let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
         c_enc.complexity(5).vbr(false).fec(true, 30).max_bandwidth(BW_WB);
         let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
-        enc.complexity = 5;
-        enc.use_cbr = true;
-        enc.use_inband_fec = true;
-        enc.packet_loss_perc = 30;
+        enc.set_complexity(5).unwrap();
+        enc.set_vbr(false);
+        enc.set_inband_fec(true);
+        enc.set_packet_loss_perc(30).unwrap();
         enc.set_max_bandwidth(Bandwidth::Wideband).unwrap();
         // A new C encoder at the low bitrate, for comparison.
         let mut c_new = CEncoder::new(rate, 1, APP_AUDIO);
@@ -859,7 +859,7 @@ fn fec_decision_after_a_reset_matches_libopus() {
             }
             let bitrate = if i < 15 { 64000 } else { 16000 };
             c_enc.bitrate(bitrate);
-            enc.bitrate_bps = bitrate;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             let c_packet = c_enc.encode(input);
             let n = enc.encode(input, frame, &mut buf).unwrap();
             assert_eq!(n, c_packet.len(), "{rate} Hz, packet {i}: size");

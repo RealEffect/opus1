@@ -15,14 +15,14 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::decode_indices::{
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::decode_indices::{
     silk_decode_indices, silk_stereo_decode_mid_only, silk_stereo_decode_pred,
 };
-use opus1::silk::decode_pulses::silk_decode_pulses;
-use opus1::silk::define::{CODE_CONDITIONALLY, CODE_INDEPENDENTLY};
-use opus1::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::internals::silk::decode_pulses::silk_decode_pulses;
+use opus1::internals::silk::define::{CODE_CONDITIONALLY, CODE_INDEPENDENTLY};
+use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 
 const MODE_CELT: i32 = 1002;
 
@@ -96,8 +96,8 @@ fn seeds_of_both(case: &Case) -> (Vec<Vec<i8>>, Vec<Vec<i8>>) {
     let Case { fs, channels, bandwidth, silk_ms, bitrate } = *case;
     let mut rs = OpusEncoder::new(fs as i32, channels, Application::Audio).unwrap();
     rs.set_bandwidth(bandwidth.0);
-    rs.bitrate_bps = bitrate;
-    rs.complexity = 0;
+    rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    rs.set_complexity(0).unwrap();
     let mut c = CEncoder::new(fs, channels, APP_AUDIO);
     c.bandwidth(bandwidth.1).bitrate(bitrate).complexity(0).force_channels(channels as i32);
 

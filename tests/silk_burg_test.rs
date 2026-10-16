@@ -12,8 +12,8 @@
 
 #[cfg(test)]
 mod tests {
-    use opus1::silk::define::MAX_PREDICTION_POWER_GAIN;
-    use opus1::silk::lpc_analysis::silk_burg_modified_fix;
+    use opus1::internals::silk::define::MAX_PREDICTION_POWER_GAIN;
+    use opus1::internals::silk::lpc_analysis::silk_burg_modified_fix;
     use std::f64::consts::PI;
 
     fn min_inv_gain_q30() -> i32 {

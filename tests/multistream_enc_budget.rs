@@ -24,7 +24,7 @@ mod multistream_enc_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 /// What a C stream encoder reports for `OPUS_GET_BITRATE` when it was set to
 /// `rate` and its last coded frame has `coded_frame` samples: at most what
@@ -78,7 +78,7 @@ fn low_delay_cbr_streams_have_the_sizes_and_bitrates_of_libopus() {
                         // The streams before the last keep the bitrate of
                         // the allocation.
                         three_bytes += usize::from((0..streams - 1).any(|s| {
-                            let rate = rust.stream_encoder(s).unwrap().bitrate_bps;
+                            let rate = bitrate_set(rust.stream_encoder(s).unwrap());
                             rounds_up_to_three_bytes(rate, frame_size, fs)
                         }));
                         frames += 1;
@@ -95,7 +95,7 @@ fn low_delay_cbr_streams_have_the_sizes_and_bitrates_of_libopus() {
                                     a.padding, b.padding
                                 ));
                             }
-                            let set = rust.stream_encoder(s).unwrap().bitrate_bps;
+                            let set = bitrate_set(rust.stream_encoder(s).unwrap());
                             let c_frame = b.samples(fs) / b.frames();
                             if reported(set, fs, c_frame) != c.stream_bitrate(s) {
                                 differences.push(format!(
@@ -159,8 +159,8 @@ fn a_cbr_stream_of_three_bytes_is_coded_like_libopus() {
             assert_eq!(sys::opus_encoder_ctl(c.0, sys::OPUS_SET_VBR_REQUEST, 0), 0);
         }
         let mut rust = OpusEncoder::new(fs, 1, Application::RestrictedLowDelay).unwrap();
-        rust.bitrate_bps = bitrate;
-        rust.use_cbr = true;
+        rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        rust.set_vbr(false);
         let pcm = noise(1, frame_size, 0.3, 3);
         let (mut a, mut b) = (vec![0u8; 1500], vec![0u8; 1500]);
         let n = rust.encode(&pcm, frame_size, &mut a).unwrap();

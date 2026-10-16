@@ -20,9 +20,9 @@ mod multistream_enc_common;
 use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::Application;
-use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
-use opus1::multistream::layout::MappingType;
+use opus1::{Application, Bitrate};
+use opus1::multistream::MultistreamEncoder;
+use opus1::multistream::MappingType;
 
 /// The output channel `j` of a decoder with the layout of `case` carries
 /// this input channel, or `None` when it is silent.
@@ -314,7 +314,7 @@ fn automatic_bitrate_in_surround_mode_is_not_narrowband() {
         // The allocation is the same in both encoders.
         assert_eq!(rust.bitrate(), c.bitrate(), "{channels} channels: bitrate");
         let allocated: i32 = (0..c.streams)
-            .map(|s| rust.stream_encoder(s).unwrap().bitrate_bps)
+            .map(|s| bitrate_set(rust.stream_encoder(s).unwrap()))
             .sum();
         let bandwidth = surround_bandwidth(allocated, channels, frame_size, fs);
         assert_eq!(bandwidth, opus1::Bandwidth::Fullband);
@@ -427,7 +427,7 @@ fn stream_bitrates_are_those_of_libopus() {
                         let c_parts = split_streams(&c_packet, c.streams).unwrap();
                         let mut same_frames = true;
                         for s in 0..c.streams {
-                            let set = rust.stream_encoder(s).unwrap().bitrate_bps;
+                            let set = bitrate_set(rust.stream_encoder(s).unwrap());
                             // What libopus reports depends on the frames of
                             // its own packet.
                             let c_frame = c_parts[s].samples(fs) / c_parts[s].frames();
@@ -575,7 +575,7 @@ fn constant_bitrate_gives_the_last_stream_what_is_left() {
             let left = (total - before) as i32;
             let channels = if streams == c.coupled { 2 } else { 1 };
             assert_eq!(
-                rust.stream_encoder(streams - 1).unwrap().bitrate_bps,
+                bitrate_set(rust.stream_encoder(streams - 1).unwrap()),
                 (left * 400).clamp(500, 750_000 * channels),
                 "{}: frame {f}: bitrate of the last stream",
                 case.name

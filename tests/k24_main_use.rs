@@ -21,6 +21,7 @@
 
 mod k24_common;
 use k24_common::*;
+use opus1::Bitrate;
 
 /// `seconds` of the speech fixture from `start_s` on, at 24 kHz, in two
 /// versions: as it is (nothing above 8 kHz, the fixture is 16 kHz speech),
@@ -101,8 +102,8 @@ fn own_encoder_stream_decodes_like_libopus() {
         for bitrate in [16000, 24000, 32000, 40000] {
             let mut enc_f = opus1::OpusEncoder::new(24000, 1, opus1::Application::Voip).unwrap();
             let mut enc_i = opus1::OpusEncoder::new(24000, 1, opus1::Application::Voip).unwrap();
-            enc_f.bitrate_bps = bitrate;
-            enc_i.bitrate_bps = bitrate;
+            enc_f.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc_i.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             let mut out_f = vec![0u8; 4000];
             let mut out_i = vec![0u8; 4000];
             let mut packets = Vec::new();

@@ -2,7 +2,7 @@
 //!
 //! Each test mirrors the minimal reproducer from the corresponding issue.
 
-use opus1::OpusDecoder;
+use opus1::{Bitrate, OpusDecoder};
 
 fn try_decode(label: &str, pkt: &[u8], frame_size: usize, channels: usize) {
     let mut dec = OpusDecoder::new(48000, channels).unwrap();
@@ -173,16 +173,16 @@ fn issue_7_decode_returns_actual_sample_count() {
     // CELT 20ms @ 48kHz mono → should return 960, not whatever frame_size was passed.
     let pkt = [0xF8_u8, 0x00, 0x00, 0x00, 0x00];
     let mut dec = OpusDecoder::new(48000, 1).unwrap();
-    let mut pcm = vec![0.0f32; 1920]; // pass double the needed size
+    let mut pcm = vec![7.0f32; 1920]; // pass double the needed size
     let n = dec.decode(&pkt, 1920, &mut pcm).unwrap();
     assert_eq!(
         n, 960,
         "should return actual decoded samples (960), got {n}"
     );
-    // tail should be zero-filled
+    // As in libopus, nothing after the decoded samples is written.
     assert!(
-        pcm[960..].iter().all(|&x| x == 0.0),
-        "tail should be zero-filled"
+        pcm[960..].iter().all(|&x| x == 7.0),
+        "the rest of the buffer was written"
     );
 }
 
@@ -314,7 +314,7 @@ fn silk_plc_produces_concealment_audio() {
     let sr = 16000;
     let fs = 320;
     let mut enc = OpusEncoder::new(sr, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
     // Encode several frames of a sine wave.
     let mut packets = Vec::new();

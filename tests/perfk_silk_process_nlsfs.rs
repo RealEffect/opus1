@@ -15,8 +15,8 @@
 // The generator repeats the index-based loops of the C program.
 #![allow(clippy::needless_range_loop)]
 
-use opus1::silk::nlsf::silk_process_nlsfs;
-use opus1::silk::structs::{SilkEncoderControl, SilkEncoderState};
+use opus1::internals::silk::nlsf::silk_process_nlsfs;
+use opus1::internals::silk::structs::{SilkEncoderControl, SilkEncoderState};
 
 /// (checksum of the input, checksum of all outputs, first index, first
 /// quantized value, first prediction coefficient).

@@ -8,8 +8,18 @@
 #![allow(dead_code)]
 
 use crate::ms_support::*;
-use opus1::Application;
-use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::multistream::MultistreamEncoder;
+use opus1::{Application, Bitrate, OpusEncoder};
+
+/// The bitrate a stream encoder was given, in bits per second. The
+/// multistream encoder gives every stream an explicit bitrate when it
+/// encodes a frame.
+pub fn bitrate_set(enc: &OpusEncoder) -> i32 {
+    match enc.bitrate_setting() {
+        Bitrate::BitsPerSecond(bps) => bps,
+        other => panic!("the stream encoder has no explicit bitrate: {other:?}"),
+    }
+}
 
 /// How the layout of a test case is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

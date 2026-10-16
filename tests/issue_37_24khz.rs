@@ -14,7 +14,7 @@
 //! libopus (which scores ~0.9 on the same signal).
 
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::TAU;
 
 const PRE_SKIP: usize = 312;
@@ -56,7 +56,7 @@ fn rust_roundtrip(rate: usize, ch: usize, app: Application, br: i32) -> (u8, f64
     input.resize(input.len() + pad.div_ceil(frame * ch) * frame * ch, 0.0);
 
     let mut enc = OpusEncoder::new(rate as i32, ch, app).unwrap();
-    enc.bitrate_bps = br;
+    enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     let mut dec = OpusDecoder::new(48_000, ch).unwrap();
     let (mut out, mut pkt, mut pcm) = (Vec::new(), [0u8; 8000], vec![0f32; 5760 * ch]);
     let mut toc = 0;

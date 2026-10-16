@@ -1,24 +1,7 @@
-use crate::silk::macros::{silk_mul, silk_smlawb};
+//! libopus `silk_lin2log` (silk/lin2log.c).
+//!
+//! The function lives in `macros.rs`, next to `silk_clz_frac`, which it is
+//! built on. This module keeps the path `silk::lin2log::silk_lin2log`, which
+//! the encoder modules import.
 
-pub fn silk_lin2log(in_lin: i32) -> i32 {
-    if in_lin <= 0 {
-        return 0;
-    }
-
-    let lz = in_lin.leading_zeros() as i32;
-
-    let rot = 24 - lz;
-    let x = in_lin as u32;
-    let frac_q7 = if rot == 0 {
-        x & 0x7f
-    } else if rot < 0 {
-        let m = (-rot) as u32;
-        x.rotate_left(m) & 0x7f
-    } else {
-        let r = rot as u32;
-        x.rotate_right(r) & 0x7f
-    } as i32;
-
-    let res = silk_smlawb(frac_q7, silk_mul(frac_q7, 128 - frac_q7), 179);
-    res + ((31 - lz) << 7)
-}
+pub use crate::silk::macros::silk_lin2log;

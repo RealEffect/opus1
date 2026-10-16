@@ -16,12 +16,12 @@ This glossary defines, in alphabetical order, the terms that these documents use
 - **Bandwidth (audio bandwidth)**: The highest audio frequency that a packet codes: narrowband (4 kHz), mediumband (6 kHz), wideband (8 kHz), super-wideband (12 kHz) or fullband (20 kHz). It is stored in the TOC byte and does not depend on the output sampling rate of the decoder (`opus1::Bandwidth`).
 - **Bit allocation**: CELT's rule for dividing the bits of a frame among its bands. Encoder and decoder compute the same split from a fixed table and a few values in the frame, for example per-band boosts and the allocation trim. So the split itself costs few bits.
 - **Bit-exact**: Producing exactly the same bits, or the same output samples, as a reference implementation. [What Opus is](01-what-is-opus.md#how-this-library-relates-to-libopus) says which parts of opus1 are bit-exact with libopus.
-- **Bitrate**: The number of bits per second that the encoder spends, usually given in kilobits per second (kb/s). Opus covers about 6 to 510 kb/s. In opus1 it is set with `OpusEncoder::bitrate_bps`.
+- **Bitrate**: The number of bits per second that the encoder spends, usually given in kilobits per second (kb/s). Opus covers about 6 to 510 kb/s. In opus1 it is set with `OpusEncoder::set_bitrate`.
 - **Bitstream**: The exact sequence of bits that an encoder writes and a decoder reads. RFC 6716 fixes the format of the Opus bitstream. Encoders may differ in which bits they choose to write.
 
 ## C
 
-- **CBR (constant bitrate)**: Every packet has the same size, whatever the audio. In opus1, `OpusEncoder::use_cbr = true` selects it.
+- **CBR (constant bitrate)**: Every packet has the same size, whatever the audio. In opus1, `OpusEncoder::set_vbr(false)` selects it.
 - **CELT (Constrained Energy Lapped Transform)**: The transform layer of Opus, from the Xiph.Org Foundation, for music and general audio. It codes MDCT coefficients band by band: the energy of each band explicitly, and the shape of each band with PVQ.
 - **Channel mapping table**: See mapping family.
 - **CNG (comfort noise generation)**: Noise that the SILK decoder adds while it conceals lost or missing frames, with the spectrum and level of the recent background noise. It keeps the background from dropping out during packet loss and during DTX.
@@ -159,7 +159,7 @@ This glossary defines, in alphabetical order, the terms that these documents use
 ## V
 
 - **VAD (voice activity detection)**: SILK's estimate of whether, and how strongly, a frame contains speech, made from the energy in four frequency bands. It decides whether a frame counts as having voice activity. It is also used for DTX, FEC and the timing of bandwidth switches.
-- **VBR (variable bitrate)**: The packet size follows how hard the audio is to code, while the average follows the bitrate asked for. It is the default in libopus and in opus1 (`use_cbr = false`).
+- **VBR (variable bitrate)**: The packet size follows how hard the audio is to code, while the average follows the bitrate asked for. It is the default in libopus and in opus1 (`set_vbr(true)`).
 - **Voiced, unvoiced**: SILK's classes for a frame with speech. Voiced frames are periodic, with a pitch (vowels). Unvoiced frames are noise-like (sounds such as "s" or "f"). A third class marks frames without voice activity.
 
 ## W

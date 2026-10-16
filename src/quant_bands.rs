@@ -1,5 +1,6 @@
+use crate::mathops::mac;
 use crate::modes::CeltMode;
-use crate::range_coder::{BITRES, RANGE_BUF_MAX, RangeCoder};
+use crate::range_coder::{RANGE_BUF_MAX, RangeCoder};
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -85,7 +86,7 @@ fn loss_distortion(
         let off = c * len;
         for i in start..end.min(len) {
             let d = e_bands[off + i] - old_e_bands[off + i];
-            dist += d * d;
+            dist = mac(dist, d, d);
         }
     }
     dist.min(200.0)
@@ -123,7 +124,9 @@ fn quant_coarse_energy_impl(
             let x = e_bands[c * m.nb_ebands + i];
             let old_e_val = old_e_bands[c * m.nb_ebands + i];
             let old_e = old_e_val.max(-9.0);
-            let f = x - coef * old_e - prev[c];
+            // C `x - MULT16_32_Q15(coef,oldE) - prev[c]`: the product is
+            // fused into the first subtraction on 64-bit ARM.
+            let f = mac(x, -coef, old_e) - prev[c];
 
             let mut qi = ((f + 0.5).floor() as i32).clamp(-32767, 32767);
 
@@ -180,9 +183,12 @@ fn quant_coarse_energy_impl(
 
             let q = qi as f32;
             error[c * m.nb_ebands + i] = f - q;
-            let tmp = coef * old_e + prev[c] + q;
+            // C `MULT16_32_Q15(coef,oldE) + prev[c] + q` and
+            // `prev[c] + q - MULT16_32_Q15(beta,q)`: each product is fused
+            // into the addition after it on 64-bit ARM.
+            let tmp = mac(prev[c], coef, old_e) + q;
             old_e_bands[c * m.nb_ebands + i] = tmp;
-            prev[c] = prev[c] + q - beta * q;
+            prev[c] = mac(prev[c] + q, -beta, q);
         }
     }
 
@@ -290,7 +296,7 @@ pub fn quant_coarse_energy_advanced(
             max_decay,
             lfe,
         );
-        let tell_intra = crate::tell_frac_inline!(enc);
+        let tell_intra = crate::range_coder::tell_frac_inline!(enc);
 
         let intra_state = enc.save_state();
         let intra_offs = enc.offs as usize;
@@ -317,7 +323,7 @@ pub fn quant_coarse_energy_advanced(
         );
 
         if badness1 < badness2
-            || (badness1 == badness2 && crate::tell_frac_inline!(enc) + intra_bias > tell_intra)
+            || (badness1 == badness2 && crate::range_coder::tell_frac_inline!(enc) + intra_bias > tell_intra)
         {
             enc.restore_state(&intra_state);
             enc.buf[start_offs..intra_offs].copy_from_slice(&intra_bytes);
@@ -331,7 +337,7 @@ pub fn quant_coarse_energy_advanced(
         *delayed_intra = new_distortion;
     } else {
         let pred2 = PRED_COEF[lm] * PRED_COEF[lm];
-        *delayed_intra = pred2 * *delayed_intra + new_distortion;
+        *delayed_intra = mac(new_distortion, pred2, *delayed_intra);
     }
 }
 
@@ -412,9 +418,12 @@ pub fn unquant_coarse_energy(
             let old_e = old_e_bands[c * m.nb_ebands + i];
 
             let q = qi as f32;
-            let tmp = coef * old_e + prev[c] + q;
+            // C `MULT16_32_Q15(coef,oldE) + prev[c] + q` and
+            // `prev[c] + q - MULT16_32_Q15(beta,q)`: each product is fused
+            // into the addition after it on 64-bit ARM.
+            let tmp = mac(prev[c], coef, old_e) + q;
             old_e_bands[c * m.nb_ebands + i] = tmp;
-            prev[c] = prev[c] + q - beta * q;
+            prev[c] = mac(prev[c] + q, -beta, q);
         }
     }
 }
@@ -774,7 +783,7 @@ mod tests {
             *delayed_intra = new_distortion;
         } else {
             let pred2 = PRED_COEF[lm] * PRED_COEF[lm];
-            *delayed_intra = pred2 * *delayed_intra + new_distortion;
+            *delayed_intra = mac(new_distortion, pred2, *delayed_intra);
         }
     }
 

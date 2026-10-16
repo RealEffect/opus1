@@ -11,7 +11,7 @@
 //! - VBR shrink behavior
 //! - hybrid mode sanity
 //! - known bad pattern regression (fc 7f fe) not produced for true silence
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::process::Command;
 
 const FRAME_SIZE: usize = 960;
@@ -157,7 +157,7 @@ fn is_finite_all(v: &[f32]) -> bool {
 fn celt_only_zero_pcm_cross_decode() {
     // D-1: CELT-only zero PCM 48k stereo Audio 960 192k
     let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc.bitrate_bps = 192000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     // Verify that at 192k it selects CELT-only (TOC should be 0xfc for 20ms stereo FB)
     let zero = vec![0.0f32; FRAME_SIZE * 2 * 5];
     let mut out = vec![0u8; 1500];
@@ -242,7 +242,7 @@ fn audio_to_silence_to_audio_transition() {
     let mut packets = Vec::new();
     let mut out = vec![0u8; 1500];
     let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc.bitrate_bps = 192000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     for f in 0..total {
         let chunk = &pcm[f * FRAME_SIZE * 2..(f + 1) * FRAME_SIZE * 2];
         let n = enc.encode(chunk, FRAME_SIZE, &mut out).unwrap();
@@ -314,7 +314,7 @@ fn repeated_silence_no_burst() {
     // D-3: 10-100 frames continuous zero
     for &n_frames in &[10, 50, 100] {
         let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-        enc.bitrate_bps = 192000;
+        enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
         let zero = vec![0.0f32; FRAME_SIZE * 2];
         let mut packets = Vec::new();
         let mut out = vec![0u8; 1500];
@@ -363,7 +363,7 @@ fn near_silence_threshold() {
     // D-4: test values around lsb_depth threshold (24 bits => 1/(1<<24) ≈5.96e-08)
     let threshold = 1.0 / ((1u32 << 24) as f32);
     let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc.bitrate_bps = 192000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     let mut out = vec![0u8; 1500];
     // prime with silence to get overlap_max=0
     let zero = vec![0.0f32; FRAME_SIZE * 2];
@@ -395,7 +395,7 @@ fn near_silence_threshold() {
     // Also test exact zero vs tiny: pure zero is silence, tiny below also silence, above not
     // Cross-decode both
     let mut enc2 = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc2.bitrate_bps = 192000;
+    enc2.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     // encode below and decode
     let mut pkts = Vec::new();
     for _ in 0..3 {
@@ -420,8 +420,8 @@ fn vbr_shrink_and_cbr_no_shrink() {
     let mut out = vec![0u8; 1500];
     // VBR (default)
     let mut enc_vbr = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc_vbr.bitrate_bps = 192000;
-    enc_vbr.use_cbr = false;
+    enc_vbr.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc_vbr.set_vbr(true);
     let n_vbr = enc_vbr.encode(&zero, FRAME_SIZE, &mut out).unwrap();
     assert!(
         n_vbr <= 10,
@@ -430,8 +430,8 @@ fn vbr_shrink_and_cbr_no_shrink() {
     );
     // CBR
     let mut enc_cbr = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc_cbr.bitrate_bps = 192000;
-    enc_cbr.use_cbr = true;
+    enc_cbr.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc_cbr.set_vbr(false);
     let n_cbr = enc_cbr.encode(&zero, FRAME_SIZE, &mut out).unwrap();
     assert!(
         n_cbr >= 400,
@@ -446,8 +446,8 @@ fn vbr_shrink_and_cbr_no_shrink() {
     );
     // For VBR, also check payload0 ff
     let mut enc_vbr2 = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc_vbr2.bitrate_bps = 192000;
-    enc_vbr2.use_cbr = false;
+    enc_vbr2.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc_vbr2.set_vbr(true);
     let n = enc_vbr2.encode(&zero, FRAME_SIZE, &mut out).unwrap();
     assert_eq!(out[1], 0xff, "VBR silence bit not true {:02x}", out[1]);
     let _ = n_vbr;
@@ -459,7 +459,7 @@ fn hybrid_zero_sanity() {
     // Hybrid mode: use 32k or 24k where Opus selects Hybrid for Audio?
     // At 48k 32kbps Audio should be Hybrid? Let's force hybrid by low bitrate
     let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc.bitrate_bps = 32000; // low enough to force Hybrid? Check encoder logic
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap(); // low enough to force Hybrid? Check encoder logic
     // Ensure mode is Hybrid by checking TOC? TOC for Hybrid has different config.
     let zero = vec![0.0f32; FRAME_SIZE * 2];
     let mut out = vec![0u8; 1500];
@@ -489,8 +489,8 @@ fn known_bad_pattern_not_emitted_for_true_silence() {
     // The bad pattern is TOC 0xfc + payload starting 7f fe (silence=false) with large size (480)
     // For VBR true silence, correct is 3 bytes ff fe
     let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
-    enc.bitrate_bps = 192000;
-    enc.use_cbr = false;
+    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_vbr(true);
     let zero = vec![0.0f32; FRAME_SIZE * 2];
     let mut out = vec![0u8; 1500];
     // Encode enough frames to get into stable silence (account for overlap)

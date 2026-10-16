@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus1::modes::default_mode;
-use opus1::quant_bands::{quant_coarse_energy, quant_fine_energy};
-use opus1::range_coder::RangeCoder;
+use opus1::internals::modes::default_mode;
+use opus1::internals::quant_bands::{quant_coarse_energy, quant_fine_energy};
+use opus1::internals::range_coder::RangeCoder;
 
 #[test]
 fn test_quant_energy_match() {

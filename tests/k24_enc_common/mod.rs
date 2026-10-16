@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use audiopus_sys as sys;
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 use std::os::raw::c_int;
 
 /// The input rate under test.
@@ -282,11 +282,11 @@ pub fn rs_encoder(cfg: &Cfg) -> OpusEncoder {
         App::LowDelay => Application::RestrictedLowDelay,
     };
     let mut enc = OpusEncoder::new(FS as i32, cfg.channels, app).unwrap();
-    enc.bitrate_bps = cfg.bitrate;
-    enc.use_cbr = cfg.cbr;
-    enc.complexity = cfg.complexity;
-    enc.use_inband_fec = cfg.fec;
-    enc.packet_loss_perc = cfg.loss;
+    enc.set_bitrate(Bitrate::BitsPerSecond(cfg.bitrate)).unwrap();
+    enc.set_vbr(!cfg.cbr);
+    enc.set_complexity(cfg.complexity).unwrap();
+    enc.set_inband_fec(cfg.fec);
+    enc.set_packet_loss_perc(cfg.loss).unwrap();
     enc
 }
 

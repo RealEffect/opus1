@@ -6,9 +6,9 @@
 //! (`enc_kernel_tests`), which compare them bit for bit with the plain
 //! loops they replace. The tests here check what a caller can observe.
 
-use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// Input rates of the CELT encoder and how many 48 kHz samples one input
 /// sample stands for.

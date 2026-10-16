@@ -2,8 +2,8 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus1::silk::define::*;
-use opus1::silk::pitch_analysis::silk_pitch_analysis_core;
+use opus1::internals::silk::define::*;
+use opus1::internals::silk::pitch_analysis::silk_pitch_analysis_core;
 use std::f32::consts::PI;
 
 #[test]

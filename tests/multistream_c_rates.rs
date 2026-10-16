@@ -1,4 +1,4 @@
-//! `opus1::multistream::rate_alloc` against C libopus.
+//! `opus1::internals::multistream::rate_alloc` against C libopus.
 //!
 //! The C multistream encoder gives every stream encoder a bitrate before it
 //! encodes a frame. That bitrate can be read back from the stream encoder
@@ -14,8 +14,8 @@
 mod ms_support;
 
 use ms_support::*;
-use opus1::multistream::layout::{ChannelLayout, MappingType};
-use opus1::multistream::rate_alloc::{
+use opus1::multistream::{ChannelLayout, MappingType};
+use opus1::internals::multistream::rate_alloc::{
     MS_FRAME_TMP, cbr_last_stream_bitrate, cbr_max_data_bytes, clamp_user_bitrate, rate_allocation,
     smallest_packet, stream_max_bytes,
 };

@@ -2,8 +2,8 @@
 //! libopus celt/mathops.h.
 //!
 //! `mac` and `mac_f64` round as libopus does on the processor this crate is
-//! built for. `pitch::mul_acc` and `kiss_fft::Arith` are separate on
-//! purpose: their callers choose the rounding at compile time.
+//! built for. `kiss_fft::Arith` is separate on purpose: its callers choose
+//! the rounding at compile time.
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;

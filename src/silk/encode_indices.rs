@@ -162,31 +162,6 @@ pub fn silk_encode_indices(
     ps_range_enc.encode_icdf(ps_indices.seed as i32, &SILK_UNIFORM4_ICDF, 8);
 }
 
-/// Quantization indices `[interval % 3, sub-step, interval / 3]` of a zero
-/// stereo predictor: what libopus's `silk_stereo_quant_pred` makes of
-/// pred (0, 0), as for its `toMono` frames. Interval 7, sub-step 2 is level
-/// -820 + 164 * 5 = 0, and the joint symbol is 5 * 2 + 2 = 12.
-const NEUTRAL_PRED_IX: [[i8; 3]; 2] = [[1, 2, 2], [1, 2, 2]];
-
-/// Write a frame's stereo header with a zero predictor: the mid/side
-/// predictors, then the mid-only flag.
-///
-/// The decoder applies the predictors to mid-only frames too (side = pred *
-/// mid in `silk_stereo_ms_to_lr`), so a non-zero one skews the channels.
-/// Index 0, for example, is pred (0, -13364) and decodes as
-/// L = -0.63 * mid, R = 2.63 * mid. `_side_idx` and `_pred_idx` are
-/// ignored. The stereo encoder writes its real predictors with
-/// [`silk_stereo_encode_pred`].
-pub fn silk_encode_stereo(
-    ps_range_enc: &mut RangeCoder,
-    _side_idx: i8,
-    _pred_idx: i8,
-    only_middle: i8,
-) {
-    silk_stereo_encode_pred(ps_range_enc, &NEUTRAL_PRED_IX);
-    silk_stereo_encode_mid_only(ps_range_enc, only_middle);
-}
-
 /// Entropy code the mid/side predictor indices (libopus
 /// `silk_stereo_encode_pred`), as `silk_stereo_quant_pred` returns them.
 pub fn silk_stereo_encode_pred(ps_range_enc: &mut RangeCoder, ix: &[[i8; 3]; 2]) {
@@ -211,9 +186,18 @@ mod tests {
     use super::*;
     use crate::silk::decode_indices::{silk_stereo_decode_mid_only, silk_stereo_decode_pred};
 
+    /// Quantization indices `[interval % 3, sub-step, interval / 3]` of a
+    /// zero stereo predictor: what libopus's `silk_stereo_quant_pred` makes
+    /// of pred (0, 0), as for its `toMono` frames. Interval 7, sub-step 2 is
+    /// level -820 + 164 * 5 = 0, and the joint symbol is 5 * 2 + 2 = 12.
+    const NEUTRAL_PRED_IX: [[i8; 3]; 2] = [[1, 2, 2], [1, 2, 2]];
+
+    /// A stereo header with a zero predictor and the mid-only flag, then
+    /// decoded again.
     fn round_trip(only_middle: i8) -> ([i32; 2], bool) {
         let mut enc = RangeCoder::new_encoder(64);
-        silk_encode_stereo(&mut enc, 0, 0, only_middle);
+        silk_stereo_encode_pred(&mut enc, &NEUTRAL_PRED_IX);
+        silk_stereo_encode_mid_only(&mut enc, only_middle);
         let bytes = enc.finish();
         let mut dec = RangeCoder::new_decoder(&bytes);
         let pred = silk_stereo_decode_pred(&mut dec);

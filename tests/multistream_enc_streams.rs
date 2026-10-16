@@ -29,9 +29,9 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::multistream::encoder::MultistreamEncoder;
-use opus1::multistream::layout::MappingType;
-use opus1::multistream::surround::SurroundProbe;
+use opus1::multistream::MultistreamEncoder;
+use opus1::multistream::MappingType;
+use opus1::internals::multistream::surround::SurroundProbe;
 use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 /// A rising sine with a little noise, different on every channel.
@@ -217,8 +217,8 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                 let stream = enc.stream_encoder(s).unwrap();
                 // The bitrate of the allocation, or under constant bitrate
                 // what was left for the last stream.
-                single.bitrate_bps = stream.bitrate_bps;
-                single.use_cbr = !vbr;
+                single.set_bitrate(stream.bitrate_setting()).unwrap();
+                single.set_vbr(vbr);
                 let (left, right) = inputs[s];
                 // What a surround or ambisonics layout sets on a stream
                 // (opus_multistream_encoder.c:939-962).

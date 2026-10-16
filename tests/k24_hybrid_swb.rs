@@ -19,7 +19,7 @@
 
 mod k24_common;
 use k24_common::*;
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 /// Lowest per-frame SNR (opus1 against libopus) from frame `skip` on.
 fn worst_frame_snr(packets: &[Vec<u8>], rate: usize, skip: usize) -> f64 {
@@ -70,7 +70,7 @@ fn own_encoder_24k_voip_packets_decode_like_libopus() {
     // speech and would leave the CELT layer of the Hybrid packets empty.
     let pcm = speech_fullband(24000, 3.0);
     let mut enc = OpusEncoder::new(24000, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     let mut buf = [0u8; 1500];
     let packets: Vec<Vec<u8>> = pcm
         .chunks_exact(480)

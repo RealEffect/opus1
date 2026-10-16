@@ -1,16 +1,17 @@
 //! The public functions of `src/pitch.rs` and `src/celt_lpc.rs` against plain
 //! reference code.
 //!
-//! The reference code in this file is written one sample at a time. It follows
-//! the order of additions that each function has on the target:
+//! The reference code in this file is libopus's C code, written one sample at
+//! a time, with the order of additions of libopus on the target:
 //!
-//! - aarch64 adds most sums of products with fused multiply-add, in the two
-//!   orders described at the top of `src/pitch.rs`;
-//! - every other target that this file is compiled for multiplies and adds
-//!   separately, one product after the other.
+//! - on aarch64 libopus adds every product of these sums with a fused
+//!   multiply-add, and its NEON kernels have the orders described at the top
+//!   of `src/pitch.rs`;
+//! - on every other target that this file is compiled for, libopus's C code
+//!   multiplies and adds separately, one product after the other.
 //!
-//! The x86 kernels use other orders again, which this file does not describe,
-//! so it is not compiled for x86.
+//! The x86 kernels of this crate use other orders, which this file does not
+//! describe, so it is not compiled for x86.
 //!
 //! Every input and output slice is placed directly before or directly after
 //! a memory page that must not be touched (see `Region`). A kernel that reads
@@ -21,8 +22,8 @@
 // The reference functions repeat the index-based loops of the C code.
 #![allow(clippy::needless_range_loop)]
 
-use opus1::celt_lpc::autocorr;
-use opus1::pitch::{
+use opus1::internals::celt_lpc::autocorr;
+use opus1::internals::pitch::{
     dual_inner_prod, inner_prod, pitch_downsample, pitch_search, pitch_xcorr, remove_doubling,
 };
 
@@ -250,50 +251,61 @@ fn assert_same(got: &[f32], want: &[f32], what: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Reference code
+// Reference code: libopus's C code and NEON kernels, one sample at a time
 // ---------------------------------------------------------------------------
 
-/// `inner_prod`.
+/// `acc + a * b` as libopus computes `MAC16_16` and other products in a sum
+/// on this target: one fused multiply-add on aarch64 (clang contracts the C
+/// expression, and the NEON kernels ask for it), a separate multiply and add
+/// elsewhere.
+fn mac(acc: f32, a: f32, b: f32) -> f32 {
+    if NEON { a.mul_add(b, acc) } else { acc + a * b }
+}
+
+/// libopus `MAX16(a, b)` and `MAX32(a, b)` of the float build:
+/// `a > b ? a : b`.
+fn max_first(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+
+/// libopus `celt_inner_prod`.
 ///
-/// aarch64: four running sums that take the samples 4m, 4m+1, 4m+2 and 4m+3
-/// with fused multiply-add; they are added as (s0 + s1) + (s2 + s3); the last
-/// `n % 4` products follow with a separate multiply and add.
-/// Elsewhere: one running sum, a separate multiply and add per sample.
+/// aarch64 (`celt_inner_prod_neon`): four running sums that take the samples
+/// 4m, 4m+1, 4m+2 and 4m+3; they are added as (s0 + s2) + (s1 + s3); the last
+/// `n % 4` products follow one by one.
+/// Elsewhere (`celt_inner_prod_c`): one running sum.
 fn ref_inner(x: &[f32], y: &[f32], n: usize) -> f32 {
     if NEON {
         let whole = n / 4 * 4;
         let mut s = [0.0f32; 4];
         for j in 0..whole {
-            s[j % 4] = x[j].mul_add(y[j], s[j % 4]);
+            s[j % 4] = mac(s[j % 4], x[j], y[j]);
         }
-        let mut sum = (s[0] + s[1]) + (s[2] + s[3]);
+        let mut sum = (s[0] + s[2]) + (s[1] + s[3]);
         for j in whole..n {
-            sum += x[j] * y[j];
+            sum = mac(sum, x[j], y[j]);
         }
         sum
     } else {
         let mut sum = 0.0f32;
         for j in 0..n {
-            sum += x[j] * y[j];
+            sum = mac(sum, x[j], y[j]);
         }
         sum
     }
 }
 
-/// `pitch_xcorr`: `out[k] = sum over j < len of x[j] * y[j + k]`.
-///
-/// aarch64: with 32 lags or more, the lags below the largest multiple of four
-/// use one running sum and a fused multiply-add per sample. All other lags
-/// are computed like `inner_prod`.
-/// Elsewhere: one running sum, a separate multiply and add per sample.
+/// libopus `celt_pitch_xcorr`: `out[k] = sum over j < len of x[j] * y[j + k]`.
+/// The lags below the largest multiple of four have one running sum each
+/// (`xcorr_kernel`), the others are `celt_inner_prod`.
 fn ref_xcorr(x: &[f32], y: &[f32], len: usize, lags: usize) -> Vec<f32> {
-    let by_sample = if NEON && lags >= 32 { lags & !3 } else { 0 };
+    let by_sample = lags & !3;
     (0..lags)
         .map(|k| {
             if k < by_sample {
                 let mut sum = 0.0f32;
                 for j in 0..len {
-                    sum = x[j].mul_add(y[j + k], sum);
+                    sum = mac(sum, x[j], y[j + k]);
                 }
                 sum
             } else {
@@ -303,28 +315,8 @@ fn ref_xcorr(x: &[f32], y: &[f32], len: usize, lags: usize) -> Vec<f32> {
         .collect()
 }
 
-/// One plus the energy of `y`, the start value in `find_best_pitch`.
-fn ref_energy_plus_one(y: &[f32]) -> f32 {
-    if NEON {
-        let whole = y.len() / 4 * 4;
-        let mut s = [0.0f32; 4];
-        for j in 0..whole {
-            s[j % 4] = y[j].mul_add(y[j], s[j % 4]);
-        }
-        let mut sum = 1.0f32 + ((s[0] + s[1]) + (s[2] + s[3]));
-        for &v in &y[whole..] {
-            sum += v * v;
-        }
-        sum
-    } else {
-        let mut sum = 1.0f32;
-        for &v in y {
-            sum += v * v;
-        }
-        sum
-    }
-}
-
+/// libopus `find_best_pitch` of the float build.
+///
 /// `keep_limit` is true for the real algorithm. With false the running energy
 /// is not held at 1 or above; the tests use that to show that their inputs
 /// reach the limit.
@@ -338,7 +330,10 @@ fn ref_find_best_pitch(
     let mut best_num = [-1.0f32, -1.0f32];
     let mut best_den = [0.0f32, 0.0f32];
     let mut best_pitch = [0usize, 1];
-    let mut syy = ref_energy_plus_one(&y[..len]);
+    let mut syy = 1.0f32;
+    for j in 0..len {
+        syy = mac(syy, y[j], y[j]);
+    }
     for i in 0..max_pitch {
         if xcorr[i] > 0.0 {
             let xc16 = xcorr[i] * 1e-12;
@@ -358,15 +353,17 @@ fn ref_find_best_pitch(
                 }
             }
         }
-        syy += y[i + len] * y[i + len] - y[i] * y[i];
-        if keep_limit && syy < 1.0 {
-            syy = 1.0;
+        // C `Syy += y[i+len]*y[i+len] - y[i]*y[i]`: clang fuses the first
+        // product into the subtraction.
+        syy += mac(-(y[i] * y[i]), y[i + len], y[i + len]);
+        if keep_limit {
+            syy = max_first(1.0, syy);
         }
     }
     best_pitch
 }
 
-/// `pitch_search` as it was before the package: every step written out.
+/// libopus `pitch_search`, every step written out.
 fn ref_pitch_search(
     x_lp: &[f32],
     y: &[f32],
@@ -386,14 +383,11 @@ fn ref_pitch_search(
 
     xcorr.resize(max_pitch, 0.0);
     for i in 0..max_pitch {
-        xcorr[i] = -1.0;
+        xcorr[i] = 0.0;
         if (i as i32 - 2 * best[0] as i32).abs() > 2 && (i as i32 - 2 * best[1] as i32).abs() > 2 {
             continue;
         }
-        xcorr[i] = ref_inner(x_lp, &y[i..], len);
-        if xcorr[i] < -1.0 {
-            xcorr[i] = -1.0;
-        }
+        xcorr[i] = max_first(-1.0, ref_inner(x_lp, &y[i..], len));
     }
     best = ref_find_best_pitch(&xcorr, y, len, max_pitch, keep_limit);
 
@@ -411,18 +405,16 @@ fn ref_pitch_search(
     ((2 * best[0]) as isize).wrapping_sub(offset) as usize
 }
 
+/// libopus `compute_pitch_gain` of the float build.
 fn ref_pitch_gain(xy: f32, xx: f32, yy: f32) -> f32 {
-    if xy <= 0.0 || xx <= 0.0 || yy <= 0.0 {
-        return 0.0;
-    }
-    xy / (1.0 + xx * yy).sqrt()
+    xy / mac(1.0, xx, yy).sqrt()
 }
 
-/// `remove_doubling` as it was before the package: one inner product per
-/// call, and the energy of every lag up to `max_period / 2`.
+/// libopus 1.6.1 `remove_doubling`: one inner product per call, and the
+/// energy of every lag up to `max_period / 2`.
 ///
-/// `keep_limit` is true for the real algorithm. With false the running energy
-/// is not held at 0 or above (see `ref_find_best_pitch`).
+/// `keep_limit` is true for the real algorithm. With false the energies in
+/// the table are not held at 0 or above (see `ref_find_best_pitch`).
 #[allow(clippy::too_many_arguments)]
 fn ref_remove_doubling(
     x: &[f32],
@@ -448,14 +440,11 @@ fn ref_remove_doubling(
     let xy = ref_inner(x_target, &x[max_period - t0..], n);
     let mut yy_lookup = vec![0.0f32; max_period + 1];
     yy_lookup[0] = xx;
-    let mut yy_curr = xx;
+    let mut yy = xx;
     for i in 1..=max_period {
-        yy_curr = yy_curr + x[max_period - i] * x[max_period - i]
-            - x[max_period + n - i] * x[max_period + n - i];
-        if keep_limit && yy_curr < 0.0 {
-            yy_curr = 0.0;
-        }
-        yy_lookup[i] = yy_curr;
+        let (a, b) = (x[max_period - i], x[max_period + n - i]);
+        yy = mac(mac(yy, a, a), -b, b);
+        yy_lookup[i] = if keep_limit { max_first(0.0, yy) } else { yy };
     }
 
     let mut best_xy = xy;
@@ -484,11 +473,11 @@ fn ref_remove_doubling(
         } else if (t1 as i32 - prev_period as i32).abs() <= 2 && 5 * k * k < t0 {
             cont = 0.5 * prev_gain;
         }
-        let mut thresh = (0.7 * g0 - cont).max(0.3);
+        let mut thresh = max_first(0.3, mac(-cont, 0.7, g0));
         if t1 < 3 * min_period {
-            thresh = (0.85 * g0 - cont).max(0.4);
+            thresh = max_first(0.4, mac(-cont, 0.85, g0));
         } else if t1 < 2 * min_period {
-            thresh = (0.9 * g0 - cont).max(0.5);
+            thresh = max_first(0.5, mac(-cont, 0.9, g0));
         }
         if g1 > thresh {
             best_xy = xy_new;
@@ -498,8 +487,8 @@ fn ref_remove_doubling(
         }
     }
 
-    best_xy = best_xy.max(0.0);
-    let pg = if best_yy <= best_xy {
+    best_xy = max_first(0.0, best_xy);
+    let mut pg = if best_yy <= best_xy {
         1.0f32
     } else {
         best_xy / (best_yy + 1.0)
@@ -515,29 +504,56 @@ fn ref_remove_doubling(
     } else if (xcorr[0] - xcorr[2]) > 0.7 * (xcorr[1] - xcorr[2]) {
         offset = -1;
     }
-
+    if pg > g {
+        pg = g;
+    }
     *t0_ptr = ((2 * t as i32 + offset) as usize).max(min_period0);
-    pg.min(g)
+    pg
 }
 
-/// The spectral flattening at the end of `pitch_downsample` (libopus,
-/// celt/pitch.c): an LPC analysis of order 4 and a 5-tap filter built from
-/// it. The autocorrelation and the LPC recursion are the library's own; they
-/// have their tests further down.
+/// libopus `_celt_lpc` of the float build.
+fn ref_lpc(ac: &[f32], p: usize) -> Vec<f32> {
+    let mut lpc = vec![0.0f32; p];
+    let mut error = ac[0];
+    if ac[0] > 1e-10 {
+        for i in 0..p {
+            let mut rr = 0.0f32;
+            for j in 0..i {
+                rr = mac(rr, lpc[j], ac[i - j]);
+            }
+            rr += ac[i + 1];
+            let r = -rr / error;
+            lpc[i] = r;
+            for j in 0..(i + 1) >> 1 {
+                let tmp1 = lpc[j];
+                let tmp2 = lpc[i - 1 - j];
+                lpc[j] = mac(tmp1, r, tmp2);
+                lpc[i - 1 - j] = mac(tmp2, r, tmp1);
+            }
+            error = mac(error, -(r * r), error);
+            if error <= 0.001 * ac[0] {
+                break;
+            }
+        }
+    }
+    lpc
+}
+
+/// The spectral flattening at the end of libopus `pitch_downsample`
+/// (celt/pitch.c): an LPC analysis of order 4 and a 5-tap filter built from
+/// it.
 fn ref_flatten(x_lp: &mut [f32]) {
     let len = x_lp.len();
     if len < 5 {
         return;
     }
-    let mut ac = [0.0f32; 5];
-    opus1::celt_lpc::autocorr(x_lp, &mut ac, None, 0, 4, len);
+    let mut ac = ref_autocorr(x_lp, None, 0, 4);
     ac[0] *= 1.0001;
     for i in 1..=4 {
         let f = 0.008 * i as f32;
-        ac[i] -= ac[i] * f * f;
+        ac[i] = mac(ac[i], -(ac[i] * f), f);
     }
-    let mut coef = [0.0f32; 4];
-    opus1::celt_lpc::lpc(&mut coef, &ac, 4);
+    let mut coef = ref_lpc(&ac, 4);
     let mut tmp = 1.0f32;
     for c in coef.iter_mut() {
         tmp *= 0.9;
@@ -545,18 +561,18 @@ fn ref_flatten(x_lp: &mut [f32]) {
     }
     let num = [
         coef[0] + 0.8,
-        coef[1] + 0.8 * coef[0],
-        coef[2] + 0.8 * coef[1],
-        coef[3] + 0.8 * coef[2],
+        mac(coef[1], 0.8, coef[0]),
+        mac(coef[2], 0.8, coef[1]),
+        mac(coef[3], 0.8, coef[2]),
         0.8 * coef[3],
     ];
-    // x[i] += num[0] * x[i - 1] + .. + num[4] * x[i - 5], on the old values,
-    // with zeros before the first sample.
+    // libopus `celt_fir5`: x[i] += num[0] * x[i - 1] + .. + num[4] * x[i - 5],
+    // on the old values, with zeros before the first sample.
     let mut past = [0.0f32; 5];
     for v in x_lp.iter_mut() {
         let mut sum = *v;
         for j in 0..5 {
-            sum += num[j] * past[j];
+            sum = mac(sum, num[j], past[j]);
         }
         past.copy_within(0..4, 1);
         past[0] = *v;
@@ -564,40 +580,52 @@ fn ref_flatten(x_lp: &mut [f32]) {
     }
 }
 
-/// The decimation of `pitch_downsample`, before the spectral flattening.
+/// The decimation of libopus `pitch_downsample`, before the spectral
+/// flattening. clang computes `.25f*a + .25f*b + .5f*c` as
+/// `fma(c, .5, fma(a, .25, .25 * b))` on aarch64. The first channel is
+/// stored, the second added to it. A channel that lacks a sample adds
+/// nothing (libopus is never called with such a channel).
 fn ref_downsample(x: &[&[f32]], len: usize, factor: usize) -> Vec<f32> {
     let offset = factor / 2;
     let mut out = vec![0.0f32; len];
     for i in 1..len {
         let mut val = 0.0f32;
-        for x_k in x {
+        for (k, x_k) in x.iter().enumerate() {
             if factor * i + offset < x_k.len() {
-                val += 0.25 * x_k[factor * i - offset]
-                    + 0.25 * x_k[factor * i + offset]
-                    + 0.5 * x_k[factor * i];
+                let v = mac(
+                    mac(
+                        0.25 * x_k[factor * i + offset],
+                        x_k[factor * i - offset],
+                        0.25,
+                    ),
+                    x_k[factor * i],
+                    0.5,
+                );
+                val = if k == 0 { v } else { val + v };
             }
         }
         out[i] = val;
     }
     let mut val = 0.0f32;
-    for x_k in x {
+    for (k, x_k) in x.iter().enumerate() {
         if offset < x_k.len() {
-            val += 0.25 * x_k[offset] + 0.5 * x_k[0];
+            let v = mac(0.5 * x_k[0], x_k[offset], 0.25);
+            val = if k == 0 { v } else { val + v };
         }
     }
     out[0] = val;
     out
 }
 
-/// `autocorr`: the first `n - lag` products of every lag come from
-/// `pitch_xcorr`, the others are added to that one by one.
+/// libopus `_celt_autocorr`: the first `n - lag` products of every lag come
+/// from `celt_pitch_xcorr`, the others are summed from 0 and then added.
 fn ref_autocorr(x: &[f32], window: Option<&[f32]>, overlap: usize, lag: usize) -> Vec<f32> {
     let n = x.len();
     let mut xx = x.to_vec();
     if let Some(win) = window {
         for i in 0..overlap {
-            xx[i] *= win[i];
-            xx[n - 1 - i] *= win[i];
+            xx[i] = x[i] * win[i];
+            xx[n - 1 - i] = x[n - 1 - i] * win[i];
         }
     }
     let fast_n = n - lag;
@@ -605,7 +633,7 @@ fn ref_autocorr(x: &[f32], window: Option<&[f32]>, overlap: usize, lag: usize) -
     for (k, out) in ac.iter_mut().enumerate() {
         let mut d = 0.0f32;
         for i in k + fast_n..n {
-            d += xx[i] * xx[i - k];
+            d = mac(d, xx[i], xx[i - k]);
         }
         *out += d;
     }
@@ -617,7 +645,7 @@ fn ref_autocorr(x: &[f32], window: Option<&[f32]>, overlap: usize, lag: usize) -
 // ---------------------------------------------------------------------------
 
 #[test]
-fn inner_products_follow_the_order_of_the_target() {
+fn inner_products_follow_libopus() {
     let mut g = Gen(0xA11CE);
     let (mut rx, mut ry1, mut ry2) = (Region::new(), Region::new(), Region::new());
     for kind in FILLS {
@@ -642,7 +670,7 @@ fn inner_products_follow_the_order_of_the_target() {
 }
 
 #[test]
-fn pitch_xcorr_follows_the_order_of_the_target() {
+fn pitch_xcorr_follows_libopus() {
     let mut g = Gen(0xB0B);
     let (mut rx, mut ry, mut rout) = (Region::new(), Region::new(), Region::new());
     // Every pair of small sizes, then the sizes of the encoder (30 to 240
@@ -720,7 +748,7 @@ fn pitch_xcorr_with_a_short_y_writes_only_the_lags_that_fit() {
 }
 
 #[test]
-fn pitch_downsample_matches_the_formula() {
+fn pitch_downsample_follows_libopus() {
     let mut g = Gen(0xD0E);
     let (mut r0, mut r1, mut r2, mut rout) =
         (Region::new(), Region::new(), Region::new(), Region::new());
@@ -767,7 +795,7 @@ fn pitch_downsample_matches_the_formula() {
 }
 
 #[test]
-fn pitch_search_matches_the_old_algorithm() {
+fn pitch_search_follows_libopus() {
     let mut g = Gen(0x5EA2C4);
     let (mut rx, mut ry) = (Region::new(), Region::new());
     let mut results = std::collections::BTreeSet::new();
@@ -832,7 +860,7 @@ fn pitch_search_matches_the_old_algorithm() {
 }
 
 #[test]
-fn remove_doubling_matches_the_old_algorithm() {
+fn remove_doubling_follows_libopus() {
     let mut g = Gen(0xD0B1E);
     let mut rx = Region::new();
     let mut changed_period = 0;
@@ -982,9 +1010,10 @@ fn pitch_search_holds_the_window_energy_at_one() {
     );
 }
 
-/// The energies in `remove_doubling` are a running sum too, held at 0 (see
-/// `pitch_search_holds_the_window_energy_at_one`). Here the loud samples are
-/// the last ones of the target, which leave the window first.
+/// The energies in `remove_doubling` come from a running sum too. libopus
+/// stores each one held at 0 or above, but keeps the running sum itself as
+/// it is (see `pitch_search_holds_the_window_energy_at_one`). Here the loud
+/// samples are the last ones of the target, which leave the window first.
 #[test]
 fn remove_doubling_holds_the_energy_at_zero() {
     let mut g = Gen(0x2E20);
@@ -1057,7 +1086,7 @@ fn remove_doubling_holds_the_energy_at_zero() {
 }
 
 #[test]
-fn autocorr_matches_the_old_algorithm() {
+fn autocorr_follows_libopus() {
     let mut g = Gen(0xAC);
     let (mut rx, mut rac, mut rwin) = (Region::new(), Region::new(), Region::new());
     let win: Vec<f32> = (0..160)

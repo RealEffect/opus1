@@ -29,7 +29,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder, packet};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder, packet};
 
 /// A small deterministic generator (the 64-bit LCG of Knuth's MMIX).
 struct Rng(u64);
@@ -251,14 +251,14 @@ fn walk(
         c_enc.set(sys::OPUS_SET_INBAND_FEC_REQUEST, s.fec as i32);
         c_enc.set(sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, s.loss);
         c_enc.set(sys::OPUS_SET_COMPLEXITY_REQUEST, s.complexity);
-        enc.bitrate_bps = s.bitrate;
-        enc.use_cbr = s.cbr;
+        enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
+        enc.set_vbr(!s.cbr);
         enc.set_force_mode(s.mode.map(|m| m.1));
         enc.set_bandwidth(s.bandwidth.1);
         enc.set_max_bandwidth(s.max_bandwidth.1).unwrap();
-        enc.use_inband_fec = s.fec;
-        enc.packet_loss_perc = s.loss;
-        enc.complexity = s.complexity;
+        enc.set_inband_fec(s.fec);
+        enc.set_packet_loss_perc(s.loss).unwrap();
+        enc.set_complexity(s.complexity).unwrap();
 
         let frame = rate * s.tenth_ms / 10_000;
         if at + frame * channels > pcm.len() {

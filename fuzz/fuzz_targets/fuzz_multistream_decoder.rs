@@ -19,10 +19,12 @@
 //! After every call both decoders must accept or refuse alike. When they
 //! accept, they must return the same number of samples and end in the same
 //! final range (the state of the range decoders, combined over the
-//! streams). Decoded `f32` samples must be finite. While the decoders have
-//! decoded only whole packets as the encoders wrote them, with no frame of
-//! 0 or 1 bytes and no stream that switched from CELT-only to SILK or
-//! Hybrid, the output of every channel must be within 50 dB of libopus's.
+//! streams). opus1 must write only the samples it returns, with `f32` and
+//! with 16-bit output, and they must fit its buffer. Decoded `f32` samples
+//! must be finite. While the decoders have decoded only whole packets as
+//! the encoders wrote them, with no frame of 0 or 1 bytes and no stream
+//! that switched from CELT-only to SILK or Hybrid, the output of every
+//! channel must be within 50 dB of libopus's.
 
 #![no_main]
 
@@ -36,6 +38,10 @@ use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
 });
+
+/// What opus1's output buffer holds before a call.
+const MARK_I16: i16 = 0x5a5a;
+const MARK_F32: f32 = 1234.5;
 
 /// The packets of one frame duration from one libopus encoder per stream,
 /// joined as libopus's multistream encoder joins them.
@@ -231,8 +237,10 @@ fn run(data: &[u8]) -> Result<()> {
         let what = format!(
             "step {step}: fec={fec}, i16={i16_out}, frame_size={frame_size}, packet {packet:02x?}"
         );
+        // opus1's buffer starts with a marker value: the samples after the
+        // ones a call returns must keep it.
         let (r, cr) = if i16_out {
-            let mut a = vec![0i16; rust_len];
+            let mut a = vec![MARK_I16; rust_len];
             let mut b = vec![0i16; full];
             let r = if fec {
                 rust.decode_fec_i16(&packet, frame_size, &mut a)
@@ -243,14 +251,16 @@ fn run(data: &[u8]) -> Result<()> {
                 continue;
             }
             let cr = c.decode_i16(&packet, &mut b, frame_size, fec);
-            if let (true, Ok(n)) = (clean, r) {
-                if cr == n as i32 {
+            if let Ok(n) = r {
+                assert!(n * ch <= rust_len, "{what}: {n} samples per channel for a buffer of {rust_len}");
+                assert!(a[n * ch..].iter().all(|&x| x == MARK_I16), "{what}: samples after the {n} returned were written");
+                if clean && cr == n as i32 {
                     assert_close(&what, &a[..n * ch], &b[..n * ch], 2.0);
                 }
             }
             (r, cr)
         } else {
-            let mut a = vec![0f32; rust_len];
+            let mut a = vec![MARK_F32; rust_len];
             let mut b = vec![0f32; full];
             let r = if fec {
                 rust.decode_fec(&packet, frame_size, &mut a)
@@ -262,7 +272,8 @@ fn run(data: &[u8]) -> Result<()> {
             }
             let cr = c.decode_float(&packet, &mut b, frame_size, fec);
             if let Ok(n) = r {
-                assert!(n * ch <= rust_len);
+                assert!(n * ch <= rust_len, "{what}: {n} samples per channel for a buffer of {rust_len}");
+                assert!(a[n * ch..].iter().all(|&x| x == MARK_F32), "{what}: samples after the {n} returned were written");
                 if let Some(bad) = a[..n * ch].iter().position(|x| !x.is_finite()) {
                     panic!("step {step}: sample {bad} is {}", a[bad]);
                 }

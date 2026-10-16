@@ -4,9 +4,9 @@
 
 mod celtenc_common;
 use celtenc_common::*;
-use opus1::celt::CeltEncoder;
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::CeltEncoder;
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// One test frame of `frame` samples per channel, the channels interleaved.
 fn test_frame(channels: usize, frame: usize) -> Vec<f32> {

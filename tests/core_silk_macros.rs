@@ -12,8 +12,8 @@
 //! Inputs for which the C macro has no defined meaning at all (a shift count
 //! out of range, a division by zero) are left out and named at the test.
 
-use opus1::silk::log2lin::silk_log2lin;
-use opus1::silk::macros::*;
+use opus1::internals::silk::log2lin::silk_log2lin;
+use opus1::internals::silk::macros::*;
 
 // ---------------------------------------------------------------------------
 // Inputs
@@ -685,6 +685,11 @@ fn logarithm_and_its_inverse_match_libopus() {
     assert_eq!(silk_lin2log(2), 128);
     assert_eq!(silk_lin2log(65536), 16 * 128);
     assert_eq!(silk_lin2log(-1), c_lin2log(-1));
+    // The encoder modules import the function through `silk::lin2log`. It
+    // is the same one, so 0 gives -128 there too.
+    for a in [i32::MIN, -1, 0, 1, 60, i32::MAX] {
+        assert_eq!(opus1::internals::silk::lin2log::silk_lin2log(a), c_lin2log(a), "lin2log({a})");
+    }
     // The two are inverses of each other to within 1 %.
     for x in [1i32, 3, 10, 100, 1000, 65536, 1_000_000, 1 << 30] {
         let back = silk_log2lin(silk_lin2log(x)) as f64;

@@ -27,12 +27,13 @@ fn compute_hp_coeffs(cutoff_hz: i32, fs: i32) -> ([i32; 3], [i32; 2]) {
 }
 
 /// The 16-bit high-pass filter of the fixed-point build of libopus
-/// (`hp_cutoff`, opus_encoder.c), on 16-bit input.
+/// (`hp_cutoff`, opus_encoder.c), on float input (1.0 = 32768). The input
+/// is first rounded to 16 bits: half up, then limited to the 16-bit range.
 ///
 /// Mono filters the shorter of `input` and `output`. Stereo filters `len`
 /// interleaved sample pairs. `hp_mem` holds 2 state values per channel.
-pub fn hp_cutoff_i16(
-    input: &[i16],
+pub fn hp_cutoff(
+    input: &[f32],
     cutoff_hz: i32,
     output: &mut [i16],
     hp_mem: &mut [i32],
@@ -46,31 +47,11 @@ pub fn hp_cutoff_i16(
         return;
     }
     let n = filtered_len(input.len(), output.len(), len, channels);
-    output[..n].copy_from_slice(&input[..n]);
-    hp_cutoff_in_place(&mut output[..n], cutoff_hz, hp_mem, channels, fs);
-}
-
-/// [`hp_cutoff_i16`] on float input (1.0 = 32768), which is first rounded
-/// to 16 bits: half up, then limited to the 16-bit range.
-pub fn hp_cutoff(
-    input: &[f32],
-    cutoff_hz: i32,
-    output: &mut [i16],
-    hp_mem: &mut [i32],
-    len: usize,
-    channels: usize,
-    fs: i32,
-) {
-    // As in `hp_cutoff_i16`.
-    if fs < 1000 {
-        return;
-    }
-    let n = filtered_len(input.len(), output.len(), len, channels);
     float_to_i16_round(&input[..n], &mut output[..n]);
     hp_cutoff_in_place(&mut output[..n], cutoff_hz, hp_mem, channels, fs);
 }
 
-/// The samples that [`hp_cutoff_i16`] and [`hp_cutoff`] filter.
+/// The samples that [`hp_cutoff`] filters.
 fn filtered_len(input_len: usize, output_len: usize, len: usize, channels: usize) -> usize {
     if channels == 1 {
         input_len.min(output_len)
@@ -156,7 +137,7 @@ pub fn hp_cutoff_float(
     channels: usize,
     fs: i32,
 ) {
-    // As in `hp_cutoff_i16`.
+    // As in `hp_cutoff`.
     if fs < 1000 {
         return;
     }

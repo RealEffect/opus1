@@ -14,9 +14,9 @@
 
 mod k24_common;
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 
 /// FNV-1a, 32 bits.
 fn fnv1a(bytes: &[u8]) -> u32 {
@@ -48,8 +48,8 @@ fn first_difference(channels: usize, pcm: &[i16], script: &[Packet], want: &[u32
     enc.set_bandwidth(Bandwidth::Wideband);
     let mut buf = vec![0u8; 4000];
     for (i, (p, input)) in script.iter().zip(pcm.chunks_exact(frame * channels)).enumerate() {
-        enc.bitrate_bps = p.bitrate;
-        enc.complexity = p.complexity;
+        enc.set_bitrate(Bitrate::BitsPerSecond(p.bitrate)).unwrap();
+        enc.set_complexity(p.complexity).unwrap();
         enc.set_force_channels(p.channels).unwrap();
         let n = enc.encode_i16(input, frame, &mut buf).unwrap();
         if fnv1a(&buf[..n]) != want[i] {
@@ -179,9 +179,9 @@ fn silk_layers(packets: &[Vec<u8>], channels: usize) -> Vec<u32> {
 fn hybrid_at_a_constant_bitrate_codes_the_silk_layer_of_libopus() {
     let pcm: Vec<i16> = speech_16k(3.0).iter().flat_map(|&v| [v, v, v]).collect();
     let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.complexity = 9;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_complexity(9).unwrap();
+    enc.set_vbr(false);
     enc.set_force_mode(Some(ForcedMode::Hybrid));
     enc.set_bandwidth(Bandwidth::Fullband);
     let mut buf = vec![0u8; 4000];
@@ -242,8 +242,8 @@ fn both_stereo_channels_make_room_for_the_redundant_frame_of_a_rate_switch() {
         .map(|&v| (v * 32768.0).round() as i16)
         .collect();
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 64000;
-    enc.complexity = 9;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_complexity(9).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
     enc.set_force_channels(Some(2)).unwrap();
     let mut buf = vec![0u8; 100];
@@ -343,16 +343,16 @@ fn stereo_that_starts_with_a_silk_rate_switch_runs_the_side_through_the_transiti
         .collect();
     let frame = 160;
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.complexity = 5;
+    enc.set_complexity(5).unwrap();
     let mut buf = vec![0u8; 4000];
     let mut differ = Vec::new();
     for (i, input) in pcm.chunks_exact(2 * frame).enumerate().take(272) {
-        enc.bitrate_bps = match i {
+        enc.set_bitrate(Bitrate::BitsPerSecond(match i {
             0..40 => 40000,
             40..170 => 7000,
             170 => 14000,
             _ => 40000,
-        };
+        })).unwrap();
         let n = enc.encode_i16(input, frame, &mut buf).unwrap();
         if i == 170 || i == 171 {
             // One channel at 12 kHz, then two at 16 kHz.
@@ -399,10 +399,10 @@ fn prediction_disabled_codes_every_silk_packet_alone_like_libopus() {
         .collect();
     let frame = 320;
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.complexity = 9;
-    enc.use_inband_fec = true;
-    enc.packet_loss_perc = 5;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_complexity(9).unwrap();
+    enc.set_inband_fec(true);
+    enc.set_packet_loss_perc(5).unwrap();
     let mut buf = vec![0u8; 4000];
     let mut differ = Vec::new();
     for (i, input) in pcm.chunks_exact(2 * frame).enumerate().take(140) {
@@ -457,8 +457,8 @@ fn a_stereo_silk_rate_switch_gives_the_side_the_mids_low_pass_state() {
         .collect();
     let frame = 320;
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 40000;
-    enc.complexity = 5;
+    enc.set_bitrate(Bitrate::BitsPerSecond(40000)).unwrap();
+    enc.set_complexity(5).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
     enc.set_force_channels(Some(2)).unwrap();
     let mut buf = vec![0u8; 4000];

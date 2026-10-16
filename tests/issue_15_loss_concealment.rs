@@ -11,7 +11,7 @@
 //! taken from the placeholder TOC (or from `frame_size` for an empty packet).
 //! These tests pin that behaviour down, plus a randomized no-panic sweep.
 
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use proptest::prelude::*;
 use std::f32::consts::PI;
 
@@ -54,8 +54,8 @@ fn encode_stream(
 ) -> Vec<Vec<u8>> {
     let frame = rate as usize / 50;
     let mut enc = OpusEncoder::new(rate, channels, app).unwrap();
-    enc.bitrate_bps = bitrate;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_vbr(false);
     (0..n_packets)
         .map(|p| {
             let pcm = signal(p * frame, frame, rate, channels);

@@ -17,10 +17,10 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus1::hp_cutoff::dc_reject_float;
-use opus1::range_coder::RangeCoder;
-use opus1::silk::decode_indices::{silk_stereo_decode_mid_only, silk_stereo_decode_pred};
-use opus1::silk::enc_api::{SilkControl, SilkEncoder, SilkInput, silk_downmix_stereo};
+use opus1::internals::hp_cutoff::dc_reject_float;
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::decode_indices::{silk_stereo_decode_mid_only, silk_stereo_decode_pred};
+use opus1::internals::silk::enc_api::{SilkControl, SilkEncoder, SilkInput, silk_downmix_stereo};
 
 /// C `FLOAT2INT16`.
 fn float2int16(x: f32) -> i16 {

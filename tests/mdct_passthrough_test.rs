@@ -4,7 +4,7 @@
 
 #[test]
 fn test_celt_mdct_passthrough() {
-    use opus1::modes::default_mode;
+    use opus1::internals::modes::default_mode;
 
     let mode = default_mode();
     let frame_size = 960;

@@ -4,7 +4,7 @@
 //! the bytes of the previous one. These tests fill the buffer with a marker
 //! byte before encoding and require the same packet as a clean buffer gives.
 
-use opus1::range_coder::RangeCoder;
+use opus1::internals::range_coder::RangeCoder;
 
 /// Small deterministic generator (xorshift64*), so the tests need no crate.
 struct Rng(u64);

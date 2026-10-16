@@ -260,6 +260,10 @@ fn noise_shape_feedback_order<const ORDER: usize>(
 /// entry is not read: the caller passes the newest sample in `newest`, the
 /// value it has just computed, and its product is added last. `order` is at
 /// most 16; `a_q12` holds at least `order` coefficients.
+///
+/// On aarch64 the quantizer uses `short_prediction_neon`; this version is
+/// its reference in the tests.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 fn short_prediction(
     window: &[i32; NSQ_LPC_BUF_LENGTH],
@@ -275,6 +279,157 @@ fn short_prediction(
         pred = silk_smlawb(pred, newest, a_q12[0] as i32);
     }
     pred
+}
+
+/// The coefficients of `short_prediction` in the form `short_prediction_neon`
+/// reads, prepared once per subframe.
+///
+/// Lane `i` of `older[v]` multiplies window position `4 * v + i` for
+/// `v < 3`; `older[3]` multiplies positions 11 to 14. Position 11 is in two
+/// of these loads, so lane 0 of `older[3]` is zero. Each entry is
+/// `smulwb_operand(a_q12[15 - position])`, so that `vqdmulhq_s32` gives the
+/// product of `silk_smlawb`. Position 15, the newest sample, is not here.
+#[cfg(target_arch = "aarch64")]
+struct ShortPredictionNeon {
+    older: [[i32; 4]; 4],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl ShortPredictionNeon {
+    fn new(a_q12: &[i16; MAX_LPC_ORDER]) -> Self {
+        let operand = |position: usize| smulwb_operand(a_q12[MAX_LPC_ORDER - 1 - position]);
+        let mut older = [[0i32; 4]; 4];
+        for (v, row) in older.iter_mut().enumerate() {
+            for (i, c) in row.iter_mut().enumerate() {
+                let position = if v < 3 { 4 * v + i } else { 11 + i };
+                if v < 3 || i > 0 {
+                    *c = operand(position);
+                }
+            }
+        }
+        Self { older }
+    }
+}
+
+/// `short_prediction` with NEON: the 15 older samples in 4 vector products,
+/// then the newest one with `silk_smlawb`. The additions wrap around, so
+/// their order does not change the result. `a0` is `a_q12[0]` and `bias` is
+/// `order / 2`; the coefficients from the order on are zero.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn short_prediction_neon(
+    window: &[i32; NSQ_LPC_BUF_LENGTH],
+    c: &ShortPredictionNeon,
+    bias: i32,
+    a0: i16,
+    newest: i32,
+) -> i32 {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON is part of the aarch64 baseline. The loads read 4
+    // elements at offset 0, 4, 8 and 11 of the 16-element window and the 4
+    // elements of each coefficient row.
+    let sum = unsafe {
+        let w = window.as_ptr();
+        let t0 = vqdmulhq_s32(vld1q_s32(w), vld1q_s32(c.older[0].as_ptr()));
+        let t1 = vqdmulhq_s32(vld1q_s32(w.add(4)), vld1q_s32(c.older[1].as_ptr()));
+        let t2 = vqdmulhq_s32(vld1q_s32(w.add(8)), vld1q_s32(c.older[2].as_ptr()));
+        let t3 = vqdmulhq_s32(vld1q_s32(w.add(11)), vld1q_s32(c.older[3].as_ptr()));
+        vaddvq_s32(vaddq_s32(vaddq_s32(t0, t1), vaddq_s32(t2, t3)))
+    };
+    silk_smlawb(bias.wrapping_add(sum), newest, a0 as i32)
+}
+
+/// Shaping orders up to this one keep the state of the noise shaping
+/// feedback in NEON registers (`FeedbackNeon`).
+#[cfg(target_arch = "aarch64")]
+const FEEDBACK_NEON_MAX_ORDER: usize = 16;
+
+/// `noise_shape_feedback` with its state in 4 NEON registers instead of
+/// memory, for shaping orders up to `FEEDBACK_NEON_MAX_ORDER`.
+///
+/// Lane `i` of `state[v]` is entry `4 * v + i` of the filter state. The
+/// lanes from the order on take part in the shifts but are never added up
+/// or written back.
+#[cfg(target_arch = "aarch64")]
+struct FeedbackNeon {
+    state: [core::arch::aarch64::int32x4_t; 4],
+    /// Lane `i` of `coef[v]` multiplies state entry `4 * v + i`, which
+    /// becomes entry `4 * v + i + 1` in the step: it is
+    /// `smulwb_operand(coef[4 * v + i + 1])`, zero from the order on.
+    coef: [[i32; 4]; 4],
+    /// The coefficient of the newest value, `coef[0]`.
+    coef0: i16,
+    /// `order / 2`, the start of the sum.
+    bias: i32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl FeedbackNeon {
+    /// `state` and `coef` have the same length, the shaping order, at most
+    /// `FEEDBACK_NEON_MAX_ORDER`.
+    fn new(state: &[i32], coef: &[i16]) -> Self {
+        use core::arch::aarch64::*;
+        let order = coef.len().min(FEEDBACK_NEON_MAX_ORDER);
+        debug_assert_eq!(state.len(), coef.len());
+        debug_assert!(coef.len() <= FEEDBACK_NEON_MAX_ORDER);
+        let mut lanes = [0i32; FEEDBACK_NEON_MAX_ORDER];
+        lanes[..order].copy_from_slice(&state[..order]);
+        let mut c = [[0i32; 4]; 4];
+        for (j, dst) in c.as_flattened_mut().iter_mut().enumerate() {
+            if j + 1 < order {
+                *dst = smulwb_operand(coef[j + 1]);
+            }
+        }
+        // SAFETY: NEON is part of the aarch64 baseline; each load reads 4
+        // elements of the 16-element array.
+        let state = unsafe { core::array::from_fn(|v| vld1q_s32(lanes.as_ptr().add(4 * v))) };
+        Self {
+            state,
+            coef: c,
+            coef0: coef.first().copied().unwrap_or(0),
+            bias: (order as i32) >> 1,
+        }
+    }
+
+    /// One step of `noise_shape_feedback`: the same return value and the
+    /// same new state.
+    #[inline(always)]
+    fn step(&mut self, newest: i32) -> i32 {
+        use core::arch::aarch64::*;
+        let s = &mut self.state;
+        // SAFETY: NEON is part of the aarch64 baseline; each load reads one
+        // 4-element row.
+        let sum = unsafe {
+            let c = &self.coef;
+            let t0 = vqdmulhq_s32(s[0], vld1q_s32(c[0].as_ptr()));
+            let t1 = vqdmulhq_s32(s[1], vld1q_s32(c[1].as_ptr()));
+            let t2 = vqdmulhq_s32(s[2], vld1q_s32(c[2].as_ptr()));
+            let t3 = vqdmulhq_s32(s[3], vld1q_s32(c[3].as_ptr()));
+            vaddvq_s32(vaddq_s32(vaddq_s32(t0, t1), vaddq_s32(t2, t3)))
+        };
+        // Every entry moves up by one place and `newest` enters at place 0.
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe {
+            s[3] = vextq_s32::<3>(s[2], s[3]);
+            s[2] = vextq_s32::<3>(s[1], s[2]);
+            s[1] = vextq_s32::<3>(s[0], s[1]);
+            s[0] = vextq_s32::<3>(vdupq_n_s32(newest), s[0]);
+        }
+        silk_smlawb(self.bias.wrapping_add(sum), newest, self.coef0 as i32) << 1
+    }
+
+    /// Writes the state back; `state` has the length of the order.
+    fn store(&self, state: &mut [i32]) {
+        use core::arch::aarch64::*;
+        let mut lanes = [0i32; FEEDBACK_NEON_MAX_ORDER];
+        for (v, &row) in self.state.iter().enumerate() {
+            // SAFETY: NEON is part of the aarch64 baseline; each store
+            // writes 4 elements of the 16-element array.
+            unsafe { vst1q_s32(lanes.as_mut_ptr().add(4 * v), row) };
+        }
+        let order = state.len().min(FEEDBACK_NEON_MAX_ORDER);
+        state[..order].copy_from_slice(&lanes[..order]);
+    }
 }
 
 /// The quantization level of a residual as libopus `silk_noise_shape_quantizer`
@@ -373,6 +528,8 @@ fn silk_noise_shape_quantizer(
         lambda_q10,
         offset_q10,
         predict_lpc_order,
+        #[cfg(target_arch = "aarch64")]
+        lpc_neon: ShortPredictionNeon::new(&a),
     };
     let x_sc_q10 = &x_sc_q10[..subfr_length];
 
@@ -399,27 +556,55 @@ fn silk_noise_shape_quantizer(
         None
     };
     // One call per combination, so that each has its own copy of the loop.
-    match (&prediction, &shaping) {
-        (Some(prediction), Some(shaping)) => quantize_subframe(
-            nsq,
-            x_sc_q10,
-            pulses,
-            xq_offset,
-            s_ltp_q15,
-            &p,
-            Some(prediction),
-            Some(shaping),
-        ),
-        (None, Some(shaping)) => {
-            quantize_subframe(nsq, x_sc_q10, pulses, xq_offset, s_ltp_q15, &p, None, Some(shaping))
-        }
-        (None, None) => quantize_subframe(nsq, x_sc_q10, pulses, xq_offset, s_ltp_q15, &p, None, None),
-        // A voiced subframe without a lag does not occur (libopus asserts
-        // it); this is what the libopus loop computes for it.
-        (Some(prediction), None) => {
-            quantize_subframe(nsq, x_sc_q10, pulses, xq_offset, s_ltp_q15, &p, Some(prediction), None)
-        }
+    macro_rules! run {
+        ($in_registers:literal) => {
+            match (&prediction, &shaping) {
+                (Some(prediction), Some(shaping)) => quantize_subframe::<$in_registers>(
+                    nsq,
+                    x_sc_q10,
+                    pulses,
+                    xq_offset,
+                    s_ltp_q15,
+                    &p,
+                    Some(prediction),
+                    Some(shaping),
+                ),
+                (None, Some(shaping)) => quantize_subframe::<$in_registers>(
+                    nsq,
+                    x_sc_q10,
+                    pulses,
+                    xq_offset,
+                    s_ltp_q15,
+                    &p,
+                    None,
+                    Some(shaping),
+                ),
+                (None, None) => quantize_subframe::<$in_registers>(
+                    nsq, x_sc_q10, pulses, xq_offset, s_ltp_q15, &p, None, None,
+                ),
+                // A voiced subframe without a lag does not occur (libopus
+                // asserts it); this is what the libopus loop computes for it.
+                (Some(prediction), None) => quantize_subframe::<$in_registers>(
+                    nsq,
+                    x_sc_q10,
+                    pulses,
+                    xq_offset,
+                    s_ltp_q15,
+                    &p,
+                    Some(prediction),
+                    None,
+                ),
+            }
+        };
     }
+    #[cfg(target_arch = "aarch64")]
+    if shaping_lpc_order <= FEEDBACK_NEON_MAX_ORDER {
+        run!(true);
+    } else {
+        run!(false);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    run!(false);
 
     nsq.s_lpc_q14
         .copy_within(subfr_length..subfr_length + NSQ_LPC_BUF_LENGTH, 0);
@@ -438,6 +623,8 @@ struct SubframeParams<'a> {
     lambda_q10: i32,
     offset_q10: i32,
     predict_lpc_order: usize,
+    #[cfg(target_arch = "aarch64")]
+    lpc_neon: ShortPredictionNeon,
 }
 
 /// Long-term prediction of a voiced subframe.
@@ -462,8 +649,11 @@ struct HarmonicShaping {
 /// for a voiced subframe, `shaping` for a subframe with a lag. The function
 /// is inlined into every call, so each combination has its own copy of the
 /// loop.
+///
+/// With `FEEDBACK_IN_REGISTERS` (aarch64, shaping order at most
+/// `FEEDBACK_NEON_MAX_ORDER`) the shaping feedback runs on `FeedbackNeon`.
 #[inline(always)]
-fn quantize_subframe(
+fn quantize_subframe<const FEEDBACK_IN_REGISTERS: bool>(
     nsq: &mut SilkNSQState,
     x_sc_q10: &[i32],
     pulses: &mut [i8],
@@ -479,6 +669,11 @@ fn quantize_subframe(
     let xq = &mut nsq.xq[xq_offset..xq_offset + subfr_length];
     let s_lpc_q14 = &mut nsq.s_lpc_q14[..NSQ_LPC_BUF_LENGTH + subfr_length];
     let s_ar2_q14 = &mut nsq.s_ar2_q14[..shaping_lpc_order];
+    #[cfg(target_arch = "aarch64")]
+    let mut feedback = FeedbackNeon::new(
+        &s_ar2_q14[..shaping_lpc_order.min(FEEDBACK_NEON_MAX_ORDER)],
+        &p.ar_shp_q13[..shaping_lpc_order.min(FEEDBACK_NEON_MAX_ORDER)],
+    );
 
     let mut rand_seed = nsq.rand_seed;
     let mut s_ltp_shp_buf_idx = nsq.s_ltp_shp_buf_idx as usize;
@@ -503,19 +698,36 @@ fn quantize_subframe(
             s_lpc_q14[i..i + NSQ_LPC_BUF_LENGTH].try_into().unwrap();
         // One copy of the sum per order the codec uses, with the number of
         // taps known at compile time.
+        #[cfg(not(target_arch = "aarch64"))]
         let lpc_pred_q10 = match p.predict_lpc_order {
             16 => short_prediction(window, p.a_q12, 16, newest_xq_q14),
             10 => short_prediction(window, p.a_q12, 10, newest_xq_q14),
             6 => short_prediction(window, p.a_q12, 6, newest_xq_q14),
             order => short_prediction(window, p.a_q12, order, newest_xq_q14),
         };
+        #[cfg(target_arch = "aarch64")]
+        let lpc_pred_q10 = short_prediction_neon(
+            window,
+            &p.lpc_neon,
+            (p.predict_lpc_order as i32) >> 1,
+            p.a_q12[0],
+            newest_xq_q14,
+        );
 
-        let mut n_ar_q12 = match shaping_lpc_order {
-            12 => noise_shape_feedback_order::<12>(s_diff_shp_q14, s_ar2_q14, p.ar_shp_q13),
-            14 => noise_shape_feedback_order::<14>(s_diff_shp_q14, s_ar2_q14, p.ar_shp_q13),
-            16 => noise_shape_feedback_order::<16>(s_diff_shp_q14, s_ar2_q14, p.ar_shp_q13),
-            _ => noise_shape_feedback(s_diff_shp_q14, s_ar2_q14, p.ar_shp_q13),
+        let scalar_feedback = |state: &mut [i32]| match shaping_lpc_order {
+            12 => noise_shape_feedback_order::<12>(s_diff_shp_q14, state, p.ar_shp_q13),
+            14 => noise_shape_feedback_order::<14>(s_diff_shp_q14, state, p.ar_shp_q13),
+            16 => noise_shape_feedback_order::<16>(s_diff_shp_q14, state, p.ar_shp_q13),
+            _ => noise_shape_feedback(s_diff_shp_q14, state, p.ar_shp_q13),
         };
+        #[cfg(target_arch = "aarch64")]
+        let mut n_ar_q12 = if FEEDBACK_IN_REGISTERS {
+            feedback.step(s_diff_shp_q14)
+        } else {
+            scalar_feedback(s_ar2_q14)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let mut n_ar_q12 = scalar_feedback(s_ar2_q14);
         n_ar_q12 = silk_smlawb(n_ar_q12, s_lf_ar_q14, p.tilt_q14);
 
         let mut n_lf_q12 = silk_smulwb(newest_shp_q14, p.lf_shp_q14);
@@ -589,6 +801,10 @@ fn quantize_subframe(
         rand_seed = rand_seed.wrapping_add(pulse as i32);
     }
 
+    #[cfg(target_arch = "aarch64")]
+    if FEEDBACK_IN_REGISTERS {
+        feedback.store(s_ar2_q14);
+    }
     nsq.rand_seed = rand_seed;
     nsq.s_ltp_shp_buf_idx = s_ltp_shp_buf_idx as i32;
     nsq.s_ltp_buf_idx = s_ltp_buf_idx as i32;
@@ -684,6 +900,32 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn feedback_in_registers_matches_reference() {
+        let mut rng = Rng(0x0A2F_31B5_77C3_9E01);
+        for case in 0..2000usize {
+            // Every even order up to the limit of the register version.
+            let order = 2 * (1 + case % (FEEDBACK_NEON_MAX_ORDER / 2));
+            let coef: Vec<i16> = (0..order).map(|_| rng.coef()).collect();
+            let start: Vec<i32> = (0..order).map(|_| rng.value()).collect();
+
+            let mut want_state = start.clone();
+            let mut neon = FeedbackNeon::new(&start, &coef);
+            // Several steps, so that the shifts carry values between the
+            // registers.
+            for step in 0..20 {
+                let newest = rng.value();
+                let want = feedback_ref(newest, &mut want_state, &coef, order);
+                let got = neon.step(newest);
+                assert_eq!(got, want, "order {order}, case {case}, step {step}");
+            }
+            let mut got_state = vec![0x0bad_f00d; order];
+            neon.store(&mut got_state);
+            assert_eq!(got_state, want_state, "order {order}, case {case}");
+        }
+    }
+
     #[test]
     fn short_prediction_matches_definition() {
         let mut rng = Rng(0x1319_8A2E_0370_7344);
@@ -710,6 +952,17 @@ mod tests {
                 window[NSQ_LPC_BUF_LENGTH - 1],
             );
             assert_eq!(got, want, "order {order}");
+            #[cfg(target_arch = "aarch64")]
+            {
+                let got = short_prediction_neon(
+                    &window_without_newest,
+                    &ShortPredictionNeon::new(&a_q12),
+                    (order as i32) >> 1,
+                    a_q12[0],
+                    window[NSQ_LPC_BUF_LENGTH - 1],
+                );
+                assert_eq!(got, want, "NEON, order {order}");
+            }
         }
     }
 }

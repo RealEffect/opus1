@@ -86,7 +86,7 @@ pub fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> Result<i32, &'s
 /// The bitrate control of the multistream encoder (libopus
 /// `opus_multistream_encoder_ctl`, `OPUS_SET_BITRATE_REQUEST`).
 ///
-/// `value` is [`OPUS_AUTO`], [`OPUS_BITRATE_MAX`] or bits per second for all
+/// `value` is `OPUS_AUTO`, `OPUS_BITRATE_MAX` or bits per second for all
 /// channels together. The two special values pass through unchanged. Any
 /// other value must be positive and is clamped to 500 to 750 000 bits per
 /// second per channel. `channels` is the channel count of the layout; 0 is
@@ -246,15 +246,15 @@ pub fn ambisonics_rate_allocation(
 /// Writes one value per stream to `rate[..layout.streams()]`, each at least
 /// 500 bits per second, and returns their sum.
 ///
-/// - `mapping_type` selects the rule: [`ambisonics_rate_allocation`] for
-///   ambisonics, [`surround_rate_allocation`] for everything else.
+/// - `mapping_type` selects the rule: `ambisonics_rate_allocation` for
+///   ambisonics, `surround_rate_allocation` for everything else.
 /// - `lfe_stream` is the LFE stream reported by [`ChannelLayout::surround`].
 ///   It is used only with [`MappingType::Surround`]. libopus has no LFE
 ///   stream with the other mapping types
 ///   (`opus_multistream_encoder_init_impl` sets `lfe_stream` to -1 for them),
 ///   so the value is ignored there.
 /// - `user_bitrate` is the encoder setting after [`clamp_user_bitrate`]:
-///   [`OPUS_AUTO`], [`OPUS_BITRATE_MAX`] or bits per second.
+///   `OPUS_AUTO`, `OPUS_BITRATE_MAX` or bits per second.
 /// - `frame_size` is in samples per channel at the sampling rate `fs`.
 ///
 /// A stream encoder limits what it is given to 750 000 bits per second per
@@ -326,7 +326,7 @@ pub fn smallest_packet(streams: usize, frame_size: usize, fs: i32) -> Result<usi
 /// - `user_bitrate` is the encoder setting, as for [`rate_allocation`].
 /// - `rate_sum` is the value [`rate_allocation`] returned for this frame. It
 ///   is used when the bitrate is automatic.
-/// - With [`OPUS_BITRATE_MAX`] the buffer length is the only limit.
+/// - With `OPUS_BITRATE_MAX` the buffer length is the only limit.
 ///
 /// In constant bitrate mode the encoder pads the last stream, so the packet
 /// has exactly this many bytes.

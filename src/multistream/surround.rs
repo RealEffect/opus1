@@ -12,7 +12,8 @@
 
 use super::{ChannelSource, Interleaved};
 use crate::bands::compute_band_energies;
-use crate::celt::{celt_preemphasis, resampling_factor, upsample_scale_zero};
+use crate::celt::{amp2log2_enc, celt_preemphasis, resampling_factor, upsample_scale_zero};
+use crate::mathops::celt_log2;
 use crate::modes::{self, CeltMode};
 use crate::packet;
 use crate::pitch::inner_prod;
@@ -200,13 +201,11 @@ impl SurroundAnalysis {
             }
 
             // libopus `amp2Log2(mode, 21, 21, ..)`: log2 of the amplitude
-            // above the mean level of the band. `bands::amp2log2` is not
-            // used because it limits the amplitude to 1e-10 from below,
-            // which libopus does not do.
+            // above the mean level of the band, with libopus's
+            // approximation of the logarithm (`celt_log2`), as the CELT
+            // encoder computes it.
             let band_log_e = &mut band_smr[MASK_BANDS * c..MASK_BANDS * (c + 1)];
-            for i in 0..MASK_BANDS {
-                band_log_e[i] = band_e[i].log2() - mode.e_means[i];
-            }
+            amp2log2_enc(mode, MASK_BANDS, &band_e, band_log_e, 1);
             // Masking spreads to the neighbouring bands: it falls by 6 dB
             // per band going up and by 12 dB per band going down.
             for i in 1..MASK_BANDS {
@@ -253,7 +252,8 @@ impl SurroundAnalysis {
                 mask_log_e[2][i]
             };
         }
-        let channel_offset = 0.5 * (2.0 / (channels - 1) as f32).log2();
+        // C `HALF16(celt_log2(QCONST32(2.f,14)/(channels-1)))`.
+        let channel_offset = 0.5 * celt_log2(2.0 / (channels - 1) as f32);
         for mask in &mut mask_log_e {
             for v in mask.iter_mut() {
                 *v += channel_offset;

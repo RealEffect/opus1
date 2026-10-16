@@ -16,23 +16,28 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 ## Features
 
 - **Pure Rust** — no C dependencies
-- **High performance:** on Apple M4 Pro, decoding takes 0.50-0.82x and encoding (complexity 0-5, where both do the same work) 0.48-0.63x the time of C libopus 1.6.1 (see [Performance](#performance))
+- **High performance:** on Apple M4 Pro, decoding takes 0.56-0.86x and encoding (complexity 0-5, where both do the same work) 0.53-0.71x the time of C libopus built at `-O2`, the optimization level of libopus's own build. Against the Homebrew build of libopus 1.6.1, which is about 10 % slower, the ranges are 0.50-0.81x and 0.46-0.63x. opus1 is also faster than libopus on the big and the small cores of an Android phone (see [Performance](#performance))
 - **Multichannel:** multistream encoder and decoder (mapping families 0, 1, 2 and 255), interoperable with libopus
+- **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels)
 - **`#![no_std]` + no `alloc`:** fully heap-free — runs on bare metal, RTOS, and WebAssembly with **no global allocator**
 
 ## Quick Start
 
 ```rust
-use opus1::{OpusEncoder, OpusDecoder, Application};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
-// Encode
+// Encode. Without `set_bitrate` the encoder uses libopus's automatic
+// bitrate (`Bitrate::Auto`, 19 kb/s for 16 kHz mono in 20 ms frames).
+// Each setter refuses what libopus refuses, for example a complexity of 11.
 let mut encoder = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 16000;
-encoder.use_cbr = true;
+encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
+encoder.set_vbr(false); // constant bitrate: every packet has 40 bytes
+assert!(encoder.set_complexity(11).is_err());
 
 let input = vec![0.0f32; 320]; // 20ms frame at 16kHz
 let mut output = vec![0u8; 256];
 let bytes = encoder.encode(&input, 320, &mut output).unwrap();
+assert_eq!(bytes, 40);
 
 // Encode PCM16 directly. The output is byte-for-byte identical to
 // `encode()` called with the same audio converted via
@@ -40,24 +45,30 @@ let bytes = encoder.encode(&input, 320, &mut output).unwrap();
 let input_i16 = vec![0i16; 320]; // 20ms frame at 16kHz
 let bytes = encoder.encode_i16(&input_i16, 320, &mut output).unwrap();
 
-// Decode
+// Decode. `decode` writes the samples it returns and nothing after them.
 let mut decoder = OpusDecoder::new(16000, 1).unwrap();
 let mut pcm = vec![0.0f32; 320];
 let samples = decoder.decode(&output[..bytes], 320, &mut pcm).unwrap();
+assert_eq!(samples, 320);
 ```
+
+The public API is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`,
+`Bandwidth`, `Bitrate`, `ForcedMode`, `pcm_soft_clip`) and the modules `packet`
+and `multistream`. [docs/06](docs/06-using-the-library.md) shows the settings and
+recipes for calls, voice agents and music.
 
 Decoding to 16-bit PCM, and recovering a lost packet from the in-band
 forward error correction (FEC) data of the next one:
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 // Three 20 ms packets of a 180 Hz tone at 16 kHz. Each packet after the
 // first also carries a low-bitrate copy of the frame before it (in-band FEC).
 let mut encoder = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 24000;
-encoder.use_inband_fec = true;
-encoder.packet_loss_perc = 10;
+encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+encoder.set_inband_fec(true);
+encoder.set_packet_loss_perc(10).unwrap();
 let tone: Vec<f32> = (0..3 * 320)
     .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 180.0 * i as f32 / 16000.0).sin())
     .collect();
@@ -83,8 +94,8 @@ Float output is not clipped to [-1, 1], as in libopus's `opus_decode_float`.
 ### Multichannel
 
 ```rust
-use opus1::Application;
-use opus1::multistream::{Bitrate, MultistreamEncoder, MultistreamDecoder};
+use opus1::{Application, Bitrate};
+use opus1::multistream::{MultistreamEncoder, MultistreamDecoder};
 
 // 5.1 at 48 kHz in Vorbis channel order (mapping family 1).
 let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
@@ -152,7 +163,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   than on the stack. The test suite of this build needs big test-thread stacks:
   `scripts/check_no_std.sh` sets `RUST_MIN_STACK=33554432` (32 MiB).
 - **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
-- **Packets are capped** at the RFC 6716 maximum of 1276 bytes (the heap-free range-coder buffer is sized accordingly); standalone `RangeCoder`/CELT use supports up to 2048 bytes.
+- **Packets are capped** at the RFC 6716 maximum of 1276 bytes (the heap-free range-coder buffer is sized accordingly).
 - **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target. Check with `scripts/check_no_std.sh`.
 
 ## Performance
@@ -165,48 +176,86 @@ same mode, bandwidth and channel count as opus1. The table gives the median
 time per 20 ms frame (10 ms or 2.5 ms where named) and the ratio opus1 / libopus
 (below 1 means opus1 is faster).
 
-### vs C libopus 1.6.1 on Apple M4 Pro (aarch64), default release profile
+### vs C libopus on Apple M4 Pro (aarch64), default release profile
 
-Measured on 2026-10-16 at commit `b63e8c3` while other programs kept the load
-average near 4. Over three runs the ratios varied by at most 3 %, because the
-two libraries run interleaved and a busy machine slows both.
+Measured on 2026-10-17 with the code of commit `0090242`. The main C reference
+is libopus built at `-O2`, the optimization level of libopus's own build:
+`scripts/android/build-libopus.sh --host` builds it with Apple clang from the
+libopus source that the crate `opus-head-sys` 0.3.3 vendors (libopus main branch,
+commit `228a0f85`). The second ratio column is the Homebrew libopus 1.6.1, which
+the tests link. It behaves like a build at `-Os`. Built at `-Os`, the vendored
+source takes 1.11 times the encode time and 1.13 times the decode time of its
+`-O2` build (geometric means). Four harness programs ran in turns, three
+passes each: the code before and after the latest speed work (see below), each
+linked with each libopus build. Between the passes the ratio of a scenario changed
+by at most 2.2 %.
 
-| Scenario | Encode µs | Ratio | Decode µs | Ratio |
-|---|---:|---:|---:|---:|
-| SILK NB 8 kHz mono 12 kb/s, complexity 0 | 9.0 | 0.62 | 2.0 | 0.62 |
-| SILK WB 16 kHz mono 20 kb/s, complexity 10 | 45.9 | 0.39 | 3.8 | 0.58 |
-| SILK WB 16 kHz stereo 32 kb/s, complexity 9 | 91.2 | 0.40 | 6.8 | 0.57 |
-| Hybrid SWB 24 kHz mono 24 kb/s, complexity 9 | 63.7 | 0.38 | 7.2 | 0.53 |
-| Hybrid FB 48 kHz stereo 40 kb/s, complexity 9 | 132.6 | 0.41 | 13.5 | 0.50 |
-| CELT FB 48 kHz mono 64 kb/s, complexity 0 | 12.2 | 0.60 | 8.4 | 0.76 |
-| CELT FB 48 kHz mono 64 kb/s, complexity 10 | 21.8 | 0.39* | 10.0 | 0.65 |
-| CELT FB 48 kHz stereo 128 kb/s, complexity 5 | 37.5 | 0.49 | 19.7 | 0.66 |
-| CELT FB 48 kHz stereo 128 kb/s, complexity 10 | 58.6 | 0.48* | 19.8 | 0.66 |
-| CELT FB 48 kHz stereo 128 kb/s, 2.5 ms, complexity 9 | 11.5 | 0.62* | 3.2 | 0.77 |
+| Scenario | opus1 encode µs | Ratio vs `-O2` | Ratio vs Homebrew | opus1 decode µs | Ratio vs `-O2` | Ratio vs Homebrew |
+|---|---:|---:|---:|---:|---:|---:|
+| SILK NB 8 kHz mono 12 kb/s, complexity 0 | 8.8 | 0.71 | 0.62 | 2.0 | 0.64 | 0.62 |
+| SILK WB 16 kHz mono 20 kb/s, complexity 10 | 44.5 | 0.50* | 0.38* | 3.8 | 0.61 | 0.59 |
+| SILK WB 16 kHz stereo 32 kb/s, complexity 9 | 88.6 | 0.55* | 0.39* | 6.9 | 0.60 | 0.57 |
+| Hybrid SWB 24 kHz mono 24 kb/s, complexity 9 | 61.8 | 0.51* | 0.37* | 7.1 | 0.61 | 0.54 |
+| Hybrid FB 48 kHz stereo 40 kb/s, complexity 9 | 128.4 | 0.57* | 0.40* | 13.5 | 0.56 | 0.50 |
+| CELT FB 48 kHz mono 64 kb/s, complexity 0 | 11.8 | 0.63 | 0.59 | 8.4 | 0.81 | 0.76 |
+| CELT FB 48 kHz mono 64 kb/s, complexity 10 | 21.0 | 0.44* | 0.37* | 9.9 | 0.80 | 0.65 |
+| CELT FB 48 kHz stereo 128 kb/s, complexity 5 | 35.4 | 0.56 | 0.47 | 19.3 | 0.82 | 0.65 |
+| CELT FB 48 kHz stereo 128 kb/s, complexity 10 | 55.2 | 0.56* | 0.46* | 19.4 | 0.82 | 0.65 |
+| CELT FB 48 kHz stereo 128 kb/s, 2.5 ms, complexity 9 | 11.0 | 0.69* | 0.59* | 3.2 | 0.84 | 0.77 |
 
 \* libopus runs its speech/music analysis (`analysis.c`) at complexity 7 and
-above; opus1 has no port of it, so these encode ratios favour opus1.
+above when the input rate is 16 kHz or more; opus1 has no port of it, so these
+encode ratios favour opus1.
 The C SILK encoder in a float build of libopus is the floating-point one;
 opus1 ports the fixed-point one.
+The libopus main branch encodes SILK and Hybrid at complexity 9 and 10 in about
+0.78 of the time of 1.6.1 at the same optimization level. So in the SILK and
+Hybrid rows at complexity 9 and 10, the `-O2` reference is faster than a 1.6.1
+build at `-O2` would be.
 
-The measured code includes a refactoring that merged duplicate code paths
-without changing the output. Against the code before it (commit `5c8e05e`), the
-opus1 / libopus encode ratio of the CELT scenarios is 1.3-14 % lower (13-14 %
-at complexity 0). The ratios of decoding and of SILK and Hybrid encoding changed
-by -2.4 % to +0.7 %, within the variation between runs. See
-[docs/08-performance.md](docs/08-performance.md#effect-of-the-refactoring).
+Over all 28 scenarios of the bench set (geometric means), opus1 takes 0.567 of
+the encode time and 0.694 of the decode time of libopus at `-O2`, and 0.458
+and 0.619 of the Homebrew build. The full table is in
+[docs/08-performance.md](docs/08-performance.md#latest-results).
+
+On an Android phone (MediaTek MT6833), against libopus built with the NDK's
+clang at `-O2`, opus1 is faster in all 28 scenarios on both kinds of core
+(geometric means, commit `0090242`): encoding 0.64 and decoding 0.77 of
+libopus's time on the Cortex-A76, 0.66 and 0.84 on the in-order Cortex-A55. See
+[docs/08-performance.md](docs/08-performance.md#on-an-android-phone).
+
+The latest speed work ("round 7" in the performance document) was aimed at
+the in-order Cortex-A55. It rewrote the pitch analysis of the CELT encoder, the
+post-filter of the CELT decoder, the SILK noise-shaping quantizers, and the PVQ
+search, the spreading rotation and the bit allocation of the CELT encoder. The
+output did not change. Against the code before it, run in turns on the same
+machine (geometric means over the bench set), encoding takes 10.8-11.1 % less
+time on the Cortex-A55, 7.5 % less on the Cortex-A76 and 2.5-2.8 % less on
+Apple M4 Pro. Decoding takes 1.9-2.0 % less on the Cortex-A55, 1.0 % less on
+the Cortex-A76 and about the same time (within 0.4 %) on Apple M4 Pro. From
+the Cortex-A76 to the Cortex-A55, opus1's encoding now grows 3.02 times slower
+and libopus's 2.90 times; before this work opus1's grew 3.14 times. See
+[docs/08-performance.md](docs/08-performance.md#round-7-work-for-in-order-cores).
 
 Against opus-rs 0.1.37 on the same machine (change of the opus1 / libopus
-ratio), encoding takes 33-56 % less time for SILK and Hybrid and 29-49 % less
-for mono CELT; decoding takes 35-62 % less in every scenario. Stereo CELT
-encoding takes 24-30 % less time at complexity 0 and 5. From complexity 5 it now
-runs libopus's stereo pitch pre-filter and, from complexity 8, its second
-quantization pass per stereo band (`theta_rdo`). So at complexity 9 and 10 it
-takes 2-22 % more time than in 0.1.37, while staying at 0.48-0.62 of libopus's
-time.
+ratio, Homebrew libopus), encoding takes 33-56 % less time for SILK and Hybrid
+and 29-49 % less for mono CELT; decoding takes 35-62 % less in every scenario.
+Stereo CELT encoding takes 24-30 % less time at complexity 0 and 5. From
+complexity 5 it now runs libopus's stereo pitch pre-filter and, from complexity
+8, its second quantization pass per stereo band (`theta_rdo`). So at complexity
+9 and 10 it takes 2-22 % more time than in 0.1.37, while staying at 0.48-0.62
+of the Homebrew libopus's time.
 
-Where it helps: `lto = "fat"`, `codegen-units = 1` and `panic = "abort"` in the
-application's release profile take another 2-3 % off decoding. `-C target-cpu=native`
+Build settings that help (measured, see
+[docs/06-using-the-library.md](docs/06-using-the-library.md#build-settings-for-speed)):
+`lto = "fat"`, `codegen-units = 1` and `panic = "abort"` in the application's
+release profile take 1.7 % off decoding on Apple M4 Pro and 1.1-1.5 % off
+encoding on the Cortex-A76. For Android, `-C target-cpu=cortex-a55` orders the
+instructions for the in-order Cortex-A55. With the ARMv8.2-A extensions turned
+off again (so the program runs on every 64-bit ARM phone) and with that
+profile, it takes 4.4-4.5 % off encoding and 1.3-1.5 % off decoding on the
+Cortex-A55, and 0.5-1.4 % off both on the Cortex-A76. Building for the
+Cortex-A76 instead makes the Cortex-A55 15 % slower. `-C target-cpu=native`
 changes nothing measurable on Apple silicon.
 
 On aarch64 the FFT uses the FEAT_FCMA complex multiply-add instructions (part of
@@ -235,6 +284,51 @@ The crate is renamed from `opus-rs` to `opus1`. Code that used `opus_rs::` now u
 
 This release was checked against libopus 1.6.1 throughout: every fix below has a
 test that compares opus1 with the C library under the same settings.
+
+**Breaking changes to the public interface**
+- `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
+  so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
+  call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
+  `set_bandwidth(Bandwidth::Superwideband)` or `set_bandwidth(Bandwidth::Fullband)`,
+  so that low bitrates do not fall back to wideband SILK.
+- The public field `OpusDecoder::hybrid_skip_celt` is removed. The decoder never
+  read it.
+- The settings of `OpusEncoder` are methods instead of public fields:
+  `set_bitrate` with `bitrate_setting` and `bitrate`, `set_complexity` and
+  `complexity`, `set_vbr` and `vbr` (instead of `use_cbr`, with the opposite
+  meaning), `set_inband_fec` and `inband_fec`, `set_packet_loss_perc` and
+  `packet_loss_perc`. Each setter checks its value as libopus's `OPUS_SET_*`
+  request does. A bitrate of 0 or less, a complexity outside 0-10 and a packet
+  loss outside 0-100 % are errors, and the setting keeps its old value. A
+  bitrate is raised to at least 500 b/s and limited to at most 750,000 b/s per
+  channel. The encoder no longer
+  clamps the settings on every `encode` call.
+- The default bitrate of `OpusEncoder` is libopus's automatic one,
+  `Bitrate::Auto`: 60 × rate / frame size + rate × channels b/s, for example
+  19 kb/s for 16 kHz mono and 99 kb/s for 48 kHz stereo in 20 ms frames. It was
+  a fixed 64 kb/s. An encoder that is given a bitrate writes the same packets as
+  before.
+- `Bitrate` moved from `opus1::multistream` to the crate root.
+  `OpusEncoder::set_bitrate` takes it too, so a single stream now also has
+  `Bitrate::Auto` (libopus `OPUS_AUTO`) and `Bitrate::Max` (`OPUS_BITRATE_MAX`).
+- New: `set_vbr_constraint` on `OpusEncoder` and `MultistreamEncoder` (libopus
+  `OPUS_SET_VBR_CONSTRAINT`). Turning the constraint off gives CELT-only packets
+  an unconstrained variable bitrate.
+- The internal modules are private. The public API is the crate root
+  (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`,
+  `ForcedMode`, `pcm_soft_clip`) and the modules `packet` and `multistream`. The
+  modules `bands`, `celt`, `celt_lpc`, `hp_cutoff`, `kiss_fft`, `mdct`, `modes`,
+  `pitch`, `pvq`, `quant_bands`, `range_coder`, `rate` and `silk`, the types
+  `CeltEncoder`, `CeltDecoder`, `SilkResampler`, `SilkResamplerDown1_3` and
+  `SilkResamplerDown1_6` at the crate root, and the macro `tell_frac_inline!`
+  are no longer exported. The submodules of
+  `multistream` are private too; their public items, `validate_ambisonics`
+  included, are in `opus1::multistream`. The tests of this repository reach
+  internal items through `opus1::internals`, which is hidden from the
+  documentation and not part of the stable API.
+- `OpusDecoder::decode` no longer sets the part of `output` after the decoded
+  samples to zero. As in libopus, it writes only the samples it returns. A program
+  that relied on the zeros must clear the buffer itself.
 
 **24 kHz audio**
 - **Fix: Hybrid super-wideband packets decoded with 21 CELT bands instead of 19.**
@@ -265,15 +359,42 @@ test that compares opus1 with the C library under the same settings.
 **Behaviour changes**
 - Float output is no longer clamped to [-1, 1] (libopus does not clip float output).
   Use `decode_i16` for 16-bit output.
-- The automatic mode choice follows libopus. With the default bitrate of 64 kb/s
-  a 16 kHz VoIP encoder now codes CELT, as libopus does at that bitrate. Set
-  `bitrate_bps` to a speech rate (for example 16-24 kb/s) to keep SILK.
+- The automatic mode choice follows libopus. At 64 kb/s a 16 kHz VoIP encoder
+  now codes CELT, as libopus does at that bitrate. At speech rates (for example
+  16-24 kb/s, or the automatic 19 kb/s of 20 ms frames) it codes SILK.
 - Stereo input is coded as mono at low bitrates, as libopus does.
 - Encoder output changed to follow libopus in many places (stereo pitch
   pre-filter, `theta_rdo` at complexity 8 and above, SILK pitch analysis, pulse
-  search, band energies, FFT and MDCT rounding on aarch64). Over 960 CELT test
-  streams the mean quality gap to libopus is now 0.02 dB; a voiced 300-packet
+  search, band energies, FFT and MDCT rounding on aarch64). A voiced 300-packet
   SILK stream is byte-identical to fixed-point libopus.
+
+**Closer to libopus** (aarch64, against libopus 1.6.1)
+- The CELT encoder writes the packets of libopus: all 1,080,000 packets of the
+  960 streams of `celtenc_gap_report` (mono and stereo, 16 and 48 kHz, 2.5 to
+  20 ms, CBR and VBR, complexity 4 to 9), up from 91.2 %. Through `OpusEncoder`
+  the remaining differences at complexity 7 and above come from the missing
+  speech and music analysis. Stereo input whose channels are scaled copies of
+  each other still gives a few other packets at 128 kb/s per channel and more.
+- The CELT decoder gives the samples of libopus: 51 of 51 CELT streams and 28 of
+  29 Hybrid streams of `perf_harness modes` (8 and 25 before), and every
+  concealed frame of the CELT loss tests and the multistream loss tests.
+- What changed: the pitch analysis of the pre-filter and the loss concealment
+  (one shared, libopus-rounded set of functions; the concealment's copies are
+  gone), the comb filter (four taps had too few digits, and its rounding), the
+  coarse energy prediction, a dynalloc boost that only libopus's main branch
+  has, the 750 kb/s per channel limit and the silent VBR frame of the CELT
+  encoder, `celt_log2` in the surround masking, and one `silk_lin2log` that
+  gives libopus's result for 0.
+- Speed: the pitch analysis got new kernels (the decimation and lag 4 inside
+  the autocorrelation chain, eight samples per step in the correlation, energy
+  sums inside the correlation passes), and the comb filter became faster.
+  Against the state before these changes, in the 13 CELT scenarios of the
+  bench, encode time changed by -1.4 to +0.9 % and decode time by -2.9 to
+  +0.5 % (three alternating runs on a busy machine, where single rows vary by
+  about 2 %). Frames of 20 ms are faster. Frames of 2.5 ms are slightly
+  slower: the exact pitch analysis costs about 0.3 µs more per frame, and six
+  more alternating runs measured +0.6 % encode time for stereo 128 kb/s c9
+  with 2.5 ms frames.
 
 **Performance** (Apple M4 Pro, see [Performance](#performance))
 - Decoding takes 35-62 % less time than in 0.1.37 and is now faster than libopus
@@ -286,22 +407,37 @@ test that compares opus1 with the C library under the same settings.
   autocorrelation, cross-correlations, comb filters and de-emphasis; FFT with
   FEAT_FCMA instructions; fewer copies and no zero-filling of buffers that are
   overwritten.
+- Work for in-order cores such as the Cortex-A55: the pitch analysis of the
+  CELT encoder, the post-filter of the CELT decoder, the SILK noise-shaping
+  quantizers, and the PVQ search, the spreading rotation and the bit allocation
+  of the CELT encoder now give such a core independent work at each step. The output is the same.
+  Against the code before, run in turns (geometric means over the bench set),
+  encoding takes 10.8-11.1 % less time on the Cortex-A55 of an Android phone,
+  7.5 % less on its Cortex-A76 and 2.5-2.8 % less on Apple M4 Pro. Decoding
+  takes 1.9-2.0 % less on the Cortex-A55 and 1.0 % less on the Cortex-A76.
 - Fixes found in review: several vector kernels read past the end of short
   slices; `compute_theta` wrote through a shared reference, so its output depended
   on inlining.
 
 **Fuzzing**
-- The 18 fuzz targets in `fuzz/` build and run on the stable toolchain
-  (`fuzz/fuzz.sh`), with overflow checks on. Five of them compare with
+- The 19 fuzz targets in `fuzz/` build and run on the stable toolchain
+  (`fuzz/fuzz.sh`), with overflow checks on. Six of them compare with
   libopus: packet parsing, padding and writing; a decoder fed packet
-  streams with losses and FEC; the multistream decoder and encoder; and an
-  encoder whose settings change between frames.
+  streams with losses and FEC; the multistream decoder and encoder; an
+  encoder whose settings change between frames; and the channel order of
+  both encoders. They also check the packet length of a constant bitrate
+  against libopus's rule, and that the multistream decoder writes only the
+  samples it returns.
 
 **Known gaps** (measured against libopus 1.6.1)
 - libopus's speech/music analysis (`analysis.c`) and discontinuous transmission
   are not ported.
 - x86-64 code was only compile-checked in this release, not run.
-- The CELT decoder agrees with libopus to 136-146 dB but is not bit-exact on most streams.
+- Two FEC streams of the decoder agree with libopus to 185 and 186 dB instead of
+  bit for bit.
+- SILK stereo with a constant bitrate at 12 kHz can lose its stereo image on
+  tones, as the fixed-point build of libopus does; the float build keeps it
+  ([docs/10](docs/10-differences-from-libopus.md#silk)).
 
 ### Unreleased (earlier)
 

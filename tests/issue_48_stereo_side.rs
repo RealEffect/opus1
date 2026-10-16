@@ -16,7 +16,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -288,8 +288,8 @@ fn run(case: &Case) -> Measured {
     let input = (case.signal)(sr, frame * packets);
 
     let mut rs_enc = OpusEncoder::new(sr as i32, CH, Application::Voip).unwrap();
-    rs_enc.bitrate_bps = case.bitrate;
-    rs_enc.use_cbr = case.cbr;
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(case.bitrate)).unwrap();
+    rs_enc.set_vbr(!case.cbr);
     // A stereo stream, as libopus below: both encoders would otherwise code
     // the input as mono below ~18 kb/s.
     rs_enc.set_force_channels(Some(CH)).unwrap();
@@ -299,13 +299,13 @@ fn run(case: &Case) -> Measured {
     let mut c_enc = CEnc::new(sr as u32, CCh::Stereo, CApp::Voip).unwrap();
     c_enc.set_bitrate(CBitrate::Bits(case.bitrate)).unwrap();
     c_enc.set_vbr(!case.cbr).unwrap();
-    c_enc.set_complexity(rs_enc.complexity).unwrap();
+    c_enc.set_complexity(rs_enc.complexity()).unwrap();
     c_enc.set_bandwidth(case.bandwidth).unwrap();
     c_enc.set_signal(CSignal::Voice).unwrap();
     c_enc.set_force_channels(Some(CCh::Stereo)).unwrap();
     if let Some(loss) = case.fec_loss {
-        rs_enc.use_inband_fec = true;
-        rs_enc.packet_loss_perc = loss;
+        rs_enc.set_inband_fec(true);
+        rs_enc.set_packet_loss_perc(loss).unwrap();
         c_enc.set_inband_fec(true).unwrap();
         c_enc.set_packet_loss_perc(loss).unwrap();
     }
@@ -332,7 +332,7 @@ fn run(case: &Case) -> Measured {
             } else {
                 other
             };
-            rs_enc.bitrate_bps = rate;
+            rs_enc.set_bitrate(Bitrate::BitsPerSecond(rate)).unwrap();
             c_enc.set_bitrate(CBitrate::Bits(rate)).unwrap();
         }
         for (k, (dec, fec_dec, stream)) in streams.iter_mut().enumerate() {

@@ -14,6 +14,7 @@
 
 mod k24_enc_common;
 use k24_enc_common::*;
+use opus1::Bitrate;
 
 const BITRATES: [i32; 10] = [
     6_000, 8_000, 12_000, 16_000, 24_000, 32_000, 48_000, 64_000, 96_000, 128_000,
@@ -163,7 +164,7 @@ fn bandwidth_follows_a_bitrate_change() {
         let (mut rs, mut c) = (Vec::new(), Vec::new());
         for (k, &bitrate) in schedule.iter().enumerate() {
             let part = &pcm[k * 4 * FS..(k + 1) * 4 * FS];
-            rs_enc.bitrate_bps = bitrate;
+            rs_enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             c_enc.ctl(audiopus_sys::OPUS_SET_BITRATE_REQUEST, bitrate);
             rs.extend(enc_rs_with(&mut rs_enc, &cfg, part).unwrap());
             c.extend(c_enc.encode(&cfg, part));
@@ -218,7 +219,7 @@ fn celt_only_frames_end_a_rate_switch() {
     let (mut rs, mut c) = (Vec::new(), Vec::new());
     for (k, &bitrate) in schedule.iter().enumerate() {
         let part = &pcm[k * 3 * FS..(k + 1) * 3 * FS];
-        rs_enc.bitrate_bps = bitrate;
+        rs_enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
         c_enc.ctl(audiopus_sys::OPUS_SET_BITRATE_REQUEST, bitrate);
         rs.extend(enc_rs_with(&mut rs_enc, &cfg, part).unwrap());
         c.extend(c_enc.encode(&cfg, part));
@@ -285,7 +286,7 @@ fn silk_only_after_celt_only_restarts_once() {
         let (mut rs_last, mut c_last) = (Vec::new(), Vec::new());
         for &(from, to, bitrate, frame) in &parts {
             cfg.frame = frame;
-            rs_enc.bitrate_bps = bitrate;
+            rs_enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             c_enc.ctl(audiopus_sys::OPUS_SET_BITRATE_REQUEST, bitrate);
             rs_last = enc_rs_with(&mut rs_enc, &cfg, &pcm[from..to]).unwrap();
             c_last = c_enc.encode(&cfg, &pcm[from..to]);

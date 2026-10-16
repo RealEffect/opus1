@@ -5,7 +5,7 @@
 /// SILK encoder-decoder loopback test
 /// Encodes a 440Hz sine wave with SILK and decodes it back,
 /// then verifies the output is valid (non-zero) and has reasonable SNR.
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 /// Generate a 440Hz sine wave at the given sample rate
 fn generate_sine(sample_rate: i32, duration_ms: i32, frequency: f32) -> Vec<f32> {
@@ -48,8 +48,8 @@ fn test_silk_encode_decode_loopback() {
 
     // Create encoder
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip).unwrap();
-    encoder.bitrate_bps = bitrate;
-    encoder.use_cbr = true;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    encoder.set_vbr(false);
 
     // Create decoder
     let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
@@ -159,8 +159,8 @@ fn test_silk_encode_decode_nonzero_output() {
     let frame_size = 160;
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip).unwrap();
-    encoder.bitrate_bps = 10000;
-    encoder.use_cbr = true;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(10000)).unwrap();
+    encoder.set_vbr(false);
 
     let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
 
@@ -201,8 +201,8 @@ fn test_silk_multi_frame_continuity() {
     let frame_size = 160;
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip).unwrap();
-    encoder.bitrate_bps = 16000; // Higher bitrate for better quality
-    encoder.use_cbr = true;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap(); // Higher bitrate for better quality
+    encoder.set_vbr(false);
 
     let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
 

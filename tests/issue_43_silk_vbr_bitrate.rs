@@ -18,7 +18,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus1::{Application, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Packets per stream, and how many leading packets are warm-up.
@@ -106,8 +106,8 @@ fn rs_packets(setup: Setup, cbr: bool, buf_len: usize) -> Vec<Vec<u8>> {
     // detector to say otherwise (opus_encoder.c: `equiv_rate >= threshold`).
     // The libopus side below is kept in SILK with the voice signal hint.
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
-    enc.bitrate_bps = setup.bitrate;
-    enc.use_cbr = cbr;
+    enc.set_bitrate(Bitrate::BitsPerSecond(setup.bitrate)).unwrap();
+    enc.set_vbr(!cbr);
     let mut out = vec![0u8; buf_len];
     (0..PACKETS)
         .map(|p| {

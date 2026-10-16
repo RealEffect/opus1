@@ -25,7 +25,7 @@ mod ms_support;
 
 use audiopus_sys as sys;
 use ms_support::{APP_AUDIO, CMsEncoder, max_packet_bytes, noise, silence, to_i16, tones, voiced};
-use opus1::multistream::surround::SurroundProbe;
+use opus1::internals::multistream::surround::SurroundProbe;
 use std::f64::consts::PI;
 use std::os::raw::{c_int, c_void};
 
@@ -509,9 +509,17 @@ fn mask_is_the_mask_of_libopus_for_every_layout_rate_and_frame_size() {
     println!("all: {all}");
     // Rounding is all that differs. Few values differ by more than 1e-4,
     // and next to none by more than the tolerance. Measured on aarch64:
-    // 0.5 % and 9 values. 44 % of the values are the same bits.
+    // no value differs by more than 1e-4, and 98.7 % of the values are the
+    // same bits (1,231,583 of 1,247,400).
     assert!(all.above_1e4 * 20 < all.values, "{all}");
     assert!(all.above * 10_000 < all.values, "{all}");
+    // On aarch64 opus1 takes the band levels and the channel offset with
+    // libopus's approximation of the logarithm (`celt_log2`), as libopus
+    // does there. With the exact logarithm for the band levels 78.5 % of the
+    // values are the same bits, and with it for the offset 89.2 %.
+    if cfg!(target_arch = "aarch64") {
+        assert!(all.exact * 1000 >= all.values * 985, "{all}");
+    }
 }
 
 #[test]

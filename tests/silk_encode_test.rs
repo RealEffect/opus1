@@ -4,13 +4,13 @@
 
 /// SILK end-to-end encode test
 /// Tests that silk_encode_frame runs without crashing and produces valid output
-use opus1::range_coder::RangeCoder;
-use opus1::silk::control_codec::*;
-use opus1::silk::define::*;
-use opus1::silk::enc_api::silk_encode_frame;
-use opus1::silk::init_encoder::silk_init_encoder;
-use opus1::silk::structs::*;
-use opus1::{Application, OpusEncoder};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::control_codec::*;
+use opus1::internals::silk::define::*;
+use opus1::internals::silk::enc_api::silk_encode_frame;
+use opus1::internals::silk::init_encoder::silk_init_encoder;
+use opus1::internals::silk::structs::*;
+use opus1::{Application, Bitrate, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Helper: generate a voiced-like sine wave at ~200 Hz for 16 kHz
@@ -149,17 +149,17 @@ fn test_lbrr_encoding_enabled() {
     // Encoder WITHOUT LBRR
     let mut enc_no_fec =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Encoder creation failed");
-    enc_no_fec.bitrate_bps = 20000;
-    enc_no_fec.use_cbr = false;
-    enc_no_fec.use_inband_fec = false;
+    enc_no_fec.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    enc_no_fec.set_vbr(true);
+    enc_no_fec.set_inband_fec(false);
 
     // Encoder WITH LBRR
     let mut enc_with_fec =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Encoder creation failed");
-    enc_with_fec.bitrate_bps = 20000;
-    enc_with_fec.use_cbr = false;
-    enc_with_fec.use_inband_fec = true;
-    enc_with_fec.packet_loss_perc = 10;
+    enc_with_fec.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    enc_with_fec.set_vbr(true);
+    enc_with_fec.set_inband_fec(true);
+    enc_with_fec.set_packet_loss_perc(10).unwrap();
 
     let mut total_bytes_no_fec = 0usize;
     let mut total_bytes_with_fec = 0usize;
@@ -222,9 +222,9 @@ fn test_lbrr_flag_in_packet() {
 
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Encoder creation failed");
-    encoder.bitrate_bps = 20000;
-    encoder.use_inband_fec = true;
-    encoder.packet_loss_perc = 10;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder.set_inband_fec(true);
+    encoder.set_packet_loss_perc(10).unwrap();
 
     // Encode 3 frames: first frame has no LBRR (no previous frame),
     // subsequent frames may include LBRR

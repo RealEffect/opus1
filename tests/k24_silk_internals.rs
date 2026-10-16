@@ -8,9 +8,9 @@
 
 mod k24_common;
 
-use opus1::silk::nlsf::silk_nlsf2a;
-use opus1::silk::nlsf_decode::silk_nlsf_decode;
-use opus1::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
+use opus1::internals::silk::nlsf::silk_nlsf2a;
+use opus1::internals::silk::nlsf_decode::silk_nlsf_decode;
+use opus1::internals::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
 use std::os::raw::{c_int, c_void};
 
 unsafe extern "C" {
@@ -54,8 +54,8 @@ unsafe extern "C" {
 /// ones (extra least-significant bits for very large pulses).
 #[test]
 fn decode_pulses_matches_libopus() {
-    use opus1::range_coder::RangeCoder;
-    use opus1::silk::decode_pulses::silk_decode_pulses as rs_decode_pulses;
+    use opus1::internals::range_coder::RangeCoder;
+    use opus1::internals::silk::decode_pulses::silk_decode_pulses as rs_decode_pulses;
     let mut rng = Lcg(3);
     for trial in 0..20000 {
         // Bias some streams towards 0x00 / 0xFF bytes, which decode to the
@@ -138,7 +138,7 @@ fn resonant_filter(r: f64, angles: &[f64]) -> Vec<i16> {
 /// frame on.
 #[test]
 fn lpc_inverse_pred_gain_matches_libopus() {
-    use opus1::silk::lpc_analysis::silk_lpc_inverse_pred_gain;
+    use opus1::internals::silk::lpc_analysis::silk_lpc_inverse_pred_gain;
     // The filter of the first diverging frame of the chirp stream.
     let from_chirp: [i16; 10] = [5782, -8287, 4351, -2408, 157, -223, -45, -302, 104, -250];
     let c = unsafe { silk_LPC_inverse_pred_gain_c(from_chirp.as_ptr(), 10) };
@@ -200,7 +200,7 @@ unsafe extern "C" {
 /// method and produced a different signal.
 #[test]
 fn resampler_matches_libopus_for_every_rate_pair() {
-    use opus1::silk::resampler::SilkResampler;
+    use opus1::internals::silk::resampler::SilkResampler;
     let mut rng = Lcg(5);
     let mut pairs = Vec::new();
     for fs_in in [8000, 12000, 16000] {
@@ -360,7 +360,7 @@ fn nlsf2a_matches_libopus_on_resonant_filters() {
 /// The three long-term-prediction gain codebooks.
 #[test]
 fn ltp_gain_codebooks_match_libopus() {
-    use opus1::silk::tables::SILK_LTP_VQ_PTRS_Q7;
+    use opus1::internals::silk::tables::SILK_LTP_VQ_PTRS_Q7;
     for (cb, size) in [8usize, 16, 32].into_iter().enumerate() {
         let c = unsafe { std::slice::from_raw_parts(silk_LTP_vq_ptrs_Q7[cb], size * 5) };
         for entry in 0..size {

@@ -367,7 +367,7 @@ pub fn measure_signal(setting: Setting, pcm: &[f32]) -> Measured {
         .map(|s| StreamRate {
             kind: stream_kind(&rust, s),
             set: [
-                rust.stream_encoder(s).unwrap().bitrate_bps,
+                bitrate_set(rust.stream_encoder(s).unwrap()),
                 c.stream_bitrate(s),
             ],
             used: [

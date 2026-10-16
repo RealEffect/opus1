@@ -7,7 +7,7 @@
 //! functions are fixed-point, so the outputs and the filter states must be
 //! identical.
 
-use opus1::silk::resampler::{
+use opus1::internals::silk::resampler::{
     SILK_RESAMPLER_2_3_COEFS_LQ, silk_resampler_down2_3, silk_resampler_private_ar2,
 };
 

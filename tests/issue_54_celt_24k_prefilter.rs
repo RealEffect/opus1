@@ -53,7 +53,7 @@ fn input(rate: usize, level: f64) -> Vec<f32> {
 
 fn opus1_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
     let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = bitrate;
+    enc.set_bitrate(opus1::Bitrate::BitsPerSecond(bitrate)).unwrap();
     let frame = rate / 50;
     let mut pkt = [0u8; 4000];
     input(rate, level)

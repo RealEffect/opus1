@@ -1,4 +1,4 @@
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 fn max_abs(v: &[f32]) -> f32 {
     v.iter().map(|x| x.abs()).fold(0.0f32, f32::max)
@@ -22,8 +22,8 @@ fn vbr_near_silence_192k_not_huge() {
         }
     }
     let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
-    enc.bitrate_bps = 192000;
-    enc.use_cbr = false;
+    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_vbr(true);
     let mut out = vec![0u8; 1276];
     let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
     assert!(n > 0 && n <= 1276);
@@ -57,8 +57,8 @@ fn high_bitrate_matrix_48k_stereo() {
             }
         }
         let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
-        enc.bitrate_bps = kbps * 1000;
-        enc.use_cbr = false;
+        enc.set_bitrate(Bitrate::BitsPerSecond(kbps * 1000)).unwrap();
+        enc.set_vbr(true);
         let mut out = vec![0u8; 1276];
         let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
         let mut dec = OpusDecoder::new(48000, channels).unwrap();
@@ -89,8 +89,8 @@ fn per_packet_fresh_decoder_192k() {
         }
     }
     let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
-    enc.bitrate_bps = 192000;
-    enc.use_cbr = false;
+    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_vbr(true);
     let mut out = vec![0u8; 1276];
     let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
     let pkt = out[..n].to_vec();

@@ -143,5 +143,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_channel_order"
+path = "fuzz_targets/fuzz_channel_order.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

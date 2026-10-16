@@ -7,9 +7,9 @@
 //! Two decoders are fed the same packets. One writes planar, the other
 //! interleaved. Their states stay equal, so every frame can be compared.
 
-use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// A tone with noise bursts and pauses, different in the two channels.
 fn test_signal(channels: usize, samples: usize) -> Vec<f32> {

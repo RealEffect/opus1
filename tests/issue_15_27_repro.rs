@@ -10,9 +10,9 @@
 //!   2. The encoder omitted per-frame / LBRR stereo headers -> bitstream desync.
 //!   3. Multi-frame (40/60 ms) SILK packets decoded only their first frame.
 
-use opus1::silk::SilkResampler;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::internals::silk::SilkResampler;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Delay-compensated SNR: SILK decode introduces an algorithmic delay, so
@@ -154,8 +154,8 @@ fn issue_15_resampler_short_output_no_panic() {
 #[test]
 fn issue_27_1_stereo_silk_40ms_encode_no_panic() {
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_vbr(false);
     let frame = 640; // 40 ms @ 16 kHz
     let input = sine_input(frame, 16000, 2);
     let mut pkt = vec![0u8; 1500];
@@ -176,8 +176,8 @@ fn issue_27_1_stereo_silk_40ms_encode_no_panic() {
 #[test]
 fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_vbr(false);
     let frame = 640;
 
     let mut dec = OpusDecoder::new(16000, 2).unwrap();
@@ -216,9 +216,9 @@ fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
 #[test]
 fn issue_27_2b_stereo_fec_roundtrip_consistent() {
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
-    enc.use_inband_fec = true;
-    enc.packet_loss_perc = 40;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_inband_fec(true);
+    enc.set_packet_loss_perc(40).unwrap();
     let frame = 320; // 20 ms
 
     let mut dec = OpusDecoder::new(16000, 2).unwrap();
@@ -250,10 +250,10 @@ fn issue_27_2b_stereo_fec_roundtrip_consistent() {
 #[test]
 fn issue_27_2b_stereo_fec_cbr_roundtrip_consistent() {
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.use_cbr = true;
-    enc.use_inband_fec = true;
-    enc.packet_loss_perc = 40;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_vbr(false);
+    enc.set_inband_fec(true);
+    enc.set_packet_loss_perc(40).unwrap();
     let frame = 320; // 20 ms
 
     let mut dec = OpusDecoder::new(16000, 2).unwrap();
@@ -293,8 +293,8 @@ fn issue_27_2b_stereo_fec_cbr_roundtrip_consistent() {
 #[test]
 fn issue_27_3_silk_40ms_mono_full_decode() {
     let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_vbr(false);
     let frame = 640;
 
     let mut dec = OpusDecoder::new(16000, 1).unwrap();
@@ -321,8 +321,8 @@ fn issue_27_3_silk_40ms_mono_full_decode() {
 #[test]
 fn issue_27_3_silk_40ms_resampled_full_decode() {
     let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_vbr(false);
     let enc_frame = 640; // 40 ms @ 16 kHz
 
     let mut dec = OpusDecoder::new(48000, 1).unwrap();
@@ -398,8 +398,8 @@ fn deep_scan_encode_short_input_returns_err() {
 /// now be rejected cleanly.
 #[test]
 fn deep_scan_celt_decode_oversized_frame_rejected() {
-    use opus1::celt::{CeltDecoder, PcmLayout};
-    use opus1::{modes, range_coder::RangeCoder};
+    use opus1::internals::celt::{CeltDecoder, PcmLayout};
+    use opus1::internals::{modes, range_coder::RangeCoder};
     let mut dec = CeltDecoder::new(modes::default_mode(), 1, 48000);
     let pkt = [0xABu8; 32];
     let mut pcm = vec![0.0f32; 2160]; // 45 ms: lands in the old guard gap
@@ -416,9 +416,9 @@ fn deep_scan_celt_decode_oversized_frame_rejected() {
 fn deep_scan_fixedvec_push_overflow_guarded() {
     // 960 = 2^6 * 3 * 5 is a valid 5-smooth FFT size but exceeds
     // KISS_MAX_N = 480.
-    assert!(opus1::kiss_fft::KissFftState::new(960).is_none());
+    assert!(opus1::internals::kiss_fft::KissFftState::new(960).is_none());
     // Sanity: normal sizes still construct.
-    assert!(opus1::kiss_fft::KissFftState::new(480).is_some());
+    assert!(opus1::internals::kiss_fft::KissFftState::new(480).is_some());
 }
 
 /// A `SilkDecoder` used without `init()` must fail gracefully instead of

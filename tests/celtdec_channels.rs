@@ -19,9 +19,9 @@ mod celtdec_common;
 mod k24_common;
 use celtdec_common::*;
 use k24_common::*;
-use opus1::celt::{CeltDecoder, PcmLayout};
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::{CeltDecoder, PcmLayout};
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// Lowest SNR against libopus of any decoded (not concealed) frame, in dB.
 /// A stream as a whole reaches about 135 dB, the same as with matching

@@ -2,11 +2,11 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus1::silk::define::*;
-use opus1::silk::nlsf_decode::silk_nlsf_decode;
-use opus1::silk::nlsf_encode::silk_nlsf_encode;
-use opus1::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
-use opus1::{Application, OpusEncoder};
+use opus1::internals::silk::define::*;
+use opus1::internals::silk::nlsf_decode::silk_nlsf_decode;
+use opus1::internals::silk::nlsf_encode::silk_nlsf_encode;
+use opus1::internals::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
+use opus1::{Application, Bitrate, OpusEncoder};
 use std::f32::consts::PI;
 
 #[test]
@@ -230,15 +230,15 @@ fn test_nlsf_interpolation_activated_at_complexity5() {
 
     let mut encoder_interp =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
-    encoder_interp.complexity = 5; // NLSF interpolation activates at complexity >= 5
-    encoder_interp.bitrate_bps = 20000;
-    encoder_interp.use_cbr = false;
+    encoder_interp.set_complexity(5).unwrap(); // NLSF interpolation activates at complexity >= 5
+    encoder_interp.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder_interp.set_vbr(true);
 
     let mut encoder_no_interp =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
-    encoder_no_interp.complexity = 0; // No interpolation
-    encoder_no_interp.bitrate_bps = 20000;
-    encoder_no_interp.use_cbr = false;
+    encoder_no_interp.set_complexity(0).unwrap(); // No interpolation
+    encoder_no_interp.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder_no_interp.set_vbr(true);
 
     // Encode multiple frames and verify output is valid (non-empty, non-crashing)
     let mut bytes_interp = Vec::new();
@@ -302,9 +302,9 @@ fn test_nlsf_interpolation_40ms_frames() {
 
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
-    encoder.complexity = 5;
-    encoder.bitrate_bps = 20000;
-    encoder.use_cbr = false;
+    encoder.set_complexity(5).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder.set_vbr(true);
 
     // Encode several 40ms frames and verify they don't crash
     for frame_idx in 0..5 {

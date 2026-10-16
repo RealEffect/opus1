@@ -13,19 +13,19 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::control_codec::{
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::control_codec::{
     SilkBandwidthControl, silk_control_audio_bandwidth, silk_control_encoder,
 };
-use opus1::silk::decode_pulses::silk_decode_pulses;
-use opus1::silk::enc_api::{
+use opus1::internals::silk::decode_pulses::silk_decode_pulses;
+use opus1::internals::silk::enc_api::{
     SilkControl, SilkEncoder, SilkInput, SilkPrefill, silk_average_first_mono_frame,
     silk_downmix_stereo, silk_encode_packet, silk_encode_prefill,
 };
-use opus1::silk::encode_pulses::silk_encode_pulses;
-use opus1::silk::init_encoder::silk_init_encoder;
-use opus1::silk::resampler::SilkResampler;
-use opus1::silk::structs::SilkEncoderState;
+use opus1::internals::silk::encode_pulses::silk_encode_pulses;
+use opus1::internals::silk::init_encoder::silk_init_encoder;
+use opus1::internals::silk::resampler::SilkResampler;
+use opus1::internals::silk::structs::SilkEncoderState;
 
 const API_FS: usize = 48_000;
 

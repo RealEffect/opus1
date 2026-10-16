@@ -1,8 +1,10 @@
 //! `hp_cutoff` rounds its float input to 16 bits and filters it. These tests
-//! require that the result equals the 16-bit entry point `hp_cutoff_i16` on
-//! the rounded samples, for every length.
+//! require that the result equals the filter of the rounded samples, for
+//! every length. The rounded samples go into `hp_cutoff` as `s / 32768`,
+//! which the rounding gives back unchanged, so that call filters exactly
+//! the 16-bit samples.
 
-use opus1::hp_cutoff::{hp_cutoff, hp_cutoff_i16};
+use opus1::internals::hp_cutoff::hp_cutoff;
 
 /// xorshift64 generator with a fixed seed, so the test data never changes.
 struct XorShift(u64);
@@ -28,9 +30,24 @@ fn to_i16(x: f32) -> i16 {
     (x * 32768.0 + 0.5).floor().clamp(-32768.0, 32767.0) as i16
 }
 
-/// Run both entry points over `calls` consecutive frames of `frames` sample
-/// frames each and require equal output and equal filter state after every
-/// call.
+/// The filter of 16-bit samples: `hp_cutoff` on `s / 32768`, which it
+/// rounds back to `s` exactly.
+fn hp_cutoff_rounded(
+    input: &[i16],
+    cutoff_hz: i32,
+    output: &mut [i16],
+    hp_mem: &mut [i32],
+    len: usize,
+    channels: usize,
+    fs: i32,
+) {
+    let exact: Vec<f32> = input.iter().map(|&x| x as f32 / 32768.0).collect();
+    hp_cutoff(&exact, cutoff_hz, output, hp_mem, len, channels, fs);
+}
+
+/// Run `hp_cutoff` on the input and on the rounded input over `calls`
+/// consecutive frames of `frames` sample frames each, and require equal
+/// output and equal filter state after every call.
 fn check(
     rng: &mut XorShift,
     frames: usize,
@@ -58,7 +75,7 @@ fn check(
             channels,
             fs,
         );
-        hp_cutoff_i16(
+        hp_cutoff_rounded(
             &input_i16,
             cutoff_hz,
             &mut out_i16[..n],
@@ -144,7 +161,7 @@ fn block_wise_equals_single_pass_for_extreme_input() {
                 channels,
                 48000,
             );
-            hp_cutoff_i16(
+            hp_cutoff_rounded(
                 &input_i16,
                 60,
                 &mut out_i16,
@@ -170,7 +187,7 @@ fn mono_stops_at_the_shorter_of_input_and_output() {
         let mut out_f32 = vec![0x5a5ai16; out_len];
         let mut out_i16 = vec![0x5a5ai16; out_len];
         hp_cutoff(&input, 60, &mut out_f32, &mut mem_f32, 1000, 1, 16000);
-        hp_cutoff_i16(&input_i16, 60, &mut out_i16, &mut mem_i16, 1000, 1, 16000);
+        hp_cutoff_rounded(&input_i16, 60, &mut out_i16, &mut mem_i16, 1000, 1, 16000);
         assert_eq!(out_f32, out_i16, "output length {out_len}");
         assert_eq!(mem_f32, mem_i16, "output length {out_len}");
     }

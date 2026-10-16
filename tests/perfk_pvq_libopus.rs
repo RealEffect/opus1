@@ -19,7 +19,7 @@
 //! difference is allowed.
 
 use audiopus_sys as _;
-use opus1::pvq::pvq_search;
+use opus1::internals::pvq::pvq_search;
 use std::os::raw::c_int;
 
 unsafe extern "C" {

@@ -1,4 +1,5 @@
-//! `opus1::multistream::layout` against C libopus.
+//! The channel layouts of `opus1::multistream` (`src/multistream/layout.rs`)
+//! against C libopus.
 //!
 //! - `ChannelLayout::surround` against `opus_multistream_surround_encoder_create`:
 //!   same accept or reject, same streams, coupled streams and mapping. The
@@ -15,9 +16,7 @@ mod ms_support;
 
 use audiopus_sys as sys;
 use ms_support::*;
-use opus1::multistream::layout::{
-    ChannelLayout, MappingType, SILENT_CHANNEL, validate_ambisonics,
-};
+use opus1::multistream::{ChannelLayout, MappingType, SILENT_CHANNEL, validate_ambisonics};
 
 const FS: i32 = 48_000;
 /// 20 ms at 48 kHz.

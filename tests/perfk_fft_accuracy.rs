@@ -14,11 +14,11 @@
 //! The limits below sit a few decibels under what the code measures today.
 //! Run with `--nocapture` to see the measured values.
 
-use opus1::kiss_fft::{
+use opus1::internals::kiss_fft::{
     KissCpx, KissFftState, opus_fft_impl, opus_fft_impl_fused, opus_fft_impl_scalar,
 };
-use opus1::mdct::MdctLookup;
-use opus1::modes::default_mode;
+use opus1::internals::mdct::MdctLookup;
+use opus1::internals::modes::default_mode;
 use std::f64::consts::PI;
 
 /// Deterministic pseudo-random numbers, so every run tests the same data.

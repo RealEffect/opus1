@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{chirp, to_stereo};
-use opus1::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder, packet, pcm_soft_clip};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder, packet, pcm_soft_clip};
 
 /// Frame sizes no buffer can hold. Several are chosen so that
 /// `frame_size * 2` overflows to a small number, or so that their lowest 32
@@ -213,7 +213,7 @@ fn encoder_at_extreme_settings_writes_packets_libopus_decodes() {
             for (b, bandwidth) in bandwidths.into_iter().enumerate() {
                 for (f, frame_2_5ms) in [1usize, 4, 8, 24].into_iter().enumerate() {
                     // Each combination takes one of the bitrates in turn.
-                    let bitrate = [i32::MIN, 500, 6000, 510_000, i32::MAX][(m + b + f) % 5];
+                    let bitrate = [1, 500, 6000, 510_000, i32::MAX][(m + b + f) % 5];
                     for cbr in [false, true] {
                         for room in [0usize, 1, 2, 3, 9, 1276, 4000] {
                             let frame = rate / 400 * frame_2_5ms;
@@ -221,8 +221,8 @@ fn encoder_at_extreme_settings_writes_packets_libopus_decodes() {
                             let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
                             enc.set_force_mode(mode);
                             enc.set_bandwidth(bandwidth);
-                            enc.bitrate_bps = bitrate;
-                            enc.use_cbr = cbr;
+                            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                            enc.set_vbr(!cbr);
                             let mut c_dec = CDecoder::new(rate, channels);
                             let mut buf = vec![0u8; room];
                             for input in pcm.chunks_exact(frame * channels).take(3) {
@@ -265,8 +265,8 @@ fn large_celt_narrowband_stereo_packets_have_the_decoders_final_range() {
         for cbr in [false, true] {
             let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
             enc.set_force_mode(Some(ForcedMode::CeltOnly));
-            enc.bitrate_bps = bitrate;
-            enc.use_cbr = cbr;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc.set_vbr(!cbr);
             let mut c_dec = CDecoder::new(rate, 2);
             let mut dec = OpusDecoder::new(rate as i32, 2).unwrap();
             let mut buf = vec![0u8; 1276];
@@ -384,8 +384,8 @@ fn insane_frames(application: (i32, Application), mode: Option<(i32, ForcedMode)
     let mut c_enc = CEncoder::new(rate, 1, application.0);
     c_enc.bitrate(32000).complexity(5);
     let mut enc = OpusEncoder::new(rate as i32, 1, application.1).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.complexity = 5;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_complexity(5).unwrap();
     if let Some((c_mode, forced)) = mode {
         c_enc.force_mode(c_mode);
         enc.set_force_mode(Some(forced));

@@ -3,7 +3,7 @@
 //! internal function can be called directly. The function is fixed-point:
 //! energy and shift must be identical.
 
-use opus1::silk::sigproc_fix::silk_sum_sqr_shift;
+use opus1::internals::silk::sigproc_fix::silk_sum_sqr_shift;
 use std::os::raw::c_int;
 
 unsafe extern "C" {

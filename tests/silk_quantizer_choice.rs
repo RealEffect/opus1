@@ -22,12 +22,12 @@
 //! of 0, so after one frame the seed is still 0 exactly when the
 //! delayed-decision quantizer ran.
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::control_codec::silk_control_encoder;
-use opus1::silk::define::CODE_INDEPENDENTLY;
-use opus1::silk::enc_api::silk_encode_frame;
-use opus1::silk::init_encoder::silk_init_encoder;
-use opus1::silk::structs::SilkEncoderState;
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::control_codec::silk_control_encoder;
+use opus1::internals::silk::define::CODE_INDEPENDENTLY;
+use opus1::internals::silk::enc_api::silk_encode_frame;
+use opus1::internals::silk::init_encoder::silk_init_encoder;
+use opus1::internals::silk::structs::SilkEncoderState;
 
 /// Encodes one 20 ms frame of a 200 Hz tone at 16 kHz with the given number
 /// of delayed-decision states and warping, and returns the random seed left

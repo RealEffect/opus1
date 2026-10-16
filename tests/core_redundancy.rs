@@ -23,7 +23,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech, to_stereo};
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 
 /// Speech, mono or stereo. No steady tones: on those the SILK encoder of
 /// opus1 is known to be several dB below libopus (tests/core_switch.rs),
@@ -126,8 +126,8 @@ fn run(stream: &Stream) -> Outcome {
     let mut c_enc = CEncoder::new(rate, channels, application.0);
     c_enc.complexity(5).vbr(!cbr);
     let mut enc = OpusEncoder::new(rate as i32, channels, application.1).unwrap();
-    enc.complexity = 5;
-    enc.use_cbr = cbr;
+    enc.set_complexity(5).unwrap();
+    enc.set_vbr(!cbr);
     // One C decoder for each stream.
     let mut dec = CDecoder::new(rate, channels);
     let mut c_dec = CDecoder::new(rate, channels);
@@ -138,7 +138,7 @@ fn run(stream: &Stream) -> Outcome {
     for (i, input) in pcm.chunks_exact(frame * channels).take(packets_total).enumerate() {
         let step = schedule[i / hold];
         c_enc.bitrate(step.bitrate).bandwidth(step.bandwidth.0);
-        enc.bitrate_bps = step.bitrate;
+        enc.set_bitrate(Bitrate::BitsPerSecond(step.bitrate)).unwrap();
         enc.set_bandwidth(step.bandwidth.1);
         match step.mode {
             Some((c_mode, forced)) => {
@@ -473,8 +473,8 @@ fn step_means(application: (i32, Application), rate: usize, offset: f32) -> Vec<
     let mut c_enc = CEncoder::new(rate, 1, application.0);
     c_enc.complexity(5).bitrate(24000);
     let mut enc = OpusEncoder::new(rate as i32, 1, application.1).unwrap();
-    enc.complexity = 5;
-    enc.bitrate_bps = 24000;
+    enc.set_complexity(5).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     let (mut dec, mut c_dec) = (CDecoder::new(rate, 1), CDecoder::new(rate, 1));
     let mut buf = vec![0u8; 1500];
     let mut sums = vec![(0f64, 0f64); schedule.len()];
@@ -601,9 +601,9 @@ fn hybrid_after_silk_only_starts_its_celt_layer_afresh() {
         let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
         c_enc.complexity(5).vbr(!cbr).bitrate(32000).force_mode(MODE_SILK);
         let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
-        enc.complexity = 5;
-        enc.use_cbr = cbr;
-        enc.bitrate_bps = 32000;
+        enc.set_complexity(5).unwrap();
+        enc.set_vbr(!cbr);
+        enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
         enc.set_force_mode(Some(ForcedMode::SilkOnly));
         let (mut dec, mut c_dec) = (CDecoder::new(rate, 1), CDecoder::new(rate, 1));
         let mut buf = vec![0u8; 1500];

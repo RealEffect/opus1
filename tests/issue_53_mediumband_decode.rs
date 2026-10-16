@@ -15,8 +15,8 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -95,7 +95,7 @@ fn opus1_packets(ch: usize) -> Vec<Vec<u8>> {
     let frame = MB_RATE / 50;
     let input = voiced(MB_RATE, ch, MB_RATE);
     let mut enc = OpusEncoder::new(MB_RATE as i32, ch, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     let mut pkt = vec![0u8; 1500];
     input
         .chunks_exact(frame * ch)

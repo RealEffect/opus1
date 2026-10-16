@@ -55,10 +55,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use audiopus_sys as ffi;
-use opus1::range_coder::RangeCoder;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus1::{Application, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::internals::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+use opus1::{Application, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
 
 /// Output buffer handed to both encoders. It is larger than any packet, so
 /// it never limits the bit rate.
@@ -89,25 +89,22 @@ const MODE_CELT_ONLY: c_int = 1002;
 // ---------------------------------------------------------------------------
 //
 // The speed of some codec functions depends on the address at which the
-// linker places them. Measured on an Apple M4 Pro: the same machine code of
-// `silk_warped_autocorrelation_fix` has a fast and a slow state, about 1.7
-// times apart, and the placement decides which one a build gets. That
-// changes the SILK encode time at complexity 5 by 11 to 17 %. No simple rule
-// for the slow placements was found. Any change to this program or to the
-// library moves the code, so a timing difference of that size between two
-// builds may have nothing to do with the change.
+// linker places them. Any change to this program or to the library moves
+// the code, so a timing difference between two builds may have nothing to
+// do with the change.
 //
-// Example: two builds of this program that differed in a comment and one
-// local variable gave 35.7 and 31.1 microseconds per frame for the Rust
-// encoder of `silk_nb_8k_mono_12k_vbr_c5_20ms`, and 64.3 and 55.3 for
-// `silk_wb_16k_mono_20k_vbr_c5_20ms`. No other bench row moved by more than
-// the usual noise.
+// Measured in October 2026 (docs/08-performance.md, "Code placement"):
+// moving the code by 16 to 48 bytes changed single timings by up to about
+// 2 % on Apple M4 Pro and on a Cortex-A76, by up to 4 % for libopus's SILK
+// encoding on the Cortex-A76, and by at most 0.5 % on a Cortex-A55.
+// Earlier, before its NEON version, `silk_warped_autocorrelation_fix` had a
+// fast and a slow placement on Apple M4 Pro, about 1.7 times apart.
 //
 // To tell the two apart, build this program with the environment variable
 // `PERF_HARNESS_PAD=<bytes>` (for example 0, 20, 40 and 60). The padding
 // below then moves all library code by about that many bytes, and `bench`
 // can be repeated at several placements. The `spread` command compares the
-// results. The padding exists on macOS only.
+// results. The padding exists on macOS, Linux and Android.
 
 /// Parse a decimal number at compile time. Anything else gives 0.
 const fn parse_decimal(text: Option<&str>) -> usize {
@@ -131,12 +128,22 @@ const fn parse_decimal(text: Option<&str>) -> usize {
 /// time.
 const LAYOUT_PAD: usize = parse_decimal(option_env!("PERF_HARNESS_PAD"));
 
-/// The padding itself. It is never read or executed. The object file of this
+/// The padding itself. It is never executed. The object file of this
 /// program is linked before the library, so the padding moves the library
 /// code.
 #[cfg(target_os = "macos")]
 #[used]
 #[unsafe(link_section = "__TEXT,__text")]
+static LAYOUT_PADDING: [u8; LAYOUT_PAD] = [0; LAYOUT_PAD];
+
+/// The padding on ELF targets (Linux and Android). It goes into the plain
+/// `.text` section of its object file, which the linker places before the
+/// functions of that object and before the library. `main` passes its
+/// address to `black_box`, so that the linker's removal of unused sections
+/// (`--gc-sections`) keeps it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[used]
+#[unsafe(link_section = ".text")]
 static LAYOUT_PADDING: [u8; LAYOUT_PAD] = [0; LAYOUT_PAD];
 
 // ---------------------------------------------------------------------------
@@ -1259,11 +1266,17 @@ fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
     };
     let mut encoder = OpusEncoder::new(sc.rate as i32, sc.channels, application)
         .map_err(|e| format!("OpusEncoder::new: {e}"))?;
-    encoder.bitrate_bps = sc.bitrate;
-    encoder.complexity = sc.complexity;
-    encoder.use_cbr = sc.cbr;
-    encoder.use_inband_fec = sc.fec;
-    encoder.packet_loss_perc = sc.loss_perc;
+    encoder
+        .set_bitrate(Bitrate::BitsPerSecond(sc.bitrate))
+        .map_err(|e| format!("set_bitrate: {e}"))?;
+    encoder
+        .set_complexity(sc.complexity)
+        .map_err(|e| format!("set_complexity: {e}"))?;
+    encoder.set_vbr(!sc.cbr);
+    encoder.set_inband_fec(sc.fec);
+    encoder
+        .set_packet_loss_perc(sc.loss_perc)
+        .map_err(|e| format!("set_packet_loss_perc: {e}"))?;
     if forced {
         encoder.set_force_mode(Some(match sc.mode {
             Mode::Silk => ForcedMode::SilkOnly,
@@ -1355,9 +1368,10 @@ impl CSettings {
     }
 }
 
-/// The settings opus1 exposes as public fields, read back after encoding:
-/// bit rate, complexity, constant bit rate, forward error correction,
-/// expected loss in percent. The encoder clamps them on every call.
+/// The settings of opus1 that the scenarios set, read back after encoding:
+/// bit rate (`OpusEncoder::bitrate`, as libopus `OPUS_GET_BITRATE`),
+/// complexity, constant bit rate, forward error correction, expected loss
+/// in percent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RustSettings {
     bitrate: i32,
@@ -1370,11 +1384,11 @@ struct RustSettings {
 impl RustSettings {
     fn of(encoder: &OpusEncoder) -> Self {
         Self {
-            bitrate: encoder.bitrate_bps,
-            complexity: encoder.complexity,
-            cbr: encoder.use_cbr,
-            fec: encoder.use_inband_fec,
-            loss_perc: encoder.packet_loss_perc,
+            bitrate: encoder.bitrate(),
+            complexity: encoder.complexity(),
+            cbr: !encoder.vbr(),
+            fec: encoder.inband_fec(),
+            loss_perc: encoder.packet_loss_perc(),
         }
     }
 
@@ -2396,7 +2410,7 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
     );
     let _ = writeln!(
         header,
-        "- the Rust encode time of the SILK complexity-5 rows depends on where the linker places the code: two states about 16 % apart were measured, and any change to the library or to this program can switch between them; compare such a row over several PERF_HARNESS_PAD builds with the `spread` command before trusting a change"
+        "- where the linker places the code moves single timings by up to about 2 % on Apple M4 Pro and on a Cortex-A76 (4 % for libopus on the A76); to compare two builds, run them in turns and use the `pairs` command (docs/08-performance.md, \"Comparing two builds\")"
     );
     println!("{header}");
     println!("{BENCH_HEADER}");
@@ -2616,6 +2630,121 @@ fn cmd_spread(paths: &[String]) -> Result<i32, String> {
         "- Rust/C ratio of the medians: encode {:.1}%, decode {:.1}%",
         worst_ratio[0], worst_ratio[1]
     );
+    Ok(0)
+}
+
+/// Compare two builds that ran in turns, from pairs of `bench --json`
+/// files: `pairs BASE CAND [BASE CAND ...]`. The two files of a pair were
+/// measured one after the other, so the machine was in the same state for
+/// both.
+///
+/// For each scenario and each of the four operations it prints the change
+/// of the median time from BASE to CAND, as the lowest and the highest
+/// change over the pairs. A change that has the same sign in every pair is
+/// marked. The libopus columns are a control: libopus is the same code in
+/// both builds, so a change there comes from the clock of the machine or
+/// from where the linker placed libopus.
+fn cmd_pairs(paths: &[String]) -> Result<i32, String> {
+    if paths.len() < 2 || !paths.len().is_multiple_of(2) {
+        return Err("pairs needs an even number of bench JSON files: BASE CAND [BASE CAND ...]".to_string());
+    }
+    // The median times of the four operations, per scenario, of one file.
+    let read = |path: &String| -> Result<Vec<(String, [f64; 4])>, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            let Some(name) = json_text_field(line, "name") else {
+                continue;
+            };
+            let mut medians = [0.0; 4];
+            for (median, operation) in medians.iter_mut().zip(OPERATIONS) {
+                *median = json_number_field(line, &format!("{operation}_med_ns"))
+                    .ok_or_else(|| format!("{path}: {name} has no {operation}_med_ns"))?;
+            }
+            rows.push((name, medians));
+        }
+        Ok(rows)
+    };
+    let files = paths.iter().map(read).collect::<Result<Vec<_>, _>>()?;
+    let pairs = files.len() / 2;
+    // Per scenario in the first file: per operation, the change of each pair
+    // in percent.
+    let mut table: Vec<(String, [Vec<f64>; 4])> = Vec::new();
+    for (name, _) in &files[0] {
+        let find = |file: &Vec<(String, [f64; 4])>| file.iter().find(|(n, _)| n == name).map(|(_, m)| *m);
+        let mut changes: [Vec<f64>; 4] = Default::default();
+        let mut complete = true;
+        for pair in 0..pairs {
+            let (Some(base), Some(cand)) = (find(&files[2 * pair]), find(&files[2 * pair + 1])) else {
+                complete = false;
+                break;
+            };
+            for (operation, change) in changes.iter_mut().enumerate() {
+                change.push((cand[operation] / base[operation] - 1.0) * 100.0);
+            }
+        }
+        if complete {
+            table.push((name.clone(), changes));
+        }
+    }
+    if table.is_empty() {
+        return Err("no scenario is in every file".to_string());
+    }
+    let lowest = |values: &[f64]| values.iter().copied().fold(f64::INFINITY, f64::min);
+    let highest = |values: &[f64]| values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    println!("{pairs} pairs. Change of the median time from BASE to CAND, lowest to highest over the pairs.");
+    println!("Below 0 means CAND is faster. `faster` or `slower`: the same sign in every pair.\n");
+    println!(
+        "| scenario | Rust enc | | C enc | Rust dec | | C dec |\n|---|---:|---|---:|---:|---|---:|"
+    );
+    let cell = |values: &[f64]| format!("{:+.1} to {:+.1} %", lowest(values), highest(values));
+    let sign = |values: &[f64]| {
+        if highest(values) < 0.0 {
+            "faster"
+        } else if lowest(values) > 0.0 {
+            "slower"
+        } else {
+            ""
+        }
+    };
+    for (name, changes) in &table {
+        println!(
+            "| {name} | {} | {} | {} | {} | {} | {} |",
+            cell(&changes[0]),
+            sign(&changes[0]),
+            cell(&changes[1]),
+            cell(&changes[2]),
+            sign(&changes[2]),
+            cell(&changes[3]),
+        );
+    }
+    // Geometric mean over the scenarios, per pair and operation.
+    println!("\nGeometric mean over the {} scenarios, per pair:", table.len());
+    for (operation, label) in OPERATION_LABELS.iter().enumerate() {
+        let per_pair: Vec<String> = (0..pairs)
+            .map(|pair| {
+                let log_sum: f64 = table.iter().map(|(_, c)| (1.0 + c[operation][pair] / 100.0).ln()).sum();
+                format!("{:+.2} %", ((log_sum / table.len() as f64).exp() - 1.0) * 100.0)
+            })
+            .collect();
+        println!("- {label}: {}", per_pair.join(", "));
+    }
+    // The Rust/C ratio removes a change of the whole machine's speed. It
+    // also takes in any change of libopus's own time, for example when
+    // libopus is linked into the program and the linker placed it
+    // elsewhere.
+    for (label, rust, c) in [("Rust/C ratio, encode", 0, 1), ("Rust/C ratio, decode", 2, 3)] {
+        let per_pair: Vec<String> = (0..pairs)
+            .map(|pair| {
+                let log_sum: f64 = table
+                    .iter()
+                    .map(|(_, ch)| ((1.0 + ch[rust][pair] / 100.0) / (1.0 + ch[c][pair] / 100.0)).ln())
+                    .sum();
+                format!("{:+.2} %", ((log_sum / table.len() as f64).exp() - 1.0) * 100.0)
+            })
+            .collect();
+        println!("- {label}: {}", per_pair.join(", "));
+    }
     Ok(0)
 }
 
@@ -2897,7 +3026,9 @@ fn rust_encode_switching(case: &SwitchCase, clip: &Clip) -> Result<Packets, Stri
     let mut out = [0u8; MAX_PACKET];
     let mut packets = Packets::default();
     for (index, frame) in clip.pcm.chunks_exact(clip.step).enumerate() {
-        encoder.bitrate_bps = switch_bitrate(sc, index);
+        encoder
+            .set_bitrate(Bitrate::BitsPerSecond(switch_bitrate(sc, index)))
+            .map_err(|e| format!("set_bitrate at frame {index}: {e}"))?;
         let len = encoder
             .encode(frame, clip.frame, &mut out)
             .map_err(|e| format!("Rust encode failed at frame {index}: {e}"))?;
@@ -4135,9 +4266,16 @@ const USAGE: &str = "usage: perf_harness <command> [options]
       Compare several bench --json files: the lowest minimum per scenario,
       and how far the minimums and the medians of the files are apart.
 
+  pairs BASE CAND [BASE CAND ...]
+      Compare two builds that ran in turns. Each BASE CAND pair of bench
+      --json files was measured one after the other. Prints the change of
+      every median time from BASE to CAND, lowest to highest over the
+      pairs, and marks changes that have the same sign in every pair.
+
 Code placement: the speed of some functions depends on where the linker puts
-them (up to 15 % on a whole scenario). Build with PERF_HARNESS_PAD=<bytes>
-to move the library code (macOS only), for example:
+them (up to about 2 % per scenario on Apple M4 Pro and on a Cortex-A76, 4 %
+for libopus on the A76). Build with PERF_HARNESS_PAD=<bytes>
+to move the library code (macOS, Linux and Android), for example:
   for pad in 0 20 40 60; do
     PERF_HARNESS_PAD=$pad cargo run --release --example perf_harness -- \
       bench --json target/perf/pad_$pad.json
@@ -4147,6 +4285,8 @@ to move the library code (macOS only), for example:
 --filter takes a comma-separated list of substrings of scenario names.";
 
 fn main() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    black_box(LAYOUT_PADDING.as_ptr());
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = args.split_first() else {
         eprintln!("{USAGE}");
@@ -4186,6 +4326,7 @@ fn main() {
         "signals" => Opts::parse(rest, &["--seconds", "--dump"], &[]).and_then(|opts| cmd_signals(&opts)),
         "resampler" => Opts::parse(rest, &[], &[]).and_then(|_| cmd_resampler()),
         "spread" => cmd_spread(rest),
+        "pairs" => cmd_pairs(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(0)

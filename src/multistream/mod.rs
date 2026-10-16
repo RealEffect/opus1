@@ -10,17 +10,20 @@
 //!
 //! What is here:
 //!
-//! - [`MultistreamEncoder`](crate::multistream::MultistreamEncoder), in the
-//!   module `encoder`: encodes interleaved samples into a multistream
-//!   packet. A port of libopus `opus_multistream_encoder.c`. The module
-//!   `surround` holds its surround masking analysis, and the module
-//!   `rate_alloc` how it divides a bitrate among the streams.
-//! - [`MultistreamDecoder`](crate::multistream::MultistreamDecoder), in the
-//!   module `decoder`: decodes a multistream packet into interleaved
-//!   samples. A port of libopus `opus_multistream_decoder.c`.
-//! - [`ChannelLayout`](crate::multistream::ChannelLayout), in the module
-//!   `layout`: the layout, its checks, and the layouts of the mapping
-//!   families of the Ogg Opus header.
+//! - [`MultistreamEncoder`](crate::multistream::MultistreamEncoder):
+//!   encodes interleaved samples into a multistream packet. A port of
+//!   libopus `opus_multistream_encoder.c` (`src/multistream/encoder.rs`).
+//!   Its surround masking analysis is in `src/multistream/surround.rs`, and
+//!   how it divides a bitrate among the streams in
+//!   `src/multistream/rate_alloc.rs`.
+//! - [`MultistreamDecoder`](crate::multistream::MultistreamDecoder): decodes
+//!   a multistream packet into interleaved samples. A port of libopus
+//!   `opus_multistream_decoder.c` (`src/multistream/decoder.rs`).
+//! - [`ChannelLayout`](crate::multistream::ChannelLayout): the layout, its
+//!   checks, and the layouts of the mapping families of the Ogg Opus header
+//!   (`src/multistream/layout.rs`).
+//!   [`validate_ambisonics`](crate::multistream::validate_ambisonics) checks
+//!   the channel count of an ambisonics layout.
 //! - [`ChannelMappingTable`](crate::multistream::ChannelMappingTable): the
 //!   channel mapping table as it is stored in an Ogg Opus header.
 //! - [`split_self_delimited`](crate::multistream::split_self_delimited):
@@ -44,8 +47,8 @@
 //! own.
 //!
 //! ```
-//! use opus1::Application;
-//! use opus1::multistream::{Bitrate, MultistreamEncoder};
+//! use opus1::multistream::MultistreamEncoder;
+//! use opus1::{Application, Bitrate};
 //!
 //! // 5.1 at 48 kHz: front left, centre, front right, rear left, rear
 //! // right, LFE.
@@ -118,15 +121,15 @@
 // `src/lib.rs` puts a line of documentation in front of that text, and
 // rustdoc then resolves the links of both from the crate root.
 
-pub mod decoder;
-pub mod encoder;
-pub mod layout;
-pub mod rate_alloc;
-pub mod surround;
+mod decoder;
+mod encoder;
+mod layout;
+pub(crate) mod rate_alloc;
+pub(crate) mod surround;
 
 pub use decoder::MultistreamDecoder;
-pub use encoder::{Bitrate, MultistreamEncoder};
-pub use layout::{ChannelLayout, MappingType, SILENT_CHANNEL};
+pub use encoder::MultistreamEncoder;
+pub use layout::{ChannelLayout, MappingType, SILENT_CHANNEL, validate_ambisonics};
 
 use crate::{float2int16, int16_to_res, packet};
 
@@ -246,7 +249,7 @@ pub struct ChannelMappingTable {
     pub coupled_count: u8,
     /// One entry per output channel: the decoded channel it uses, or
     /// [`SILENT_CHANNEL`] for silence. Decoded channels are numbered as
-    /// [`layout`] describes: 2 per stereo stream first, then 1 per mono
+    /// [`ChannelLayout`] describes: 2 per stereo stream first, then 1 per mono
     /// stream.
     pub mapping: Vec<u8>,
 }

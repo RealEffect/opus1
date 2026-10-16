@@ -1,12 +1,11 @@
 use crate::modes::CeltMode;
 use crate::range_coder::RangeCoder;
 use core::cmp::{max, min};
+use core::hint::select_unpredictable;
 
 const MAX_EBANDS: usize = 21;
 pub const BITRES: i32 = 3;
 pub const FINE_OFFSET: i32 = 21;
-pub const QTHETA_OFFSET: i32 = 4;
-pub const QTHETA_OFFSET_TWOPHASE: i32 = 16;
 pub const MAX_FINE_BITS: i32 = 8;
 
 pub const LOG2_FRAC_TABLE: [u8; 24] = [
@@ -84,6 +83,60 @@ pub fn pulses2bits(m: &CeltMode, band: usize, lm: i32, pulses: i32) -> i32 {
     }
 }
 
+/// What one band adds to the bit sum of an allocation search (libopus
+/// `clt_compute_allocation` and `interp_bits2pulses`). The search visits
+/// the bands from the last one down. A band at or above its threshold
+/// `thresh` sets `done`. While `done` is set, a band adds its `bits` up to
+/// its `cap`. Before that, a band adds `floor` if it reaches it, else
+/// nothing.
+///
+/// The code has no branch that depends on the data. The searches run this
+/// about 200 times per frame, and an in-order core such as the Cortex-A55
+/// loses many cycles on each mispredicted branch.
+#[inline(always)]
+fn searched_bits(bits: i32, thresh: i32, cap: i32, floor: i32, done: &mut bool) -> i32 {
+    *done |= bits >= thresh;
+    let below = select_unpredictable(bits >= floor, floor, 0);
+    select_unpredictable(*done, min(bits, cap), below)
+}
+
+/// The bits that one band allocation vector gives the bands of a frame:
+/// the loop of the bisection over the vectors in libopus
+/// `clt_compute_allocation`. Each slice has one entry per band, from the
+/// first band of the frame on.
+///
+/// - `row`: the vector, in 1/32 bit per coefficient and channel.
+/// - `width`: `(C * N) << LM`, where `N` is the width of the band at LM 0.
+/// - `floor`: `C << BITRES`.
+#[inline(always)]
+fn vector_bits(
+    row: &[u8],
+    width: &[i32],
+    trim_offset: &[i32],
+    offsets: &[i32],
+    thresh: &[i32],
+    cap: &[i32],
+    floor: i32,
+) -> i32 {
+    // One length for all slices, so the loop has no bounds checks.
+    let len = width.len();
+    let (row, trim_offset, offsets) = (&row[..len], &trim_offset[..len], &offsets[..len]);
+    let (thresh, cap) = (&thresh[..len], &cap[..len]);
+    let mut psum = 0;
+    let mut done = false;
+    for j in (0..len).rev() {
+        // C: `(C*N*alloc) << LM >> 2`. The product does not overflow, so the
+        // order of the factors and of the shift does not matter.
+        let bits = (width[j] * row[j] as i32) >> 2;
+        // C: `if (bitsj > 0) bitsj = IMAX(0, bitsj + trim_offset[j])`. The
+        // value is not negative, so for 0 the trim is left out instead.
+        let trim = select_unpredictable(bits > 0, trim_offset[j], 0);
+        let bits = max(0, bits + trim) + offsets[j];
+        psum += searched_bits(bits, thresh[j], cap[j], floor, &mut done);
+    }
+    psum
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn clt_compute_allocation(
     m: &CeltMode,
@@ -138,44 +191,36 @@ pub fn clt_compute_allocation(
     let thresh = &mut thresh_buf[..nb_ebands];
     let mut trim_offset_buf = [0i32; MAX_EBANDS];
     let trim_offset = &mut trim_offset_buf[..nb_ebands];
+    // `(c * n) << lm` per band, where `n` is the band width at LM 0.
+    let mut width_buf = [0i32; MAX_EBANDS];
+    let width = &mut width_buf[..nb_ebands];
 
     for j in start..end {
-        thresh[j] = max(
-            c << BITRES,
-            ((3 * (m.e_bands[j + 1] - m.e_bands[j]) as i32) << (lm + BITRES)) >> 4,
-        );
-        trim_offset[j] = (c
-            * (m.e_bands[j + 1] - m.e_bands[j]) as i32
-            * (alloc_trim - 5 - lm)
-            * (end - j - 1) as i32
-            * (1 << (lm + BITRES)))
-            >> 6;
-        if (m.e_bands[j + 1] - m.e_bands[j]) << lm == 1 {
+        let n = (m.e_bands[j + 1] - m.e_bands[j]) as i32;
+        width[j] = (c * n) << lm;
+        thresh[j] = max(c << BITRES, ((3 * n) << (lm + BITRES)) >> 4);
+        trim_offset[j] =
+            (c * n * (alloc_trim - 5 - lm) * (end - j - 1) as i32 * (1 << (lm + BITRES))) >> 6;
+        if n << lm == 1 {
             trim_offset[j] -= c << BITRES;
         }
     }
 
+    let floor = c << BITRES;
     let mut lo = 1;
     let mut hi = m.nb_alloc_vectors as i32 - 1;
     while lo <= hi {
-        let mut done = false;
-        let mut psum = 0;
         let mid = (lo + hi) >> 1;
-        for j in (start..end).rev() {
-            let n = (m.e_bands[j + 1] - m.e_bands[j]) as i32;
-            let raw = m.alloc_vectors[mid as usize * m.alloc_stride + j] as i32;
-            let mut bitsj = (c * n * raw) << lm >> 2;
-            if bitsj > 0 {
-                bitsj = max(0, bitsj + trim_offset[j]);
-            }
-            bitsj += offsets[j];
-            if bitsj >= thresh[j] || done {
-                done = true;
-                psum += min(bitsj, cap[j]);
-            } else if bitsj >= (c << BITRES) {
-                psum += c << BITRES;
-            }
-        }
+        let row = &m.alloc_vectors[mid as usize * m.alloc_stride..];
+        let psum = vector_bits(
+            &row[start..end],
+            &width[start..end],
+            &trim_offset[start..end],
+            &offsets[start..end],
+            &thresh[start..end],
+            &cap[start..end],
+            floor,
+        );
         if psum > total {
             hi = mid - 1;
         } else {
@@ -283,18 +328,18 @@ fn interp_bits2pulses(
     let mut bits_buf = [0i32; MAX_EBANDS];
     let bits = &mut bits_buf[..m.nb_ebands];
 
+    // The bands `start..end`, all of one length, so the loops below have no
+    // bounds checks.
+    let len = end - start;
+    let (bands_bits1, bands_bits2) = (&bits1[start..end][..len], &bits2[start..end][..len]);
+    let (bands_thresh, bands_cap) = (&thresh[start..end][..len], &cap[start..end][..len]);
     for _ in 0..6 {
         let mid = (lo + hi) >> 1;
         psum = 0;
         let mut done = false;
-        for j in (start..end).rev() {
-            let tmp = bits1[j] + ((mid * bits2[j]) >> 6);
-            if tmp >= thresh[j] || done {
-                done = true;
-                psum += min(tmp, cap[j]);
-            } else if tmp >= alloc_floor {
-                psum += alloc_floor;
-            }
+        for j in (0..len).rev() {
+            let tmp = bands_bits1[j] + ((mid * bands_bits2[j]) >> 6);
+            psum += searched_bits(tmp, bands_thresh[j], bands_cap[j], alloc_floor, &mut done);
         }
         if psum > total {
             hi = mid;
@@ -304,19 +349,13 @@ fn interp_bits2pulses(
     }
     psum = 0;
     let mut done = false;
-    for j in (start..end).rev() {
-        let mut tmp = bits1[j] + ((lo * bits2[j]) >> 6);
-        if tmp < thresh[j] && !done {
-            if tmp >= alloc_floor {
-                tmp = alloc_floor;
-            } else {
-                tmp = 0;
-            }
-        } else {
-            done = true;
-        }
-        tmp = min(tmp, cap[j]);
-        bits[j] = tmp;
+    for (j, bits_j) in bits[start..end][..len].iter_mut().enumerate().rev() {
+        let tmp = bands_bits1[j] + ((lo * bands_bits2[j]) >> 6);
+        // Unlike the search, C caps the floor here too: a band below its
+        // threshold keeps `min(floor, cap)`.
+        let tmp = searched_bits(tmp, bands_thresh[j], i32::MAX, alloc_floor, &mut done);
+        let tmp = min(tmp, bands_cap[j]);
+        *bits_j = tmp;
         psum += tmp;
     }
 

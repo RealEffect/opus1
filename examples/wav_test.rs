@@ -3,8 +3,8 @@
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
 // WAV file encoder/decoder test using OpusEncoder/OpusDecoder
-use opus1::silk::resampler::SilkResampler;
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::internals::silk::resampler::SilkResampler;
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -163,7 +163,6 @@ struct ModeConfig {
     target_rate: u32,
     app_mode: Application,
     bitrate: i32,
-    skip_celt: bool,
 }
 
 fn process_mode(config: ModeConfig, src_samples: &[i16], src_rate: u32) {
@@ -173,7 +172,6 @@ fn process_mode(config: ModeConfig, src_samples: &[i16], src_rate: u32) {
         target_rate,
         app_mode,
         bitrate,
-        skip_celt,
     } = config;
 
     let mut effective_app_mode = app_mode;
@@ -215,13 +213,12 @@ fn process_mode(config: ModeConfig, src_samples: &[i16], src_rate: u32) {
     // Initialize encoder
     let mut encoder = OpusEncoder::new(target_rate as i32, 1, effective_app_mode)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = effective_bitrate;
-    encoder.use_cbr = true;
-    encoder.complexity = 5;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(effective_bitrate)).unwrap();
+    encoder.set_vbr(false);
+    encoder.set_complexity(5).unwrap();
 
     // Initialize decoder
     let mut decoder = OpusDecoder::new(target_rate as i32, 1).expect("Failed to create decoder");
-    decoder.hybrid_skip_celt = skip_celt;
 
     // Encode frame by frame
     let mut all_payload: Vec<u8> = Vec::new();
@@ -363,12 +360,10 @@ fn process_mode(config: ModeConfig, src_samples: &[i16], src_rate: u32) {
     }
 
     // Save output
-    let suffix = if skip_celt { "_silk_only" } else { "" };
     let output_path = format!(
-        "fixtures/decoded_{}_{}{}_{}.wav",
+        "fixtures/decoded_{}_{}_{}.wav",
         app_name.to_lowercase(),
         rate_name,
-        suffix,
         BUILD_TAG,
     );
     write_wav(Path::new(&output_path), target_rate, 1, &decoded_samples);
@@ -401,7 +396,7 @@ fn main() {
     let (header, samples) = read_wav(input_path);
     let src_rate = header.sample_rate;
 
-    // Process all 4 combinations + diagnostic voip48_silk_only
+    // Process all 4 combinations
     let modes = [
         ModeConfig {
             app_name: "voip",
@@ -409,7 +404,6 @@ fn main() {
             target_rate: 16000,
             app_mode: Application::Voip,
             bitrate: 20000,
-            skip_celt: false,
         },
         ModeConfig {
             app_name: "voip",
@@ -417,7 +411,6 @@ fn main() {
             target_rate: 48000,
             app_mode: Application::Voip,
             bitrate: 32000,
-            skip_celt: false,
         },
         ModeConfig {
             app_name: "audio",
@@ -425,7 +418,6 @@ fn main() {
             target_rate: 16000,
             app_mode: Application::Audio,
             bitrate: 24000,
-            skip_celt: false,
         },
         ModeConfig {
             app_name: "audio",
@@ -433,16 +425,6 @@ fn main() {
             target_rate: 48000,
             app_mode: Application::Audio,
             bitrate: 32000,
-            skip_celt: false,
-        },
-        // Diagnostic: voip48 with CELT skipped (SILK only in hybrid mode)
-        ModeConfig {
-            app_name: "voip",
-            rate_name: "48k",
-            target_rate: 48000,
-            app_mode: Application::Voip,
-            bitrate: 32000,
-            skip_celt: true,
         },
     ];
 
@@ -457,8 +439,8 @@ fn main() {
         let rate = 16000i32;
         let frame_size = rate as usize * 20 / 1000; // 320
         let mut enc = OpusEncoder::new(rate, 1, Application::Voip).expect("encoder");
-        enc.bitrate_bps = 24000;
-        enc.use_cbr = true;
+        enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+        enc.set_vbr(false);
         let mut dec16 = OpusDecoder::new(rate, 1).expect("dec 16k");
         let mut dec48 = OpusDecoder::new(48000, 1).expect("dec 48k");
 
@@ -574,9 +556,6 @@ fn main() {
     println!("  - fixtures/decoded_voip_48k.wav");
     println!("  - fixtures/decoded_audio_16k.wav");
     println!("  - fixtures/decoded_audio_48k.wav");
-    println!(
-        "  - fixtures/decoded_voip_48k_silk_only.wav  (diagnostic: hybrid decode without CELT)"
-    );
     println!("  - fixtures/decoded_24kbps_rs_16k.wav  (RS-only 24kbps -> 16k)");
     println!("  - fixtures/decoded_24kbps_rs_48k.wav  (RS-only 24kbps -> 48k)");
 }

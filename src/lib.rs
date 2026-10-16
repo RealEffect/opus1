@@ -17,25 +17,27 @@ mod compat;
 mod fixedvec;
 mod mathops;
 
-pub mod bands;
-pub mod celt;
-pub mod celt_lpc;
-pub mod hp_cutoff;
-pub mod kiss_fft;
-pub mod mdct;
-pub mod modes;
+mod bands;
+mod celt;
+mod celt_lpc;
+mod hp_cutoff;
+#[doc(hidden)]
+pub mod internals;
+mod kiss_fft;
+mod mdct;
+mod modes;
 /// Multichannel encoding and decoding (several Opus streams in one packet).
 /// It allocates in its constructors, so it needs the `std` feature (on by
 /// default). The single-stream codec stays `no_std` without `alloc`.
 #[cfg(feature = "std")]
 pub mod multistream;
 pub mod packet;
-pub mod pitch;
-pub mod pvq;
-pub mod quant_bands;
-pub mod range_coder;
-pub mod rate;
-pub mod silk;
+mod pitch;
+mod pvq;
+mod quant_bands;
+mod range_coder;
+mod rate;
+mod silk;
 
 /// The Rust examples in `README.md` and in `docs/`. `cargo test --doc`
 /// compiles and runs every ` ```rust ` block in these files, so the
@@ -78,12 +80,10 @@ mod doc_examples {
     struct DifferencesFromLibopus;
 }
 
-pub use silk::{SilkResampler, SilkResamplerDown1_3, SilkResamplerDown1_6};
-
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
-pub use celt::{CeltDecoder, CeltEncoder};
+use celt::{CeltDecoder, CeltEncoder};
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float};
 use range_coder::RangeCoder;
 use silk::enc_api::{SilkControl, SilkEncoder, SilkInput, SilkPrefill};
@@ -190,6 +190,24 @@ pub enum ForcedMode {
     Hybrid,
     /// CELT alone: music, and frames shorter than 10 ms.
     CeltOnly,
+}
+
+/// The bitrate setting of an encoder: libopus `OPUS_SET_BITRATE`. See
+/// [`OpusEncoder::set_bitrate`]; `MultistreamEncoder::set_bitrate` takes it
+/// too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bitrate {
+    /// libopus `OPUS_AUTO`, the default: the encoder picks the bitrate from
+    /// the sampling rate, the channel count and the frame duration. An
+    /// [`OpusEncoder`] takes `60 * rate / frame_size + rate * channels` bits
+    /// per second: 19,000 b/s for 16 kHz mono and 99,000 b/s for 48 kHz
+    /// stereo in 20 ms frames.
+    Auto,
+    /// libopus `OPUS_BITRATE_MAX`: as many bits as the output buffer holds.
+    /// An [`OpusEncoder`] takes at most 1,500,000 b/s.
+    Max,
+    /// Bits per second for all channels together.
+    BitsPerSecond(i32),
 }
 
 /// The decisions `opus_encode_native` makes once per packet and hands to
@@ -351,8 +369,7 @@ pub struct OpusEncoder {
     /// last time, kept for the hysteresis of the next decision.
     auto_bandwidth: Bandwidth,
     /// C `st->user_bandwidth`: a bandwidth the caller asked for
-    /// (`set_bandwidth`, `enable_hybrid_mode`), or `None` for the automatic
-    /// choice.
+    /// (`set_bandwidth`), or `None` for the automatic choice.
     user_bandwidth: Option<Bandwidth>,
     /// C `st->max_bandwidth`: the widest bandwidth the automatic choice may
     /// pick (`set_max_bandwidth`).
@@ -416,19 +433,35 @@ pub struct OpusEncoder {
     /// C `stereo_width` of `opus_encode_native`: the estimate for the
     /// current packet, 0 for mono input.
     stereo_width: f32,
-    pub bitrate_bps: i32,
+    /// C `st->user_bitrate_bps`: the bitrate setting
+    /// ([`set_bitrate`](Self::set_bitrate)).
+    user_bitrate: Bitrate,
     /// C `st->bitrate_bps`: the bitrate the current packet is coded at. It
-    /// is `bitrate_bps`, or the rate the output buffer stands for when that
-    /// is lower (libopus `user_bitrate_to_bitrate`). With a constant
-    /// bitrate it is the rate of the whole bytes the packet takes. A 20 ms
-    /// part of a 40/60 ms packet keeps the packet's value.
+    /// is the rate of `user_bitrate`, or the rate the output buffer stands
+    /// for when that is lower (libopus `user_bitrate_to_bitrate`). With a
+    /// constant bitrate it is the rate of the whole bytes the packet takes.
+    /// A 20 ms part of a 40/60 ms packet keeps the packet's value.
     packet_bitrate_bps: i32,
-    pub complexity: i32,
-    pub use_cbr: bool,
-
-    pub use_inband_fec: bool,
-
-    pub packet_loss_perc: i32,
+    /// C `st->silk_mode.complexity`: 0 to 10
+    /// ([`set_complexity`](Self::set_complexity)).
+    complexity: i32,
+    /// C `!st->use_vbr`: every packet has the size the bitrate gives it
+    /// ([`set_vbr`](Self::set_vbr)).
+    use_cbr: bool,
+    /// C `st->vbr_constraint`: with a variable bitrate, CELT-only packets
+    /// stay close to the bitrate
+    /// ([`set_vbr_constraint`](Self::set_vbr_constraint)).
+    vbr_constraint: bool,
+    /// C `st->silk_mode.useInBandFEC`
+    /// ([`set_inband_fec`](Self::set_inband_fec)).
+    use_inband_fec: bool,
+    /// C `st->silk_mode.packetLossPercentage`: 0 to 100
+    /// ([`set_packet_loss_perc`](Self::set_packet_loss_perc)).
+    packet_loss_perc: i32,
+    /// C `st->prev_framesize`: the duration in samples of the last frame
+    /// that was coded, 0 before the first one. [`bitrate`](Self::bitrate)
+    /// reads it.
+    prev_frame_size: usize,
     /// C `silk_mode.reducedDependency` (`OPUS_SET_PREDICTION_DISABLED`):
     /// every frame is coded without prediction from the frames before it.
     prediction_disabled: bool,
@@ -985,12 +1018,17 @@ impl OpusEncoder {
             silk_stereo_width_q14: 1 << 14,
             width_mem: StereoWidthState::default(),
             stereo_width: 0.0,
-            bitrate_bps: 64000,
-            packet_bitrate_bps: 64000,
+            // C `opus_encoder_init`: `user_bitrate_bps = OPUS_AUTO` and
+            // `bitrate_bps = 3000 + Fs * channels`. Each packet sets the
+            // second again before it is read.
+            user_bitrate: Bitrate::Auto,
+            packet_bitrate_bps: 3000 + sampling_rate * channels as i32,
             complexity: 9,
             use_cbr: false,
+            vbr_constraint: true,
             use_inband_fec: false,
             packet_loss_perc: 0,
+            prev_frame_size: 0,
             prediction_disabled: false,
             #[cfg(not(feature = "heap"))]
             celt_prefill: [0.0; CELT_PREFILL],
@@ -1330,23 +1368,127 @@ impl OpusEncoder {
         }
     }
 
-    pub fn enable_hybrid_mode(&mut self) -> Result<(), &'static str> {
-        if self.sampling_rate != 24000 && self.sampling_rate != 48000 {
-            return Err("Hybrid mode requires 24kHz or 48kHz sampling rate");
-        }
-        let bw = if self.sampling_rate == 48000 {
-            Bandwidth::Fullband
-        } else {
-            Bandwidth::Superwideband
+    /// libopus `OPUS_SET_BITRATE`: the bitrate of the packets, for all
+    /// channels together. The default is [`Bitrate::Auto`], as in libopus:
+    /// `60 * rate / frame_size + rate * channels` b/s, for example
+    /// 19,000 b/s for 16 kHz mono in 20 ms frames.
+    ///
+    /// As in libopus, an explicit bitrate must be positive. It is raised to
+    /// at least 500 bits per second and limited to at most 750,000 bits per
+    /// second per channel. The length of the output buffer of each
+    /// [`encode`](Self::encode) call can lower it further.
+    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), &'static str> {
+        self.user_bitrate = match bitrate {
+            Bitrate::BitsPerSecond(bps) if bps <= 0 => return Err("Invalid bitrate"),
+            Bitrate::BitsPerSecond(bps) => {
+                Bitrate::BitsPerSecond(bps.clamp(500, 750_000 * self.channels as i32))
+            }
+            other => other,
         };
-        self.mode = OpusMode::Hybrid;
-        self.bandwidth = bw;
-        // Like libopus's OPUS_SET_BANDWIDTH: the automatic, rate-dependent
-        // choice no longer applies. Low bitrates then stay Hybrid instead of
-        // dropping to wideband SILK.
-        self.user_bandwidth = Some(bw);
-        self.silk.forget_rate();
         Ok(())
+    }
+
+    /// The bitrate that was set, after its limits were applied.
+    pub fn bitrate_setting(&self) -> Bitrate {
+        self.user_bitrate
+    }
+
+    /// libopus `OPUS_GET_BITRATE`: the bitrate in bits per second that the
+    /// setting stands for. [`Bitrate::Auto`] and [`Bitrate::Max`] depend
+    /// on the duration of the last frame that was coded (2.5 ms before the
+    /// first one), and every setting counts with at most what a 1276-byte
+    /// packet per frame carries.
+    pub fn bitrate(&self) -> i32 {
+        self.user_bitrate_to_bitrate(self.prev_frame_size, OPUS_MAX_PACKET_BYTES)
+    }
+
+    /// libopus `user_bitrate_to_bitrate` (opus_encoder.c:733): the bitrate
+    /// of the setting for frames of `frame_size` samples (0 counts as
+    /// 2.5 ms), at most what `max_data_bytes` bytes per frame carry.
+    fn user_bitrate_to_bitrate(&self, frame_size: usize, max_data_bytes: usize) -> i32 {
+        let fs = self.sampling_rate;
+        let frame_size = if frame_size == 0 { fs as usize / 400 } else { frame_size };
+        let max_bitrate = bits_to_bitrate(8 * max_data_bytes as i32, fs, frame_size);
+        let user_bitrate = match self.user_bitrate {
+            Bitrate::Auto => 60 * fs / frame_size as i32 + fs * self.channels as i32,
+            Bitrate::Max => 1_500_000,
+            Bitrate::BitsPerSecond(bps) => bps,
+        };
+        user_bitrate.min(max_bitrate)
+    }
+
+    /// libopus `OPUS_SET_COMPLEXITY`: 0 to 10. Higher values spend more
+    /// processor time for better quality. The default is 9.
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+        if !(0..=10).contains(&complexity) {
+            return Err("Invalid complexity");
+        }
+        self.complexity = complexity;
+        Ok(())
+    }
+
+    /// The complexity set with [`set_complexity`](Self::set_complexity).
+    pub fn complexity(&self) -> i32 {
+        self.complexity
+    }
+
+    /// libopus `OPUS_SET_VBR`: a variable bitrate (`true`, the default) or a
+    /// constant one (`false`). With a constant bitrate every packet of the
+    /// same duration has the same size.
+    pub fn set_vbr(&mut self, vbr: bool) {
+        self.use_cbr = !vbr;
+    }
+
+    /// Whether the bitrate is variable ([`set_vbr`](Self::set_vbr)).
+    pub fn vbr(&self) -> bool {
+        !self.use_cbr
+    }
+
+    /// libopus `OPUS_SET_VBR_CONSTRAINT`: with a variable bitrate, keep
+    /// CELT-only packets close to the bitrate (`true`, the default). Without
+    /// the constraint a CELT-only packet can take more bytes for a hard
+    /// frame and fewer for an easy one. It has no effect with a constant
+    /// bitrate. Hybrid packets are never constrained, as in libopus.
+    pub fn set_vbr_constraint(&mut self, constrained: bool) {
+        self.vbr_constraint = constrained;
+    }
+
+    /// Whether the variable bitrate is constrained
+    /// ([`set_vbr_constraint`](Self::set_vbr_constraint)).
+    pub fn vbr_constraint(&self) -> bool {
+        self.vbr_constraint
+    }
+
+    /// libopus `OPUS_SET_INBAND_FEC`: let SILK and Hybrid packets carry a
+    /// low-bitrate copy of the frame before them (in-band forward error
+    /// correction, FEC), so that a decoder can rebuild a lost packet. The
+    /// copy is coded only when [`set_packet_loss_perc`](Self::set_packet_loss_perc)
+    /// is above 0 and the bitrate leaves room for it. Off by default.
+    pub fn set_inband_fec(&mut self, enabled: bool) {
+        self.use_inband_fec = enabled;
+    }
+
+    /// Whether in-band FEC is on ([`set_inband_fec`](Self::set_inband_fec)).
+    pub fn inband_fec(&self) -> bool {
+        self.use_inband_fec
+    }
+
+    /// libopus `OPUS_SET_PACKET_LOSS_PERC`: the packet loss the network is
+    /// expected to have, 0 to 100 percent. The default is 0. Higher values
+    /// make the packets more robust against loss, at the cost of quality
+    /// without loss.
+    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), &'static str> {
+        if !(0..=100).contains(&percent) {
+            return Err("Invalid packet loss percentage");
+        }
+        self.packet_loss_perc = percent;
+        Ok(())
+    }
+
+    /// The expected packet loss in percent
+    /// ([`set_packet_loss_perc`](Self::set_packet_loss_perc)).
+    pub fn packet_loss_perc(&self) -> i32 {
+        self.packet_loss_perc
     }
 
     /// libopus `OPUS_SET_FORCE_MODE`: ask for a coding mode instead of the
@@ -1514,10 +1656,11 @@ impl OpusEncoder {
     /// libopus `OPUS_RESET_STATE`: forget the signal coded so far. The
     /// encoder then behaves like a new one with the same settings.
     ///
-    /// The settings that stay are the bitrate, the complexity, CBR or VBR,
-    /// in-band FEC, the packet loss percentage, the forced mode, the
-    /// bandwidth and maximum bandwidth, and the LFE flag. The energy mask
-    /// is cleared, as in libopus.
+    /// The settings that stay are the bitrate, the complexity, CBR or VBR
+    /// and the VBR constraint, in-band FEC, the packet loss percentage, the
+    /// forced mode, the bandwidth and maximum bandwidth, the forced channel
+    /// count, the prediction switch and the LFE flag. The energy mask is
+    /// cleared, as in libopus.
     ///
     /// As in libopus, three things SILK reported for the last packet also
     /// stay: whether the packet was to carry FEC, whether SILK allowed a
@@ -1530,9 +1673,10 @@ impl OpusEncoder {
         let Ok(mut fresh) = Self::new(self.sampling_rate, self.channels, self.application) else {
             return;
         };
-        fresh.bitrate_bps = self.bitrate_bps;
+        fresh.user_bitrate = self.user_bitrate;
         fresh.complexity = self.complexity;
         fresh.use_cbr = self.use_cbr;
+        fresh.vbr_constraint = self.vbr_constraint;
         fresh.use_inband_fec = self.use_inband_fec;
         fresh.packet_loss_perc = self.packet_loss_perc;
         fresh.user_forced_mode = self.user_forced_mode;
@@ -1581,7 +1725,7 @@ impl OpusEncoder {
     ///
     /// The packet never exceeds `output`. As in libopus, the length of
     /// `output` also counts as a limit on the bitrate: when it holds less
-    /// than `bitrate_bps` gives the frame, the encoder chooses mode and
+    /// than the bitrate gives the frame, the encoder chooses mode and
     /// bandwidth for the lower rate. Pass a buffer of 1276 bytes per 20 ms
     /// or more when the bitrate alone should decide.
     pub fn encode(
@@ -1638,9 +1782,8 @@ impl OpusEncoder {
     /// 6. 16-bit input is coded with the 24-bit silence threshold of float
     ///    input (libopus: `lsb_depth` 16), so that both entry points give
     ///    the same packets.
-    /// 7. Frames of 80, 100 and 120 ms, `OPUS_AUTO` and `OPUS_BITRATE_MAX`
-    ///    as bitrates, unconstrained VBR for CELT-only, and the controls
-    ///    for signal type and phase inversion are not offered.
+    /// 7. Frames of 80, 100 and 120 ms and the controls for signal type
+    ///    and phase inversion are not offered.
     /// 8. On purpose: a frame that announces the switch to CELT-only
     ///    without room for the redundant frame still resets the CELT
     ///    encoder. The decoder starts the CELT-only packets from the reset
@@ -1667,15 +1810,6 @@ impl OpusEncoder {
         let frame_rate = frame_rate_from_params(self.sampling_rate, frame_size)
             .ok_or("Invalid frame size for sampling rate")?;
 
-        // Clamp caller-provided control fields the way libopus's ctl
-        // interface does: OPUS_SET_BITRATE clamps to [500, 3000000] and
-        // complexity to [0, 10]. Unclamped extremes overflow the bitrate
-        // arithmetic downstream (bitrate*6 in celt, `equiv*(90+complexity)`
-        // in the mode selection).
-        self.bitrate_bps = self.bitrate_bps.clamp(500, 3_000_000);
-        self.complexity = self.complexity.clamp(0, 10);
-        self.packet_loss_perc = self.packet_loss_perc.clamp(0, 100);
-
         // The encoder consumes exactly frame_size * channels samples per call.
         // Short input is rejected here, so that it cannot panic inside the
         // high-pass filter or the float-to-integer conversion loops.
@@ -1697,8 +1831,7 @@ impl OpusEncoder {
         // when that is lower. A constant bitrate codes whole bytes, and the
         // bitrate becomes the rate of those bytes.
         let fs = self.sampling_rate;
-        let max_bitrate = bits_to_bitrate(8 * max_data_bytes as i32, fs, frame_size);
-        let mut bitrate = self.bitrate_bps.min(max_bitrate);
+        let mut bitrate = self.user_bitrate_to_bitrate(frame_size, max_data_bytes);
         let mut cbr_bytes = 0usize;
         if self.use_cbr {
             let nominal = (bitrate_to_bits(bitrate, fs, frame_size) + 4) / 8;
@@ -2371,9 +2504,10 @@ impl OpusEncoder {
             // The value is accepted: it is `OPUS_BITRATE_MAX` or above 500.
             let _ = self.celt_enc.set_bitrate(celt_bitrate);
             self.celt_enc.set_vbr(!self.use_cbr);
-            // libopus: Hybrid VBR is unconstrained (can steal from SILK), CELT-only constrained
+            // C 2453-2462: Hybrid VBR is unconstrained (CELT can take bits
+            // SILK left), CELT-only VBR follows the setting.
             self.celt_enc
-                .set_constrained_vbr(mode == OpusMode::CeltOnly);
+                .set_constrained_vbr(mode == OpusMode::CeltOnly && self.vbr_constraint);
             // C `CELT_SET_START_BAND`; 0 and 17 are both valid.
             let _ = self.celt_enc.set_start_band(start_band);
 
@@ -2405,6 +2539,7 @@ impl OpusEncoder {
         // that mode is CELT-only.
         self.prev_enc_mode = Some(if d.to_celt { OpusMode::CeltOnly } else { mode });
         self.prev_channels = sch;
+        self.prev_frame_size = frame_size;
         // C 2562: from here on a frame is coded. The packets too small to
         // code anything leave `first` alone.
         self.first = false;
@@ -2614,7 +2749,8 @@ impl OpusEncoder {
         // for its own 20 ms packets). libopus 1.5 and earlier had no such
         // limit under VBR, and neither has opus1.
         let max_header_bytes = if nb == 2 { 3 } else { 2 + (nb - 1) * 2 };
-        let repacketize_len = if self.use_cbr {
+        // C 1749: VBR, and CBR at the maximum bitrate, may fill the buffer.
+        let repacketize_len = if self.use_cbr && self.user_bitrate != Bitrate::Max {
             cbr_bytes.min(output.len())
         } else {
             output.len()
@@ -2743,9 +2879,6 @@ pub struct OpusDecoder {
     /// way. 0 before the first SILK frame.
     silk_internal_rate: i32,
 
-    /// Not used by the decoder. Kept because it is a public field.
-    pub hybrid_skip_celt: bool,
-
     #[cfg(not(feature = "heap"))]
     w_pcm_i16: FixedVec<i16, OPUS_PCM_I16>,
     #[cfg(feature = "heap")]
@@ -2800,7 +2933,6 @@ impl OpusDecoder {
             softclip_mem: [0.0; OPUS_MAX_CHANNELS],
             silk_channels_internal: 0,
             silk_internal_rate: 0,
-            hybrid_skip_celt: false,
 
             #[cfg(not(feature = "heap"))]
             w_pcm_i16: FixedVec::from_value(0i16, 960 * channels),
@@ -2818,6 +2950,11 @@ impl OpusDecoder {
 
     /// Decode one Opus packet into interleaved `f32` PCM, returning the
     /// number of samples per channel written.
+    ///
+    /// `frame_size` is the room in `output`, in samples per channel. The
+    /// packet says how many samples it holds. Only the first
+    /// `samples * channels` values of `output` are written, where `samples`
+    /// is the result; the rest of `output` is left as it was, as in libopus.
     ///
     /// The packet may code another channel count than the decoder has, as
     /// in libopus. A mono packet is written to both channels of a stereo
@@ -2846,9 +2983,6 @@ impl OpusDecoder {
         output: &mut [f32],
     ) -> Result<usize, &'static str> {
         let (samples, _) = self.decode_native(input, frame_size, output, false, false, false)?;
-        // Zero-fill any extra space the caller provided beyond what the packet
-        // actually produces, so stale data is never left in the buffer.
-        output[samples * self.channels..].fill(0.0);
         Ok(samples)
     }
 
@@ -4069,9 +4203,9 @@ mod tests {
     #[test]
     fn test_invalid_small_frame_size_returns_error_not_panic() {
         let mut enc = OpusEncoder::new(48000, 2, Application::Voip).unwrap();
-        enc.bitrate_bps = 64000;
-        enc.complexity = 5;
-        enc.use_cbr = true;
+        enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+        enc.set_complexity(5).unwrap();
+        enc.set_vbr(false);
 
         // 48 samples at 48kHz = 1ms → frame_rate=1000, invalid for Hybrid mode.
         let input = vec![0.0f32; 48 * 2]; // stereo interleaved
@@ -4180,9 +4314,9 @@ mod tests {
     fn decode_native_handles_fec_and_padding_in_self_delimited_packets() {
         let frame_size = 320usize;
         let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-        enc.bitrate_bps = 28000;
-        enc.use_inband_fec = true;
-        enc.packet_loss_perc = 25;
+        enc.set_bitrate(Bitrate::BitsPerSecond(28000)).unwrap();
+        enc.set_inband_fec(true);
+        enc.set_packet_loss_perc(25).unwrap();
         let packets = encode_tone(&mut enc, frame_size, 40);
         // SILK-only packets, half of them or more with a copy of the frame
         // before: the second bit of a mono SILK frame is its FEC flag.

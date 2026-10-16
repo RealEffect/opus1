@@ -1065,7 +1065,7 @@ pub use crate::silk::control_codec::SILK_ENC_FS_NOT_SUPPORTED;
 ///
 /// This is the fixed-point build. The float build of libopus converts the
 /// sum of the two float samples to 16 bits first, which clips a sum beyond
-/// 16 bits before it is halved: [`silk_downmix_stereo_float`].
+/// 16 bits before it is halved: `silk_downmix_stereo_float`.
 pub fn silk_downmix_stereo(stereo: &[i16], mono: &mut [i16]) {
     let n = mono.len().min(stereo.len() / 2);
     for i in 0..n {
@@ -1307,7 +1307,7 @@ pub enum SilkInput<'a> {
     /// Float samples (1.0 is full scale), as the float build of libopus
     /// takes them. Each sample is rounded to 16 bits (`RES2INT16`). Stereo
     /// input coded as one channel is mixed down by
-    /// [`silk_downmix_stereo_float`].
+    /// `silk_downmix_stereo_float`.
     Float(&'a [f32]),
 }
 
@@ -1459,12 +1459,6 @@ impl SilkEncoder {
             silk_init_encoder(&mut ch.state, 0);
         }
         self.time_since_switch_allowed_ms = 0;
-    }
-
-    /// Start at the rate asked for on the next packet, as a new encoder
-    /// does, without clearing the channels.
-    pub fn forget_rate(&mut self) {
-        self.initialized = false;
     }
 
     /// The state of the mono or mid channel.

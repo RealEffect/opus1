@@ -12,11 +12,11 @@
 // The loops follow the C code, which steps through its arrays in chunks.
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use opus1::kiss_fft::{
+use opus1::internals::kiss_fft::{
     FFT_TWIDDLES_480, KissCpx, KissFftState, opus_fft_impl, opus_fft_impl_fused,
     opus_fft_impl_scalar,
 };
-use opus1::modes::default_mode;
+use opus1::internals::modes::default_mode;
 use std::os::raw::{c_int, c_void};
 
 #[repr(C)]

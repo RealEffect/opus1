@@ -49,9 +49,24 @@
 #     log10. Android's and Apple's give different last bits for some
 #     inputs.
 #
+# For this computer (--host). The same build can be made for a 64-bit ARM
+# computer, such as a Mac with Apple silicon, with its own compiler `cc` and
+# archiver `ar`. It then serves as a fair C reference on that computer: the
+# Homebrew libopus behaves like a build at -Os, while libopus's own build
+# uses -O2 (docs/08-performance.md, "The C reference matters"). The
+# library goes to $ANDROID_OUT/libopus-host unless LIBOPUS_PREFIX is set.
+# Link the harness against it in a cargo directory of its own:
+#
+#   LIBOPUS_LIB_DIR=<prefix> LIBOPUS_NO_PKG=1 LIBOPUS_STATIC=1 \
+#     CARGO_TARGET_DIR=target/libopus-o2 \
+#     cargo build --release --example perf_harness
+#
+# OPUS_EXTRA_CFLAGS=-Os gives a build at -Os, because the last -O flag
+# counts.
+#
 # Settings (environment variables; see scripts/android/env.sh for the
 # common ones):
-#   ANDROID_NDK_HOME  required.
+#   ANDROID_NDK_HOME  required, except with --host.
 #   OPUS_SRC          The libopus source tree. Default: the copy in the
 #                     cargo registry, vendored by the crate opus-head-sys
 #                     0.3.3 (see above).
@@ -61,15 +76,35 @@
 #   LIBOPUS_PREFIX    Install directory (lib/libopus.a, include/opus/*.h).
 #   JOBS              Parallel compiler processes. Default 8.
 #   OPUS_CC           The compiler command. Default: the NDK's
-#                     aarch64-linux-android$ANDROID_API-clang.
+#                     aarch64-linux-android$ANDROID_API-clang, or cc with
+#                     --host.
 #   OPUS_EXTRA_CFLAGS More compiler flags, added after the ones above. For
 #                     example "-fno-vectorize -fno-slp-vectorize" builds
 #                     a library whose loops are not vectorized by clang.
 #
-# Usage: scripts/android/build-libopus.sh
+# Usage: scripts/android/build-libopus.sh [--host]
 set -euo pipefail
+PREFIX_FROM_USER=${LIBOPUS_PREFIX:-}
 source "$(dirname "$0")/env.sh"
-need_ndk
+
+HOST=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host) HOST=1 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+if [ "$HOST" = 1 ]; then
+    # The defines below choose the NEON code of 64-bit ARM.
+    case "$(uname -m)" in
+        arm64 | aarch64) ;;
+        *) echo "error: --host needs a 64-bit ARM computer; this one is $(uname -m)" >&2; exit 2 ;;
+    esac
+    LIBOPUS_PREFIX=${PREFIX_FROM_USER:-$ANDROID_OUT/libopus-host}
+else
+    need_ndk
+fi
 
 if [ -z "${OPUS_SRC:-}" ]; then
     for d in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/opus-head-sys-0.3.3/vendored/opus; do
@@ -87,11 +122,18 @@ if [ -z "${OPUS_VERSION:-}" ]; then
 fi
 JOBS=${JOBS:-8}
 
-BIN=$(ndk_bin)
 # The compiler command, as words. OPUS_CC replaces it, for example to try
 # another clang: "clang -target aarch64-linux-android21 --sysroot=$SYSROOT".
-read -r -a CC <<< "${OPUS_CC:-$BIN/aarch64-linux-android${ANDROID_API}-clang}"
-AR="$BIN/llvm-ar"
+if [ "$HOST" = 1 ]; then
+    read -r -a CC <<< "${OPUS_CC:-cc}"
+    AR=ar
+    TARGET_NAME="this computer ($(uname -s) $(uname -m))"
+else
+    BIN=$(ndk_bin)
+    read -r -a CC <<< "${OPUS_CC:-$BIN/aarch64-linux-android${ANDROID_API}-clang}"
+    AR="$BIN/llvm-ar"
+    TARGET_NAME=aarch64-linux-android
+fi
 OBJ_DIR="$LIBOPUS_PREFIX/obj"
 rm -rf "$OBJ_DIR"
 mkdir -p "$OBJ_DIR" "$LIBOPUS_PREFIX/lib" "$LIBOPUS_PREFIX/include/opus"
@@ -148,7 +190,7 @@ INCLUDES=(
 )
 
 {
-    echo "# libopus for aarch64-linux-android, built by scripts/android/build-libopus.sh"
+    echo "# libopus for $TARGET_NAME, built by scripts/android/build-libopus.sh"
     echo "# source: $OPUS_SRC"
     echo "# compiler: $("${CC[@]}" --version | head -n 1)"
     echo "CC=${CC[*]}"

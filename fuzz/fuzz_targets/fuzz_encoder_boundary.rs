@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
@@ -29,29 +29,29 @@ fuzz_target!(|data: &[u8]| {
                     6000, // Minimum recommended
                     16000, 32000, 64000, 128000, 256000, 510000, // Maximum
                 ];
-                encoder.bitrate_bps = bitrates[data[0] as usize % bitrates.len()];
+                let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(bitrates[data[0] as usize % bitrates.len()]));
 
                 // Test complexity values (0-10, with edge cases)
-                encoder.complexity = match data[1] % 5 {
+                let _ = encoder.set_complexity(match data[1] % 5 {
                     0 => 0,
                     1 => 5,
                     2 => 10,
                     3 => -1, // Invalid, should be handled
                     _ => (data[1] % 11) as i32,
-                };
+                });
 
                 // Test packet loss percentage
-                encoder.packet_loss_perc = match data[2] % 5 {
+                let _ = encoder.set_packet_loss_perc(match data[2] % 5 {
                     0 => 0,
                     1 => 50,
                     2 => 100,
                     3 => -1,  // Invalid
                     _ => 101, // Invalid
-                };
+                });
 
                 // Test FEC settings
-                encoder.use_inband_fec = data[3] % 2 == 0;
-                encoder.use_cbr = data[4] % 2 == 0;
+                encoder.set_inband_fec(data[3] % 2 == 0);
+                encoder.set_vbr(data[4] % 2 != 0);
 
                 // Test frame sizes based on sample rate
                 let frame_sizes: Vec<usize> = match sampling_rate {

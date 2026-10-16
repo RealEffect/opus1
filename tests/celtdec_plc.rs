@@ -15,12 +15,15 @@
 //!   Hybrid stream.
 //!
 //! The noise comes from the decoder's random seed, so a correct port
-//! reproduces it to the last bits (more than 120 dB).
+//! reproduces it to the last bits.
 //!
-//! The pitch repetition cannot agree that closely, because it is built from
-//! the decoder's own output, and that output already differs from libopus's
-//! in the last bit (good frames agree to about 135 dB). Three steps amplify
-//! the difference:
+//! The pitch repetition is built from the decoder's own output. On 64-bit
+//! ARM that output, and the pitch search and the linear prediction built on
+//! it, have the bits of libopus's arm64 build. So every concealed frame
+//! here is libopus's to the last bit there, and the limits ask for that.
+//!
+//! On other processors the decoder's output may differ from libopus's in
+//! the last bit, and three steps amplify such a difference:
 //!
 //! 1. A 24th-order linear predictor is fitted to the output. Changing the
 //!    last bit of the output changes a concealed frame at about -70 dB.
@@ -39,8 +42,9 @@
 //!    40 ms.
 //!
 //! An error in the algorithm looks different: a wrong pitch, fade factor or
-//! energy leaves 20 dB or less in every frame of its kind. The limits below
-//! are therefore on the median, and on the share of frames below 40 dB.
+//! energy leaves 20 dB or less in every frame of its kind. The limits for
+//! other processors are therefore on the median, and on the share of frames
+//! below 40 dB.
 //!
 //! Run with `--nocapture` to see the measured numbers.
 
@@ -66,31 +70,47 @@ struct Limits {
     recovered_worst: f64,
 }
 
-/// The limits for pitch repetition were measured on 64-bit ARM. There
-/// opus1 rounds the sums of the concealment the way libopus does (see
-/// `plc_mac` in src/celt.rs). On other processors the two round differently,
-/// so more frames are badly matched. The limits are wider there. They have
-/// not been measured.
+/// On 64-bit ARM opus1 rounds as libopus's arm64 build does, so every
+/// frame must be libopus's (the SNR of identical frames is 200 dB). On
+/// other processors the two may round differently, so more frames may be
+/// badly matched. The limits are wider there. They have not been measured.
 const ARM64: bool = cfg!(target_arch = "aarch64");
 
+/// Every frame the same as libopus's.
+const IDENTICAL: Limits = Limits {
+    concealed_median: 199.0,
+    first_good_median: 199.0,
+    poor_share: 0.0,
+    worst: 199.0,
+    recovered_worst: 199.0,
+};
+
 /// Losses concealed by pitch repetition, full-band output.
-const PITCH: Limits = Limits {
-    concealed_median: if ARM64 { 65.0 } else { 55.0 },
-    first_good_median: if ARM64 { 70.0 } else { 60.0 },
-    poor_share: if ARM64 { 0.02 } else { 0.1 },
-    worst: f64::NEG_INFINITY,
-    recovered_worst: if ARM64 { 85.0 } else { 60.0 },
+const PITCH: Limits = if ARM64 {
+    IDENTICAL
+} else {
+    Limits {
+        concealed_median: 55.0,
+        first_good_median: 60.0,
+        poor_share: 0.1,
+        worst: f64::NEG_INFINITY,
+        recovered_worst: 60.0,
+    }
 };
 
 /// Losses concealed by pitch repetition, band-limited output (a decoder
-/// below 48 kHz, or a stream narrower than fullband). Up to one frame in
-/// ten is badly matched here, see the top of this file.
-const PITCH_BAND_LIMITED: Limits = Limits {
-    concealed_median: if ARM64 { 60.0 } else { 45.0 },
-    first_good_median: if ARM64 { 65.0 } else { 50.0 },
-    poor_share: if ARM64 { 0.25 } else { 0.6 },
-    worst: f64::NEG_INFINITY,
-    recovered_worst: if ARM64 { 60.0 } else { 40.0 },
+/// below 48 kHz, or a stream narrower than fullband). Off 64-bit ARM up to
+/// one frame in ten may be badly matched here, see the top of this file.
+const PITCH_BAND_LIMITED: Limits = if ARM64 {
+    IDENTICAL
+} else {
+    Limits {
+        concealed_median: 45.0,
+        first_good_median: 50.0,
+        poor_share: 0.6,
+        worst: f64::NEG_INFINITY,
+        recovered_worst: 40.0,
+    }
 };
 
 /// Losses concealed with noise only.
@@ -403,9 +423,10 @@ fn long_burst_ends_in_noise_like_libopus() {
 /// packets in a row have arrived (libopus `skip_plc`). Pattern: a long
 /// burst, one good packet, one lost (noise), two good, one lost (pitch).
 ///
-/// The lost packet after a single good one must be noise in both decoders.
-/// Noise is reproduced to the last bits and pitch repetition is not, so the
-/// SNR of that frame tells which of the two opus1 used.
+/// The lost packet after a single good one must be noise in both decoders,
+/// and the one after two good packets pitch repetition. Each frame must
+/// match the frame of libopus; the other way of concealing would give
+/// another signal.
 #[test]
 fn pitch_concealment_returns_after_two_good_packets() {
     let (rate, frame) = (48000, 960);
@@ -436,14 +457,11 @@ fn pitch_concealment_returns_after_two_good_packets() {
         assert!(after_one > NOISE_FRAME_DB, "noise frame: {after_one:.1} dB");
         pitch_frames.push(after_two);
     }
-    // The frames after two good packets are pitch repetition: close to
-    // libopus, but not to the last bits.
+    // The frames after two good packets are pitch repetition: as close to
+    // libopus as `PITCH` asks (on 64-bit ARM, the frames of libopus).
     pitch_frames.sort_by(|a, b| a.total_cmp(b));
     let median = pitch_frames[pitch_frames.len() / 2];
-    assert!(
-        median > PITCH.concealed_median && median < NOISE_FRAME_DB,
-        "pitch frames: median {median:.1} dB"
-    );
+    assert!(median > PITCH.concealed_median, "pitch frames: median {median:.1} dB");
     let s = loss_stats(&c, &r, &lost, rate, 1, frame);
     let mut report = Report::new();
     report.check("burst, 1 good, 1 lost, 2 good, 1 lost", s, PITCH);

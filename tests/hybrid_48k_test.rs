@@ -1,4 +1,4 @@
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 #[test]
 fn test_48k_hybrid_quality() {
@@ -9,8 +9,8 @@ fn test_48k_hybrid_quality() {
 
     // Create encoder/decoder in VoIP mode (uses Hybrid for 48kHz)
     let mut encoder = OpusEncoder::new(sample_rate, 1, Application::Voip).unwrap();
-    encoder.bitrate_bps = 32000;
-    encoder.use_cbr = true;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    encoder.set_vbr(false);
 
     let mut decoder = OpusDecoder::new(sample_rate, 1).unwrap();
 

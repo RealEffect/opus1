@@ -26,15 +26,15 @@ fn gen_pcm(fs: i32, num_samples: usize) -> Vec<f32> {
 }
 
 fn run_config(fs: i32, bitrate: i32, complexity: i32, c_ref_hex: &[&str], label: &str) {
-    use opus1::{Application, OpusEncoder};
+    use opus1::{Application, Bitrate, OpusEncoder};
     let frame_size = fs as usize / 50;
     let total_samples = frame_size * c_ref_hex.len();
     let pcm = gen_pcm(fs, total_samples);
 
     let mut encoder = OpusEncoder::new(fs, 1, Application::Voip).expect("encoder");
-    encoder.complexity = complexity;
-    encoder.bitrate_bps = bitrate;
-    encoder.use_cbr = true;
+    encoder.set_complexity(complexity).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    encoder.set_vbr(false);
 
     let mut mismatches = 0;
     for (i, ref_hex) in c_ref_hex.iter().enumerate() {
@@ -579,7 +579,7 @@ fn voiced_signal(samples: usize) -> Vec<i16> {
 /// 238 with the first one corrected (the first eight blocks), 300 with both.
 #[test]
 fn long_voiced_stream_is_the_stream_of_fixed_point_libopus() {
-    use opus1::{Application, OpusEncoder};
+    use opus1::{Application, Bitrate, OpusEncoder};
     const C_BLOCK_HASHES: [u64; 12] = [
         0x4919c56ab5c5a233,
         0x99c741894692a57d,
@@ -597,9 +597,9 @@ fn long_voiced_stream_is_the_stream_of_fixed_point_libopus() {
     let frame_size = 320;
     let pcm = voiced_signal(frame_size * 25 * C_BLOCK_HASHES.len());
     let mut encoder = OpusEncoder::new(16000, 1, Application::Voip).expect("encoder");
-    encoder.complexity = 5;
-    encoder.bitrate_bps = 20000;
-    encoder.use_cbr = false;
+    encoder.set_complexity(5).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder.set_vbr(true);
 
     let mut out = vec![0u8; 1275];
     let mut equal_blocks = Vec::new();

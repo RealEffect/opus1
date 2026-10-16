@@ -8,7 +8,7 @@
 /// fixed-point Rust encoder against a mismatched floating-point reference, which
 /// can never produce byte-identical output. Fixed-point compatibility coverage
 /// remains in `tests/silk_fixed_point_compare.rs`.
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Test TOC byte structure is correct for SILK NB 20ms CBR
@@ -19,9 +19,9 @@ fn test_silk_toc_byte_structure() {
 
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
-    encoder.complexity = 0;
-    encoder.bitrate_bps = 10000;
-    encoder.use_cbr = true;
+    encoder.set_complexity(0).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(10000)).unwrap();
+    encoder.set_vbr(false);
 
     let mut input = vec![0.0f32; frame_size];
     for i in 0..frame_size {
@@ -61,9 +61,9 @@ fn test_silk_multi_frame_sizes() {
 
     let mut encoder =
         OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
-    encoder.complexity = 0;
-    encoder.bitrate_bps = 10000;
-    encoder.use_cbr = true;
+    encoder.set_complexity(0).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(10000)).unwrap();
+    encoder.set_vbr(false);
 
     for frame_idx in 0..5 {
         let mut input = vec![0.0f32; frame_size];

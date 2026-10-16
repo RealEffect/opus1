@@ -4,20 +4,20 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::decode_indices::silk_decode_indices;
-use opus1::silk::decode_pulses::silk_decode_pulses;
-use opus1::silk::define::CODE_INDEPENDENTLY;
-use opus1::silk::control_codec::{
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::decode_indices::silk_decode_indices;
+use opus1::internals::silk::decode_pulses::silk_decode_pulses;
+use opus1::internals::silk::define::CODE_INDEPENDENTLY;
+use opus1::internals::silk::control_codec::{
     SilkBandwidthControl, silk_control_audio_bandwidth, silk_control_encoder,
 };
-use opus1::silk::define::TRANSITION_FRAMES;
-use opus1::silk::enc_api::{silk_encode_do_vad, silk_encode_packet, silk_encode_prefill};
-use opus1::silk::stereo_lr_to_ms::silk_stereo_lr_to_ms;
-use opus1::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus1::silk::init_encoder::silk_init_encoder;
-use opus1::silk::structs::SilkEncoderState;
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::internals::silk::define::TRANSITION_FRAMES;
+use opus1::internals::silk::enc_api::{silk_encode_do_vad, silk_encode_packet, silk_encode_prefill};
+use opus1::internals::silk::stereo_lr_to_ms::silk_stereo_lr_to_ms;
+use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
+use opus1::internals::silk::init_encoder::silk_init_encoder;
+use opus1::internals::silk::structs::SilkEncoderState;
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 
 const FS: usize = 16_000;
 const FRAME: usize = 320;
@@ -93,9 +93,9 @@ fn fec_copies_are_coded_with_libopus_gain_increase() {
         let mut rs = OpusEncoder::new(FS as i32, 1, Application::Audio).unwrap();
         rs.set_force_mode(Some(ForcedMode::SilkOnly));
         rs.set_bandwidth(Bandwidth::Wideband);
-        rs.bitrate_bps = 32_000;
-        rs.use_inband_fec = true;
-        rs.packet_loss_perc = loss;
+        rs.set_bitrate(Bitrate::BitsPerSecond(32_000)).unwrap();
+        rs.set_inband_fec(true);
+        rs.set_packet_loss_perc(loss).unwrap();
         let mut c = CEncoder::new(FS, 1, APP_AUDIO);
         c.silk_only().bandwidth(BW_WB).bitrate(32_000).fec(true, loss);
         let mut out = vec![0u8; 1500];

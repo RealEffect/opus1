@@ -17,6 +17,8 @@
 //! - With an output buffer of 4000 bytes per stream the frame is encoded.
 //! - Every packet is accepted by libopus's multistream decoder, which
 //!   decodes exactly one frame and ends in the encoder's final range.
+//! - With a constant bitrate and an explicit or the maximum bitrate, the
+//!   packet has the length libopus's rule gives.
 //! - opus1's multistream decoder does the same. Its output is within 50 dB
 //!   of libopus's until a packet has a frame of 0 or 1 bytes, which the
 //!   decoders conceal, or switches a stream from CELT-only to SILK or
@@ -33,8 +35,8 @@ use audiopus_sys as sys;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use opus1::multistream::{Bitrate, MultistreamDecoder, MultistreamEncoder};
-use opus1::{Application, Bandwidth, ForcedMode};
+use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode};
 
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
@@ -301,6 +303,32 @@ fn run(data: &[u8]) -> Result<()> {
         };
         assert!(len <= out_len);
         let p = &packet[..len];
+        // libopus's rule for a constant bitrate (opus_multistream_encoder.c
+        // 918-928): the packet has the bytes of the bitrate, rounded to the
+        // nearest byte, at least the smallest packet (one byte for the last
+        // stream, two for each other), at most the buffer; at the maximum
+        // bitrate it fills the buffer. The last stream is padded to that
+        // length. The automatic bitrate goes by the allocation, which is not
+        // known here.
+        if !enc.vbr() {
+            let smallest = 2 * streams - 1;
+            let expected = match enc.bitrate_setting() {
+                Bitrate::Auto => None,
+                Bitrate::Max => Some(out_len),
+                Bitrate::BitsPerSecond(bps) => {
+                    let bytes = ((bitrate_to_bits(bps, fs, frame_size) + 4) / 8).max(0) as usize;
+                    Some(out_len.min(smallest.max(bytes)))
+                }
+            };
+            if let Some(expected) = expected {
+                assert_eq!(
+                    len,
+                    expected,
+                    "frame {n}: constant bitrate {:?}, {frame_size} samples, {out_len}-byte buffer",
+                    enc.bitrate_setting()
+                );
+            }
+        }
         let range = enc.final_range();
 
         let got = c_dec.decode_float(p, &mut c_out, 2880, false);

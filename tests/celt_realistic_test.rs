@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// Test CELT loopback at a realistic bitrate (160 bytes per frame @ 960 samples)
 /// to isolate whether the CELT codec itself works, vs the OpusEncoder wrapper.

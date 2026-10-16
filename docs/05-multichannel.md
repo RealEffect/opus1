@@ -172,7 +172,7 @@ Ambisonics describes a sound field around the listener instead of loudspeaker fe
 - An ambisonics signal of order `n` has `(n + 1)²` channels: 1, 4, 9, 16, and so on up to 225. The channels are in Ambisonic Channel Number (ACN) order.
 - Two more channels may follow: a stereo pair that is not part of the sound field, for example music or commentary. RFC 8486 calls them non-diegetic channels.
 
-So the valid channel counts are the square numbers up to 225, and the square numbers plus 2 up to 227. `opus1::multistream::layout::validate_ambisonics` checks a count.
+So the valid channel counts are the square numbers up to 225, and the square numbers plus 2 up to 227. `opus1::multistream::validate_ambisonics` checks a count.
 
 The layout: every ambisonics channel gets an uncoupled stream, in channel order. The extra stereo pair, if present, is coupled stream 0. Every stream is coded CELT-only, and every stream gets the same share of the bitrate.
 
@@ -197,7 +197,7 @@ The mapping family in the header says what the output channels mean. The stream 
 
 ### The total bitrate
 
-`MultistreamEncoder::set_bitrate` takes a `Bitrate`:
+`MultistreamEncoder::set_bitrate` takes a `Bitrate` (`opus1::Bitrate`, the type `OpusEncoder::set_bitrate` takes too):
 
 | Value | Meaning |
 |---|---|
@@ -244,32 +244,47 @@ While it writes a packet, the encoder gives each stream a byte limit:
 
 With constant bitrate the last stream gets the bitrate that fills the bytes that are left. Its packet is then padded, so the whole packet reaches its exact size.
 
-`opus1::multistream::rate_alloc` holds these rules as plain functions: `rate_allocation`, `smallest_packet`, `cbr_max_data_bytes`, `stream_max_bytes` and `cbr_last_stream_bitrate`.
+The source file `src/multistream/rate_alloc.rs` holds these rules. After a frame, each stream encoder reports the bitrate it was given, and the multistream encoder reports their sum:
 
 ```rust
-use opus1::multistream::{ChannelLayout, MappingType};
-use opus1::multistream::rate_alloc::{rate_allocation, OPUS_AUTO};
+use opus1::multistream::{MappingType, MultistreamEncoder};
+use opus1::{Application, Bitrate};
 
-// The layout, mapping type and LFE stream of 5.1 (family 1).
-let (layout, mapping_type, lfe_stream) = ChannelLayout::surround(6, 1).unwrap();
-assert_eq!((mapping_type, lfe_stream), (MappingType::Surround, Some(3)));
+// 5.1 at 48 kHz (family 1): two coupled streams, the centre and the LFE.
+let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
+assert_eq!((encoder.mapping_type(), encoder.lfe_stream()), (MappingType::Surround, Some(3)));
+let pcm = vec![0.0f32; 960 * 6]; // 20 ms
+let mut packet = vec![0u8; 4000];
+let stream_rates = |encoder: &MultistreamEncoder| -> Vec<i32> {
+    (0..4).map(|s| encoder.stream_encoder(s).unwrap().bitrate()).collect()
+};
 
-// 256 kb/s, 20 ms frames at 48 kHz.
-let mut rates = [0i32; 4];
-let sum = rate_allocation(&layout, mapping_type, lfe_stream, 256_000, 960, 48_000, &mut rates)
-    .unwrap();
-assert_eq!(rates, [95_120, 95_120, 57_560, 8_195]);
-assert_eq!(sum, 255_995);
+// 256 kb/s.
+encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
+encoder.encode(&pcm, 960, &mut packet).unwrap();
+assert_eq!(stream_rates(&encoder), [95_120, 95_120, 57_560, 8_195]);
+assert_eq!(encoder.bitrate(), 255_995);
 
 // The automatic bitrate.
-let sum = rate_allocation(&layout, mapping_type, lfe_stream, OPUS_AUTO, 960, 48_000, &mut rates)
-    .unwrap();
-assert_eq!(sum, 307_998);
+encoder.set_bitrate(Bitrate::Auto).unwrap();
+encoder.encode(&pcm, 960, &mut packet).unwrap();
+assert_eq!(encoder.bitrate(), 307_998);
 
 // The same layout without surround mode, as `MultistreamEncoder::new`
 // builds it: no LFE stream, so both uncoupled streams are treated alike.
-rate_allocation(&layout, MappingType::None, None, 256_000, 960, 48_000, &mut rates).unwrap();
-assert_eq!(rates, [78_666, 78_666, 49_333, 49_333]);
+let layout = encoder.layout().clone();
+let mut plain = MultistreamEncoder::new(
+    48_000,
+    6,
+    layout.streams(),
+    layout.coupled_streams(),
+    layout.mapping(),
+    Application::Audio,
+)
+.unwrap();
+plain.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
+plain.encode(&pcm, 960, &mut packet).unwrap();
+assert_eq!(stream_rates(&plain), [78_666, 78_666, 49_333, 49_333]);
 ```
 
 ## Surround mode
@@ -346,6 +361,7 @@ A port of libopus `OpusMSEncoder`.
 | `set_bitrate(Bitrate)`, `bitrate_setting()` | Sets and reads the total bitrate setting. |
 | `bitrate()` | The sum of the stream bitrates that the last frame used. |
 | `set_vbr(bool)`, `vbr()` | Variable bitrate (`true`, the default) or constant bitrate. |
+| `set_vbr_constraint(bool)`, `vbr_constraint()` | With variable bitrate, keeps CELT-only packets close to the bitrate (`true`, the default). |
 | `set_complexity(0..=10)`, `complexity()` | Complexity of every stream. The default is 9. |
 | `set_inband_fec(bool)`, `inband_fec()` | In-band forward error correction (FEC) on every stream. Only SILK frames carry it. |
 | `set_packet_loss_perc(0..=100)`, `packet_loss_perc()` | Expected packet loss in percent. |
@@ -403,12 +419,11 @@ A port of libopus `OpusMSDecoder`.
 | `MappingType` | `None`, `Surround` or `Ambisonics`. |
 | `SILENT_CHANNEL` | The mapping entry 255. |
 | `ChannelMappingTable` | The table of an Ogg Opus header: `channels`, `stream_count`, `coupled_count`, `mapping`. |
-| `layout::validate_ambisonics(channels)` | The stream and coupled stream counts of an ambisonics channel count, or `None`. |
+| `validate_ambisonics(channels)` | The stream and coupled stream counts of an ambisonics channel count, or `None`. |
 | `split_self_delimited(data, scratch)` | Cuts the first stream out of a multistream packet. |
 
 ```rust
-use opus1::multistream::{ChannelLayout, MappingType};
-use opus1::multistream::layout::validate_ambisonics;
+use opus1::multistream::{ChannelLayout, MappingType, validate_ambisonics};
 
 // 7.1 in family 1: 5 streams, the first 3 coupled, LFE in stream 4.
 let (layout, mapping_type, lfe) = ChannelLayout::surround(8, 1).unwrap();
@@ -442,9 +457,8 @@ assert!(ChannelLayout::surround(4, 3).is_err());
 ### Encoding 5.1
 
 ```rust
-use opus1::Application;
-use opus1::multistream::{Bitrate, MultistreamEncoder};
-use opus1::packet;
+use opus1::multistream::MultistreamEncoder;
+use opus1::{Application, Bitrate, packet};
 
 // 5.1 at 48 kHz in the channel order of mapping family 1:
 // front left, centre, front right, rear left, rear right, LFE.
@@ -497,8 +511,8 @@ assert_eq!(len, 640);
 ### Decoding 5.1 through an Ogg Opus header
 
 ```rust
-use opus1::Application;
-use opus1::multistream::{Bitrate, ChannelMappingTable, MultistreamDecoder, MultistreamEncoder};
+use opus1::multistream::{ChannelMappingTable, MultistreamDecoder, MultistreamEncoder};
+use opus1::{Application, Bitrate};
 
 let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
@@ -610,6 +624,6 @@ These differences from libopus 1.6.1 are known. The figures come from the projec
 
 - **Bandwidth with an automatic or maximum bitrate in surround mode.** libopus compares the raw setting (−1000 or −1) with the thresholds, so it always chooses narrowband. `opus1` uses the allocated bitrate and codes fullband. This is deliberate.
 - **Frame sizes.** 80, 100 and 120 ms frames and the expert frame duration control are not offered.
-- **Controls.** The multistream encoder has no control for these: the least significant bit (LSB) depth, constrained variable bitrate, the signal type, discontinuous transmission (DTX), the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`.
+- **Controls.** The multistream encoder has no control for these: the least significant bit (LSB) depth, the signal type, discontinuous transmission (DTX), the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`.
 - **Rate use without the speech/music analysis.** libopus's speech/music analysis is not ported. At 16 kHz and with `Application::Voip`, the `opus1` multistream encoder used 65 % to 80 % of the requested rate in four test cases, where libopus used 101 % to 102 %. In the test matrix of `tests/multistream_enc_validity.rs`, libopus wrote some packets with a stereo Hybrid stream: 128 at 8 kilobits per second (kb/s) per channel, and 111 at 24 kb/s per channel. `opus1` wrote none.
 - **Family 3 (projection)** is not supported.

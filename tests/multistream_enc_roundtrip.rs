@@ -16,7 +16,7 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::Application;
-use opus1::multistream::encoder::MultistreamEncoder;
+use opus1::multistream::MultistreamEncoder;
 use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
 
 const FS: i32 = 48_000;

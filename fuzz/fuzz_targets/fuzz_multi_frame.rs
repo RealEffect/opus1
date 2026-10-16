@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 32 {
@@ -34,14 +34,14 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Configure encoder
-    encoder.bitrate_bps = match data[3] % 5 {
+    let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(match data[3] % 5 {
         0 => 16000,
         1 => 32000,
         2 => 64000,
         3 => 96000,
         _ => 128000,
-    };
-    encoder.complexity = (data[4] % 11) as i32;
+    }));
+    let _ = encoder.set_complexity((data[4] % 11) as i32);
 
     // Frame size
     let frame_size = match data[5] % 4 {

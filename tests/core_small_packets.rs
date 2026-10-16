@@ -11,7 +11,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus1::{Application, ForcedMode, OpusEncoder, packet};
+use opus1::{Application, Bitrate, ForcedMode, OpusEncoder, packet};
 
 fn signal(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
     let voice = speech(rate, seconds);
@@ -75,9 +75,9 @@ fn small_buffers(rate: usize, frame_tenth_ms: &[usize]) -> Counts {
                         let mut c_enc = CEncoder::new(rate, channels, APP_AUDIO);
                         c_enc.bitrate(bitrate).vbr(!cbr).complexity(5);
                         let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
-                        enc.bitrate_bps = bitrate;
-                        enc.use_cbr = cbr;
-                        enc.complexity = 5;
+                        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                        enc.set_vbr(!cbr);
+                        enc.set_complexity(5).unwrap();
                         if let Some((c_mode, forced)) = mode {
                             c_enc.force_mode(c_mode);
                             enc.set_force_mode(Some(forced));
@@ -174,9 +174,9 @@ fn constant_bitrate_above_one_frame_pads_like_libopus() {
         let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
         c_enc.bitrate(bitrate).vbr(false).complexity(5).force_mode(MODE_CELT);
         let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
-        enc.bitrate_bps = bitrate;
-        enc.use_cbr = true;
-        enc.complexity = 5;
+        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_vbr(false);
+        enc.set_complexity(5).unwrap();
         enc.set_force_mode(Some(ForcedMode::CeltOnly));
         let mut c_dec = CDecoder::new(rate, 2);
         let mut buf = vec![0u8; len];

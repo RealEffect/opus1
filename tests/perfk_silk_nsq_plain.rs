@@ -13,8 +13,8 @@
 //! The quantizer is fixed-point: the pulses and the whole state after every
 //! frame must be identical.
 
-use opus1::silk::nsq::silk_nsq;
-use opus1::silk::structs::{SideInfoIndices, SilkEncoderStateCommon, SilkNSQState};
+use opus1::internals::silk::nsq::silk_nsq;
+use opus1::internals::silk::structs::{SideInfoIndices, SilkEncoderStateCommon, SilkNSQState};
 
 const MAX_LPC_ORDER: usize = 16;
 const MAX_SHAPE_LPC_ORDER: usize = 24;

@@ -10,7 +10,7 @@
 mod ms_support;
 
 use ms_support::noise;
-use opus1::multistream::surround::SurroundProbe;
+use opus1::internals::multistream::surround::SurroundProbe;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

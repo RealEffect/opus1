@@ -186,7 +186,7 @@ The example encodes 20 ms of a tone and reads the TOC byte, first by hand and th
 
 ```rust
 use opus1::packet;
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 // 20 ms of a 440 Hz tone at 48 kHz, mono: 960 samples.
 let pcm: Vec<f32> = (0..960)
@@ -194,7 +194,7 @@ let pcm: Vec<f32> = (0..960)
     .collect();
 
 let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
-encoder.bitrate_bps = 64_000;
+encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
 let mut buf = vec![0u8; 1276];
 let len = encoder.encode(&pcm, 960, &mut buf).unwrap();
 let pkt = &buf[..len];
@@ -226,9 +226,9 @@ There are three ways to control the bitrate:
 
 In opus1:
 
-- `OpusEncoder::bitrate_bps` sets the bitrate, in bits per second. It starts at 64 000.
-- `OpusEncoder::use_cbr` chooses CBR (`true`) or VBR (`false`, the default).
-- VBR is constrained for CELT-only packets. In Hybrid packets the CELT layer uses unconstrained VBR. Both match libopus with its default settings.
+- `OpusEncoder::set_bitrate` sets the bitrate: `Bitrate::BitsPerSecond(n)` in bits per second, `Bitrate::Auto` or `Bitrate::Max`. It starts at `Bitrate::Auto`, libopus's automatic bitrate of 60 × rate / frame size + rate × channels b/s: 19,000 b/s for 16 kHz mono and 99,000 b/s for 48 kHz stereo in 20 ms frames.
+- `OpusEncoder::set_vbr` chooses VBR (`true`, the default) or CBR (`false`).
+- VBR is constrained for CELT-only packets, unless `set_vbr_constraint(false)` turns the constraint off. In Hybrid packets the CELT layer uses unconstrained VBR. Both match libopus.
 - The length of the output buffer passed to `encode` is a limit too. When the buffer is smaller than the bitrate needs, the encoder codes for the lower bitrate.
 
 ## Channels
@@ -309,13 +309,13 @@ Notes on these tools:
 [The decoder](04-decoder.md) explains how concealment and FEC work inside. The example below loses two packets. It rebuilds the first one from the FEC data of the next packet, and it conceals the second.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 // 16 kHz mono with in-band FEC: 20 ms is 320 samples.
 let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 24_000;
-encoder.use_inband_fec = true;
-encoder.packet_loss_perc = 10;
+encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
+encoder.set_inband_fec(true);
+encoder.set_packet_loss_perc(10).unwrap();
 
 let mut packets = Vec::new();
 for f in 0..5 {

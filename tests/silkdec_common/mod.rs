@@ -18,11 +18,11 @@
 #![allow(dead_code)]
 
 use audiopus_sys as sys;
-use opus1::SilkResampler;
-use opus1::range_coder::RangeCoder;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus1::silk::decoder_structs::SilkDecControl;
+use opus1::internals::silk::SilkResampler;
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::internals::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+use opus1::internals::silk::decoder_structs::SilkDecControl;
 
 // ---------------------------------------------------------------------------
 // Signals

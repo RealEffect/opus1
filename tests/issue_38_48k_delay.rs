@@ -33,8 +33,8 @@
 //! does not port, so only libopus's CELT output is a like-for-like reference.)
 
 use opus::{Channels as CCh, Decoder as CDec};
-use opus1::range_coder::RangeCoder;
-use opus1::{Application, OpusEncoder};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::{Application, Bitrate, OpusEncoder};
 
 const SR: usize = 48000;
 const FRAME: usize = 960;
@@ -55,7 +55,7 @@ fn chirp(sr: usize, seconds: usize) -> Vec<f32> {
 fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
     let input = chirp(SR, 13);
     let mut enc = OpusEncoder::new(SR as i32, 1, app).unwrap();
-    enc.bitrate_bps = bitrate;
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     let mut pkt = vec![0u8; 1500];
     let packets = input
         .chunks_exact(FRAME)

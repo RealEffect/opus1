@@ -1,4 +1,4 @@
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 #[test]
 fn test_48k_audio_roundtrip() {
@@ -6,8 +6,8 @@ fn test_48k_audio_roundtrip() {
     let frame_size = 960;
 
     let mut enc = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = 64_000;
-    enc.complexity = 0;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+    enc.set_complexity(0).unwrap();
     let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
 
     let mut rng: u32 = 12345;

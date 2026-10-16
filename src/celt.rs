@@ -1,8 +1,10 @@
 use crate::bands::{
-    SPREAD_NONE, SPREAD_NORMAL, celt_inner_prod, compute_band_energies, denormalise_bands, haar1,
-    log2amp, normalise_bands, quant_all_bands, spreading_decision,
+    SPREAD_NONE, SPREAD_NORMAL, compute_band_energies, denormalise_bands, haar1, log2amp,
+    normalise_bands, quant_all_bands, spreading_decision,
 };
+use crate::celt_lpc::{self, autocorr, celt_fir, celt_iir};
 use crate::mathops::{celt_exp2, celt_log2, mac, mac_f64};
+use crate::pitch::{pitch_downsample, pitch_search};
 use crate::modes::{CeltMode, SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF};
 use crate::quant_bands::{
     quant_coarse_energy_advanced, quant_energy_finalise, quant_fine_energy, unquant_coarse_energy,
@@ -29,8 +31,6 @@ const CELT_NB_X_CH: usize = CELT_NB_EBANDS * CELT_MAX_CHANNELS;
 const CELT_OVERLAP: usize = 120;
 /// Encoder `in_mem`: `channels * overlap`.
 const CELT_IN_MEM: usize = CELT_MAX_CHANNELS * CELT_OVERLAP;
-/// Prefilter comb-filter memory: `channels * COMBFILTER_MAXPERIOD`.
-const CELT_PREFILTER_MEM: usize = CELT_MAX_CHANNELS * COMBFILTER_MAXPERIOD;
 /// Longest frame the encoder codes, in samples at 48 kHz (20 ms).
 /// `CeltEncoder::encode` panics on a longer one.
 const CELT_ENC_MAX_FRAME: usize = 960;
@@ -42,8 +42,11 @@ const CELT_FRAME_X_CH: usize = CELT_ENC_MAX_FRAME * CELT_MAX_CHANNELS;
 const CELT_W_FREQ: usize = CELT_FRAME_X_CH + 4;
 /// PVQ stride-access scratch: `frame_x_ch + STRIDE_ACCESS_PAD`.
 const CELT_W_X_ENC: usize = CELT_FRAME_X_CH + STRIDE_ACCESS_PAD;
-/// Prefilter pre-scratch: `channels * (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME)`.
-const CELT_PREFILTER_PRE: usize = CELT_MAX_CHANNELS * (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME);
+/// Room per channel in `CeltEncoder::prefilter_buf`: the history of the
+/// pre-filter and one frame of input after it.
+const PREFILTER_STRIDE: usize = COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME;
+/// `CeltEncoder::prefilter_buf`: `channels * PREFILTER_STRIDE`.
+const CELT_PREFILTER_BUF: usize = CELT_MAX_CHANNELS * PREFILTER_STRIDE;
 /// Prefilter pitch buffer: `(COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME) >> 1`.
 const CELT_PREFILTER_PITCH: usize = (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME) >> 1;
 /// Longest frame the decoder produces, in samples at 48 kHz (20 ms).
@@ -1356,11 +1359,47 @@ fn stereo_analysis(m: &CeltMode, x: &[f32], lm: i32, n0: usize) -> bool {
 const COMBFILTER_MINPERIOD: usize = 15;
 const COMBFILTER_MAXPERIOD: usize = 1024;
 
+/// The taps of the three pitch filters (libopus `comb_filter`, `gains`).
+///
+/// libopus writes them as `QCONST16(0.3066406250f, 15)` and so on, which
+/// in the float build is the float nearest to that decimal. Each one is a
+/// multiple of 2^-12 and so an exact `f32`. Shorter decimals such as
+/// 0.3066406 round to another `f32` in four of the seven cases.
+// The digits are libopus's: each literal is its exact value.
+#[allow(clippy::excessive_precision)]
 const PREFILTER_GAINS: [[f32; 3]; 3] = [
-    [0.306_640_6, 0.217_041, 0.129_638_7],
-    [0.463_867_2, 0.268_066_4, 0.0],
-    [0.799_804_7, 0.100_097_7, 0.0],
+    [0.306_640_625, 0.217_041_015_625, 0.129_638_671_875],
+    [0.463_867_187_5, 0.268_066_406_25, 0.0],
+    [0.799_804_687_5, 0.100_097_656_25, 0.0],
 ];
+
+/// One output of libopus `comb_filter_const_c` (celt/celt.c):
+/// `x + g[0] * centre + g[1] * near + g[2] * far`, where `near` and `far` are
+/// the sums of the two samples one and two places from the centre tap. The
+/// products are added in that order, each with `mac`: clang fuses each of
+/// them into its addition on 64-bit ARM.
+#[inline(always)]
+fn comb_tap3(x: f32, g: [f32; 3], centre: f32, near: f32, far: f32) -> f32 {
+    mac(mac(mac(x, g[0], centre), g[1], near), g[2], far)
+}
+
+/// One output of the cross-fade at the start of libopus `comb_filter`:
+/// `x` plus the three taps of the old filter, each weighted with `1 - f`,
+/// plus the three taps of the new one, each weighted with `f`. The weights
+/// are multiplied into the gains first (C `MULT_COEF((COEF_ONE-f),g00)`),
+/// and the six products are added in that order, each with `mac`.
+#[inline(always)]
+fn comb_fade_tap6(x: f32, f: f32, old: [f32; 3], old_taps: [f32; 3], new: [f32; 3], new_taps: [f32; 3]) -> f32 {
+    let one_minus_f = 1.0 - f;
+    let mut s = x;
+    for k in 0..3 {
+        s = mac(s, one_minus_f * old[k], old_taps[k]);
+    }
+    for k in 0..3 {
+        s = mac(s, f * new[k], new_taps[k]);
+    }
+    s
+}
 
 #[allow(clippy::too_many_arguments)]
 fn comb_filter_const(
@@ -1436,7 +1475,7 @@ fn comb_filter_const_scalar(
 
     for i in 0..n {
         x0 = x[x_idx + i - t + 2];
-        y[y_idx + i] = x[x_idx + i] + g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4);
+        y[y_idx + i] = comb_tap3(x[x_idx + i], [g10, g11, g12], x2, x1 + x3, x0 + x4);
         x4 = x3;
         x3 = x2;
         x2 = x1;
@@ -1467,11 +1506,9 @@ fn comb_filter_const_neon(
 
 /// `comb_filter_const` for 64-bit ARM, four samples per pass.
 ///
-/// A group of four samples adds each product with a fused multiply-add,
-/// which rounds once. The last `n % 4` samples round every product first,
-/// as `comb_filter_const_scalar` does for all samples. The results can
-/// therefore differ in the last bit. `comb_filter_const_reference` in the
-/// tests writes out which sample is computed which way.
+/// Every sample adds each product with a fused multiply-add, in the order
+/// of `comb_tap3`, as libopus's arm64 build does. The result has the bits
+/// of `comb_filter_const_scalar`.
 ///
 /// # Safety
 ///
@@ -1538,7 +1575,7 @@ unsafe fn comb_filter_const_neon_impl(
 
     while i < n {
         let sx0 = x[x_idx + i - t + 2];
-        y[y_idx + i] = x[x_idx + i] + g10 * sx2 + g11 * (sx1 + sx3) + g12 * (sx0 + sx4);
+        y[y_idx + i] = comb_tap3(x[x_idx + i], [g10, g11, g12], sx2, sx1 + sx3, sx0 + sx4);
         sx4 = sx3;
         sx3 = sx2;
         sx2 = sx1;
@@ -1861,12 +1898,16 @@ fn comb_filter(
     while i < inner_overlap && i < n {
         let x0 = x[x_idx + i - t1 + 2];
         let f = window[i] * window[i];
-        y[y_idx + i] = x[x_idx + i]
-            + (1.0 - f)
-                * (g00 * x[x_idx + i - t0]
-                    + g01 * (x[x_idx + i - t0 + 1] + x[x_idx + i - t0 - 1])
-                    + g02 * (x[x_idx + i - t0 + 2] + x[x_idx + i - t0 - 2]))
-            + f * (g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4));
+        let at = x_idx + i - t0;
+        let old_taps = [x[at], x[at + 1] + x[at - 1], x[at + 2] + x[at - 2]];
+        y[y_idx + i] = comb_fade_tap6(
+            x[x_idx + i],
+            f,
+            [g00, g01, g02],
+            old_taps,
+            [g10, g11, g12],
+            [x2, x1 + x3, x0 + x4],
+        );
 
         x4 = x3;
         x3 = x2;
@@ -1884,11 +1925,14 @@ fn comb_filter(
     }
 }
 
-/// In-place comb filter: buf[y_idx..y_idx+n] is both input and output.
-/// Reference samples at buf[y_idx + i - T + offset] may already be filtered
-/// if T < i, matching C libopus's in-place comb_filter(out, out, ...) behavior.
-fn comb_filter_inplace(
-    buf: &mut [f32],
+/// In-place comb filter over the frames of `C` channels that share one
+/// filter: `bufs[c][y_idx..y_idx + n]` is both the input and the output of
+/// channel `c`. The samples the filter reads at `y_idx + i - t` and around
+/// it may already be filtered, as in libopus, which calls
+/// `comb_filter(out, out, ...)` once per channel.
+#[allow(clippy::too_many_arguments)]
+fn comb_filter_inplace<const C: usize>(
+    bufs: &mut [&mut [f32]; C],
     y_idx: usize,
     t0: usize,
     t1: usize,
@@ -1901,7 +1945,7 @@ fn comb_filter_inplace(
     overlap: usize,
 ) {
     if g0 == 0.0 && g1 == 0.0 {
-        // nothing to do; buf[y_idx..] already holds the input
+        // nothing to do; the buffers already hold the input
         return;
     }
 
@@ -1925,19 +1969,27 @@ fn comb_filter_inplace(
     };
     if fade > 0 {
         let (old, new) = ([g00, g01, g02], [g10, g11, g12]);
-        comb_inplace_fade(buf, y_idx, t0, t1, fade, old, new, window);
+        comb_inplace_fade(bufs, y_idx, t0, t1, fade, old, new, window);
     }
-    // The rest of the frame uses the new filter alone.
-    if fade < n {
-        comb_inplace_const(buf, y_idx + fade, t1, n - fade, [g10, g11, g12]);
+    // The rest of the frame uses the new filter alone. libopus leaves it
+    // as it is when the new gain is 0.
+    if fade < n && g1 != 0.0 {
+        comb_inplace_const(bufs, y_idx + fade, t1, n - fade, [g10, g11, g12]);
     }
 }
 
+/// libopus `run_prefilter` (celt/celt_encoder.c): finds the pitch period
+/// and gain of the comb filter for this frame and filters `in_buf` with it.
+///
+/// `pre` is `CeltEncoder::prefilter_buf`: per channel, `PREFILTER_STRIDE`
+/// values, of which the first `COMBFILTER_MAXPERIOD` hold the history of
+/// the unfiltered input. The frame is put after the history, and at the end
+/// the history moves up by `frame_size`.
 // 3.1416/3.141593 literals mirror celt_encoder.c; keep them verbatim.
 #[allow(clippy::approx_constant)]
 fn run_prefilter(
     in_buf: &mut [f32],
-    prefilter_mem: &mut [f32],
+    pre: &mut [f32],
     prefilter_period: usize,
     prefilter_gain: f32,
     prefilter_tapset: i32,
@@ -1947,7 +1999,6 @@ fn run_prefilter(
     frame_size: usize,
     overlap: usize,
 
-    pre: &mut [f32],
     pitch_buf: &mut [f32],
     before: &mut [f32],
     after: &mut [f32],
@@ -1965,12 +2016,12 @@ fn run_prefilter(
     let max_period = COMBFILTER_MAXPERIOD;
     let min_period = COMBFILTER_MINPERIOD;
     let buf_stride = frame_size + overlap;
+    // C `pre[c]`: the history and then the frame, at `c * PREFILTER_STRIDE`.
     let pre_size = max_period + frame_size;
+    assert!(pre_size <= PREFILTER_STRIDE && pre.len() >= channels * PREFILTER_STRIDE);
 
     for c in 0..channels {
-        pre[c * pre_size..c * pre_size + max_period]
-            .copy_from_slice(&prefilter_mem[c * max_period..(c + 1) * max_period]);
-        pre[c * pre_size + max_period..c * pre_size + pre_size].copy_from_slice(
+        pre[c * PREFILTER_STRIDE + max_period..c * PREFILTER_STRIDE + pre_size].copy_from_slice(
             &in_buf[c * buf_stride + overlap..c * buf_stride + overlap + frame_size],
         );
     }
@@ -2000,7 +2051,7 @@ fn run_prefilter(
         {
             let mut pre_slices: FixedVec<&[f32], 2> = FixedVec::new();
             for c in 0..channels {
-                pre_slices.push(&pre[c * pre_size..c * pre_size + pre_size]);
+                pre_slices.push(&pre[c * PREFILTER_STRIDE..c * PREFILTER_STRIDE + pre_size]);
             }
             crate::pitch::pitch_downsample(&pre_slices, pitch_buf, pitch_buf_len, channels, 2);
         }
@@ -2088,7 +2139,7 @@ fn run_prefilter(
 
     for c in 0..channels {
         if offset > 0 {
-            let pre_c = &pre[c * pre_size..];
+            let pre_c = &pre[c * PREFILTER_STRIDE..];
             comb_filter(
                 in_buf,
                 pre_c,
@@ -2107,7 +2158,7 @@ fn run_prefilter(
         }
 
         {
-            let pre_c = &pre[c * pre_size..];
+            let pre_c = &pre[c * PREFILTER_STRIDE..];
             comb_filter(
                 in_buf,
                 pre_c,
@@ -2134,9 +2185,13 @@ fn run_prefilter(
 
     // C 1557-1569: whether the filter is worth it.
     let cancel_pitch = if channels == 2 {
+        // C `MULT16_32_Q15(MULT16_16_Q15(.25, gain1), before[0]) +
+        // MULT16_32_Q15(.01, before[1])`: clang fuses the first product into
+        // the addition.
+        let quarter_gain = 0.25 * gain1;
         let thresh = [
-            0.25 * gain1 * before[0] + 0.01 * before[1],
-            0.25 * gain1 * before[1] + 0.01 * before[0],
+            mac(0.01 * before[1], quarter_gain, before[0]),
+            mac(0.01 * before[0], quarter_gain, before[1]),
         ];
         // "Don't use the filter if one channel gets significantly worse."
         let worse = after[0] - before[0] > thresh[0] || after[1] - before[1] > thresh[1];
@@ -2157,11 +2212,11 @@ fn run_prefilter(
         for c in 0..channels {
             let body = c * buf_stride + overlap;
             in_buf[body..body + frame_size].copy_from_slice(
-                &pre[c * pre_size + max_period..c * pre_size + max_period + frame_size],
+                &pre[c * PREFILTER_STRIDE + max_period..c * PREFILTER_STRIDE + pre_size],
             );
             comb_filter(
                 in_buf,
-                &pre[c * pre_size..],
+                &pre[c * PREFILTER_STRIDE..],
                 body + offset,
                 max_period + offset,
                 prev_period,
@@ -2177,11 +2232,12 @@ fn run_prefilter(
         }
     }
 
+    // C: `OPUS_COPY(st->prefilter_mem+c*COMBFILTER_MAXPERIOD, pre[c]+N,
+    // COMBFILTER_MAXPERIOD)`: the last `max_period` values of history and
+    // frame become the history.
     for c in 0..channels {
-        push_prefilter_history(
-            &mut prefilter_mem[c * max_period..(c + 1) * max_period],
-            &pre[c * pre_size + max_period..c * pre_size + pre_size],
-        );
+        pre[c * PREFILTER_STRIDE..c * PREFILTER_STRIDE + pre_size]
+            .copy_within(frame_size..pre_size, 0);
     }
 
     if cancel_pitch {
@@ -2191,9 +2247,10 @@ fn run_prefilter(
     }
 }
 
-/// Append one frame of pre-emphasized, unfiltered input to a channel's
-/// `prefilter_mem` history (libopus `run_prefilter`, which runs every frame
-/// whether or not the comb filter is enabled).
+/// Append one frame of pre-emphasized, unfiltered input to the history of
+/// one channel in `CeltEncoder::prefilter_buf` (C `prefilter_mem`). libopus
+/// `run_prefilter` does this every frame, whether or not the comb filter is
+/// enabled.
 fn push_prefilter_history(mem: &mut [f32], frame: &[f32]) {
     let (n, max_period) = (frame.len(), mem.len());
     if n >= max_period {
@@ -2237,7 +2294,14 @@ pub struct CeltEncoder {
     spread_decision: i32,
     intensity: i32,
     last_coded_bands: i32,
-    prefilter_mem: FixedVec<f32, CELT_PREFILTER_MEM>,
+    /// Per channel, `PREFILTER_STRIDE` values. The first
+    /// `COMBFILTER_MAXPERIOD` are libopus `st->prefilter_mem`: the
+    /// pre-emphasized input before the pre-filter, up to the end of the
+    /// last frame. During a frame, the frame itself follows them (libopus
+    /// `pre` in `run_prefilter`). At the end of the frame the history moves
+    /// up by the frame size. libopus copies the history into `pre` and back
+    /// every frame; keeping the two together needs one move instead.
+    prefilter_buf: FixedVec<f32, CELT_PREFILTER_BUF>,
     prefilter_period: usize,
     prefilter_gain: f32,
     prefilter_tapset: i32,
@@ -2272,7 +2336,6 @@ pub struct CeltEncoder {
     /// frame (C 2813), the noise seed of `quant_all_bands` in the next one.
     rng: u32,
 
-    w_prefilter_pre: FixedVec<f32, CELT_PREFILTER_PRE>,
     w_prefilter_pitch_buf: FixedVec<f32, CELT_PREFILTER_PITCH>,
     w_prefilter_before: FixedVec<f32, CELT_MAX_CHANNELS>,
     w_prefilter_after: FixedVec<f32, CELT_MAX_CHANNELS>,
@@ -2314,6 +2377,9 @@ pub struct CeltEncoder {
     /// signal so far. `alloc_trim_analysis` raises it by at most 0.25 per
     /// frame; the VBR target of the next frames goes down with it.
     stereo_saving: f32,
+    /// The cosines of the spreading rotations of recent frames (see
+    /// `RotationCache`). It only saves time, so a reset keeps it.
+    rotations: crate::pvq::RotationCache,
 }
 
 /// libopus `delayedIntra` after `OPUS_RESET_STATE`.
@@ -2598,7 +2664,13 @@ fn tone_detect(x: &[f32], fs: i32, first: Option<ToneSums>) -> (f32, f32) {
 /// root of the 1e-27 that `compute_band_energies` starts from, gets about
 /// -44.8. (`bands::amp2log2` raises the energy to 1e-10 first, -33.2, and
 /// puts -14 in the bands below its `start`.)
-fn amp2log2_enc(mode: &CeltMode, end: usize, band_e: &[f32], band_log_e: &mut [f32], channels: usize) {
+pub(crate) fn amp2log2_enc(
+    mode: &CeltMode,
+    end: usize,
+    band_e: &[f32],
+    band_log_e: &mut [f32],
+    channels: usize,
+) {
     let nb = mode.nb_ebands;
     for c in 0..channels {
         for i in 0..end {
@@ -3034,9 +3106,6 @@ fn dynalloc_analysis(
                 follower[end - 1] += 2.0;
                 follower[end - 2] += 1.0;
             }
-        }
-        if effective_bytes > 320 {
-            follower[0] += 1.5f32.min(1e-3 * (effective_bytes - 320) as f32);
         }
         for i in start..end {
             follower[i] = follower[i].min(4.0);
@@ -3509,32 +3578,18 @@ mod enc_kernel_tests {
     }
 
     /// `comb_filter_const` with one index expression per tap, as libopus
-    /// describes the filter:
+    /// writes the filter:
     /// `y[i] = x[i] + g10 * x[i - T] + g11 * (x[i - T + 1] + x[i - T - 1])
-    /// + g12 * (x[i - T + 2] + x[i - T - 2])`.
-    ///
-    /// The first `fused` samples take each product and the addition after
-    /// it as one fused multiply-add, the way the NEON kernel computes its
-    /// groups of four. The other samples round every product first.
-    fn comb_filter_const_reference(
-        x: &[f32],
-        x_idx: usize,
-        t: usize,
-        n: usize,
-        g: [f32; 3],
-        fused: usize,
-    ) -> Vec<f32> {
+    /// + g12 * (x[i - T + 2] + x[i - T - 2])`, each product added with
+    /// `mac` (one fused multiply-add on 64-bit ARM).
+    fn comb_filter_const_reference(x: &[f32], x_idx: usize, t: usize, n: usize, g: [f32; 3]) -> Vec<f32> {
         (0..n)
             .map(|i| {
                 let at = x_idx + i;
                 let centre = x[at - t];
                 let near = x[at - t + 1] + x[at - t - 1];
                 let far = x[at - t + 2] + x[at - t - 2];
-                if i < fused {
-                    g[2].mul_add(far, g[1].mul_add(near, g[0].mul_add(centre, x[at])))
-                } else {
-                    x[at] + g[0] * centre + g[1] * near + g[2] * far
-                }
+                mac(mac(mac(x[at], g[0], centre), g[1], near), g[2], far)
             })
             .collect()
     }
@@ -3544,14 +3599,13 @@ mod enc_kernel_tests {
     type CombFilterConst = fn(&mut [f32], &[f32], usize, usize, usize, usize, f32, f32, f32);
 
     /// Runs `kernel` on every combination of period, length and position
-    /// worth testing and compares its output with the reference. `fused`
-    /// gives, for a length, how many samples use the fused multiply-add.
+    /// worth testing and compares its output with the reference.
     ///
     /// `x` is exactly as long as the kernel may read: it starts `lead`
     /// samples before the first tap and ends with the last input sample.
     /// `y` has four more values on each side of the output range, which
     /// must keep the pattern they start with.
-    fn check_comb_filter_const(kernel: CombFilterConst, fused: fn(usize) -> usize) {
+    fn check_comb_filter_const(kernel: CombFilterConst) {
         let mut rng = Rng::new(12);
         // 2 is the smallest period the kernels accept, 15 and 1022 are the
         // limits of the pitch pre-filter and of the post-filter. The
@@ -3564,7 +3618,7 @@ mod enc_kernel_tests {
                         let x_idx = lead + t + 2;
                         let x = samples(&mut rng, x_idx + n, kind);
                         let g = [0.3 * rng.unit(), 0.2 * rng.unit(), 0.1 * rng.unit()];
-                        let want = comb_filter_const_reference(&x, x_idx, t, n, g, fused(n));
+                        let want = comb_filter_const_reference(&x, x_idx, t, n, g);
 
                         let mut y = vec![-7.5f32; y_idx + n + 4];
                         kernel(&mut y, &x, y_idx, x_idx, t, n, g[0], g[1], g[2]);
@@ -3581,16 +3635,14 @@ mod enc_kernel_tests {
     /// The portable version. This machine does not run it inside the codec.
     #[test]
     fn comb_filter_const_scalar_matches_the_formula() {
-        check_comb_filter_const(comb_filter_const_scalar, |_| 0);
+        check_comb_filter_const(comb_filter_const_scalar);
     }
 
-    /// The version the codec runs on 64-bit ARM. Its groups of four samples
-    /// use the fused multiply-add and its last `n % 4` samples do not, so
-    /// it differs from the portable version in the last bit.
+    /// The version the codec runs on 64-bit ARM.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn comb_filter_const_neon_matches_its_reference_order() {
-        check_comb_filter_const(comb_filter_const, |n| n - n % 4);
+        check_comb_filter_const(comb_filter_const);
     }
 
     /// `transient_analysis` as it was written before its loops were fused:
@@ -4112,7 +4164,7 @@ impl CeltEncoder {
             spread_decision: SPREAD_NORMAL,
             intensity: 0,
             last_coded_bands: 0,
-            prefilter_mem: FixedVec::from_value(0.0, channels * COMBFILTER_MAXPERIOD),
+            prefilter_buf: FixedVec::from_value(0.0, channels * PREFILTER_STRIDE),
             // libopus clears its state, so the first frame has no pitch
             // period to continue.
             prefilter_period: 0,
@@ -4146,10 +4198,6 @@ impl CeltEncoder {
             w_fine_priority: FixedVec::from_value(0, nb_x_ch),
             w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
 
-            w_prefilter_pre: FixedVec::from_value(
-                0.0,
-                channels * (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME),
-            ),
             w_prefilter_pitch_buf: FixedVec::from_value(
                 0.0,
                 (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME) >> 1,
@@ -4169,6 +4217,7 @@ impl CeltEncoder {
             disable_pf: false,
             force_intra: false,
             energy_error: FixedVec::from_value(0.0, nb_x_ch),
+            rotations: crate::pvq::RotationCache::new(),
             spec_avg: 0.0,
             stereo_saving: 0.0,
         }
@@ -4220,7 +4269,7 @@ impl CeltEncoder {
         self.intensity = 0;
         self.energy_mask = None;
         self.in_mem.fill(0.0);
-        self.prefilter_mem.fill(0.0);
+        self.prefilter_buf.fill(0.0);
         self.old_band_e[..nb_x_ch].fill(0.0);
         self.old_band_e2[..nb_x_ch].fill(OLD_LOG_E_RESET);
         self.old_band_e3[..nb_x_ch].fill(OLD_LOG_E_RESET);
@@ -4312,12 +4361,13 @@ impl CeltEncoder {
     /// libopus `OPUS_SET_BITRATE` for the CELT encoder: the bitrate VBR
     /// aims at, in bits per second. With `OPUS_BITRATE_MAX` (-1, the
     /// default) there is no target, and a frame takes the bytes it is given.
-    /// A value of 500 or less is an error, and the setting stays.
+    /// A value of 500 or less is an error, and the setting stays. A value
+    /// above 750 kb/s per channel is lowered to that, as libopus does.
     pub fn set_bitrate(&mut self, bitrate: i32) -> Result<(), &'static str> {
         if bitrate <= 500 && bitrate != OPUS_BITRATE_MAX {
             return Err("CELT bitrate must be above 500 b/s");
         }
-        self.bitrate = bitrate;
+        self.bitrate = bitrate.min(750_000 * self.channels as i32);
         Ok(())
     }
     pub fn set_vbr(&mut self, vbr: bool) {
@@ -4413,29 +4463,27 @@ impl CeltEncoder {
         let tell_initial = rc.tell();
         let tell_initial_frac = rc.tell_frac();
         let nb_filled_bytes_initial = ((tell_initial + 4) >> 3).max(0) as usize;
-        let (mut nb_compressed_bytes, effective_bytes) =
+        let (mut nb_compressed_bytes, mut effective_bytes) =
             self.frame_bytes(rc, vbr_rate, packet_bytes, tell_initial);
         let mut total_bits = (nb_compressed_bytes * 8) as i32;
-        // C 2032: Hybrid at a low CELT rate, on anything but voiced speech.
-        let hybrid_low_rate = hybrid && effective_bytes < 15 && self.silk_signal_type != 2;
 
         // `in_buf` holds, per channel, `overlap` samples of history and then
         // the pre-emphasized frame (C `in`). The frame is written straight
         // into it.
         //
         // C 2017: tone and transient analysis see the *unfiltered* history in
-        // the overlap head (the `prefilter_mem` tail). The prefiltered
-        // overlap of the previous frame (`in_mem`) is put there afterwards.
-        // Analysing that one puts a step between head and body wherever the
-        // comb filter was active, which reads as a transient on steady
-        // pitched input.
+        // the overlap head: the tail of the history in `prefilter_buf` (C
+        // `prefilter_mem`). The prefiltered overlap of the previous frame
+        // (`in_mem`) is put there afterwards. Analysing that one puts a step
+        // between head and body wherever the comb filter was active, which
+        // reads as a transient on steady pitched input.
         let buf_stride = frame_size + overlap;
         let max_period = COMBFILTER_MAXPERIOD;
         let in_buf = &mut self.w_in_buf[..buf_stride * cc];
         for (c, channel) in in_buf.chunks_exact_mut(buf_stride).enumerate() {
-            channel[..overlap].copy_from_slice(
-                &self.prefilter_mem[(c + 1) * max_period - overlap..(c + 1) * max_period],
-            );
+            let history_end = c * PREFILTER_STRIDE + max_period;
+            channel[..overlap]
+                .copy_from_slice(&self.prefilter_buf[history_end - overlap..history_end]);
         }
         preemphasis_input(
             pcm,
@@ -4476,6 +4524,8 @@ impl CeltEncoder {
         // C `tell`: where the range coder stood on entry. A silent frame
         // counts as full, so nothing else is coded in it.
         let mut tell_c = tell_initial;
+        // C `nbAvailableBytes = 2` of a silent frame under VBR.
+        let mut silent_vbr = false;
         if silence {
             // "In VBR mode there is no need to send more than the minimum."
             if vbr_rate.is_some() {
@@ -4485,13 +4535,23 @@ impl CeltEncoder {
                     total_bits = (nb_compressed_bytes * 8) as i32;
                     rc.shrink(nb_compressed_bytes as u32);
                 }
+                // C `effectiveBytes=nbCompressedBytes=IMIN(..)`: the
+                // analyses that still run go by the two bytes.
+                effective_bytes = nb_compressed_bytes;
+                silent_vbr = true;
             }
             let cur_tell = rc.tell();
             tell_c = (nb_compressed_bytes * 8) as i32;
             rc.nbits_total += tell_c - cur_tell;
         }
+        // C 2032: Hybrid at a low CELT rate, on anything but voiced speech.
+        let hybrid_low_rate = hybrid && effective_bytes < 15 && self.silk_signal_type != 2;
         // C `nbAvailableBytes`: what the packet has left, after the VBR bound.
-        let nb_available_bytes = nb_compressed_bytes.saturating_sub(nb_filled_bytes_initial);
+        let nb_available_bytes = if silent_vbr {
+            2
+        } else {
+            nb_compressed_bytes.saturating_sub(nb_filled_bytes_initial)
+        };
         // C 1928-1930: the rate the allocation decisions go by.
         let frame_overhead = (40 * channels as i32 + 20) * ((400 >> lm) - 50);
         let mut equiv_rate = ((packet_bytes as i32 * 8 * 50) << (3 - lm)) - frame_overhead;
@@ -4586,7 +4646,7 @@ impl CeltEncoder {
         let (pf_on, gain1, pitch_index) = if pf_search || self.prefilter_gain != 0.0 {
             run_prefilter(
                 in_buf,
-                &mut self.prefilter_mem,
+                &mut self.prefilter_buf,
                 self.prefilter_period,
                 self.prefilter_gain,
                 self.prefilter_tapset,
@@ -4595,7 +4655,6 @@ impl CeltEncoder {
                 cc,
                 frame_size,
                 overlap,
-                &mut self.w_prefilter_pre,
                 &mut self.w_prefilter_pitch_buf,
                 &mut self.w_prefilter_before,
                 &mut self.w_prefilter_after,
@@ -4615,7 +4674,7 @@ impl CeltEncoder {
             for c in 0..cc {
                 let body = c * buf_stride + overlap;
                 push_prefilter_history(
-                    &mut self.prefilter_mem[c * max_period..(c + 1) * max_period],
+                    &mut self.prefilter_buf[c * PREFILTER_STRIDE..][..max_period],
                     &in_buf[body..body + frame_size],
                 );
             }
@@ -5182,7 +5241,7 @@ impl CeltEncoder {
         // resynthesises the bands for its second pass per stereo band
         // (`theta_rdo`). The seed is `st->rng`.
         let mut seed = self.rng;
-        crate::bands::quant_all_bands_enc(
+        crate::bands::quant_all_bands_enc_with(
             mode,
             start_band,
             end,
@@ -5204,6 +5263,7 @@ impl CeltEncoder {
             &mut seed,
             self.complexity,
             false,
+            &mut self.rotations,
         );
 
         if anti_collapse_rsv > 0 {
@@ -5376,349 +5436,38 @@ enum FrameType {
     PlcPeriodic,
 }
 
-// The concealment functions below add their products with `mac`, which
-// rounds as libopus does on this processor. libopus asks for the fused
-// multiply-add instruction in its 64-bit ARM correlation kernels
-// (celt/arm/celt_neon_intr.c, celt/arm/pitch_neon_intr.c).
-//
-// The rounding matters here. The concealment fits a predictor to the
-// decoder's output and stops at the first order that reaches 30 dB of
-// prediction gain. For band-limited output (a decoder at 8 to 16 kHz) the
-// gain passes that limit slowly, so the last bit of the autocorrelation
-// decides the order. Measured on 64-bit ARM against libopus 1.6.1 over
-// 1150 concealed frames at all decoder rates: with fused rounding in all
-// the sums of the concealment, 18 frames matched libopus to less than
-// 40 dB. With the product rounded first, 65 did.
-
-/// Correlation of `x` with `y` at every lag: `xcorr[k]` is the sum of
-/// `x[j] * y[j + k]` over the length of `x`. Port of libopus
-/// `celt_pitch_xcorr` (celt/pitch.c, celt/arm/celt_neon_intr.c).
-///
-/// libopus takes the lags four at a time and adds each lag's products one
-/// by one. Lags left over after the groups of four go through
-/// `celt_inner_prod`. `y` must hold `x.len() + xcorr.len() - 1` samples.
-fn plc_pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32]) {
-    let len = x.len();
-    let grouped = xcorr.len() & !3;
-    for (k, out) in xcorr.iter_mut().enumerate() {
-        *out = if k < grouped {
-            let mut sum = 0.0f32;
-            for (xj, yj) in x.iter().zip(&y[k..k + len]) {
-                sum = mac(sum, *xj, *yj);
-            }
-            sum
-        } else {
-            celt_inner_prod(x, &y[k..k + len])
-        };
-    }
-}
-
-/// Autocorrelation of `x` at the lags `0..=lag`. Port of libopus
-/// `_celt_autocorr` (celt/celt_lpc.c) without its window, which the caller
-/// applies beforehand.
-///
-/// As in libopus, the first `x.len() - lag` products of every lag are summed
-/// by `celt_pitch_xcorr` and the remaining products are added afterwards.
-fn plc_autocorr(x: &[f32], ac: &mut [f32], lag: usize) {
-    let n = x.len();
-    let fast_n = n - lag;
-    plc_pitch_xcorr(&x[..fast_n], x, &mut ac[..=lag]);
-    for k in 0..=lag {
-        let mut d = 0.0f32;
-        for i in k + fast_n..n {
-            d = mac(d, x[i], x[i - k]);
-        }
-        ac[k] += d;
-    }
-}
-
-/// Linear predictor of order `lpc.len()` from the autocorrelation `ac`, by
-/// the Levinson-Durbin recursion. Port of libopus `_celt_lpc`
-/// (celt/celt_lpc.c).
-fn plc_lpc(lpc: &mut [f32], ac: &[f32]) {
-    let p = lpc.len();
-    lpc.fill(0.0);
-    let mut error = ac[0];
-    if ac[0] > 1e-10 {
-        for i in 0..p {
-            // Sum up this iteration's reflection coefficient.
-            let mut rr = 0.0f32;
-            for j in 0..i {
-                rr = mac(rr, lpc[j], ac[i - j]);
-            }
-            rr += ac[i + 1];
-            let r = -(rr / error);
-            // Update the coefficients and the prediction error.
-            lpc[i] = r;
-            for j in 0..(i + 1) >> 1 {
-                let tmp1 = lpc[j];
-                let tmp2 = lpc[i - 1 - j];
-                lpc[j] = mac(tmp1, r, tmp2);
-                lpc[i - 1 - j] = mac(tmp2, r, tmp1);
-            }
-            error = mac(error, -(r * r), error);
-            // Stop once the prediction gain reaches 30 dB.
-            if error <= 0.001 * ac[0] {
-                break;
-            }
-        }
-    }
-}
-
-/// Low-pass the decoder history and keep every second sample, for the pitch
-/// search of the concealment. Port of libopus `pitch_downsample`
-/// (celt/pitch.c) with a factor of 2.
-///
-/// `x_lp[i]` is the sum over the channels of
-/// `0.25 * x[2i - 1] + 0.5 * x[2i] + 0.25 * x[2i + 1]`. A 4th-order linear
-/// predictor then flattens the spectrum, so that the search locks on the
-/// pitch and not on a formant. Each channel must hold `2 * x_lp.len()`
-/// samples.
-fn plc_pitch_downsample(x0: &[f32], x1: Option<&[f32]>, x_lp: &mut [f32]) {
-    let len = x_lp.len();
-    for i in 1..len {
-        x_lp[i] = 0.25 * x0[2 * i - 1] + 0.25 * x0[2 * i + 1] + 0.5 * x0[2 * i];
-    }
-    x_lp[0] = 0.25 * x0[1] + 0.5 * x0[0];
-    if let Some(x1) = x1 {
-        for i in 1..len {
-            x_lp[i] += 0.25 * x1[2 * i - 1] + 0.25 * x1[2 * i + 1] + 0.5 * x1[2 * i];
-        }
-        x_lp[0] += 0.25 * x1[1] + 0.5 * x1[0];
-    }
-
-    let mut ac = [0.0f32; 5];
-    plc_autocorr(x_lp, &mut ac, 4);
-    // Noise floor at -40 dB, then lag windowing.
-    ac[0] *= 1.0001;
-    for i in 1..=4 {
-        let f = 0.008 * i as f32;
-        ac[i] = mac(ac[i], -(ac[i] * f), f);
-    }
-    let mut lpc = [0.0f32; 4];
-    plc_lpc(&mut lpc, &ac);
-    let mut tmp = 1.0f32;
-    for coef in lpc.iter_mut() {
-        tmp *= 0.9;
-        *coef *= tmp;
-    }
-    // Add a zero at 0.8.
-    let c1 = 0.8f32;
-    let num = [
-        lpc[0] + 0.8,
-        mac(lpc[1], c1, lpc[0]),
-        mac(lpc[2], c1, lpc[1]),
-        mac(lpc[3], c1, lpc[2]),
-        c1 * lpc[3],
-    ];
-    // libopus `celt_fir5`, in place.
-    let mut mem = [0.0f32; 5];
-    for v in x_lp.iter_mut() {
-        let mut sum = *v;
-        for (coef, past) in num.iter().zip(mem.iter()) {
-            sum = mac(sum, *coef, *past);
-        }
-        mem[4] = mem[3];
-        mem[3] = mem[2];
-        mem[2] = mem[1];
-        mem[1] = mem[0];
-        mem[0] = *v;
-        *v = sum;
-    }
-}
-
-/// The two lags with the highest normalised correlation. Port of libopus
-/// `find_best_pitch` (celt/pitch.c).
-///
-/// `xcorr[i]` is the correlation at lag `i`. It is compared as
-/// `xcorr[i]^2 / energy of y[i..i + len]`, without the division. `y` must
-/// hold `len + xcorr.len()` samples.
-fn plc_find_best_pitch(xcorr: &[f32], y: &[f32], len: usize) -> [usize; 2] {
-    let mut best_num = [-1.0f32; 2];
-    let mut best_den = [0.0f32; 2];
-    let mut best_pitch = [0usize, 1];
-    let mut syy = 1.0f32;
-    for &v in &y[..len] {
-        syy = mac(syy, v, v);
-    }
-    for (i, &corr) in xcorr.iter().enumerate() {
-        if corr > 0.0 {
-            // libopus scales the correlation down before squaring it, so
-            // that the square neither underflows nor overflows.
-            let xcorr16 = corr * 1e-12;
-            let num = xcorr16 * xcorr16;
-            if num * best_den[1] > best_num[1] * syy {
-                if num * best_den[0] > best_num[0] * syy {
-                    best_num[1] = best_num[0];
-                    best_den[1] = best_den[0];
-                    best_pitch[1] = best_pitch[0];
-                    best_num[0] = num;
-                    best_den[0] = syy;
-                    best_pitch[0] = i;
-                } else {
-                    best_num[1] = num;
-                    best_den[1] = syy;
-                    best_pitch[1] = i;
-                }
-            }
-        }
-        syy += y[i + len] * y[i + len] - y[i] * y[i];
-        if syy < 1.0 {
-            syy = 1.0;
-        }
-    }
-    best_pitch
-}
-
-/// Find the lag at which `y` matches `x_lp` best. Port of libopus
-/// `pitch_search` (celt/pitch.c).
-///
-/// `x_lp` and `y` hold every second sample of a signal. `len` and
-/// `max_pitch` count samples of the full signal, and so does the result, a
-/// lag below `max_pitch`.
-///
-/// A first search runs on every second sample of `x_lp` and `y` and keeps
-/// two candidates. A second search looks at the lags around those two. The
-/// result is then refined by one sample, from the correlation at the two
-/// neighbouring lags.
-///
-/// `x_lp` must hold `len / 2` samples and `y` `(len + max_pitch) / 2`.
-/// `scratch` is working memory of at least `len / 2 + max_pitch` samples.
-///
-/// The encoder's `crate::pitch::pitch_search` is not used here: it adds the
-/// products in another order and leaves out the scaling in
-/// `find_best_pitch`, so it can pick another lag than libopus.
-fn plc_pitch_search(
-    x_lp: &[f32],
-    y: &[f32],
-    len: usize,
-    max_pitch: usize,
-    scratch: &mut [f32],
-) -> usize {
-    let lag = len + max_pitch;
-    let (x_lp4, rest) = scratch.split_at_mut(len >> 2);
-    let (y_lp4, rest) = rest.split_at_mut(lag >> 2);
-    let xcorr = &mut rest[..max_pitch >> 1];
-
-    // Keep every second sample once more.
-    for (j, v) in x_lp4.iter_mut().enumerate() {
-        *v = x_lp[2 * j];
-    }
-    for (j, v) in y_lp4.iter_mut().enumerate() {
-        *v = y[2 * j];
-    }
-
-    // Coarse search at a quarter of the decoder's rate.
-    let coarse = &mut xcorr[..max_pitch >> 2];
-    plc_pitch_xcorr(x_lp4, y_lp4, coarse);
-    let best_pitch = plc_find_best_pitch(coarse, y_lp4, len >> 2);
-
-    // Finer search at half the rate, around the two candidates.
-    let half_len = len >> 1;
-    for (i, out) in xcorr.iter_mut().enumerate() {
-        *out = 0.0;
-        if i.abs_diff(2 * best_pitch[0]) > 2 && i.abs_diff(2 * best_pitch[1]) > 2 {
-            continue;
-        }
-        let sum = celt_inner_prod(&x_lp[..half_len], &y[i..i + half_len]);
-        *out = if -1.0 > sum { -1.0 } else { sum };
-    }
-    let best = plc_find_best_pitch(xcorr, y, half_len)[0];
-
-    // Refine by pseudo-interpolation.
-    let mut pitch = 2 * best;
-    if best > 0 && best < (max_pitch >> 1) - 1 {
-        let a = xcorr[best - 1];
-        let b = xcorr[best];
-        let c = xcorr[best + 1];
-        if (c - a) > 0.7 * (b - a) {
-            pitch -= 1;
-        } else if (a - c) > 0.7 * (b - c) {
-            pitch += 1;
-        }
-    }
-    pitch
-}
-
-/// All-zero (analysis) filter of the concealment. Port of libopus `celt_fir`
-/// (celt/celt_lpc.c):
-/// `y[i] = x[at + i] + sum over j of num[j] * x[at + i - 1 - j]`.
-///
-/// The `num.len()` samples before `x[at]` are the filter's history. The
-/// products are added from the oldest sample to the newest, as in libopus.
-fn plc_fir(x: &[f32], at: usize, num: &[f32], y: &mut [f32]) {
-    let ord = num.len();
-    for (i, out) in y.iter_mut().enumerate() {
-        let hist = &x[at + i - ord..at + i];
-        let mut sum = x[at + i];
-        for j in 0..ord {
-            sum = mac(sum, num[ord - 1 - j], hist[j]);
-        }
-        *out = sum;
-    }
-}
-
-/// All-pole (synthesis) filter of the concealment, run in place over
-/// `buf[at..at + n]`. Port of libopus `celt_iir` (celt/celt_lpc.c):
-/// `buf[at + i] -= sum over j of den[j] * buf[at + i - 1 - j]`.
-///
-/// The `den.len()` samples before `buf[at]` are the filter's memory.
-/// libopus computes four outputs at a time: each one first adds the
-/// products with the samples before the group, oldest first, then the
-/// products with the outputs of its own group, newest first. The same order
-/// is kept here so that rounding matches.
-fn plc_iir(buf: &mut [f32], at: usize, n: usize, den: &[f32]) {
-    let ord = den.len();
-    let mut i = 0;
-    while i + 4 <= n {
-        let p = at + i;
-        let mut sum = [buf[p], buf[p + 1], buf[p + 2], buf[p + 3]];
-        for (k, s) in sum.iter_mut().enumerate() {
-            for j in 0..ord - k {
-                *s = mac(*s, den[ord - 1 - j], -buf[p - ord + j + k]);
-            }
-        }
-        buf[p] = sum[0];
-        sum[1] = mac(sum[1], -buf[p], den[0]);
-        buf[p + 1] = sum[1];
-        sum[2] = mac(sum[2], -buf[p + 1], den[0]);
-        sum[2] = mac(sum[2], -buf[p], den[1]);
-        buf[p + 2] = sum[2];
-        sum[3] = mac(sum[3], -buf[p + 2], den[0]);
-        sum[3] = mac(sum[3], -buf[p + 1], den[1]);
-        sum[3] = mac(sum[3], -buf[p], den[2]);
-        buf[p + 3] = sum[3];
-        i += 4;
-    }
-    // The concealment always filters a multiple of four samples. This loop
-    // covers any other length.
-    while i < n {
-        let p = at + i;
-        let mut sum = buf[p];
-        for j in 0..ord {
-            sum = mac(sum, den[ord - 1 - j], -buf[p - ord + j]);
-        }
-        buf[p] = sum;
-        i += 1;
-    }
-}
-
-/// Constant part of the in-place comb filter, for `n` samples from `at`:
+/// Constant part of the in-place comb filter, for `n` samples from `at` of
+/// each channel in `bufs`:
 /// `buf[i] += g[0] * buf[i - t] + g[1] * (buf[i - t + 1] + buf[i - t - 1])
 /// + g[2] * (buf[i - t + 2] + buf[i - t - 2])`.
 ///
 /// The samples it reads at `i - t` and around it may be ones it has just
 /// written. `t` must be at least `COMBFILTER_MINPERIOD` and at most
-/// `at - 2`.
+/// `at - 2`. All channels use the same period and taps.
 #[inline]
-fn comb_inplace_const(buf: &mut [f32], at: usize, t: usize, n: usize, g: [f32; 3]) {
+fn comb_inplace_const<const C: usize>(
+    bufs: &mut [&mut [f32]; C],
+    at: usize,
+    t: usize,
+    n: usize,
+    g: [f32; 3],
+) {
+    // Two channels take the version that loads each sample once. See
+    // `comb_inplace_const_window_neon` for why one channel does not.
     #[cfg(target_arch = "aarch64")]
-    comb_inplace_const_neon(buf, at, t, n, g);
+    if C == 2 {
+        comb_inplace_const_window_neon::<C, 2>(bufs, at, t, n, g);
+    } else {
+        comb_inplace_const_neon::<C, COMB_VECTORS>(bufs, at, t, n, g);
+    }
     #[cfg(not(target_arch = "aarch64"))]
-    comb_inplace_const_scalar(buf, at, t, n, g);
+    for buf in bufs.iter_mut() {
+        comb_inplace_const_scalar(buf, at, t, n, g);
+    }
 }
 
-/// Portable version of `comb_inplace_const`, one sample at a time.
+/// Portable version of `comb_inplace_const` for one channel, one sample at
+/// a time.
 fn comb_inplace_const_scalar(buf: &mut [f32], at: usize, t: usize, n: usize, g: [f32; 3]) {
     for idx in at..at + n {
         let s = buf[idx];
@@ -5727,59 +5476,230 @@ fn comb_inplace_const_scalar(buf: &mut [f32], at: usize, t: usize, n: usize, g: 
         let rm1 = buf[idx - t - 1];
         let rp2 = buf[idx - t + 2];
         let rm2 = buf[idx - t - 2];
-        buf[idx] = s + g[0] * r + g[1] * (rp1 + rm1) + g[2] * (rp2 + rm2);
+        buf[idx] = comb_tap3(s, g, r, rp1 + rm1, rp2 + rm2);
     }
 }
 
-/// `comb_inplace_const` with vector instructions, four samples per step.
-///
-/// The newest sample a step reads is `buf[i + 3 - t + 2]`. With `t` at
-/// least 15 that is before `buf[i]`, so the four samples of a step do not
-/// depend on each other. Multiplication and addition stay separate
-/// instructions, in the order of the portable version, so both versions
-/// round the same way.
+/// Vectors of four samples that `comb_inplace_const_neon` and
+/// `comb_inplace_fade_neon` compute per channel in one step. On the
+/// Cortex-A55 and the Cortex-A76, 3 took less time than 1 or 2.
 #[cfg(target_arch = "aarch64")]
-fn comb_inplace_const_neon(buf: &mut [f32], at: usize, t: usize, n: usize, g: [f32; 3]) {
+const COMB_VECTORS: usize = 3;
+
+/// `comb_inplace_const` with vector instructions. One step filters `V`
+/// vectors of four samples of every channel.
+///
+/// The newest sample a step reads is `buf[i + 4 * V - 1 - t + 2]`. With
+/// `4 * V + 2 <= t` that is before `buf[i]`, the first sample the step
+/// writes. So the samples of a step do not depend on each other, and the
+/// step loads all its input before it stores. The vectors of a step go
+/// through each operation one after the other. A processor that runs
+/// instructions in program order can then start the next vector's
+/// operation while the previous one is still running.
+///
+/// Each sample takes the steps of `comb_tap3` in its order, each product
+/// added with a fused multiply-add, so the result is the same as the
+/// portable version's.
+#[cfg(target_arch = "aarch64")]
+fn comb_inplace_const_neon<const C: usize, const V: usize>(
+    bufs: &mut [&mut [f32]; C],
+    at: usize,
+    t: usize,
+    n: usize,
+    g: [f32; 3],
+) {
+    const { assert!(V >= 1 && 4 * V + 2 <= COMBFILTER_MINPERIOD) };
     // `t` comes from the packet, so this is checked in every build.
-    assert!(t >= COMBFILTER_MINPERIOD && at >= t + 2 && at + n <= buf.len());
-    let vec_n = n & !3;
-    // SAFETY: every step reads `buf[i - t - 2..i - t + 6]` and reads and
-    // writes `buf[i..i + 4]`, for `i` from `at` in steps of 4 while
-    // `i + 4 <= at + vec_n`. The check above gives `i - t - 2 >= 0` and
-    // `i + 4 <= buf.len()`, and `t >= 15` puts the first range below the
-    // second. All accesses go through one pointer taken from `&mut buf`.
+    assert!(t >= COMBFILTER_MINPERIOD && at >= t + 2);
+    for buf in bufs.iter() {
+        assert!(at + n <= buf.len());
+    }
+    let step = 4 * V;
+    let main = n - n % step;
+    let ptr: [*mut f32; C] = core::array::from_fn(|c| bufs[c].as_mut_ptr());
+    // SAFETY: for channel `c`, every step reads `buf[i - t - 2..i - t + 4 * V
+    // + 2]` and reads and writes `buf[i..i + 4 * V]`, for `i` from `at` in
+    // steps of `4 * V` while `i + 4 * V <= at + main`. The checks above give
+    // `i - t - 2 >= 0` and `i + 4 * V <= buf.len()`, and `4 * V + 2 <= t`
+    // puts the range that is read below the one that is written. Each
+    // channel is accessed only through the pointer taken from its own
+    // `&mut` slice, and two `&mut` slices do not overlap.
     unsafe {
-        let p = buf.as_mut_ptr();
-        let g0 = vdupq_n_f32(g[0]);
-        let g1 = vdupq_n_f32(g[1]);
-        let g2 = vdupq_n_f32(g[2]);
+        let gv = [vdupq_n_f32(g[0]), vdupq_n_f32(g[1]), vdupq_n_f32(g[2])];
+        let zero = vdupq_n_f32(0.0);
         let mut i = at;
-        while i < at + vec_n {
-            let y = p.add(i);
-            let r = y.sub(t);
-            let near = vaddq_f32(vld1q_f32(r.add(1)), vld1q_f32(r.sub(1)));
-            let far = vaddq_f32(vld1q_f32(r.add(2)), vld1q_f32(r.sub(2)));
-            let mut acc = vaddq_f32(vld1q_f32(y), vmulq_f32(g0, vld1q_f32(r)));
-            acc = vaddq_f32(acc, vmulq_f32(g1, near));
-            acc = vaddq_f32(acc, vmulq_f32(g2, far));
-            vst1q_f32(y, acc);
-            i += 4;
+        while i < at + main {
+            let mut acc = [[zero; V]; C];
+            let mut near = [[zero; V]; C];
+            let mut far = [[zero; V]; C];
+            for c in 0..C {
+                for v in 0..V {
+                    let y = ptr[c].add(i + 4 * v);
+                    let r = y.sub(t);
+                    near[c][v] = vaddq_f32(vld1q_f32(r.add(1)), vld1q_f32(r.sub(1)));
+                    far[c][v] = vaddq_f32(vld1q_f32(r.add(2)), vld1q_f32(r.sub(2)));
+                    acc[c][v] = vfmaq_f32(vld1q_f32(y), gv[0], vld1q_f32(r));
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    acc[c][v] = vfmaq_f32(acc[c][v], gv[1], near[c][v]);
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    acc[c][v] = vfmaq_f32(acc[c][v], gv[2], far[c][v]);
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    vst1q_f32(ptr[c].add(i + 4 * v), acc[c][v]);
+                }
+            }
+            i += step;
         }
     }
-    comb_inplace_const_scalar(buf, at + vec_n, t, n - vec_n, g);
+    for buf in bufs.iter_mut() {
+        comb_inplace_const_scalar(buf, at + main, t, n - main, g);
+    }
+}
+
+/// `comb_inplace_const` with vector instructions that load each sample of
+/// the taps once. One step filters `V` vectors of four samples of every
+/// channel.
+///
+/// The taps of the samples `i..i + 4` are `buf[i - t - 2..i - t + 6]`.
+/// With `r = i - t`, the kernel holds the vectors `buf[r - 4..r]`,
+/// `buf[r..r + 4]` and `buf[r + 4..r + 8]` in registers. It takes the taps
+/// one and two places from the centre out of them with `vextq_f32`. A step
+/// loads the vectors that follow the last one it has, up to
+/// `buf[r + 4 * V + 4]` with `r = i - t`, exclusive. With `4 * V + 4 <= t`
+/// that is before `buf[i]`, the first sample the step writes. Every sample
+/// before `buf[i]` has its final value: it is history or it was written by
+/// an earlier step, and it is not written again. So the vectors that a
+/// step keeps for the next one stay valid.
+///
+/// Per vector of output this takes 2 loads and 9 vector operations, where
+/// `comb_inplace_const_neon` takes 6 loads and 5 vector operations. The
+/// Cortex-A55 loads slowly: for the two channels of a 20 ms frame this
+/// version took 0.67 of the time of the other one there, and 1.38 times
+/// its time on the Cortex-A76. For one channel it was slower than the
+/// version before both kernels on the Cortex-A76, so one channel takes
+/// `comb_inplace_const_neon`.
+///
+/// Each sample takes the steps of `comb_tap3` in its order, each product
+/// added with a fused multiply-add, so the result is the same as the
+/// portable version's.
+#[cfg(target_arch = "aarch64")]
+fn comb_inplace_const_window_neon<const C: usize, const V: usize>(
+    bufs: &mut [&mut [f32]; C],
+    at: usize,
+    t: usize,
+    n: usize,
+    g: [f32; 3],
+) {
+    const { assert!(V >= 1 && 4 * V + 4 <= COMBFILTER_MINPERIOD) };
+    // `t` comes from the packet, so this is checked in every build.
+    assert!(t >= COMBFILTER_MINPERIOD && at >= t + 2);
+    for buf in bufs.iter() {
+        assert!(at + n <= buf.len());
+    }
+    let step = 4 * V;
+    let main = n - n % step;
+    let ptr: [*mut f32; C] = core::array::from_fn(|c| bufs[c].as_mut_ptr());
+    // SAFETY: for channel `c`, the first loads read `buf[at - t - 2..at - t
+    // + 4]`, and `at >= t + 2`. A step at `i` reads `buf[i - t + 4..i - t +
+    // 4 * V + 4]` and reads and writes `buf[i..i + 4 * V]`, for `i` from
+    // `at` in steps of `4 * V` while `i + 4 * V <= at + main`. So every
+    // access lies in `buf[0..at + n]`, which the checks above put inside
+    // the slice. `4 * V + 4 <= t` puts each read below the samples the
+    // step writes. Each channel is accessed only through the pointer taken
+    // from its own `&mut` slice, and two `&mut` slices do not overlap.
+    unsafe {
+        let gv = [vdupq_n_f32(g[0]), vdupq_n_f32(g[1]), vdupq_n_f32(g[2])];
+        let zero = vdupq_n_f32(0.0);
+        // `prev` is `buf[r - 4..r]` and `cur` is `buf[r..r + 4]`. Only the
+        // last two lanes of `prev` are used, so only they are loaded.
+        let mut prev: [float32x4_t; C] = core::array::from_fn(|c| {
+            vcombine_f32(vdup_n_f32(0.0), vld1_f32(ptr[c].add(at - t - 2)))
+        });
+        let mut cur: [float32x4_t; C] = core::array::from_fn(|c| vld1q_f32(ptr[c].add(at - t)));
+        let mut i = at;
+        while i < at + main {
+            // `next[c][v]` is `buf[r + 4 * v + 4..r + 4 * v + 8]`.
+            let mut next = [[zero; V]; C];
+            let mut acc = [[zero; V]; C];
+            for c in 0..C {
+                for v in 0..V {
+                    next[c][v] = vld1q_f32(ptr[c].add(i - t + 4 + 4 * v));
+                    acc[c][v] = vld1q_f32(ptr[c].add(i + 4 * v));
+                }
+            }
+            let mut centre = [[zero; V]; C];
+            let mut near = [[zero; V]; C];
+            let mut far = [[zero; V]; C];
+            for c in 0..C {
+                for v in 0..V {
+                    let before = match v {
+                        0 => prev[c],
+                        1 => cur[c],
+                        _ => next[c][v - 2],
+                    };
+                    let mid = if v == 0 { cur[c] } else { next[c][v - 1] };
+                    let after = next[c][v];
+                    centre[c][v] = mid;
+                    // `buf[k + 1] + buf[k - 1]` and `buf[k + 2] + buf[k - 2]`
+                    // for the four samples `k` of `mid`.
+                    let plus1 = vextq_f32::<1>(mid, after);
+                    let minus1 = vextq_f32::<3>(before, mid);
+                    near[c][v] = vaddq_f32(plus1, minus1);
+                    let plus2 = vextq_f32::<2>(mid, after);
+                    let minus2 = vextq_f32::<2>(before, mid);
+                    far[c][v] = vaddq_f32(plus2, minus2);
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    acc[c][v] = vfmaq_f32(acc[c][v], gv[0], centre[c][v]);
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    acc[c][v] = vfmaq_f32(acc[c][v], gv[1], near[c][v]);
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    acc[c][v] = vfmaq_f32(acc[c][v], gv[2], far[c][v]);
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    vst1q_f32(ptr[c].add(i + 4 * v), acc[c][v]);
+                }
+                prev[c] = if V == 1 { cur[c] } else { next[c][V - 2] };
+                cur[c] = next[c][V - 1];
+            }
+            i += step;
+        }
+    }
+    for buf in bufs.iter_mut() {
+        comb_inplace_const_scalar(buf, at + main, t, n - main, g);
+    }
 }
 
 /// Cross-fading part of the in-place comb filter, for `n` samples from
-/// `at`. The old filter (period `t0`, taps `g0`) is weighted with
-/// `1 - window[i]^2` and the new one (period `t1`, taps `g1`) with
-/// `window[i]^2`.
+/// `at` of each channel in `bufs`. The old filter (period `t0`, taps `g0`)
+/// is weighted with `1 - window[i]^2` and the new one (period `t1`, taps
+/// `g1`) with `window[i]^2`.
 ///
 /// Both periods must be at least `COMBFILTER_MINPERIOD` and at most
-/// `at - 2`. `window` must hold `n` values.
+/// `at - 2`. `window` must hold `n` values. All channels use the same
+/// filters.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn comb_inplace_fade(
-    buf: &mut [f32],
+fn comb_inplace_fade<const C: usize>(
+    bufs: &mut [&mut [f32]; C],
     at: usize,
     t0: usize,
     t1: usize,
@@ -5789,12 +5709,15 @@ fn comb_inplace_fade(
     window: &[f32],
 ) {
     #[cfg(target_arch = "aarch64")]
-    comb_inplace_fade_neon(buf, at, t0, t1, n, g0, g1, window);
+    comb_inplace_fade_neon::<C, COMB_VECTORS>(bufs, at, t0, t1, n, g0, g1, window);
     #[cfg(not(target_arch = "aarch64"))]
-    comb_inplace_fade_scalar(buf, at, t0, t1, n, g0, g1, window);
+    for buf in bufs.iter_mut() {
+        comb_inplace_fade_scalar(buf, at, t0, t1, n, g0, g1, window);
+    }
 }
 
-/// Portable version of `comb_inplace_fade`, one sample at a time.
+/// Portable version of `comb_inplace_fade` for one channel, one sample at a
+/// time.
 #[allow(clippy::too_many_arguments)]
 fn comb_inplace_fade_scalar(
     buf: &mut [f32],
@@ -5820,19 +5743,29 @@ fn comb_inplace_fade_scalar(
         let r1m1 = buf[idx - t1 - 1];
         let r1p2 = buf[idx - t1 + 2];
         let r1m2 = buf[idx - t1 - 2];
-        buf[idx] = s
-            + (1.0 - f) * (g0[0] * r0 + g0[1] * (r0p1 + r0m1) + g0[2] * (r0p2 + r0m2))
-            + f * (g1[0] * r1 + g1[1] * (r1p1 + r1m1) + g1[2] * (r1p2 + r1m2));
+        buf[idx] = comb_fade_tap6(
+            s,
+            f,
+            g0,
+            [r0, r0p1 + r0m1, r0p2 + r0m2],
+            g1,
+            [r1, r1p1 + r1m1, r1p2 + r1m2],
+        );
     }
 }
 
-/// `comb_inplace_fade` with vector instructions, four samples per step.
-/// See `comb_inplace_const_neon` for why four samples of a step are
-/// independent and why the result is the same as the portable version's.
+/// `comb_inplace_fade` with vector instructions. One step filters `V`
+/// vectors of four samples of every channel. See
+/// `comb_inplace_const_neon` for why the samples of a step are
+/// independent. The weights of the two filters depend on the position in
+/// the window only, so the channels share them.
+///
+/// Each sample takes the steps of `comb_fade_tap6` in its order, so the
+/// result is the same as the portable version's.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-fn comb_inplace_fade_neon(
-    buf: &mut [f32],
+fn comb_inplace_fade_neon<const C: usize, const V: usize>(
+    bufs: &mut [&mut [f32]; C],
     at: usize,
     t0: usize,
     t1: usize,
@@ -5841,51 +5774,99 @@ fn comb_inplace_fade_neon(
     g1: [f32; 3],
     window: &[f32],
 ) {
+    const { assert!(V >= 1 && 4 * V + 2 <= COMBFILTER_MINPERIOD) };
     // The periods come from the packet, so this is checked in every build.
     assert!(t0 >= COMBFILTER_MINPERIOD && t1 >= COMBFILTER_MINPERIOD);
-    assert!(at >= t0 + 2 && at >= t1 + 2 && at + n <= buf.len() && n <= window.len());
-    let vec_n = n & !3;
+    assert!(at >= t0 + 2 && at >= t1 + 2 && n <= window.len());
+    for buf in bufs.iter() {
+        assert!(at + n <= buf.len());
+    }
+    let step = 4 * V;
+    let main = n - n % step;
+    let ptr: [*mut f32; C] = core::array::from_fn(|c| bufs[c].as_mut_ptr());
 
-    /// The three taps of one filter around `r`:
-    /// `g[0] * r[0] + g[1] * (r[1] + r[-1]) + g[2] * (r[2] + r[-2])`.
+    /// The three taps of one filter around `r`: `r[0]`, `r[1] + r[-1]` and
+    /// `r[2] + r[-2]`.
     ///
     /// SAFETY: the caller guarantees that `r.sub(2)..r.add(6)` is readable.
     #[inline(always)]
-    unsafe fn taps(r: *const f32, g: [float32x4_t; 3]) -> float32x4_t {
+    unsafe fn taps(r: *const f32) -> [float32x4_t; 3] {
         // SAFETY: see the function's contract.
         unsafe {
-            let near = vaddq_f32(vld1q_f32(r.add(1)), vld1q_f32(r.sub(1)));
-            let far = vaddq_f32(vld1q_f32(r.add(2)), vld1q_f32(r.sub(2)));
-            let acc = vaddq_f32(vmulq_f32(g[0], vld1q_f32(r)), vmulq_f32(g[1], near));
-            vaddq_f32(acc, vmulq_f32(g[2], far))
+            [
+                vld1q_f32(r),
+                vaddq_f32(vld1q_f32(r.add(1)), vld1q_f32(r.sub(1))),
+                vaddq_f32(vld1q_f32(r.add(2)), vld1q_f32(r.sub(2))),
+            ]
         }
     }
 
-    // SAFETY: every step reads `window[k..k + 4]` with `k + 4 <= vec_n`,
-    // reads `buf[i - t - 2..i - t + 6]` for both periods and reads and
-    // writes `buf[i..i + 4]`, for `i` from `at` in steps of 4 while
-    // `i + 4 <= at + vec_n`. The checks above give `i - t - 2 >= 0`,
-    // `i + 4 <= buf.len()` and `vec_n <= window.len()`, and `t >= 15` puts
-    // the ranges that are read below the one that is written. All accesses
-    // to `buf` go through one pointer taken from `&mut buf`.
+    // SAFETY: every step reads `window[k..k + 4 * V]` with
+    // `k + 4 * V <= main <= window.len()`. For channel `c` it reads
+    // `buf[i - t - 2..i - t + 4 * V + 2]` for both periods and reads and
+    // writes `buf[i..i + 4 * V]`, with `i = at + k`, while
+    // `k + 4 * V <= main`. The checks above give `i - t - 2 >= 0` and
+    // `i + 4 * V <= buf.len()`, and `4 * V + 2 <= t` puts the ranges that
+    // are read below the one that is written. Each channel is accessed only
+    // through the pointer taken from its own `&mut` slice.
     unsafe {
-        let p = buf.as_mut_ptr();
         let w = window.as_ptr();
         let old = [vdupq_n_f32(g0[0]), vdupq_n_f32(g0[1]), vdupq_n_f32(g0[2])];
         let new = [vdupq_n_f32(g1[0]), vdupq_n_f32(g1[1]), vdupq_n_f32(g1[2])];
         let one = vdupq_n_f32(1.0);
+        let zero = vdupq_n_f32(0.0);
         let mut k = 0;
-        while k < vec_n {
-            let y = p.add(at + k);
-            let wk = vld1q_f32(w.add(k));
-            let f = vmulq_f32(wk, wk);
-            let from_old = vmulq_f32(vsubq_f32(one, f), taps(y.sub(t0), old));
-            let from_new = vmulq_f32(f, taps(y.sub(t1), new));
-            vst1q_f32(y, vaddq_f32(vaddq_f32(vld1q_f32(y), from_old), from_new));
-            k += 4;
+        while k < main {
+            // The weights of `comb_fade_tap6`: `(1 - f) * g0[j]` and
+            // `f * g1[j]`, with `f = w * w`.
+            let mut w_old = [[zero; 3]; V];
+            let mut w_new = [[zero; 3]; V];
+            for v in 0..V {
+                let wk = vld1q_f32(w.add(k + 4 * v));
+                let f = vmulq_f32(wk, wk);
+                let one_minus_f = vsubq_f32(one, f);
+                for j in 0..3 {
+                    w_old[v][j] = vmulq_f32(one_minus_f, old[j]);
+                    w_new[v][j] = vmulq_f32(f, new[j]);
+                }
+            }
+            let mut acc = [[zero; V]; C];
+            let mut old_taps = [[[zero; 3]; V]; C];
+            let mut new_taps = [[[zero; 3]; V]; C];
+            for c in 0..C {
+                for v in 0..V {
+                    let y = ptr[c].add(at + k + 4 * v);
+                    acc[c][v] = vld1q_f32(y);
+                    old_taps[c][v] = taps(y.sub(t0));
+                    new_taps[c][v] = taps(y.sub(t1));
+                }
+            }
+            // The order of `comb_fade_tap6`.
+            for j in 0..3 {
+                for c in 0..C {
+                    for v in 0..V {
+                        acc[c][v] = vfmaq_f32(acc[c][v], w_old[v][j], old_taps[c][v][j]);
+                    }
+                }
+            }
+            for j in 0..3 {
+                for c in 0..C {
+                    for v in 0..V {
+                        acc[c][v] = vfmaq_f32(acc[c][v], w_new[v][j], new_taps[c][v][j]);
+                    }
+                }
+            }
+            for c in 0..C {
+                for v in 0..V {
+                    vst1q_f32(ptr[c].add(at + k + 4 * v), acc[c][v]);
+                }
+            }
+            k += step;
         }
     }
-    comb_inplace_fade_scalar(buf, at + vec_n, t0, t1, n - vec_n, g0, g1, &window[vec_n..]);
+    for buf in bufs.iter_mut() {
+        comb_inplace_fade_scalar(buf, at + main, t0, t1, n - main, g0, g1, &window[main..]);
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -5942,8 +5923,10 @@ mod comb_inplace_tests {
     ];
     const PERIODS: [usize; 12] = [15, 16, 17, 18, 19, 20, 21, 22, 33, 100, 700, 1022];
 
-    /// The filter written as one loop over the frame, as it was before it
-    /// was split into a cross-fading part and a constant part.
+    /// libopus `comb_filter` (celt/celt.c) with `x == y`, written as one loop
+    /// over the frame: the cross-fade for the first `overlap` samples, then
+    /// the new filter alone, which is skipped when its gain is 0. Every
+    /// product is added with `mac`, in the order of the C expressions.
     #[allow(clippy::too_many_arguments)]
     fn one_loop_filter(
         buf: &mut [f32],
@@ -5966,26 +5949,35 @@ mod comb_inplace_tests {
         let [g00, g01, g02] = PREFILTER_GAINS[tapset0 as usize].map(|g| g0 * g);
         let [g10, g11, g12] = PREFILTER_GAINS[tapset1 as usize].map(|g| g1 * g);
         let same = g0 == g1 && t0 == t1 && tapset0 == tapset1;
-        let fade = if same { 0 } else { overlap };
+        let fade = if same { 0 } else { overlap.min(n) };
         for i in 0..n {
             let idx = y_idx + i;
-            let new = g10 * buf[idx - t1]
-                + g11 * (buf[idx - t1 + 1] + buf[idx - t1 - 1])
-                + g12 * (buf[idx - t1 + 2] + buf[idx - t1 - 2]);
-            if i < fade {
-                let f = window[i] * window[i];
-                let old = g00 * buf[idx - t0]
-                    + g01 * (buf[idx - t0 + 1] + buf[idx - t0 - 1])
-                    + g02 * (buf[idx - t0 + 2] + buf[idx - t0 - 2]);
-                buf[idx] = buf[idx] + (1.0 - f) * old + f * new;
-            } else {
-                // `s + a + b + c` adds from the left, and so does the
-                // constant part of the filter.
-                buf[idx] = buf[idx]
-                    + g10 * buf[idx - t1]
-                    + g11 * (buf[idx - t1 + 1] + buf[idx - t1 - 1])
-                    + g12 * (buf[idx - t1 + 2] + buf[idx - t1 - 2]);
+            if i >= fade && g1 == 0.0 {
+                break;
             }
+            let x = buf[idx];
+            let new_taps = [
+                buf[idx - t1],
+                buf[idx - t1 + 1] + buf[idx - t1 - 1],
+                buf[idx - t1 + 2] + buf[idx - t1 - 2],
+            ];
+            buf[idx] = if i < fade {
+                let f = window[i] * window[i];
+                let old_taps = [
+                    buf[idx - t0],
+                    buf[idx - t0 + 1] + buf[idx - t0 - 1],
+                    buf[idx - t0 + 2] + buf[idx - t0 - 2],
+                ];
+                let mut s = x;
+                s = mac(s, (1.0 - f) * g00, old_taps[0]);
+                s = mac(s, (1.0 - f) * g01, old_taps[1]);
+                s = mac(s, (1.0 - f) * g02, old_taps[2]);
+                s = mac(s, f * g10, new_taps[0]);
+                s = mac(s, f * g11, new_taps[1]);
+                mac(s, f * g12, new_taps[2])
+            } else {
+                mac(mac(mac(x, g10, new_taps[0]), g11, new_taps[1]), g12, new_taps[2])
+            };
         }
     }
 
@@ -6012,26 +6004,65 @@ mod comb_inplace_tests {
             } else {
                 (next(&mut seed) % 3) as i32
             };
-            let mut got = signal(y_idx + n + 7, &mut seed, round % 4 == 3);
+            let extreme = round % 4 == 3;
+            let mut got = signal(y_idx + n + 7, &mut seed, extreme);
             let mut want = got.clone();
             comb_filter_inplace(
-                &mut got, y_idx, t0, t1, n, g0, g1, tapset0, tapset1, window, overlap,
+                &mut [&mut got[..]], y_idx, t0, t1, n, g0, g1, tapset0, tapset1, window, overlap,
             );
             one_loop_filter(
                 &mut want, y_idx, t0, t1, n, g0, g1, tapset0, tapset1, window, overlap,
             );
-            assert_same(
-                &got,
-                &want,
-                &format!("n {n} t0 {t0} t1 {t1} g0 {g0} g1 {g1}"),
+            let what = format!("n {n} t0 {t0} t1 {t1} g0 {g0} g1 {g1}");
+            assert_same(&got, &want, &what);
+
+            // Two channels with the same filter. Each must come out as if
+            // it were filtered alone.
+            let mut got0 = signal(y_idx + n + 7, &mut seed, extreme);
+            let mut got1 = signal(y_idx + n + 7, &mut seed, extreme);
+            let (mut want0, mut want1) = (got0.clone(), got1.clone());
+            comb_filter_inplace(
+                &mut [&mut got0[..], &mut got1[..]],
+                y_idx, t0, t1, n, g0, g1, tapset0, tapset1, window, overlap,
             );
+            for want in [&mut want0, &mut want1] {
+                one_loop_filter(want, y_idx, t0, t1, n, g0, g1, tapset0, tapset1, window, overlap);
+            }
+            assert_same(&got0, &want0, &format!("channel 0 of 2, {what}"));
+            assert_same(&got1, &want1, &format!("channel 1 of 2, {what}"));
         }
     }
 
+    /// Runs `kernel` on `C` channels of random signal and compares each
+    /// channel with `portable` on that channel alone.
     #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn const_part_neon_matches_portable_version() {
-        let mut seed = 7u32;
+    fn check_channels<const C: usize>(
+        len: usize,
+        seed: &mut u32,
+        extreme: bool,
+        what: &str,
+        kernel: impl Fn(&mut [&mut [f32]; C]),
+        portable: impl Fn(&mut [f32]),
+    ) {
+        let mut got: Vec<Vec<f32>> = (0..C).map(|_| signal(len, seed, extreme)).collect();
+        let mut want = got.clone();
+        let mut bufs: [&mut [f32]; C] = {
+            let mut it = got.iter_mut();
+            core::array::from_fn(|_| &mut it.next().unwrap()[..])
+        };
+        kernel(&mut bufs);
+        for (c, (got, want)) in got.iter().zip(want.iter_mut()).enumerate() {
+            portable(want);
+            assert_same(got, want, &format!("channel {c} of {C}, {what}"));
+        }
+    }
+
+    /// A vector version of `comb_inplace_const`.
+    #[cfg(target_arch = "aarch64")]
+    type ConstKernel<const C: usize> = fn(&mut [&mut [f32]; C], usize, usize, usize, [f32; 3]);
+
+    #[cfg(target_arch = "aarch64")]
+    fn check_const_part<const C: usize>(seed: &mut u32, name: &str, kernel: ConstKernel<C>) {
         for extreme in [false, true] {
             for &n in &LENGTHS {
                 for &t in &PERIODS {
@@ -6040,11 +6071,63 @@ mod comb_inplace_tests {
                         // Start right after the history the filter reads,
                         // and at a few other places.
                         for at in [t + 2, t + 3, t + 9, 1100] {
-                            let mut got = signal(at + n + 5, &mut seed, extreme);
-                            let mut want = got.clone();
-                            comb_inplace_const_neon(&mut got, at, t, n, g);
-                            comb_inplace_const_scalar(&mut want, at, t, n, g);
-                            assert_same(&got, &want, &format!("n {n} t {t} at {at}"));
+                            check_channels::<C>(
+                                at + n + 5,
+                                seed,
+                                extreme,
+                                &format!("{name}, n {n} t {t} at {at}"),
+                                |bufs| kernel(bufs, at, t, n, g),
+                                |buf| comb_inplace_const_scalar(buf, at, t, n, g),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn const_part_neon_matches_portable_version() {
+        let mut seed = 7u32;
+        check_const_part::<1>(&mut seed, "1 vector", comb_inplace_const_neon::<1, 1>);
+        check_const_part::<1>(&mut seed, "2 vectors", comb_inplace_const_neon::<1, 2>);
+        check_const_part::<1>(&mut seed, "3 vectors", comb_inplace_const_neon::<1, 3>);
+        check_const_part::<2>(&mut seed, "1 vector", comb_inplace_const_neon::<2, 1>);
+        check_const_part::<2>(&mut seed, "2 vectors", comb_inplace_const_neon::<2, 2>);
+        check_const_part::<2>(&mut seed, "3 vectors", comb_inplace_const_neon::<2, 3>);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn const_part_window_neon_matches_portable_version() {
+        let mut seed = 13u32;
+        check_const_part::<1>(&mut seed, "window, 1 vector", comb_inplace_const_window_neon::<1, 1>);
+        check_const_part::<1>(&mut seed, "window, 2 vectors", comb_inplace_const_window_neon::<1, 2>);
+        check_const_part::<2>(&mut seed, "window, 1 vector", comb_inplace_const_window_neon::<2, 1>);
+        check_const_part::<2>(&mut seed, "window, 2 vectors", comb_inplace_const_window_neon::<2, 2>);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn check_fade_part<const C: usize, const V: usize>(seed: &mut u32) {
+        let window = crate::modes::default_mode().window;
+        for extreme in [false, true] {
+            for &n in LENGTHS.iter().filter(|&&n| n <= window.len()) {
+                for &t0 in &PERIODS {
+                    for &t1 in &[15, 16, 19, 100, 1022] {
+                        let g0 = PREFILTER_GAINS[t0 % 3].map(|g| 0.5625 * g);
+                        let g1 = PREFILTER_GAINS[t1 % 3].map(|g| 0.75 * g);
+                        for at in [t0.max(t1) + 2, 1100] {
+                            check_channels::<C>(
+                                at + n + 5,
+                                seed,
+                                extreme,
+                                &format!("{V} vectors, n {n} t0 {t0} t1 {t1} at {at}"),
+                                |bufs| {
+                                    comb_inplace_fade_neon::<C, V>(bufs, at, t0, t1, n, g0, g1, window)
+                                },
+                                |buf| comb_inplace_fade_scalar(buf, at, t0, t1, n, g0, g1, window),
+                            );
                         }
                     }
                 }
@@ -6055,25 +6138,13 @@ mod comb_inplace_tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn fade_part_neon_matches_portable_version() {
-        let window = crate::modes::default_mode().window;
         let mut seed = 11u32;
-        for extreme in [false, true] {
-            for &n in LENGTHS.iter().filter(|&&n| n <= window.len()) {
-                for &t0 in &PERIODS {
-                    for &t1 in &[15, 16, 19, 100, 1022] {
-                        let g0 = PREFILTER_GAINS[t0 % 3].map(|g| 0.5625 * g);
-                        let g1 = PREFILTER_GAINS[t1 % 3].map(|g| 0.75 * g);
-                        for at in [t0.max(t1) + 2, 1100] {
-                            let mut got = signal(at + n + 5, &mut seed, extreme);
-                            let mut want = got.clone();
-                            comb_inplace_fade_neon(&mut got, at, t0, t1, n, g0, g1, window);
-                            comb_inplace_fade_scalar(&mut want, at, t0, t1, n, g0, g1, window);
-                            assert_same(&got, &want, &format!("n {n} t0 {t0} t1 {t1} at {at}"));
-                        }
-                    }
-                }
-            }
-        }
+        check_fade_part::<1, 1>(&mut seed);
+        check_fade_part::<1, 2>(&mut seed);
+        check_fade_part::<1, 3>(&mut seed);
+        check_fade_part::<2, 1>(&mut seed);
+        check_fade_part::<2, 2>(&mut seed);
+        check_fade_part::<2, 3>(&mut seed);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -6081,7 +6152,7 @@ mod comb_inplace_tests {
     #[should_panic]
     fn const_part_neon_rejects_a_period_longer_than_the_history() {
         let mut buf = vec![0.0f32; 64];
-        comb_inplace_const_neon(&mut buf, 20, 19, 8, [0.1, 0.1, 0.1]);
+        comb_inplace_const_neon::<1, COMB_VECTORS>(&mut [&mut buf[..]], 20, 19, 8, [0.1, 0.1, 0.1]);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -6089,7 +6160,44 @@ mod comb_inplace_tests {
     #[should_panic]
     fn const_part_neon_rejects_a_frame_past_the_end() {
         let mut buf = vec![0.0f32; 64];
-        comb_inplace_const_neon(&mut buf, 40, 15, 28, [0.1, 0.1, 0.1]);
+        comb_inplace_const_neon::<1, COMB_VECTORS>(&mut [&mut buf[..]], 40, 15, 28, [0.1, 0.1, 0.1]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic]
+    fn const_part_neon_rejects_a_second_channel_past_the_end() {
+        let (mut buf0, mut buf1) = (vec![0.0f32; 64], vec![0.0f32; 60]);
+        let bufs = &mut [&mut buf0[..], &mut buf1[..]];
+        comb_inplace_const_neon::<2, COMB_VECTORS>(bufs, 40, 15, 24, [0.1, 0.1, 0.1]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic]
+    fn const_part_window_neon_rejects_a_period_longer_than_the_history() {
+        let mut buf = vec![0.0f32; 64];
+        comb_inplace_const_window_neon::<1, 2>(&mut [&mut buf[..]], 20, 19, 8, [0.1, 0.1, 0.1]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic]
+    fn const_part_window_neon_rejects_a_second_channel_past_the_end() {
+        let (mut buf0, mut buf1) = (vec![0.0f32; 64], vec![0.0f32; 60]);
+        let bufs = &mut [&mut buf0[..], &mut buf1[..]];
+        comb_inplace_const_window_neon::<2, 2>(bufs, 40, 15, 24, [0.1, 0.1, 0.1]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic]
+    fn fade_part_neon_rejects_a_second_channel_past_the_end() {
+        let window = crate::modes::default_mode().window;
+        let (mut buf0, mut buf1) = (vec![0.0f32; 64], vec![0.0f32; 60]);
+        let (g0, g1) = ([0.1; 3], [0.2; 3]);
+        let bufs = &mut [&mut buf0[..], &mut buf1[..]];
+        comb_inplace_fade_neon::<2, COMB_VECTORS>(bufs, 40, 15, 16, 24, g0, g1, window);
     }
 }
 
@@ -6124,35 +6232,39 @@ mod deemph_segments_tests {
         x
     }
 
-    /// Run the segment filter on `C` channels and compare it with the
-    /// filter that takes one sample at a time.
+    /// Run the segment filter on `C` channels, in both layouts, and compare
+    /// it with the filter that takes one sample at a time.
     fn check<const C: usize>(kind: usize, n: usize, warmup: usize, coef: f32, seed: &mut u32) {
         let at = warmup + [0, 1, 6][(next(seed) % 3) as usize];
         let what = format!("{C} channels, signal {kind}, n {n}, warmup {warmup}, coef {coef}");
         let hist: [Vec<f32>; C] = core::array::from_fn(|_| shaped_signal(kind, at + n + 2, seed));
         let mem: [f32; C] = core::array::from_fn(|c| [0.0, 1234.5, -3e-20][(c + kind) % 3]);
+        let h: [&[f32]; C] = core::array::from_fn(|c| &hist[c][..]);
 
         // Three more values than the frame: they must stay as they are.
-        let mut got: [Vec<f32>; C] = core::array::from_fn(|_| vec![7.0f32; n + 3]);
-        let got_mem = {
-            let mut it = got.iter_mut();
-            let y: [&mut [f32]; C] = core::array::from_fn(|_| &mut it.next().unwrap()[..n]);
-            let h: [&[f32]; C] = core::array::from_fn(|c| &hist[c][..]);
-            deemph_segments_neon(h, at, y, warmup, coef, mem)
-        };
+        let mut planar = vec![7.0f32; C * n + 3];
+        let mut interleaved = vec![7.0f32; C * n + 3];
+        let planar_mem = deemph_segments_neon::<C, false>(h, at, &mut planar, n, warmup, coef, mem);
+        let inter_mem =
+            deemph_segments_neon::<C, true>(h, at, &mut interleaved, n, warmup, coef, mem);
         for c in 0..C {
-            let mut want = vec![7.0f32; n + 3];
+            let mut want = vec![7.0f32; n];
             let want_mem = deemph_mono(
                 &hist[c][at..at + n],
-                &mut want[..n],
+                &mut want[..],
                 1,
                 coef,
                 mem[c],
                 |o, v| *o = v,
             );
-            assert_same(&got[c], &want, &what);
-            assert_same(&[got_mem[c]], &[want_mem], &format!("{what}: memory"));
+            let got: Vec<f32> = interleaved[..C * n].iter().skip(c).step_by(C).copied().collect();
+            assert_same(&planar[c * n..(c + 1) * n], &want, &format!("{what}: planar"));
+            assert_same(&got, &want, &format!("{what}: interleaved"));
+            assert_same(&[planar_mem[c]], &[want_mem], &format!("{what}: memory"));
+            assert_same(&[inter_mem[c]], &[want_mem], &format!("{what}: memory, interleaved"));
         }
+        assert_same(&planar[C * n..], &[7.0; 3], &format!("{what}: past the end"));
+        assert_same(&interleaved[C * n..], &[7.0; 3], &format!("{what}: past the end"));
     }
 
     #[test]
@@ -6197,7 +6309,8 @@ mod deemph_segments_tests {
                 // alone.
                 let mut mem2 = [0.0f32; 2];
                 let mut mem1 = [0.0f32; 1];
-                let mut y = [vec![0.0f32; n], vec![0.0f32; n]];
+                let mut y = vec![0.0f32; 2 * n];
+                let warmup = DEEMPH_WARMUP;
                 for frame in 0..12 {
                     for h in hist.iter_mut() {
                         h.copy_within(n.., 0);
@@ -6205,10 +6318,9 @@ mod deemph_segments_tests {
                         h[at..].fill(if frame == 0 { last } else { 0.0 });
                     }
                     DEEMPH_RECOMPUTED.with(|count| count.set(0));
-                    let [y0, y1] = &mut y;
                     let h = [&hist[0][..], &hist[1][..]];
-                    mem2 = deemph_segments_neon(h, at, [y0, y1], DEEMPH_WARMUP, coef, mem2);
-                    mem1 = deemph_segments_neon([h[0]], at, [y0], DEEMPH_WARMUP, coef, mem1);
+                    mem2 = deemph_segments_neon::<2, false>(h, at, &mut y, n, warmup, coef, mem2);
+                    mem1 = deemph_segments_neon::<1, false>([h[0]], at, &mut y, n, warmup, coef, mem1);
                     // The memory takes about 570 samples to stop. Later
                     // frames are all silence, their run-in included.
                     if frame >= 4 {
@@ -6230,7 +6342,7 @@ mod deemph_segments_tests {
     fn segments_reject_a_frame_that_is_not_a_multiple_of_32() {
         let hist = [0.0f32; 400];
         let mut y = [0.0f32; 48];
-        deemph_segments_neon([&hist[..]], 200, [&mut y[..]], 160, 0.85, [0.0]);
+        deemph_segments_neon::<1, false>([&hist[..]], 200, &mut y, 48, 160, 0.85, [0.0]);
     }
 
     #[test]
@@ -6238,7 +6350,7 @@ mod deemph_segments_tests {
     fn segments_reject_a_history_shorter_than_the_run_in() {
         let hist = [0.0f32; 400];
         let mut y = [0.0f32; 64];
-        deemph_segments_neon([&hist[..]], 100, [&mut y[..]], 160, 0.85, [0.0]);
+        deemph_segments_neon::<1, false>([&hist[..]], 100, &mut y, 64, 160, 0.85, [0.0]);
     }
 
     #[test]
@@ -6246,7 +6358,15 @@ mod deemph_segments_tests {
     fn segments_reject_a_frame_past_the_end_of_the_history() {
         let hist = [0.0f32; 220];
         let mut y = [0.0f32; 64];
-        deemph_segments_neon([&hist[..]], 160, [&mut y[..]], 160, 0.85, [0.0]);
+        deemph_segments_neon::<1, false>([&hist[..]], 160, &mut y, 64, 160, 0.85, [0.0]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn segments_reject_an_output_shorter_than_the_frames() {
+        let hist = [0.0f32; 400];
+        let mut y = [0.0f32; 127];
+        deemph_segments_neon::<2, true>([&hist[..], &hist[..]], 200, &mut y, 64, 160, 0.85, [0.0; 2]);
     }
 }
 
@@ -6789,9 +6909,11 @@ fn transpose4(rows: [float32x4_t; 4]) -> [float32x4_t; 4] {
 /// segments at the same time. The result is the same, bit for bit, as that
 /// of `deemph_mono` on each channel.
 ///
-/// `hist[c][at..at + n]` is the frame of channel `c` and `y[c]` receives
-/// its `n` output samples, scaled to the output range. `mem` holds the
-/// filter memories. The function returns them for the next frame.
+/// `hist[c][at..at + n]` is the frame of channel `c`. `out` receives the
+/// `n` output samples of each channel, scaled to the output range: one
+/// channel after the other, or with `INTERLEAVED` the channels of each
+/// sample together. `mem` holds the filter memories. The function returns
+/// them for the next frame.
 ///
 /// # Why segments
 ///
@@ -6833,10 +6955,11 @@ fn transpose4(rows: [float32x4_t; 4]) -> [float32x4_t; 4] {
 /// must hold `warmup` samples before `at`. Their values do not matter for
 /// the result.
 #[cfg(target_arch = "aarch64")]
-fn deemph_segments_neon<const C: usize>(
+fn deemph_segments_neon<const C: usize, const INTERLEAVED: bool>(
     hist: [&[f32]; C],
     at: usize,
-    y: [&mut [f32]; C],
+    out: &mut [f32],
+    n: usize,
     warmup: usize,
     coef: f32,
     mem: [f32; C],
@@ -6845,38 +6968,41 @@ fn deemph_segments_neon<const C: usize>(
     const LANES: usize = 8;
     assert!(C == 1 || C == 2);
     let per_ch = LANES / C;
-    let n = y[0].len();
     let seg = n / per_ch;
     assert!(n.is_multiple_of(32) && warmup.is_multiple_of(4) && at >= warmup);
+    assert!(out.len() >= C * n);
     for c in 0..C {
-        assert!(y[c].len() == n && at + n <= hist[c].len());
+        assert!(at + n <= hist[c].len());
     }
+    // The place in `out` of sample `i` of channel `c`. With one channel
+    // the two layouts are the same.
+    let place = |c: usize, i: usize| if INTERLEAVED { i * C + c } else { c * n + i };
 
     // Filter `s` handles segment `s % per_ch` of channel `s / per_ch`.
-    // `x_ptr[s]` is where its run-in starts and `y_ptr[s]` where its
-    // segment's output goes.
+    // `x_ptr[s]` is where its run-in starts.
     let mut x_ptr = [core::ptr::null::<f32>(); LANES];
-    let mut y_ptr = [core::ptr::null_mut::<f32>(); LANES];
     for c in 0..C {
-        let (x_base, y_base) = (hist[c].as_ptr(), y[c].as_mut_ptr());
+        let x_base = hist[c].as_ptr();
         for q in 0..per_ch {
             // SAFETY: `at - warmup + q * seg <= at + n <= hist[c].len()`
-            // and `q * seg <= n == y[c].len()` (checked above), so both
-            // pointers stay inside their slices.
+            // (checked above), so the pointer stays inside the slice.
             unsafe {
                 x_ptr[c * per_ch + q] = x_base.add(at - warmup + q * seg);
-                y_ptr[c * per_ch + q] = y_base.add(q * seg);
             }
         }
     }
+    let o = out.as_mut_ptr();
 
     // SAFETY: filter `s` reads `x_ptr[s][t..t + 4]` for `t` in steps of 4
     // below `warmup + seg`. The last value read is at
-    // `at + (q + 1) * seg - 1 < at + n` in `hist[c]`. It writes
-    // `y_ptr[s][t..t + 4]` for `t` below `seg`, which is its own segment
-    // `y[c][q * seg..(q + 1) * seg]`. The segments of the filters do not
-    // overlap. `hist` and `y` cannot overlap either: one is borrowed
-    // shared and the other mutably. `warmup` and `seg` are multiples of 4.
+    // `at + (q + 1) * seg - 1 < at + n` in `hist[c]`. At step `t` it writes
+    // samples `k..k + 4` of its segment, with `k = t - warmup` below `seg`:
+    // the places `place(c, q * seg + k)` to `place(c, q * seg + k + 3)`.
+    // They are below `C * n <= out.len()`. With `INTERLEAVED` and two
+    // channels the two channels' samples `k..k + 4` of segment `q` are the
+    // eight values from `2 * (q * seg + k)`. The filters write different
+    // places. `hist` and `out` cannot overlap: one is borrowed shared and
+    // the other mutably. `warmup` and `seg` are multiples of 4.
     let (start_mem, end_mem) = unsafe {
         let very_small = vdupq_n_f32(DEEMPH_VERY_SMALL);
         let coef_v = vdupq_n_f32(coef);
@@ -6920,6 +7046,10 @@ fn deemph_segments_neon<const C: usize>(
 
         // The segments.
         while t < warmup + seg {
+            let k = t - warmup;
+            // Row `j` of `rows[g]` holds samples `k..k + 4` of filter
+            // `4 * g + j`.
+            let mut rows = [[very_small; 4]; 2];
             for (g, mg) in m.iter_mut().enumerate() {
                 let mut scaled = [very_small; 4];
                 for (s, x) in scaled.iter_mut().zip(load(g, t)) {
@@ -6928,8 +7058,21 @@ fn deemph_segments_neon<const C: usize>(
                     *s = vmulq_f32(out, scale);
                 }
                 // Back to one vector of four samples per filter.
-                for (j, row) in transpose4(scaled).into_iter().enumerate() {
-                    vst1q_f32(y_ptr[4 * g + j].add(t - warmup), row);
+                rows[g] = transpose4(scaled);
+            }
+            if INTERLEAVED && C == 2 {
+                // Group `c` holds the four segments of channel `c`.
+                for q in 0..4 {
+                    let p = o.add(2 * (q * seg + k));
+                    vst1q_f32(p, vzip1q_f32(rows[0][q], rows[1][q]));
+                    vst1q_f32(p.add(4), vzip2q_f32(rows[0][q], rows[1][q]));
+                }
+            } else {
+                for (g, group) in rows.iter().enumerate() {
+                    for (j, row) in group.iter().enumerate() {
+                        let s = 4 * g + j;
+                        vst1q_f32(o.add(place(s / per_ch, (s % per_ch) * seg + k)), *row);
+                    }
                 }
             }
             t += 4;
@@ -6953,8 +7096,11 @@ fn deemph_segments_neon<const C: usize>(
                 #[cfg(all(test, feature = "std"))]
                 DEEMPH_RECOMPUTED.with(|count| count.set(count.get() + 1));
                 let x = &hist[c][at + q * seg..at + (q + 1) * seg];
-                let out = &mut y[c][q * seg..(q + 1) * seg];
-                deemph_mono(x, out, 1, coef, exact, |o, v| *o = v)
+                let mut m = exact;
+                for (i, &x) in x.iter().enumerate() {
+                    out[place(c, q * seg + i)] = deemph_step(x, &mut m, coef) * DEEMPH_SCALE;
+                }
+                m
             };
         }
         next_mem[c] = exact;
@@ -6999,6 +7145,51 @@ fn emit_stereo<'a>(
             put(o0, g0[0]);
             put(o1, g1[0]);
         }
+    }
+}
+
+/// The pitch post-filter of a frame of `n` samples, in place in the
+/// histories `bufs` of all channels (see `CeltDecoder::postfilter`).
+/// `filters` holds the period, gain and tapset of the filter before last,
+/// of the last one and of this frame's.
+#[inline(always)]
+fn postfilter_frame<const C: usize>(
+    mode: &CeltMode,
+    bufs: &mut [&mut [f32]; C],
+    n: usize,
+    lm: usize,
+    filters: [(usize, f32, i32); 3],
+) {
+    let short_n = mode.short_mdct_size;
+    let at = DECODE_BUFFER_SIZE - n;
+    let [old, last, new] = filters;
+    comb_filter_inplace(
+        bufs,
+        at,
+        old.0,
+        last.0,
+        short_n,
+        old.1,
+        last.1,
+        old.2,
+        last.2,
+        mode.window,
+        mode.overlap,
+    );
+    if lm != 0 {
+        comb_filter_inplace(
+            bufs,
+            at + short_n,
+            last.0,
+            new.0,
+            n - short_n,
+            last.1,
+            new.1,
+            last.2,
+            new.2,
+            mode.window,
+            mode.overlap,
+        );
     }
 }
 
@@ -7818,42 +8009,20 @@ impl CeltDecoder {
     /// one. The rest of the frame cross-fades from the last filter to the
     /// one given here.
     fn postfilter(&mut self, n: usize, lm: usize, pitch: usize, gain: f32, tapset: i32) {
-        let mode = self.mode;
-        let overlap = mode.overlap;
-        let short_n = mode.short_mdct_size;
-        let chan_mem = DECODE_BUFFER_SIZE + overlap;
-        let at = DECODE_BUFFER_SIZE - n;
-        for ch in 0..self.channels {
-            let hist = self.hist_start(ch);
-            let buf = &mut self.decode_mem[hist..hist + chan_mem];
-            comb_filter_inplace(
-                buf,
-                at,
-                self.prefilter_period_old,
-                self.prefilter_period,
-                short_n,
-                self.prefilter_gain_old,
-                self.prefilter_gain,
-                self.prefilter_tapset_old,
-                self.prefilter_tapset,
-                mode.window,
-                overlap,
-            );
-            if lm != 0 {
-                comb_filter_inplace(
-                    buf,
-                    at + short_n,
-                    self.prefilter_period,
-                    pitch,
-                    n - short_n,
-                    self.prefilter_gain,
-                    gain,
-                    self.prefilter_tapset,
-                    tapset,
-                    mode.window,
-                    overlap,
-                );
-            }
+        let filters = [
+            (self.prefilter_period_old, self.prefilter_gain_old, self.prefilter_tapset_old),
+            (self.prefilter_period, self.prefilter_gain, self.prefilter_tapset),
+            (pitch, gain, tapset),
+        ];
+        let chan_mem = DECODE_BUFFER_SIZE + CELT_OVERLAP;
+        let pos = self.hist_pos;
+        let (mem0, mem1) = self.decode_mem.split_at_mut(CELT_HIST_STRIDE);
+        let ch0 = &mut mem0[pos..pos + chan_mem];
+        if self.channels == 2 {
+            let ch1 = &mut mem1[pos..pos + chan_mem];
+            postfilter_frame(self.mode, &mut [ch0, ch1], n, lm, filters);
+        } else {
+            postfilter_frame(self.mode, &mut [ch0], n, lm, filters);
         }
     }
 
@@ -7911,10 +8080,11 @@ impl CeltDecoder {
     /// `deemphasis` for frames of 10 and 20 ms, with the filter computed in
     /// segments (`deemph_segments_neon`). The output is the same.
     ///
-    /// The filter writes straight into `pcm` when `pcm` takes one channel
-    /// after the other at 48 kHz. For the other layouts and rates it writes
-    /// into `w_freq`, which is free once the frame is synthesised, and a
-    /// second pass puts the samples in their places.
+    /// The filter writes straight into `pcm` when the output rate is 48 kHz
+    /// and the frame replaces what `pcm` holds. When the frame is added to
+    /// `pcm`, or the output rate is lower, it writes into `w_freq`, which is
+    /// free once the frame is synthesised, and a second pass puts the
+    /// samples in their places.
     #[cfg(target_arch = "aarch64")]
     fn deemphasis_in_segments(
         &mut self,
@@ -7931,13 +8101,14 @@ impl CeltDecoder {
         let add = |o: &mut f32, v: f32| *o += v;
         let (h0, h1) = (self.hist_start(0), self.hist_start(1));
         let hist0 = &self.decode_mem[h0..h0 + chan_mem];
+        let warmup = DEEMPH_WARMUP;
         if self.channels == 1 {
             let m = [self.preemph_mem[0]];
             let m = if ds == 1 && layout != PcmLayout::InterleavedAdd {
-                deemph_segments_neon([hist0], at, [&mut pcm[..n]], DEEMPH_WARMUP, coef, m)
+                deemph_segments_neon::<1, false>([hist0], at, pcm, n, warmup, coef, m)
             } else {
                 let y = &mut self.w_freq[..n];
-                let m = deemph_segments_neon([hist0], at, [&mut *y], DEEMPH_WARMUP, coef, m);
+                let m = deemph_segments_neon::<1, false>([hist0], at, y, n, warmup, coef, m);
                 let out = &mut pcm[..api_frame_size];
                 if layout == PcmLayout::InterleavedAdd {
                     emit_mono(y, out, ds, add);
@@ -7951,12 +8122,13 @@ impl CeltDecoder {
             let hist = [hist0, &self.decode_mem[h1..h1 + chan_mem]];
             let m = [self.preemph_mem[0], self.preemph_mem[1]];
             let m = if ds == 1 && layout == PcmLayout::Planar {
-                let (out0, out1) = pcm[..2 * n].split_at_mut(n);
-                deemph_segments_neon(hist, at, [out0, out1], DEEMPH_WARMUP, coef, m)
+                deemph_segments_neon::<2, false>(hist, at, pcm, n, warmup, coef, m)
+            } else if ds == 1 && layout == PcmLayout::Interleaved {
+                deemph_segments_neon::<2, true>(hist, at, pcm, n, warmup, coef, m)
             } else {
-                let (y0, y1) = self.w_freq[..2 * n].split_at_mut(n);
-                let m =
-                    deemph_segments_neon(hist, at, [&mut *y0, &mut *y1], DEEMPH_WARMUP, coef, m);
+                let y = &mut self.w_freq[..2 * n];
+                let m = deemph_segments_neon::<2, false>(hist, at, y, n, warmup, coef, m);
+                let (y0, y1) = y.split_at(n);
                 let out = &mut pcm[..2 * api_frame_size];
                 match layout {
                     PcmLayout::Planar => {
@@ -8028,13 +8200,15 @@ impl CeltDecoder {
         } else {
             None
         };
-        plc_pitch_downsample(ch0, ch1, lp);
-        let lag = plc_pitch_search(
+        match ch1 {
+            Some(ch1) => pitch_downsample(&[ch0, ch1], lp, DECODE_BUFFER_SIZE >> 1, 2, 2),
+            None => pitch_downsample(&[ch0], lp, DECODE_BUFFER_SIZE >> 1, 1, 2),
+        }
+        let lag = pitch_search(
             &lp[PLC_PITCH_LAG_MAX >> 1..],
             lp,
             DECODE_BUFFER_SIZE - PLC_PITCH_LAG_MAX,
             PLC_PITCH_LAG_MAX - PLC_PITCH_LAG_MIN,
-            &mut self.w_x[..],
         );
         // The lag is below PLC_PITCH_LAG_MAX - PLC_PITCH_LAG_MIN, so the
         // period is within the two limits.
@@ -8140,6 +8314,8 @@ impl CeltDecoder {
                     // Predictor for the last PLC_MAX_PERIOD samples before
                     // the loss (libopus `_celt_autocorr` with the window,
                     // then `_celt_lpc`).
+                    // The window is applied to a copy here, which saves
+                    // the stack copy that `autocorr` makes for a window.
                     let xx = &mut tmp[..PLC_MAX_PERIOD];
                     xx.copy_from_slice(&exc_all[PLC_LPC_ORDER..]);
                     for i in 0..overlap {
@@ -8147,7 +8323,7 @@ impl CeltDecoder {
                         xx[PLC_MAX_PERIOD - 1 - i] *= window[i];
                     }
                     let mut ac = [0.0f32; PLC_LPC_ORDER + 1];
-                    plc_autocorr(xx, &mut ac, PLC_LPC_ORDER);
+                    autocorr(xx, &mut ac, None, 0, PLC_LPC_ORDER, PLC_MAX_PERIOD);
                     // Noise floor at -40 dB.
                     ac[0] *= 1.0001;
                     // Lag windowing keeps the recursion stable.
@@ -8155,13 +8331,13 @@ impl CeltDecoder {
                         let lag = i as f32;
                         ac[i] = mac(ac[i], -(ac[i] * (0.008f32 * 0.008f32) * lag), lag);
                     }
-                    plc_lpc(lpc, &ac);
+                    celt_lpc::lpc(lpc, &ac, PLC_LPC_ORDER);
                 }
 
                 // Excitation of the last `exc_length` samples before the
                 // loss.
                 let exc_start = PLC_LPC_ORDER + PLC_MAX_PERIOD - exc_length;
-                plc_fir(exc_all, exc_start, lpc, &mut tmp[..exc_length]);
+                celt_fir(exc_all, exc_start, lpc, &mut tmp[..exc_length]);
                 exc_all[exc_start..].copy_from_slice(&tmp[..exc_length]);
                 let exc = &exc_all[PLC_LPC_ORDER..];
 
@@ -8203,7 +8379,7 @@ impl CeltDecoder {
 
                 // Back to the signal domain. The filter continues from the
                 // last decoded samples, so the signal stays continuous.
-                plc_iir(buf, at, extrapolation_len, lpc);
+                celt_iir(buf, at, extrapolation_len, lpc);
 
                 // The synthesis can come out louder than the signal it
                 // copies, when the signal changed inside the analysed
@@ -8270,16 +8446,17 @@ mod tests {
     fn cancelled_prefilter_still_fades_out_previous_filter() {
         let mode = modes::default_mode();
         let (n, overlap, max_period) = (960, mode.overlap, COMBFILTER_MAXPERIOD);
-        let mut mem: Vec<f32> = (0..max_period)
-            .map(|i| (i as f32 * 0.3).sin() * 1000.0)
-            .collect();
+        // The history of the pre-filter, then room for the frame.
+        let mut pre = vec![0.0f32; PREFILTER_STRIDE];
+        for (i, v) in pre[..max_period].iter_mut().enumerate() {
+            *v = (i as f32 * 0.3).sin() * 1000.0;
+        }
         let mut in_buf = vec![0.0f32; n + overlap];
-        let mut pre = vec![0.0f32; max_period + n];
         let mut pitch_buf = vec![0.0f32; (max_period + n) >> 1];
         let (mut before, mut after) = ([0.0f32], [0.0f32]);
         let (pf_on, gain, _) = run_prefilter(
             &mut in_buf,
-            &mut mem,
+            &mut pre,
             100,
             0.5,
             0,
@@ -8288,7 +8465,6 @@ mod tests {
             1,
             n,
             overlap,
-            &mut pre,
             &mut pitch_buf,
             &mut before,
             &mut after,
@@ -8310,5 +8486,140 @@ mod tests {
             body[overlap..].iter().all(|&v| v == 0.0),
             "frame past the overlap must be the unfiltered input"
         );
+    }
+
+    // libopus `OPUS_SET_BITRATE` of the CELT encoder lowers the bitrate to
+    // 750 kb/s per channel. No stream tried so far has packets that depend
+    // on that limit: a frame never takes more than 1275 bytes, and above
+    // the limit the bitrate only moves the VBR target further past that.
+    // So the stored value is checked here.
+    #[test]
+    fn bitrate_is_limited_to_750_kbps_per_channel() {
+        let mode = modes::default_mode();
+        for channels in [1usize, 2] {
+            let mut enc = CeltEncoder::new(mode, channels);
+            let limit = 750_000 * channels as i32;
+            for (set, kept) in [
+                (64_000, 64_000),
+                (limit, limit),
+                (limit + 1, limit),
+                (3_000_000, limit),
+                (OPUS_BITRATE_MAX, OPUS_BITRATE_MAX),
+            ] {
+                enc.set_bitrate(set).unwrap();
+                assert_eq!(enc.bitrate, kept, "{channels} channels, set {set}");
+            }
+        }
+    }
+}
+
+/// The comb filter against `comb_filter` of the libopus these tests link
+/// (celt/celt.c, exported by the static library), in place as the decoder
+/// calls it and from one buffer into another as the encoder does.
+#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
+mod comb_filter_libopus_tests {
+    use super::*;
+    use audiopus_sys as _;
+
+    unsafe extern "C" {
+        /// `void comb_filter(opus_val32 *y, opus_val32 *x, int T0, int T1,
+        /// int N, opus_val16 g0, opus_val16 g1, int tapset0, int tapset1,
+        /// const celt_coef *window, int overlap, int arch)`, float build.
+        #[link_name = "comb_filter"]
+        fn c_comb_filter(
+            y: *mut f32,
+            x: *mut f32,
+            t0: i32,
+            t1: i32,
+            n: i32,
+            g0: f32,
+            g1: f32,
+            tapset0: i32,
+            tapset1: i32,
+            window: *const f32,
+            overlap: i32,
+            arch: i32,
+        );
+    }
+
+    /// Periods, gains (multiples of 0.09375, as the codec quantizes them, 0
+    /// included), tapsets and frame lengths of the codec, in many
+    /// combinations. Old and new filter are the same in one case of five,
+    /// so the cross-fade is skipped there.
+    fn cases() -> impl Iterator<Item = (usize, usize, usize, f32, f32, i32, i32)> {
+        (0..600usize).map(|round| {
+            let n = [960usize, 120, 480, 240, 840, 360][round % 6];
+            let t0 = 15 + (round * 37) % 1008;
+            let mut t1 = 15 + (round * 53) % 1008;
+            let g0 = 0.09375 * (round % 9) as f32;
+            let mut g1 = 0.09375 * ((round / 9) % 9) as f32;
+            let tapset0 = (round % 3) as i32;
+            let mut tapset1 = ((round / 3) % 3) as i32;
+            if round % 5 == 0 {
+                (t1, g1, tapset1) = (t0, g0, tapset0);
+            }
+            (n, t0, t1, g0, g1, tapset0, tapset1)
+        })
+    }
+
+    fn signal(len: usize, seed: &mut u32) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((*seed >> 8) as f32 / 8_388_608.0 - 1.0) * 3000.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_place_filter_is_the_one_of_libopus() {
+        let window = crate::modes::default_mode().window;
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        let mut seed = 3u32;
+        for (n, t0, t1, g0, g1, tapset0, tapset1) in cases() {
+            let at = COMBFILTER_MAXPERIOD + 4;
+            let input = [signal(at + n, &mut seed), signal(at + n, &mut seed)];
+            let mut want = input.clone();
+            // SAFETY: the filter reads `t + 2` samples before `at` and
+            // writes `n` samples from `at`, all inside `buf`.
+            unsafe {
+                for buf in want.iter_mut() {
+                    let p = buf.as_mut_ptr().add(at);
+                    c_comb_filter(p, p, t0 as i32, t1 as i32, n as i32, g0, g1, tapset0, tapset1, window.as_ptr(), CELT_OVERLAP as i32, 0);
+                }
+            }
+            let what = format!("n {n} t0 {t0} t1 {t1} g0 {g0} g1 {g1} tapsets {tapset0} {tapset1}");
+
+            let mut got = input[0].clone();
+            comb_filter_inplace(&mut [&mut got[..]], at, t0, t1, n, g0, g1, tapset0, tapset1, window, CELT_OVERLAP);
+            assert!(same(&got, &want[0]), "one channel: {what}");
+
+            // The two channels of a stereo frame, filtered together.
+            let [mut got0, mut got1] = input;
+            let bufs = &mut [&mut got0[..], &mut got1[..]];
+            comb_filter_inplace(bufs, at, t0, t1, n, g0, g1, tapset0, tapset1, window, CELT_OVERLAP);
+            assert!(same(&got0, &want[0]), "channel 0 of 2: {what}");
+            assert!(same(&got1, &want[1]), "channel 1 of 2: {what}");
+        }
+    }
+
+    #[test]
+    fn filter_into_another_buffer_is_the_one_of_libopus() {
+        let window = crate::modes::default_mode().window;
+        let mut seed = 5u32;
+        for (n, t0, t1, g0, g1, tapset0, tapset1) in cases() {
+            let at = COMBFILTER_MAXPERIOD + 4;
+            let mut x = signal(at + n, &mut seed);
+            let mut got = vec![0.0f32; n];
+            let mut want = vec![0.0f32; n];
+            comb_filter(&mut got, &x, 0, at, t0, t1, n, g0, g1, tapset0, tapset1, window, CELT_OVERLAP);
+            // SAFETY: the filter reads `x[at - t - 2..at + n]` and writes
+            // `want[..n]`.
+            unsafe {
+                c_comb_filter(want.as_mut_ptr(), x.as_mut_ptr().add(at), t0 as i32, t1 as i32, n as i32, g0, g1, tapset0, tapset1, window.as_ptr(), CELT_OVERLAP as i32, 0);
+            }
+            let what = format!("n {n} t0 {t0} t1 {t1} g0 {g0} g1 {g1} tapsets {tapset0} {tapset1}");
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{what}");
+        }
     }
 }

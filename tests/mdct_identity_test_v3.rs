@@ -1,4 +1,4 @@
-use opus1::mdct::MdctLookup;
+use opus1::internals::mdct::MdctLookup;
 
 #[test]
 fn test_mdct_scaling() {

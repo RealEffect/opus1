@@ -17,7 +17,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -256,11 +256,11 @@ fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
     let input = voiced(sr, ch, frame * packets);
 
     let mut enc = OpusEncoder::new(sr as i32, ch, Application::Voip).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.use_cbr = cbr;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_vbr(!cbr);
     if fec {
-        enc.use_inband_fec = true;
-        enc.packet_loss_perc = 40;
+        enc.set_inband_fec(true);
+        enc.set_packet_loss_perc(40).unwrap();
     }
     let mut c_dec = CDec::new(sr as u32, c_channels(ch)).unwrap();
     let mut c_fec = CDec::new(sr as u32, c_channels(ch)).unwrap();

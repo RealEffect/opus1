@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 {
@@ -40,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Test various bitrates
-    encoder.bitrate_bps = match data[3] % 8 {
+    let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(match data[3] % 8 {
         0 => 6000,
         1 => 16000,
         2 => 32000,
@@ -49,10 +49,10 @@ fuzz_target!(|data: &[u8]| {
         5 => 128000,
         6 => 256000,
         _ => 510000,
-    };
+    }));
 
     // Test complexity
-    encoder.complexity = (data[4] % 11) as i32 - 1;
+    let _ = encoder.set_complexity((data[4] % 11) as i32 - 1);
 
     // Generate input with various spectral characteristics
     let samples_needed = frame_size * channels;

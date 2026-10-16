@@ -1,4 +1,4 @@
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 fn make_sine(
     freq: f64,
@@ -76,10 +76,10 @@ fn test_celt_multi_frame_code_0_and_1() {
     let fs = 960;
 
     let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
-    enc.bitrate_bps = 64000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
-    enc.use_cbr = true;
+    enc.set_vbr(false);
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(440.0, sr, fs, ch, 1);
@@ -129,7 +129,7 @@ fn test_celt_multi_frame_code_2() {
     let fs = 960;
 
     let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
-    enc.bitrate_bps = 64000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(880.0, sr, fs, ch, 1);
@@ -175,10 +175,10 @@ fn test_celt_multi_frame_code_3_with_padding() {
     let fs = 960;
 
     let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
-    enc.bitrate_bps = 64000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     // Zero-padding payloads is only neutral when both already share a size;
     // VBR sizes vary legitimately, so pin CBR to keep the resize a no-op.
-    enc.use_cbr = true;
+    enc.set_vbr(false);
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(660.0, sr, fs, ch, 1);
     let pkt0 = encode_full(&mut enc, &pcm0, fs, 400);
@@ -229,7 +229,7 @@ fn test_celt_multi_frame_code_3_self_delimiting() {
     let fs = 960;
 
     let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
-    enc.bitrate_bps = 64000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(880.0, sr, fs, ch, 1);
@@ -276,8 +276,8 @@ fn test_silk_multi_frame_code_3_padding_roundtrip() {
     let target_size = 100usize;
 
     let mut enc = OpusEncoder::new(sr, ch, Application::Voip).unwrap();
-    enc.bitrate_bps = 24000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_vbr(false);
 
     let mut dec = OpusDecoder::new(sr, ch).unwrap();
 
@@ -307,10 +307,10 @@ fn test_hybrid_multi_frame_roundtrip() {
     let ch = 1;
     let fs = 960;
     let mut enc = OpusEncoder::new(sr, ch, Application::Audio).unwrap();
-    enc.bitrate_bps = 64000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
-    enc.use_cbr = true;
+    enc.set_vbr(false);
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(660.0, sr, fs, ch, 1);
@@ -354,14 +354,14 @@ fn test_multi_frame_code_2_unequal_payloads() {
     let fs = 960;
 
     let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
-    enc.bitrate_bps = 64000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
 
     let pcm_silence = vec![0.0f32; fs];
     let pcm_tone = make_sine(440.0, sr, fs, ch, 0);
     let pkt_sil = encode_full(&mut enc, &pcm_silence, fs, 400);
     // fresh encoder for tone to avoid state interference
     let mut enc2 = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
-    enc2.bitrate_bps = 64000;
+    enc2.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     let pkt_tone = encode_full(&mut enc2, &pcm_tone, fs, 400);
 
     // Baseline: both frames through same decoder
@@ -404,10 +404,10 @@ fn test_multi_frame_all_codes_stereo() {
     let fs = 960;
 
     let mut enc = OpusEncoder::new(sr, ch, Application::Audio).unwrap();
-    enc.bitrate_bps = 96000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(96000)).unwrap();
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
-    enc.use_cbr = true;
+    enc.set_vbr(false);
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(660.0, sr, fs, ch, 1);

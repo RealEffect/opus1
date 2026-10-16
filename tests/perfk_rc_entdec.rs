@@ -11,8 +11,8 @@
 //! whose two parts combine to more than its limit, raw bits read past the
 //! start of the packet, range coder bytes read past its end.
 
-use opus1::quant_bands::E_PROB_MODEL;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::quant_bands::E_PROB_MODEL;
+use opus1::internals::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uint};
 
 /// `ec_ctx` of libopus (celt/entcode.h).

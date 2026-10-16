@@ -33,8 +33,7 @@ use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::multistream::encoder::Bitrate;
-use opus1::{Application, Bandwidth, ForcedMode};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode};
 
 /// A small deterministic random number generator.
 struct Lcg(u32);

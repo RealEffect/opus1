@@ -11,10 +11,10 @@
 //!
 //! - `silk_nlsf_del_dec_quant_reference` follows the libopus code line by
 //!   line.
-//! - `silk_nlsf_del_dec_quant_tables` is the fast version. It keeps each
-//!   candidate in one 64-bit word and prunes without branches. It hands over
-//!   to the reference version in the one case it does not cover (a negative
-//!   rate-distortion value).
+//! - `silk_nlsf_del_dec_quant_group` is the fast version, for several
+//!   searches at once. It keeps each candidate in one 64-bit word and prunes
+//!   without branches. It hands over to the reference version in the one
+//!   case it does not cover (a negative rate-distortion value).
 
 use core::hint::select_unpredictable as select;
 
@@ -185,7 +185,7 @@ fn lowest(rd_q25: &[i32; 2 * N_STATES]) -> (usize, i32) {
     (best, min_q25)
 }
 
-/// The search as libopus writes it. `silk_nlsf_del_dec_quant_tables` gives
+/// The search as libopus writes it. `silk_nlsf_del_dec_quant_group` gives
 /// the same result faster and uses this version for the input it does not
 /// cover.
 ///
@@ -410,19 +410,6 @@ fn prune(better: &[i64; N_STATES], worse: &[i64; N_STATES], paths: &mut Paths) -
     survivors
 }
 
-/// The search, with the tables prepared by the caller (see
-/// `NlsfQuantInput`).
-///
-/// Returns the rate-distortion value (Q25) of the chosen path and writes its
-/// `order` residual indices to `indices`. The result is that of
-/// `silk_nlsf_del_dec_quant_reference`.
-pub(crate) fn silk_nlsf_del_dec_quant_tables(indices: &mut [i8], input: &NlsfQuantInput) -> i32 {
-    let mut group_indices = [[0i8; MAX_LPC_ORDER]; 1];
-    let [rd_q25] = silk_nlsf_del_dec_quant_group(&mut group_indices, core::array::from_ref(input));
-    indices[..input.order].copy_from_slice(&group_indices[0][..input.order]);
-    rd_q25
-}
-
 /// One search of a group after its first coefficients.
 struct Lane {
     /// `state[j]` is the candidate in place `j`.
@@ -584,73 +571,87 @@ pub(crate) fn silk_nlsf_del_dec_quant_group<const K: usize>(
     result
 }
 
-/// Delayed-decision quantiser for the NLSF residual (libopus
-/// `silk_NLSF_del_dec_quant`).
-///
-/// This entry point builds the level table and one rate table per
-/// coefficient on every call. `silk_nlsf_encode` builds the tables once per
-/// frame and calls `silk_nlsf_del_dec_quant_tables` directly.
-pub fn silk_nlsf_del_dec_quant(
-    indices: &mut [i8],
-    x_q10: &[i16],
-    w_q5: &[i16],
-    pred_coef_q8: &[u8],
-    ec_ix: &[i16],
-    ec_rates_q5: &[u8],
-    quant_step_size_q16: i32,
-    inv_quant_step_size_q6: i16,
-    mu_q20: i32,
-    order: i16,
-) -> i32 {
-    let order = order as usize;
-    assert!(order <= MAX_LPC_ORDER);
-
-    let mut x = [0i16; MAX_LPC_ORDER];
-    let mut w = [0i16; MAX_LPC_ORDER];
-    let mut pred = [0u8; MAX_LPC_ORDER];
-    x[..order].copy_from_slice(&x_q10[..order]);
-    w[..order].copy_from_slice(&w_q5[..order]);
-    pred[..order].copy_from_slice(&pred_coef_q8[..order]);
-
-    let mut rate_cost = [[0i32; NLSF_QUANT_LEVELS]; MAX_LPC_ORDER];
-    let mut rate_row = [0u8; MAX_LPC_ORDER];
-    for i in 0..order {
-        // A rate outside `ec_rates_q5` is never used by a valid codebook;
-        // it counts as zero here.
-        let mut table_rates_q5 = [0u8; NLSF_EC_TABLE_LEN];
-        if let Some(table) = usize::try_from(ec_ix[i])
-            .ok()
-            .and_then(|start| ec_rates_q5.get(start..))
-        {
-            for (rate, &from_table) in table_rates_q5.iter_mut().zip(table) {
-                *rate = from_table;
-            }
-        }
-        rate_cost[i] = silk_nlsf_rate_cost(mu_q20, &table_rates_q5);
-        rate_row[i] = i as u8;
-    }
-
-    silk_nlsf_del_dec_quant_tables(
-        indices,
-        &NlsfQuantInput {
-            x_q10: &x,
-            w_q5: &w,
-            pred_coef_q8: &pred,
-            rate_cost: &rate_cost,
-            rate_row: &rate_row,
-            levels: &silk_nlsf_quant_levels(quant_step_size_q16),
-            inv_quant_step_size_q6,
-            order,
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::silk::define::{NLSF_QUANT_MAX_AMPLITUDE, NLSF_QUANT_MAX_AMPLITUDE_EXT};
     use crate::silk::macros::{silk_limit, silk_smlabb};
     use crate::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
+
+    /// The search, with the tables prepared by the caller (see
+    /// `NlsfQuantInput`).
+    ///
+    /// Returns the rate-distortion value (Q25) of the chosen path and writes its
+    /// `order` residual indices to `indices`. The result is that of
+    /// `silk_nlsf_del_dec_quant_reference`.
+    fn silk_nlsf_del_dec_quant_tables(indices: &mut [i8], input: &NlsfQuantInput) -> i32 {
+        let mut group_indices = [[0i8; MAX_LPC_ORDER]; 1];
+        let [rd_q25] = silk_nlsf_del_dec_quant_group(&mut group_indices, core::array::from_ref(input));
+        indices[..input.order].copy_from_slice(&group_indices[0][..input.order]);
+        rd_q25
+    }
+
+    /// Delayed-decision quantiser for the NLSF residual (libopus
+    /// `silk_NLSF_del_dec_quant`).
+    ///
+    /// With libopus's arguments. It builds the level table and one rate table
+    /// per coefficient on every call. `silk_nlsf_encode` builds the tables
+    /// once per frame and calls `silk_nlsf_del_dec_quant_group`.
+    #[allow(clippy::too_many_arguments)]
+    fn silk_nlsf_del_dec_quant(
+        indices: &mut [i8],
+        x_q10: &[i16],
+        w_q5: &[i16],
+        pred_coef_q8: &[u8],
+        ec_ix: &[i16],
+        ec_rates_q5: &[u8],
+        quant_step_size_q16: i32,
+        inv_quant_step_size_q6: i16,
+        mu_q20: i32,
+        order: i16,
+    ) -> i32 {
+        let order = order as usize;
+        assert!(order <= MAX_LPC_ORDER);
+
+        let mut x = [0i16; MAX_LPC_ORDER];
+        let mut w = [0i16; MAX_LPC_ORDER];
+        let mut pred = [0u8; MAX_LPC_ORDER];
+        x[..order].copy_from_slice(&x_q10[..order]);
+        w[..order].copy_from_slice(&w_q5[..order]);
+        pred[..order].copy_from_slice(&pred_coef_q8[..order]);
+
+        let mut rate_cost = [[0i32; NLSF_QUANT_LEVELS]; MAX_LPC_ORDER];
+        let mut rate_row = [0u8; MAX_LPC_ORDER];
+        for i in 0..order {
+            // A rate outside `ec_rates_q5` is never used by a valid codebook;
+            // it counts as zero here.
+            let mut table_rates_q5 = [0u8; NLSF_EC_TABLE_LEN];
+            if let Some(table) = usize::try_from(ec_ix[i])
+                .ok()
+                .and_then(|start| ec_rates_q5.get(start..))
+            {
+                for (rate, &from_table) in table_rates_q5.iter_mut().zip(table) {
+                    *rate = from_table;
+                }
+            }
+            rate_cost[i] = silk_nlsf_rate_cost(mu_q20, &table_rates_q5);
+            rate_row[i] = i as u8;
+        }
+
+        silk_nlsf_del_dec_quant_tables(
+            indices,
+            &NlsfQuantInput {
+                x_q10: &x,
+                w_q5: &w,
+                pred_coef_q8: &pred,
+                rate_cost: &rate_cost,
+                rate_row: &rate_row,
+                levels: &silk_nlsf_quant_levels(quant_step_size_q16),
+                inv_quant_step_size_q6,
+                order,
+            },
+        )
+    }
 
     /// A direct port of libopus `silk_NLSF_del_dec_quant`, the reference
     /// for the two versions in this file. The tests require that every

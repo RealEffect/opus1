@@ -15,9 +15,9 @@ mod k24_common;
 use audiopus_sys as sys;
 use celtdec_common::*;
 use k24_common::*;
-use opus1::celt::{CeltDecoder, PcmLayout};
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::{CeltDecoder, PcmLayout};
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// Decode all of `payload` as one CELT frame of `frame` samples per channel.
 fn decode_all(

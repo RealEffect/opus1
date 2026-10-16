@@ -18,9 +18,9 @@ mod celtdec_common;
 mod k24_common;
 use celtdec_common::*;
 use k24_common::*;
-use opus1::celt::{CeltDecoder, PcmLayout};
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::{CeltDecoder, PcmLayout};
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 const ARM64: bool = cfg!(target_arch = "aarch64");
 /// Lowest median SNR of pitch-concealed frames against libopus, in dB.

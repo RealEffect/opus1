@@ -50,8 +50,8 @@ use ms_support::{
     OPUS_SET_FORCE_MODE_REQUEST, OPUS_SET_LFE_REQUEST, max_packet_bytes, noise, split_streams, toc,
     tones, voiced,
 };
-use opus1::multistream::surround::SurroundProbe;
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::internals::multistream::surround::SurroundProbe;
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 use std::os::raw::{c_int, c_void};
 
 const NB_BANDS: usize = 21;
@@ -732,8 +732,8 @@ fn rust_stream_bytes(setup: Setup, pcm: &[f32], rates: &[i32], use_mask: bool) -
         .map(|(s, of)| {
             let stream_channels = if of.1.is_some() { 2 } else { 1 };
             let mut enc = OpusEncoder::new(fs, stream_channels, Application::Audio).unwrap();
-            enc.bitrate_bps = rates[s];
-            enc.use_cbr = false;
+            enc.set_bitrate(Bitrate::BitsPerSecond(rates[s])).unwrap();
+            enc.set_vbr(true);
             enc.set_bandwidth(bandwidth);
             enc.set_force_mode(Some(ForcedMode::CeltOnly));
             enc.set_lfe(lfe_stream == Some(s));

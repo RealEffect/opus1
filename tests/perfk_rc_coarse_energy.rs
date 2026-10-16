@@ -14,9 +14,9 @@
 //! drop fast in many bands, which is where the limit on the decay applies
 //! and where the count of `badness` matters.
 
-use opus1::modes::default_mode;
-use opus1::quant_bands::quant_coarse_energy_advanced;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::modes::default_mode;
+use opus1::internals::quant_bands::quant_coarse_energy_advanced;
+use opus1::internals::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uint, c_void};
 
 /// `ec_ctx` of libopus (celt/entcode.h).

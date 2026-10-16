@@ -7,7 +7,7 @@
 //! unchecked indexing below `storage`, and `encode_icdf` read the caller's
 //! table with an unchecked symbol.
 
-use opus1::range_coder::{BITRES, RANGE_BUF_MAX, RangeCoder};
+use opus1::internals::range_coder::{RANGE_BUF_MAX, RangeCoder};
 
 /// Small deterministic pseudo-random generator.
 struct Lcg(u64);
@@ -118,47 +118,3 @@ fn encode_icdf_round_trip_for_every_symbol() {
     }
 }
 
-/// `tell_frac_inline!` gives the value of `tell_frac` for every range a
-/// coder can have between two symbols (above 2^23).
-#[test]
-fn tell_frac_inline_matches_tell_frac() {
-    let mut rng = Lcg(5);
-    let mut rc = RangeCoder::new_encoder(64);
-    let mut ranges: Vec<u32> = vec![(1 << 23) + 1, (1 << 24) - 1, 1 << 24, 1 << 31, u32::MAX];
-    for shift in 0..8 {
-        // Around each threshold of the correction table.
-        for c in [35733u32, 38967, 42495, 46340, 50535, 55109, 60097, 65535] {
-            for d in [0u32, 1] {
-                ranges.push(((c + d) << 8 >> shift).max((1 << 23) + 1));
-            }
-        }
-    }
-    for _ in 0..20_000 {
-        ranges.push(rng.next().max((1 << 23) + 1));
-    }
-    for rng_value in ranges {
-        rc.rng = rng_value;
-        rc.nbits_total = 33 + (rng.next() % 10_000) as i32;
-        let inline = opus1::tell_frac_inline!(rc);
-        assert_eq!(inline, rc.tell_frac(), "rng {rng_value:#x}");
-    }
-}
-
-/// A range that no coder has between symbols (zero, or below 2^15) must not
-/// make `tell_frac_inline!` read outside its table. The value itself has no
-/// meaning; release builds must return and debug builds may panic on the
-/// shift.
-#[test]
-fn tell_frac_inline_stays_inside_its_table_for_any_range() {
-    let mut rc = RangeCoder::new_encoder(64);
-    for rng_value in [0u32, 1, 255, 1 << 15, (1 << 16) - 1, 1 << 16, 1 << 22] {
-        rc.rng = rng_value;
-        let result = std::panic::catch_unwind(|| {
-            let rc = rc.clone();
-            opus1::tell_frac_inline!(rc)
-        });
-        if cfg!(not(debug_assertions)) {
-            assert!(result.is_ok(), "rng {rng_value:#x}");
-        }
-    }
-}

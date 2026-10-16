@@ -31,10 +31,10 @@
 mod silkdec_common;
 use silkdec_common::*;
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus1::silk::decoder_structs::SilkDecControl;
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::internals::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+use opus1::internals::silk::decoder_structs::SilkDecControl;
 
 /// The ways a packet is damaged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

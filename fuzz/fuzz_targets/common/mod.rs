@@ -15,6 +15,7 @@
 
 use audiopus_sys as sys;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
+use opus1::Bitrate;
 use std::os::raw::{c_int, c_uchar};
 
 /// The sampling rates Opus supports.
@@ -258,6 +259,99 @@ impl Drop for CMsDecoder {
     }
 }
 
+/// The libopus multistream encoder (`opus_multistream_encoder_create` and
+/// `opus_multistream_surround_encoder_create`), driven by raw controls.
+pub struct CMsEncoder {
+    st: *mut sys::OpusMSEncoder,
+    pub channels: usize,
+}
+
+impl CMsEncoder {
+    /// An encoder for a layout of `streams` streams, the first `coupled` of
+    /// them stereo, and a mapping. Returns the C error code when libopus
+    /// refuses the layout.
+    pub fn new(
+        fs: i32,
+        channels: usize,
+        streams: usize,
+        coupled: usize,
+        mapping: &[u8],
+        application: i32,
+    ) -> std::result::Result<Self, i32> {
+        let mut err = 0;
+        let st = unsafe {
+            sys::opus_multistream_encoder_create(
+                fs,
+                channels as c_int,
+                streams as c_int,
+                coupled as c_int,
+                mapping.as_ptr(),
+                application,
+                &mut err,
+            )
+        };
+        if err != 0 || st.is_null() {
+            return Err(err);
+        }
+        Ok(Self { st, channels })
+    }
+
+    /// An encoder with the layout of a mapping family. Returns the encoder
+    /// and its streams, coupled streams and mapping, or the C error code.
+    pub fn surround(
+        fs: i32,
+        channels: usize,
+        family: u8,
+        application: i32,
+    ) -> std::result::Result<(Self, usize, usize, Vec<u8>), i32> {
+        let (mut streams, mut coupled) = (0, 0);
+        let mut mapping = [0u8; 256];
+        let mut err = 0;
+        let st = unsafe {
+            sys::opus_multistream_surround_encoder_create(
+                fs,
+                channels as c_int,
+                family as c_int,
+                &mut streams,
+                &mut coupled,
+                mapping.as_mut_ptr(),
+                application,
+                &mut err,
+            )
+        };
+        if err != 0 || st.is_null() {
+            return Err(err);
+        }
+        Ok((Self { st, channels }, streams as usize, coupled as usize, mapping[..channels].to_vec()))
+    }
+
+    /// A control that takes one `opus_int32`. Returns the C result.
+    pub fn set(&mut self, request: i32, value: i32) -> i32 {
+        unsafe { sys::opus_multistream_encoder_ctl(self.st, request, value) }
+    }
+
+    /// `opus_multistream_encode_float` into `out`. Returns the packet
+    /// length or an error code.
+    pub fn encode(&mut self, pcm: &[f32], frame_size: usize, out: &mut [u8]) -> i32 {
+        assert!(pcm.len() >= frame_size * self.channels);
+        unsafe {
+            sys::opus_multistream_encode_float(
+                self.st,
+                pcm.as_ptr(),
+                frame_size as c_int,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        }
+    }
+}
+
+impl Drop for CMsEncoder {
+    fn drop(&mut self) {
+        unsafe { sys::opus_multistream_encoder_destroy(self.st) }
+    }
+}
+
 /// The libopus repacketizer (`opus_repacketizer_create`).
 pub struct CRepacketizer(pub *mut sys::OpusRepacketizer);
 
@@ -463,6 +557,67 @@ impl Signal {
         }
         self.t += frame_size as u64;
     }
+}
+
+/// libopus `bitrate_to_bits` (opus_private.h): bits per second to bits
+/// per frame of `frame_size` samples at `fs`.
+pub fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: usize) -> i32 {
+    (bitrate as i64 * 6 / (6 * fs as i64 / frame_size as i64)) as i32
+}
+
+/// libopus `bits_to_bitrate` (opus_private.h): bits per frame to bits per
+/// second.
+pub fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> i32 {
+    (bits as i64 * (6 * fs as i64 / frame_size as i64) / 6) as i32
+}
+
+/// The length libopus gives a constant-bitrate packet of one stream, as the
+/// lowest and the highest length allowed (opus_encoder.c,
+/// `opus_encode_native`):
+///
+/// - The bitrate is that of the setting (`user_bitrate_to_bitrate`: the
+///   automatic one is 60 * fs / frame_size + fs * channels, the maximum
+///   1.5 Mb/s), at most what the buffer holds, and the buffer counts with
+///   at most 6 * 1276 bytes.
+/// - The packet has the whole bytes of that bitrate, rounded to the nearest
+///   byte and at most the buffer (`cbr_bytes`), and at least 1 byte.
+/// - A packet that is too small to code audio is padded to that length too,
+///   but its frame count code can need 2 bytes (C 1340-1406).
+/// - At the maximum bitrate a 40 or 60 ms packet of 20 ms CELT or Hybrid
+///   frames is padded to the whole buffer (C 1749).
+///
+/// `toc` is the first byte of the packet; it tells a SILK-only packet.
+pub fn cbr_packet_len(
+    setting: Bitrate,
+    fs: i32,
+    channels: usize,
+    frame_size: usize,
+    out_len: usize,
+    toc: u8,
+) -> (usize, usize) {
+    let max_data_bytes = out_len.min(6 * 1276) as i32;
+    let max_bitrate = bits_to_bitrate(max_data_bytes * 8, fs, frame_size);
+    let user = match setting {
+        Bitrate::Auto => 60 * fs / frame_size as i32 + fs * channels as i32,
+        Bitrate::Max => 1_500_000,
+        Bitrate::BitsPerSecond(bps) => bps,
+    };
+    let bitrate = user.min(max_bitrate);
+    let cbr_bytes = ((bitrate_to_bits(bitrate, fs, frame_size) + 4) / 8).min(max_data_bytes);
+    let bitrate = bits_to_bitrate(cbr_bytes * 8, fs, frame_size);
+    let max_data_bytes = cbr_bytes.max(1);
+    let frame_rate = fs / frame_size as i32;
+    let no_audio = max_data_bytes < 3
+        || bitrate < 3 * frame_rate * 8
+        || (frame_rate < 50 && (max_data_bytes * frame_rate < 300 || bitrate < 2400));
+    if no_audio {
+        return (max_data_bytes as usize, max_data_bytes.max(2) as usize);
+    }
+    let silk_only = toc >> 3 < 12;
+    if setting == Bitrate::Max && frame_size * 50 > fs as usize && !silk_only {
+        return (out_len, out_len);
+    }
+    (max_data_bytes as usize, max_data_bytes as usize)
 }
 
 /// The frame sizes an encoder takes at `fs`: 2.5, 5, 10, 20, 40 and 60 ms.

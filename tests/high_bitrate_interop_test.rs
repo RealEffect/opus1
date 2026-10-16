@@ -9,7 +9,7 @@
 //! The issue reports the stream decodes to garbage in libopus above ~160 kbps
 //! even though the encoder output looks fine in self-loopback.
 
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::process::Command;
 
 const FRAME_SIZE: usize = 960; // 20 ms @ 48 kHz
@@ -227,7 +227,7 @@ fn high_bitrate_interop() {
     for (sig_name, pcm) in &signals {
         for &kbps in &[128, 160, 176, 192] {
             let mut enc = OpusEncoder::new(48000, 2, Application::Audio).unwrap();
-            enc.bitrate_bps = kbps * 1000;
+            enc.set_bitrate(Bitrate::BitsPerSecond(kbps * 1000)).unwrap();
             let packets = encode_frames(&mut enc, pcm);
 
             let crate_out = decode_with_crate(&packets);

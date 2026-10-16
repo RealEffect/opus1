@@ -11,9 +11,9 @@
 mod celtenc_common;
 
 use celtenc_common::Noise;
-use opus1::celt::CeltEncoder;
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::CeltEncoder;
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// One frame of `n` samples per channel, the channels interleaved.
 fn signal(kind: u32, n: usize, channels: usize, noise: &mut Noise, phase: &mut f32) -> Vec<f32> {

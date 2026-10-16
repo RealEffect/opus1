@@ -13,7 +13,7 @@
 use opus::{
     Application as CApp, Channels as CCh, Decoder as CDec, Encoder as CEnc,
 };
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 const MAX_FRAME: usize = 5760; // 120 ms @ 48 kHz, per channel
@@ -110,8 +110,8 @@ fn rust_enc_c_dec(
     let packets = 1000 / ms;
     let input = voiced(rate, ch, frame * packets);
     let mut enc = OpusEncoder::new(rate as i32, ch, app).unwrap();
-    enc.bitrate_bps = br;
-    enc.use_cbr = cbr;
+    enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    enc.set_vbr(!cbr);
     let mut dec = CDec::new(rate as u32, c_channels(ch)).unwrap();
     let (mut ref_pcm, mut out_pcm) = (Vec::new(), Vec::new());
     let mut pkt = vec![0u8; 8000];
@@ -233,31 +233,46 @@ fn hybrid_60ms_mono_and_stereo() {
 #[test]
 fn issue_repro_exact_config() {
     // From the issue: OpusEncoder::new(16000, 2, Voip), 60 ms = 960 samples.
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
     let pcm = vec![0.1f32; 960 * 2];
     let mut out = vec![0u8; 4000];
+    let mut c_out = vec![0u8; 4000];
+    let mut decoded = vec![0f32; 960 * 2];
+
+    // A new encoder has libopus's automatic bitrate: 60 * 16000 / 960 +
+    // 16000 * 2 = 33 kb/s. At that rate libopus codes SILK too: the 60 ms go
+    // into one SILK wideband frame, TOC config 11, stereo.
+    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
-    // The bitrate of a new opus1 encoder is 64 kb/s. At that rate the
-    // automatic mode is CELT-only, in libopus too: the packet holds three
-    // 20 ms CELT wideband frames (TOC config 23, frame count code 3).
+    assert_eq!(enc.bitrate(), 33_000);
+    let mut c_enc = CEnc::new(16000, CCh::Stereo, CApp::Voip).unwrap();
+    c_enc.set_complexity(enc.complexity()).unwrap();
+    c_enc.encode_float(&pcm, &mut c_out).unwrap();
+    assert_eq!(out[0], c_out[0], "the TOC byte differs from libopus's");
+    assert_eq!(out[0], 0x5c, "expected one SILK WB 60 ms stereo frame, got {:#04x}", out[0]);
+    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    assert_eq!(dec.decode(&out[..n], 960, &mut decoded).unwrap(), 960);
+
+    // At 64 kb/s the automatic mode is CELT-only, in libopus too: the packet
+    // holds three 20 ms CELT wideband frames (TOC config 23, frame count
+    // code 3).
+    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
+    assert!(n > 1);
     let mut c_enc = CEnc::new(16000, CCh::Stereo, CApp::Voip).unwrap();
     c_enc.set_bitrate(opus::Bitrate::Bits(64000)).unwrap();
-    c_enc.set_complexity(enc.complexity).unwrap();
-    let mut c_out = vec![0u8; 4000];
+    c_enc.set_complexity(enc.complexity()).unwrap();
     c_enc.encode_float(&pcm, &mut c_out).unwrap();
     assert_eq!(out[0], c_out[0], "the TOC byte differs from libopus's");
     assert_eq!(out[0], 0xbf, "expected three CELT WB 20 ms frames, got {:#04x}", out[0]);
-
     let mut dec = OpusDecoder::new(16000, 2).unwrap();
-    let mut decoded = vec![0f32; 960 * 2];
-    let got = dec.decode(&out[..n], 960, &mut decoded).unwrap();
-    assert_eq!(got, 960);
+    assert_eq!(dec.decode(&out[..n], 960, &mut decoded).unwrap(), 960);
 
     // At 32 kb/s the same encoder codes SILK, and the 60 ms go into one
     // SILK frame: TOC config 11 = SILK wideband 60 ms.
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
-    enc.bitrate_bps = 32000;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
     assert_eq!(out[0] >> 3, 11, "expected SILK WB 60 ms TOC, got {:#04x}", out[0]);

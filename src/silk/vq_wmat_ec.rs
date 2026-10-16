@@ -101,6 +101,7 @@ fn gain_penalty_q15(gain_q7: i32, max_gain_q7: i32) -> i32 {
 
 /// Total bits (Q8) of a vector: the bits for its residual energy, assuming
 /// 6 dB per bit and sample, plus half of its code length.
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "neon"))))]
 #[inline(always)]
 fn ltp_vq_bits_q8(res_nrg_q15: i32, subfr_len: i32, cl_q5: u8) -> i32 {
     let bits_res_q8 = silk_smulbb(subfr_len, silk_lin2log(res_nrg_q15) - (15 << 7));
@@ -109,6 +110,7 @@ fn ltp_vq_bits_q8(res_nrg_q15: i32, subfr_len: i32, cl_q5: u8) -> i32 {
 
 /// The search, one codebook vector at a time. The three slices are the
 /// codebook: its vectors, the gain of each vector and its code length.
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "neon"))))]
 fn search_scalar(
     xx_q17: &CorrMatrix,
     xx_in_q17: &[i32; LTP_ORDER],
@@ -190,53 +192,6 @@ pub(crate) fn silk_vq_wmat_ec_codebook(
             subfr_len,
             max_gain_q7,
         )
-    }
-}
-
-/// Entropy-constrained search of one LTP codebook for one subframe (libopus
-/// `silk_VQ_WMat_EC`).
-///
-/// The matrix is the 25 values of `xx_q17` from `xx_q17_ptr` and the vector
-/// the 5 values of `xx_q17_in` from `xx_q17_in_ptr`. The first `l` entries of
-/// `cb_q7`, `cb_gain_q7` and `cl_q5` are the codebook. `gain_q7_out` is only
-/// written when a vector qualified.
-pub fn silk_vq_wmat_ec(
-    ind: &mut i8,
-    res_nrg_q15: &mut i32,
-    rate_dist_q7: &mut i32,
-    gain_q7_out: &mut i32,
-    xx_q17: &[i32],
-    xx_q17_ptr: usize,
-    xx_q17_in: &[i32],
-    xx_q17_in_ptr: usize,
-    cb_q7: &[[i8; LTP_ORDER]],
-    cb_gain_q7: &[u8],
-    cl_q5: &[u8],
-    subfr_len: i32,
-    max_gain_q7: i32,
-    l: i32,
-) {
-    let xx_q17: &CorrMatrix = xx_q17[xx_q17_ptr..]
-        .first_chunk()
-        .expect("25 values of the correlation matrix");
-    let xx_in_q17: &[i32; LTP_ORDER] = xx_q17_in[xx_q17_in_ptr..]
-        .first_chunk()
-        .expect("5 values of the correlation vector");
-    let l = l.max(0) as usize;
-    let best = search_scalar(
-        xx_q17,
-        xx_in_q17,
-        &cb_q7[..l],
-        &cb_gain_q7[..l],
-        &cl_q5[..l],
-        subfr_len,
-        max_gain_q7,
-    );
-    *ind = best.ind;
-    *res_nrg_q15 = best.res_nrg_q15;
-    *rate_dist_q7 = best.rate_dist_q7;
-    if let Some(gain_q7) = best.gain_q7 {
-        *gain_q7_out = gain_q7;
     }
 }
 
@@ -448,6 +403,54 @@ mod tests {
         SILK_LTP_GAIN_BITS_Q5_PTRS, SILK_LTP_VQ_GAIN_PTRS_Q7, SILK_LTP_VQ_PTRS_Q7,
         SILK_LTP_VQ_SIZES,
     };
+
+    /// Entropy-constrained search of one LTP codebook for one subframe (libopus
+    /// `silk_VQ_WMat_EC`), with libopus's arguments, over the portable search.
+    ///
+    /// The matrix is the 25 values of `xx_q17` from `xx_q17_ptr` and the vector
+    /// the 5 values of `xx_q17_in` from `xx_q17_in_ptr`. The first `l` entries of
+    /// `cb_q7`, `cb_gain_q7` and `cl_q5` are the codebook. `gain_q7_out` is only
+    /// written when a vector qualified.
+    #[allow(clippy::too_many_arguments)]
+    fn silk_vq_wmat_ec(
+        ind: &mut i8,
+        res_nrg_q15: &mut i32,
+        rate_dist_q7: &mut i32,
+        gain_q7_out: &mut i32,
+        xx_q17: &[i32],
+        xx_q17_ptr: usize,
+        xx_q17_in: &[i32],
+        xx_q17_in_ptr: usize,
+        cb_q7: &[[i8; LTP_ORDER]],
+        cb_gain_q7: &[u8],
+        cl_q5: &[u8],
+        subfr_len: i32,
+        max_gain_q7: i32,
+        l: i32,
+    ) {
+        let xx_q17: &CorrMatrix = xx_q17[xx_q17_ptr..]
+            .first_chunk()
+            .expect("25 values of the correlation matrix");
+        let xx_in_q17: &[i32; LTP_ORDER] = xx_q17_in[xx_q17_in_ptr..]
+            .first_chunk()
+            .expect("5 values of the correlation vector");
+        let l = l.max(0) as usize;
+        let best = search_scalar(
+            xx_q17,
+            xx_in_q17,
+            &cb_q7[..l],
+            &cb_gain_q7[..l],
+            &cl_q5[..l],
+            subfr_len,
+            max_gain_q7,
+        );
+        *ind = best.ind;
+        *res_nrg_q15 = best.res_nrg_q15;
+        *rate_dist_q7 = best.rate_dist_q7;
+        if let Some(gain_q7) = best.gain_q7 {
+            *gain_q7_out = gain_q7;
+        }
+    }
 
     /// The function as it was before this file had two versions: a direct
     /// port of libopus `silk_VQ_WMat_EC`, with the two additions that can

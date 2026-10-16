@@ -6,7 +6,7 @@
 //! be written, whatever the buffer held before; nothing after `n` may change;
 //! the magnitudes add up to `k`; and a pulse has the sign of its coefficient.
 
-use opus1::pvq::pvq_search;
+use opus1::internals::pvq::pvq_search;
 
 /// Small deterministic generator, so that the test needs no dependency.
 struct Lcg(u64);

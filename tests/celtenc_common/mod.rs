@@ -7,11 +7,11 @@
 //! comes from the encoder alone.
 #![allow(dead_code)]
 
-use opus1::celt::CeltEncoder;
-use opus1::hp_cutoff::dc_reject_float;
-use opus1::modes::{SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF, default_mode};
-use opus1::quant_bands::E_PROB_MODEL;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::CeltEncoder;
+use opus1::internals::hp_cutoff::dc_reject_float;
+use opus1::internals::modes::{SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF, default_mode};
+use opus1::internals::quant_bands::E_PROB_MODEL;
+use opus1::internals::range_coder::RangeCoder;
 use std::os::raw::{c_int, c_uchar};
 
 pub mod c_celt;
@@ -788,7 +788,7 @@ pub fn anti_collapse_flag(payload: &[u8], channels: usize, end: usize, lm: usize
     let mut masks = vec![0u32; mode.nb_ebands * channels];
     let band_e = vec![1.0f32; mode.nb_ebands * channels];
     let mut dual_stereo = a.dual_stereo;
-    opus1::bands::quant_all_bands(
+    opus1::internals::bands::quant_all_bands(
         false,
         mode,
         0,
@@ -855,7 +855,7 @@ fn parse_frame_rc(
     };
     let mut fine_priority = vec![0i32; nb];
     let (mut dual_stereo, mut balance) = (0, 0);
-    a.coded_bands = opus1::rate::clt_compute_allocation(
+    a.coded_bands = opus1::internals::rate::clt_compute_allocation(
         mode,
         0,
         end,

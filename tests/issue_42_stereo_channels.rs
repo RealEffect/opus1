@@ -22,7 +22,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -184,8 +184,8 @@ fn run(cfg: &Config) -> Measured {
     let input = voiced(sr, frame * packets);
 
     let mut rs_enc = OpusEncoder::new(sr as i32, CH, Application::Voip).unwrap();
-    rs_enc.bitrate_bps = 32000;
-    rs_enc.use_cbr = cfg.cbr;
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    rs_enc.set_vbr(!cfg.cbr);
 
     // libopus at opus1's settings. A steady harmonic tone can read as music
     // and pull libopus into CELT, and below ~18 kb/s libopus would switch to
@@ -193,7 +193,7 @@ fn run(cfg: &Config) -> Measured {
     let mut c_enc = CEnc::new(sr as u32, CCh::Stereo, CApp::Voip).unwrap();
     c_enc.set_bitrate(CBitrate::Bits(32000)).unwrap();
     c_enc.set_vbr(!cfg.cbr).unwrap();
-    c_enc.set_complexity(rs_enc.complexity).unwrap();
+    c_enc.set_complexity(rs_enc.complexity()).unwrap();
     c_enc.set_bandwidth(cfg.bandwidth).unwrap();
     c_enc.set_signal(CSignal::Voice).unwrap();
     c_enc.set_force_channels(Some(CCh::Stereo)).unwrap();

@@ -1,5 +1,5 @@
 /// Tests for stereo encoding and decoding
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 /// Test basic stereo encoding and decoding
@@ -11,7 +11,7 @@ fn test_stereo_basic() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Audio)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 32000;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
 
     // Create stereo input (two sine waves at different frequencies)
     let mut input = vec![0.0f32; frame_size * channels];
@@ -60,7 +60,7 @@ fn test_stereo_bitrate_range() {
     for bitrate in [24000, 32000, 48000, 64000] {
         let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Audio)
             .expect("Failed to create encoder");
-        encoder.bitrate_bps = bitrate;
+        encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
 
         let mut input = vec![0.0f32; frame_size * channels];
         for i in 0..frame_size {
@@ -90,7 +90,7 @@ fn test_stereo_silk_only() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 24000;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
     let mut input = vec![0.0f32; frame_size * channels];
     for i in 0..frame_size {
@@ -124,7 +124,7 @@ fn test_silk_stereo_roundtrip() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 24000;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
     // Create different signals for left and right channels
     let mut input = vec![0.0f32; frame_size * channels];
@@ -182,7 +182,7 @@ fn test_silk_stereo_sample_rates() {
 
         let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
             .expect("Failed to create encoder");
-        encoder.bitrate_bps = 20000;
+        encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
 
         let mut input = vec![0.0f32; frame_size * channels];
         for i in 0..frame_size {
@@ -226,7 +226,7 @@ fn test_silk_stereo_channel_separation() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 32000; // Higher bitrate for better quality
+    encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap(); // Higher bitrate for better quality
 
     // Left channel: 300 Hz, Right channel: 500 Hz (different but both audible)
     let mut input = vec![0.0f32; frame_size * channels];
@@ -278,7 +278,7 @@ fn test_silk_stereo_multiframe() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 24000;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
     // Create input for multiple frames
     let total_samples = frame_size * num_frames * channels;
@@ -343,7 +343,7 @@ fn test_silk_stereo_phase_inverted() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 24000;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
     // Left and right channels are identical but phase-inverted
     let mut input = vec![0.0f32; frame_size * channels];
@@ -395,7 +395,7 @@ fn test_stereo_narrowband() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 16000;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
 
     let mut input = vec![0.0f32; frame_size * channels];
     for i in 0..frame_size {
@@ -433,7 +433,7 @@ fn test_silk_stereo_speech() {
 
     let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
         .expect("Failed to create encoder");
-    encoder.bitrate_bps = 24000;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
     // Create speech-like signal with multiple frequency components
     let mut input = vec![0.0f32; frame_size * channels];

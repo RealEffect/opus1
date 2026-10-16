@@ -1,9 +1,10 @@
 use crate::mathops::{celt_exp2, mac};
 use crate::modes::CeltMode;
+use crate::pitch::celt_inner_prod;
 use crate::pvq::*;
 use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, bits2pulses, get_pulses, pulses2bits};
-use crate::tell_frac_inline;
+use crate::range_coder::tell_frac_inline;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -29,6 +30,9 @@ pub struct BandCtx<'a> {
     /// passes of `quant_band_stereo_rdo` start from the same input, so the
     /// second pass takes the angle of the first.
     pub stereo_angle: Option<i32>,
+    /// The encoder's cache of rotation angles (see `RotationCache`). `None`
+    /// computes each angle.
+    pub rotations: Option<&'a mut RotationCache>,
 }
 
 #[inline]
@@ -431,62 +435,6 @@ pub fn compute_qn(n: usize, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -
         };
         let qn = (raw + 1) >> 1 << 1;
         qn.min(256)
-    }
-}
-
-/// libopus `celt_inner_prod` of the float build: the sum of `x[i] * y[i]`.
-///
-/// On aarch64 this is `celt_inner_prod_neon` (celt/arm/pitch_neon_intr.c
-/// 186-214). It has one accumulator of four lanes, updated with fused
-/// multiply-adds, eight values per step and then four more if they are
-/// there. The lanes are added low half plus high half, then the two
-/// results. The last one to three values are added one at a time with
-/// fused multiply-adds.
-///
-/// Elsewhere this is `celt_inner_prod_c` (celt/pitch.h 159-168): one value
-/// at a time from 0, without fusing.
-///
-/// `y` must be at least as long as `x`.
-#[inline(always)]
-pub(crate) fn celt_inner_prod(x: &[f32], y: &[f32]) -> f32 {
-    let n = x.len();
-    // The only bounds check. The loads below rely on it.
-    let y = &y[..n];
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        // SAFETY: every load reads `x[i..i + 4]` or `y[i..i + 4]` with
-        // `i + 4 <= n`; both slices hold exactly `n` values.
-        unsafe {
-            let xp = x.as_ptr();
-            let yp = y.as_ptr();
-            let mut acc = vdupq_n_f32(0.0);
-            let mut i = 0;
-            while i + 8 <= n {
-                acc = vfmaq_f32(acc, vld1q_f32(xp.add(i)), vld1q_f32(yp.add(i)));
-                acc = vfmaq_f32(acc, vld1q_f32(xp.add(i + 4)), vld1q_f32(yp.add(i + 4)));
-                i += 8;
-            }
-            if n - i >= 4 {
-                acc = vfmaq_f32(acc, vld1q_f32(xp.add(i)), vld1q_f32(yp.add(i)));
-                i += 4;
-            }
-            let half = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
-            let mut xy = vget_lane_f32::<0>(vpadd_f32(half, half));
-            while i < n {
-                xy = mac(xy, *xp.add(i), *yp.add(i));
-                i += 1;
-            }
-            xy
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut xy = 0.0f32;
-        for (&a, &b) in x.iter().zip(y) {
-            xy = mac(xy, a, b);
-        }
-        xy
     }
 }
 
@@ -1175,7 +1123,7 @@ fn quant_partition_leaf<const ENCODE_ONLY: bool>(
     if q != 0 {
         let k = get_pulses(q);
         return if encode {
-            alg_quant(
+            alg_quant_with(
                 x,
                 n,
                 k,
@@ -1184,6 +1132,7 @@ fn quant_partition_leaf<const ENCODE_ONLY: bool>(
                 ctx.rc,
                 gain,
                 resynth,
+                ctx.rotations.as_deref_mut(),
             )
         } else {
             alg_unquant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain)
@@ -1965,11 +1914,17 @@ fn compute_channel_weights(ex: f32, ey: f32) -> [f32; 2] {
 /// the result with the smaller distortion: the `theta_rdo` branch of libopus
 /// `quant_all_bands` (celt/bands.c 1809-1880).
 ///
-/// The first pass codes the band with `theta_round = -1`. Its bytes, its
-/// coder state, its decoded band and its folding output are kept. The
-/// second pass starts from the same state with `theta_round = 1`. It takes
-/// the angle that the first pass computed (`BandCtx::stereo_angle`). When the
-/// first pass has the smaller or equal distortion, its result is put back.
+/// The first pass codes the band in place with `theta_round = -1`. Its coder
+/// state, its bytes and its folding output in `norm` are kept. The second
+/// pass starts from the same coder state with `theta_round = 1`, on a copy
+/// of the input. It takes the angle that the first pass computed
+/// (`BandCtx::stereo_angle`). When the first pass has the smaller or equal
+/// distortion, its coder state, bytes and folding output are put back.
+/// Otherwise the band of the second pass is copied over the first one.
+///
+/// libopus runs both passes in place: it copies the band of the first pass
+/// aside and copies it back when that pass wins. The order here gives the
+/// same results with fewer copies.
 ///
 /// libopus copies the coder bytes from the start offset to the end of the
 /// buffer. A pass writes only bytes from `offs` up and raw bits from the
@@ -2024,7 +1979,7 @@ fn quant_band_stereo_rdo(
     let (offs0, end_offs0) = (ctx.rc.offs as usize, ctx.rc.end_offs as usize);
     let (seed0, remaining0) = (ctx.seed, ctx.remaining_bits);
 
-    // Encode and round down.
+    // Encode and round down, in place.
     ctx.theta_round = -1;
     let (lb, lb_out) = prepare_lowband_views(
         norm,
@@ -2038,20 +1993,14 @@ fn quant_band_stereo_rdo(
     let cm_down = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, fill);
     let dist_down = distortion(x, y, x_save, y_save);
 
-    // Keep the first result.
+    // Keep what the first pass wrote outside the band.
     let state_down = ctx.rc.save_state();
     let (seed_down, remaining_down) = (ctx.seed, ctx.remaining_bits);
-    let mut x_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let mut y_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
     let mut norm_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    // SAFETY (all three): as above. `norm_down` is written and read only
-    // when `keep_norm` holds.
-    let x_down = unsafe { core::slice::from_raw_parts_mut(x_down_mu.as_mut_ptr() as *mut f32, n) };
-    let y_down = unsafe { core::slice::from_raw_parts_mut(y_down_mu.as_mut_ptr() as *mut f32, n) };
+    // SAFETY: as above. `norm_down` is written and read only when
+    // `keep_norm` holds.
     let norm_down =
         unsafe { core::slice::from_raw_parts_mut(norm_down_mu.as_mut_ptr() as *mut f32, n) };
-    x_down.copy_from_slice(x);
-    y_down.copy_from_slice(y);
     let keep_norm = !last && norm_pos + n <= norm.len();
     if keep_norm {
         norm_down.copy_from_slice(&norm[norm_pos..norm_pos + n]);
@@ -2073,17 +2022,22 @@ fn quant_band_stereo_rdo(
     bytes[..front.len()].copy_from_slice(&ctx.rc.buf[front.clone()]);
     bytes[front.len()..].copy_from_slice(&ctx.rc.buf[back.clone()]);
 
-    // Restore.
+    // Back to the coder state before the first pass.
     ctx.rc.restore_state(&state0);
     ctx.seed = seed0;
     ctx.remaining_bits = remaining0;
-    x.copy_from_slice(x_save);
-    y.copy_from_slice(y_save);
     if let Some((start, m_val)) = hybrid_fold {
         special_hybrid_folding(ctx.m, norm, start, m_val);
     }
 
-    // Encode and round up.
+    // Encode and round up, on a copy of the input.
+    let mut x_up_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let mut y_up_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    // SAFETY (both): as for `x_save`.
+    let x_up = unsafe { core::slice::from_raw_parts_mut(x_up_mu.as_mut_ptr() as *mut f32, n) };
+    let y_up = unsafe { core::slice::from_raw_parts_mut(y_up_mu.as_mut_ptr() as *mut f32, n) };
+    x_up.copy_from_slice(x_save);
+    y_up.copy_from_slice(y_save);
     ctx.theta_round = 1;
     let (lb, lb_out) = prepare_lowband_views(
         norm,
@@ -2094,23 +2048,24 @@ fn quant_band_stereo_rdo(
         n,
         !last,
     );
-    let cm_up = quant_band_stereo(ctx, x, y, n, b, b_blocks, lb, lm, lb_out, fill);
-    let dist_up = distortion(x, y, x_save, y_save);
+    let cm_up = quant_band_stereo(ctx, x_up, y_up, n, b, b_blocks, lb, lm, lb_out, fill);
+    let dist_up = distortion(x_up, y_up, x_save, y_save);
 
     if dist_down >= dist_up {
+        // The first pass wins. Its band is still in `x` and `y`.
         ctx.rc.restore_state(&state_down);
         ctx.rc.buf[front.clone()].copy_from_slice(&bytes[..front.len()]);
         ctx.rc.buf[back].copy_from_slice(&bytes[front.len()..]);
         ctx.seed = seed_down;
         ctx.remaining_bits = remaining_down;
         ctx.theta_round = -1;
-        x.copy_from_slice(x_down);
-        y.copy_from_slice(y_down);
         if keep_norm {
             norm[norm_pos..norm_pos + n].copy_from_slice(norm_down);
         }
         cm_down
     } else {
+        x.copy_from_slice(x_up);
+        y.copy_from_slice(y_up);
         cm_up
     }
 }
@@ -2147,6 +2102,59 @@ pub fn quant_all_bands_enc(
     complexity: i32,
     disable_inv: bool,
 ) {
+    quant_all_bands_enc_with(
+        m,
+        start,
+        end,
+        x,
+        y,
+        collapse_masks,
+        band_e,
+        pulses,
+        short_blocks,
+        spread,
+        dual_stereo,
+        intensity,
+        tf_res,
+        total_bits,
+        balance,
+        rc,
+        lm,
+        coded_bands,
+        seed,
+        complexity,
+        disable_inv,
+        &mut RotationCache::new(),
+    );
+}
+
+/// `quant_all_bands_enc` with the encoder's cache of rotation angles. The
+/// cache only saves time: the results are those of `quant_all_bands_enc`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quant_all_bands_enc_with(
+    m: &CeltMode,
+    start: usize,
+    end: usize,
+    x: &mut [f32],
+    y: Option<&mut [f32]>,
+    collapse_masks: &mut [u32],
+    band_e: &[f32],
+    pulses: &[i32],
+    short_blocks: bool,
+    spread: i32,
+    dual_stereo: &mut bool,
+    intensity: usize,
+    tf_res: &[i32],
+    total_bits: i32,
+    balance: &mut i32,
+    rc: &mut RangeCoder,
+    lm: i32,
+    coded_bands: i32,
+    seed: &mut u32,
+    complexity: i32,
+    disable_inv: bool,
+    rotations: &mut RotationCache,
+) {
     quant_all_bands_impl(
         true,
         m,
@@ -2171,6 +2179,7 @@ pub fn quant_all_bands_enc(
         disable_inv,
         seed,
         complexity,
+        Some(rotations),
     );
 }
 
@@ -2225,6 +2234,7 @@ pub fn quant_all_bands(
         disable_inv,
         seed,
         0,
+        None,
     );
 }
 
@@ -2255,6 +2265,7 @@ fn quant_all_bands_impl(
     disable_inv: bool,
     seed: &mut u32,
     complexity: i32,
+    mut rotations: Option<&mut RotationCache>,
 ) {
     // C 1618-1623: at complexity 8 and above the encoder codes each stereo
     // band twice and resynthesises every band for it.
@@ -2392,6 +2403,7 @@ fn quant_all_bands_impl(
             disable_inv,
             seed: ctx_seed,
             stereo_angle: None,
+            rotations: rotations.as_deref_mut(),
         };
 
         let x_slice = &mut x[offset..offset + n];

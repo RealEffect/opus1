@@ -2,9 +2,9 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus1::celt::{CeltDecoder, CeltEncoder, PcmLayout};
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::{CeltDecoder, CeltEncoder, PcmLayout};
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 fn snr_with_delay(input: &[f32], output: &[f32], delay: usize) -> f32 {
     let len = input.len().min(output.len().saturating_sub(delay));

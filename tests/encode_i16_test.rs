@@ -3,7 +3,7 @@
 //! audio converted via `sample as f32 / 32768.0`, across SILK-only,
 //! Hybrid and CELT-only modes.
 
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 /// Deterministic test signal: speech-like sine + LCG noise, moderate level.
 struct SignalGen {
@@ -68,11 +68,11 @@ impl EncConfig {
         let mut a = OpusEncoder::new(self.fs, self.channels, self.app).unwrap();
         let mut b = OpusEncoder::new(self.fs, self.channels, self.app).unwrap();
         for enc in [&mut a, &mut b] {
-            enc.bitrate_bps = self.bitrate;
-            enc.complexity = self.complexity;
-            enc.use_cbr = self.use_cbr;
-            enc.use_inband_fec = self.fec;
-            enc.packet_loss_perc = self.loss;
+            enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
+            enc.set_complexity(self.complexity).unwrap();
+            enc.set_vbr(!self.use_cbr);
+            enc.set_inband_fec(self.fec);
+            enc.set_packet_loss_perc(self.loss).unwrap();
         }
         (a, b)
     }
@@ -260,8 +260,8 @@ fn encode_i16_roundtrip_decodes() {
     let frame_size = 320; // 20 ms
     let mut enc_a = OpusEncoder::new(fs, channels, Application::Voip).unwrap();
     let mut enc_b = OpusEncoder::new(fs, channels, Application::Voip).unwrap();
-    enc_a.bitrate_bps = 24000;
-    enc_b.bitrate_bps = 24000;
+    enc_a.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc_b.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     let mut dec = OpusDecoder::new(fs, channels).unwrap();
 
     let mut signal = SignalGen::new(fs as usize);

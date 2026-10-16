@@ -14,8 +14,8 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech, to_stereo};
-use opus1::range_coder::RangeCoder;
-use opus1::{Application, ForcedMode, OpusEncoder};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
 
 /// The first flags of a CELT-only frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,8 +86,8 @@ fn celt_flags(
     let mut c_enc = CEncoder::new(rate, channels, APP_AUDIO);
     c_enc.complexity(10).bitrate(48000 * channels as i32).force_mode(MODE_CELT);
     let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
-    enc.complexity = 10;
-    enc.bitrate_bps = 48000 * channels as i32;
+    enc.set_complexity(10).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(48000 * channels as i32)).unwrap();
     enc.set_force_mode(Some(ForcedMode::CeltOnly));
     setup(&mut enc, &mut c_enc);
     let mut buf = vec![0u8; 1500];
@@ -135,7 +135,7 @@ fn packet_loss_turns_the_celt_pitch_filter_off_like_libopus() {
         let with_filter = lossless.iter().filter(|(got, _)| got.postfilter).count();
         assert!(with_filter * 5 >= lossless.len(), "{what}: post-filter in {with_filter} frames");
         let lossy = |enc: &mut OpusEncoder, c_enc: &mut CEncoder| {
-            enc.packet_loss_perc = 10;
+            enc.set_packet_loss_perc(10).unwrap();
             c_enc.set(audiopus_sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10);
         };
         for (i, (got, want)) in celt_flags(rate, channels, 200, &lossy).into_iter().enumerate() {
@@ -159,8 +159,8 @@ fn celt_after_silk_starts_afresh_without_prediction_like_libopus() {
         let mut c_enc = CEncoder::new(rate, channels, APP_AUDIO);
         c_enc.complexity(10).bitrate(64000);
         let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
-        enc.complexity = 10;
-        enc.bitrate_bps = 64000;
+        enc.set_complexity(10).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
         let mut buf = vec![0u8; 1500];
         let (long, short) = (rate / 50, rate / 200);
         let mut at = 0;

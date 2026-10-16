@@ -8,10 +8,10 @@
 //!
 //! P1: guards for direct calls into the low-level public components.
 
-use opus1::silk::SilkResampler;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::silk::init_decoder::silk_decoder_set_fs;
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::internals::silk::SilkResampler;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::internals::silk::init_decoder::silk_decoder_set_fs;
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 use std::f32::consts::PI;
 
 // ---------------------------------------------------------------------------
@@ -28,8 +28,8 @@ fn p0_cross_bandwidth_plc_lag_no_panic() {
     // 120 Hz tone at 16 kHz: decodes voiced with a large pitch lag.
     let wb_frame = 320usize; // 20 ms @ 16 kHz
     let mut wb_enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-    wb_enc.bitrate_bps = 24000;
-    wb_enc.use_cbr = true;
+    wb_enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    wb_enc.set_vbr(false);
     let wb_input: Vec<f32> = (0..wb_frame)
         .map(|i| (2.0 * PI * 120.0 * (i as f32 / 16000.0)).sin() * 0.4)
         .collect();
@@ -37,8 +37,8 @@ fn p0_cross_bandwidth_plc_lag_no_panic() {
     // 8 kHz encoder: silence produces unvoiced NB packets.
     let nb_frame = 160usize; // 20 ms @ 8 kHz
     let mut nb_enc = OpusEncoder::new(8000, 1, Application::Voip).unwrap();
-    nb_enc.bitrate_bps = 12000;
-    nb_enc.use_cbr = true;
+    nb_enc.set_bitrate(Bitrate::BitsPerSecond(12000)).unwrap();
+    nb_enc.set_vbr(false);
     let nb_input = vec![0.0f32; nb_frame];
 
     let mut dec = OpusDecoder::new(16000, 1).unwrap();
@@ -74,9 +74,9 @@ fn p0_cross_bandwidth_plc_lag_no_panic() {
 /// switch (libopus decoder_set_fs.c) and leave it untouched otherwise.
 #[test]
 fn p0_set_fs_resets_state_on_bandwidth_change() {
-    use opus1::silk::define::TYPE_NO_VOICE_ACTIVITY;
+    use opus1::internals::silk::define::TYPE_NO_VOICE_ACTIVITY;
 
-    let mut dec = opus1::silk::dec_api::SilkDecoder::new();
+    let mut dec = opus1::internals::silk::dec_api::SilkDecoder::new();
     assert_eq!(dec.init(16000, 1), 0);
 
     // Simulate voiced WB state with a maximal lag.
@@ -110,15 +110,15 @@ fn p0_set_fs_resets_state_on_bandwidth_change() {
 /// `silk_decode_core`. This test crashes on the pre-fix code.
 #[test]
 fn p0_silk_layer_cross_bandwidth_recovery() {
-    use opus1::range_coder::RangeCoder;
-    use opus1::silk::decode_frame::{FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+    use opus1::internals::range_coder::RangeCoder;
+    use opus1::internals::silk::decode_frame::{FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
 
     let wb_frame = 320usize;
     let nb_frame = 160usize;
 
     let mut wb_enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-    wb_enc.bitrate_bps = 24000;
-    wb_enc.use_cbr = true;
+    wb_enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    wb_enc.set_vbr(false);
     let wb_input: Vec<f32> = (0..wb_frame)
         .map(|i| (2.0 * PI * 120.0 * (i as f32 / 16000.0)).sin() * 0.4)
         .collect();
@@ -128,8 +128,8 @@ fn p0_silk_layer_cross_bandwidth_recovery() {
         .expect("enc");
 
     let mut nb_enc = OpusEncoder::new(8000, 1, Application::Voip).unwrap();
-    nb_enc.bitrate_bps = 12000;
-    nb_enc.use_cbr = true;
+    nb_enc.set_bitrate(Bitrate::BitsPerSecond(12000)).unwrap();
+    nb_enc.set_vbr(false);
     let nb_input = vec![0.0f32; nb_frame];
     let mut nb_pkt = vec![0u8; 1500];
     let m = nb_enc
@@ -189,7 +189,7 @@ fn p1_hp_cutoff_invalid_fs_no_panic() {
     let input = vec![0.5f32; 160];
     let mut output = vec![0i16; 160];
     let mut hp_mem = [0i32; 2];
-    opus1::hp_cutoff::hp_cutoff(
+    opus1::internals::hp_cutoff::hp_cutoff(
         &input,
         60,
         &mut output,
@@ -205,7 +205,7 @@ fn p1_hp_cutoff_invalid_fs_no_panic() {
 #[test]
 fn p1_exp_rotation_zero_stride_no_panic() {
     let mut x = vec![0.5f32; 64];
-    opus1::pvq::exp_rotation(&mut x, 64, -1, 0, 2, 1);
+    opus1::internals::pvq::exp_rotation(&mut x, 64, -1, 0, 2, 1);
 }
 
 /// CELT constructors reject invalid channel counts with a clear message
@@ -213,13 +213,13 @@ fn p1_exp_rotation_zero_stride_no_panic() {
 #[test]
 #[should_panic(expected = "channels must be 1 or 2")]
 fn p1_celt_encoder_new_rejects_channels() {
-    let _ = opus1::celt::CeltEncoder::new(opus1::modes::default_mode(), 3);
+    let _ = opus1::internals::celt::CeltEncoder::new(opus1::internals::modes::default_mode(), 3);
 }
 
 #[test]
 #[should_panic(expected = "channels must be 1 or 2")]
 fn p1_celt_decoder_new_rejects_channels() {
-    let _ = opus1::celt::CeltDecoder::new(opus1::modes::default_mode(), 3, 48000);
+    let _ = opus1::internals::celt::CeltDecoder::new(opus1::internals::modes::default_mode(), 3, 48000);
 }
 
 /// CELT decode with a frame size that does not match the MDCT geometry is
@@ -227,9 +227,9 @@ fn p1_celt_decoder_new_rejects_channels() {
 /// panicking deep inside the transform.
 #[test]
 fn p1_celt_decode_invalid_frame_size_rejected() {
-    use opus1::celt::PcmLayout::Planar;
-    use opus1::range_coder::RangeCoder;
-    let mut dec = opus1::celt::CeltDecoder::new(opus1::modes::default_mode(), 1, 48000);
+    use opus1::internals::celt::PcmLayout::Planar;
+    use opus1::internals::range_coder::RangeCoder;
+    let mut dec = opus1::internals::celt::CeltDecoder::new(opus1::internals::modes::default_mode(), 1, 48000);
     let pkt = [0xABu8; 64];
     // 100 samples @ 48 kHz matches no `120 << lm` geometry.
     let mut pcm = vec![0.0f32; 100];
@@ -244,7 +244,7 @@ fn p1_celt_decode_invalid_frame_size_rejected() {
 #[test]
 #[should_panic(expected = "encode: ft must be > 0")]
 fn p1_range_coder_encode_ft_zero_panics() {
-    use opus1::range_coder::RangeCoder;
+    use opus1::internals::range_coder::RangeCoder;
     let mut rc = RangeCoder::new_encoder(16);
     rc.encode(0, 0, 0);
 }
@@ -257,30 +257,34 @@ fn p1_pitch_xcorr_short_y_no_panic() {
     let x = vec![0.25f32; 40];
     let y = vec![0.5f32; 50]; // contract would need len + max_pitch - 1 = 99
     let mut xcorr = vec![0.0f32; 60];
-    opus1::pitch::pitch_xcorr(&x, &y, &mut xcorr, 40, 60);
+    opus1::internals::pitch::pitch_xcorr(&x, &y, &mut xcorr, 40, 60);
 }
 
 // ---------------------------------------------------------------------------
-// P2: encoder control-field clamps
+// P2: extreme encoder settings
 // ---------------------------------------------------------------------------
 
-/// Absurd pub-field values must not overflow the mode-selection / bitrate
-/// arithmetic; encode() clamps them the way libopus ctl does.
+/// Absurd settings must not overflow the mode-selection or bitrate
+/// arithmetic. The setters refuse what libopus's controls refuse, keep the
+/// old value then, and limit a huge bitrate to 750,000 b/s per channel.
 #[test]
-fn p2_encoder_extreme_fields_no_panic() {
+fn p2_encoder_extreme_settings_no_panic() {
     let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = i32::MAX;
-    enc.complexity = i32::MAX;
-    enc.packet_loss_perc = i32::MAX;
+    enc.set_bitrate(Bitrate::BitsPerSecond(i32::MAX)).unwrap();
+    assert_eq!(enc.bitrate_setting(), Bitrate::BitsPerSecond(750_000));
+    assert!(enc.set_complexity(i32::MAX).is_err());
+    assert!(enc.set_packet_loss_perc(i32::MAX).is_err());
     let input = vec![0.0f32; 960];
     let mut pkt = vec![0u8; 1500];
     let res = enc.encode(&input, 960, &mut pkt);
-    assert!(res.is_ok(), "encode with extreme fields must not panic");
+    assert!(res.is_ok(), "encode with extreme settings must not panic");
 
     let mut enc2 = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
-    enc2.bitrate_bps = i32::MIN;
-    enc2.complexity = i32::MIN;
-    enc2.packet_loss_perc = i32::MIN;
+    assert!(enc2.set_bitrate(Bitrate::BitsPerSecond(i32::MIN)).is_err());
+    assert!(enc2.set_complexity(i32::MIN).is_err());
+    assert!(enc2.set_packet_loss_perc(i32::MIN).is_err());
+    enc2.set_bitrate(Bitrate::BitsPerSecond(1)).unwrap();
+    assert_eq!(enc2.bitrate_setting(), Bitrate::BitsPerSecond(500));
     let res2 = enc2.encode(&input, 960, &mut pkt);
-    assert!(res2.is_ok(), "encode with extreme fields must not panic");
+    assert!(res2.is_ok(), "encode with extreme settings must not panic");
 }

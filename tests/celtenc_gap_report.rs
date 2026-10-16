@@ -9,6 +9,9 @@
 //! `CELTENC_REPORT` narrows the table: a list of words separated by commas,
 //! and a row is printed when its label contains all of them, for example
 //! `CELTENC_REPORT=stereo,48k,c5`.
+//!
+//! `sample_of_rows_is_the_packets_of_libopus` runs a few of the rows as an
+//! ordinary test.
 
 mod celtenc_common;
 
@@ -92,6 +95,65 @@ fn celt_encoder_against_libopus() {
                 }
             }
         }
+    }
+}
+
+/// A sample of the rows of `celt_encoder_against_libopus`, as a test: on
+/// 64-bit ARM every packet must be the packet of libopus.
+///
+/// The first three rows are the only rows of the report that change when
+/// the coarse energy prediction of the encoder rounds its product before
+/// the addition, instead of fusing it as libopus does on 64-bit ARM
+/// (`x - coef * oldE` changes the first row, 7 of 1200 packets;
+/// `coef * oldE + prev` the other two, 1021 of 1200 packets each). The
+/// other rows cover both channel counts, both signals, short and long
+/// frames, and the complexities with and without the pitch pre-filter's
+/// search.
+///
+/// Elsewhere the crate may round differently from the libopus the tests
+/// link, so the test only prints its numbers there.
+#[test]
+fn sample_of_rows_is_the_packets_of_libopus() {
+    // (channels, fs, frame in half ms, b/s per channel, complexity, vbr, signal)
+    let mut rows = vec![
+        (2usize, 48_000usize, 10usize, 48_000i32, 4i32, false, "music"),
+        (2, 16_000, 10, 24_000, 4, true, "speech"),
+        (2, 16_000, 10, 24_000, 5, true, "speech"),
+    ];
+    for channels in [1, 2] {
+        for signal in ["speech", "music"] {
+            for frame_ms_x2 in [5, 40] {
+                for complexity in [5, 9] {
+                    rows.push((channels, 48_000, frame_ms_x2, 48_000, complexity, true, signal));
+                }
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for (channels, fs, frame_ms_x2, per_channel, complexity, vbr, signal) in rows {
+        let pcm = signals(fs, channels)
+            .into_iter()
+            .find(|(name, _)| *name == signal)
+            .expect("signal")
+            .1;
+        let mut st = Stream::new(fs, channels, frame_ms_x2, per_channel * channels as i32);
+        st.complexity = complexity;
+        st.vbr = vbr;
+        let c = st.enc_c(&pcm);
+        let rs = st.enc_rs(&pcm);
+        let same = Stream::same_frames(&c, &rs);
+        let label = format!(
+            "{channels} ch {signal} {} kHz, frame {frame_ms_x2}/2 ms, {per_channel} b/s, c{complexity} {}",
+            fs / 1000,
+            if vbr { "vbr" } else { "cbr" }
+        );
+        println!("{label}: {same} of {} packets are libopus's", c.len());
+        if same != c.len() {
+            failures.push(label);
+        }
+    }
+    if cfg!(target_arch = "aarch64") {
+        assert!(failures.is_empty(), "rows with packets other than libopus's: {failures:?}");
     }
 }
 

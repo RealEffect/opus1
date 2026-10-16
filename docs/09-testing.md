@@ -21,14 +21,14 @@ Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-appl
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 228 | 1094 |
-| Unit tests inside `src/` | - | 312 |
+| Integration tests in `tests/*.rs` | 229 | 1101 |
+| Unit tests inside `src/` | - | 314 |
 | Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (47) | - | 49 |
-| **Total** | | **1455** |
+| **Total** | | **1464** |
 
 25 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 11 directories of shared helper code (for example `tests/k24_common/`) and 4 files of recorded reference values (`*.expected`).
 
-A full run, `cargo test --release`, passed all 1430 tests that are not ignored on Apple M4 Pro. It took 129 seconds, with the tests already built.
+A full run, `cargo test --release`, passed all 1439 tests that are not ignored on Apple M4 Pro. It took 257 seconds with the build, while other programs kept the machine busy.
 
 ## How libopus is linked
 
@@ -37,7 +37,9 @@ Two development dependencies give the tests access to libopus:
 - `opus` 0.3: a safe Rust wrapper around the libopus encoder and decoder.
 - `audiopus_sys` 0.2: the raw C interface of libopus. The tests need it for controls that `opus` does not expose. Examples are forcing the coding mode (`OPUS_SET_FORCE_MODE`), decoding with the FEC flag (`opus_decode_float` with `decode_fec = 1`), the repacketizer and the multistream functions.
 
-`opus` uses `audiopus_sys`, so both reach the same libopus. Some tests also call internal functions of libopus directly, such as its fast Fourier transform (FFT) and its pitch search (`tests/perfk_fft_libopus.rs`, `tests/perfk_pitch_libopus.rs`). That works because libopus is linked as a static library, which is the default of `audiopus_sys` on macOS.
+`opus` uses `audiopus_sys`, so both reach the same libopus. Some tests also call internal functions of libopus directly, such as its fast Fourier transform (FFT), its pitch search and its comb filter (`tests/perfk_fft_libopus.rs`, `tests/perfk_pitch_libopus.rs`, the module `comb_filter_libopus_tests` in `src/celt.rs`). That works because libopus is linked as a static library, which is the default of `audiopus_sys` on macOS.
+
+A rounding difference of one unit in the last place changes a result only near a decision, and ordinary test signals seldom come that close. Some tests therefore build such cases on purpose. `tests/perfk_pitch_libopus.rs` uses signals that repeat exactly, so that two pitch lags tie, quiet signals, where `1 + xx * yy` in the pitch gain is near 2^24, and a bisection that finds where `remove_doubling` switches between two periods. Each of them fails when one fused multiply-add of libopus is replaced by a separate multiply and add. The other tests do not notice that change.
 
 The build script of `audiopus_sys` looks for libopus in this order:
 
@@ -77,10 +79,10 @@ Most tests drive opus1 and libopus with the same input and settings, then compar
 The final-range check, written as a test of the kind the suite contains:
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 20_000;
+encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
 let mut decoder = OpusDecoder::new(16_000, 1).unwrap();
 
 let frame = 320; // 20 ms at 16 kHz
@@ -112,8 +114,8 @@ A test file's name starts with a prefix that says what it covers. The counts are
 |---|---:|---:|---|
 | `multistream_` | 31 | 276 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`) and the surround analysis (`_surround_*`). |
 | `core_` | 22 | 142 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output. |
-| `perfk_` | 33 | 113 | Guards for the speed work. Each rewritten kernel is compared with the libopus function, with reference values recorded from libopus, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
-| `celtenc_` | 16 | 78 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching. |
+| `perfk_` | 33 | 116 | Guards for the speed work. Each rewritten kernel is compared with the libopus function, with reference values recorded from libopus, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
+| `celtenc_` | 17 | 82 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching, the rate rules (`celtenc_rate_rules.rs`). |
 | `issue_` | 14 | 75 | Regression tests named after GitHub issues, most of them against libopus (for example `issue_42_stereo_channels.rs`). `issues_repro.rs` adds 14 more tests. |
 | `k24_` | 21 | 72 | The 24 kilohertz (kHz) path: decoding at every output rate, encoding in each mode, SILK loss handling. `k24_main_use.rs` lets libopus choose the mode, as in a real call. |
 | `silk_` | 14 | 66 | SILK parts tested one by one: the bitstream, Burg analysis, linear predictive coding (LPC), the normalized line spectral frequencies (NLSF), the quantizer, and packets of the fixed-point build. |
@@ -196,15 +198,16 @@ fuzz/fuzz.sh all 300                    # every target, 300 seconds each
 
 `fuzz/fuzz.sh` builds the targets with cargo and the coverage options that cargo-fuzz uses without a sanitizer. Debug assertions and overflow checks are on, so an integer overflow stops a run like a panic. The corpus of each target is kept in `fuzz/corpus/<target>/`. An input that fails is written to `fuzz/artifacts/<target>/`. `fuzz/README.md` gives the build command, how to reproduce and minimize a failure, and the `cargo +nightly fuzz` command, which still works.
 
-Five targets compare opus1 with libopus, which is linked as for the tests:
+Six targets compare opus1 with libopus, which is linked as for the tests:
 
 | Target | What must hold |
 |---|---|
 | `fuzz_packet` | The `packet` module gives libopus's results: `parse` (plain and self-delimited), `nb_frames` and `nb_samples` against `opus_packet_parse_impl` and `opus_packet_get_nb_*`, `pad` and `multistream_pad` against `opus_packet_pad` and `opus_multistream_packet_pad` byte for byte, and `write` against the libopus repacketizer byte for byte. `multistream_validate` accepts what libopus's multistream decoder accepts. Written and padded packets parse to the frames they were made of. |
 | `fuzz_decoder_sequence` | A stream of packets into `OpusDecoder` and into libopus's decoder. The packets come from a libopus encoder whose settings change (2.5 to 120 ms, FEC, discontinuous transmission, forced modes and bandwidths), or from the input. Some are damaged or lost. The calls are `decode`, `decode_i16`, `decode_fec` and `decode_fec_i16`, on decoders of either channel count. After every call both decoders accept or refuse alike, return the same number of samples, and end in the same final range. While no packet was lost or damaged, the output is within 50 dB of libopus's. opus1's output buffer sometimes has more or less room than the frame size. More room changes nothing. With too little room opus1 may refuse, and then it keeps its state. |
-| `fuzz_multistream_decoder` | A layout and packets into `MultistreamDecoder` and into libopus's `opus_multistream_decoder`. Both accept or refuse the layout alike. After every call they accept or refuse alike, return the same number of samples, and end in the same final range. While no packet was lost or damaged, the output is within 50 dB of libopus's. opus1's output buffer sometimes has more or less room than the frame size. More room changes nothing. With too little room opus1 may refuse, and then it keeps its state. A decoder built from the layout as the channel mapping table of an Ogg Opus header is accepted too. |
-| `fuzz_multistream_encoder` | `MultistreamEncoder` with a layout, settings and audio from the input. libopus accepts and refuses the same layouts, and picks the same streams and mapping for a mapping family. Every packet decodes in libopus's multistream decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings, given `f32` samples where the first gets the same audio as `i16`, writes the same packets. One sample too few is refused, and the encoder keeps its state. |
-| `fuzz_encoder_settings` | `OpusEncoder` with settings that change between frames: bitrate, variable or constant bitrate, complexity, forced mode, bandwidth, forced channel count, FEC, loss percentage, the low-frequency-effects (LFE) flag, energy mask, prediction and frame size. Every valid frame is encoded. Every packet decodes in libopus's decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings, given `f32` samples where the first gets the same audio as `i16`, writes the same packets. One sample too few is refused, and the encoder keeps its state. |
+| `fuzz_multistream_decoder` | A layout and packets into `MultistreamDecoder` and into libopus's `opus_multistream_decoder`. Both accept or refuse the layout alike. After every call they accept or refuse alike, return the same number of samples, and end in the same final range. While no packet was lost or damaged, the output is within 50 dB of libopus's. opus1's output buffer sometimes has more or less room than the frame size. More room changes nothing. With too little room opus1 may refuse, and then it keeps its state. A decoder built from the layout as the channel mapping table of an Ogg Opus header is accepted too. opus1 writes only the samples it returns, with `f32` and with 16-bit output: the rest of its buffer keeps a marker value. |
+| `fuzz_multistream_encoder` | `MultistreamEncoder` with a layout, settings and audio from the input. libopus accepts and refuses the same layouts, and picks the same streams and mapping for a mapping family. Every packet decodes in libopus's multistream decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings, given `f32` samples where the first gets the same audio as `i16`, writes the same packets. One sample too few is refused, and the encoder keeps its state. With a constant bitrate that is explicit or the maximum, a packet has the length of libopus's rule (`opus_multistream_encoder.c` lines 918-928): the bytes of the bitrate, at least the smallest packet and at most the buffer, or the whole buffer at the maximum bitrate. |
+| `fuzz_encoder_settings` | `OpusEncoder` with settings that change between frames: bitrate (also automatic and maximum), variable or constant bitrate and the constraint of variable bitrate, complexity, forced mode, bandwidth, forced channel count, FEC, loss percentage, the low-frequency-effects (LFE) flag, energy mask, prediction and frame size. A setting libopus refuses is refused. Every valid frame is encoded. With a constant bitrate every packet has the length of libopus's rule in `opus_encode_native` (`cbr_packet_len` in `fuzz/fuzz_targets/common/mod.rs`). Every packet decodes in libopus's decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings, given `f32` samples where the first gets the same audio as `i16`, writes the same packets. One sample too few is refused, and the encoder keeps its state. |
+| `fuzz_channel_order` | A stereo `OpusEncoder`, or a `MultistreamEncoder` with the layout of a mapping family or with channels, streams and a mapping, gets a tone of its own in every input channel. libopus's encoder codes the same tones with the same settings, and libopus's decoders decode both. For each output channel the check measures the strongest tone of another input channel, relative to its level at the input (the leakage). Wherever libopus's leakage is -20 dB or less, opus1's must be below -6 dB. A channel on the wrong output gives a leakage of about 0 dB. Stereo streams that an encoder codes as mono, and those that SILK codes with a constant bitrate, are left out, see below. |
 
 The output is compared only while both decoders have decoded the same packets in full. opus1's decoder differs from libopus's only in rounding, so 50 dB leaves a wide margin. After a lost or damaged packet the output is no longer compared. The concealment searches the decoded signal for its pitch, and a rounding difference can change what it finds. A frame of 0 or 1 bytes is concealed as well, so it also ends the comparison. So does a packet that switches from CELT-only to SILK or Hybrid. Unless such a packet carries a redundant CELT frame, the decoder conceals 5 ms in CELT and fades them into the new frame. The targets do not look for the redundant frame, so they stop comparing after every such switch. The fuzzer found a switch without a redundant frame at 8 kHz. On the CELT packets before it, the two decoders agreed to 127 dB or better. On the 20 ms SILK frame of the switch they agreed to 33 dB. The difference lay in the first 5 ms of that frame, which hold the concealed CELT audio. There the decoders agreed to 27 dB, and on the other 15 ms to 294 dB.
 
@@ -274,6 +277,62 @@ The targets do find defects. Defects were put into a copy of the code on purpose
 
 Every run stopped within 20 seconds.
 
+### Checks added with the 0.2.0 interface
+
+Four checks came with the interface changes of 0.2.0:
+
+1. `fuzz_multistream_decoder` fills opus1's output buffer with a marker value before each call. After a call, the samples behind the ones returned must still hold it, and the samples returned must fit the buffer. This holds for `f32` and for 16-bit output. Before, only the `f32` path checked the fit.
+2. `fuzz_encoder_settings` compares the length of every constant-bitrate packet with libopus's rule (`cbr_packet_len` in `fuzz/fuzz_targets/common/mod.rs`, after `opus_encode_native`). It also requires that a bitrate, complexity or loss percentage that libopus refuses is refused. The automatic and the maximum bitrate and the constraint of the variable bitrate are among the settings it changes. Its output buffers have 1 to 12,000 bytes. Only a buffer of more than 7,500 bytes shows one part of the rule: at the maximum bitrate a 40 or 60 ms packet is padded to the whole buffer (opus_encoder.c:1749). With a smaller buffer the bitrate of the buffer is below the 1.5 Mb/s of the maximum bitrate, so the constant size is the buffer anyway.
+3. `fuzz_multistream_encoder` compares the length of every constant-bitrate packet with libopus's rule for an explicit and for the maximum bitrate (`opus_multistream_encoder.c` lines 918-928). The rule for the automatic bitrate depends on the allocation, which the target does not know.
+4. `fuzz_channel_order` is new. It is described in its own comment and in the table above.
+
+Each check ran for 12 minutes as one process, the first three at the same time and `fuzz_channel_order` in its final form after them, on Apple M4 Pro while other work ran on the machine. None failed:
+
+| Target | Inputs run |
+|---|---:|
+| `fuzz_encoder_settings` | 632,010 |
+| `fuzz_multistream_encoder` | 338,192 |
+| `fuzz_multistream_decoder` | 783,536 |
+| `fuzz_channel_order` | 140,527 |
+
+`fuzz_channel_order` failed four times while its check was being shaped, each time on a difference between the encoders that is not a channel order fault:
+
+- A stereo stream that SILK coded with a constant bitrate at 12 kHz lost its stereo image in opus1. The fixed-point build of libopus, which opus1's SILK encoder ports, loses it too (built with `cc`, see [Checks against the fixed-point build](#checks-against-the-fixed-point-build-of-libopus)); the float build keeps it. Such streams are left out of the check.
+- 7.1 sound at 24 kHz with the automatic bitrate: the encoders chose other bandwidths on purpose (D1 in [Differences from libopus](10-differences-from-libopus.md)). Surround layouts get an explicit bitrate since.
+- A stereo stream that both encoders coded as mono. Such streams are left out.
+- Three mono streams at 24 kHz in 2.5 ms frames at complexity 7: opus1 lost the tone of one channel where libopus kept it. libopus runs its speech and music analysis there, which opus1 does not have. The check now measures how loud another channel's tone comes out, so a lost tone no longer counts.
+
+Defects put into a copy of the code show that the new checks find what they look for. Each run started from a copy of the target's corpus from the runs above and failed while it replayed the saved inputs:
+
+| Defect put in | Target | What failed | Time |
+|---|---|---|---|
+| A constant-bitrate packet of one stream took `(bits + 7) / 8` bytes instead of `(bits + 4) / 8`. | `fuzz_encoder_settings` | packet length | 3 s |
+| The same rounding in the multistream encoder's constant-bitrate budget. | `fuzz_multistream_encoder` | packet length | 33 s |
+| `MultistreamDecoder::decode_i16` wrote one sample behind those it returned. | `fuzz_multistream_decoder` | marker value | 1 s |
+| The multistream encoder fed the left input channel of a coupled stream to its right channel and the right to its left. | `fuzz_channel_order` | another channel's tone at 0.1 dB of its input level | 6 s |
+| SILK's stereo coding took the side signal as right minus left. | `fuzz_channel_order` | another channel's tone at 0.0 dB of its input level | 1 s |
+
+A review of the checks put in five other defects, each into the code as it is in the repository, and fuzzed each target from an empty corpus directory with the saved inputs of the runs above as seeds. Every defect was found:
+
+| Defect put in | Target | What failed | Time |
+|---|---|---|---|
+| `MultistreamDecoder::decode_fec_i16` wrote one sample behind those it returned. | `fuzz_multistream_decoder` | marker value | 0 s |
+| A 40 or 60 ms packet at the maximum bitrate and a constant bitrate was padded to the size of 1.5 Mb/s instead of the whole buffer. | `fuzz_encoder_settings` | packet length (7,500 bytes for a buffer of 8,336) | 49 s |
+| A packet too small to code audio was not padded to the constant size. | `fuzz_encoder_settings` | packet length | 2 s |
+| The multistream encoder limited a packet at the maximum bitrate and a constant bitrate to the allocated bitrate instead of the buffer. | `fuzz_multistream_encoder` | packet length | 14 s |
+| `OpusEncoder` swapped the left and the right channel of the input before CELT coded it. | `fuzz_channel_order` | another channel's tone at -4.7 dB of its input level | 0 s |
+
+The second defect could not be found before the buffers went above 4,000 bytes, and `core_encoder_settings::maximum_bitrate_gives_the_packets_of_libopus` did not find it either before it got a buffer of 10,000 bytes.
+
+The four targets then ran again without a defect, 10.5 minutes each, as four processes at the same time on Apple M4 Pro while other work ran on the machine. None failed:
+
+| Target | Inputs run |
+|---|---:|
+| `fuzz_encoder_settings` (buffers up to 12,000 bytes) | 194,364 |
+| `fuzz_multistream_encoder` | 109,976 |
+| `fuzz_multistream_decoder` | 277,128 |
+| `fuzz_channel_order` | 99,048 |
+
 ## `#![no_std]` checks
 
 Without its default features, opus1 builds as `#![no_std]` with no heap allocation (see the [README](../README.md)). `scripts/check_no_std.sh` checks this:
@@ -323,6 +382,8 @@ They were written on, and first run on, a HONOR CLK-AN00: MediaTek MT6833, Andro
 | `golden.sh` | Writes the golden hashes on the phone. With `--check FILE` it also checks them against a golden file from another machine. |
 | `bench.sh` | Runs `perf_harness bench`, pinned with `taskset` to one CPU of the fast cluster and one of the slow cluster (see [Performance](08-performance.md#on-an-android-phone)). |
 | `profile.sh` | Counts hardware events per frame with `simpleperf stat` and samples the hot functions with `simpleperf record`, for one operation of the harness. |
+| `build-variant.sh NAME` | Builds the harness with the compiler settings of the environment (for example `RUSTFLAGS`, `CARGO_PROFILE_RELEASE_LTO` or `PERF_HARNESS_PAD`) as the program `target/android/bin/perf_harness_NAME`. It records the settings and the address of the code section beside it. |
+| `ab.sh BASE VARIANT...` | Runs such programs in turns on the phone, as one job: each pass runs every program once on each chosen CPU, and the order turns by one place from pass to pass. At the end it prints `perf_harness pairs` of BASE against each other program (see [Comparing two builds](08-performance.md#comparing-two-builds)). |
 
 `env.sh` holds the settings that all scripts share. The commands of a first run:
 
@@ -334,6 +395,17 @@ scripts/android/golden.sh --check target/perf/golden_final.txt
 scripts/android/bench.sh --runs 2
 scripts/android/profile.sh --little celt_fb_48k_mono_64k_vbr_c10_20ms enc rust
 ```
+
+To compare two builds, for example the default build and one for the Cortex-A55, in three passes on CPU 5 and CPU 7:
+
+```text
+scripts/android/build-variant.sh base
+RUSTFLAGS="-C target-cpu=cortex-a55" scripts/android/build-variant.sh a55
+scripts/android/ab.sh --passes 3 --cpus "5 7" base a55 -- \
+  --filter silk_wb_16k_mono_20k_vbr_c10_20ms,celt_fb_48k_mono_64k_vbr_c10_20ms
+```
+
+`build-libopus.sh --host` builds the same libopus for the computer it runs on, when that is a 64-bit ARM computer such as a Mac with Apple silicon. It is the C reference at `-O2` of [The C reference](08-performance.md#the-c-reference).
 
 Some details:
 

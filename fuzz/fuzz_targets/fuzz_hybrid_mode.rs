@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
@@ -43,17 +43,17 @@ fuzz_target!(|data: &[u8]| {
             }
 
             // Configure encoder with various settings
-            encoder.bitrate_bps = match data[2] % 6 {
+            let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(match data[2] % 6 {
                 0 => 16000,
                 1 => 32000,
                 2 => 64000,
                 3 => 96000,
                 4 => 128000,
                 _ => 256000,
-            };
+            }));
 
-            encoder.complexity = (data[3] % 11) as i32;
-            encoder.use_cbr = data[4] % 2 == 0;
+            let _ = encoder.set_complexity((data[3] % 11) as i32);
+            encoder.set_vbr(data[4] % 2 != 0);
 
             // Generate test input
             let samples_needed = frame_size * channels;

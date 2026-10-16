@@ -75,8 +75,7 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
-use opus1::multistream::encoder::Bitrate;
-use opus1::{Application, ForcedMode};
+use opus1::{Application, Bitrate, ForcedMode};
 
 /// libopus runs its analysis from complexity 7 on.
 const COMPLEXITY: i32 = 6;

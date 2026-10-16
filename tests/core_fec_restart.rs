@@ -17,10 +17,10 @@ mod core_common;
 mod k24_common;
 
 use core_common::*;
-use opus1::range_coder::RangeCoder;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL};
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::internals::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 
 /// The first gain index of the SILK frame of a 20 ms wideband mono packet,
 /// decoded as the normal frame or as the LBRR copy it carries.
@@ -50,11 +50,11 @@ fn gain_increases(application: (i32, Application), loss: i32) -> Vec<(usize, i32
     let mut c_enc = CEncoder::new(rate, 1, application.0);
     c_enc.complexity(5).bitrate(32000).bandwidth(BW_WB).fec(true, loss);
     let mut enc = OpusEncoder::new(rate as i32, 1, application.1).unwrap();
-    enc.complexity = 5;
-    enc.bitrate_bps = 32000;
+    enc.set_complexity(5).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_bandwidth(Bandwidth::Wideband);
-    enc.use_inband_fec = true;
-    enc.packet_loss_perc = loss;
+    enc.set_inband_fec(true);
+    enc.set_packet_loss_perc(loss).unwrap();
     let mut buf = vec![0u8; 1500];
     let (mut packets, mut c_packets) = (Vec::new(), Vec::new());
     for (i, input) in pcm.chunks_exact(frame).enumerate() {

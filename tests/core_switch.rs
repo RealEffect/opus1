@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{aligned_snr, multitone, speech, to_stereo, toc_summary};
-use opus1::{Application, Bandwidth, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
 
 const MODES: [(&str, i32, ForcedMode); 3] = [
     ("SILK", MODE_SILK, ForcedMode::SilkOnly),
@@ -49,8 +49,8 @@ fn mode_changes_in_a_running_stream_keep_the_final_range() {
         let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
         c_enc.bitrate(bitrate).complexity(5);
         let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
-        enc.bitrate_bps = bitrate;
-        enc.complexity = 5;
+        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_complexity(5).unwrap();
         let mut c_dec = CDecoder::new(rate, 1);
         let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
         let mut buf = vec![0u8; 4000];
@@ -93,8 +93,8 @@ fn bandwidth_limits_and_lfe_changed_in_a_running_stream() {
     let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
     c_enc.bitrate(40000).complexity(5);
     let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = 40000;
-    enc.complexity = 5;
+    enc.set_bitrate(Bitrate::BitsPerSecond(40000)).unwrap();
+    enc.set_complexity(5).unwrap();
     let mut c_dec = CDecoder::new(rate, 1);
     let mut buf = vec![0u8; 4000];
     let (mut packets, mut c_packets) = (Vec::new(), Vec::new());
@@ -168,9 +168,9 @@ fn cbr_run(rate: usize, channels: usize, mode: usize, frame_2_5ms: usize, pcm: &
     c_enc.force_mode(c_mode).bitrate(bitrate).vbr(false).complexity(5);
     let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
     enc.set_force_mode(Some(forced));
-    enc.bitrate_bps = bitrate;
-    enc.use_cbr = true;
-    enc.complexity = 5;
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_vbr(false);
+    enc.set_complexity(5).unwrap();
     if c_mode == MODE_SILK && rate > 16000 {
         // SILK-only reaches wideband at most.
         c_enc.max_bandwidth(BW_WB);
@@ -314,8 +314,8 @@ fn packets_too_small_to_code_name_the_last_coded_mode() {
                     let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
                     c_enc.vbr(!cbr).complexity(5).lfe(lfe);
                     let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
-                    enc.use_cbr = cbr;
-                    enc.complexity = 5;
+                    enc.set_vbr(!cbr);
+                    enc.set_complexity(5).unwrap();
                     enc.set_lfe(lfe);
                     if let Some((c_mode, forced)) = mode {
                         c_enc.force_mode(c_mode);
@@ -333,7 +333,7 @@ fn packets_too_small_to_code_name_the_last_coded_mode() {
                         let low = (ms % 300 >= 200) != low_first;
                         let bitrate = if low { 600 } else { 32000 };
                         c_enc.bitrate(bitrate);
-                        enc.bitrate_bps = bitrate;
+                        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                         let c_packet = c_enc.encode(input);
                         let n = enc.encode(input, frame, &mut buf).unwrap_or_else(|e| panic!("{what}, packet {i}: {e}"));
                         let packet = &buf[..n];
@@ -384,8 +384,8 @@ fn placeholders_in_short_frames_after_longer_coded_packets() {
                 let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
                 enc.set_force_mode(Some(forced));
                 enc.set_bandwidth(bw);
-                enc.use_cbr = cbr;
-                enc.complexity = 5;
+                enc.set_vbr(!cbr);
+                enc.set_complexity(5).unwrap();
                 let mut buf = vec![0u8; 4000];
                 let mut at = 0;
                 let mut seen = 0;
@@ -395,7 +395,7 @@ fn placeholders_in_short_frames_after_longer_coded_packets() {
                     let coding = (at / 480) % 25 < 20;
                     let (frame, bitrate) = if coding { (960, 32000) } else { (short, 600) };
                     c_enc.bitrate(bitrate);
-                    enc.bitrate_bps = bitrate;
+                    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                     let input = &pcm[at..at + frame];
                     at += frame;
                     let c_packet = c_enc.encode(input);

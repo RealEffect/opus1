@@ -19,9 +19,9 @@
 
 mod celtenc_common;
 use celtenc_common::*;
-use opus1::celt::CeltEncoder;
-use opus1::modes::default_mode;
-use opus1::range_coder::RangeCoder;
+use opus1::internals::celt::CeltEncoder;
+use opus1::internals::modes::default_mode;
+use opus1::internals::range_coder::RangeCoder;
 
 /// A mask: its name and the value for (channel, band).
 type Mask = (&'static str, fn(usize, usize) -> f32);

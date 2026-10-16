@@ -1,4 +1,4 @@
-use opus1::pvq::{cwrsi, icwrs};
+use opus1::internals::pvq::{cwrsi, icwrs};
 
 #[test]
 fn test_pvq_consistency() {

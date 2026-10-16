@@ -25,8 +25,8 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::multistream::encoder::MultistreamEncoder;
-use opus1::multistream::surround::SurroundProbe;
+use opus1::multistream::MultistreamEncoder;
+use opus1::internals::multistream::surround::SurroundProbe;
 use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
 
 const FS: i32 = 48_000;
@@ -245,8 +245,8 @@ fn coupled_streams_equal_to_a_stereo_encoder(vbr: bool, given: MaskGiven) -> (us
         let left = layout.left_channel(stream, None).unwrap();
         let right = layout.right_channel(stream, None).unwrap();
         let mut single = OpusEncoder::new(FS, 2, Application::Audio).unwrap();
-        single.bitrate_bps = enc.stream_encoder(stream).unwrap().bitrate_bps;
-        single.use_cbr = !vbr;
+        single.set_bitrate(enc.stream_encoder(stream).unwrap().bitrate_setting()).unwrap();
+        single.set_vbr(vbr);
         single.set_force_mode(Some(ForcedMode::CeltOnly));
         single.set_bandwidth(Bandwidth::Fullband);
         let mut out = vec![0u8; 1500];

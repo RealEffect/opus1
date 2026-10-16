@@ -71,6 +71,12 @@ impl CEncoder {
         self
     }
 
+    /// A "set" control that takes one `opus_int32`, with libopus's return
+    /// code: 0 when the value was taken, `OPUS_BAD_ARG` (-1) when not.
+    pub fn try_set(&mut self, request: i32, value: i32) -> i32 {
+        unsafe { sys::opus_encoder_ctl(self.st, request, value) }
+    }
+
     /// A "get" control that returns one `opus_int32`.
     pub fn get(&mut self, request: i32) -> i32 {
         let mut value = 0i32;

@@ -12,7 +12,7 @@
 //! The function is fixed-point: the residual energy, its Q value and every
 //! coefficient must be identical.
 
-use opus1::silk::lpc_analysis::silk_burg_modified_fix;
+use opus1::internals::silk::lpc_analysis::silk_burg_modified_fix;
 
 /// (checksum of the input, residual energy, its Q value, checksum of all
 /// coefficients, coefficients 0, 1 and the last one).

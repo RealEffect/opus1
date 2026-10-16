@@ -3,10 +3,10 @@
 //! Bad arguments return an error and leave the decoder as it was. Data that
 //! no encoder would write decodes to something, without a panic.
 
-use opus1::range_coder::RangeCoder;
-use opus1::silk::dec_api::SilkDecoder;
-use opus1::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus1::silk::decoder_structs::SilkDecControl;
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::internals::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
+use opus1::internals::silk::decoder_structs::SilkDecControl;
 
 mod silkdec_common;
 use silkdec_common::*;

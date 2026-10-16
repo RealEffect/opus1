@@ -10,10 +10,10 @@
 mod celtenc_common;
 use celtenc_common::Noise;
 
-use opus1::bands;
-use opus1::modes::{CeltMode, default_mode};
-use opus1::range_coder::RangeCoder;
-use opus1::rate::clt_compute_allocation;
+use opus1::internals::bands;
+use opus1::internals::modes::{CeltMode, default_mode};
+use opus1::internals::range_coder::RangeCoder;
+use opus1::internals::rate::clt_compute_allocation;
 use std::os::raw::{c_int, c_uchar, c_void};
 
 /// libopus `ec_ctx` (celt/entcode.h).
@@ -84,6 +84,7 @@ unsafe extern "C" {
         gain: f32,
     ) -> u32;
     fn exp_rotation(x: *mut f32, len: c_int, dir: c_int, stride: c_int, k: c_int, spread: c_int);
+    fn op_pvq_search_c(x: *mut f32, iy: *mut c_int, k: c_int, n: c_int, arch: c_int) -> f32;
     fn anti_collapse(
         m: *const c_void,
         x: *mut f32,
@@ -170,6 +171,55 @@ fn stereo_angles_are_the_ones_libopus_computes() {
     println!("{checked} angles, all equal to libopus's");
 }
 
+
+/// The pulse search gives the pulses of libopus's `op_pvq_search_c`, on
+/// the band sizes and pulse counts the encoder uses and on inputs that
+/// take every path of the search: the projection for many pulses, the
+/// pulse search after it, bands that are silent, tiny or too large, and
+/// bands with many equal values.
+#[test]
+fn pulses_are_searched_as_libopus_does() {
+    let mut noise = Noise(31);
+    let (mut checked, mut differ) = (0, 0);
+    for n in (1usize..=24).chain([32, 36, 44, 48, 64, 72, 88, 96, 144, 176]) {
+        for k in [1, 2, 3, 4, 5, 7, 10, 16, 24, 40, 64, 128] {
+            for round in 0..12 {
+                let mut x: Vec<f32> = (0..n).map(|_| noise.next()).collect();
+                match round % 6 {
+                    // A few large values among small ones.
+                    1 => {
+                        x.iter_mut().for_each(|v| *v *= 1e-3);
+                        let at = (noise.next().abs() * n as f32) as usize % n;
+                        x[at] = 0.9;
+                    }
+                    // Silent, or so small that libopus puts one pulse at 0.
+                    2 => x.fill(0.0),
+                    3 => x.iter_mut().for_each(|v| *v *= 1e-18),
+                    // So large that the sum reaches 64.
+                    4 => x.iter_mut().for_each(|v| *v *= 64.0),
+                    // Equal magnitudes.
+                    5 => {
+                        for (i, v) in x.iter_mut().enumerate() {
+                            *v = if i % 2 == 0 { 0.25 } else { -0.25 };
+                        }
+                    }
+                    _ => {}
+                }
+                let mut xc = x.clone();
+                let mut yc = vec![0 as c_int; n];
+                unsafe { op_pvq_search_c(xc.as_mut_ptr(), yc.as_mut_ptr(), k, n as c_int, 0) };
+                let mut yr = vec![0i32; n];
+                opus1::internals::pvq::pvq_search(&x, &mut yr, k, n);
+                checked += 1;
+                differ += (yc != yr) as usize;
+            }
+        }
+    }
+    println!("{differ} of {checked} pulse vectors differ from libopus's");
+    if cfg!(target_arch = "aarch64") {
+        assert_eq!(differ, 0);
+    }
+}
 
 /// `compute_band_energies` gives the band amplitudes libopus gives, to the
 /// bit.
@@ -973,7 +1023,7 @@ fn spreading_rotation_is_the_one_of_libopus() {
                         unsafe {
                             exp_rotation(xc.as_mut_ptr(), n as c_int, dir, b as c_int, k, spread)
                         };
-                        opus1::pvq::exp_rotation(&mut xr, n, dir, b, k, spread);
+                        opus1::internals::pvq::exp_rotation(&mut xr, n, dir, b, k, spread);
                         checked += 1;
                         differ += !same_bits(&xc, &xr) as usize;
                     }
@@ -1030,11 +1080,11 @@ fn pulses_are_resynthesised_as_libopus_does() {
                     // opus1: the same.
                     let mut rc = RangeCoder::new_encoder(200);
                     let mut xr = x.clone();
-                    let cm_r = opus1::pvq::alg_quant(&mut xr, n, k, spread, b, &mut rc, gain, true);
+                    let cm_r = opus1::internals::pvq::alg_quant(&mut xr, n, k, spread, b, &mut rc, gain, true);
                     rc.done();
                     let mut rd = RangeCoder::new_decoder(&rc.buf[..200]);
                     let mut yr = vec![0f32; n];
-                    let dm_r = opus1::pvq::alg_unquant(&mut yr, n, k, spread, b, &mut rd, gain);
+                    let dm_r = opus1::internals::pvq::alg_unquant(&mut yr, n, k, spread, b, &mut rd, gain);
                     checked += 1;
                     let ok = cm_c == cm_r
                         && dm_c == dm_r

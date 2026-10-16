@@ -16,13 +16,24 @@ This document describes how the source code of `opus1` is organised, for maintai
 
 ## Source layout
 
+### The public interface and `internals`
+
+The public interface is the crate root and two modules:
+
+- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`.
+- `packet`: reading, writing and padding packets.
+- `multistream`: the multistream encoder and decoder and their channel layouts.
+
+Every other module is private. The tests, benchmarks, examples and fuzz targets of the repository reach internal items through the module `opus1::internals` (`src/internals.rs`). That module is hidden from the documentation and is not part of the stable API. Each module inside it has the name and the place of an internal module, and re-exports only the items that code outside the crate uses, for example `opus1::internals::range_coder::RangeCoder`. So the compiler reports an internal item that neither the codec nor a test uses as dead code.
+
 ### The Opus layer and shared code
 
 | File | What it does | libopus counterpart |
 |---|---|---|
 | `src/lib.rs` | `OpusEncoder` and `OpusDecoder`: mode and bandwidth decisions, in-band forward error correction (FEC) decisions, mode switches with redundant CELT frames, packets of 40 and 60 milliseconds (ms), packet loss, `pcm_soft_clip`. | `src/opus_encoder.c`, `src/opus_decoder.c`, `opus_pcm_soft_clip` in `src/opus.c` |
+| `src/internals.rs` | The internal items that the tests, benchmarks, examples and fuzz targets use (see above). | none |
 | `src/packet.rs` | Reading, writing and padding packets; self-delimited framing; checks of multistream packets. | `opus_packet_parse_impl` in `src/opus.c`, `src/repacketizer.c`, `opus_multistream_packet_validate` in `src/opus_multistream_decoder.c` |
-| `src/hp_cutoff.rs` | The encoder's input filters: the high-pass filter for speech (`hp_cutoff`, `hp_cutoff_i16`, `hp_cutoff_float`) and, for other audio, the filter that removes the constant (DC, direct current) part of the signal (`dc_reject_float`). The integer filters use the second-order filter of `src/silk/sigproc_fix.rs`. | `hp_cutoff` and `dc_reject` in `src/opus_encoder.c` |
+| `src/hp_cutoff.rs` | The encoder's input filters: the high-pass filter for speech (`hp_cutoff`, `hp_cutoff_float`) and, for other audio, the filter that removes the constant (DC, direct current) part of the signal (`dc_reject_float`). The integer filters use the second-order filter of `src/silk/sigproc_fix.rs`. | `hp_cutoff` and `dc_reject` in `src/opus_encoder.c` |
 | `src/range_coder.rs` | `RangeCoder`: the range encoder and decoder, bit counting (`tell`, `tell_frac`), Laplace-distributed symbols. | `celt/entenc.c`, `celt/entdec.c`, `celt/entcode.c`, `celt/laplace.c` |
 | `src/fixedvec.rs` | `FixedVec<T, N>`: a growable buffer with a fixed capacity, stored inline. See [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored). | none |
 | `src/compat.rs` | `OnceCell` (a value built once, without the heap), a stable insertion sort (`sort_by`), the x86 feature probes (`x86_has_avx` and others), and the `Math` trait that maps float functions to `libm` without `std`. | none |
@@ -40,8 +51,8 @@ This document describes how the source code of `opus1` is organised, for maintai
 | `src/pvq.rs` | The pyramid vector quantizer (PVQ): pulse search (`pvq_search`, `alg_quant`), `alg_unquant`, and the coding of pulse vectors as one number (`encode_pulses`, `decode_pulses`). | `celt/vq.c`, `celt/cwrs.c` |
 | `src/mdct.rs` | `MdctLookup`: the forward and inverse MDCT. | `celt/mdct.c` |
 | `src/kiss_fft.rs` | The complex fast Fourier transform (FFT) behind the MDCT, with a portable version, a NEON version (NEON: the vector instructions of 64-bit ARM) and a FEAT_FCMA version (see [The FFT and FEAT_FCMA](#the-fft-and-feat_fcma)). | `celt/kiss_fft.c` |
-| `src/pitch.rs` | Pitch search for the pre-filter (`pitch_downsample`, `pitch_search`, `remove_doubling`), cross-correlations and inner products. | `celt/pitch.c`, `celt/pitch.h` |
-| `src/celt_lpc.rs` | Linear prediction helpers of CELT: `lpc` and `autocorr`. | `celt/celt_lpc.c` |
+| `src/pitch.rs` | Pitch search for the pre-filter and the loss concealment (`pitch_downsample`, `pitch_search`, `remove_doubling`), cross-correlations and inner products (`celt_inner_prod`). | `celt/pitch.c`, `celt/pitch.h` |
+| `src/celt_lpc.rs` | Linear prediction of CELT: `lpc`, `autocorr` and the two filters of the loss concealment (`celt_fir`, `celt_iir`). | `celt/celt_lpc.c` |
 
 ### The SILK layer (`src/silk/`)
 
@@ -255,7 +266,7 @@ The loops that take most of the run time have several versions. The rule is the 
    - Some kernels in `pitch.rs` and `celt.rs` also have an SSE version. SSE (Streaming SIMD Extensions, where SIMD means single instruction, multiple data) is the older set of x86 vector instructions, and every x86-64 processor has it.
 4. Otherwise it runs the portable Rust version.
 
-The check happens inside the public function, at every call. With `std` the probes use `std::arch::is_x86_feature_detected!`, which stores its answer after the first call. Without `std` they use `cfg!(target_feature = "...")`, which the compiler decides from the build flags.
+The check happens inside the function that the rest of the codec calls, at every call. With `std` the probes use `std::arch::is_x86_feature_detected!`, which stores its answer after the first call. Without `std` they use `cfg!(target_feature = "...")`, which the compiler decides from the build flags.
 
 Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `silk/sigproc_fix.rs`. Files with aarch64 versions: those, plus, under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs`, `nlsf.rs`, `nsq_del_dec.rs`, `pitch_analysis.rs`, `resampler.rs` and `vq_wmat_ec.rs`.
 
@@ -269,7 +280,7 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 
 - The module `fused` builds the FFT stages twice from one macro, `kernels!`: `fused::fcma` (marked `#[target_feature(enable = "neon,fcma")]`, with `fcmla` and `fcadd`) and `fused::fma` (plain NEON with `fmla`). Both give the same bits.
 - `has_fcma()` decides which one runs. It is `true` at compile time where the target includes FEAT_FCMA (Apple silicon). Elsewhere it asks `std::arch::is_aarch64_feature_detected!("fcma")` with `std`, and answers `false` without `std`.
-- On aarch64 the FFT gives the bits of `opus_fft_impl_fused`, which match the arm64 build of libopus. On other targets it gives the bits of `opus_fft_impl_scalar`. Both functions are public, so tests can compare them on any machine.
+- On aarch64 the FFT gives the bits of `opus_fft_impl_fused`, which match the arm64 build of libopus. On other targets it gives the bits of `opus_fft_impl_scalar`. The tests reach both through `opus1::internals::kiss_fft`, so they can compare them on any machine.
 
 ## Unsafe code
 
@@ -290,19 +301,19 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 - The SILK functions keep the libopus convention and return `i32` codes: 0 (`SILK_NO_ERROR`) for success, and negative codes such as `SILK_ENC_FS_NOT_SUPPORTED` (-102) otherwise. `SilkEncoder::encode` (`src/silk/enc_api.rs`) turns a non-zero code into a message, such as `"SILK encoding failed"`.
 - The CELT encoder reports nothing itself. The range coder records an overflow in its `error` field, and `src/lib.rs` checks that field and the bit count after each frame.
 - Input is checked before state changes. The decoder parses the packet and checks the buffer sizes before it updates its state, so a rejected packet leaves the decoder unchanged.
-- Settings that are public fields (`bitrate_bps`, `complexity`, `packet_loss_perc`) are clamped at the next `encode`, not rejected.
+- The setters of `OpusEncoder` check their values as libopus's `OPUS_SET_*` requests do. A refused value is an error and leaves the setting as it was. A positive bitrate outside the allowed range is limited instead, as in libopus.
 
 ## Tests, examples, benchmarks and fuzzing
 
 ### `tests/`
 
-The repository holds 228 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
+The repository holds 229 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
 
 | Prefix | Files | What the tests cover |
 |---|---:|---|
 | `perfk_` | 33 | Single kernels after performance work, against the same function inside libopus or a reference version: FFT, PVQ, range coder, pitch, SILK analysis and quantizer. Four `.expected` files hold reference output. |
 | `multistream_` | 31 | The multistream encoder and decoder: `multistream_c_*` against libopus's own functions, `multistream_enc_*` and `multistream_dec_*` for each side, `multistream_e2e_*` end to end, `multistream_surround_*` for the surround masking analysis. |
-| `core_` | 22 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits. |
+| `core_` | 23 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits. |
 | `k24_` | 21 | The 24 kHz path: encoder modes, Hybrid super-wideband, SILK internals and loss, and the decoder matrix of every mode and bandwidth at every output rate. |
 | `celtenc_`, `celtdec_`, `celt_` | 16, 4, 8 | The CELT encoder and decoder. |
 | `silkenc_`, `silkdec_`, `silk_` | 6, 10, 14 | The SILK encoder and decoder. |
@@ -329,7 +340,7 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
 
 ### `fuzz/`
 
-`fuzz/` is a separate Cargo package of 18 targets for libFuzzer. `fuzz/fuzz.sh` builds them with the stable toolchain and runs them. Five targets compare opus1 with libopus: `fuzz_packet`, `fuzz_decoder_sequence`, `fuzz_multistream_decoder`, `fuzz_multistream_encoder` and `fuzz_encoder_settings`. Their wrappers of the libopus C functions are in `fuzz/fuzz_targets/common/mod.rs`. The other 13 targets run opus1 alone. `fuzz/README.md` and [Testing](09-testing.md#fuzzing) describe what each target checks.
+`fuzz/` is a separate Cargo package of 19 targets for libFuzzer. `fuzz/fuzz.sh` builds them with the stable toolchain and runs them. Six targets compare opus1 with libopus: `fuzz_packet`, `fuzz_decoder_sequence`, `fuzz_multistream_decoder`, `fuzz_multistream_encoder`, `fuzz_encoder_settings` and `fuzz_channel_order`. Their wrappers of the libopus C functions are in `fuzz/fuzz_targets/common/mod.rs`. The other 13 targets run opus1 alone. `fuzz/README.md` and [Testing](09-testing.md#fuzzing) describe what each target checks.
 
 ### `scripts/`
 

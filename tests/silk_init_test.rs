@@ -1,5 +1,5 @@
-use opus1::silk::init_encoder::silk_init_encoder;
-use opus1::silk::structs::SilkEncoderState;
+use opus1::internals::silk::init_encoder::silk_init_encoder;
+use opus1::internals::silk::structs::SilkEncoderState;
 
 #[test]
 fn test_silk_init() {

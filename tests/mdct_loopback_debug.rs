@@ -2,7 +2,7 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus1::mdct::MdctLookup;
+use opus1::internals::mdct::MdctLookup;
 use std::f32::consts::PI;
 
 #[test]

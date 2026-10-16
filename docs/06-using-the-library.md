@@ -1,6 +1,6 @@
 # Using the library
 
-This document shows how to use `opus1` in an application. It starts with one frame through the encoder and the decoder. It then explains the default settings and how the encoder chooses its coding mode. Three recipes follow: a voice over Internet Protocol (VoIP) call at 16 kilohertz (kHz), a voice agent at 24 kHz, and music at 48 kHz. Then come the settings that matter most (frame duration, bitrate, complexity), packet loss and 16-bit samples. The last sections cover the build without the standard library, errors, threads, memory, and how to build and test the crate on a machine without cmake. Readers new to Opus can start with [What Opus is](01-what-is-opus.md). The byte layout of a packet is in [Opus packets](02-packets.md). Audio with more than two channels is in [Multichannel audio](05-multichannel.md). The [documentation index](README.md) lists the other documents.
+This document shows how to use `opus1` in an application. It starts with one frame through the encoder and the decoder. It then explains the default settings and how the encoder chooses its coding mode. Three recipes follow: a voice over Internet Protocol (VoIP) call at 16 kilohertz (kHz), a voice agent at 24 kHz, and music at 48 kHz. Then come the settings that matter most (frame duration, bitrate, complexity), packet loss and 16-bit samples. The last sections cover the build without the standard library, errors, threads, memory, the build settings that make the codec faster, and how to build and test the crate on a machine without cmake. Readers new to Opus can start with [What Opus is](01-what-is-opus.md). The byte layout of a packet is in [Opus packets](02-packets.md). Audio with more than two channels is in [Multichannel audio](05-multichannel.md). The [documentation index](README.md) lists the other documents.
 
 Every `rust` example below is a complete program fragment. `cargo test --doc` compiles and runs each of them against this crate.
 
@@ -26,10 +26,12 @@ opus1 = "0.2"
 
 The crate was published as `opus-rs` up to version 0.1.37. Code that used `opus_rs::` now uses `opus1::`.
 
+The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`) and the modules `packet` and `multistream`. The crate also has a module `internals` for the tests of its repository. That module is hidden from the documentation, and any release may change it.
+
 ## One frame through the encoder and the decoder
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 let rate = 16_000; // samples per second
 let frame = 320; // 20 ms at 16 kHz
@@ -40,7 +42,7 @@ let pcm: Vec<f32> = (0..frame)
     .collect();
 
 let mut encoder = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 20_000;
+encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
 
 // The length of `packet` is the largest packet the encoder may write.
 let mut packet = vec![0u8; 1276];
@@ -57,28 +59,29 @@ The rules of `OpusEncoder::encode(input, frame_size, output)`:
 - The sampling rate is 8000, 12000, 16000, 24000 or 48000 hertz (Hz). Other rates need a resampler before the encoder.
 - `frame_size` is 2.5, 5, 10, 20, 40 or 60 ms of samples per channel.
 - `input` holds at least `frame_size * channels` samples. The encoder reads exactly that many.
-- The length of `output` is the largest packet allowed. It also limits the bitrate. When `output` holds fewer bytes than `bitrate_bps` gives the frame, the encoder codes the frame at the lower rate. Give it 1276 bytes for each 20 ms of the frame when the bitrate alone should decide.
+- The length of `output` is the largest packet allowed. It also limits the bitrate. When `output` holds fewer bytes than the bitrate gives the frame, the encoder codes the frame at the lower rate. Give it 1276 bytes for each 20 ms of the frame when the bitrate alone should decide.
 - The result is the number of bytes written to `output`.
 
 The rules of `OpusDecoder::decode(packet, frame_size, output)`:
 
 - `frame_size` is the room in `output`, in samples per channel. The packet itself says how long it is.
-- The result is the number of samples per channel written. The rest of `output` is set to zero.
+- The result is the number of samples per channel written. The rest of `output` is left as it was, as in libopus.
 - The decoder may have another channel count than the packet. A mono packet fills both channels of a stereo decoder. A stereo packet is mixed down by a mono decoder.
 - The output sampling rate may differ from the input rate of the encoder. Any of the five rates decodes any packet.
 - Float output is not clipped, as in libopus `opus_decode_float`. Loud signals can come back with peaks beyond 1.0.
 
 ## Default settings and the automatic choice of mode
 
-These public fields of `OpusEncoder` can be set at any time. The next `encode` call uses them.
+These settings of `OpusEncoder` can be changed at any time. The next `encode` call uses them. Each setter checks its value as the matching `OPUS_SET_*` request of libopus does. A setter that can refuse a value returns a `Result`. After an error the setting keeps its old value.
 
-| Field | Default | Meaning |
-|---|---|---|
-| `bitrate_bps` | 64000 | Target bitrate in b/s, for all channels together. Values outside 500 to 3,000,000 are clamped. |
-| `complexity` | 9 | 0 to 10. Higher values spend more processor time for better quality. Values outside are clamped. |
-| `use_cbr` | `false` | `true` gives every packet the same size (constant bitrate, CBR). `false` lets the size follow the signal (variable bitrate, VBR). |
-| `use_inband_fec` | `false` | `true` lets SILK packets carry a low-bitrate copy of the previous frame, so a lost packet can be rebuilt (in-band forward error correction, FEC). |
-| `packet_loss_perc` | 0 | The packet loss the network is expected to have, 0 to 100 percent. |
+| Setter | Getter | Default | Meaning |
+|---|---|---|---|
+| `set_bitrate(Bitrate)` | `bitrate_setting()`, `bitrate()` | `Bitrate::Auto` | Target bitrate for all channels together: `Bitrate::BitsPerSecond(n)`, `Bitrate::Auto` or `Bitrate::Max`. A value of 0 or less is refused. Other values are raised to at least 500 b/s and limited to at most 750,000 b/s per channel. `bitrate()` returns the rate in b/s, as libopus `OPUS_GET_BITRATE` does. |
+| `set_complexity(i32)` | `complexity()` | 9 | 0 to 10. Higher values spend more processor time for better quality. Other values are refused. |
+| `set_vbr(bool)` | `vbr()` | `true` | `false` gives every packet the same size (constant bitrate, CBR). `true` lets the size follow the signal (variable bitrate, VBR). |
+| `set_vbr_constraint(bool)` | `vbr_constraint()` | `true` | With VBR, `true` keeps the size of CELT-only packets close to the bitrate. `false` lets it follow the signal more freely. |
+| `set_inband_fec(bool)` | `inband_fec()` | `false` | `true` lets SILK and Hybrid packets carry a low-bitrate copy of the previous frame, so a lost packet can be rebuilt (in-band forward error correction, FEC). |
+| `set_packet_loss_perc(i32)` | `packet_loss_perc()` | 0 | The packet loss the network is expected to have, 0 to 100 percent. Other values are refused. |
 
 The three `Application` values give the encoder a hint about the signal. They match libopus's `OPUS_APPLICATION_*` values.
 
@@ -90,12 +93,21 @@ For every packet the encoder chooses the mode, the audio bandwidth and the numbe
 
 ### The default bitrate
 
-The default `bitrate_bps` is 64,000 b/s for every sampling rate and channel count. libopus starts with a different default, `OPUS_AUTO`. It is 60 × rate / frame size + rate × channels, which gives 19,000 b/s for 16 kHz mono with 20 ms frames. `opus1` has no `OPUS_AUTO`.
+The default bitrate is `Bitrate::Auto`, as in libopus (`OPUS_AUTO`). It is 60 × rate / frame size + rate × channels bits per second, so it depends on the input and on the frame duration:
 
-64 kb/s is a high rate for speech. At this rate a 16 kHz VoIP encoder codes CELT, and libopus 1.6.1 does the same at 64 kb/s. Set `bitrate_bps` to a speech rate to get SILK:
+| Input | Frame | Automatic bitrate |
+|---|---|---|
+| 8 kHz mono | 20 ms | 11,000 b/s |
+| 16 kHz mono | 20 ms | 19,000 b/s |
+| 24 kHz mono | 20 ms | 27,000 b/s |
+| 48 kHz mono | 20 ms | 51,000 b/s |
+| 48 kHz stereo | 20 ms | 99,000 b/s |
+| 48 kHz stereo | 10 ms | 102,000 b/s |
+
+`bitrate()` returns the rate that applies, for the duration of the last frame. The automatic rate is a speech rate at 8 and 16 kHz, so a 16 kHz VoIP encoder codes SILK. A bitrate that is set explicitly changes that. At 64 kb/s the same encoder codes CELT, and libopus 1.6.1 does the same at 64 kb/s:
 
 ```rust
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 let frame = 320; // 20 ms at 16 kHz
 let pcm: Vec<f32> = (0..frame).map(|i| 0.2 * (i as f32 * 0.07).sin()).collect();
@@ -106,14 +118,15 @@ let mut packet = vec![0u8; 1276];
 let config = |packet: &[u8]| packet[0] >> 3;
 
 let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
-assert_eq!(encoder.bitrate_bps, 64_000);
+assert_eq!(encoder.bitrate_setting(), Bitrate::Auto);
 encoder.encode(&pcm, frame, &mut packet).unwrap();
-assert!(config(&packet) >= 16); // CELT
+assert_eq!(encoder.bitrate(), 19_000);
+assert!(config(&packet) <= 11); // SILK
 
 let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 20_000;
+encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
 encoder.encode(&pcm, frame, &mut packet).unwrap();
-assert!(config(&packet) <= 11); // SILK
+assert!(config(&packet) >= 16); // CELT
 ```
 
 The first byte of a packet is its table-of-contents (TOC) byte. The [TOC byte](02-packets.md#the-toc-byte) section of the packet document lists all 32 configurations.
@@ -125,7 +138,7 @@ The table shows the configurations the encoder wrote for 50 packets of a synthet
 | Input | Application | Bitrate | FEC and loss | Packets |
 |---|---|---|---|---|
 | 8 kHz mono | `Voip` | 12 kb/s | off | SILK NB |
-| 16 kHz mono | `Voip` | 64 kb/s (default) | off | CELT WB |
+| 16 kHz mono | `Voip` | 64 kb/s | off | CELT WB |
 | 16 kHz mono | `Voip` | 16, 20 or 24 kb/s | off | SILK WB |
 | 16 kHz mono | `Voip` | 20 kb/s | on, 10 % | SILK MB (37) and SILK NB (13) |
 | 16 kHz mono | `Voip` | 24 or 28 kb/s | on, 10 % | SILK WB |
@@ -158,15 +171,15 @@ Settings and the reason for each:
 - Complexity: the default, 9. SILK encoding at 16 kHz takes about 46 microseconds (µs) per 20 ms frame at complexity 10 on an Apple M4 Pro. That is a small fraction of the 20 ms the frame lasts.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 const RATE: i32 = 16_000;
 const FRAME: usize = 320; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 24_000;
-encoder.use_inband_fec = true;
-encoder.packet_loss_perc = 10;
+encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
+encoder.set_inband_fec(true);
+encoder.set_packet_loss_perc(10).unwrap();
 
 let mut decoder = OpusDecoder::new(RATE, 1).unwrap();
 
@@ -202,13 +215,13 @@ Settings and the reason for each:
 - Encode the 16-bit samples directly with `encode_i16`.
 
 ```rust
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 const RATE: i32 = 24_000;
 const FRAME: usize = 480; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 24_000;
+encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
 
 // One utterance from the TTS engine (a stand-in signal here). It does not
 // end on a frame boundary.
@@ -248,14 +261,14 @@ Settings and the reason for each:
 - 20 ms frames. Use 10, 5 or 2.5 ms frames when the delay must be lower. Shorter frames need more bits for the same quality.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 const RATE: i32 = 48_000;
 const FRAME: usize = 960; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, 2, Application::Audio).unwrap();
-encoder.bitrate_bps = 128_000;
-encoder.complexity = 10;
+encoder.set_bitrate(Bitrate::BitsPerSecond(128_000)).unwrap();
+encoder.set_complexity(10).unwrap();
 let mut decoder = OpusDecoder::new(RATE, 2).unwrap();
 
 // Interleaved stereo: 440 Hz on the left, 660 Hz on the right.
@@ -305,7 +318,7 @@ The table gives starting points for mono speech and for music. Raise the bitrate
 | Music, mono | 48 kHz | `Audio` | 48-64 kb/s | CELT fullband. |
 | Music, stereo | 48 kHz | `Audio` | 96-128 kb/s | CELT fullband stereo. |
 
-With `use_cbr = true` every packet has the size the bitrate gives the frame. With VBR (the default) the sizes vary around the target. The mode decision counts a constant bitrate as worth about 8 % less than the same variable bitrate, as libopus does.
+With `set_vbr(false)` every packet has the size the bitrate gives the frame. With VBR (the default) the sizes vary around the target. The mode decision counts a constant bitrate as worth about 8 % less than the same variable bitrate, as libopus does.
 
 ### Complexity
 
@@ -360,8 +373,8 @@ With in-band FEC each SILK or Hybrid packet can carry a low-bitrate copy of the 
 
 On the encoder:
 
-- Set `use_inband_fec = true`.
-- Set `packet_loss_perc` to the loss you expect. With 0 % no copy is coded. The higher the value, the more bits go to the copy.
+- Call `set_inband_fec(true)`.
+- Call `set_packet_loss_perc` with the loss you expect. With 0 % no copy is coded. The higher the value, the more bits go to the copy.
 - Give the encoder enough bitrate (see the table above).
 - CELT-only packets carry no copy. With FEC on, the encoder chooses SILK or Hybrid instead of CELT when the expected loss is above 0 % (`Application::Voip`) or above 5 % (`Application::Audio`), as libopus does.
 
@@ -373,15 +386,15 @@ On the decoder, when packet `n` is lost and packet `n + 1` has arrived:
 When several packets in a row are lost, conceal all but the last one with empty packets, then use `decode_fec` for the last one.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 const RATE: i32 = 16_000;
 const FRAME: usize = 320; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
-encoder.bitrate_bps = 24_000;
-encoder.use_inband_fec = true;
-encoder.packet_loss_perc = 10;
+encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
+encoder.set_inband_fec(true);
+encoder.set_packet_loss_perc(10).unwrap();
 
 // 30 packets of a test signal.
 let signal: Vec<f32> = (0..FRAME * 30)
@@ -521,7 +534,7 @@ Without `heap`, keep the encoder and the decoder in a `static` (or in other memo
 ```rust
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 /// Room for one encoder, outside every stack.
 struct EncoderSlot(UnsafeCell<MaybeUninit<OpusEncoder>>);
@@ -544,7 +557,7 @@ unsafe fn init_encoder() -> &'static mut OpusEncoder {
 
 // SAFETY: this is the first and only call.
 let encoder = unsafe { init_encoder() };
-encoder.bitrate_bps = 16_000;
+encoder.set_bitrate(Bitrate::BitsPerSecond(16_000)).unwrap();
 let mut packet = [0u8; 1276];
 let len = encoder.encode(&[0.0f32; 320], 320, &mut packet).unwrap();
 assert!(len > 0);
@@ -569,16 +582,18 @@ What is rejected:
 | `decode` | a packet longer than `frame_size` | `"frame_size too small for packet"` |
 | `decode` and the other decode calls | an output buffer shorter than the samples to be written | `"Output buffer too small for packet"` |
 | `decode` with an empty packet, `decode_fec` | a `frame_size` that is not a multiple of 2.5 ms | `"Lost frame: frame_size must be a multiple of 2.5 ms"` |
+| `set_bitrate` | `Bitrate::BitsPerSecond(n)` with `n` of 0 or less | `"Invalid bitrate"` |
+| `set_complexity` | a value outside 0 to 10 | `"Invalid complexity"` |
+| `set_packet_loss_perc` | a value outside 0 to 100 | `"Invalid packet loss percentage"` |
 | `set_max_bandwidth` | `Bandwidth::Auto` | `"Invalid maximum bandwidth"` |
 | `set_force_channels` | more channels than the encoder has, or 0 | `"Invalid forced channel count"` |
-| `enable_hybrid_mode` | an encoder at 8, 12 or 16 kHz | `"Hybrid mode requires 24kHz or 48kHz sampling rate"` |
 
-What is not rejected: `bitrate_bps`, `complexity` and `packet_loss_perc` are public fields. The next `encode` call clamps them to 500-3,000,000, 0-10 and 0-100. libopus's `OPUS_SET_*` requests clamp them in the same way.
+What is not rejected: a positive bitrate below 500 b/s or above 750,000 b/s per channel. `set_bitrate` moves it to the nearest limit, as libopus's `OPUS_SET_BITRATE` does.
 
 The decoder checks the packet and the buffer sizes before it changes its state. After an invalid packet or a buffer that is too small, the next packet decodes normally.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 // 44.1 kHz is not an Opus sampling rate.
 assert_eq!(
@@ -594,10 +609,12 @@ assert_eq!(
     Err("Invalid frame size for sampling rate")
 );
 
-// Out-of-range settings are clamped, not rejected.
-encoder.complexity = 42;
-encoder.encode(&[0.0; 960], 960, &mut packet).unwrap();
-assert_eq!(encoder.complexity, 10);
+// A complexity above 10 is refused, and the old value stays.
+assert_eq!(encoder.set_complexity(42), Err("Invalid complexity"));
+assert_eq!(encoder.complexity(), 9);
+// A bitrate above 750 kb/s per channel is limited, not refused.
+encoder.set_bitrate(Bitrate::BitsPerSecond(1_000_000)).unwrap();
+assert_eq!(encoder.bitrate_setting(), Bitrate::BitsPerSecond(750_000));
 
 let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
 let mut out = [0.0f32; 960];
@@ -644,6 +661,75 @@ assert!(worker.join().unwrap() > 0);
 - One exception in the default build: `OpusEncoder::reset_state` builds a fresh encoder with the same settings. So it allocates the 122,784 bytes (mono) or 132,712 bytes (stereo) of a new state and frees the old one. `OpusDecoder::reset_state` allocates nothing.
 - The sizes of one encoder and one decoder are in [Size of the encoder and the decoder](#size-of-the-encoder-and-the-decoder).
 - A multistream encoder or decoder holds one `OpusEncoder` or `OpusDecoder` per stream. For 5.1 sound (4 streams) a `MultistreamEncoder` allocated 605,822 bytes and a `MultistreamDecoder` 500,320 bytes in the measurement above. The repository's tests `multistream_enc_no_alloc` and `multistream_dec_no_alloc` check that they allocate nothing after they are built.
+
+## Build settings for speed
+
+opus1 is fast with the default release profile. An application can still gain a few percent with the settings below. None of them changes what the codec computes: the golden hashes of the harness stay the same. The measurements behind them are in [Build settings for applications](08-performance.md#build-settings-for-applications). They were made on Apple M4 Pro and on an Android phone with Cortex-A76 (big) and Cortex-A55 (small, in-order) cores.
+
+### The release profile, on every platform
+
+Cargo takes the release profile from the application's own `Cargo.toml`, so opus1 cannot set it. Add:
+
+```toml
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"   # only if the application does not catch panics
+```
+
+- `codegen-units = 1` compiles each crate as one unit, so more functions can be inlined.
+- `lto = "fat"` (link-time optimization) lets the compiler optimize across crates.
+- `panic = "abort"` removes the code that unwinds the stack after a panic.
+
+Measured change of the time of opus1:
+
+| Core | Encode | Decode |
+|---|---:|---:|
+| Apple M4 Pro | none (-0.2 % to +0.1 %) | 1.6 % to 1.7 % less |
+| Cortex-A76 | 1.1 % to 1.5 % less | none (-0.3 % to +0.2 %) |
+| Cortex-A55 | 0.4 % to 0.6 % less | 0.4 % to 0.7 % less |
+
+### Android on 64-bit ARM
+
+Most Android phones combine fast cores with slower in-order cores, such as the Cortex-A55. Android moves threads between them, so the codec often runs on a small core. There it takes about three times as long as on a big core. The default build for `aarch64-linux-android` names no core. Naming the Cortex-A55 lets the compiler order the instructions for that core and align the functions to 16 bytes. Put this in the application's `.cargo/config.toml`, and use the release profile above:
+
+```toml
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "target-cpu=cortex-a55",
+    # Keep to the instructions of ARMv8.0-A, so that the program also runs
+    # on phones with older cores.
+    "-C", "target-feature=-lse,-rdm,-dotprod,-fp16,-rcpc,-ras,-lor,-pan,-vh,-dpb,-crc,-aes,-sha2",
+]
+```
+
+Measured change of the time of opus1, against the default build with the default profile:
+
+| Core | Encode | Decode |
+|---|---:|---:|
+| Cortex-A55 | 4.4 % to 4.5 % less | 1.3 % to 1.5 % less |
+| Cortex-A76 | 0.5 % to 0.7 % less | 1.1 % to 1.4 % less |
+
+Notes:
+
+1. The second line matters. `target-cpu=cortex-a55` alone allows the instructions of ARMv8.2-A, and the compiler uses some of them: the SILK encoder then contains the dot-product instruction `sdot`. Such a program stops with an illegal-instruction error on a phone whose cores are older, for example the Cortex-A53 or the Cortex-A73. Without these instructions the measured gain was the same.
+2. If every phone the application supports has ARMv8.2-A cores (Cortex-A55, Cortex-A75, Cortex-A76 or newer), the second line can go. `-C target-cpu=cortex-a55` alone, with the release profile, measured 4.3 % to 4.4 % less encode time and 1.7 % to 2.0 % less decode time on the Cortex-A55, and 1.3 % less encode time on the Cortex-A76.
+3. `rustflags` apply to every crate of the application. A crate that decides at compile time whether to use the AES, SHA or CRC instructions (with `cfg(target_feature = "aes")`, for example) then uses its version without them.
+4. Do not build for the big core alone. `-C target-cpu=cortex-a76` gained less than 1 % on the Cortex-A76, but made encoding 15 % and decoding 7.6 % slower on the Cortex-A55.
+
+### macOS on Apple silicon
+
+`-C target-cpu=native` changed nothing measurable on Apple M4 Pro (within 0.3 %). The default target `aarch64-apple-darwin` already includes the instructions the codec uses, FEAT_FCMA among them. Use only the release profile.
+
+iOS was not measured. The target `aarch64-apple-ios` assumes an older core without FEAT_FCMA, so with `std` the FFT checks for it at run time.
+
+### x86-64
+
+These settings were not measured on x86-64 in this release. With `std`, opus1 detects AVX2 and FMA at run time. Without `std`, enable them at build time, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"` (see [Feature flags](#feature-flags)).
+
+### Code alignment
+
+Applications need no special code alignment. Aligning every function to 64 bytes (`-C llvm-args=-align-all-functions=6`) changed the speed of opus1 by less than 1 % on all three measured cores. It does make measurements on the Cortex-A76 steadier, so it is recommended for comparing two builds there (see [Code placement](08-performance.md#code-placement)).
 
 ## Building and testing on a machine without cmake
 

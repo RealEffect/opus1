@@ -12,7 +12,7 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus1::{Application, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
 
 /// A change of settings before packet `at`.
 #[derive(Clone, Copy)]
@@ -48,14 +48,14 @@ impl Stream {
         enc.set_force_mode(Some(ForcedMode::SilkOnly));
         // The channel count libopus is forced to in `encode_c`.
         enc.set_force_channels(Some(self.channels)).unwrap();
-        enc.use_cbr = self.cbr;
+        enc.set_vbr(!self.cbr);
         let mut out = vec![0u8; 1500];
         let mut packets = Vec::new();
         for (i, chunk) in pcm.chunks_exact(self.frame * self.channels).enumerate() {
             for s in self.steps.iter().filter(|s| s.at == i) {
-                enc.use_inband_fec = s.fec;
-                enc.packet_loss_perc = s.loss;
-                enc.bitrate_bps = s.bitrate;
+                enc.set_inband_fec(s.fec);
+                enc.set_packet_loss_perc(s.loss).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
             }
             let n = enc.encode(chunk, self.frame, &mut out).unwrap();
             packets.push(out[..n].to_vec());

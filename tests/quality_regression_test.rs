@@ -19,7 +19,7 @@
 ///   - voip  48 kHz (HybridFB,  32 kbps): 13.37 dB
 ///   - audio 16 kHz (SilkOnly,  24 kbps): 21.65 dB
 ///   - audio 48 kHz (HybridFB,  32 kbps): 21.31 dB
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -137,8 +137,8 @@ fn toc_mode_name(toc: u8) -> &'static str {
 #[test]
 fn test_mode_voip_16k_is_silk_only() {
     let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 20000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    enc.set_vbr(false);
 
     let input = make_sine(16000, 440.0, 320);
     let mut buf = vec![0u8; 512];
@@ -156,8 +156,8 @@ fn test_mode_voip_16k_is_silk_only() {
 #[test]
 fn test_mode_voip_48k_is_hybrid_fb() {
     let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_vbr(false);
 
     let input = make_sine(48000, 440.0, 960);
     let mut buf = vec![0u8; 512];
@@ -181,8 +181,8 @@ fn test_mode_voip_48k_is_hybrid_fb() {
 #[test]
 fn test_mode_audio_16k_is_silk_only() {
     let mut enc = OpusEncoder::new(16000, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = 16000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
+    enc.set_vbr(false);
 
     let input = make_sine(16000, 440.0, 320);
     let mut buf = vec![0u8; 512];
@@ -201,8 +201,8 @@ fn test_mode_audio_16k_is_silk_only() {
 #[test]
 fn test_mode_audio_48k_is_hybrid_fb_not_celt_only() {
     let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = 16000; // Below 17.6 kbps threshold → HybridFB
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap(); // Below 17.6 kbps threshold → HybridFB
+    enc.set_vbr(false);
 
     let input = make_sine(48000, 440.0, 960);
     let mut buf = vec![0u8; 512];
@@ -235,8 +235,8 @@ fn test_snr_voip_16k() {
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
     let mut enc = OpusEncoder::new(sample_rate, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 20000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    enc.set_vbr(false);
 
     let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);
@@ -266,8 +266,8 @@ fn test_snr_voip_48k() {
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
     let mut enc = OpusEncoder::new(sample_rate, 1, Application::Voip).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_vbr(false);
 
     let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);
@@ -297,8 +297,8 @@ fn test_snr_audio_16k() {
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
     let mut enc = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = 24000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_vbr(false);
 
     let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);
@@ -328,8 +328,8 @@ fn test_snr_audio_48k() {
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
     let mut enc = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
-    enc.bitrate_bps = 32000;
-    enc.use_cbr = true;
+    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_vbr(false);
 
     let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);

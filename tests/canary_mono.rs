@@ -1,4 +1,4 @@
-use opus1::{Application as RsApp, OpusDecoder as RsDec, OpusEncoder as RsEnc};
+use opus1::{Application as RsApp, Bitrate, OpusDecoder as RsDec, OpusEncoder as RsEnc};
 
 #[test]
 fn mono_impulse_48k_64k_finite_small_packet() {
@@ -9,7 +9,7 @@ fn mono_impulse_48k_64k_finite_small_packet() {
     let mut pcm = vec![0.0f32; fs * ch];
     pcm[0] = 1.0;
     let mut enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
-    enc.bitrate_bps = br;
+    enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     let mut buf = vec![0u8; 1276];
     let n = enc.encode(&pcm, fs, &mut buf).unwrap();
     // Reference: libopus (vcpkg 1.5.2) emits 282 bytes for this exact input,

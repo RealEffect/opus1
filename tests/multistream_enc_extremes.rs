@@ -13,8 +13,8 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::Application;
-use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
+use opus1::{Application, Bitrate};
+use opus1::multistream::MultistreamEncoder;
 
 /// The channels 0 to 253 in pairs: 127 stereo streams and no mono stream.
 static PAIRS_254: [u8; 254] = {

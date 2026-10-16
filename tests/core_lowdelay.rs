@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder};
 
 fn mean(pcm: &[f32]) -> f64 {
     pcm.iter().map(|&v| v as f64).sum::<f64>() / pcm.len() as f64
@@ -30,8 +30,8 @@ fn low_delay_input_is_dc_rejected_like_libopus() {
         let mut c_enc = CEncoder::new(rate, channels, APP_LOWDELAY);
         c_enc.bitrate(bitrate).complexity(5);
         let mut enc = OpusEncoder::new(rate as i32, channels, Application::RestrictedLowDelay).unwrap();
-        enc.bitrate_bps = bitrate;
-        enc.complexity = 5;
+        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_complexity(5).unwrap();
         let (mut dec, mut c_dec) = (CDecoder::new(rate, channels), CDecoder::new(rate, channels));
         let mut buf = vec![0u8; 4000];
         let (mut out, mut c_out) = (Vec::new(), Vec::new());

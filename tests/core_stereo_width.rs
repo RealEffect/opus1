@@ -12,7 +12,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus1::{Application, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
 
 /// Level of the side signal (left minus right) against the mid signal (left
 /// plus right), in dB. It goes down as a stereo image gets narrower.
@@ -49,9 +49,9 @@ fn celt_streams(rate: usize, bitrate: i32, cbr: bool, input: &[f32]) -> (Decoded
     let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
     c_enc.bitrate(bitrate).complexity(5).vbr(!cbr).force_mode(MODE_CELT);
     let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
-    enc.bitrate_bps = bitrate;
-    enc.complexity = 5;
-    enc.use_cbr = cbr;
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_complexity(5).unwrap();
+    enc.set_vbr(!cbr);
     enc.set_force_mode(Some(ForcedMode::CeltOnly));
     let (mut dec, mut c_dec) = (CDecoder::new(rate, 2), CDecoder::new(rate, 2));
     let mut buf = vec![0u8; 4000];
@@ -129,7 +129,7 @@ fn stereo_input_at_low_bitrates_has_the_channel_count_of_libopus() {
         let mut c_enc = CEncoder::new(rate, 2, c_application);
         c_enc.complexity(5);
         let mut enc = OpusEncoder::new(rate as i32, 2, application).unwrap();
-        enc.complexity = 5;
+        enc.set_complexity(5).unwrap();
         let mut c_dec = CDecoder::new(rate, 2);
         let mut buf = vec![0u8; 4000];
         let (mut differ, mut mono, mut packets) = (0, 0, 0);
@@ -138,7 +138,7 @@ fn stereo_input_at_low_bitrates_has_the_channel_count_of_libopus() {
             let step = (i / 4) % 64;
             let bitrate = 8000 + 1000 * if step < 32 { 32 - step } else { step - 32 } as i32;
             c_enc.bitrate(bitrate);
-            enc.bitrate_bps = bitrate;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             let n = enc.encode(pcm, frame, &mut buf).unwrap();
             let c_packet = c_enc.encode(pcm);
             c_dec.decode(Some(&buf[..n]), frame, false).unwrap();

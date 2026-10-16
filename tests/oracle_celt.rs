@@ -1,5 +1,5 @@
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
-use opus1::{Application as RsApp, OpusDecoder as RsDec, OpusEncoder as RsEnc};
+use opus1::{Application as RsApp, Bitrate, OpusDecoder as RsDec, OpusEncoder as RsEnc};
 
 fn make_sine(sr: i32, ch: usize, frame_size: usize, freq: f32) -> Vec<f32> {
     let mut v = vec![0.0f32; frame_size * ch];
@@ -67,9 +67,9 @@ fn impulse_fixture_hex() -> Option<&'static str> {
 #[cfg(target_arch = "aarch64")]
 fn first_packets(pcm: &[f32]) -> (Vec<u8>, Vec<u8>) {
     let mut rs_enc = RsEnc::new(48000, 1, RsApp::Audio).unwrap();
-    rs_enc.bitrate_bps = 64000;
-    rs_enc.use_cbr = true;
-    rs_enc.complexity = 10;
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    rs_enc.set_vbr(false);
+    rs_enc.set_complexity(10).unwrap();
     let mut rs_buf = vec![0u8; 1276];
     let rs_n = rs_enc.encode(pcm, 960, &mut rs_buf).unwrap();
     let mut c_enc = CEnc::new(48000, CCh::Mono, CApp::Audio).unwrap();
@@ -126,9 +126,9 @@ fn oracle_celt_sine_48k_mono_64k() {
     let fs = 960;
     let pcm = make_sine(sr, ch, fs, 440.0);
     let mut rs_enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
-    rs_enc.bitrate_bps = br;
-    rs_enc.use_cbr = true;
-    rs_enc.complexity = 10;
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc.set_vbr(false);
+    rs_enc.set_complexity(10).unwrap();
     let mut rs_buf = vec![0u8; 1276];
     let rs_n = rs_enc.encode(&pcm, fs, &mut rs_buf).unwrap();
     let mut c_enc = CEnc::new(
@@ -172,9 +172,9 @@ fn oracle_celt_sine_48k_mono_64k() {
     }
     // Determinism: re-encode same input must be byte-identical
     let mut rs_enc2 = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
-    rs_enc2.bitrate_bps = br;
-    rs_enc2.use_cbr = true;
-    rs_enc2.complexity = 10;
+    rs_enc2.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc2.set_vbr(false);
+    rs_enc2.set_complexity(10).unwrap();
     let mut rs_buf2 = vec![0u8; 1276];
     let rs_n2 = rs_enc2.encode(&pcm, fs, &mut rs_buf2).unwrap();
     assert_eq!(rs_n, rs_n2, "non-deterministic size");
@@ -194,9 +194,9 @@ fn oracle_impulse_48k_mono_64k() {
     let mut pcm = vec![0.0f32; fs * ch];
     pcm[0] = 1.0;
     let mut rs_enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
-    rs_enc.bitrate_bps = br;
-    rs_enc.use_cbr = true;
-    rs_enc.complexity = 10;
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc.set_vbr(false);
+    rs_enc.set_complexity(10).unwrap();
     let mut rs_buf = vec![0u8; 1276];
     let rs_n = rs_enc.encode(&pcm, fs, &mut rs_buf).unwrap();
     let mut c_enc = CEnc::new(sr as u32, CCh::Mono, CApp::Audio).unwrap();
@@ -237,9 +237,9 @@ fn oracle_impulse_48k_mono_64k() {
         );
     }
     let mut rs_enc2 = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
-    rs_enc2.bitrate_bps = br;
-    rs_enc2.use_cbr = true;
-    rs_enc2.complexity = 10;
+    rs_enc2.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc2.set_vbr(false);
+    rs_enc2.set_complexity(10).unwrap();
     let mut rs_buf2 = vec![0u8; 1276];
     let rs_n2 = rs_enc2.encode(&pcm, fs, &mut rs_buf2).unwrap();
     assert_eq!(rs_n, rs_n2);
@@ -258,9 +258,9 @@ fn oracle_all_sr_ch_br() {
                 let fs = sr / 50;
                 let pcm = make_sine(sr, ch, fs as usize, freq);
                 let mut rs_enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
-                rs_enc.bitrate_bps = br;
-                rs_enc.use_cbr = true;
-                rs_enc.complexity = 10;
+                rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+                rs_enc.set_vbr(false);
+                rs_enc.set_complexity(10).unwrap();
                 let mut rs_buf = vec![0u8; 1276];
                 let rs_n = rs_enc.encode(&pcm, fs as usize, &mut rs_buf).unwrap();
                 let c_ch = if ch == 1 { CCh::Mono } else { CCh::Stereo };

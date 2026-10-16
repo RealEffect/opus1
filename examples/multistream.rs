@@ -12,8 +12,8 @@ fn main() {
 
 #[cfg(feature = "std")]
 fn main() -> Result<(), &'static str> {
-    use opus1::Application;
-    use opus1::multistream::{Bitrate, MultistreamDecoder, MultistreamEncoder};
+    use opus1::{Application, Bitrate};
+    use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
 
     const SAMPLE_RATE: i32 = 48_000;
     const CHANNELS: usize = 6;

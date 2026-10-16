@@ -7,7 +7,9 @@
 //! `Box`-allocated, the structs shrink to a few KB, and construction plus a
 //! full encode/decode round-trip must fit on a 768 KiB stack.
 
-use opus1::{Application, OpusDecoder, OpusEncoder};
+#[cfg(feature = "heap")]
+use opus1::{Application, Bitrate};
+use opus1::{OpusDecoder, OpusEncoder};
 
 /// `size_of` returns bytes.
 #[cfg(feature = "heap")]
@@ -72,7 +74,7 @@ fn roundtrip_on_stack_with(stack_size: usize, application: Application, bitrate:
         .stack_size(stack_size)
         .spawn(move || {
             let mut enc = OpusEncoder::new(48000, 2, application).unwrap();
-            enc.bitrate_bps = bitrate;
+            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
 
             let frame_size = 960; // 20 ms @ 48 kHz
             let mut input = vec![0.0f32; frame_size * 2];

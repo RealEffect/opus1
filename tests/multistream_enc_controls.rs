@@ -16,8 +16,8 @@ use audiopus_sys as sys;
 use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::multistream::encoder::{Bitrate, MultistreamEncoder};
-use opus1::{Application, ForcedMode};
+use opus1::multistream::MultistreamEncoder;
+use opus1::{Application, Bitrate, ForcedMode};
 
 /// Whether a stream of the packet is stereo and in Hybrid mode. The final
 /// range of such a packet is not compared: see the note on the fault in
@@ -342,19 +342,19 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
         for s in 0..streams {
             let enc = rust.stream_encoder(s).unwrap();
             assert_eq!(
-                enc.complexity,
+                enc.complexity(),
                 c.stream_get(s, sys::OPUS_GET_COMPLEXITY_REQUEST)
             );
             assert_eq!(
-                !enc.use_cbr as i32,
+                enc.vbr() as i32,
                 c.stream_get(s, sys::OPUS_GET_VBR_REQUEST)
             );
             assert_eq!(
-                enc.use_inband_fec as i32,
+                enc.inband_fec() as i32,
                 c.stream_get(s, sys::OPUS_GET_INBAND_FEC_REQUEST)
             );
             assert_eq!(
-                enc.packet_loss_perc,
+                enc.packet_loss_perc(),
                 c.stream_get(s, sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST)
             );
             assert_eq!(enc.channels(), if s < c.coupled { 2 } else { 1 });
@@ -441,7 +441,7 @@ fn out_of_range_settings_are_rejected_like_libopus() {
         c.encode_float(&pcm, 960, out.len()).unwrap();
         for s in 0..c.streams {
             assert_eq!(
-                rust.stream_encoder(s).unwrap().bitrate_bps.min(510_400),
+                rust.stream_encoder(s).unwrap().bitrate(),
                 c.stream_bitrate(s),
                 "bitrate {bitrate}: stream {s}"
             );
@@ -881,7 +881,7 @@ fn surround_mode_sets_the_energy_mask_of_every_stream() {
         enc.set_bitrate(Bitrate::BitsPerSecond(32_000 * case.channels as i32))
             .unwrap();
         let streams = enc.layout().streams();
-        let surround = enc.mapping_type() == opus1::multistream::layout::MappingType::Surround;
+        let surround = enc.mapping_type() == opus1::multistream::MappingType::Surround;
         let pcm = voiced(fs, case.channels, 3 * frame_size);
         let mut out = vec![0u8; max_packet_bytes(streams)];
         for frame in pcm.chunks_exact(frame_size * case.channels) {
