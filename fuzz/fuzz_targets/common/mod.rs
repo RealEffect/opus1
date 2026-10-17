@@ -15,7 +15,7 @@
 
 use audiopus_sys as sys;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
-use opus1::Bitrate;
+use opus1::{Bitrate, FrameDuration};
 use std::os::raw::{c_int, c_uchar};
 
 /// The sampling rates Opus supports.
@@ -583,8 +583,9 @@ pub fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> i32 {
 ///   byte and at most the buffer (`cbr_bytes`), and at least 1 byte.
 /// - A packet that is too small to code audio is padded to that length too,
 ///   but its frame count code can need 2 bytes (C 1340-1406).
-/// - At the maximum bitrate a 40 or 60 ms packet of 20 ms CELT or Hybrid
-///   frames is padded to the whole buffer (C 1749).
+/// - At the maximum bitrate a packet made of several frames is padded to
+///   the whole buffer (C 1749): CELT or Hybrid of 40 ms or more, SILK of
+///   80 ms or more.
 ///
 /// `toc` is the first byte of the packet; it tells a SILK-only packet.
 pub fn cbr_packet_len(
@@ -614,16 +615,42 @@ pub fn cbr_packet_len(
         return (max_data_bytes as usize, max_data_bytes.max(2) as usize);
     }
     let silk_only = toc >> 3 < 12;
-    if setting == Bitrate::Max && frame_size * 50 > fs as usize && !silk_only {
+    let several_frames = (frame_size * 50 > fs as usize && !silk_only) || frame_size * 50 > 3 * fs as usize;
+    if setting == Bitrate::Max && several_frames {
         return (out_len, out_len);
     }
     (max_data_bytes as usize, max_data_bytes as usize)
 }
 
-/// The frame sizes an encoder takes at `fs`: 2.5, 5, 10, 20, 40 and 60 ms.
-pub fn encoder_frame_sizes(fs: i32) -> [usize; 6] {
+/// The frame sizes an encoder takes at `fs`: 2.5, 5, 10, 20, 40, 60, 80,
+/// 100 and 120 ms.
+pub fn encoder_frame_sizes(fs: i32) -> [usize; 9] {
     let f = fs as usize / 400;
-    [f, 2 * f, 4 * f, 8 * f, 16 * f, 24 * f]
+    [f, 2 * f, 4 * f, 8 * f, 16 * f, 24 * f, 32 * f, 40 * f, 48 * f]
+}
+
+/// The frame an encode call of `frame_size` samples codes with the expert
+/// frame duration `duration`, or `None` when the call is refused: libopus
+/// `frame_size_select`, written out here from its rules.
+pub fn selected_frame_size(fs: i32, frame_size: usize, duration: FrameDuration) -> Option<usize> {
+    let fs = fs as usize;
+    if frame_size < fs / 400 {
+        return None;
+    }
+    let ms_times_10 = match duration {
+        FrameDuration::Argument => None,
+        FrameDuration::Ms2_5 => Some(25),
+        FrameDuration::Ms5 => Some(50),
+        FrameDuration::Ms10 => Some(100),
+        FrameDuration::Ms20 => Some(200),
+        FrameDuration::Ms40 => Some(400),
+        FrameDuration::Ms60 => Some(600),
+        FrameDuration::Ms80 => Some(800),
+        FrameDuration::Ms100 => Some(1000),
+        FrameDuration::Ms120 => Some(1200),
+    };
+    let size = ms_times_10.map_or(frame_size, |t| fs * t / 10_000);
+    (size <= frame_size && encoder_frame_sizes(fs as i32).contains(&size)).then_some(size)
 }
 
 /// Changes some bytes of a packet: flips bits, cuts it short, or appends

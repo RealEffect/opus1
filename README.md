@@ -16,7 +16,7 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 ## Features
 
 - **Pure Rust** — no C dependencies
-- **High performance:** on Apple M4 Pro, decoding takes 0.56-0.86x and encoding (complexity 0-5, where both do the same work) 0.53-0.71x the time of C libopus built at `-O2`, the optimization level of libopus's own build. Against the Homebrew build of libopus 1.6.1, which is about 10 % slower, the ranges are 0.50-0.81x and 0.46-0.63x. opus1 is also faster than libopus on the big and the small cores of an Android phone (see [Performance](#performance))
+- **High performance:** on Apple M4 Pro, decoding takes 0.56-0.86x and encoding (complexity 0-5, where both do the same work) 0.53-0.71x the time of C libopus 1.6.1 built at `-O2`, the optimization level of libopus's own build. Against the Homebrew build of libopus 1.6.1, which behaves like a build at `-Os` and takes about 24 % more time to encode and 12 % more to decode, the ranges are 0.50-0.81x and 0.46-0.63x. opus1 is also faster than libopus on the big and the small cores of an Android phone (see [Performance](#performance))
 - **Multichannel:** multistream encoder and decoder (mapping families 0, 1, 2 and 255), interoperable with libopus
 - **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels)
 - **`#![no_std]` + no `alloc`:** fully heap-free — runs on bare metal, RTOS, and WebAssembly with **no global allocator**
@@ -163,7 +163,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   than on the stack. The test suite of this build needs big test-thread stacks:
   `scripts/check_no_std.sh` sets `RUST_MIN_STACK=33554432` (32 MiB).
 - **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
-- **Packets are capped** at the RFC 6716 maximum of 1276 bytes (the heap-free range-coder buffer is sized accordingly).
+- **Frames are capped** at the RFC 6716 maximum of 1275 bytes (the heap-free range-coder buffer is sized accordingly). A packet of 40 to 120 ms holds up to six such frames.
 - **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target. Check with `scripts/check_no_std.sh`.
 
 ## Performance
@@ -178,54 +178,79 @@ time per 20 ms frame (10 ms or 2.5 ms where named) and the ratio opus1 / libopus
 
 ### vs C libopus on Apple M4 Pro (aarch64), default release profile
 
-Measured on 2026-10-17 with the code of commit `0090242`. The main C reference
-is libopus built at `-O2`, the optimization level of libopus's own build:
-`scripts/android/build-libopus.sh --host` builds it with Apple clang from the
-libopus source that the crate `opus-head-sys` 0.3.3 vendors (libopus main branch,
-commit `228a0f85`). The second ratio column is the Homebrew libopus 1.6.1, which
-the tests link. It behaves like a build at `-Os`. Built at `-Os`, the vendored
-source takes 1.11 times the encode time and 1.13 times the decode time of its
-`-O2` build (geometric means). Four harness programs ran in turns, three
-passes each: the code before and after the latest speed work (see below), each
-linked with each libopus build. Between the passes the ratio of a scenario changed
-by at most 2.2 %.
+Measured on 2026-10-17 with the code of commit `b7a8b64` (the work of round 8
+merged on `c96e936`). Both C references are the release libopus 1.6.1. The main one is
+built at `-O2`, the optimization level of libopus's own build:
+`scripts/android/build-libopus.sh --host --rtcd --src <1.6.1 source>` builds
+it with Apple clang and the flags of libopus's `configure`, plus the run-time
+CPU detection that `configure` uses on Android. With that detection libopus's
+SILK encoder uses its NEON quantizer, as on a phone. The second ratio column
+is the Homebrew libopus 1.6.1, which the tests link. It behaves like a build at
+`-Os` and calls the C version of that quantizer. The `-O2` build takes 0.81 of
+its encode time and 0.89 of its decode time (geometric means). The code before
+and after round 8 ran in turns, each linked with each libopus build: four
+harness programs, three passes. Between the passes the ratio of a scenario
+changed by at most 2.4 %.
 
 | Scenario | opus1 encode µs | Ratio vs `-O2` | Ratio vs Homebrew | opus1 decode µs | Ratio vs `-O2` | Ratio vs Homebrew |
 |---|---:|---:|---:|---:|---:|---:|
-| SILK NB 8 kHz mono 12 kb/s, complexity 0 | 8.8 | 0.71 | 0.62 | 2.0 | 0.64 | 0.62 |
-| SILK WB 16 kHz mono 20 kb/s, complexity 10 | 44.5 | 0.50* | 0.38* | 3.8 | 0.61 | 0.59 |
-| SILK WB 16 kHz stereo 32 kb/s, complexity 9 | 88.6 | 0.55* | 0.39* | 6.9 | 0.60 | 0.57 |
-| Hybrid SWB 24 kHz mono 24 kb/s, complexity 9 | 61.8 | 0.51* | 0.37* | 7.1 | 0.61 | 0.54 |
-| Hybrid FB 48 kHz stereo 40 kb/s, complexity 9 | 128.4 | 0.57* | 0.40* | 13.5 | 0.56 | 0.50 |
-| CELT FB 48 kHz mono 64 kb/s, complexity 0 | 11.8 | 0.63 | 0.59 | 8.4 | 0.81 | 0.76 |
-| CELT FB 48 kHz mono 64 kb/s, complexity 10 | 21.0 | 0.44* | 0.37* | 9.9 | 0.80 | 0.65 |
-| CELT FB 48 kHz stereo 128 kb/s, complexity 5 | 35.4 | 0.56 | 0.47 | 19.3 | 0.82 | 0.65 |
-| CELT FB 48 kHz stereo 128 kb/s, complexity 10 | 55.2 | 0.56* | 0.46* | 19.4 | 0.82 | 0.65 |
-| CELT FB 48 kHz stereo 128 kb/s, 2.5 ms, complexity 9 | 11.0 | 0.69* | 0.59* | 3.2 | 0.84 | 0.77 |
+| SILK NB 8 kHz mono 12 kb/s, complexity 0 | 8.9 | 0.71 | 0.62 | 2.0 | 0.64 | 0.62 |
+| SILK WB 16 kHz mono 20 kb/s, complexity 10 | 42.9 | 0.49* | 0.36* | 3.8 | 0.61 | 0.59 |
+| SILK WB 16 kHz stereo 32 kb/s, complexity 9 | 85.3 | 0.53* | 0.38* | 6.9 | 0.60 | 0.57 |
+| Hybrid SWB 24 kHz mono 24 kb/s, complexity 9 | 59.3 | 0.49* | 0.36* | 7.2 | 0.61 | 0.54 |
+| Hybrid FB 48 kHz stereo 40 kb/s, complexity 9 | 123.5 | 0.55* | 0.39* | 13.5 | 0.56 | 0.50 |
+| CELT FB 48 kHz mono 64 kb/s, complexity 0 | 11.3 | 0.60 | 0.57 | 8.0 | 0.77 | 0.72 |
+| CELT FB 48 kHz mono 64 kb/s, complexity 10 | 20.3 | 0.42* | 0.36* | 9.5 | 0.76 | 0.63 |
+| CELT FB 48 kHz stereo 128 kb/s, complexity 5 | 34.1 | 0.53 | 0.45 | 18.6 | 0.79 | 0.63 |
+| CELT FB 48 kHz stereo 128 kb/s, complexity 10 | 52.6 | 0.53* | 0.43* | 18.7 | 0.79 | 0.63 |
+| CELT FB 48 kHz stereo 128 kb/s, 2.5 ms, complexity 9 | 10.6 | 0.66* | 0.57* | 3.1 | 0.82 | 0.74 |
 
 \* libopus runs its speech/music analysis (`analysis.c`) at complexity 7 and
 above when the input rate is 16 kHz or more; opus1 has no port of it, so these
 encode ratios favour opus1.
 The C SILK encoder in a float build of libopus is the floating-point one;
 opus1 ports the fixed-point one.
-The libopus main branch encodes SILK and Hybrid at complexity 9 and 10 in about
-0.78 of the time of 1.6.1 at the same optimization level. So in the SILK and
-Hybrid rows at complexity 9 and 10, the `-O2` reference is faster than a 1.6.1
-build at `-O2` would be.
 
-Over all 28 scenarios of the bench set (geometric means), opus1 takes 0.567 of
-the encode time and 0.694 of the decode time of libopus at `-O2`, and 0.458
-and 0.619 of the Homebrew build. The full table is in
-[docs/08-performance.md](docs/08-performance.md#latest-results).
+Over all 28 scenarios of the bench set (geometric means), opus1 takes 0.544 of
+the encode time and 0.680 of the decode time of libopus 1.6.1 at `-O2`, and
+0.442 and 0.607 of the Homebrew build (before round 8: 0.565 and 0.695, 0.458
+and 0.619). The full table is in
+[docs/08-performance.md](docs/08-performance.md#latest-results), and
+[The C reference](docs/08-performance.md#the-c-reference) explains the builds.
 
-On an Android phone (MediaTek MT6833), against libopus built with the NDK's
-clang at `-O2`, opus1 is faster in all 28 scenarios on both kinds of core
-(geometric means, commit `0090242`): encoding 0.64 and decoding 0.77 of
-libopus's time on the Cortex-A76, 0.66 and 0.84 on the in-order Cortex-A55. See
+On an Android phone (MediaTek MT6833), against libopus 1.6.1 built with the
+NDK's clang at `-O2` and the flags of libopus's `configure` for Android, opus1
+is faster in all 28 scenarios on both kinds of core (geometric means, commit
+`b7a8b64`): encoding 0.625 and decoding 0.759 of libopus's time on the
+Cortex-A76, 0.651 and 0.821 on the in-order Cortex-A55. See
 [docs/08-performance.md](docs/08-performance.md#on-an-android-phone).
 
-The latest speed work ("round 7" in the performance document) was aimed at
-the in-order Cortex-A55. It rewrote the pitch analysis of the CELT encoder, the
+The latest speed work ("round 8" in the performance document) made the
+release libopus 1.6.1, built from Xiph's release file, the C reference on the
+Mac and on the phone. It also went on with the work for in-order cores, in
+these parts:
+
+- the SILK delayed-decision quantizer;
+- the PVQ search and the bit allocation of CELT;
+- the pitch analysis of the CELT encoder;
+- the FFT, the inverse MDCT and the de-emphasis of the CELT decoder.
+
+The output did not change. Against the code before it, run in turns
+(geometric means over the bench set):
+
+| | Apple M4 Pro | Cortex-A76 | Cortex-A55 |
+|---|---:|---:|---:|
+| Encoding | 3.1-3.5 % less time | 1.5 % less | 1.5-1.8 % less |
+| Decoding | 1.9-2.2 % less | 1.4 % less | 1.7-1.8 % less |
+
+CELT encoding and decoding take 2.3-4.2 % less time on all three cores. Most
+of that comes from the PVQ search and the allocation. On Apple M4 Pro, SILK and
+Hybrid encoding at complexity 6 and 7 take 3.8-6.4 % less time. That removes
+the slowdown that round 7 left there. See
+[docs/08-performance.md](docs/08-performance.md#round-8-more-work-for-in-order-cores).
+
+Round 7 before it was aimed at the in-order Cortex-A55. It rewrote the pitch
+analysis of the CELT encoder, the
 post-filter of the CELT decoder, the SILK noise-shaping quantizers, and the PVQ
 search, the spreading rotation and the bit allocation of the CELT encoder. The
 output did not change. Against the code before it, run in turns on the same
@@ -243,7 +268,7 @@ and 29-49 % less for mono CELT; decoding takes 35-62 % less in every scenario.
 Stereo CELT encoding takes 24-30 % less time at complexity 0 and 5. From
 complexity 5 it now runs libopus's stereo pitch pre-filter and, from complexity
 8, its second quantization pass per stereo band (`theta_rdo`). So at complexity
-9 and 10 it takes 2-22 % more time than in 0.1.37, while staying at 0.48-0.62
+9 and 10 it takes 2-22 % more time than in 0.1.37, while staying at 0.46-0.59
 of the Homebrew libopus's time.
 
 Build settings that help (measured, see
@@ -354,6 +379,18 @@ test that compares opus1 with the C library under the same settings.
 - `OpusEncoder`: `set_force_mode`, `set_bandwidth`, `set_max_bandwidth`,
   `set_force_channels`, `set_lfe`, `set_energy_mask`, `final_range`,
   `reset_state`, `lookahead`.
+- Frames of 80, 100 and 120 ms in `OpusEncoder` and `MultistreamEncoder`,
+  coded as libopus 1.6.1 codes them: CELT and Hybrid as four to six 20 ms
+  frames, SILK as two 40 ms, five 20 ms or two 60 ms frames, in one packet.
+  With CBR every packet has libopus's size, and CELT-only packets at
+  complexity 0 to 5 are libopus's byte for byte. With VBR a part is not cut
+  to its share of the bitrate, as with 40 and 60 ms (with in-band FEC that
+  limit cost libopus about 20 dB in the streams measured).
+- `set_expert_frame_duration` and `expert_frame_duration` on `OpusEncoder`
+  and `MultistreamEncoder`, with the new type `FrameDuration` (libopus
+  `OPUS_SET_EXPERT_FRAME_DURATION`): each call codes one frame of the duration
+  that is set. The multistream encoder no longer differs from libopus in its
+  frame sizes (difference D3).
 - `packet` module: parse, write and pad packets, self-delimited framing.
 
 **Behaviour changes**
@@ -415,6 +452,26 @@ test that compares opus1 with the C library under the same settings.
   encoding takes 10.8-11.1 % less time on the Cortex-A55 of an Android phone,
   7.5 % less on its Cortex-A76 and 2.5-2.8 % less on Apple M4 Pro. Decoding
   takes 1.9-2.0 % less on the Cortex-A55 and 1.0 % less on the Cortex-A76.
+- A second round of this work, again with the same output:
+  - The PVQ search places the next pulse in advance and checks each pulse
+    with fewer instructions.
+  - `bits2pulses` and the two allocation searches use vector compares and
+    sums instead of chains of dependent steps.
+  - The cosines of the spreading rotation no longer call the C library.
+  - The delayed-decision quantizer keeps its shaping coefficients in
+    registers. On Apple cores it starts its shaping filter before the
+    survivors are chosen.
+  - The CELT decoder builds its spectrum in place. Its FFT, inverse MDCT and
+    de-emphasis work on two independent groups per step.
+
+  Against the code before, run in turns, encoding takes 3.1-3.5 % less time
+  on Apple M4 Pro, 1.5 % less on the Cortex-A76 and 1.5-1.8 % less on the
+  Cortex-A55. Decoding takes 1.9-2.2 %, 1.4 % and 1.7-1.8 % less.
+- The C reference for these numbers is the release libopus 1.6.1, built from
+  Xiph's release file with the settings of its own `configure`
+  (`scripts/android/build-libopus.sh --src`). Earlier phone runs linked the
+  libopus main branch, which writes other packets than 1.6.1 for many SILK,
+  Hybrid and LFE streams.
 - Fixes found in review: several vector kernels read past the end of short
   slices; `compute_theta` wrote through a shared reference, so its output depended
   on inlining.

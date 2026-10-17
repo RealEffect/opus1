@@ -57,8 +57,9 @@ assert_eq!(samples, frame);
 The rules of `OpusEncoder::encode(input, frame_size, output)`:
 
 - The sampling rate is 8000, 12000, 16000, 24000 or 48000 hertz (Hz). Other rates need a resampler before the encoder.
-- `frame_size` is 2.5, 5, 10, 20, 40 or 60 ms of samples per channel.
+- `frame_size` is 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms of samples per channel.
 - `input` holds at least `frame_size * channels` samples. The encoder reads exactly that many.
+- With an expert frame duration set, the encoder codes only the first frame of that duration (see [Frame duration](#frame-duration)).
 - The length of `output` is the largest packet allowed. It also limits the bitrate. When `output` holds fewer bytes than the bitrate gives the frame, the encoder codes the frame at the lower rate. Give it 1276 bytes for each 20 ms of the frame when the bitrate alone should decide.
 - The result is the number of bytes written to `output`.
 
@@ -82,6 +83,7 @@ These settings of `OpusEncoder` can be changed at any time. The next `encode` ca
 | `set_vbr_constraint(bool)` | `vbr_constraint()` | `true` | With VBR, `true` keeps the size of CELT-only packets close to the bitrate. `false` lets it follow the signal more freely. |
 | `set_inband_fec(bool)` | `inband_fec()` | `false` | `true` lets SILK and Hybrid packets carry a low-bitrate copy of the previous frame, so a lost packet can be rebuilt (in-band forward error correction, FEC). |
 | `set_packet_loss_perc(i32)` | `packet_loss_perc()` | 0 | The packet loss the network is expected to have, 0 to 100 percent. Other values are refused. |
+| `set_expert_frame_duration(FrameDuration)` | `expert_frame_duration()` | `FrameDuration::Argument` | The duration of the frame each `encode` call codes. `Argument` takes the `frame_size` of the call. See [Frame duration](#frame-duration). |
 
 The three `Application` values give the encoder a hint about the signal. They match libopus's `OPUS_APPLICATION_*` values.
 
@@ -300,9 +302,67 @@ assert_eq!(decoder.decode(&packet[..len], FRAME, &mut out).unwrap(), FRAME);
 | 10 ms | 480 | all | low delay with speech coding |
 | 20 ms | 960 | all | in doubt: calls, voice agents, streaming |
 | 40 ms | 1920 | all | fewer packets per second matter more than delay |
-| 60 ms | 2880 | all | the fewest packets per second |
+| 60 ms | 2880 | all | few packets per second |
+| 80 ms | 3840 | all | fewer packets still, when a delay of more than 80 ms does not matter |
+| 100 ms | 4800 | all | the same |
+| 120 ms | 5760 | all | the fewest packets per second, for example for storage or a link that sends few packets |
 
-SILK codes 40 and 60 ms as one Opus frame, made of two or three 20 ms SILK frames. CELT and Hybrid frames are at most 20 ms long, so the encoder puts two or three 20 ms frames into one packet. Frames shorter than 10 ms are always coded with CELT, whatever the application. Frames of 80, 100 and 120 ms, which libopus offers, are not available.
+A packet holds at most 120 ms. The encoder splits a long frame into parts, as libopus does:
+
+- SILK codes 40 and 60 ms as one Opus frame, made of two or three 20 ms SILK frames.
+- SILK frames are at most 60 ms long. 80 ms is two frames of 40 ms, 100 ms is five frames of 20 ms, and 120 ms is two frames of 60 ms, in one packet.
+- CELT and Hybrid frames are at most 20 ms long. 40 to 120 ms is two to six frames of 20 ms in one packet.
+
+The encoder decides the mode, the bandwidth and the channels once for the whole packet, and every part is coded with them. Frames shorter than 10 ms are always coded with CELT, whatever the application.
+
+With VBR, libopus 1.6 limits each part of such a packet to the bytes the bitrate gives one part. `opus1` leaves that limit out, so a part can take more bytes when the signal needs them, as with frames of their own. With in-band FEC the limit costs libopus much quality. One measurement: 2.4 s of speech at 8 kHz mono, `Audio`, 64 kb/s VBR, complexity 9, FEC with 10 % expected loss, decoded by libopus. libopus's SNR falls from 29.8 dB in 60 ms frames to 10.2 dB in 80 ms frames and 8.8 dB in 120 ms frames. `opus1` gives 30.2 and 29.6 dB. [Differences from libopus](10-differences-from-libopus.md) lists this with the other deliberate differences.
+
+```rust
+use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+
+const FRAME: usize = 5760; // 120 ms at 48 kHz
+let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+let pcm: Vec<f32> = (0..FRAME).map(|i| 0.3 * (i as f32 * 0.03).sin()).collect();
+let mut packet = vec![0u8; 6 * 1276];
+let len = encoder.encode(&pcm, FRAME, &mut packet).unwrap();
+// CELT-only at 64 kb/s: six 20 ms frames, frame count code 3.
+assert_eq!(packet[0] & 0x03, 3);
+assert_eq!(packet[1] & 0x3f, 6);
+
+let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+let mut out = vec![0.0f32; FRAME];
+assert_eq!(decoder.decode(&packet[..len], FRAME, &mut out).unwrap(), FRAME);
+```
+
+#### Expert frame duration
+
+`set_expert_frame_duration` is libopus's `OPUS_SET_EXPERT_FRAME_DURATION`. With any value but `FrameDuration::Argument`, each `encode` call codes one frame of that duration:
+
+- `frame_size` must be at least that long, or the call is refused. It need not be a frame size of Opus itself.
+- `input` must still hold `frame_size * channels` samples. The encoder codes the first frame of them.
+- The caller learns how much audio was coded from the packet (`packet::nb_samples`), and passes the rest again with the next call. libopus calls this "variable duration": the encoder may code less audio than the call passes. libopus 1.6.1 chooses no duration of its own; the one that is set is used.
+
+The values are those of libopus: `FrameDuration::try_from(5000..=5009)` gives `Argument` (`OPUS_FRAMESIZE_ARG`, 5000) and the durations from 2.5 ms (5001) to 120 ms (5009). Any other number is refused, as libopus refuses it. The setting stays across `reset_state`.
+
+```rust
+use opus1::{Application, FrameDuration, OpusEncoder, packet};
+
+let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+encoder.set_expert_frame_duration(FrameDuration::Ms20);
+assert_eq!(FrameDuration::try_from(5004), Ok(FrameDuration::Ms20));
+assert!(FrameDuration::try_from(5010).is_err());
+
+// 50 ms of audio, which is no frame size of Opus: the call codes the
+// first 20 ms of it.
+let pcm = vec![0.0f32; 2400];
+let mut out = vec![0u8; 1500];
+let len = encoder.encode(&pcm, 2400, &mut out).unwrap();
+assert_eq!(packet::nb_samples(&out[..len], 48_000).unwrap(), 960);
+
+// Less than 20 ms is refused.
+assert!(encoder.encode(&pcm, 480, &mut out).is_err());
+```
 
 ### Bitrate
 
@@ -575,9 +635,9 @@ What is rejected:
 |---|---|---|
 | `OpusEncoder::new`, `OpusDecoder::new` | a sampling rate other than 8000, 12000, 16000, 24000, 48000 | `"Invalid sampling rate"` |
 | `OpusEncoder::new`, `OpusDecoder::new` | a channel count other than 1 or 2 | `"Invalid number of channels"` |
-| `encode`, `encode_i16` | a frame size that is not 2.5, 5, 10, 20, 40 or 60 ms | `"Invalid frame size for sampling rate"` |
+| `encode`, `encode_i16` | a frame size that is not 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms; with an expert frame duration, a frame size shorter than that duration | `"Invalid frame size for sampling rate"` |
 | `encode`, `encode_i16` | fewer than `frame_size * channels` input samples | `"Input buffer too small for frame"` |
-| `encode`, `encode_i16` | an empty output buffer | `"Output buffer too small"` |
+| `encode`, `encode_i16` | an empty output buffer, or a 100 ms frame into a 1-byte buffer | `"Output buffer too small"` |
 | `decode` and the other decode calls | a packet that breaks the rules of section 3 of RFC 6716 (Request for Comments 6716, the Opus specification) | `"Invalid packet"` |
 | `decode` | a packet longer than `frame_size` | `"frame_size too small for packet"` |
 | `decode` and the other decode calls | an output buffer shorter than the samples to be written | `"Output buffer too small for packet"` |

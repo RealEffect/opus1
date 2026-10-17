@@ -6,6 +6,7 @@ use crate::celt_lpc::{autocorr, lpc};
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
 use crate::mathops::mac;
+use core::mem::MaybeUninit;
 
 /// Capacity for pitch-search working buffers (x_lp4 / y_lp4 / xcorr). Bounded by
 /// `COMBFILTER_MAXPERIOD = 1024` and the maximum pitch lag.
@@ -2187,6 +2188,9 @@ fn best_pitch_from(xcorr: &[f32], syy: &[f32], best_pitch: &mut [usize; 2]) {
 /// almost never reached: the chain runs without it, and when any value of
 /// the chain is below 1, the entries are computed again with it. Until the
 /// first value below 1 the two chains are the same, so the result is too.
+///
+/// The table is not cleared before use: the entries below `next` hold
+/// values, and the others are written before they are read.
 struct WindowEnergies<'a> {
     /// y[..n]: the sample that leaves the window at each lag.
     leaving: &'a [f32],
@@ -2194,16 +2198,16 @@ struct WindowEnergies<'a> {
     entering: &'a [f32],
     /// C `Syy` at the lag `next`.
     syy: f32,
-    /// The next entry to fill.
+    /// The next entry to fill. The entries below it are filled.
     next: usize,
-    table: &'a mut [f32],
+    table: &'a mut [MaybeUninit<f32>],
 }
 
 impl<'a> WindowEnergies<'a> {
     /// The table of `table.len()` lags of `y`, with `len` samples per window
     /// and `first` the energy of the first window plus one. `y` must hold
     /// `len + table.len()` samples.
-    fn new(y: &'a [f32], len: usize, first: f32, table: &'a mut [f32]) -> Self {
+    fn new(y: &'a [f32], len: usize, first: f32, table: &'a mut [MaybeUninit<f32>]) -> Self {
         let n = table.len();
         Self {
             leaving: &y[..n],
@@ -2218,7 +2222,7 @@ impl<'a> WindowEnergies<'a> {
     /// lower limit at each step, as libopus does.
     fn fill_exact(&mut self, end: usize) {
         for i in self.next..end {
-            self.table[i] = self.syy;
+            self.table[i].write(self.syy);
             let (old, new) = (self.leaving[i], self.entering[i]);
             self.syy += mac(-(old * old), new, new);
             if self.syy < 1.0 {
@@ -2249,32 +2253,46 @@ impl<'a> WindowEnergies<'a> {
                     let o = vld1q_f32(old.as_ptr().add(done));
                     let w = vld1q_f32(new.as_ptr().add(done));
                     let d = vfmaq_f32(vnegq_f32(vmulq_f32(o, o)), w, w);
-                    vst1q_f32(out.as_mut_ptr().add(done), d);
+                    vst1q_f32(out.as_mut_ptr().add(done).cast(), d);
                     done += 4;
                 }
             }
         }
         for ((d, &o), &w) in out[done..].iter_mut().zip(&old[done..]).zip(&new[done..]) {
-            *d = mac(-(o * o), w, w);
+            d.write(mac(-(o * o), w, w));
         }
     }
 
+    /// The filled entries, `table[..next]`.
+    fn filled(&self) -> &[f32] {
+        // SAFETY: the entries below `next` hold values: `fill_exact` writes
+        // each entry before it moves `next` past it, and `fill_to` and
+        // `fill_both` move it only over entries that `increments` wrote.
+        unsafe { assume_written(&self.table[..self.next]) }
+    }
+
     /// Fills the entries up to `end`, or does nothing when they are filled.
-    fn fill_to(&mut self, end: usize) {
+    /// Every `B::EVERY` steps also fill one entry of `beside`.
+    fn fill_to<B: Beside>(&mut self, end: usize, beside: &mut B) {
         if end <= self.next {
             return;
         }
         let (start, first) = (self.next, self.syy);
         self.increments(end);
+        // SAFETY: `increments` wrote every entry from `start` to `end`.
+        let table = unsafe { assume_written_mut(&mut self.table[start..end]) };
         let mut s = first;
-        for t in &mut self.table[start..end] {
-            let d = *t;
-            *t = s;
-            s += d;
+        for part in table.chunks_mut(B::EVERY) {
+            for t in part {
+                let d = *t;
+                *t = s;
+                s += d;
+            }
+            beside.fill(1);
         }
         self.syy = s;
         self.next = end;
-        if below_one(&self.table[start..end]) || s < 1.0 {
+        if below_one(table) || s < 1.0 {
             core::hint::cold_path();
             (self.next, self.syy) = (start, first);
             self.fill_exact(end);
@@ -2283,37 +2301,66 @@ impl<'a> WindowEnergies<'a> {
 
     /// Fills the next `count` entries of `a` and of `b`, which must both
     /// have that many left, side by side: the processor then works on one
-    /// chain while the other waits.
-    fn fill_both(a: &mut Self, b: &mut Self, count: usize) {
+    /// chain while the other waits. Every `B::EVERY` steps also fill one
+    /// entry of `beside`.
+    fn fill_both<B: Beside>(a: &mut Self, b: &mut Self, count: usize, beside: &mut B) {
         let (ia, ib) = (a.next, b.next);
         let (fa, fb) = (a.syy, b.syy);
         a.increments(ia + count);
         b.increments(ib + count);
+        // SAFETY: `increments` wrote these entries of both tables.
+        let ta = unsafe { assume_written_mut(&mut a.table[ia..ia + count]) };
+        let tb = unsafe { assume_written_mut(&mut b.table[ib..ib + count]) };
         let (mut sa, mut sb) = (fa, fb);
-        for (ta, tb) in a.table[ia..ia + count]
-            .iter_mut()
-            .zip(&mut b.table[ib..ib + count])
-        {
-            let (da, db) = (*ta, *tb);
-            *ta = sa;
-            *tb = sb;
-            sa += da;
-            sb += db;
+        for (pa, pb) in ta.chunks_mut(B::EVERY).zip(tb.chunks_mut(B::EVERY)) {
+            for (ta, tb) in pa.iter_mut().zip(pb) {
+                let (da, db) = (*ta, *tb);
+                *ta = sa;
+                *tb = sb;
+                sa += da;
+                sb += db;
+            }
+            beside.fill(1);
         }
         (a.syy, b.syy) = (sa, sb);
         a.next += count;
         b.next += count;
-        if below_one(&a.table[ia..ia + count]) || sa < 1.0 {
+        let (redo_a, redo_b) = (below_one(ta) || sa < 1.0, below_one(tb) || sb < 1.0);
+        if redo_a {
             core::hint::cold_path();
             (a.next, a.syy) = (ia, fa);
             a.fill_exact(ia + count);
         }
-        if below_one(&b.table[ib..ib + count]) || sb < 1.0 {
+        if redo_b {
             core::hint::cold_path();
             (b.next, b.syy) = (ib, fb);
             b.fill_exact(ib + count);
         }
     }
+}
+
+/// `v` as the values it holds.
+///
+/// # Safety
+///
+/// Every element of `v` must have been written.
+#[inline(always)]
+unsafe fn assume_written(v: &[MaybeUninit<f32>]) -> &[f32] {
+    // SAFETY: `MaybeUninit<f32>` has the layout of `f32`, and the caller
+    // promises that every element holds a value.
+    unsafe { core::slice::from_raw_parts(v.as_ptr().cast(), v.len()) }
+}
+
+/// `v` as the values it holds, to change them.
+///
+/// # Safety
+///
+/// Every element of `v` must have been written.
+#[inline(always)]
+unsafe fn assume_written_mut(v: &mut [MaybeUninit<f32>]) -> &mut [f32] {
+    // SAFETY: as in `assume_written`. Only values are written through the
+    // result, so the elements keep holding values.
+    unsafe { core::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), v.len()) }
 }
 
 /// Whether any value of `v` is below 1. Not-a-number values are not.
@@ -2345,20 +2392,16 @@ fn below_one(v: &[f32]) -> bool {
 /// sets every other lag to 0, and no lag below -1.
 ///
 /// There are at most ten such lags. Their inner products are computed
-/// together (`inner_prod_many`).
-///
-/// Returns the lags in rising order, how many there are, and one more than
-/// the last lag whose correlation is above 0 (0 when there is none).
-fn fine_xcorr(
+/// together (`inner_prod_many`). On aarch64 the pass fills one entry of
+/// `beside` per four samples.
+fn fine_xcorr<B: Beside>(
     x_lp: &[f32],
     y: &[f32],
     len: usize,
     best_pitch: &[usize; 2],
-    xcorr: &mut [f32],
-) -> ([usize; 10], usize, usize) {
-    let max_pitch = xcorr.len();
-    xcorr.fill(0.0);
-
+    max_pitch: usize,
+    beside: &mut B,
+) -> FineLags {
     let near = |i: usize, coarse: usize| (i as i32 - 2 * coarse as i32).abs() <= 2;
     let mut lags = [0usize; 10];
     let mut count = 0;
@@ -2376,25 +2419,65 @@ fn fine_xcorr(
     }
 
     let mut sums = [0.0f32; 10];
-    inner_prod_many(x_lp, y, &lags[..count], len, &mut sums[..count]);
-    let mut end = 0;
-    for (&i, &sum) in lags[..count].iter().zip(&sums) {
+    if B::ACTIVE {
+        inner_prod_many_side(
+            x_lp,
+            y,
+            &lags[..count],
+            len,
+            &mut sums[..count],
+            &mut || beside.fill(1),
+        );
+    } else {
+        inner_prod_many(x_lp, y, &lags[..count], len, &mut sums[..count]);
+    }
+    let mut fine = FineLags {
+        lags,
+        xcorr: [0.0; 10],
+        count,
+        end: 0,
+    };
+    for (k, (&i, &sum)) in lags[..count].iter().zip(&sums).enumerate() {
         // C `MAX32(-1, sum)`, which keeps a not-a-number sum.
-        xcorr[i] = if -1.0 > sum { -1.0 } else { sum };
+        fine.xcorr[k] = if -1.0 > sum { -1.0 } else { sum };
         if sum > 0.0 {
-            end = end.max(i + 1);
+            fine.end = fine.end.max(i + 1);
         }
     }
     // Each candidate's lags are in rising order; the second candidate can be
     // the lower one. An insertion sort of at most ten values.
     for i in 1..count {
         let mut j = i;
-        while j > 0 && lags[j - 1] > lags[j] {
-            lags.swap(j - 1, j);
+        while j > 0 && fine.lags[j - 1] > fine.lags[j] {
+            fine.lags.swap(j - 1, j);
+            fine.xcorr.swap(j - 1, j);
             j -= 1;
         }
     }
-    (lags, count, end)
+    fine
+}
+
+/// The lags of the fine search of `pitch_search` (`fine_xcorr`) and their
+/// correlations, C `xcorr[lags[k]] = xcorr[k]` for `k < count`. libopus
+/// sets the correlation of every other lag to 0.
+struct FineLags {
+    /// In rising order.
+    lags: [usize; 10],
+    xcorr: [f32; 10],
+    count: usize,
+    /// One more than the last lag whose correlation is above 0, 0 when there
+    /// is none.
+    end: usize,
+}
+
+impl FineLags {
+    /// C `xcorr[i]` after the fine search.
+    fn at(&self, i: usize) -> f32 {
+        self.lags[..self.count]
+            .iter()
+            .position(|&lag| lag == i)
+            .map_or(0.0, |k| self.xcorr[k])
+    }
 }
 
 /// The coarse search of `pitch_search`: `pitch_xcorr(x4, y4, xcorr, ..)` for
@@ -2405,12 +2488,21 @@ fn fine_xcorr(
 ///
 /// The two energies are chains of additions that wait for each other. On
 /// aarch64 they are summed inside the passes of the correlation, which
-/// leave time for them, so they take almost no time of their own.
-fn coarse_xcorr(x4: &[f32], y4: &[f32], y: &[f32], xcorr: &mut [f32]) -> (f32, f32) {
+/// leave time for them, so they take almost no time of their own. The
+/// passes also fill entries of `beside`.
+fn coarse_xcorr<B: Beside>(
+    x4: &[f32],
+    y4: &[f32],
+    y: &[f32],
+    xcorr: &mut [f32],
+    beside: &mut B,
+) -> (f32, f32) {
     let len4 = x4.len();
     // Only the aarch64 code takes steps; elsewhere `finish` does all of them.
     #[allow(unused_mut)]
     let (mut coarse, mut fine) = (Energy::new(&y4[..len4]), Energy::new(y));
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = beside;
     #[cfg(target_arch = "aarch64")]
     if xcorr.len() >= 64 && len4 >= 8 {
         // libopus `celt_pitch_xcorr_float_neon`, as in `pitch_xcorr_neon`.
@@ -2423,7 +2515,10 @@ fn coarse_xcorr(x4: &[f32], y4: &[f32], y: &[f32], xcorr: &mut [f32]) -> (f32, f
             // the kernel.
             let calls = skew_side_calls(len4, by_sample).max(1);
             let per_call = y.len().max(len4).div_ceil(calls);
-            let mut side = || Energy::step_both(&mut fine, &mut coarse, per_call);
+            let mut side = || {
+                Energy::step_both(&mut fine, &mut coarse, per_call);
+                beside.fill(BESIDE_PER_SKEW_CALL);
+            };
             xcorr_skewed_neon(x4, y4, grouped, &mut side);
         } else {
             // `side` runs once per step of eight samples of every pass of 64
@@ -2432,6 +2527,7 @@ fn coarse_xcorr(x4: &[f32], y4: &[f32], y: &[f32], xcorr: &mut [f32]) -> (f32, f
             let mut side = || {
                 fine.step(4);
                 coarse.step(2);
+                beside.fill(BESIDE_PER_STEP);
             };
             xcorr_by_sample_passes_side_neon::<16, _>(x4, y4, grouped, &mut side);
         }
@@ -2504,21 +2600,26 @@ impl<'a> Energy<'a> {
     }
 }
 
-/// `dst[j] = src[2 * j]` for every `j < dst.len()`.
+/// Writes `src[2 * j]` into `dst[j]` for every `j < dst.len()` and returns
+/// `dst` with its values.
 ///
 /// Needs `src.len() >= 2 * dst.len() - 1`. Written over pairs of samples, so
 /// that the compiler can turn it into vector code.
 #[inline(always)]
-fn take_even(src: &[f32], dst: &mut [f32]) {
+fn take_even<'b>(src: &[f32], dst: &'b mut [MaybeUninit<f32>]) -> &'b [f32] {
     let n = dst.len();
     if n == 0 {
-        return;
+        return &[];
     }
     let (pairs, last) = src[..2 * n - 1].as_chunks::<2>();
+    assert!(pairs.len() == n - 1);
     for (d, pair) in dst.iter_mut().zip(pairs) {
-        *d = pair[0];
+        d.write(pair[0]);
     }
-    dst[n - 1] = last[0];
+    dst[n - 1].write(last[0]);
+    // SAFETY: the loop wrote dst[..n - 1], one element per pair, and the
+    // line above dst[n - 1].
+    unsafe { assume_written(dst) }
 }
 
 /// libopus `pitch_search`: finds the lag at which `y` is most similar to
@@ -2534,58 +2635,106 @@ fn take_even(src: &[f32], dst: &mut [f32]) {
 /// `x_lp` and `y` themselves, only around the two best coarse lags. The lag
 /// is refined by one sample from the correlation at its two neighbours.
 pub fn pitch_search(x_lp: &[f32], y: &[f32], len: usize, max_pitch: usize) -> usize {
+    pitch_search_beside(x_lp, y, len, max_pitch, &mut ())
+}
+
+/// A chain of additions that `pitch_search_beside` advances in the gaps of
+/// its own work: the window energies of `remove_doubling` when the
+/// encoder's pre-filter calls the two (`prefilter_pitch`), and nothing
+/// (`()`) otherwise.
+trait Beside {
+    /// Whether there is a chain at all.
+    const ACTIVE: bool;
+
+    /// The loops of the window energies of `find_best_pitch` fill one entry
+    /// per this many steps of their own.
+    const EVERY: usize;
+
+    /// Fills up to `count` more entries.
+    fn fill(&mut self, count: usize);
+
+    /// Called when the coarse search has found its two lags (in samples
+    /// of `y` decimated by two, `best_pitch_from`).
+    fn coarse_found(&mut self, best_pitch: &[usize; 2]);
+}
+
+impl Beside for () {
+    const ACTIVE: bool = false;
+    const EVERY: usize = usize::MAX;
+
+    #[inline(always)]
+    fn fill(&mut self, _count: usize) {}
+
+    #[inline(always)]
+    fn coarse_found(&mut self, _best_pitch: &[usize; 2]) {}
+}
+
+/// Entries of `beside` that the coarse search fills per call of its side
+/// work, in the kernel for shared windows (`xcorr_skewed_neon`) and in the
+/// other one (`xcorr_by_sample_passes_side_neon`).
+#[cfg(target_arch = "aarch64")]
+const BESIDE_PER_SKEW_CALL: usize = 4;
+#[cfg(target_arch = "aarch64")]
+const BESIDE_PER_STEP: usize = 3;
+
+/// `pitch_search` that also advances the chain `beside`.
+fn pitch_search_beside<B: Beside>(
+    x_lp: &[f32],
+    y: &[f32],
+    len: usize,
+    max_pitch: usize,
+    beside: &mut B,
+) -> usize {
     let mut best_pitch = [0, 0];
 
     let max_pitch = max_pitch >> 1;
     let len = len >> 1;
     let lag = len + max_pitch;
+    let coarse_lags = max_pitch >> 1;
 
-    // The buffers hold up to 1024 values each, but only the part that is
-    // used is cleared. Longer inputs panic in `resize`.
-    let mut x_lp4: FixedVec<f32, PITCH_BUF_MAX> = FixedVec::new();
-    let mut y_lp4: FixedVec<f32, PITCH_BUF_MAX> = FixedVec::new();
+    // The buffers hold up to 1024 values each. Longer inputs panic. Only the
+    // correlations are cleared: every other value is written before it is
+    // read.
+    let mut x4_buf = [const { MaybeUninit::<f32>::uninit() }; PITCH_BUF_MAX];
+    let mut y4_buf = [const { MaybeUninit::<f32>::uninit() }; PITCH_BUF_MAX];
+    let x_lp4 = take_even(x_lp, &mut x4_buf[..len >> 1]);
+    let y_lp4 = take_even(y, &mut y4_buf[..lag >> 1]);
     let mut xcorr: FixedVec<f32, PITCH_BUF_MAX> = FixedVec::new();
-    x_lp4.resize(len >> 1, 0.0);
-    y_lp4.resize(lag >> 1, 0.0);
-    xcorr.resize(max_pitch, 0.0);
+    xcorr.resize(coarse_lags, 0.0);
 
-    take_even(x_lp, &mut x_lp4);
-    take_even(y, &mut y_lp4);
-
-    let (syy_coarse, syy_fine) =
-        coarse_xcorr(&x_lp4, &y_lp4, &y[..len], &mut xcorr[..max_pitch >> 1]);
+    let (syy_coarse, syy_fine) = coarse_xcorr(x_lp4, y_lp4, &y[..len], &mut xcorr, beside);
 
     // The window energies of the two calls of `find_best_pitch`. Both tables
     // are chains of additions that wait for each other, so they are filled
     // side by side, up to the last coarse lag.
-    let coarse_lags = max_pitch >> 1;
-    let mut tables: FixedVec<f32, { PITCH_BUF_MAX + PITCH_BUF_MAX / 2 }> = FixedVec::new();
-    tables.resize(coarse_lags + max_pitch, 0.0);
-    let (coarse_table, fine_table) = tables.split_at_mut(coarse_lags);
-    let mut coarse = WindowEnergies::new(&y_lp4, len >> 1, syy_coarse, coarse_table);
+    let mut tables = [const { MaybeUninit::<f32>::uninit() }; PITCH_BUF_MAX + PITCH_BUF_MAX / 2];
+    let (coarse_table, fine_table) = tables[..coarse_lags + max_pitch].split_at_mut(coarse_lags);
+    let mut coarse = WindowEnergies::new(y_lp4, len >> 1, syy_coarse, coarse_table);
     let mut fine = WindowEnergies::new(y, len, syy_fine, fine_table);
-    WindowEnergies::fill_both(&mut coarse, &mut fine, coarse_lags.min(max_pitch));
-    coarse.fill_to(coarse_lags);
-    best_pitch_from(&xcorr[..coarse_lags], coarse.table, &mut best_pitch);
+    WindowEnergies::fill_both(&mut coarse, &mut fine, coarse_lags.min(max_pitch), beside);
+    coarse.fill_to(coarse_lags, beside);
+    best_pitch_from(&xcorr, coarse.filled(), &mut best_pitch);
+    beside.coarse_found(&best_pitch);
 
-    let (lags, count, end) = fine_xcorr(x_lp, y, len, &best_pitch, &mut xcorr);
+    let found = fine_xcorr(x_lp, y, len, &best_pitch, max_pitch, beside);
     // libopus compares every lag up to `max_pitch`. Only the lags of the
     // fine correlation have a correlation above 0, and only they can win;
     // the window energy at each of them is the same as in libopus's loop.
-    fine.fill_to(end);
+    fine.fill_to(found.end, beside);
+    let syy = fine.filled();
     let mut best = BestPitch::new();
-    for &i in &lags[..count] {
-        if i < end {
-            best.consider(i, xcorr[i], fine.table[i]);
+    for (&i, &xc) in found.lags[..found.count].iter().zip(&found.xcorr) {
+        if i < found.end {
+            best.consider(i, xc, syy[i]);
         }
     }
     best_pitch = best.pitch;
 
     let mut offset = 0;
     if best_pitch[0] > 0 && best_pitch[0] < max_pitch - 1 {
-        let a = xcorr[best_pitch[0] - 1];
-        let b = xcorr[best_pitch[0]];
-        let c = xcorr[best_pitch[0] + 1];
+        let a = found.at(best_pitch[0] - 1);
+        let b = found.at(best_pitch[0]);
+        let c = found.at(best_pitch[0] + 1);
         if (c - a) > 0.7 * (b - a) {
             offset = 1;
         } else if (a - c) > 0.7 * (b - c) {
@@ -2607,6 +2756,11 @@ static SECOND_CHECK: [usize; 16] = [0, 0, 3, 2, 3, 2, 5, 2, 3, 2, 3, 2, 5, 2, 3,
 /// `remove_doubling` tries the periods `t0 / k` for `k` from 2 to 15.
 const MAX_DOUBLING_CANDS: usize = 14;
 
+/// Capacity of the table of window energies of `remove_doubling`. It holds
+/// `max_period / 2 + 1` entries at most; the encoder's `max_period` is
+/// `COMBFILTER_MAXPERIOD = 1024`.
+const MAX_YY_SIZE: usize = 1024;
+
 /// The inner products `remove_doubling` needs before it decides anything,
 /// and its table of window energies.
 ///
@@ -2618,35 +2772,45 @@ const MAX_DOUBLING_CANDS: usize = 14;
 /// the bits of `celt_inner_prod`, as each output of libopus
 /// `dual_inner_prod_neon` has.
 ///
-/// `yy_lookup[i]` is the energy of the `n` samples that start `i` samples
-/// before the target, held at 0 or more, for `i < yy_lookup.len()`. Each
-/// entry follows from the running sum of the one before it (C `yy`, which
-/// is not held at 0), starting from `xx`.
+/// The returned table holds `end` entries: entry `i` is the energy of the
+/// `n` samples that start `i` samples before the target, held at 0 or more.
+/// Each entry follows from the running sum of the one before it (C `yy`,
+/// which is not held at 0), starting from `xx`.
+///
+/// `started` is that chain when the caller has started it already
+/// (`prefilter_pitch`, aarch64 only); `xx` is then its entry 0. Otherwise
+/// the chain starts here, in `own_table`.
 ///
 /// On aarch64 the products are computed together, up to 16 per pass. The
 /// energies are one chain of additions that waits for itself, and they
-/// start from `xx`. So `xx` comes in the first pass, and the energies are
-/// summed during the later passes, which leave time for them.
-fn doubling_products(
-    x: &[f32],
+/// start from `xx`. So `xx` comes first, and the energies are summed during
+/// the passes of the other products, which leave time for them.
+#[allow(clippy::too_many_arguments)]
+fn doubling_products<'a>(
+    x: &'a [f32],
     max_period: usize,
     n: usize,
     t0: usize,
     cands: &[(usize, usize)],
     pair_xy: &mut [(f32, f32); MAX_DOUBLING_CANDS],
-    yy_lookup: &mut [f32],
+    end: usize,
+    started: Option<Energies<'a>>,
+    own_table: &'a mut [MaybeUninit<f32>; MAX_YY_SIZE],
     around_t0: &mut Option<[f32; 3]>,
-) -> (f32, f32) {
+) -> (f32, f32, Energies<'a>) {
     let x_target = &x[max_period..];
-    let (xx, xy);
     #[cfg(target_arch = "aarch64")]
     {
+        // Only `prefilter_pitch` on Apple's processors starts the chain.
+        #[cfg(not(target_vendor = "apple"))]
+        let started: Option<Energies> = {
+            let _ = started;
+            None
+        };
         const TOTAL: usize = 4 + 2 * MAX_DOUBLING_CANDS;
-        // First the energy of the target and its products at the periods t0,
+        // The energy of the target, then its products at the periods t0,
         // t0 - 1 and t0 + 1 (`remove_doubling` needs the last two when it
-        // keeps t0). The chain of energies starts from the first of them,
-        // so this short pass comes first, and the chain runs during the
-        // passes of the candidates.
+        // keeps t0), then those of the candidates.
         let mut offsets = [0usize; TOTAL];
         offsets[..4].copy_from_slice(&[
             max_period,
@@ -2659,12 +2823,25 @@ fn doubling_products(
         }
         let count = 4 + 2 * cands.len();
         let mut sums = [0.0f32; TOTAL];
-        inner_prod_many(x_target, x, &offsets[..4], n, &mut sums[..4]);
-        let mut energies = Energies::new(x, max_period, n, sums[0], yy_lookup);
+        // The products that the passes with the chain compute: all but the
+        // energy when the chain has started, else all after the short first
+        // pass, which gives the energy that starts the chain.
+        let (mut energies, first) = match started {
+            Some(energies) => {
+                sums[0] = energies.filled()[0];
+                (energies, 1)
+            }
+            None => {
+                inner_prod_many(x_target, x, &offsets[..4], n, &mut sums[..4]);
+                let table = &mut own_table[..end];
+                (Energies::new(x, max_period, n, sums[0], table), 4)
+            }
+        };
+        energies.set_end(end);
         let steps = n / 4;
-        for (offs, out) in offsets[4..count]
+        for (offs, out) in offsets[first..count]
             .chunks(MANY_PER_PASS)
-            .zip(sums[4..count].chunks_mut(MANY_PER_PASS))
+            .zip(sums[first..count].chunks_mut(MANY_PER_PASS))
         {
             // A pass calls `side` once per four samples (`steps` times).
             if energies.left() >= 2 * steps {
@@ -2676,32 +2853,44 @@ fn doubling_products(
             } else {
                 // The last entries, spread over the pass.
                 let per_call = energies.left().div_ceil(steps.max(1));
-                inner_prod_many_side(x_target, x, offs, n, out, &mut || energies.step(per_call));
+                inner_prod_many_side(x_target, x, offs, n, out, &mut || {
+                    // On the Apple M4 Pro the runs are 1-3 % faster for
+                    // 10 and 20 ms frames, on the Cortex-A76 the steps
+                    // one by one.
+                    #[cfg(target_vendor = "apple")]
+                    energies.step_runs(per_call);
+                    #[cfg(not(target_vendor = "apple"))]
+                    energies.step(per_call);
+                });
             }
         }
         energies.finish();
         for (p, s) in pair_xy.iter_mut().zip(sums[4..count].as_chunks::<2>().0) {
             *p = (s[0], s[1]);
         }
-        (xx, xy) = (sums[0], sums[1]);
-        *around_t0 = Some([sums[2], xy, sums[3]]);
+        *around_t0 = Some([sums[2], sums[1], sums[3]]);
+        (sums[0], sums[1], energies)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = around_t0;
-        (xx, xy) = dual_inner_prod(x_target, x_target, &x[max_period - t0..], n);
+        let _ = (around_t0, started);
+        let (xx, xy) = dual_inner_prod(x_target, x_target, &x[max_period - t0..], n);
         for (p, &(t1, t1b)) in pair_xy.iter_mut().zip(cands) {
             *p = dual_inner_prod(x_target, &x[max_period - t1..], &x[max_period - t1b..], n);
         }
-        Energies::new(x, max_period, n, xx, yy_lookup).finish();
+        let mut energies = Energies::new(x, max_period, n, xx, &mut own_table[..end]);
+        energies.finish();
+        (xx, xy, energies)
     }
-    (xx, xy)
 }
 
 /// The table of window energies of `remove_doubling`, filled in parts:
 /// C `yy = yy+MULT16_16(x[-i],x[-i])-MULT16_16(x[N-i],x[N-i])` and
 /// `yy_lookup[i] = MAX32(0, yy)` for `i` from 1 on. clang turns the update
 /// into two fused multiply-adds (`mac`).
+///
+/// The table is not cleared before use: the entries below `next` hold
+/// values, and no other entry is read.
 struct Energies<'a> {
     /// The decimated signal; the target starts at `x[max_period]`.
     x: &'a [f32],
@@ -2709,49 +2898,102 @@ struct Energies<'a> {
     n: usize,
     /// The running sum C `yy`.
     yy: f32,
-    /// The next entry to fill.
+    /// The next entry to fill. The entries below it are filled.
     next: usize,
-    table: &'a mut [f32],
+    /// The entries are filled up to here, at most to the end of `table`.
+    end: usize,
+    table: &'a mut [MaybeUninit<f32>],
 }
 
 impl<'a> Energies<'a> {
-    fn new(x: &'a [f32], max_period: usize, n: usize, xx: f32, table: &'a mut [f32]) -> Self {
+    /// The chain that starts at `table[0] = xx`, to be filled up to the end
+    /// of `table`.
+    fn new(
+        x: &'a [f32],
+        max_period: usize,
+        n: usize,
+        xx: f32,
+        table: &'a mut [MaybeUninit<f32>],
+    ) -> Self {
         // Entry `i` reads x[max_period - i] and x[max_period + n - i].
         assert!(table.len() <= max_period + 1 && max_period + n <= x.len());
-        table[0] = xx;
+        table[0].write(xx);
         Self {
             x,
             max_period,
             n,
             yy: xx,
             next: 1,
+            end: table.len(),
             table,
         }
+    }
+
+    /// Fills the entries up to `end` (at most the length of the table) and
+    /// no further. Entries that are filled already stay filled.
+    #[cfg(target_arch = "aarch64")]
+    fn set_end(&mut self, end: usize) {
+        self.end = end.min(self.table.len());
     }
 
     /// Fills the next `count` entries, or all that are left.
     #[inline(always)]
     fn step(&mut self, count: usize) {
-        let end = (self.next + count).min(self.table.len());
+        let end = (self.next + count).min(self.end);
         for i in self.next..end {
             let new = self.x[self.max_period - i];
             let old = self.x[self.max_period + self.n - i];
             self.yy = mac(mac(self.yy, new, new), -old, old);
             // C `MAX32(0, yy)`.
-            self.table[i] = if 0.0 > self.yy { 0.0 } else { self.yy };
+            self.table[i].write(if 0.0 > self.yy { 0.0 } else { self.yy });
         }
+        self.next = self.next.max(end);
+    }
+
+    /// `step`, with the samples of all its entries taken as two runs first.
+    /// It has fewer instructions per entry when `count` is large, and more
+    /// per call.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    #[inline(always)]
+    fn step_runs(&mut self, count: usize) {
+        let (start, end) = (self.next, (self.next + count).min(self.end));
+        if end <= start {
+            return;
+        }
+        // Entry i reads x[max_period - i] and x[max_period + n - i]: from
+        // `start` to `end`, the two runs below from their last sample down.
+        let (at, n) = (self.max_period, self.n);
+        let entering = &self.x[at + 1 - end..=at - start];
+        let leaving = &self.x[at + n + 1 - end..=at + n - start];
+        let mut yy = self.yy;
+        for ((t, &new), &old) in self.table[start..end]
+            .iter_mut()
+            .zip(entering.iter().rev())
+            .zip(leaving.iter().rev())
+        {
+            yy = mac(mac(yy, new, new), -old, old);
+            // C `MAX32(0, yy)`.
+            t.write(if 0.0 > yy { 0.0 } else { yy });
+        }
+        self.yy = yy;
         self.next = end;
     }
 
+    /// The filled entries, `table[..next]`.
+    fn filled(&self) -> &[f32] {
+        // SAFETY: `new` writes entry 0, and `step` and `step2_unchecked`
+        // write each entry before they move `next` past it.
+        unsafe { assume_written(&self.table[..self.next]) }
+    }
+
     /// Fills all entries that are left.
-    fn finish(mut self) {
-        self.step(self.table.len());
+    fn finish(&mut self) {
+        self.step(self.left());
     }
 
     /// How many entries are left to fill.
-    #[cfg(target_arch = "aarch64")]
     fn left(&self) -> usize {
-        self.table.len() - self.next
+        self.end.saturating_sub(self.next)
     }
 
     /// Fills the next two entries, as `step(2)`, without checks and without
@@ -2765,25 +3007,53 @@ impl<'a> Energies<'a> {
     #[inline(always)]
     unsafe fn step2_unchecked(&mut self) {
         let i = self.next;
-        debug_assert!(i + 2 <= self.table.len());
-        // SAFETY: entries i and i + 1 exist (the caller's promise), and
-        // `new` asserted table.len() <= max_period + 1 and
-        // max_period + n <= x.len(). So max_period - i - 1 >= 0 and
-        // max_period + n - i < x.len() for i >= 1.
+        debug_assert!(i + 2 <= self.end && self.end <= self.table.len());
+        // SAFETY: entries i and i + 1 exist (the caller's promise, and
+        // `set_end` keeps `end` within the table), and `new` asserted
+        // table.len() <= max_period + 1 and max_period + n <= x.len(). So
+        // max_period - i - 1 >= 0 and max_period + n - i < x.len() for
+        // i >= 1.
         unsafe {
             let at = self.x.as_ptr().add(self.max_period - i);
             let (new0, new1) = (*at, *at.sub(1));
             let (old0, old1) = (*at.add(self.n), *at.add(self.n - 1));
             let yy0 = mac(mac(self.yy, new0, new0), -old0, old0);
             let yy1 = mac(mac(yy0, new1, new1), -old1, old1);
-            let table = self.table.as_mut_ptr().add(i);
+            let table = self.table.as_mut_ptr().add(i).cast::<f32>();
             // C `MAX32(0, yy)`.
-            *table = if 0.0 > yy0 { 0.0 } else { yy0 };
-            *table.add(1) = if 0.0 > yy1 { 0.0 } else { yy1 };
+            table.write(if 0.0 > yy0 { 0.0 } else { yy0 });
+            table.add(1).write(if 0.0 > yy1 { 0.0 } else { yy1 });
             self.yy = yy1;
         }
         self.next = i + 2;
     }
+}
+
+/// The candidate periods of `remove_doubling` for the period `t0`: `t1` is
+/// about `t0 / k`, and `t1b` is a second period that is checked together
+/// with it. Both depend on `t0` and `k` only. Returns the candidates and
+/// how many there are. All periods are in samples of the decimated signal.
+fn doubling_candidates(
+    t0: usize,
+    min_period: usize,
+    max_period: usize,
+) -> ([(usize, usize); MAX_DOUBLING_CANDS], usize) {
+    let mut cands = [(0usize, 0usize); MAX_DOUBLING_CANDS];
+    let mut n_cands = 0;
+    for k in 2..=15 {
+        let t1 = (2 * t0 + k) / (2 * k);
+        if t1 < min_period {
+            break;
+        }
+        let t1b = if k == 2 {
+            if t1 + t0 > max_period { t0 } else { t0 + t1 }
+        } else {
+            (2 * SECOND_CHECK[k] * t0 + k) / (2 * k)
+        };
+        cands[n_cands] = (t1, t1b);
+        n_cands += 1;
+    }
+    (cands, n_cands)
 }
 
 /// libopus `remove_doubling` (celt/pitch.c) of the float build: checks
@@ -2796,12 +3066,37 @@ impl<'a> Energies<'a> {
 /// `min_period`.
 pub fn remove_doubling(
     x: &[f32],
+    max_period: usize,
+    min_period: usize,
+    n: usize,
+    t0_ptr: &mut usize,
+    prev_period: usize,
+    prev_gain: f32,
+) -> f32 {
+    remove_doubling_from(
+        x,
+        max_period,
+        min_period,
+        n,
+        t0_ptr,
+        prev_period,
+        prev_gain,
+        None,
+    )
+}
+
+/// `remove_doubling`, with the chain of window energies that the caller
+/// may have started (`doubling_products`).
+#[allow(clippy::too_many_arguments)]
+fn remove_doubling_from<'a>(
+    x: &'a [f32],
     mut max_period: usize,
     mut min_period: usize,
     mut n: usize,
     t0_ptr: &mut usize,
     mut prev_period: usize,
     prev_gain: f32,
+    started: Option<Energies<'a>>,
 ) -> f32 {
     let min_period0 = min_period;
     max_period /= 2;
@@ -2819,49 +3114,33 @@ pub fn remove_doubling(
     let mut t = *t0_ptr;
     let t0 = *t0_ptr;
 
-    // The shorter periods the loop below tries: `t1` is about `t0 / k`, and
-    // `t1b` is a second period that is checked together with it. Both depend
-    // on `t0` and `k` only. So all inner products of the loop can be computed
-    // before its decisions, several at a time.
-    let mut cands = [(0usize, 0usize); MAX_DOUBLING_CANDS];
-    let mut n_cands = 0;
-    for k in 2..=15 {
-        let t1 = (2 * t0 + k) / (2 * k);
-        if t1 < min_period {
-            break;
-        }
-        let t1b = if k == 2 {
-            if t1 + t0 > max_period { t0 } else { t0 + t1 }
-        } else {
-            (2 * SECOND_CHECK[k] * t0 + k) / (2 * k)
-        };
-        cands[n_cands] = (t1, t1b);
-        n_cands += 1;
-    }
+    // All inner products of the loop below can be computed before its
+    // decisions, several at a time.
+    let (cands, n_cands) = doubling_candidates(t0, min_period, max_period);
     let cands = &cands[..n_cands];
 
     // libopus fills the table of window energies up to `max_period`. It is
     // only read at `t0` and at the periods of the candidates, so here it ends
     // at the largest of them.
     let last = cands.iter().fold(t0, |m, &(t1, t1b)| m.max(t1).max(t1b));
-    const MAX_YY_SIZE: usize = 1024;
-    // `new` plus `resize` clears the used entries only and builds the table
-    // in place. (`FixedVec::from_value` would build it and then copy all 4 KB.)
-    let mut yy_lookup: FixedVec<f32, MAX_YY_SIZE> = FixedVec::new();
-    yy_lookup.resize(last + 1, 0.0);
+    // Not cleared: `Energies` writes each entry before it is read.
+    let mut own_table = [const { MaybeUninit::<f32>::uninit() }; MAX_YY_SIZE];
 
     let mut pair_xy = [(0.0f32, 0.0f32); MAX_DOUBLING_CANDS];
     let mut around_t0 = None;
-    let (xx, xy) = doubling_products(
+    let (xx, xy, energies) = doubling_products(
         x,
         max_period,
         n,
         t0,
         cands,
         &mut pair_xy,
-        &mut yy_lookup,
+        last + 1,
+        started,
+        &mut own_table,
         &mut around_t0,
     );
+    let yy_lookup = &energies.filled()[..last + 1];
 
     let mut best_xy = xy;
     let mut best_yy = yy_lookup[t0];
@@ -2935,6 +3214,138 @@ pub fn remove_doubling(
     pg
 }
 
+/// The pitch analysis of the encoder's pre-filter after `pitch_downsample`
+/// (libopus `run_prefilter`, celt/celt_encoder.c): `pitch_search` over
+/// `max_period - 3 * min_period` lags, then `remove_doubling` on the period
+/// it finds. `x` is the decimated signal (C `pitch_buf`), with
+/// `max_period / 2` samples of history before the frame of `n / 2`
+/// samples. Returns the period C `pitch_index` and the gain of
+/// `remove_doubling`, as the two calls give them.
+///
+/// The chain of window energies of `remove_doubling` (`Energies`) waits for
+/// itself at every step, and it does not depend on the period. On Apple's
+/// 64-bit ARM processors it therefore starts before the search and runs in
+/// the gaps of the search's own work (`DoublingChain`). For a 2.5 ms frame
+/// the chain takes longer than the products of `remove_doubling`. These
+/// cores run many instructions at once, out of program order, and the
+/// search plus the chain takes 12 % less time than the two calls on an
+/// Apple M4 Pro at 2.5 ms. The Cortex-A55 and Cortex-A76 of an Android
+/// phone take 8 to 20 % more time that way, so elsewhere this is the two
+/// calls.
+pub(crate) fn prefilter_pitch(
+    x: &[f32],
+    max_period: usize,
+    min_period: usize,
+    n: usize,
+    prev_period: usize,
+    prev_gain: f32,
+) -> (usize, f32) {
+    let search_max = max_period - 3 * min_period;
+    // C `pitch_index` from the lag of `pitch_search`.
+    let period = |lag: usize| (max_period - lag).min(max_period - 2);
+    let half = max_period >> 1;
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    {
+        let target = &x[half..half + n / 2];
+        let xx = celt_inner_prod(target, target);
+        let mut table = [const { MaybeUninit::<f32>::uninit() }; MAX_YY_SIZE];
+        let mut energies = Energies::new(x, half, n / 2, xx, &mut table[..half + 1]);
+        energies.set_end(DOUBLING_EARLY);
+        let mut chain = DoublingChain {
+            energies,
+            max_period,
+            min_period,
+        };
+        let mut t0 = period(pitch_search_beside(
+            &x[half..],
+            x,
+            n,
+            search_max,
+            &mut chain,
+        ));
+        let gain = remove_doubling_from(
+            x,
+            max_period,
+            min_period,
+            n,
+            &mut t0,
+            prev_period,
+            prev_gain,
+            Some(chain.energies),
+        );
+        (t0, gain)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    {
+        let mut t0 = period(pitch_search(&x[half..], x, n, search_max));
+        let gain = remove_doubling(
+            x,
+            max_period,
+            min_period,
+            n,
+            &mut t0,
+            prev_period,
+            prev_gain,
+        );
+        (t0, gain)
+    }
+}
+
+/// Entries of the chain of `remove_doubling` that `prefilter_pitch` fills
+/// before the coarse search has found its lags. Until then the period is
+/// not known, and neither is how many entries `remove_doubling` reads.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+const DOUBLING_EARLY: usize = 512;
+
+/// The chain of window energies of `remove_doubling` while `pitch_search`
+/// runs (`prefilter_pitch`). `max_period` and `min_period` are the
+/// arguments of `remove_doubling`.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+struct DoublingChain<'a> {
+    energies: Energies<'a>,
+    max_period: usize,
+    min_period: usize,
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+impl Beside for DoublingChain<'_> {
+    const ACTIVE: bool = true;
+    const EVERY: usize = 3;
+
+    #[inline(always)]
+    fn fill(&mut self, count: usize) {
+        self.energies.step_runs(count);
+    }
+
+    /// Limits the chain to the entries `remove_doubling` can read. The fine
+    /// search tests the lags `i` within 2 of `2 * c` for each coarse lag
+    /// `c`, and returns `2 * i` moved by at most one. The table ends after
+    /// the longest candidate period of the periods that follow from that.
+    /// (When no lag correlates above 0, the search returns 0 and the table
+    /// needs more entries; `remove_doubling` then fills them.)
+    fn coarse_found(&mut self, best_pitch: &[usize; 2]) {
+        let half = self.max_period / 2;
+        let min_half = self.min_period / 2;
+        let mut end = 0;
+        for &c in best_pitch {
+            for lag in (4 * c).saturating_sub(5)..=4 * c + 5 {
+                let index = self.max_period.saturating_sub(lag).min(self.max_period - 2);
+                let t0 = (index / 2).min(half - 1);
+                // The longest candidate period: the second one of k = 2 (the
+                // others are at most t0).
+                let t1 = (2 * t0 + 2) / 4;
+                let last = if t1 >= min_half && t1 + t0 <= half {
+                    t0 + t1
+                } else {
+                    t0
+                };
+                end = end.max(last + 1);
+            }
+        }
+        self.energies.set_end(end);
+    }
+}
+
 /// libopus `MAX16(a, b)` of the float build, `a > b ? a : b`: `b` when the
 /// two compare equal or `b` is not a number.
 #[inline(always)]
@@ -2947,6 +3358,14 @@ pub(crate) mod tests {
     use super::*;
     #[cfg(not(feature = "std"))]
     use std::vec::Vec;
+
+    /// `v` as a table for `WindowEnergies`, which writes only values into it,
+    /// so `v` keeps holding values.
+    fn as_table(v: &mut [f32]) -> &mut [MaybeUninit<f32>] {
+        // SAFETY: `MaybeUninit<f32>` has the layout of `f32`. The code under
+        // test writes only values through the result.
+        unsafe { core::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), v.len()) }
+    }
 
     /// Small deterministic generator, so that a failure can be repeated.
     pub(crate) struct Rng(u64);
@@ -3241,13 +3660,13 @@ pub(crate) mod tests {
                 let first = Energy::new(&y[..len]).finish();
 
                 let mut exact = vec![f32::NAN; lags];
-                WindowEnergies::new(&y, len, first, &mut exact).fill_exact(lags);
+                WindowEnergies::new(&y, len, first, as_table(&mut exact)).fill_exact(lags);
                 for part in [1usize, 3, 8, 1000] {
                     let mut table = vec![f32::NAN; lags];
-                    let mut e = WindowEnergies::new(&y, len, first, &mut table);
+                    let mut e = WindowEnergies::new(&y, len, first, as_table(&mut table));
                     while e.next < lags {
                         let end = (e.next + part).min(lags);
-                        e.fill_to(end);
+                        e.fill_to(end, &mut ());
                     }
                     assert_same(&table, &exact, &format!("{what} part {part}"));
                     let mut got = [7, 7];
@@ -3259,15 +3678,15 @@ pub(crate) mod tests {
                 // starts from another energy and one entry later.
                 let mut table = vec![f32::NAN; lags];
                 let mut other = vec![f32::NAN; lags];
-                let mut a = WindowEnergies::new(&y, len, first, &mut table);
-                let mut b = WindowEnergies::new(&y, len, 2.5, &mut other);
-                b.fill_to(1);
-                WindowEnergies::fill_both(&mut a, &mut b, lags / 2);
-                a.fill_to(lags);
-                b.fill_to(lags);
+                let mut a = WindowEnergies::new(&y, len, first, as_table(&mut table));
+                let mut b = WindowEnergies::new(&y, len, 2.5, as_table(&mut other));
+                b.fill_to(1, &mut ());
+                WindowEnergies::fill_both(&mut a, &mut b, lags / 2, &mut ());
+                a.fill_to(lags, &mut ());
+                b.fill_to(lags, &mut ());
                 assert_same(&table, &exact, &format!("{what} side by side"));
                 let mut alone = vec![f32::NAN; lags];
-                WindowEnergies::new(&y, len, 2.5, &mut alone).fill_exact(lags);
+                WindowEnergies::new(&y, len, 2.5, as_table(&mut alone)).fill_exact(lags);
                 assert_same(&other, &alone, &format!("{what} second chain"));
             }
         }
@@ -3293,14 +3712,14 @@ pub(crate) mod tests {
                 }
                 let first = Energy::new(&y[..len]).finish();
                 let mut want = vec![f32::NAN; lags];
-                WindowEnergies::new(&y, len, first, &mut want).fill_exact(lags);
+                WindowEnergies::new(&y, len, first, as_table(&mut want)).fill_exact(lags);
                 let mut got = vec![f32::NAN; lags];
-                WindowEnergies::new(&y, len, first, &mut got).fill_to(lags);
+                WindowEnergies::new(&y, len, first, as_table(&mut got)).fill_to(lags, &mut ());
                 assert_same(&got, &want, &format!("len {len} lags {lags}"));
                 let mut other = vec![f32::NAN; lags];
-                let mut a = WindowEnergies::new(&y, len, first, &mut got);
-                let mut b = WindowEnergies::new(&y, len, first, &mut other);
-                WindowEnergies::fill_both(&mut a, &mut b, lags);
+                let mut a = WindowEnergies::new(&y, len, first, as_table(&mut got));
+                let mut b = WindowEnergies::new(&y, len, first, as_table(&mut other));
+                WindowEnergies::fill_both(&mut a, &mut b, lags, &mut ());
                 assert_same(&got, &want, &format!("len {len} lags {lags} first"));
                 assert_same(&other, &want, &format!("len {len} lags {lags} second"));
                 if want.contains(&1.0) {
@@ -3310,6 +3729,231 @@ pub(crate) mod tests {
         }
         // The test is only worth something when the limit was reached.
         assert!(limited > 5, "{limited}");
+    }
+
+    /// `prefilter_pitch` gives the period and the gain of `pitch_search`
+    /// followed by `remove_doubling`, for every frame size of the encoder:
+    /// on periodic signals of many periods, where the table of
+    /// `remove_doubling` has from a few to all of its entries, and on the
+    /// kinds of `KINDS`. Silence and signals without a positive correlation
+    /// make the search return 0 and need the whole table.
+    #[test]
+    fn prefilter_pitch_is_pitch_search_then_remove_doubling() {
+        let mut rng = Rng::new(21);
+        for frame in [120usize, 240, 480, 960] {
+            let buf_len = (1024 + frame) >> 1;
+            for trial in 0..60 {
+                let kind = KINDS[trial % KINDS.len()];
+                let buf: Vec<f32> = if trial % 3 == 0 {
+                    samples(&mut rng, buf_len, kind)
+                } else {
+                    // A period from 8 to 520 samples of the decimated signal.
+                    let period = 8.0 + 512.0 * (0.5 + 0.5 * rng.unit());
+                    let noise = samples(&mut rng, buf_len, kind);
+                    (0..buf_len)
+                        .map(|i| {
+                            let phase = core::f32::consts::TAU * i as f32 / period;
+                            1e4 * (phase.sin() + 0.3 * (2.0 * phase).sin()) + 0.1 * noise[i]
+                        })
+                        .collect()
+                };
+                let prev_period = 15 + (rng.next_u32() % 1000) as usize;
+                let prev_gain = 0.5 + 0.5 * rng.unit();
+                let found = pitch_search(&buf[512..], &buf, frame, 979);
+                let mut want = (1024 - found).min(1022);
+                let want_gain =
+                    remove_doubling(&buf, 1024, 15, frame, &mut want, prev_period, prev_gain);
+                let (got, gain) = prefilter_pitch(&buf, 1024, 15, frame, prev_period, prev_gain);
+                let what = format!("frame {frame} trial {trial} {kind:?}");
+                assert_eq!(got, want, "{what}");
+                assert_same(&[gain], &[want_gain], &what);
+            }
+            // Silence: no lag correlates above 0.
+            let silence = vec![0.0f32; buf_len];
+            let found = pitch_search(&silence[512..], &silence, frame, 979);
+            let mut want = (1024 - found).min(1022);
+            let want_gain = remove_doubling(&silence, 1024, 15, frame, &mut want, 100, 0.5);
+            let (got, gain) = prefilter_pitch(&silence, 1024, 15, frame, 100, 0.5);
+            assert_eq!(got, want, "silence, frame {frame}");
+            assert_same(&[gain], &[want_gain], &format!("silence, frame {frame}"));
+        }
+    }
+
+    /// The pitch analysis of the encoder's pre-filter, as `run_prefilter`
+    /// in celt.rs calls it: `pitch_search` and `remove_doubling` on the
+    /// output of `pitch_downsample`. Returns C `pitch_index` and the gain.
+    fn prefilter_search(
+        pitch_buf: &[f32],
+        frame: usize,
+        prev_period: usize,
+        prev_gain: f32,
+    ) -> (usize, f32) {
+        prefilter_pitch(pitch_buf, 1024, 15, frame, prev_period, prev_gain)
+    }
+
+    /// The time the pitch analysis of the encoder's pre-filter takes per
+    /// frame, for each frame size, mono and stereo. Not a check: it prints
+    /// the times and a hash of the results, which must not change when the
+    /// code gets faster.
+    ///
+    /// The input is the WAV file (48 kHz, 16-bit, one or two channels) named
+    /// by `PITCH_TIMING_WAV`, or a synthetic signal without it. It runs
+    /// through the encoder's pre-emphasis. `PITCH_TIMING_REPS` sets how often
+    /// each loop runs (default 15); the times are the fastest run.
+    ///
+    /// `PITCH_TIMING_WAV=music.wav cargo test --release --lib
+    /// prefilter_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn prefilter_timing() {
+        use std::time::Instant;
+        const MAX_PERIOD: usize = 1024;
+
+        // On macOS, ask for a performance core (as examples/perf_harness.rs).
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+            }
+            // SAFETY: changes the scheduling class of the calling thread only.
+            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+        }
+
+        let wav = std::env::var("PITCH_TIMING_WAV").ok();
+        let mut input: Vec<Vec<f32>> = match &wav {
+            Some(path) => {
+                let bytes = std::fs::read(path).expect("read PITCH_TIMING_WAV");
+                // The chunks after the 12-byte RIFF header.
+                let (mut at, mut channels, mut data) = (12, 0usize, &bytes[..0]);
+                while at + 8 <= bytes.len() {
+                    let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+                    let body = &bytes[at + 8..(at + 8 + size as usize).min(bytes.len())];
+                    match &bytes[at..at + 4] {
+                        b"fmt " => channels = u16::from_le_bytes([body[2], body[3]]) as usize,
+                        b"data" => data = body,
+                        _ => {}
+                    }
+                    at += 8 + size as usize + (size as usize & 1);
+                }
+                assert!(channels == 1 || channels == 2, "{channels} channels");
+                let samples: Vec<f32> = data
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| i16::from_le_bytes(*b) as f32)
+                    .collect();
+                (0..channels)
+                    .map(|c| samples.iter().skip(c).step_by(channels).copied().collect())
+                    .collect()
+            }
+            None => {
+                // Two voices of harmonics whose pitch changes every 0.25 s.
+                let mut rng = Rng::new(5);
+                (0..2)
+                    .map(|c| {
+                        (0..5 * 48000)
+                            .map(|i| {
+                                let note = [110.0f32, 147.0, 196.0, 131.0][(i / 12000) % 4];
+                                let f0 = note * (1.0 + 0.5 * c as f32);
+                                let t = i as f32 / 48000.0;
+                                let mut s = 0.0;
+                                for h in 1..8 {
+                                    s += (core::f32::consts::TAU * f0 * h as f32 * t).sin()
+                                        / h as f32;
+                                }
+                                6000.0 * s + 200.0 * rng.unit()
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+        };
+        // The encoder's pre-emphasis at 48 kHz (`celt_preemphasis`).
+        for ch in &mut input {
+            let mut mem = 0.0f32;
+            for v in ch.iter_mut() {
+                let x = *v;
+                *v = x - mem;
+                mem = 0.850_006_1 * x;
+            }
+        }
+        let reps: usize = std::env::var("PITCH_TIMING_REPS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(15);
+        let len = input[0].len();
+        println!(
+            "input {} ({} ch, {:.1} s), {reps} reps",
+            wav.as_deref().unwrap_or("synthetic"),
+            input.len(),
+            len as f64 / 48000.0
+        );
+        println!(
+            "frame ch frames | downsample  search  doubling  search+doubling (us/frame) | hash"
+        );
+        let fastest = |f: &mut dyn FnMut()| {
+            (0..reps)
+                .map(|_| {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64()
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        for frame in [120usize, 240, 480, 960] {
+            for channels in 1..=input.len().min(2) {
+                let frames = ((len - MAX_PERIOD) / frame).min(400);
+                let buf_len = (MAX_PERIOD + frame) >> 1;
+                let mut bufs = vec![0.0f32; frames * buf_len];
+                let t_down = fastest(&mut || {
+                    for (f, buf) in bufs.chunks_exact_mut(buf_len).enumerate() {
+                        let at = f * frame;
+                        let pre: Vec<&[f32]> = input[..channels]
+                            .iter()
+                            .map(|ch| &ch[at..at + MAX_PERIOD + frame])
+                            .collect();
+                        pitch_downsample(&pre, buf, buf_len, channels, 2);
+                    }
+                });
+                // C `pitch_index` before `remove_doubling`.
+                let mut found = vec![0usize; frames];
+                let t_search = fastest(&mut || {
+                    for (buf, out) in bufs.chunks_exact(buf_len).zip(found.iter_mut()) {
+                        let lag = pitch_search(&buf[MAX_PERIOD >> 1..], buf, frame, 979);
+                        *out = (MAX_PERIOD - lag).min(MAX_PERIOD - 2);
+                    }
+                });
+                let t_doubling = fastest(&mut || {
+                    let (mut period, mut gain) = (15usize, 0.0f32);
+                    for (buf, &t0) in bufs.chunks_exact(buf_len).zip(&found) {
+                        let mut index = t0;
+                        let g =
+                            remove_doubling(buf, MAX_PERIOD, 15, frame, &mut index, period, gain);
+                        (period, gain) = (index, 0.7 * g);
+                    }
+                });
+                let mut hash = 0u64;
+                let t_both = fastest(&mut || {
+                    let (mut period, mut gain) = (15usize, 0.0f32);
+                    hash = 0;
+                    for buf in bufs.chunks_exact(buf_len) {
+                        let (index, g) = prefilter_search(buf, frame, period, gain);
+                        (period, gain) = (index, 0.7 * g);
+                        hash = hash.wrapping_mul(0x100_0000_01b3)
+                            ^ (index as u64)
+                            ^ ((g.to_bits() as u64) << 16);
+                    }
+                });
+                let us = |t: f64| t * 1e6 / frames as f64;
+                println!(
+                    "{frame:5} {channels:2} {frames:6} | {:10.2} {:7.2} {:9.2} {:16.2} | {hash:016x}",
+                    us(t_down),
+                    us(t_search),
+                    us(t_doubling),
+                    us(t_both)
+                );
+            }
+        }
     }
 
     #[test]

@@ -178,7 +178,7 @@ Every packet starts with a **table-of-contents (TOC) byte**. It has three fields
 
 In opus1:
 
-- Each call of `OpusEncoder::encode` codes 2.5, 5, 10, 20, 40 or 60 ms of audio into one packet.
+- Each call of `OpusEncoder::encode` codes 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms of audio into one packet.
 - The decoder reads any valid packet, up to 120 ms.
 - The `packet` module reads, writes and pads packets without decoding them.
 
@@ -406,7 +406,6 @@ The main gaps:
 
 - the speech/music and tonality analysis of the encoder (libopus `analysis.c`);
 - DTX in the encoder;
-- encoder frames of 80, 100 and 120 ms;
 - some controls, for example phase inversion, signal type, and a decoder output gain;
 - the machine-learning tools (deep PLC, DRED, OSCE), the quality extension, and packet extensions;
 - ambisonics with a demixing matrix (mapping family 3);

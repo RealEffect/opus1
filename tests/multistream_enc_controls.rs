@@ -582,10 +582,7 @@ fn frame_sizes_and_buffers_are_checked_like_libopus() {
         for frame_size in sizes {
             let c_ok = c.encode_float(&pcm, frame_size, out.len()).is_ok();
             let rust_ok = rust.encode(&pcm, frame_size, &mut out).is_ok();
-            // 80, 100 and 120 ms: libopus takes them, opus1 does not
-            // (difference D3 of the design).
-            let long = [32, 40, 48].map(|k| k * unit).contains(&frame_size);
-            assert_eq!(rust_ok, c_ok && !long, "{fs} Hz: frame size {frame_size}");
+            assert_eq!(rust_ok, c_ok, "{fs} Hz: frame size {frame_size}");
             assert_eq!(
                 c_ok,
                 [1, 2, 4, 8, 16, 24, 32, 40, 48]

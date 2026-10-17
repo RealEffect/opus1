@@ -297,32 +297,30 @@ pub fn silk_pitch_analysis_core(
     silk_sum_sqr_shift(&mut energy, &mut shift, frame_unscaled, frame_length);
     shift += 3 - silk_clz32(energy);
 
-    let frame: &[i16];
-    if shift > 0 {
+    let frame: &[i16] = if shift > 0 {
         let s = (shift + 1) >> 1;
         for i in 0..frame_length {
             frame_scaled_buf[i] = frame_unscaled[i] >> s;
         }
-        frame = &frame_scaled_buf[..frame_length];
+        &frame_scaled_buf[..frame_length]
     } else {
-        frame = &frame_unscaled[..frame_length];
-    }
+        &frame_unscaled[..frame_length]
+    };
 
-    let frame_8khz: &[i16];
-    if fs_khz == 16 {
+    let frame_8khz: &[i16] = if fs_khz == 16 {
         filt_state[0..2].fill(0);
         // The slicing checks that the frame fits the buffer.
         let output = &mut frame_8khz_buf[..frame_length_8khz];
         silk_resampler_down2(&mut filt_state[..2], output, frame, frame_length as i32);
-        frame_8khz = output;
+        output
     } else if fs_khz == 12 {
         filt_state[0..6].fill(0);
         let output = &mut frame_8khz_buf[..frame_length_8khz];
         silk_resampler_down2_3(&mut filt_state[..6], output, frame, frame_length as i32);
-        frame_8khz = output;
+        output
     } else {
-        frame_8khz = frame;
-    }
+        frame
+    };
 
     filt_state[0..2].fill(0);
     silk_resampler_down2(

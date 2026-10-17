@@ -1306,12 +1306,14 @@ mod neon {
         bias: int32x4_t,
         /// The shaping order: the length of `ar_shp_q13`.
         order: usize,
+        /// See `coef_vectors`.
+        keep_lanes: bool,
     }
 
     impl ShapingCoefs {
         #[target_feature(enable = "neon")]
         #[inline]
-        pub(super) fn new(ar_shp_q13: &[i16], warping_q16: i32) -> Self {
+        pub(super) fn new(ar_shp_q13: &[i16], warping_q16: i32, keep_lanes: bool) -> Self {
             let order = ar_shp_q13.len().min(MAX_SHAPE_LPC_ORDER);
             let mut coef = [[0i32; 4]; MAX_SHAPE_LPC_ORDER / 4];
             for (dst, &c) in coef.as_flattened_mut().iter_mut().zip(&ar_shp_q13[..order]) {
@@ -1322,8 +1324,51 @@ mod neon {
                 coef,
                 bias: vdupq_n_s32((order as i32) >> 1),
                 order,
+                keep_lanes,
             }
         }
+
+        /// The coefficient vectors for the filter taps of `later_taps` and
+        /// `shaping_filter_both`, which multiply by one lane of them.
+        ///
+        /// The compiler turns each such lane into a vector of its own and
+        /// makes these 16 to 24 vectors once, before the sample loop. They
+        /// do not fit in the registers, so every sample reloads each of
+        /// them from the stack. With `keep_lanes`, an empty `asm!`
+        /// statement, after which the compiler must assume that the 4-lane
+        /// vectors have changed, stops that: the multiplications then read
+        /// the lanes of at most 6 vectors.
+        #[target_feature(enable = "neon")]
+        #[inline]
+        fn coef_vectors<const ORDER: usize>(&self) -> [int32x4_t; MAX_SHAPE_LPC_ORDER / 4] {
+            let mut coef: [int32x4_t; MAX_SHAPE_LPC_ORDER / 4] =
+                core::array::from_fn(|j| load(&self.coef[j]));
+            if self.keep_lanes {
+                for v in coef.iter_mut().take(ORDER.div_ceil(4)) {
+                    // SAFETY: the statement is empty. It reads and writes
+                    // only the register that holds `v`, and no memory.
+                    unsafe {
+                        core::arch::asm!(
+                            "/* {0:v} */",
+                            inout(vreg) * v,
+                            options(nomem, nostack, preserves_flags)
+                        )
+                    };
+                }
+            }
+            coef
+        }
+    }
+
+    /// Whether `ShapingCoefs::coef_vectors` keeps the lanes, for `n` states.
+    ///
+    /// Measured with the quantizer alone, 3 pairs: on the Cortex-A55 2.3 to
+    /// 4.0 % less time for 2, 3 and 4 states. On the Cortex-A76, 4 states
+    /// -0.6 %, 2 states -0.3 to -2.0 %, but 3 states +0.7 to +1.0 %. On
+    /// Apple M4, 2 states +1.4 to +1.7 %. So it is used for 2 and 4 states,
+    /// and not on Apple cores.
+    const fn keep_coef_lanes(n: usize) -> bool {
+        !cfg!(target_vendor = "apple") && n != 3
     }
 
     /// The rows of `shaping_filter_rows` for the filter states of `states`.
@@ -1363,6 +1408,67 @@ mod neon {
         vreinterpretq_s32_u8(vqtbl1q_u8(vreinterpretq_u8_s32(v), perm))
     }
 
+    /// The two candidates of every state for the last sample, and which
+    /// state continues as a copy of which. This is what the shaping filter
+    /// of the next sample needs from the last one.
+    #[derive(Copy, Clone)]
+    pub(super) struct LastChoice {
+        /// `diff_q14` of the first candidate of every state.
+        pub(super) diff_first: int32x4_t,
+        /// `diff_q14` of the second candidate of every state.
+        pub(super) diff_second: int32x4_t,
+        /// All bits set in the lane of the state that continues as a copy
+        /// of the best state, with that state's second candidate. No bit is
+        /// set when no state is replaced.
+        pub(super) replaced: uint32x4_t,
+        /// The byte table for `vqtbl1q_u8` that copies the lane of the best
+        /// state into all lanes.
+        pub(super) from_best: uint8x16_t,
+        /// The byte table that moves the lane of the best state to the
+        /// replaced lane and keeps the other lanes in place.
+        pub(super) perm: uint8x16_t,
+    }
+
+    impl LastChoice {
+        /// For the first sample of a subframe: every state keeps its own
+        /// `diff_q14` and filter state.
+        #[target_feature(enable = "neon")]
+        #[inline]
+        pub(super) fn keep(diff_q14: int32x4_t) -> Self {
+            // SAFETY: each load reads the 16 bytes of a table.
+            let identity = unsafe { vld1q_u8(IDENTITY.as_ptr()) };
+            Self {
+                diff_first: diff_q14,
+                diff_second: diff_q14,
+                replaced: vdupq_n_u32(0),
+                from_best: identity,
+                perm: identity,
+            }
+        }
+
+        /// The chosen value of every state from the values `first` and
+        /// `second` of the two candidates of every state.
+        #[target_feature(enable = "neon")]
+        #[inline]
+        pub(super) fn take(&self, first: int32x4_t, second: int32x4_t) -> int32x4_t {
+            vbslq_s32(self.replaced, permute(second, self.from_best), first)
+        }
+    }
+
+    /// How many taps of the shaping filter `shaping_filter_both` computes
+    /// for both candidates of every state, before the choice of the
+    /// survivors of the last sample is known.
+    ///
+    /// On the wide out-of-order cores of Apple the sample loop waits for its
+    /// longest chain: the shaping filter, the level decision, the choice of
+    /// the survivors, and again the filter. The first taps then run at the
+    /// same time as the choice. Measured on Apple M4 with 5 taps: 3 states
+    /// 9 to 12 % less time, 4 states 7 to 8 %, 2 states 3 to 8 %. On the
+    /// Cortex-A55 and A76 the loop does not wait for that chain (removing
+    /// the filter from it saves 0 to 3 %), and the extra work made it 1 to
+    /// 6 % slower; there the filter waits for the choice (0 taps).
+    pub(super) const FIRST_TAPS: usize = if cfg!(target_vendor = "apple") { 5 } else { 0 };
+
     /// Warped noise-shaping filter of one sample for all states at once,
     /// state `k` in lane `k`. Same results as `warped_shaping_filter`.
     ///
@@ -1389,14 +1495,14 @@ mod neon {
     ) -> int32x4_t {
         debug_assert!(ORDER == 0 || ORDER == c.order);
         let zero = vdupq_n_s32(0);
-        let mut prev = diff_q14;
-        let mut t = zero;
-        // Two partial sums, one for the even and one for the odd taps, so
-        // that their additions do not wait for each other.
-        let mut even = c.bias;
-        let mut odd = zero;
         if ORDER == 0 {
             let order = c.order.min(MAX_SHAPE_LPC_ORDER);
+            let mut prev = diff_q14;
+            let mut t = zero;
+            // Two partial sums, one for the even and one for the odd taps,
+            // so that their additions do not wait for each other.
+            let mut even = c.bias;
+            let mut odd = zero;
             for m in 0..order {
                 let old = permute(load(&rows[m]), perm);
                 t = vaddq_s32(prev, vqdmulhq_s32(vsubq_s32(old, t), c.warping));
@@ -1410,12 +1516,33 @@ mod neon {
             // both does not depend on that.
             return vaddq_s32(even, odd);
         }
-        // With the order known at compile time every tap is written out, so
-        // the whole filter is one block of code without branches.
-        let coef: [int32x4_t; MAX_SHAPE_LPC_ORDER / 4] = core::array::from_fn(|j| load(&c.coef[j]));
+        let coef = c.coef_vectors::<ORDER>();
+        later_taps::<ORDER>(rows, perm, c, &coef, 0, diff_q14, zero, c.bias, zero)
+    }
+
+    /// Taps `start` to `ORDER - 1` of `shaping_filter_rows`, for an order
+    /// known at compile time. `prev` is `s[start - 1]` read through `perm`,
+    /// `t` is `t[start - 1]`, and `even` and `odd` are the partial sums of
+    /// the even and the odd taps before `start`.
+    ///
+    /// Every tap is written out, so the whole filter is one block of code
+    /// without branches.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn later_taps<const ORDER: usize>(
+        rows: &mut ShapingRows,
+        perm: uint8x16_t,
+        c: &ShapingCoefs,
+        coef: &[int32x4_t; MAX_SHAPE_LPC_ORDER / 4],
+        start: usize,
+        mut prev: int32x4_t,
+        mut t: int32x4_t,
+        mut even: int32x4_t,
+        mut odd: int32x4_t,
+    ) -> int32x4_t {
         macro_rules! tap {
             ($m:expr, $sum:ident, $lane:literal) => {
-                if $m < ORDER && $m < MAX_SHAPE_LPC_ORDER {
+                if $m >= start && $m < ORDER && $m < MAX_SHAPE_LPC_ORDER {
                     let old = permute(load(&rows[$m]), perm);
                     t = vaddq_s32(prev, vqdmulhq_s32(vsubq_s32(old, t), c.warping));
                     store(&mut rows[$m], t);
@@ -1453,32 +1580,125 @@ mod neon {
         vaddq_s32(even, odd)
     }
 
+    /// `shaping_filter_rows` for the next sample, started before the choice
+    /// of the survivors of the last sample is used. `last` holds both
+    /// candidates of every state and that choice.
+    ///
+    /// The first `FIRST` taps are computed twice, from the first and from
+    /// the second candidate of every state, each on the state's own rows. Then the replaced lane takes the second result of the best
+    /// state, the other lanes their first result. Only then are the other
+    /// taps computed, as in `shaping_filter_rows`, with `last.perm`.
+    ///
+    /// With `ORDER == 0` or `FIRST == 0` this is `shaping_filter_rows` on
+    /// the chosen `diff_q14`. The sample loop uses `FIRST_TAPS` for `FIRST`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(super) fn shaping_filter_both<const ORDER: usize, const FIRST: usize>(
+        rows: &mut ShapingRows,
+        last: &LastChoice,
+        c: &ShapingCoefs,
+    ) -> int32x4_t {
+        let first_taps = FIRST.min(ORDER).min(MAX_SHAPE_LPC_ORDER);
+        if first_taps == 0 {
+            let diff_q14 = last.take(last.diff_first, last.diff_second);
+            return shaping_filter_rows::<ORDER>(rows, last.perm, diff_q14, c);
+        }
+        debug_assert!(ORDER == c.order);
+        let zero = vdupq_n_s32(0);
+        let coef = c.coef_vectors::<ORDER>();
+        let mut even = c.bias;
+        let mut odd = zero;
+        // `t` of the two candidates, and the chosen one.
+        let mut first = zero;
+        let mut second = zero;
+        let mut t = zero;
+        // `s[m - 1]` of the states' own rows; `s[-1]` is `diff`.
+        let mut own_prev = zero;
+        macro_rules! first_tap {
+            ($m:expr, $sum:ident, $lane:literal) => {
+                if $m < first_taps {
+                    let old = load(&rows[$m]);
+                    let (prev_first, prev_second) = if $m == 0 {
+                        (last.diff_first, last.diff_second)
+                    } else {
+                        (own_prev, own_prev)
+                    };
+                    first = vaddq_s32(prev_first, vqdmulhq_s32(vsubq_s32(old, first), c.warping));
+                    second =
+                        vaddq_s32(prev_second, vqdmulhq_s32(vsubq_s32(old, second), c.warping));
+                    t = last.take(first, second);
+                    store(&mut rows[$m], t);
+                    let product = vqdmulhq_laneq_s32::<$lane>(t, coef[$m / 4]);
+                    $sum = vaddq_s32($sum, product);
+                    own_prev = old;
+                }
+            };
+        }
+        const { assert!(FIRST <= 8) };
+        first_tap!(0, even, 0);
+        first_tap!(1, odd, 1);
+        first_tap!(2, even, 2);
+        first_tap!(3, odd, 3);
+        first_tap!(4, even, 0);
+        first_tap!(5, odd, 1);
+        first_tap!(6, even, 2);
+        first_tap!(7, odd, 3);
+        let prev = permute(own_prev, last.perm);
+        later_taps::<ORDER>(rows, last.perm, c, &coef, first_taps, prev, t, even, odd)
+    }
+
     /// `shaping_filter_rows` on arrays, for the tests. `source` is the
-    /// `source` argument of `warped_shaping_filter`.
+    /// `source` argument of `warped_shaping_filter`; at most one state may
+    /// read another state's filter state. With `both`, the
+    /// function tested is `shaping_filter_both::<ORDER, FIRST>`.
+    /// `keep_lanes` is the setting of `ShapingCoefs::coef_vectors`.
     #[cfg(test)]
-    pub(super) fn shaping_filter_rows_lanes<const N: usize, const ORDER: usize>(
+    pub(super) fn shaping_filter_rows_lanes<
+        const N: usize,
+        const ORDER: usize,
+        const FIRST: usize,
+    >(
         states: &mut ShapingStates<N>,
         source: [u8; N],
         diff_q14: [i32; N],
         ar_shp_q13: &[i16],
         warping_q16: i32,
+        both: bool,
+        keep_lanes: bool,
     ) -> [i32; N] {
         // SAFETY: NEON is part of the aarch64 baseline.
         unsafe {
-            let c = ShapingCoefs::new(ar_shp_q13, warping_q16);
+            let c = ShapingCoefs::new(ar_shp_q13, warping_q16, keep_lanes);
             let mut rows = [[0i32; 4]; MAX_SHAPE_LPC_ORDER];
             for (m, row) in rows.iter_mut().enumerate() {
                 for k in 0..N {
                     row[k] = states[k][m];
                 }
             }
-            let mut table = IDENTITY;
-            for k in 0..N {
-                let from = 4 * source[k] as usize;
-                table[4 * k..4 * k + 4].copy_from_slice(&IDENTITY[from..from + 4]);
+            // At most one state reads another state's filter state: that is
+            // the replaced state, and the state it reads is the best one.
+            let replaced = (0..N).find(|&k| source[k] as usize != k);
+            assert!((0..N).all(|k| Some(k) == replaced || source[k] as usize == k));
+            let mut last = LastChoice::keep(from_lanes(diff_q14));
+            // The second candidates of the other states must not matter.
+            let mut second: [i32; 4] = core::array::from_fn(|k| (k as i32 + 1) * 0x0123_4567);
+            if let Some(dst) = replaced {
+                let best = source[dst] as usize;
+                second[best] = diff_q14[dst];
+                let mut mask = [0u32; 4];
+                mask[dst] = !0;
+                last.replaced = vld1q_u32(mask.as_ptr());
+                last.from_best = vld1q_u8(BROADCAST[best].as_ptr());
+                let mut table = IDENTITY;
+                table[4 * dst..4 * dst + 4].copy_from_slice(&BROADCAST[best][..4]);
+                last.perm = vld1q_u8(table.as_ptr());
             }
-            let perm = vld1q_u8(table.as_ptr());
-            let n_ar = shaping_filter_rows::<ORDER>(&mut rows, perm, from_lanes(diff_q14), &c);
+            last.diff_second = load(&second);
+            let n_ar = if both {
+                shaping_filter_both::<ORDER, FIRST>(&mut rows, &last, &c)
+            } else {
+                shaping_filter_rows::<ORDER>(&mut rows, last.perm, from_lanes(diff_q14), &c)
+            };
             // Only the taps below the order change.
             for (m, row) in rows.iter().enumerate().take(c.order) {
                 for k in 0..N {
@@ -1729,7 +1949,7 @@ mod neon {
 
         // The shaping filter states, one row per tap, and the byte table
         // that tells the filter which state each state continues.
-        let shaping_coefs = ShapingCoefs::new(setup.ar_shp_q13, p.warping_q16);
+        let shaping_coefs = ShapingCoefs::new(setup.ar_shp_q13, p.warping_q16, keep_coef_lanes(N));
         let mut shaping_rows = load_shaping_rows(states);
         // SAFETY: reads the 16 bytes of the table.
         let identity = unsafe { vld1q_u8(IDENTITY.as_ptr()) };
@@ -1752,6 +1972,8 @@ mod neon {
         let mut seed_init = from_lanes::<N>(core::array::from_fn(|k| states[k].seed_init));
         let mut lf_ar_q14 = from_lanes::<N>(core::array::from_fn(|k| states[k].lf_ar_q14));
         let mut diff_q14 = from_lanes::<N>(core::array::from_fn(|k| states[k].diff_q14));
+        // What `shaping_filter_both` needs from the last sample.
+        let mut last = LastChoice::keep(diff_q14);
         let mut rd_q10: [i32; N] = core::array::from_fn(|k| states[k].rd_q10);
         // The slot of the newest sample of the delay lines, and its
         // `shape_q14` row.
@@ -1767,8 +1989,13 @@ mod neon {
             // Noise shaping feedback of every state. It is the long chain of
             // the sample and only needs `diff_q14`. Everything else up to the
             // level decision does not depend on it.
-            let n_ar =
-                shaping_filter_rows::<ORDER>(&mut shaping_rows, perm, diff_q14, &shaping_coefs);
+            // `!= 0`, not `> 0`: where `FIRST_TAPS` is 0, clippy denies a
+            // comparison that is always false (`absurd_extreme_comparisons`).
+            let n_ar = if FIRST_TAPS != 0 {
+                shaping_filter_both::<ORDER, FIRST_TAPS>(&mut shaping_rows, &last, &shaping_coefs)
+            } else {
+                shaping_filter_rows::<ORDER>(&mut shaping_rows, perm, diff_q14, &shaping_coefs)
+            };
 
             let (ltp_pred_q14, n_ltp_q14) = long_term.at(s_ltp_q15, &nsq.s_ltp_shp_q14, i);
 
@@ -1863,6 +2090,13 @@ mod neon {
             // In the next sample the replaced state reads the filter state
             // of the best state.
             perm = vbslq_u8(vreinterpretq_u8_u32(replaced), from_best, identity);
+            last = LastChoice {
+                diff_first: c.diff_q14[0],
+                diff_second: c.diff_q14[1],
+                replaced,
+                from_best,
+                perm,
+            };
             for k in 0..N {
                 let replaced = sv.replace && k == sv.rd_max_ind;
                 rd_q10[k] = select(replaced, sv.rd_min_q10, rd0[k]);
@@ -2633,23 +2867,40 @@ mod tests {
             );
 
             // The NEON filter on rows, with the order known at run time and,
-            // for the orders the encoder uses, at compile time.
+            // for the orders the encoder uses, at compile time. Each also
+            // with some taps computed for both candidates.
             #[cfg(target_arch = "aarch64")]
             {
+                macro_rules! check_neon_with {
+                    ($order:literal, $first:literal, $both:literal) => {{
+                        for keep_lanes in [false, true] {
+                            let mut states = start_states;
+                            let n_ar = neon::shaping_filter_rows_lanes::<N, $order, $first>(
+                                &mut states,
+                                source,
+                                diff,
+                                &coefs[..order],
+                                warping_q16,
+                                $both,
+                                keep_lanes,
+                            );
+                            let what = format!(
+                                "NEON {}, both {} {}, keep {keep_lanes}, {N} states, order {order}, case {case}",
+                                $order, $both, $first
+                            );
+                            assert_eq!(n_ar, want_n_ar, "{what}");
+                            assert_eq!(states, want_states, "{what}");
+                        }
+                    }};
+                }
                 macro_rules! check_neon {
                     ($order:literal) => {{
-                        let mut states = start_states;
-                        let n_ar = neon::shaping_filter_rows_lanes::<N, $order>(
-                            &mut states,
-                            source,
-                            diff,
-                            &coefs[..order],
-                            warping_q16,
-                        );
-                        let what =
-                            format!("NEON {}, {N} states, order {order}, case {case}", $order);
-                        assert_eq!(n_ar, want_n_ar, "{what}");
-                        assert_eq!(states, want_states, "{what}");
+                        check_neon_with!($order, 0, false);
+                        check_neon_with!($order, 0, true);
+                        check_neon_with!($order, 1, true);
+                        check_neon_with!($order, 2, true);
+                        check_neon_with!($order, 5, true);
+                        check_neon_with!($order, 8, true);
                     }};
                 }
                 check_neon!(0);

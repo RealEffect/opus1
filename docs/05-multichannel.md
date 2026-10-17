@@ -368,6 +368,7 @@ A port of libopus `OpusMSEncoder`.
 | `set_bandwidth(Bandwidth)`, `bandwidth()` | Fixes the bandwidth of every stream. No effect in surround mode. |
 | `set_max_bandwidth(Bandwidth)`, `max_bandwidth()` | Limits the automatic bandwidth choice. |
 | `set_force_mode(Option<ForcedMode>)` | Asks every stream for SILK-only, Hybrid or CELT-only. In surround mode the coupled streams stay CELT-only, and in ambisonics mode all streams do. |
+| `set_expert_frame_duration(FrameDuration)`, `expert_frame_duration()` | The duration of the frame each `encode` call codes (libopus `OPUS_SET_EXPERT_FRAME_DURATION`). `FrameDuration::Argument`, the default, takes the `frame_size` of the call. The multistream encoder keeps this setting for itself, as libopus does; the setting of a stream encoder plays no part. |
 | `layout()`, `mapping_type()`, `lfe_stream()` | The layout, how it was chosen, and the LFE stream. |
 | `application()`, `sampling_rate()` | The settings given at construction. |
 | `lookahead()` | The delay the encoder adds, in samples per channel. An Ogg Opus header stores it, converted to 48 kHz, as the pre-skip. |
@@ -379,7 +380,7 @@ A port of libopus `OpusMSEncoder`.
 
 - `rate`, given at construction, is 8000, 12000, 16000, 24000 or 48000.
 - `pcm` holds at least `frame_size * channels` samples.
-- `frame_size` is 2.5, 5, 10, 20, 40 or 60 ms. At 48 kHz that is 120, 240, 480, 960, 1920 or 2880.
+- `frame_size` is 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms. At 48 kHz that is 120, 240, 480, 960, 1920, 2880, 3840, 4800 or 5760. With an expert frame duration set, the call codes the first frame of that duration, and `frame_size` must be at least that long.
 - `output.len()` is the largest packet allowed. The smallest buffer that can work is `2 * streams - 1` bytes.
 
 ### `MultistreamDecoder`
@@ -623,7 +624,7 @@ Packets of the `opus1` multistream encoder decode with the libopus 1.6.1 multist
 These differences from libopus 1.6.1 are known. The figures come from the project's measurements.
 
 - **Bandwidth with an automatic or maximum bitrate in surround mode.** libopus compares the raw setting (−1000 or −1) with the thresholds, so it always chooses narrowband. `opus1` uses the allocated bitrate and codes fullband. This is deliberate.
-- **Frame sizes.** 80, 100 and 120 ms frames and the expert frame duration control are not offered.
+- **Expert frame duration.** libopus's multistream encoder stores any number given to `OPUS_SET_EXPERT_FRAME_DURATION`, and then refuses every encode call when the number is no duration. `opus1` takes a `FrameDuration`, which holds only the ten values libopus defines. For those values both encoders take and refuse the same calls (`tests/multistream_long_frames.rs`). Frames of 80, 100 and 120 ms, which earlier versions did not offer (difference D3), are coded as libopus codes them.
 - **Controls.** The multistream encoder has no control for these: the least significant bit (LSB) depth, the signal type, discontinuous transmission (DTX), the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`.
 - **Rate use without the speech/music analysis.** libopus's speech/music analysis is not ported. At 16 kHz and with `Application::Voip`, the `opus1` multistream encoder used 65 % to 80 % of the requested rate in four test cases, where libopus used 101 % to 102 %. In the test matrix of `tests/multistream_enc_validity.rs`, libopus wrote some packets with a stereo Hybrid stream: 128 at 8 kilobits per second (kb/s) per channel, and 111 at 24 kb/s per channel. `opus1` wrote none.
 - **Family 3 (projection)** is not supported.

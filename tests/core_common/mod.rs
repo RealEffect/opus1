@@ -155,6 +155,37 @@ impl CEncoder {
         self.encode_max(pcm, 4000)
     }
 
+    /// `opus_encode_float` with the caller's `frame_size`, which may be
+    /// longer than the frame libopus codes (the expert frame duration).
+    /// `pcm` must hold `frame_size` samples per channel. Returns the packet
+    /// or the libopus error code.
+    pub fn try_encode(&mut self, pcm: &[f32], frame_size: usize, max_bytes: usize) -> Result<Vec<u8>, i32> {
+        assert!(pcm.len() >= frame_size * self.channels, "pcm is shorter than the frame");
+        let mut out = vec![0u8; max_bytes];
+        let n = unsafe {
+            sys::opus_encode_float(self.st, pcm.as_ptr(), frame_size as i32, out.as_mut_ptr(), max_bytes as i32)
+        };
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
+    /// `opus_encode`: like `try_encode`, for 16-bit input.
+    pub fn try_encode_i16(&mut self, pcm: &[i16], frame_size: usize, max_bytes: usize) -> Result<Vec<u8>, i32> {
+        assert!(pcm.len() >= frame_size * self.channels, "pcm is shorter than the frame");
+        let mut out = vec![0u8; max_bytes];
+        let n = unsafe {
+            sys::opus_encode(self.st, pcm.as_ptr(), frame_size as i32, out.as_mut_ptr(), max_bytes as i32)
+        };
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
     /// Encode a whole signal in frames of `frame` samples per channel. A
     /// trailing partial frame is dropped.
     pub fn encode_all(&mut self, pcm: &[f32], frame: usize) -> Vec<Vec<u8>> {

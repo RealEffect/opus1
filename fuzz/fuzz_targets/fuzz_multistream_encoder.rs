@@ -239,8 +239,8 @@ fn run(data: &[u8]) -> Result<()> {
     let mut pcm16 = Vec::new();
     let mut packet = vec![0u8; big.max(8000)];
     let mut twin_packet = vec![0u8; big.max(8000)];
-    let mut c_out = vec![0f32; 2880 * channels];
-    let mut r_out = vec![0f32; 2880 * channels];
+    let mut c_out = vec![0f32; 5760 * channels];
+    let mut r_out = vec![0f32; 5760 * channels];
 
     // No packet so far had a frame that the decoders conceal: the two
     // decoders' output must be close (see `assert_close`).
@@ -331,11 +331,11 @@ fn run(data: &[u8]) -> Result<()> {
         }
         let range = enc.final_range();
 
-        let got = c_dec.decode_float(p, &mut c_out, 2880, false);
+        let got = c_dec.decode_float(p, &mut c_out, 5760, false);
         assert_eq!(got, frame_size as i32, "frame {n}: libopus decodes {got} samples, packet {p:02x?}");
         assert_eq!(c_dec.final_range(), range, "frame {n}: libopus final range, packet {p:02x?}");
 
-        let got = dec.decode(p, 2880, &mut r_out);
+        let got = dec.decode(p, 5760, &mut r_out);
         assert_eq!(got, Ok(frame_size), "frame {n}: opus1 decoder, packet {p:02x?}");
         assert_eq!(dec.final_range(), range, "frame {n}: opus1 decoder final range");
         clean &= whole_frames(p, streams) && !modes.leaves_celt(p, streams);

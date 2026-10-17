@@ -30,8 +30,8 @@ encode_impl          checks, bitrate from the output buffer
   v
 decide_mode_and_bandwidth    channels, mode, bandwidth, FEC, redundancy
   |
-  |  CELT-only or Hybrid, 40/60 ms --> encode_multiframe --> encode_frame x2 or x3
-  |                                                     --> packet::write (one packet)
+  |  CELT or Hybrid 40-120 ms,  --> encode_multiframe --> encode_frame x2 to x6
+  |  SILK-only 80-120 ms                              --> packet::write (one packet)
   v
 encode_frame (one frame)
   |
@@ -52,7 +52,7 @@ packet = TOC byte | main frame | redundant frame | padding (CBR)
 
 ## 1. One packet: `OpusEncoder::encode`
 
-`encode` (float samples) and `encode_i16` (16-bit samples) both call `encode_impl` in `src/lib.rs`. It is the port of libopus `opus_encode_native`. `encode_i16` first converts its samples to float.
+`encode` (float samples) and `encode_i16` (16-bit samples) both call `encode_impl` in `src/lib.rs`. It is the port of libopus `opus_encode_native`. Before it, both choose the frame to code (`select_frame_size`, libopus `frame_size_select`): the `frame_size` of the call, or with an expert frame duration set, the first frame of that duration. `encode_i16` then converts the samples of that frame to float.
 
 ### 1.1 Input checks and conversion
 
@@ -60,7 +60,7 @@ packet = TOC byte | main frame | redundant frame | padding (CBR)
 
 1. It clears the final range (`final_range()` returns 0 until a frame is coded).
 2. It takes the length of the output buffer as the largest packet, but no more than 6 × 1276 bytes. An empty buffer is an error.
-3. It checks the frame size. A frame must last 2.5, 5, 10, 20, 40 or 60 ms at the API rate (`frame_rate_from_params`). Any other size is the error "Invalid frame size for sampling rate".
+3. It checks the frame size. A frame must last 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms at the API rate (`frame_rate_from_params`). Any other size is the error "Invalid frame size for sampling rate". A 100 ms frame into a buffer of one byte is the error "Output buffer too small", as in libopus.
 4. It checks that the input holds `frame_size * channels` samples.
 5. For stereo input it updates the estimate of the stereo width (`compute_stereo_width`), unless the caller forced mono packets. The width is 0 when both channels carry the same signal and 1 when they differ completely.
 
@@ -76,9 +76,9 @@ When the packet has no room to code anything, the encoder writes a TOC-only pack
 
 - the packet has fewer than 3 bytes;
 - the bitrate is below 3 bytes per frame;
-- the frame is 40 or 60 ms, and the packet allows fewer than 300 bytes per second or the bitrate is below 2400 bits per second (b/s).
+- the frame is 40 ms or longer, and the packet allows fewer than 300 bytes per second or the bitrate is below 2400 bits per second (b/s).
 
-A decoder conceals such a packet as if it were lost. Under CBR the packet is padded to its size.
+A decoder conceals such a packet as if it were lost. Under CBR the packet is padded to its size. A packet of 60 ms or more says its duration as libopus says it: one SILK frame of 60 ms, two SILK frames of 40 or 60 ms (for 80 and 120 ms), or three to six 20 ms frames with a frame count byte.
 
 ### 1.3 Mode, bandwidth and channels: `decide_mode_and_bandwidth`
 
@@ -301,13 +301,20 @@ The two directions are coded differently:
 5. The final range is the range coder state after the main frame, combined by exclusive or (XOR) with that of the redundant frame (`final_range()`).
 6. Under CBR the packet is padded to its fixed size (`packet::pad`).
 
-### 1.5 40 and 60 ms packets
+### 1.5 Packets of 40 to 120 ms
 
 SILK-only codes a 40 or 60 ms frame as one Opus frame. Inside it SILK codes 2 or 3 frames of 20 ms. The TOC names the 40 or 60 ms duration, and the frame count code is 0.
 
-CELT and Hybrid frames are 20 ms at most. `encode_multiframe` therefore codes a 40 or 60 ms CELT or Hybrid packet as 2 or 3 frames of 20 ms. Each goes through `encode_frame` with the decisions of the whole packet. `packet::write` then joins them into one packet with frame count code 1, 2 or 3 (libopus does this with its repacketizer). Each 20 ms frame gets its share of the packet. A switch to CELT-only is announced in the last frame only.
+Longer frames are split into parts, as libopus splits them (opus_encoder.c lines 1697-1838):
 
-libopus 1.6 also limits each 20 ms frame of a VBR packet to what the bitrate gives 20 ms (opus_encoder.c line 1785). That limit is left out on purpose. In libopus it costs up to 23 decibels (dB) of signal-to-noise ratio with in-band FEC on.
+| Mode | 40 ms | 60 ms | 80 ms | 100 ms | 120 ms |
+|---|---|---|---|---|---|
+| SILK-only | one frame | one frame | 2 × 40 ms | 5 × 20 ms | 2 × 60 ms |
+| CELT-only, Hybrid | 2 × 20 ms | 3 × 20 ms | 4 × 20 ms | 5 × 20 ms | 6 × 20 ms |
+
+`encode_multiframe` codes each part through `encode_frame` with the decisions of the whole packet. `packet::write` then joins them into one packet with frame count code 1, 2 or 3 (libopus does this with its repacketizer). Each part gets its share of the packet, after the bytes the header of the packet can need. A switch to CELT-only is announced in the last part only.
+
+libopus 1.6 also limits each part of a VBR packet to what the bitrate gives one part (opus_encoder.c line 1785). That limit is left out on purpose. In libopus it costs up to 23 decibels (dB) of signal-to-noise ratio with in-band FEC on.
 
 ```rust
 use opus1::{Application, OpusEncoder};
@@ -571,11 +578,12 @@ All settings take effect with the next call of `encode`. Each one is a method of
 | `set_force_mode(Option<ForcedMode>)` | `OPUS_SET_FORCE_MODE` (in libopus's private header `opus_private.h`) | `None` | Asks for SILK-only, Hybrid or CELT-only. The rules that keep a packet valid still apply (1.3): frames under 10 ms are CELT-only, SILK above wideband becomes Hybrid, Hybrid at wideband or below becomes SILK-only. |
 | `set_bandwidth(Bandwidth)` | `OPUS_SET_BANDWIDTH` | `Bandwidth::Auto` | Codes this bandwidth instead of the automatic one. It never exceeds half the API rate. CELT codes mediumband as wideband. A running SILK encoder moves to it one step at a time. |
 | `set_max_bandwidth(Bandwidth)` | `OPUS_SET_MAX_BANDWIDTH` | `Bandwidth::Fullband` | The widest bandwidth the automatic choice may take. `Bandwidth::Auto` is an error. |
-| `set_force_channels(Option<usize>)` | `OPUS_SET_FORCE_CHANNELS` | `None` | Codes 1 or 2 channels instead of the automatic choice. More than the input has is an error. A 40 or 60 ms CELT or Hybrid packet that changes to mono sets it to `Some(1)` itself, as libopus does. |
+| `set_force_channels(Option<usize>)` | `OPUS_SET_FORCE_CHANNELS` | `None` | Codes 1 or 2 channels instead of the automatic choice. More than the input has is an error. A packet made of several frames (1.5) that changes to mono sets it to `Some(1)` itself, as libopus does. |
 | `set_inband_fec(bool)` | `OPUS_SET_INBAND_FEC` | `false` | Allows LBRR copies in SILK and Hybrid packets (1.3, 2.9). With packet loss above the voice-dependent limit it also makes the encoder prefer SILK. |
 | `set_packet_loss_perc(i32)` | `OPUS_SET_PACKET_LOSS_PERC` | 0 | The expected packet loss, 0..=100; other values are an error. FEC needs it above 0. It lowers the equivalent rate, raises the LTP scaling, sets the LBRR gain step, and makes CELT code intra energy more often. |
 | `set_lfe(bool)` | `OPUS_SET_LFE` (in libopus's `celt/celt.h`) | `false` | The encoder codes a low-frequency-effects channel of a surround stream: CELT-only, narrowband, only bands 0 and 1 matter. |
 | `encode_i16` (method) | `opus_encode` (16-bit input) | | Encodes 16-bit samples. The packets are the same bytes as `encode` with `s as f32 / 32768.0`. |
+| `set_expert_frame_duration(FrameDuration)` | `OPUS_SET_EXPERT_FRAME_DURATION` | `FrameDuration::Argument` | Each call codes one frame of the duration that is set; the `frame_size` of the call must be at least that long (libopus `frame_size_select`). The setting stays across a reset. |
 | `set_prediction_disabled(bool)` | `OPUS_SET_PREDICTION_DISABLED` | `false` | Every frame can be decoded on its own: SILK codes each packet as the first after a reset, CELT turns off the pre-filter and inter-frame energy prediction. Costs quality. |
 | `set_energy_mask(Option<&[f32]>)` | `OPUS_SET_ENERGY_MASK` (in `celt/celt.h`) | `None` | Used by the multistream encoder for surround ([05-multichannel.md](05-multichannel.md)): how much each band is masked by other channels. Lowers the bits of masked bands. |
 | `reset_state()` | `OPUS_RESET_STATE` | | Forgets the signal coded so far. The settings stay. |
@@ -630,9 +638,9 @@ The encoder follows libopus 1.6 with these differences. The doc comment of `enco
 1. No speech/music analysis (`analysis.c`). The voice estimate is fixed per application. The bandwidth that analysis detects is not applied. CELT gets no analysis input. libopus runs the analysis at complexity 7 and above for 16 to 48 kHz input, so packets differ most there.
 2. No discontinuous transmission (DTX): the encoder sends a packet for every frame, also in silence.
 3. With `Voip`, SILK reads the output of the integer high-pass filter of the fixed-point build. With the other applications SILK follows the float build.
-4. 40 and 60 ms CELT and Hybrid VBR packets have no per-frame limit (1.5).
+4. VBR packets made of several frames have no limit per frame (1.5).
 5. The CELT bitrate of a Hybrid packet is at least 501 b/s.
 6. 16-bit input uses the silence threshold of float input, so both entry points give the same packets.
-7. No 80, 100 or 120 ms frames, and no controls for signal type or phase inversion.
+7. No controls for signal type or phase inversion.
 8. A frame that announces the switch to CELT-only without room for the redundant frame still resets the CELT encoder.
 9. The energy mask is copied, not kept as a pointer.

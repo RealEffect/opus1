@@ -24,13 +24,16 @@
 #      directory. The exit status is 1 when a program failed.
 #
 # Usage:
-#   scripts/android/test.sh [--no-build] [--collect] [NAME_PART ...] [-- TEST_ARGS ...]
+#   scripts/android/test.sh [--no-build | --build-only] [--collect] [NAME_PART ...] [-- TEST_ARGS ...]
 #
 #   NAME_PART  Run only the programs whose name contains one of the parts
 #              (for example `core_ perfk_fft`). `opus1` is the unit tests.
 #   TEST_ARGS  Passed to every test program, for example `-- --ignored` or
 #              `-- --test-threads=1`.
 #   --no-build Use the programs of the last build.
+#   --build-only  Build the programs and stop, without the phone. A later
+#              run with --no-build runs them. On a shared phone this keeps
+#              the build out of the time the phone is taken.
 #   --collect  Do not start anything. Wait for the run on the phone to end,
 #              then copy the logs and print the summary. Use it when this
 #              script was stopped while the phone kept running the tests.
@@ -42,11 +45,13 @@ source "$(dirname "$0")/env.sh"
 
 BUILD=1
 RUN=1
+BUILD_ONLY=0
 PARTS=()
 TEST_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-build) BUILD=0 ;;
+        --build-only) BUILD_ONLY=1 ;;
         --collect) BUILD=0; RUN=0 ;;
         --) shift; TEST_ARGS=("$@"); break ;;
         *) PARTS+=("$1") ;;
@@ -76,6 +81,9 @@ if [ "$BUILD" = 1 ]; then
         echo "$name" >> "$LIST"
     done
     echo "   $(wc -l < "$LIST" | tr -d ' ') test programs"
+fi
+if [ "$BUILD_ONLY" = 1 ]; then
+    exit 0
 fi
 
 need_device

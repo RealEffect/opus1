@@ -288,9 +288,8 @@ pub fn rate_allocation(
 }
 
 /// Whether the frame lasts 100 ms. libopus keeps one more byte per stream
-/// for such a frame, because its table-of-contents needs two bytes. The
-/// multistream encoder takes no 100 ms frames, but the functions here follow
-/// libopus for every frame size.
+/// for such a frame, because its table-of-contents needs two bytes: 100 ms
+/// is five 20 ms frames, which need a frame count byte.
 #[inline]
 fn is_100_ms(frame_size: i64, fs: i64) -> bool {
     fs / frame_size == 10

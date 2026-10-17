@@ -1186,11 +1186,11 @@ mod neon {
         let out = f2.as_mut_ptr() as *mut f32;
 
         // Butterfly `i` reads coefficient `2 * i` (`x1`) and coefficient
-        // `n2 - 1 - 2 * i` (`x2`).
-        // SAFETY: `i + 4 <= n4`, so all coefficients read are below `n2`.
-        let mut start = 0;
-        while start < n4 {
-            let i = start.min(n4 - 4);
+        // `n2 - 1 - 2 * i` (`x2`). One call rotates the butterflies
+        // `i..i + 4` and stores them.
+        // SAFETY (for every call below): `i + 4 <= n4`, so all coefficients
+        // read are below `n2`.
+        let block = |i: usize| {
             let (x1, x2) = if stride == 1 {
                 (up4(inp.add(2 * i)), down4(inp.add(n2 - 1 - 2 * i)))
             } else {
@@ -1213,6 +1213,20 @@ mod neon {
             let yr = vfmaq_f32(vmulq_f32(x1, t1), x2, t0);
             let yi = vfmaq_f32(vmulq_f32(vnegq_f32(x2), t1), x1, t0);
             store_bitrev4(yi, yr, br.add(i), out);
+        };
+        // Two blocks per step. They do not depend on each other, so a core
+        // that runs the instructions in program order works on one while
+        // the other waits for a result. The last block may overlap the one
+        // before; it then stores some butterflies a second time, with the
+        // same values.
+        let mut start = 0;
+        while start + 8 <= n4 {
+            block(start);
+            block(start + 4);
+            start += 8;
+        }
+        while start < n4 {
+            block(start.min(n4 - 4));
             start += 4;
         }
     }
@@ -1734,6 +1748,87 @@ mod mdct_tests {
 mod bit_exact_tests {
     use super::*;
     use crate::kiss_fft::test_guard::{PLACEMENTS, Region};
+
+    /// Time of the inverse transforms of the codec and of their FFT alone.
+    /// Not a check: run it by hand, pinned to one core, with
+    /// `--ignored --nocapture transform_timing`.
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore]
+    fn transform_timing() {
+        let l = MdctLookup::new(1920, 3);
+        let mut rng = Lcg(0x5eed_7171);
+        let window = test_window(&mut rng, 120);
+        let reps = 3000;
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            for _ in 0..200 {
+                f();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                for _ in 0..reps {
+                    f();
+                }
+                best = best.min(start.elapsed().as_nanos() as f64 / reps as f64);
+            }
+            std::println!("{name:34} {best:9.1} ns");
+        };
+        for (shift, stride) in [(0usize, 1usize), (1, 1), (3, 1), (3, 8)] {
+            let n2 = (1920 >> shift) / 2;
+            let mut coeffs = vec![0f32; stride * (n2 - 1) + 1];
+            fill(&mut rng, &mut coeffs, 0);
+            let mut out = vec![0f32; 60 + n2];
+            fill(&mut rng, &mut out, 0);
+            time(&format!("backward n2 {n2} stride {stride}"), &mut || {
+                l.backward(&coeffs, &mut out, &window, 120, shift, stride);
+                std::hint::black_box(&mut out);
+            });
+        }
+        // The steps around the FFT, alone.
+        #[cfg(target_arch = "aarch64")]
+        for shift in [0usize, 3] {
+            let p = l.plan(shift);
+            let n4 = p.n4;
+            let mut coeffs = vec![0f32; 2 * n4];
+            fill(&mut rng, &mut coeffs, 0);
+            let mut f2 = unwritten(n4);
+            time(&format!("pre-rotation {n4}"), &mut || {
+                // SAFETY: `n4` is 480 or 60, `coeffs` holds `2 * n4`
+                // values, and the plan has `2 * n4` rotation values and a
+                // bit-reversal table of `n4` entries below `n4`.
+                unsafe { neon::backward_pre_rotate(&coeffs, p.trig, &p.st.bitrev, &mut f2, 1) };
+                std::hint::black_box(&mut f2);
+            });
+            let spectrum: Vec<KissCpx> =
+                (0..n4).map(|_| KissCpx::new(rng.unit(), rng.unit())).collect();
+            let mut out = vec![0f32; 2 * n4];
+            time(&format!("post-rotation {n4}"), &mut || {
+                // SAFETY: as above; `spectrum` holds `n4` values and `out`
+                // `2 * n4`.
+                unsafe { neon::backward_post_rotate(&spectrum, p.trig, &mut out) };
+                std::hint::black_box(&mut out);
+            });
+            let mut out = vec![0f32; 120];
+            fill(&mut rng, &mut out, 0);
+            time("tdac 120", &mut || {
+                // SAFETY: `window` holds 120 values.
+                unsafe { neon::tdac(&mut out, &window) };
+                std::hint::black_box(&mut out);
+            });
+        }
+        for shift in [0usize, 3] {
+            let p = l.plan(shift);
+            let mut x = vec![KissCpx::new(0.0, 0.0); p.n4];
+            for v in x.iter_mut() {
+                *v = KissCpx::new(rng.unit(), rng.unit());
+            }
+            time(&format!("fft {}", p.n4), &mut || {
+                opus_fft_impl(p.st, &mut x);
+                std::hint::black_box(&mut x);
+            });
+        }
+    }
 
     /// Deterministic pseudo-random numbers, so every run tests the same data.
     struct Lcg(u64);

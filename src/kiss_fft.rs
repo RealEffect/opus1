@@ -871,9 +871,9 @@ mod neon {
         let sign_odd = vld1q_u32([0, SIGN, 0, SIGN].as_ptr());
         let ptr = fout.as_mut_ptr() as *mut f32;
 
-        // SAFETY: a group is 16 floats and `g < groups`.
-        for g in 0..groups {
-            let p = ptr.add(16 * g);
+        // One group: 16 floats at `p`.
+        // SAFETY (for every call below): `p` points to a whole group.
+        let group = |p: *mut f32| {
             let a0 = vld1q_f32(p); // f0 f1
             let a1 = vld1q_f32(p.add(4)); // f2 f3
             let b0 = vld1q_f32(p.add(8)); // f4 f5
@@ -903,6 +903,19 @@ mod neon {
             vst1q_f32(p, vaddq_f32(a0, t0));
             vst1q_f32(p.add(12), vsubq_f32(a1, t1));
             vst1q_f32(p.add(4), vaddq_f32(a1, t1));
+        };
+        // Two groups per step, as in `bfly4_m1`.
+        // SAFETY: a group is 16 floats and `g + 1 < groups`, then
+        // `g < groups`.
+        let mut g = 0;
+        while g + 2 <= groups {
+            let p = ptr.add(16 * g);
+            group(p);
+            group(p.add(16));
+            g += 2;
+        }
+        if g < groups {
+            group(ptr.add(16 * g));
         }
     }
 
@@ -916,9 +929,9 @@ mod neon {
         let sign_odd = vld1q_u32([0, SIGN, 0, SIGN].as_ptr());
         let ptr = fout.as_mut_ptr() as *mut f32;
 
-        // SAFETY: a group is 8 floats and `g < groups`.
-        for g in 0..groups {
-            let p = ptr.add(8 * g);
+        // One group: 8 floats at `p`.
+        // SAFETY (for every call below): `p` points to a whole group.
+        let group = |p: *mut f32| {
             let v0 = vld1q_f32(p); // f0 f1
             let v1 = vld1q_f32(p.add(4)); // f2 f3
 
@@ -936,6 +949,20 @@ mod neon {
 
             vst1q_f32(p, vaddq_f32(a, b));
             vst1q_f32(p.add(4), vsubq_f32(a, b));
+        };
+        // Two groups per step. They do not depend on each other, so a core
+        // that runs the instructions in program order works on one while
+        // the other waits for a result.
+        // SAFETY: a group is 8 floats and `g + 1 < groups`, then `g < groups`.
+        let mut g = 0;
+        while g + 2 <= groups {
+            let p = ptr.add(8 * g);
+            group(p);
+            group(p.add(8));
+            g += 2;
+        }
+        if g < groups {
+            group(ptr.add(8 * g));
         }
     }
 }
@@ -1195,9 +1222,7 @@ mod fused {
                         let p0 = base.add(6 * m * g);
                         let p1 = p0.add(2 * m);
                         let p2 = p1.add(2 * m);
-                        let mut j = 0usize;
-                        while j + 2 <= m {
-                            let k = 2 * j;
+                        let step = |k: usize| {
                             let (o0, o1, o2) = bfly3_step!(
                                 $cmul,
                                 $pm_i,
@@ -1210,6 +1235,10 @@ mod fused {
                             vst1q_f32(p0.add(k), o0);
                             vst1q_f32(p1.add(k), o1);
                             vst1q_f32(p2.add(k), o2);
+                        };
+                        let mut j = 0usize;
+                        while j + 2 <= m {
+                            step(2 * j);
                             j += 2;
                         }
                         if j < m {
@@ -1257,9 +1286,7 @@ mod fused {
                         let p1 = p0.add(2 * m);
                         let p2 = p1.add(2 * m);
                         let p3 = p2.add(2 * m);
-                        let mut j = 0usize;
-                        while j + 2 <= m {
-                            let k = 2 * j;
+                        let step = |k: usize| {
                             let (o0, o1, o2, o3) = bfly4_step!(
                                 $cmul,
                                 $pm_i,
@@ -1275,6 +1302,10 @@ mod fused {
                             vst1q_f32(p1.add(k), o1);
                             vst1q_f32(p2.add(k), o2);
                             vst1q_f32(p3.add(k), o3);
+                        };
+                        let mut j = 0usize;
+                        while j + 2 <= m {
+                            step(2 * j);
                             j += 2;
                         }
                         if j < m {
@@ -1327,9 +1358,7 @@ mod fused {
                         let p2 = p1.add(2 * m);
                         let p3 = p2.add(2 * m);
                         let p4 = p3.add(2 * m);
-                        let mut j = 0usize;
-                        while j + 2 <= m {
-                            let k = 2 * j;
+                        let step = |k: usize| {
                             let (o0, o1, o2, o3, o4) = bfly5_step!(
                                 $cmul,
                                 $pm_i,
@@ -1348,6 +1377,10 @@ mod fused {
                             vst1q_f32(p2.add(k), o2);
                             vst1q_f32(p3.add(k), o3);
                             vst1q_f32(p4.add(k), o4);
+                        };
+                        let mut j = 0usize;
+                        while j + 2 <= m {
+                            step(2 * j);
                             j += 2;
                         }
                         if j < m {

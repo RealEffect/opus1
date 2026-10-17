@@ -21,14 +21,14 @@ Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-appl
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 229 | 1101 |
-| Unit tests inside `src/` | - | 314 |
-| Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (47) | - | 49 |
-| **Total** | | **1464** |
+| Integration tests in `tests/*.rs` | 234 | 1128 |
+| Unit tests inside `src/` | - | 342 |
+| Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (48) | - | 50 |
+| **Total** | | **1520** |
 
-25 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 11 directories of shared helper code (for example `tests/k24_common/`) and 4 files of recorded reference values (`*.expected`).
+28 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 11 directories of shared helper code (for example `tests/k24_common/`) and 4 files of recorded reference values (`*.expected`).
 
-A full run, `cargo test --release`, passed all 1439 tests that are not ignored on Apple M4 Pro. It took 257 seconds with the build, while other programs kept the machine busy.
+A full run, `cargo test --release`, passed all 1492 tests that are not ignored on Apple M4 Pro. It took 255 seconds with the build.
 
 ## How libopus is linked
 
@@ -345,9 +345,10 @@ The multistream module needs `std`. The multistream test files that use it (30 o
 
 ## Ignored tests
 
-24 tests are marked `#[ignore]`, and one documentation example is not run.
+27 tests are marked `#[ignore]`, and one documentation example is not run.
 
 - 22 print report tables or are tools, not checks: `celtenc_bands_libopus` (2), `celtenc_gap_report` (3), `celtenc_prefilter` (1), `k24_enc_report` (15) and `perfk_rc_timing` (1).
+- 3 unit tests inside `src/` measure the speed of one function and print it: `celt::deemph_segments_tests::deemphasis_timing`, `mdct::bit_exact_tests::transform_timing` and `pitch::tests::prefilter_timing`.
 - 2 describe known gaps, both caused by the missing speech and music analysis:
   - `oracle_celt::impulse_48k_mono_64k_is_the_packet_of_libopus`
   - `multistream_enc_signals::average_rate_at_16_khz_and_for_voip_is_within_the_design_limits`
@@ -377,8 +378,8 @@ They were written on, and first run on, a HONOR CLK-AN00: MediaTek MT6833, Andro
 
 | Script | What it does |
 |---|---|
-| `build-libopus.sh` | Builds libopus as a static library with the NDK's clang. It uses the settings that libopus's own `configure` picks for this target: `-O2`, NEON intrinsics presumed, run-time detection for the DotProd code. It writes every flag to `target/android/libopus/build-flags.txt`. |
-| `test.sh` | Builds every test program with `cargo ndk -t arm64-v8a test --release --no-run` against that libopus. It copies the programs and `fixtures/` to the phone and runs them one after the other. Then it prints one line per program and the totals. |
+| `build-libopus.sh --src DIR` | Builds the libopus source tree DIR as a static library with the NDK's clang (see [Which libopus source to build](#which-libopus-source-to-build)). It uses the settings that libopus's own `configure` picks for this target: `-O2`, NEON intrinsics presumed, run-time detection for the DotProd code. They were checked against what `configure` of libopus 1.6.1 writes. The script writes every flag to `target/android/libopus/build-flags.txt`. |
+| `test.sh` | Builds every test program with `cargo ndk -t arm64-v8a test --release --no-run` against that libopus. It copies the programs and `fixtures/` to the phone and runs them one after the other. Then it prints one line per program and the totals. `--build-only` stops after the build, and `--no-build` runs the programs of the last build. So a phone that several people use is taken only while the tests run. |
 | `golden.sh` | Writes the golden hashes on the phone. With `--check FILE` it also checks them against a golden file from another machine. |
 | `bench.sh` | Runs `perf_harness bench`, pinned with `taskset` to one CPU of the fast cluster and one of the slow cluster (see [Performance](08-performance.md#on-an-android-phone)). |
 | `profile.sh` | Counts hardware events per frame with `simpleperf stat` and samples the hot functions with `simpleperf record`, for one operation of the harness. |
@@ -389,9 +390,9 @@ They were written on, and first run on, a HONOR CLK-AN00: MediaTek MT6833, Andro
 
 ```text
 export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/27.3.13750724
-scripts/android/build-libopus.sh
+scripts/android/build-libopus.sh --src opus-1.6.1
 scripts/android/test.sh
-scripts/android/golden.sh --check target/perf/golden_final.txt
+scripts/android/golden.sh --check target/perf/golden_r6.txt
 scripts/android/bench.sh --runs 2
 scripts/android/profile.sh --little celt_fb_48k_mono_64k_vbr_c10_20ms enc rust
 ```
@@ -405,7 +406,7 @@ scripts/android/ab.sh --passes 3 --cpus "5 7" base a55 -- \
   --filter silk_wb_16k_mono_20k_vbr_c10_20ms,celt_fb_48k_mono_64k_vbr_c10_20ms
 ```
 
-`build-libopus.sh --host` builds the same libopus for the computer it runs on, when that is a 64-bit ARM computer such as a Mac with Apple silicon. It is the C reference at `-O2` of [The C reference](08-performance.md#the-c-reference).
+`build-libopus.sh --host` builds the same libopus for the computer it runs on, when that is a 64-bit ARM computer such as a Mac with Apple silicon. Built from the release 1.6.1, it is the C reference at `-O2` of [The C reference](08-performance.md#the-c-reference).
 
 Some details:
 
@@ -415,25 +416,58 @@ Some details:
 - The programs run on the phone detached from adb (`setsid`). A dropped USB connection does not stop them. `test.sh --collect` waits for such a run and collects its logs.
 - `test.sh` copies the logs of each run to a new directory, `target/android/test-logs/<date>-<time>/`, so a later run does not delete them. `test-logs/latest` points at the newest one.
 
-### Which libopus the phone links
+### Which libopus source to build
 
-`build-libopus.sh` builds, by default, the libopus source that the crate `opus-head-sys` 0.3.3 vendors. That source is commit `228a0f85` of the libopus main branch, from 2026-08-28. It is newer than the release 1.6.1, which the tests were written against and which Homebrew ships. No copy of the 1.6.1 source was available for the first run. Set `OPUS_SRC` to an unpacked 1.6.1 release to link the same version as on macOS.
+`build-libopus.sh` builds the libopus source tree that `--src DIR` (or the variable `OPUS_SRC`) names. Use the release 1.6.1. The tests were written against it, and Homebrew ships it. Download it from Xiph and check it before you build it:
 
-### Results of the first run
+```text
+curl -LO https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz
+shasum -a 256 opus-1.6.1.tar.gz
+# 6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1, the sum
+# that Xiph lists in SHA256SUMS.txt next to the release
+tar xzf opus-1.6.1.tar.gz
+scripts/android/build-libopus.sh --src opus-1.6.1
+```
 
-Run on 2026-10-16 at git commit `bd080de`: 229 test programs with 1406 tests. 1372 passed, 10 failed and 24 were ignored. Two runs took 580 and 591 seconds, with the tests already built (129 seconds on Apple M4 Pro). A check run later that day, from a new build directory and a new directory on the phone, gave the same totals and the same 10 failures in 578 seconds.
+Homebrew's formula for libopus names the same file with the same SHA-256 (Secure Hash Algorithm, 256 bits) sum.
 
-None of the 10 failures comes from opus1. On the phone, opus1 writes the same packets and decodes the same samples as on Apple M4 Pro (see the golden check below). Each failing test compares opus1 with libopus, or makes its input with the C library's sine function. The difference is on that side:
+Without `--src`, the script falls back to the copy of libopus that the crate `opus-head-sys` 0.3.3 vendors, and it prints a warning. That copy is commit `228a0f85` of the libopus main branch, from 2026-08-28. It codes many SILK, Hybrid and LFE (low-frequency effects) streams differently from 1.6.1: in 86 of the 137 golden streams, libopus writes other packets. The phone runs up to round 7 linked this copy. On the phone, 11 tests more fail against it than against 1.6.1 (git commit `56ca2dd`). They compare packets with libopus: streams with an LFE channel, CBR with settings changed between packets, the rate limits and the switch of mode at a change of bitrate.
+
+The version string of libopus shows which source a program links. `perf_harness` writes it into its records and into the header of a golden file: `libopus 1.6.1` for the release, `libopus git-228a0f855ce2` for the vendored copy.
+
+The optimization level matters as well:
+
+- `-O2` is the level of libopus's own build, and of the script. Use it for timings.
+- At `-O2`, clang turns some loops of libopus into vector code. Their last bits can differ from those of the scalar code. The Homebrew library behaves like a build at `-Os` and has no such loops (see [The C reference](08-performance.md#the-c-reference)).
+- So a comparison at the bit level with the results of the Homebrew build needs a build at `-Os` (`OPUS_EXTRA_CFLAGS=-Os`) or a build without vector loops (`OPUS_EXTRA_CFLAGS="-fno-vectorize -fno-slp-vectorize"`). [Results on the phone](#results-on-the-phone) lists the tests that see the difference.
+
+`build-libopus.sh --host` builds the same way for a Mac with Apple silicon. There, `configure` builds no run-time CPU detection, and libopus's SILK encoder then calls the C version of its delayed-decision quantizer, as the Homebrew library does. `--rtcd` adds the detection, so the NEON version runs, as on the phone (see [The C reference](08-performance.md#the-c-reference)). The outputs are the same. Linking the harness or the tests against such a build is described at the top of the script.
+
+### Results on the phone
+
+Run on 2026-10-17 at git commit `56ca2dd` (round 8 and the frames of 80 to 120 ms merged), against libopus 1.6.1 built by `build-libopus.sh` at `-O2` with the NDK's clang 18: 235 test programs with 1470 tests. 1435 passed, 8 failed and 27 were ignored. The run took 675 seconds, with the tests already built, including copying them to the phone. The logs are in `target/perf/merge_56ca2dd/phone_tests/`. The same 8 tests failed at `c96e936`, before round 8.
+
+None of the 8 failures comes from opus1. Each failing test compares opus1 with libopus at the last bit, or makes its input with the C library's sine function. The difference is on that side:
 
 | Failing tests | Cause | How it was found |
 |---|---|---|
-| 8 tests of LFE (low-frequency effects) streams and mode switches: `celtenc_known_gaps` (2), `celtenc_lfe`, `celtenc_lfe_formats`, `celtenc_lfe_header`, `multistream_e2e_matrix` (2) and `core_redundancy` | The libopus source. The main-branch libopus codes these streams differently from 1.6.1. | The same 8 tests fail on Apple M4 Pro when they link the same source, built there with Apple clang at `-O2` or `-Os`. On the phone, the opus1 packets of the 50 Hz LFE tone of `celtenc_known_gaps` are byte for byte those of the Mac. libopus differs from the first packet on. No build setting of that source writes the packets of the Homebrew 1.6.1: on the Mac, `golden --check` against `golden_final.txt` found the same 86 streams different at `-O2`, at `-Os` and without `FLOAT_APPROX`, and 100 without the NEON code. |
-| `celtenc_bands_libopus::stereo_angles_are_the_ones_libopus_computes` | Vector code in libopus. At `-O2`, clang turns the loop of `stereo_itheta` (celt/vq.c) that sums `m*m` and `s*s` into vector code. The vector code rounds each product before it adds it. The scalar code does both in one fused multiply-add. So the last bit of the angle can differ. The Homebrew library has no such vector loops. | The test passes when libopus is built with `-fno-vectorize -fno-slp-vectorize`. On the Mac it fails with an `-O2` build of the same source and passes with an `-Os` build. |
+| `celtenc_bands_libopus::stereo_angles_are_the_ones_libopus_computes` | Vector code in libopus's `celt/vq.c`. At `-O2`, clang turns the loop of `stereo_itheta` that sums `m*m` and `s*s` into vector code. The vector code rounds each product before it adds it. The scalar code does both in one fused multiply-add. So the last bit of the angle can differ. | See below the table. |
+| `perfk_pitch_libopus::periodic_signals_give_the_lag_of_libopus` | Vector code in libopus's `celt/pitch.c`, where clang vectorizes loops of `pitch_downsample` and `pitch_search`. For signals that repeat exactly, `pitch_search` of opus1 then finds libopus's lag in 1165 of 1168 cases instead of all. | See below the table. |
+| 5 tests of `celtdec_plc`: `celt_only_bursts`, `celt_only_losses_at_every_decoder_rate`, `celt_only_losses_in_narrower_bandwidths`, `celt_only_single_losses_at_every_frame_size` and `pitch_concealment_returns_after_two_good_packets` | Vector code in libopus's loss concealment: in `celt/celt_lpc.c` (the linear prediction and its filters) and in `celt_decode_lost` (`celt/celt_decoder.c`). On 64-bit ARM these tests require every concealed frame to be the one libopus writes (a signal-to-noise ratio of 200 dB). Against the `-O2` build, some concealed frames match at about 60 to 120 dB only, so they differ in the last bits. | See below the table. Each of the two files alone at `-O2` makes all 5 tests fail. |
 | `issue_15_loss_concealment::silk_concealment_extrapolates_the_signal` | The test signal. It is made with `f32::sin`, which calls the C library's `sinf`. Android's and Apple's `sinf` give different last bits for some inputs. With the phone's signal, the concealed 48 kHz frame has 0.0093 of the energy of the last real frame. The test requires more than 0.01. | Of 2,000,000 inputs, Apple's `sinf` differs from the sine computed in double precision and then rounded in 151,818 cases, Android's in 25,754. A copy of the test, run on the Mac with that rounded double-precision sine, got exactly the phone's numbers. libopus's decoder, given the same packets, also conceals the frame at 0.0093 of the energy. |
 
-The 10 failures are at `tests/celtenc_known_gaps.rs:165` and `:213`, `tests/celtenc_lfe.rs:56`, `tests/celtenc_lfe_formats.rs:204`, `tests/celtenc_lfe_header.rs:236`, `tests/multistream_e2e_matrix.rs:316` (2 tests), `tests/core_redundancy.rs:241`, `tests/celtenc_bands_libopus.rs:165` and `tests/issue_15_loss_concealment.rs:304`.
+How the vector code was found to cause the first 7 failures:
 
-`golden.sh --check target/perf/golden_final.txt` found 86 of 137 streams that differ. In all 86, only fields that depend on libopus's packets differ: `c_pk`, `dec_c`, `dec_c_plc` and `dec_c_burst`, and in 7 of them also `fec_silk`. The fields of opus1's own output (`enc`, `enc_i16`, `dec_rust`, `fec_frames` and `errs`) are equal in all 137 streams. The same 86 streams differ on the Mac when the harness links the same libopus source. The golden file of the phone is identical to that Mac golden file in every field.
+1. On the phone, all 7 pass against a build of 1.6.1 with `OPUS_EXTRA_CFLAGS="-fno-vectorize -fno-slp-vectorize"`. Only the test of `issue_15_loss_concealment` still fails.
+2. On the Mac, the whole suite against the `-O2` build of 1.6.1 (Apple clang 21) fails the same 7 tests. They pass against the `-Os` build, against the build without vector loops and against the Homebrew library.
+3. On the Mac, a library was put together from the objects of the build without vector loops, with one file taken from the `-O2` build. `celt/vq.c` from the `-O2` build makes the first test fail, `celt/pitch.c` the second, and `celt/celt_lpc.c` or `celt/celt_decoder.c` the 5 tests of `celtdec_plc`. None of the other 10 files of `celt/` whose machine code the vector code changes makes one of these tests fail. (Records: `target/perf/round8/ref/mac_bisect.txt`.)
+
+The earlier runs linked the main branch of libopus (see [Which libopus source to build](#which-libopus-source-to-build)). They had 10 failures at commit `bd080de` and 18 at commit `0090242`. 10 tests failed only because that source codes some streams differently from 1.6.1. They pass with 1.6.1:
+
+- 8 tests of LFE streams and mode switches: `celtenc_known_gaps` (2), `celtenc_lfe`, `celtenc_lfe_formats`, `celtenc_lfe_header`, `multistream_e2e_matrix` (2) and `core_redundancy`.
+- `celtenc_gap_report::sample_of_rows_is_the_packets_of_libopus` and `celtenc_rate_rules::bitrate_is_limited_to_750_kbps_per_channel`.
+
+`golden.sh --check target/perf/golden_r6.txt` found 0 of 137 streams that differ, against the `-O2` build of 1.6.1 and against the build without vector loops. The golden file of the phone is identical in every field to the one of the Mac, whether the Mac links the Homebrew library or a build of 1.6.1 at `-O2` or `-Os`. So neither the vector code of `-O2` nor Android's C library changes a hash of these streams. Android's `acos`, `cos`, `exp` and `log` give other last bits than Apple's for some inputs. With the main branch, 86 of the 137 streams differed in the fields that depend on libopus's packets: `c_pk`, `dec_c`, `dec_c_plc` and `dec_c_burst`, and in 7 of them also `fec_silk`.
 
 ## How to run each part
 
@@ -450,7 +484,7 @@ The 10 failures are at `tests/celtenc_known_gaps.rs:165` and `:213`, `tests/celt
 | Golden hashes | `cargo run --release --example perf_harness -- golden --check <file>` |
 | `no_std` builds and tests | `scripts/check_no_std.sh` |
 | Fuzzing (stable toolchain) | `fuzz/fuzz.sh <target> <seconds>` |
-| Tests on an Android phone | `scripts/android/build-libopus.sh`, then `scripts/android/test.sh` |
+| Tests on an Android phone | `scripts/android/build-libopus.sh --src <libopus 1.6.1 source>`, then `scripts/android/test.sh` |
 | Golden hashes on a phone | `scripts/android/golden.sh --check <file>` |
 | Timings on a phone | `scripts/android/bench.sh --runs 2` |
 | Hardware counters and hot functions on a phone | `scripts/android/profile.sh --little <scenario> enc rust` |

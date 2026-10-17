@@ -98,7 +98,7 @@ The table shows these rules:
 
 - SILK-only goes up to wideband. Hybrid is super-wideband or fullband. CELT-only has no mediumband.
 - Frames of 2.5 and 5 ms are always CELT-only.
-- Frames of 40 and 60 ms are always SILK-only. A CELT or Hybrid encoder makes a 40 or 60 ms packet out of 20 ms frames: two or three frames in one packet.
+- Frames of 40 and 60 ms are always SILK-only. A CELT or Hybrid encoder makes a packet of 40 to 120 ms out of 20 ms frames: two to six frames in one packet. A SILK encoder makes 80 ms out of two 40 ms frames, 100 ms out of five 20 ms frames and 120 ms out of two 60 ms frames.
 
 The same table as code, checked against the library:
 

@@ -93,8 +93,9 @@ use silk::macros::*;
 
 // --- Heap-free buffer capacity constants (worst case: 2 channels). ---
 const OPUS_MAX_CHANNELS: usize = 2;
-/// Largest API frame in samples/channel (120 ms at 48 kHz). Used by the
-/// encoder's per-frame input buffers (sized `frame_size * channels`).
+/// Largest API frame in samples/channel (120 ms at 48 kHz). The encoder's
+/// SILK input buffer (`buf_filtered`) has this size too: it holds one part
+/// of a packet, at most 60 ms, of both channels.
 const OPUS_MAX_FRAME: usize = packet::MAX_PACKET_SAMPLES;
 /// Largest frame in samples per channel: 60 ms at 48 kHz.
 const OPUS_MAX_SUBFRAME: usize = 2880;
@@ -103,7 +104,8 @@ const OPUS_HP_MEM: usize = OPUS_MAX_CHANNELS * 2;
 /// Decoder `w_pcm_i16` and `w_silk_out` cap (`960 * max_channels`): one
 /// SILK frame of 20 ms at 48 kHz, interleaved.
 const OPUS_PCM_I16: usize = 960 * OPUS_MAX_CHANNELS;
-/// Largest packet of interleaved decoder output: 120 ms at 48 kHz, stereo.
+/// Largest packet of interleaved samples: 120 ms at 48 kHz, stereo. The
+/// decoder's output and `encode_i16`'s converted input have this size.
 const OPUS_PCM_PACKET: usize = OPUS_MAX_FRAME * OPUS_MAX_CHANNELS;
 /// Largest 5 ms of interleaved decoder output (`240 * max_channels`): the
 /// size of a redundancy frame or of the concealment that bridges a mode
@@ -208,6 +210,96 @@ pub enum Bitrate {
     Max,
     /// Bits per second for all channels together.
     BitsPerSecond(i32),
+}
+
+/// The frame duration setting of an encoder: libopus
+/// `OPUS_SET_EXPERT_FRAME_DURATION`. See
+/// [`OpusEncoder::set_expert_frame_duration`];
+/// `MultistreamEncoder::set_expert_frame_duration` takes it too.
+///
+/// The number of each value is the libopus constant of the same name
+/// (`OPUS_FRAMESIZE_ARG` is 5000, `OPUS_FRAMESIZE_2_5_MS` is 5001, and so
+/// on). [`FrameDuration::try_from`] takes those numbers and refuses every
+/// other one, as libopus's encoder control does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FrameDuration {
+    /// libopus `OPUS_FRAMESIZE_ARG`, the default: each frame lasts as long
+    /// as the `frame_size` argument of the encode call says.
+    Argument = 5000,
+    /// 2.5 ms (`OPUS_FRAMESIZE_2_5_MS`).
+    Ms2_5 = 5001,
+    /// 5 ms (`OPUS_FRAMESIZE_5_MS`).
+    Ms5 = 5002,
+    /// 10 ms (`OPUS_FRAMESIZE_10_MS`).
+    Ms10 = 5003,
+    /// 20 ms (`OPUS_FRAMESIZE_20_MS`).
+    Ms20 = 5004,
+    /// 40 ms (`OPUS_FRAMESIZE_40_MS`).
+    Ms40 = 5005,
+    /// 60 ms (`OPUS_FRAMESIZE_60_MS`).
+    Ms60 = 5006,
+    /// 80 ms (`OPUS_FRAMESIZE_80_MS`).
+    Ms80 = 5007,
+    /// 100 ms (`OPUS_FRAMESIZE_100_MS`).
+    Ms100 = 5008,
+    /// 120 ms (`OPUS_FRAMESIZE_120_MS`).
+    Ms120 = 5009,
+}
+
+impl FrameDuration {
+    /// Every value, in the order of their libopus numbers.
+    pub const ALL: [FrameDuration; 10] = [
+        FrameDuration::Argument,
+        FrameDuration::Ms2_5,
+        FrameDuration::Ms5,
+        FrameDuration::Ms10,
+        FrameDuration::Ms20,
+        FrameDuration::Ms40,
+        FrameDuration::Ms60,
+        FrameDuration::Ms80,
+        FrameDuration::Ms100,
+        FrameDuration::Ms120,
+    ];
+
+    /// The libopus number of the value, for example 5000 for
+    /// [`Argument`](Self::Argument).
+    pub fn to_raw(self) -> i32 {
+        self as i32
+    }
+
+    /// The frame size in samples per channel at `sampling_rate`, or `None`
+    /// for [`Argument`](Self::Argument). The arithmetic is that of libopus
+    /// `frame_size_select`, and gives a whole number at every sampling rate
+    /// Opus has.
+    pub fn samples(self, sampling_rate: i32) -> Option<usize> {
+        let fs = sampling_rate as usize;
+        Some(match self {
+            FrameDuration::Argument => return None,
+            FrameDuration::Ms2_5 => fs / 400,
+            FrameDuration::Ms5 => fs / 400 * 2,
+            FrameDuration::Ms10 => fs / 400 * 4,
+            FrameDuration::Ms20 => fs / 400 * 8,
+            FrameDuration::Ms40 => fs / 400 * 16,
+            FrameDuration::Ms60 => 3 * fs / 50,
+            FrameDuration::Ms80 => 4 * fs / 50,
+            FrameDuration::Ms100 => 5 * fs / 50,
+            FrameDuration::Ms120 => 6 * fs / 50,
+        })
+    }
+}
+
+impl TryFrom<i32> for FrameDuration {
+    type Error = &'static str;
+
+    /// The value with the libopus number `value` (5000 to 5009). Any other
+    /// number is refused, as libopus's `OPUS_SET_EXPERT_FRAME_DURATION`
+    /// refuses it with `OPUS_BAD_ARG`.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        FrameDuration::ALL
+            .into_iter()
+            .find(|d| d.to_raw() == value)
+            .ok_or("Invalid frame duration")
+    }
 }
 
 /// The decisions `opus_encode_native` makes once per packet and hands to
@@ -402,8 +494,8 @@ pub struct OpusEncoder {
     /// FEC. The next decision leans the same way (`decide_fec`). CELT-only
     /// packets clear it. libopus keeps it across `OPUS_RESET_STATE`.
     silk_lbrr_coded: i32,
-    /// C `st->nonfinal_frame`: this 20 ms part of a 40/60 ms packet is not
-    /// the last one.
+    /// C `st->nonfinal_frame`: this part of a packet made of several frames
+    /// is not the last one.
     nonfinal_frame: bool,
     /// C `st->stream_channels`: the channel count the packets code. Stereo
     /// input is coded as mono at low bitrates (`decide_stream_channels`).
@@ -440,7 +532,8 @@ pub struct OpusEncoder {
     /// is the rate of `user_bitrate`, or the rate the output buffer stands
     /// for when that is lower (libopus `user_bitrate_to_bitrate`). With a
     /// constant bitrate it is the rate of the whole bytes the packet takes.
-    /// A 20 ms part of a 40/60 ms packet keeps the packet's value.
+    /// Each part of a packet made of several frames keeps the packet's
+    /// value.
     packet_bitrate_bps: i32,
     /// C `st->silk_mode.complexity`: 0 to 10
     /// ([`set_complexity`](Self::set_complexity)).
@@ -465,6 +558,10 @@ pub struct OpusEncoder {
     /// C `silk_mode.reducedDependency` (`OPUS_SET_PREDICTION_DISABLED`):
     /// every frame is coded without prediction from the frames before it.
     prediction_disabled: bool,
+    /// C `st->variable_duration` (`OPUS_SET_EXPERT_FRAME_DURATION`): the
+    /// frame duration the caller set, or `Argument` when the `frame_size`
+    /// of each encode call decides it.
+    variable_duration: FrameDuration,
     /// The 2.5 ms that the CELT encoder codes, and throws away, after a
     /// reset for a change of mode (C `tmp_prefill`), interleaved.
     #[cfg(not(feature = "heap"))]
@@ -1030,6 +1127,7 @@ impl OpusEncoder {
             packet_loss_perc: 0,
             prev_frame_size: 0,
             prediction_disabled: false,
+            variable_duration: FrameDuration::Argument,
             #[cfg(not(feature = "heap"))]
             celt_prefill: [0.0; CELT_PREFILL],
             #[cfg(feature = "heap")]
@@ -1571,6 +1669,34 @@ impl OpusEncoder {
         self.prediction_disabled
     }
 
+    /// libopus `OPUS_SET_EXPERT_FRAME_DURATION`: the duration of the frames
+    /// the encoder codes.
+    ///
+    /// - [`FrameDuration::Argument`], the default: the `frame_size` of each
+    ///   [`encode`](Self::encode) call is the frame.
+    /// - Any other value: each call codes a frame of that duration. Its
+    ///   `frame_size` must be at least that long, and `input` must still
+    ///   hold `frame_size * channels` samples. Only the first frame of
+    ///   them is coded. A shorter `frame_size` is refused.
+    ///
+    /// libopus calls this "variable duration": the encoder may code less
+    /// audio than the call passes. The caller learns how much from the
+    /// packet ([`packet::nb_samples`]) and passes the rest again in the
+    /// next call. libopus 1.6 makes no choice of its own here; the
+    /// duration is the one that was set.
+    ///
+    /// The setting stays across [`reset_state`](Self::reset_state), as in
+    /// libopus.
+    pub fn set_expert_frame_duration(&mut self, duration: FrameDuration) {
+        self.variable_duration = duration;
+    }
+
+    /// libopus `OPUS_GET_EXPERT_FRAME_DURATION`: the value set with
+    /// [`set_expert_frame_duration`](Self::set_expert_frame_duration).
+    pub fn expert_frame_duration(&self) -> FrameDuration {
+        self.variable_duration
+    }
+
     /// libopus `OPUS_SET_FORCE_CHANNELS`: code `Some(1)` or `Some(2)`
     /// channels, or let the bitrate decide with `None`. The count may not
     /// exceed the input's. A mono encoder codes mono whatever is set.
@@ -1579,10 +1705,10 @@ impl OpusEncoder {
     /// 17 kb/s for music and 19 kb/s for speech, with 1 kb/s of hysteresis
     /// (opus_encoder.c:1428-1451).
     ///
-    /// As in libopus, a 40 or 60 ms packet that is not SILK-only and that
-    /// would lead over to mono sets this to `Some(1)` itself
-    /// (opus_encoder.c:1763-1765). The stream then stays mono until the
-    /// caller sets the count again.
+    /// As in libopus, a packet made of several frames (40 to 120 ms of
+    /// CELT or Hybrid, 80 to 120 ms of SILK) that would lead over to mono
+    /// sets this to `Some(1)` itself (opus_encoder.c:1763-1765). The stream
+    /// then stays mono until the caller sets the count again.
     pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), &'static str> {
         match channels {
             Some(n) if n < 1 || n > self.channels => Err("Invalid forced channel count"),
@@ -1659,8 +1785,8 @@ impl OpusEncoder {
     /// The settings that stay are the bitrate, the complexity, CBR or VBR
     /// and the VBR constraint, in-band FEC, the packet loss percentage, the
     /// forced mode, the bandwidth and maximum bandwidth, the forced channel
-    /// count, the prediction switch and the LFE flag. The energy mask is
-    /// cleared, as in libopus.
+    /// count, the prediction switch, the expert frame duration and the LFE
+    /// flag. The energy mask is cleared, as in libopus.
     ///
     /// As in libopus, three things SILK reported for the last packet also
     /// stay: whether the packet was to carry FEC, whether SILK allowed a
@@ -1684,6 +1810,7 @@ impl OpusEncoder {
         fresh.max_bandwidth = self.max_bandwidth;
         fresh.lfe = self.lfe;
         fresh.prediction_disabled = self.prediction_disabled;
+        fresh.variable_duration = self.variable_duration;
         // C `force_channels` and `silk_mode.toMono` lie before
         // `OPUS_ENCODER_RESET_START` too.
         fresh.force_channels = self.force_channels;
@@ -1720,8 +1847,14 @@ impl OpusEncoder {
     }
 
     /// Encode a frame of interleaved f32 PCM (scale ±1.0; C `opus_encode_float`
-    /// convention where 1.0 maps to PCM16 32768). Samples are consumed exactly
-    /// up to `frame_size * channels`.
+    /// convention where 1.0 maps to PCM16 32768). `input` must hold
+    /// `frame_size * channels` samples.
+    ///
+    /// `frame_size` is in samples per channel: 2.5, 5, 10, 20, 40, 60, 80,
+    /// 100 or 120 ms. With an expert frame duration set
+    /// ([`set_expert_frame_duration`](Self::set_expert_frame_duration)),
+    /// only the first frame of that duration is coded, and `frame_size`
+    /// must be at least that long.
     ///
     /// The packet never exceeds `output`. As in libopus, the length of
     /// `output` also counts as a limit on the bitrate: when it holds less
@@ -1734,6 +1867,7 @@ impl OpusEncoder {
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
+        let frame_size = self.select_frame_size(input.len(), frame_size)?;
         self.encode_impl(input, frame_size, output)
     }
 
@@ -1747,19 +1881,41 @@ impl OpusEncoder {
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
-        // libopus `INT16TORES`. The conversion is exact, and the 16-bit
-        // high-pass filter of the `Voip` application rounds the float
-        // samples back to the same 16-bit values. A frame size too large for
-        // the buffer is not valid, and `encode_impl` rejects it.
-        let n = input.len().min(frame_size.saturating_mul(self.channels)).min(OPUS_MAX_FRAME);
-        let mut pcm: FixedVec<f32, OPUS_MAX_FRAME> = FixedVec::from_value(0.0, n);
+        let frame_size = self.select_frame_size(input.len(), frame_size)?;
+        // libopus `INT16TORES`, over the frame that is coded. The
+        // conversion is exact, and the 16-bit high-pass filter of the
+        // `Voip` application rounds the float samples back to the same
+        // 16-bit values.
+        let n = frame_size * self.channels;
+        let mut pcm: FixedVec<f32, OPUS_PCM_PACKET> = FixedVec::from_value(0.0, n);
         for (dst, &src) in pcm.iter_mut().zip(&input[..n]) {
             *dst = int16_to_res(src);
         }
         self.encode_impl(&pcm, frame_size, output)
     }
 
+    /// The frame an encode call codes: libopus `frame_size_select`, which
+    /// `opus_encode` and `opus_encode_float` call first. `frame_size` is
+    /// the caller's (C `analysis_frame_size`), and `input_len` the number
+    /// of samples the caller passed. Returns the frame size in samples per
+    /// channel.
+    fn select_frame_size(&self, input_len: usize, frame_size: usize) -> Result<usize, &'static str> {
+        let selected = frame_size_select(frame_size, self.variable_duration, self.sampling_rate)
+            .ok_or("Invalid frame size for sampling rate")?;
+        // The caller passes `frame_size` samples per channel, as libopus
+        // reads them. Short input is rejected here, so that it cannot
+        // panic inside the high-pass filter or the conversion loops.
+        if input_len < frame_size.saturating_mul(self.channels) {
+            return Err("Input buffer too small for frame");
+        }
+        Ok(selected)
+    }
+
     /// One packet: libopus `opus_encode_native` (opus_encoder.c:1182-1853).
+    /// `frame_size` is the frame [`select_frame_size`](Self::select_frame_size)
+    /// chose. The multistream encoder calls this directly, as libopus
+    /// calls `opus_encode_native`, so the expert frame duration of a
+    /// stream encoder plays no part there.
     ///
     /// What this function, [`decide_mode_and_bandwidth`](Self::decide_mode_and_bandwidth)
     /// and [`encode_frame`](Self::encode_frame) still do differently from
@@ -1775,15 +1931,16 @@ impl OpusEncoder {
     ///    `hp_cutoff` of the fixed-point build, which has its own filter
     ///    state and only runs on frames that SILK codes. The other
     ///    applications follow the float build.
-    /// 4. 40/60 ms CELT and Hybrid packets with a variable bitrate: the
-    ///    limit of a 20 ms frame to its share of the bitrate (C 1785) is
-    ///    left out on purpose, see `encode_multiframe`.
+    /// 4. Packets made of several frames (CELT and Hybrid at 40 to 120 ms,
+    ///    SILK-only at 80 to 120 ms) with a variable bitrate: the limit of
+    ///    each frame to its share of the bitrate (C 1785) is left out on
+    ///    purpose, see `encode_multiframe`.
     /// 5. The Hybrid CELT bitrate has a floor of 501 b/s, on purpose.
     /// 6. 16-bit input is coded with the 24-bit silence threshold of float
     ///    input (libopus: `lsb_depth` 16), so that both entry points give
     ///    the same packets.
-    /// 7. Frames of 80, 100 and 120 ms and the controls for signal type
-    ///    and phase inversion are not offered.
+    /// 7. The controls for signal type and phase inversion are not
+    ///    offered.
     /// 8. On purpose: a frame that announces the switch to CELT-only
     ///    without room for the redundant frame still resets the CELT
     ///    encoder. The decoder starts the CELT-only packets from the reset
@@ -1791,7 +1948,7 @@ impl OpusEncoder {
     /// 9. The energy mask is copied. After a CELT reset libopus has lost
     ///    its pointer to the mask until the caller sets it again; here the
     ///    copy is applied again on the next frame.
-    fn encode_impl(
+    pub(crate) fn encode_impl(
         &mut self,
         input: &[f32],
         frame_size: usize,
@@ -1809,6 +1966,11 @@ impl OpusEncoder {
 
         let frame_rate = frame_rate_from_params(self.sampling_rate, frame_size)
             .ok_or("Invalid frame size for sampling rate")?;
+        // C 1231-1236: "Cannot encode 100 ms in 1 byte". A 100 ms packet
+        // without audio needs a frame count byte: it is five 20 ms frames.
+        if max_data_bytes == 1 && frame_size * 10 == self.sampling_rate as usize {
+            return Err("Output buffer too small");
+        }
 
         // The encoder consumes exactly frame_size * channels samples per call.
         // Short input is rejected here, so that it cannot panic inside the
@@ -1844,7 +2006,7 @@ impl OpusEncoder {
 
         // C 1340-1406: "If the space is too low to do something useful,
         // emit 'PLC' frames". This comes before every decision, and before
-        // a 40 or 60 ms frame is split into 20 ms parts.
+        // a frame of 40 ms or more is split into parts.
         if max_data_bytes < 3
             || bitrate < 3 * frame_rate * 8
             || (frame_rate < 50 && (max_data_bytes as i32 * frame_rate < 300 || bitrate < 2400))
@@ -1855,9 +2017,11 @@ impl OpusEncoder {
         let decisions = self.decide_mode_and_bandwidth(frame_size, frame_rate, max_data_bytes);
         let mode = decisions.mode;
 
-        // C 1697-1838: CELT and Hybrid frames are 20 ms at most. A 40 or
-        // 60 ms packet in those modes is made of 20 ms frames.
-        if mode != OpusMode::SilkOnly && frame_size > fs as usize / 50 {
+        // C 1697-1838: "Can't support higher than >60 ms frames, and
+        // >20 ms when in Hybrid or CELT-only modes". Longer packets are
+        // made of several frames.
+        let fs_u = fs as usize;
+        if (mode != OpusMode::SilkOnly && frame_size > fs_u / 50) || frame_size > 3 * fs_u / 50 {
             return self.encode_multiframe(input, frame_size, decisions, cbr_bytes, output);
         }
         self.encode_frame(input, frame_size, &mut output[..max_data_bytes], decisions)
@@ -2189,7 +2353,8 @@ impl OpusEncoder {
             //
             // - After CELT-only packets (`prefill == 1`): everything is
             //   cleared, once per packet (`silk_InitEncoder`). The later
-            //   20 ms parts of a 40/60 ms packet clear the channels again.
+            //   parts of a packet made of several frames clear the
+            //   channels again.
             // - For the first frame at a new SILK rate that follows a
             //   redundant frame (`prefill == 2`): the channels are cleared,
             //   the state of the input low-pass filter stays.
@@ -2253,7 +2418,7 @@ impl OpusEncoder {
             }
             result?;
 
-            // In a 40/60 ms Hybrid packet only the last 20 ms part leaves
+            // In a packet made of several frames only the last part leaves
             // its answer, as in libopus.
             self.silk_allow_bandwidth_switch = silk_ctl.allow_bandwidth_switch;
             self.silk_in_wb_mode_without_variable_lp = silk_ctl.in_wb_mode_without_variable_lp;
@@ -2642,8 +2807,9 @@ impl OpusEncoder {
         Ok(ret)
     }
 
-    /// Write a packet that codes nothing: only its first byte, and for
-    /// 60 ms of CELT or Hybrid a frame count. A decoder conceals such a
+    /// Write a packet that codes nothing: only its first byte, and a frame
+    /// count when it holds three to six 20 ms frames (60 to 120 ms of CELT
+    /// or Hybrid, 100 ms of SILK). A decoder conceals such a
     /// packet like a lost one. This is libopus `opus_encode_native`, "If the
     /// space is too low to do something useful, emit 'PLC' frames"
     /// (opus_encoder.c:1344-1405).
@@ -2671,16 +2837,20 @@ impl OpusEncoder {
             frame_rate = 50;
             packet_code = 1;
         }
-        // 60 ms frames. (libopus also has 80, 100 and 120 ms here, which
-        // this encoder does not take.)
+        // ">= 60 ms frames": frame rates 16 (60 ms), 12 (80 ms), 10 (100 ms)
+        // and 8 (120 ms).
         if frame_rate <= 16 {
-            if output.len() == 1 || toc_mode == OpusMode::SilkOnly {
-                // 1 x 60 ms. One byte has no room for a frame count, so the
-                // packet is a SILK one whatever the mode.
+            // "1 x 60 ms, 2 x 40 ms, 2 x 60 ms": SILK frames, as one frame or
+            // two of equal size (code 1), which the first byte alone can
+            // say. So can a buffer of one byte, whatever the mode. 100 ms
+            // has no such form and never gets here with one byte
+            // (`encode_impl` refuses it).
+            if output.len() == 1 || (toc_mode == OpusMode::SilkOnly && frame_rate != 10) {
                 toc_mode = OpusMode::SilkOnly;
-                packet_code = 0;
-                frame_rate = 16;
+                packet_code = (frame_rate <= 12) as u8;
+                frame_rate = if frame_rate == 12 { 25 } else { 16 };
             } else {
+                // 3, 4, 5 or 6 frames of 20 ms (code 3).
                 num_multiframes = (50 / frame_rate) as u8;
                 frame_rate = 50;
                 packet_code = 3;
@@ -2707,10 +2877,17 @@ impl OpusEncoder {
         Ok(ret)
     }
 
-    /// A 40 or 60 ms CELT or Hybrid packet: 20 ms frames in one packet with
-    /// frame count code 1, 2 or 3 (libopus `opus_encode_native`,
-    /// opus_encoder.c:1697-1838). Every frame is coded with the packet's
-    /// `decisions`, so the packet has one configuration.
+    /// A packet made of several frames (libopus `opus_encode_native`,
+    /// opus_encoder.c:1697-1838):
+    ///
+    /// - CELT-only and Hybrid frames are 20 ms at most, so a packet of 40
+    ///   to 120 ms is made of 2 to 6 frames of 20 ms.
+    /// - SILK-only frames are 60 ms at most. 80 ms is coded as 2 frames of
+    ///   40 ms, 100 ms as 5 frames of 20 ms, 120 ms as 2 frames of 60 ms.
+    ///
+    /// Every frame is coded with the packet's `decisions`, so the packet
+    /// has one configuration. The frames are joined into one packet with
+    /// frame count code 1, 2 or 3, as libopus's repacketizer does.
     ///
     /// `cbr_bytes` is the packet size a constant bitrate gives.
     fn encode_multiframe(
@@ -2721,10 +2898,26 @@ impl OpusEncoder {
         cbr_bytes: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
-        const MAX_SUB: usize = 3; // up to 60 ms of 20 ms frames
+        // Up to 120 ms of 20 ms frames.
+        const MAX_SUB: usize = 6;
         let ch = self.channels;
         let fs = self.sampling_rate;
-        let enc_frame = (fs / 50) as usize; // 20 ms
+        let fs_u = fs as usize;
+        // C 1712-1722: the duration of each frame.
+        let enc_frame = if decisions.mode == OpusMode::SilkOnly {
+            if frame_size == 2 * fs_u / 25 {
+                // 80 ms -> 2 x 40 ms
+                fs_u / 25
+            } else if frame_size == 3 * fs_u / 25 {
+                // 120 ms -> 2 x 60 ms
+                3 * fs_u / 50
+            } else {
+                // 100 ms -> 5 x 20 ms
+                fs_u / 50
+            }
+        } else {
+            fs_u / 50
+        };
         if enc_frame == 0 || !frame_size.is_multiple_of(enc_frame) {
             return Err("Invalid multi-frame size");
         }
@@ -2733,16 +2926,15 @@ impl OpusEncoder {
             return Err("Unsupported multi-frame size");
         }
 
-        // C 1735-1795: how large the packet and each of its 20 ms frames
-        // may be.
+        // C 1735-1795: how large the packet and each of its frames may be.
         //
         // - The packet: the caller's buffer, or under CBR the constant size.
         // - A frame: its share of the packet once the worst-case header is
         //   taken off. Under CBR also never more than the bitrate gives
-        //   20 ms.
+        //   one frame.
         //
         // Not ported on purpose: libopus 1.6 applies the "never more than
-        // the bitrate gives 20 ms" limit under VBR too (`curr_max`,
+        // the bitrate gives one frame" limit under VBR too (`curr_max`,
         // opus_encoder.c:1785). That turns VBR into a hard cap per frame and
         // costs libopus itself up to 23 dB when in-band FEC is on (measured:
         // 24 kHz stereo Hybrid, 128 kb/s, 40 ms, FEC: 3.9 dB against 27.2 dB
@@ -2764,7 +2956,7 @@ impl OpusEncoder {
         let mut tot_size = 0usize;
         let mut result = Ok(());
         // C 1762-1767. A packet that leads over to mono is not coded so: its
-        // 20 ms frames code two channels without SILK's fade, and the
+        // frames code two channels without SILK's fade, and the
         // caller's channel setting becomes mono, so that the next packet is
         // mono at once. The setting stays (a libopus behavior, ported as it
         // is).
@@ -2817,7 +3009,7 @@ impl OpusEncoder {
         for ((frame, part), &len) in frames.iter_mut().zip(&sub).zip(&lens).take(nb) {
             let parsed = packet::parse(&part[..len], false)?;
             if parsed.count != 1 {
-                return Err("Unexpected frame count in a 20 ms frame");
+                return Err("Unexpected frame count in a part of a packet");
             }
             *frame = parsed.frame(&part[..len], 0);
         }
@@ -3909,10 +4101,10 @@ fn is_whole_2_5ms(frame_size: usize, fs: i32) -> bool {
     frame_size != 0 && frame_size.is_multiple_of(fs as usize / 400)
 }
 
-/// libopus `frame_size_select` without a frame duration override: the number
-/// of frames per second (rounded down) for frames of `frame_size` samples at
-/// `sampling_rate`, or `None` when the encoder does not take that frame
-/// size. A frame is 2.5, 5, 10, 20, 40 or 60 ms.
+/// The number of frames per second (rounded down) for frames of
+/// `frame_size` samples at `sampling_rate`, or `None` when the encoder does
+/// not take that frame size. A frame is 2.5, 5, 10, 20, 40, 60, 80, 100 or
+/// 120 ms: the durations libopus `frame_size_select` accepts.
 pub(crate) fn frame_rate_from_params(sampling_rate: i32, frame_size: usize) -> Option<i32> {
     // A size that does not fit an `i32` is no frame size. Cutting it to 32
     // bits could turn it into one. No valid frame is longer than a second,
@@ -3921,19 +4113,49 @@ pub(crate) fn frame_rate_from_params(sampling_rate: i32, frame_size: usize) -> O
     if frame_size <= 0 || frame_size > sampling_rate {
         return None;
     }
-    // The check goes by duration, not by `sampling_rate % frame_size == 0`:
-    // 60 ms is 16.67 frames per second.
-    let fs = sampling_rate;
-    let valid = frame_size == fs / 400
-        || frame_size == fs / 200
-        || frame_size == fs / 100
-        || frame_size == fs / 50
-        || frame_size == fs / 25
-        || 50 * frame_size == 3 * fs;
+    // The check goes by duration, as in libopus, not by
+    // `sampling_rate % frame_size == 0`: 60 ms is 16.67 frames per second.
+    let (fs, n) = (sampling_rate, frame_size);
+    let valid = 400 * n == fs
+        || 200 * n == fs
+        || 100 * n == fs
+        || 50 * n == fs
+        || 25 * n == fs
+        || 50 * n == 3 * fs
+        || 50 * n == 4 * fs
+        || 50 * n == 5 * fs
+        || 50 * n == 6 * fs;
     if !valid {
         return None;
     }
     Some(fs / frame_size)
+}
+
+/// libopus `frame_size_select` (opus_encoder.c:827): the frame an encode
+/// call codes, in samples per channel, or `None` when the call is refused.
+///
+/// - `frame_size` is what the caller passed (C `analysis_frame_size`).
+/// - With [`FrameDuration::Argument`] the frame is `frame_size`.
+/// - With any other duration the frame has that duration. The caller must
+///   pass at least that much.
+///
+/// The frame must then be one of the durations Opus has (see
+/// [`frame_rate_from_params`]). libopus also refuses frames under 10 ms
+/// for its `RESTRICTED_SILK` application, which opus1 does not have.
+pub(crate) fn frame_size_select(
+    frame_size: usize,
+    duration: FrameDuration,
+    sampling_rate: i32,
+) -> Option<usize> {
+    if frame_size < sampling_rate as usize / 400 {
+        return None;
+    }
+    let new_size = duration.samples(sampling_rate).unwrap_or(frame_size);
+    if new_size > frame_size {
+        return None;
+    }
+    frame_rate_from_params(sampling_rate, new_size)?;
+    Some(new_size)
 }
 
 fn gen_toc(mode: OpusMode, frame_rate: i32, bandwidth: Bandwidth, channels: usize) -> u8 {

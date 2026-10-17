@@ -81,8 +81,25 @@ fn celt_sudiv(n: i32, d: i32) -> i32 {
     n / d
 }
 
+/// libopus `isqrt32` (celt/mathops.c): the integer part of the square root
+/// of `val`.
+///
+/// libopus finds it one bit at a time, in a loop of up to 16 steps whose
+/// branch depends on the data. The square root in double precision gives
+/// the same value with one instruction: it is correctly rounded, and for
+/// `val` below 2^32 that is not a square, the root lies at least 2^-17
+/// below the next integer, far more than its rounding error of at most
+/// 2^-37. So cutting off the fraction gives the integer part. A test
+/// compares it with the loop of libopus (`isqrt32_bits`).
 #[inline]
-fn isqrt32(mut val: u32) -> u32 {
+fn isqrt32(val: u32) -> u32 {
+    (val as f64).sqrt() as u32
+}
+
+/// The loop of libopus `isqrt32`, for `val` of at least 1. The reference
+/// for `isqrt32` in the tests.
+#[cfg(test)]
+fn isqrt32_bits(mut val: u32) -> u32 {
     let mut g = 0u32;
     let mut bshift = ((32 - val.leading_zeros()) as i32 - 1) >> 1;
     let mut b = 1u32 << bshift;
@@ -2989,6 +3006,27 @@ pub fn anti_collapse(
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    /// `isqrt32` gives the result of the loop of libopus for every value up
+    /// to 2^24, for every square up to 2^32 and its two neighbours, and for
+    /// the largest values.
+    #[test]
+    fn isqrt32_matches_the_bit_loop() {
+        for val in 1..1u32 << 24 {
+            assert_eq!(isqrt32(val), isqrt32_bits(val), "val {val}");
+        }
+        for root in 1..=65535u32 {
+            let sq = root * root;
+            for val in [sq - 1, sq, sq.saturating_add(1)] {
+                if val >= 1 {
+                    assert_eq!(isqrt32(val), isqrt32_bits(val), "val {val}");
+                }
+            }
+        }
+        for val in (u32::MAX - 1000)..=u32::MAX {
+            assert_eq!(isqrt32(val), isqrt32_bits(val), "val {val}");
+        }
+    }
 
     #[test]
     fn test_bitexact_primitives_reference_values() {

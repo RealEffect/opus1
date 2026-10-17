@@ -28,8 +28,11 @@
 //!   setting, -1000 or -1, and so always ends up with narrowband. This
 //!   encoder uses the bitrate the allocation chose for the frame. With an
 //!   explicit bitrate both do the same.
-//! - **D3, frame sizes.** 80, 100 and 120 ms frames and the "expert frame
-//!   duration" control are not offered: [`OpusEncoder`] has neither.
+//! - **Expert frame duration.** libopus's `OPUS_SET_EXPERT_FRAME_DURATION`
+//!   on a multistream encoder stores any number without a check, and every
+//!   later encode call with a number that is no duration fails.
+//!   [`MultistreamEncoder::set_expert_frame_duration`] takes a
+//!   [`FrameDuration`], which holds only the numbers libopus accepts.
 //! - **D5, controls.** Missing at the multistream level are the LSB depth,
 //!   the signal type, discontinuous transmission, the forced channel
 //!   count, and the switches for prediction and phase inversion. [`OpusEncoder`] has the forced channel
@@ -52,7 +55,7 @@ use super::rate_alloc::{
 };
 use super::surround::{MASK_BANDS, SurroundAnalysis};
 use crate::packet;
-use crate::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use crate::{Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, OpusEncoder};
 
 const BUFFER_TOO_SMALL: &str = "Output buffer too small";
 
@@ -130,6 +133,9 @@ pub struct MultistreamEncoder {
     stream_inputs: Vec<(usize, Option<usize>)>,
     /// The bitrate the allocation gave each stream for the current frame.
     rates: Vec<i32>,
+    /// C `st->variable_duration`: the expert frame duration
+    /// ([`set_expert_frame_duration`](Self::set_expert_frame_duration)).
+    variable_duration: FrameDuration,
     /// Input of one stream: one frame, interleaved when the stream is stereo.
     buf: Vec<f32>,
     /// Packet of one stream as its encoder wrote it.
@@ -226,8 +232,8 @@ impl MultistreamEncoder {
             encoders.push(enc);
         }
 
-        // The longest frame is 60 ms. A stereo stream has two samples each.
-        let max_frame = 3 * sampling_rate as usize / 50;
+        // The longest frame is 120 ms. A stereo stream has two samples each.
+        let max_frame = 6 * sampling_rate as usize / 50;
         let (surround, band_smr) = if mapping_type == MappingType::Surround {
             (
                 Some(SurroundAnalysis::new(channels, sampling_rate)),
@@ -249,6 +255,7 @@ impl MultistreamEncoder {
             encoders,
             stream_inputs,
             rates: vec![0; streams],
+            variable_duration: FrameDuration::Argument,
             buf: vec![0.0; 2 * max_frame],
             tmp: vec![0; MS_FRAME_TMP],
             surround,
@@ -296,7 +303,11 @@ impl MultistreamEncoder {
     ///
     /// - `pcm` holds `frame_size * channels` samples: sample `i` of channel
     ///   `c` is `pcm[i * channels + c]`. More samples are ignored.
-    /// - `frame_size` is 2.5, 5, 10, 20, 40 or 60 ms in samples per channel.
+    /// - `frame_size` is 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms in
+    ///   samples per channel. With an expert frame duration set
+    ///   ([`set_expert_frame_duration`](Self::set_expert_frame_duration)),
+    ///   only the first frame of that duration is coded, and `frame_size`
+    ///   must be at least that long.
     /// - `output.len()` is the largest packet allowed. The smallest buffer
     ///   that can work is `2 * streams - 1` bytes. A buffer that leaves a
     ///   stream too few bytes is an error ("Output buffer too small").
@@ -312,7 +323,7 @@ impl MultistreamEncoder {
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
-        self.check_input(pcm.len(), frame_size)?;
+        let frame_size = self.check_input(pcm.len(), frame_size)?;
         let src = Interleaved {
             pcm,
             channels: self.layout.channels(),
@@ -331,7 +342,7 @@ impl MultistreamEncoder {
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
-        self.check_input(pcm.len(), frame_size)?;
+        let frame_size = self.check_input(pcm.len(), frame_size)?;
         let src = Interleaved {
             pcm,
             channels: self.layout.channels(),
@@ -339,17 +350,18 @@ impl MultistreamEncoder {
         self.encode_native(&src, frame_size, output)
     }
 
-    /// Checks the frame size (libopus `frame_size_select` without a frame
-    /// duration override) and that the input holds one frame.
-    fn check_input(&self, pcm_len: usize, frame_size: usize) -> Result<(), &'static str> {
-        if crate::frame_rate_from_params(self.sampling_rate, frame_size).is_none() {
-            // D3: libopus also takes 80, 100 and 120 ms.
-            return Err("Invalid frame size");
-        }
-        if pcm_len < frame_size * self.layout.channels() {
+    /// The frame to code: libopus `frame_size_select` with the expert frame
+    /// duration of this encoder. Also checks that the input holds the
+    /// `frame_size` samples per channel the caller passed. Returns the
+    /// frame size in samples per channel.
+    fn check_input(&self, pcm_len: usize, frame_size: usize) -> Result<usize, &'static str> {
+        let selected =
+            crate::frame_size_select(frame_size, self.variable_duration, self.sampling_rate)
+                .ok_or("Invalid frame size")?;
+        if pcm_len < frame_size.saturating_mul(self.layout.channels()) {
             return Err("Input buffer too small for frame");
         }
-        Ok(())
+        Ok(selected)
     }
 
     /// libopus `opus_multistream_encode_native`. `frame_size` has been
@@ -498,14 +510,18 @@ impl MultistreamEncoder {
                     stream_channels,
                 ));
             }
-            let len = enc.encode(
+            // libopus calls `opus_encode_native`: the frame size is chosen,
+            // and an expert frame duration set on a stream encoder plays no
+            // part.
+            let len = enc.encode_impl(
                 &self.buf[..frame_size * stream_channels],
                 frame_size,
                 &mut self.tmp[..curr_max],
             )?;
 
             // The stream encoder can return more than one frame (a 60 ms
-            // CELT packet is three 20 ms frames) and can pad its packet.
+            // CELT packet is three 20 ms frames, a 120 ms one six) and can
+            // pad its packet.
             // Like the libopus repacketizer, take the frames out and write
             // them anew: with the size of the last frame for every stream
             // but the last, and padded to the full size for the last stream
@@ -702,6 +718,24 @@ impl MultistreamEncoder {
         self.max_bandwidth
     }
 
+    /// Sets the frame duration of the packets. libopus
+    /// `OPUS_SET_EXPERT_FRAME_DURATION`, which the multistream encoder keeps
+    /// for itself. See [`OpusEncoder::set_expert_frame_duration`]: with any
+    /// value but [`FrameDuration::Argument`] each [`encode`](Self::encode)
+    /// codes a frame of that duration, and its `frame_size` must be at
+    /// least that long.
+    ///
+    /// The setting stays across [`reset_state`](Self::reset_state).
+    pub fn set_expert_frame_duration(&mut self, duration: FrameDuration) {
+        self.variable_duration = duration;
+    }
+
+    /// libopus `OPUS_GET_EXPERT_FRAME_DURATION`: the value set with
+    /// [`set_expert_frame_duration`](Self::set_expert_frame_duration).
+    pub fn expert_frame_duration(&self) -> FrameDuration {
+        self.variable_duration
+    }
+
     /// Asks every stream for a coding mode instead of its automatic choice.
     /// libopus `OPUS_SET_FORCE_MODE`. `None` gives the choice back.
     ///
@@ -894,15 +928,15 @@ mod tests {
         for fs in [8000, 12000, 16000, 24000, 48000] {
             let enc = MultistreamEncoder::new_surround(fs, 2, 1, Application::Audio).unwrap();
             let ms = |tenths: usize| fs as usize * tenths / 10_000;
-            for tenths in [25, 50, 100, 200, 400, 600] {
-                assert!(
-                    enc.check_input(usize::MAX, ms(tenths)).is_ok(),
+            for tenths in [25, 50, 100, 200, 400, 600, 800, 1000, 1200] {
+                assert_eq!(
+                    enc.check_input(usize::MAX, ms(tenths)),
+                    Ok(ms(tenths)),
                     "{fs} Hz, {tenths}"
                 );
             }
-            // 80, 100 and 120 ms, which libopus takes, and sizes that are
-            // no frame at all.
-            for tenths in [800, 1000, 1200, 150, 300] {
+            // Sizes that are no frame at all.
+            for tenths in [150, 300, 1400] {
                 assert!(
                     enc.check_input(usize::MAX, ms(tenths)).is_err(),
                     "{fs} Hz, {tenths}"
@@ -918,5 +952,22 @@ mod tests {
             assert!(enc.check_input(2 * ms(200) - 1, ms(200)).is_err());
             assert!(enc.check_input(2 * ms(200), ms(200)).is_ok());
         }
+    }
+
+    #[test]
+    fn the_expert_frame_duration_picks_the_frame() {
+        let fs = 48000;
+        let mut enc = MultistreamEncoder::new_surround(fs, 2, 1, Application::Audio).unwrap();
+        assert_eq!(enc.expert_frame_duration(), FrameDuration::Argument);
+        enc.set_expert_frame_duration(FrameDuration::Ms20);
+        // The input must hold what the caller passes; the frame is 20 ms.
+        assert_eq!(enc.check_input(2 * 2880, 2880), Ok(960));
+        assert!(enc.check_input(2 * 2880 - 1, 2880).is_err());
+        // Less than 20 ms is refused.
+        assert!(enc.check_input(usize::MAX, 480).is_err());
+        // A size that is no frame is fine when 20 ms fit into it.
+        assert_eq!(enc.check_input(usize::MAX, 1000), Ok(960));
+        enc.reset_state();
+        assert_eq!(enc.expert_frame_duration(), FrameDuration::Ms20);
     }
 }

@@ -1,5 +1,5 @@
 use crate::bands::{
-    SPREAD_NONE, SPREAD_NORMAL, compute_band_energies, denormalise_bands, haar1, log2amp,
+    SPREAD_NONE, SPREAD_NORMAL, compute_band_energies, haar1, log2amp,
     normalise_bands, quant_all_bands, spreading_decision,
 };
 use crate::celt_lpc::{self, autocorr, celt_fir, celt_iir};
@@ -52,8 +52,9 @@ const CELT_PREFILTER_PITCH: usize = (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME) 
 /// Longest frame the decoder produces, in samples at 48 kHz (20 ms).
 const CELT_DEC_MAX_FRAME: usize = 960;
 /// Decoder `w_x`: the normalised spectrum of two channels and the padding
-/// that the band kernels may read past its end. The loss concealment uses
-/// the same array as working memory (`CeltDecoder::conceal`).
+/// that the band kernels may read past its end. The synthesis turns it into
+/// the spectrum of the frame in place. The de-emphasis and the loss
+/// concealment use the same array as working memory afterwards.
 const CELT_W_X_DEC: usize = {
     let spectrum = CELT_DEC_MAX_FRAME * CELT_MAX_CHANNELS + STRIDE_ACCESS_PAD;
     let conceal = 2 * PLC_MAX_PERIOD + PLC_LPC_ORDER;
@@ -63,8 +64,6 @@ const CELT_W_X_DEC: usize = {
         conceal
     }
 };
-/// Decoder `w_freq`: the spectrum of two channels, and 4 values of padding.
-const CELT_W_FREQ_DEC: usize = CELT_DEC_MAX_FRAME * CELT_MAX_CHANNELS + 4;
 /// Samples that each channel's output history can slide forward in
 /// `decode_mem` before it is moved back to the start (see
 /// `CeltDecoder::advance_history`).
@@ -2056,21 +2055,13 @@ fn run_prefilter(
             crate::pitch::pitch_downsample(&pre_slices, pitch_buf, pitch_buf_len, channels, 2);
         }
 
-        let search_max = max_period - 3 * min_period;
-        let pitch_result = crate::pitch::pitch_search(
-            &pitch_buf[max_period >> 1..],
-            pitch_buf,
-            frame_size,
-            search_max,
-        );
-        pitch_index = (max_period - pitch_result).min(max_period - 2);
-
-        gain1 = crate::pitch::remove_doubling(
+        // C `pitch_search` over `max_period - 3 * min_period` lags, then
+        // `remove_doubling`.
+        (pitch_index, gain1) = crate::pitch::prefilter_pitch(
             pitch_buf,
             max_period,
             min_period,
             frame_size,
-            &mut pitch_index,
             prefilter_period,
             prefilter_gain,
         );
@@ -6206,6 +6197,53 @@ mod deemph_segments_tests {
     use super::comb_inplace_tests::{assert_same, next, signal};
     use super::*;
 
+    /// Time of the de-emphasis of one 20 ms frame, by each way of computing
+    /// it. Not a check: run it by hand, pinned to one core, with
+    /// `--ignored --nocapture deemphasis_timing`.
+    #[test]
+    #[ignore]
+    fn deemphasis_timing() {
+        let n = 960;
+        let warmup = DEEMPH_WARMUP;
+        let coef = 0.85f32;
+        let mut seed = 0x5eed_d00du32;
+        let hist: [Vec<f32>; 2] = core::array::from_fn(|_| shaped_signal(0, warmup + n + 4, &mut seed));
+        let at = warmup;
+        let mut out = vec![0.0f32; 2 * n];
+        let reps = 4000;
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            for _ in 0..200 {
+                f();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                for _ in 0..reps {
+                    f();
+                }
+                best = best.min(start.elapsed().as_nanos() as f64 / reps as f64);
+            }
+            std::println!("{name:28} {best:9.1} ns per frame");
+        };
+        let mut m1 = [0.0f32];
+        let mut m2 = [0.0f32; 2];
+        time("segments mono", &mut || {
+            m1 = deemph_segments_neon::<1, false>([&hist[0]], at, &mut out, n, warmup, coef, m1);
+        });
+        time("segments stereo interleaved", &mut || {
+            m2 = deemph_segments_neon::<2, true>([&hist[0], &hist[1]], at, &mut out, n, warmup, coef, m2);
+        });
+        time("one sample mono", &mut || {
+            let x = &hist[0][at..at + n];
+            m1[0] = deemph_mono(x, &mut out[..n], 1, coef, m1[0], |o, v| *o = v);
+        });
+        time("one sample stereo", &mut || {
+            let (x0, x1) = (&hist[0][at..at + n], &hist[1][at..at + n]);
+            m2 = deemph_stereo(x0, x1, stereo_pairs(&mut out), 1, coef, m2, |o, v| *o = v);
+        });
+        std::hint::black_box(&out);
+    }
+
     /// Test signals of `len` samples. Several of them end in silence or
     /// change level sharply: there the filters of the segments do not reach
     /// the exact memory during their run-in, and the segments must be
@@ -6407,9 +6445,9 @@ mod decoder_scratch_tests {
         pcm
     }
 
-    /// The decoder does not clear `w_x` and `w_freq` between frames. Their
-    /// old contents must never reach the output. Decoder `b` gets both
-    /// arrays overwritten with NaN before every frame. A NaN that was read
+    /// The decoder does not clear `w_x` between frames. Its old contents
+    /// must never reach the output. Decoder `b` gets the array overwritten
+    /// with NaN before every frame. A NaN that was read
     /// would show in its output. Lost frames are part of the stream, so the
     /// concealment is covered as well.
     #[test]
@@ -6439,7 +6477,6 @@ mod decoder_scratch_tests {
                         let packet = rc.buf[..bytes].to_vec();
 
                         b.w_x.fill(f32::NAN);
-                        b.w_freq.fill(f32::NAN);
                         // Two lost frames in every ten, and a longer loss
                         // that takes the concealment from pitch to noise.
                         let lost = k % 10 >= 8 || (30..42).contains(&k);
@@ -6974,6 +7011,11 @@ fn deemph_segments_neon<const C: usize, const INTERLEAVED: bool>(
     for c in 0..C {
         assert!(at + n <= hist[c].len());
     }
+    // An empty frame leaves the memories as they are. The steps below need
+    // segments of at least 4 samples.
+    if n == 0 {
+        return mem;
+    }
     // The place in `out` of sample `i` of channel `c`. With one channel
     // the two layouts are the same.
     let place = |c: usize, i: usize| if INTERLEAVED { i * C + c } else { c * n + i };
@@ -6993,8 +7035,9 @@ fn deemph_segments_neon<const C: usize, const INTERLEAVED: bool>(
     }
     let o = out.as_mut_ptr();
 
-    // SAFETY: filter `s` reads `x_ptr[s][t..t + 4]` for `t` in steps of 4
-    // below `warmup + seg`. The last value read is at
+    // SAFETY: `n > 0`, so `seg` is a positive multiple of 4. Filter `s`
+    // reads `x_ptr[s][t..t + 4]` for `t` in steps of 4 below
+    // `warmup + seg`. The last value read is at
     // `at + (q + 1) * seg - 1 < at + n` in `hist[c]`. At step `t` it writes
     // samples `k..k + 4` of its segment, with `k = t - warmup` below `seg`:
     // the places `place(c, q * seg + k)` to `place(c, q * seg + k + 3)`.
@@ -7007,29 +7050,59 @@ fn deemph_segments_neon<const C: usize, const INTERLEAVED: bool>(
         let very_small = vdupq_n_f32(DEEMPH_VERY_SMALL);
         let coef_v = vdupq_n_f32(coef);
         let scale = vdupq_n_f32(DEEMPH_SCALE);
-        // Four samples of each of the four filters of group `g`, as one
-        // vector per sample.
-        let load = |g: usize, t: usize| {
-            transpose4([
-                vld1q_f32(x_ptr[4 * g].add(t)),
-                vld1q_f32(x_ptr[4 * g + 1].add(t)),
-                vld1q_f32(x_ptr[4 * g + 2].add(t)),
-                vld1q_f32(x_ptr[4 * g + 3].add(t)),
-            ])
+        // Four samples of each of the eight filters at step `t`: per group
+        // `g`, one vector per sample, the four filters `4 * g..4 * g + 4`
+        // in its lanes.
+        let load = |t: usize| {
+            let group = |g: usize| {
+                transpose4([
+                    vld1q_f32(x_ptr[4 * g].add(t)),
+                    vld1q_f32(x_ptr[4 * g + 1].add(t)),
+                    vld1q_f32(x_ptr[4 * g + 2].add(t)),
+                    vld1q_f32(x_ptr[4 * g + 3].add(t)),
+                ])
+            };
+            [group(0), group(1)]
         };
+
+        // The filters of both groups for four samples: one sample of group
+        // 0, then the same sample of group 1. On a core that runs the
+        // instructions in program order, the step of one group runs while
+        // the other waits for the result of its last step. Returns the
+        // outputs scaled to the output range, one vector per sample.
+        let filter = |m: &mut [float32x4_t; 2], x: [[float32x4_t; 4]; 2]| {
+            let mut scaled = [[very_small; 4]; 2];
+            for s in 0..4 {
+                let a0 = vaddq_f32(x[0][s], very_small);
+                let a1 = vaddq_f32(x[1][s], very_small);
+                let y0 = vaddq_f32(a0, m[0]);
+                let y1 = vaddq_f32(a1, m[1]);
+                m[0] = vmulq_f32(y0, coef_v);
+                m[1] = vmulq_f32(y1, coef_v);
+                scaled[0][s] = vmulq_f32(y0, scale);
+                scaled[1][s] = vmulq_f32(y1, scale);
+            }
+            scaled
+        };
+
+        // Every loop below loads and rearranges the input of the next step
+        // while the filters run on the input of this one, and stores the
+        // output of the step before. Without branches between them, an
+        // in-order core can issue these independent instructions in the
+        // cycles in which the filters wait for their results.
 
         // Run-in: memories only, no output. Every filter starts from the
         // memory of its channel at the start of the frame. With two
-        // channels the second vector holds the filters of channel 1.
+        // channels the second group holds the filters of channel 1. The
+        // next step's input lies below `warmup + seg`, because `seg >= 4`.
+        let end = warmup + seg;
         let mut m = [vdupq_n_f32(mem[0]), vdupq_n_f32(mem[C - 1])];
+        let mut x = load(0);
         let mut t = 0;
         while t < warmup {
-            for (g, mg) in m.iter_mut().enumerate() {
-                for x in load(g, t) {
-                    let out = vaddq_f32(vaddq_f32(x, very_small), *mg);
-                    *mg = vmulq_f32(out, coef_v);
-                }
-            }
+            let now = x;
+            x = load(t + 4);
+            filter(&mut m, now);
             t += 4;
         }
 
@@ -7044,39 +7117,62 @@ fn deemph_segments_neon<const C: usize, const INTERLEAVED: bool>(
         m[0] = vld1q_f32(start_mem.as_ptr());
         m[1] = vld1q_f32(start_mem.as_ptr().add(4));
 
-        // The segments.
-        while t < warmup + seg {
-            let k = t - warmup;
-            // Row `j` of `rows[g]` holds samples `k..k + 4` of filter
-            // `4 * g + j`.
-            let mut rows = [[very_small; 4]; 2];
-            for (g, mg) in m.iter_mut().enumerate() {
-                let mut scaled = [very_small; 4];
-                for (s, x) in scaled.iter_mut().zip(load(g, t)) {
-                    let out = vaddq_f32(vaddq_f32(x, very_small), *mg);
-                    *mg = vmulq_f32(out, coef_v);
-                    *s = vmulq_f32(out, scale);
-                }
-                // Back to one vector of four samples per filter.
-                rows[g] = transpose4(scaled);
-            }
+        // Store samples `k..k + 4` of every filter, from `scaled` (one
+        // vector per sample).
+        let store = |scaled: [[float32x4_t; 4]; 2], k: usize| {
             if INTERLEAVED && C == 2 {
-                // Group `c` holds the four segments of channel `c`.
+                // Group `c` holds the four segments of channel `c`. Lane
+                // pair `q` of `pairs[h][s]` (h = q / 2) is (left, right) of
+                // sample `k + s` of segment `q`.
+                let pairs: [[float64x2_t; 4]; 2] = [
+                    core::array::from_fn(|s| {
+                        vreinterpretq_f64_f32(vzip1q_f32(scaled[0][s], scaled[1][s]))
+                    }),
+                    core::array::from_fn(|s| {
+                        vreinterpretq_f64_f32(vzip2q_f32(scaled[0][s], scaled[1][s]))
+                    }),
+                ];
                 for q in 0..4 {
+                    let h = &pairs[q / 2];
+                    let (lo, hi) = if q % 2 == 0 {
+                        (vtrn1q_f64(h[0], h[1]), vtrn1q_f64(h[2], h[3]))
+                    } else {
+                        (vtrn2q_f64(h[0], h[1]), vtrn2q_f64(h[2], h[3]))
+                    };
                     let p = o.add(2 * (q * seg + k));
-                    vst1q_f32(p, vzip1q_f32(rows[0][q], rows[1][q]));
-                    vst1q_f32(p.add(4), vzip2q_f32(rows[0][q], rows[1][q]));
+                    vst1q_f32(p, vreinterpretq_f32_f64(lo));
+                    vst1q_f32(p.add(4), vreinterpretq_f32_f64(hi));
                 }
             } else {
-                for (g, group) in rows.iter().enumerate() {
-                    for (j, row) in group.iter().enumerate() {
+                for (g, group) in scaled.into_iter().enumerate() {
+                    // Back to one vector of four samples per filter.
+                    for (j, row) in transpose4(group).into_iter().enumerate() {
                         let s = 4 * g + j;
-                        vst1q_f32(o.add(place(s / per_ch, (s % per_ch) * seg + k)), *row);
+                        vst1q_f32(o.add(place(s / per_ch, (s % per_ch) * seg + k)), row);
                     }
                 }
             }
+        };
+
+        // The segments. The first step is taken before the loop, so that
+        // the loop always has the output of a step to store. The last step
+        // loads its own input again instead of reading past the segments.
+        let next = |t: usize| if t + 4 < end { t + 4 } else { t };
+        let now = x;
+        x = load(next(t));
+        let mut done = filter(&mut m, now);
+        let mut k = 0;
+        t += 4;
+        while t < end {
+            let now = x;
+            x = load(next(t));
+            store(done, k);
+            done = filter(&mut m, now);
+            k = t - warmup;
             t += 4;
         }
+        store(done, k);
+
         let mut end_mem = [0.0f32; LANES];
         vst1q_f32(end_mem.as_mut_ptr(), m[0]);
         vst1q_f32(end_mem.as_mut_ptr().add(4), m[1]);
@@ -7193,6 +7289,42 @@ fn postfilter_frame<const C: usize>(
     }
 }
 
+/// The spectrum of one channel from its normalised spectrum, in place
+/// (libopus `denormalise_bands` and the zeroing after it in
+/// `celt_synthesis`). `x` holds the `n` values of the channel, `amp` the
+/// band log-amplitudes of the channel (see `log2amp`).
+///
+/// Every band from `start` to `end` is multiplied by its amplitude, the
+/// polynomial `celt_exp2` of its log-amplitude. Then the values below band
+/// `start` and from `bound` upwards are set to 0. `bound` is at most the
+/// end of band `end`, so every value of `x` is written. The values are
+/// those of `bands::denormalise_bands` into another buffer, followed by
+/// the same zeroing.
+fn denormalise_in_place(
+    mode: &CeltMode,
+    x: &mut [f32],
+    amp: &[f32],
+    start: usize,
+    end: usize,
+    lm: usize,
+    bound: usize,
+) {
+    for (i, &lg) in amp.iter().enumerate().take(end).skip(start) {
+        let lo = (mode.e_bands[i] as usize) << lm;
+        let hi = (mode.e_bands[i + 1] as usize) << lm;
+        // C: `g = celt_exp2_db(MIN32(32.f, lg))`. The cap keeps the gain
+        // finite. The comparison is written as in `denormalise_bands`, so
+        // that a NaN takes the same path.
+        let g = celt_exp2(if 32.0 < lg { 32.0 } else { lg });
+        for v in &mut x[lo..hi] {
+            *v *= g;
+        }
+    }
+    let low = (mode.e_bands[start] as usize) << lm;
+    x[..low].fill(0.0);
+    x[bound..].fill(0.0);
+}
+
 pub struct CeltDecoder {
     mode: &'static CeltMode,
     /// Number of output channels (libopus `channels`).
@@ -7273,7 +7405,6 @@ pub struct CeltDecoder {
     w_fine_priority: FixedVec<i32, CELT_NB_X_CH>,
     w_x: FixedVec<f32, CELT_W_X_DEC>,
     w_collapse_masks: FixedVec<u32, CELT_NB_X_CH>,
-    w_freq: FixedVec<f32, CELT_W_FREQ_DEC>,
     w_band_amp: FixedVec<f32, CELT_NB_X_CH>,
 }
 
@@ -7340,7 +7471,6 @@ impl CeltDecoder {
 
             w_x: FixedVec::from_value(0.0, CELT_W_X_DEC),
             w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
-            w_freq: FixedVec::from_value(0.0, CELT_W_FREQ_DEC),
             w_band_amp: FixedVec::from_value(0.0, nb_x_ch),
         }
     }
@@ -7951,21 +8081,23 @@ impl CeltDecoder {
         let out_syn = DECODE_BUFFER_SIZE - n;
         let hist = [self.hist_start(0), self.hist_start(1)];
 
-        // Spectrum of every coded channel (libopus `denormalise_bands`):
-        // zero below the first band, and from the last band or the output
-        // Nyquist frequency upwards.
-        let freq = &mut self.w_freq[..];
+        // Spectrum of every coded channel (libopus `denormalise_bands`), in
+        // place of the normalised spectrum: zero below the first band, and
+        // from the last band or the output Nyquist frequency upwards.
+        // libopus writes it to another buffer. Here nothing reads the
+        // normalised spectrum any more, and one buffer less is touched in
+        // every frame.
+        let freq = &mut self.w_x[..];
         if silence || start >= eff_end {
             freq[..c * n].fill(0.0);
         } else {
             let band_amp = &mut self.w_band_amp[..nb_ebands * c];
             log2amp(mode, nb_ebands, band_amp, &self.old_band_e, c);
-            denormalise_bands(mode, &self.w_x, freq, band_amp, start, eff_end, c, m);
-            let low = m * mode.e_bands[start] as usize;
             let bound = (m * mode.e_bands[eff_end] as usize).min(n / self.downsample);
             for ch in 0..c {
-                freq[ch * n..ch * n + low].fill(0.0);
-                freq[ch * n + bound..(ch + 1) * n].fill(0.0);
+                let amp = &band_amp[ch * nb_ebands..(ch + 1) * nb_ebands];
+                let spectrum = &mut freq[ch * n..(ch + 1) * n];
+                denormalise_in_place(mode, spectrum, amp, start, eff_end, lm, bound);
             }
         }
 
@@ -8082,7 +8214,7 @@ impl CeltDecoder {
     ///
     /// The filter writes straight into `pcm` when the output rate is 48 kHz
     /// and the frame replaces what `pcm` holds. When the frame is added to
-    /// `pcm`, or the output rate is lower, it writes into `w_freq`, which is
+    /// `pcm`, or the output rate is lower, it writes into `w_x`, which is
     /// free once the frame is synthesised, and a second pass puts the
     /// samples in their places.
     #[cfg(target_arch = "aarch64")]
@@ -8107,7 +8239,7 @@ impl CeltDecoder {
             let m = if ds == 1 && layout != PcmLayout::InterleavedAdd {
                 deemph_segments_neon::<1, false>([hist0], at, pcm, n, warmup, coef, m)
             } else {
-                let y = &mut self.w_freq[..n];
+                let y = &mut self.w_x[..n];
                 let m = deemph_segments_neon::<1, false>([hist0], at, y, n, warmup, coef, m);
                 let out = &mut pcm[..api_frame_size];
                 if layout == PcmLayout::InterleavedAdd {
@@ -8126,7 +8258,7 @@ impl CeltDecoder {
             } else if ds == 1 && layout == PcmLayout::Interleaved {
                 deemph_segments_neon::<2, true>(hist, at, pcm, n, warmup, coef, m)
             } else {
-                let y = &mut self.w_freq[..2 * n];
+                let y = &mut self.w_x[..2 * n];
                 let m = deemph_segments_neon::<2, false>(hist, at, y, n, warmup, coef, m);
                 let (y0, y1) = y.split_at(n);
                 let out = &mut pcm[..2 * api_frame_size];
@@ -8193,7 +8325,8 @@ impl CeltDecoder {
     /// (libopus `celt_plc_pitch_search`).
     fn plc_pitch_search(&mut self) -> usize {
         let (hist0, hist1) = (self.hist_start(0), self.hist_start(1));
-        let lp = &mut self.w_freq[..DECODE_BUFFER_SIZE >> 1];
+        // `w_x` is free: the concealment uses it only after the search.
+        let lp = &mut self.w_x[..DECODE_BUFFER_SIZE >> 1];
         let ch0 = &self.decode_mem[hist0..hist0 + DECODE_BUFFER_SIZE];
         let ch1 = if self.channels == 2 {
             Some(&self.decode_mem[hist1..hist1 + DECODE_BUFFER_SIZE])
@@ -8422,7 +8555,46 @@ impl CeltDecoder {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use crate::bands::denormalise_bands;
     use crate::{modes, range_coder::RangeCoder};
+
+    /// `denormalise_in_place` gives the bits of `bands::denormalise_bands`
+    /// into another buffer followed by the zeroing of libopus
+    /// `celt_synthesis`: every frame size, several band ranges and output
+    /// rates, log-amplitudes from -30 to 34 (above the cap of 32).
+    #[test]
+    fn spectrum_in_place_is_that_of_denormalise_bands() {
+        let mode = modes::default_mode();
+        let nb = mode.nb_ebands;
+        let mut seed = 0x5eed_7001u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for lm in 0..=3usize {
+            let n = mode.short_mdct_size << lm;
+            for (start, end) in [(0usize, 21usize), (0, 13), (0, 17), (17, 21), (17, 19), (5, 6)] {
+                for ds in [1usize, 2, 3, 4, 6] {
+                    let bound = ((mode.e_bands[end] as usize) << lm).min(n / ds);
+                    let x: Vec<f32> =
+                        (0..n).map(|_| (next() as i32 >> 8) as f32 / 8_388_608.0).collect();
+                    let amp: Vec<f32> =
+                        (0..nb).map(|_| (next() >> 16) as f32 / 1024.0 - 30.0).collect();
+
+                    let mut want = vec![f32::NAN; n];
+                    denormalise_bands(mode, &x, &mut want, &amp, start, end, 1, 1 << lm);
+                    let low = (mode.e_bands[start] as usize) << lm;
+                    want[..low].fill(0.0);
+                    want[bound..].fill(0.0);
+
+                    let mut got = x.clone();
+                    denormalise_in_place(mode, &mut got, &amp, start, end, lm, bound);
+                    let same = got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits());
+                    assert!(same, "lm {lm} bands {start}..{end} downsample {ds}");
+                }
+            }
+        }
+    }
 
     // A frame of 48 samples is not a CELT frame size (120, 240, 480 or
     // 960 at 48 kHz), and the encoder panics on it. `OpusEncoder::encode`

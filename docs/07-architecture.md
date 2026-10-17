@@ -193,7 +193,7 @@ Notes:
 ```text
 encode / encode_i16  (8-48 kHz, 1 or 2 channels, interleaved)
   ├── decide_mode_and_bandwidth: mode, bandwidth, coded channels, FEC (once per packet)
-  ├── CELT or Hybrid, 40/60 ms: encode_multiframe → two or three 20 ms frames → packet::write
+  ├── CELT or Hybrid 40-120 ms, SILK 80-120 ms: encode_multiframe → two to six parts → packet::write
   └── encode_frame
         ├── high-pass or DC filter                      hp_cutoff.rs
         ├── SILK-only or Hybrid: 16-bit samples
@@ -307,7 +307,7 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 
 ### `tests/`
 
-The repository holds 229 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
+The repository holds 234 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
 
 | Prefix | Files | What the tests cover |
 |---|---:|---|

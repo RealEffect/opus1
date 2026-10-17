@@ -6,14 +6,18 @@
 //! of VBR, the complexity, the forced mode, the bandwidth and the maximum
 //! bandwidth, the forced channel count, in-band forward error correction
 //! (FEC) and the expected packet loss, the low-frequency-effects (LFE)
-//! flag, the energy mask, prediction, the frame size, the size of the
-//! output buffer, the input signal and its format (`f32` or `i16`), or
-//! reset the encoder. A setting libopus refuses must be refused.
+//! flag, the energy mask, prediction, the expert frame duration, the frame
+//! size, the size of the output buffer, the input signal and its format
+//! (`f32` or `i16`), or reset the encoder. A setting libopus refuses must
+//! be refused.
 //!
 //! What must hold for every frame:
 //!
-//! - A frame of 2.5, 5, 10, 20, 40 or 60 ms into an output buffer of at
-//!   least 1 byte is encoded. Any other frame size is refused.
+//! - The call codes the frame libopus's `frame_size_select` chooses: a
+//!   frame of 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms, or with an expert
+//!   frame duration set, the first frame of that duration. It is encoded
+//!   into an output buffer of at least 1 byte (2 bytes for 100 ms). A call
+//!   `frame_size_select` refuses is refused.
 //! - The packet fits the buffer, and libopus's decoder decodes it to
 //!   exactly one frame. With a constant bitrate it has the length libopus's
 //!   rule gives (`cbr_packet_len`). Its final range (the state of the
@@ -33,7 +37,7 @@ mod common;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, OpusDecoder, OpusEncoder};
 
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
@@ -53,7 +57,7 @@ const BANDWIDTHS: [Bandwidth; 6] = [
 
 /// One change of a setting, made on both encoders.
 fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) -> Result<()> {
-    match u.int_in_range(0..=12)? {
+    match u.int_in_range(0..=13)? {
         0 | 1 => {
             let v = match u.int_in_range(0..=9)? {
                 0 => Bitrate::BitsPerSecond(u.arbitrary()?),
@@ -154,6 +158,13 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
                 e.set_prediction_disabled(v);
             }
         }
+        12 => {
+            // Mostly the default, which takes the frame size of the call.
+            let d = if u.ratio(1, 2)? { FrameDuration::Argument } else { *u.choose(&FrameDuration::ALL)? };
+            for e in encs {
+                e.set_expert_frame_duration(d);
+            }
+        }
         _ => {
             for e in encs {
                 e.reset_state();
@@ -185,8 +196,8 @@ fn run(data: &[u8]) -> Result<()> {
     let mut pcm16 = Vec::new();
     let mut packet = vec![0u8; MAX_OUT];
     let mut twin_packet = vec![0u8; MAX_OUT];
-    let mut c_out = vec![0f32; 2880 * 2];
-    let mut r_out = vec![0f32; 2880 * 2];
+    let mut c_out = vec![0f32; 5760 * 2];
+    let mut r_out = vec![0f32; 5760 * 2];
 
     // No packet so far had a frame that the decoders conceal: the two
     // decoders' output must be close (see `assert_close`).
@@ -207,9 +218,10 @@ fn run(data: &[u8]) -> Result<()> {
                         1 => u.int_in_range(13..=200)?,
                         2 => u.int_in_range(200..=4000)?,
                         // Above 7,500 bytes the maximum bitrate (1.5 Mb/s)
-                        // is below the bitrate of the buffer, and only there
-                        // a 40 or 60 ms packet at that bitrate is padded to
-                        // the whole buffer (opus_encoder.c:1749).
+                        // is below the bitrate of a 40 ms buffer, and only
+                        // there a packet of several frames at that bitrate
+                        // is padded to the whole buffer
+                        // (opus_encoder.c:1749).
                         _ => u.int_in_range(4000..=MAX_OUT)?,
                     }
                 }
@@ -219,13 +231,17 @@ fn run(data: &[u8]) -> Result<()> {
                 }
             }
         }
-        // Sometimes a frame size the encoder must refuse.
+        // Sometimes a frame size that is no Opus frame: 0, 1, 1, 30 and
+        // 140 ms, and 80 ms and a sample. With an expert frame duration
+        // the encoder can still code the first part of it.
         let bad_size = if u.ratio(1, 32)? {
-            Some(*u.choose(&[0, 1, fs as usize / 1000, fs as usize * 3 / 100, fs as usize / 25 * 2, fs as usize / 25 * 3])?)
+            Some(*u.choose(&[0, 1, fs as usize / 1000, fs as usize * 3 / 100, fs as usize * 7 / 50, fs as usize / 25 * 2 + 1])?)
         } else {
             None
         };
         let size = bad_size.unwrap_or(frame_size);
+        // The frame the call codes, as libopus chooses it.
+        let coded = selected_frame_size(fs, size, enc.expert_frame_duration());
         let extra = if signal_wants_bytes(&mut u)? {
             let k = u.int_in_range(0..=128)?;
             u.bytes(k)?
@@ -259,38 +275,43 @@ fn run(data: &[u8]) -> Result<()> {
             (Err(_), Err(_)) => {}
             _ => panic!("frame {n}: i16={i16_in}, encoder {r:?}, twin encoder {twin_r:?}"),
         }
-        if bad_size.is_some() {
+        let Some(coded) = coded else {
             assert!(r.is_err(), "frame {n}: frame size {size} at {fs} Hz was accepted");
+            continue;
+        };
+        // "Cannot encode 100 ms in 1 byte" (opus_encoder.c:1231).
+        if out_len == 1 && coded * 10 == fs as usize {
+            assert!(r.is_err(), "frame {n}: 100 ms into 1 byte was accepted");
             continue;
         }
         let len = match r {
             Ok(len) => len,
-            Err(e) => panic!("frame {n}: encode of {size} samples into {out_len} bytes failed: {e}"),
+            Err(e) => panic!("frame {n}: encode of {coded} of {size} samples into {out_len} bytes failed: {e}"),
         };
         assert!((1..=out_len).contains(&len), "frame {n}: packet of {len} bytes for a buffer of {out_len}");
         let p = &packet[..len];
         if !enc.vbr() {
             let setting = enc.bitrate_setting();
-            let (lo, hi) = cbr_packet_len(setting, fs, channels, size, out_len, p[0]);
+            let (lo, hi) = cbr_packet_len(setting, fs, channels, coded, out_len, p[0]);
             assert!(
                 (lo..=hi).contains(&len),
-                "frame {n}: constant bitrate {setting:?}, {size} samples, {out_len}-byte buffer: \
+                "frame {n}: constant bitrate {setting:?}, {coded} samples, {out_len}-byte buffer: \
                  {len} bytes, libopus's rule gives {lo}..={hi}"
             );
         }
         let range = enc.final_range();
 
-        let got = c_dec.decode_float(p, &mut c_out, 2880, false);
-        assert_eq!(got, size as i32, "frame {n}: libopus decodes {got} samples of a {size}-sample packet {p:02x?}");
+        let got = c_dec.decode_float(p, &mut c_out, 5760, false);
+        assert_eq!(got, coded as i32, "frame {n}: libopus decodes {got} samples of a {coded}-sample packet {p:02x?}");
         assert_eq!(c_dec.final_range(), range, "frame {n}: libopus final range, packet {p:02x?}");
 
-        let got = dec.decode(p, 2880, &mut r_out[..2880 * channels]);
-        assert_eq!(got, Ok(size), "frame {n}: opus1 decoder, packet {p:02x?}");
+        let got = dec.decode(p, 5760, &mut r_out[..5760 * channels]);
+        assert_eq!(got, Ok(coded), "frame {n}: opus1 decoder, packet {p:02x?}");
         assert_eq!(dec.final_range(), range, "frame {n}: opus1 decoder final range, packet {p:02x?}");
         clean &= whole_frames(p, 1) && !modes.leaves_celt(p, 1);
         modes.decoded(p, 1);
         if clean {
-            let k = size * channels;
+            let k = coded * channels;
             assert_close(&format!("frame {n}, packet {p:02x?}"), &r_out[..k], &c_out[..k], 1e-10);
         }
     }

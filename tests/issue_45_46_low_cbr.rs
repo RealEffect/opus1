@@ -32,7 +32,7 @@ fn issue45_starved_cbr() {
         enc.set_bitrate(Bitrate::BitsPerSecond(bps)).unwrap();
         enc.set_vbr(false);
         let input: Vec<f32> = (0..frame)
-            .map(|i| (0.3 * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / sr as f32).sin()))
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / sr as f32).sin())
             .collect();
         let mut pkt = vec![0u8; 1500];
         match enc.encode(&input, frame, &mut pkt) {
@@ -60,9 +60,8 @@ fn issue46_low_cbr() {
         enc.set_vbr(false);
         let input: Vec<f32> = (0..frame)
             .map(|i| {
-                (0.3
-                    * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / sr as f32).sin()
-                    + 0.1 * (i % 7) as f32 / 7.0)
+                0.3 * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / sr as f32).sin()
+                    + 0.1 * (i % 7) as f32 / 7.0
             })
             .collect();
         let mut pkt = vec![0u8; 1500];
