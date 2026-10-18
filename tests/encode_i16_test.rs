@@ -2,6 +2,11 @@
 //! identical packets to the float entry point `encode()` fed with the same
 //! audio converted via `sample as f32 / 32768.0`, across SILK-only,
 //! Hybrid and CELT-only modes.
+//!
+//! As libopus `opus_encode`, `encode_i16` codes at an LSB depth of at most
+//! 16 bits, where `encode` codes at 24 by default. The depth sets the
+//! noise floor of the speech and music analysis and of CELT's bit
+//! allocation, so the float encoder of each pair is set to 16 bits.
 
 use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
 
@@ -74,6 +79,7 @@ impl EncConfig {
             enc.set_inband_fec(self.fec);
             enc.set_packet_loss_perc(self.loss).unwrap();
         }
+        a.set_lsb_depth(16).unwrap();
         (a, b)
     }
 }

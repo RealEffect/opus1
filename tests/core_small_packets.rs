@@ -3,8 +3,9 @@
 //! emit 'PLC' frames" (opus_encoder.c:1340-1406).
 //!
 //! The reference is the C libopus encoder with the same settings and the
-//! same buffer. The encoders run at complexity 5, where libopus makes its
-//! decisions without the speech/music analysis that opus1 does not have.
+//! same buffer. The encoders run at complexity 5, where both make their
+//! decisions without the speech/music analysis (both run it from
+//! complexity 7 on; `core_analysis_libopus.rs` compares that).
 
 mod core_common;
 mod k24_common;

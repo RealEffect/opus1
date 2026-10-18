@@ -4,8 +4,17 @@ pub const SILK_ENC_INPUT_INVALID_NO_OF_SAMPLES: i32 = -101;
 
 pub const MAX_FRAMES_PER_PACKET: usize = 3;
 
+/// Discontinuous transmission (DTX): frames without speech (200 ms) that
+/// are still sent before DTX starts.
 pub const NB_SPEECH_FRAMES_BEFORE_DTX: i32 = 10;
+/// DTX: frames (400 ms) left out in a row before one is sent again.
 pub const MAX_CONSECUTIVE_DTX: i32 = 20;
+
+/// The `activity` the Opus layer gives SILK: no decision, SILK's voice
+/// activity detector decides (silk/define.h:57).
+pub const VAD_NO_DECISION: i32 = -1;
+/// The `activity` the Opus layer gives SILK: no activity (silk/define.h:58).
+pub const VAD_NO_ACTIVITY: i32 = 0;
 
 pub const SPEECH_ACTIVITY_DTX_THRES_Q8: i32 = 13;
 

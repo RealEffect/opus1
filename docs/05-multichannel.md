@@ -357,7 +357,7 @@ A port of libopus `OpusMSEncoder`.
 | `new(rate, channels, streams, coupled_streams, mapping, application)` | An encoder for a layout you choose. No surround mode, no LFE stream. libopus `opus_multistream_encoder_create`. |
 | `new_surround(rate, channels, family, application)` | An encoder with the layout of mapping family 0, 1, 2 or 255. libopus `opus_multistream_surround_encoder_create`. |
 | `encode(pcm, frame_size, output)` | Encodes one frame of `f32` samples (full scale ±1.0). Returns the packet length. |
-| `encode_i16(pcm, frame_size, output)` | The same for 16-bit samples. Writes the packet `encode` writes for the samples `s as f32 / 32768.0`. |
+| `encode_i16(pcm, frame_size, output)` | The same for 16-bit samples. Writes the packet `encode` writes for the samples `s as f32 / 32768.0` after `set_lsb_depth(16)`. |
 | `set_bitrate(Bitrate)`, `bitrate_setting()` | Sets and reads the total bitrate setting. |
 | `bitrate()` | The sum of the stream bitrates that the last frame used. |
 | `set_vbr(bool)`, `vbr()` | Variable bitrate (`true`, the default) or constant bitrate. |
@@ -365,6 +365,10 @@ A port of libopus `OpusMSEncoder`.
 | `set_complexity(0..=10)`, `complexity()` | Complexity of every stream. The default is 9. |
 | `set_inband_fec(bool)`, `inband_fec()` | In-band forward error correction (FEC) on every stream. Only SILK frames carry it. |
 | `set_packet_loss_perc(0..=100)`, `packet_loss_perc()` | Expected packet loss in percent. |
+| `set_inband_fec_mode(InbandFec)` | The three FEC settings of libopus on every stream (see [Using the library](06-using-the-library.md#default-settings-and-the-automatic-choice-of-mode)). |
+| `set_signal(Signal)`, `signal()` | Tells every stream that the input is voice or music, or leaves it to the speech and music analysis (`Signal::Auto`, the default). |
+| `set_lsb_depth(8..=24)`, `lsb_depth()` | The precision of the input in bits, on every stream. `encode_i16` codes with at most 16. |
+| `set_dtx(bool)`, `dtx()` | Discontinuous transmission on every stream. `dtx()` reads the first stream. |
 | `set_bandwidth(Bandwidth)`, `bandwidth()` | Fixes the bandwidth of every stream. No effect in surround mode. |
 | `set_max_bandwidth(Bandwidth)`, `max_bandwidth()` | Limits the automatic bandwidth choice. |
 | `set_force_mode(Option<ForcedMode>)` | Asks every stream for SILK-only, Hybrid or CELT-only. In surround mode the coupled streams stay CELT-only, and in ambisonics mode all streams do. |
@@ -382,6 +386,8 @@ A port of libopus `OpusMSEncoder`.
 - `pcm` holds at least `frame_size * channels` samples.
 - `frame_size` is 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms. At 48 kHz that is 120, 240, 480, 960, 1920, 2880, 3840, 4800 or 5760. With an expert frame duration set, the call codes the first frame of that duration, and `frame_size` must be at least that long.
 - `output.len()` is the largest packet allowed. The smallest buffer that can work is `2 * streams - 1` bytes.
+
+From complexity 7 on, for input at 16 to 48 kHz, every stream runs the speech and music analysis, as in libopus. Each stream reads its own channels from the interleaved input of the call: a coupled stream sums its two channels and halves the sum, a mono stream reads its one channel. A 5.1 encoder therefore runs 4 analyses per frame, and a 7.1 encoder 5. The LFE stream runs one too, though LFE mode ignores most of its results.
 
 ### `MultistreamDecoder`
 
@@ -625,6 +631,6 @@ These differences from libopus 1.6.1 are known. The figures come from the projec
 
 - **Bandwidth with an automatic or maximum bitrate in surround mode.** libopus compares the raw setting (−1000 or −1) with the thresholds, so it always chooses narrowband. `opus1` uses the allocated bitrate and codes fullband. This is deliberate.
 - **Expert frame duration.** libopus's multistream encoder stores any number given to `OPUS_SET_EXPERT_FRAME_DURATION`, and then refuses every encode call when the number is no duration. `opus1` takes a `FrameDuration`, which holds only the ten values libopus defines. For those values both encoders take and refuse the same calls (`tests/multistream_long_frames.rs`). Frames of 80, 100 and 120 ms, which earlier versions did not offer (difference D3), are coded as libopus codes them.
-- **Controls.** The multistream encoder has no control for these: the least significant bit (LSB) depth, the signal type, discontinuous transmission (DTX), the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`.
-- **Rate use without the speech/music analysis.** libopus's speech/music analysis is not ported. At 16 kHz and with `Application::Voip`, the `opus1` multistream encoder used 65 % to 80 % of the requested rate in four test cases, where libopus used 101 % to 102 %. In the test matrix of `tests/multistream_enc_validity.rs`, libopus wrote some packets with a stereo Hybrid stream: 128 at 8 kilobits per second (kb/s) per channel, and 111 at 24 kb/s per channel. `opus1` wrote none.
+- **Controls.** The multistream encoder has no control for these: the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`. The least significant bit (LSB) depth, the signal type, discontinuous transmission (DTX) and the in-band FEC mode are set on every stream, as in libopus (`set_lsb_depth`, `set_signal`, `set_dtx`, `set_inband_fec_mode`).
+- **Rate use and stereo Hybrid streams.** Each stream runs the speech and music analysis, as in libopus. At 16 kHz and with `Application::Voip`, the `opus1` multistream encoder codes -12.8 % to +4.1 % around the requested rate in the 25 cases of `tests/multistream_enc_signals.rs` (libopus +0.3 % to +8.3 %). In the test matrix of `tests/multistream_enc_validity.rs`, both write the same number of packets with a stereo Hybrid stream: 239, of which libopus writes 128 at 8 kilobits per second (kb/s) per channel and 111 at 24 kb/s per channel. Before the analysis was ported, `opus1` used 65 % to 80 % of the rate in four of the cases and wrote no such packet.
 - **Family 3 (projection)** is not supported.

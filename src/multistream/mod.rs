@@ -146,6 +146,12 @@ pub(crate) trait ChannelSource {
 pub(crate) trait Sample: Copy {
     /// Silence.
     const ZERO: Self;
+    /// The precision libopus gives this input type: 24 bits for `f32`
+    /// (`MAX_ENCODING_DEPTH`) and 16 for `i16`.
+    const LSB_DEPTH: i32;
+    /// The samples as the speech and music analysis reads them: libopus
+    /// `downmix_float` for `f32` and `downmix_int` for `i16`.
+    fn analysis_pcm(pcm: &[Self]) -> crate::analysis::PcmRef<'_>;
     /// The sample as `f32` with full scale 1.0.
     fn to_f32(self) -> f32;
     /// An `f32` sample with full scale 1.0 as this type.
@@ -154,6 +160,12 @@ pub(crate) trait Sample: Copy {
 
 impl Sample for f32 {
     const ZERO: f32 = 0.0;
+    const LSB_DEPTH: i32 = 24;
+
+    #[inline(always)]
+    fn analysis_pcm(pcm: &[f32]) -> crate::analysis::PcmRef<'_> {
+        crate::analysis::PcmRef::F32(pcm)
+    }
 
     #[inline(always)]
     fn to_f32(self) -> f32 {
@@ -168,6 +180,12 @@ impl Sample for f32 {
 
 impl Sample for i16 {
     const ZERO: i16 = 0;
+    const LSB_DEPTH: i32 = 16;
+
+    #[inline(always)]
+    fn analysis_pcm(pcm: &[i16]) -> crate::analysis::PcmRef<'_> {
+        crate::analysis::PcmRef::I16(pcm)
+    }
 
     /// libopus `INT16TORES` in the float build.
     #[inline(always)]

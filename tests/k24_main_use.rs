@@ -104,6 +104,10 @@ fn own_encoder_stream_decodes_like_libopus() {
             let mut enc_i = opus1::OpusEncoder::new(24000, 1, opus1::Application::Voip).unwrap();
             enc_f.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             enc_i.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            // `encode_i16` codes at a depth of 16 bits, as libopus
+            // `opus_encode` does; the float input says so to give the
+            // same packets.
+            enc_f.set_lsb_depth(16).unwrap();
             let mut out_f = vec![0u8; 4000];
             let mut out_i = vec![0u8; 4000];
             let mut packets = Vec::new();

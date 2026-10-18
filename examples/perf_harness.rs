@@ -20,6 +20,9 @@
 //! * `resampler` checks the resampler behind the speech signals with sine
 //!   tones.
 //! * `spread` compares several `bench --json` files.
+//! * `pairs` compares two builds that ran in turns.
+//! * `analysis` times the speech and music analysis alone, opus1 against
+//!   libopus.
 //!
 //! The C side is libopus, linked through `audiopus_sys`. Both encoders are
 //! forced to the coding mode, the audio bandwidth and the channel count
@@ -35,9 +38,10 @@
 //! * The C library is a float build. Its SILK encoder is the floating-point
 //!   one (`silk/float`); the SILK encoder of opus1 is a port of the
 //!   fixed-point one.
-//! * libopus 1.6 runs an encoder step that opus1 does not have, the
-//!   tonality analysis. It is listed at `Scenario::c_only_steps`, and
-//!   `bench` names it per scenario in the column `only C runs`.
+//! * Without its cargo feature `analysis` (on by default), opus1 does not
+//!   run the tonality analysis that libopus runs from complexity 7 on. It is
+//!   listed at `Scenario::c_only_steps`, and `bench` names it per scenario
+//!   in the column `only C runs`.
 //!
 //! `bench` and `modes` report every scenario in which the two sides differ
 //! in encoder settings, packet configuration, bit rate or decoded audio.
@@ -332,7 +336,8 @@ impl Scenario {
     ///
     /// * `analysis`: the tonality analysis, `run_analysis` in `analysis.c`.
     ///   libopus runs it at complexity 7 and above for input from 16 kHz
-    ///   (`opus_encoder.c`). opus1 does not have it.
+    ///   (`opus_encoder.c`). opus1 runs it too, unless it is built without
+    ///   the cargo feature `analysis`.
     ///
     /// Two steps of libopus that opus1 also runs are not listed:
     ///
@@ -346,14 +351,12 @@ impl Scenario {
     /// The C encoder time of a scenario that lists a step includes that
     /// step, so its Rust/C encode ratio flatters opus1.
     ///
-    /// The list holds the large steps only. `opus_encoder.c` also has small
-    /// per-frame steps without a counterpart in opus1: the digital silence
-    /// check and the frame energy tracker, which serve discontinuous
-    /// transmission. (The stereo width estimate and the gain reduction of
-    /// the upper band in Hybrid are ported.)
+    /// The list holds the large steps only. (The digital silence check, the
+    /// frame energy tracker, the stereo width estimate and the gain
+    /// reduction of the upper band in Hybrid are ported.)
     fn c_only_steps(&self) -> Vec<&'static str> {
         let mut steps = Vec::new();
-        if self.complexity >= 7 && self.rate >= 16000 {
+        if !cfg!(feature = "analysis") && self.complexity >= 7 && self.rate >= 16000 {
             steps.push("analysis");
         }
         steps
@@ -2402,7 +2405,7 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
     );
     let _ = writeln!(
         header,
-        "- `only C runs` lists encoder steps that libopus runs for the scenario and opus1 does not have: `analysis` (tonality analysis); the C encode time includes them, so the encode ratio of such a row flatters opus1"
+        "- `only C runs` lists encoder steps that libopus runs for the scenario and opus1 does not: `analysis` (tonality analysis, when opus1 is built without its feature `analysis`); the C encode time includes them, so the encode ratio of such a row flatters opus1"
     );
     let _ = writeln!(
         header,
@@ -2846,6 +2849,304 @@ fn cmd_run(opts: &Opts) -> Result<i32, String> {
         elapsed.as_secs_f64(),
         elapsed.as_nanos() as f64 / frames as f64
     );
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// analysis: the speech and music analysis alone
+// ---------------------------------------------------------------------------
+
+/// The analysis functions of libopus (`src/analysis.c`, `src/mlp.c`). They
+/// are not `static`, so a program that links the static library can call
+/// them. tests/analysis_common/mod.rs declares the same functions with the
+/// full state layout.
+#[cfg(feature = "analysis")]
+mod c_analysis {
+    use std::os::raw::{c_int, c_void};
+
+    /// libopus `AnalysisInfo`, 64 bytes. Only its size matters here.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Info {
+        pub valid: c_int,
+        pub floats: [f32; 7],
+        pub bandwidth: c_int,
+        pub more: [f32; 2],
+        pub leak_boost: [u8; 19],
+    }
+
+    /// `sizeof(TonalityAnalysisState)` in the float build, in 4-byte words
+    /// (14,004 bytes).
+    pub const STATE_WORDS: usize = 14004 / 4;
+
+    /// libopus `AnalysisDenseLayer` and `AnalysisGRULayer`, as opaque data.
+    #[repr(C)]
+    pub struct Layer {
+        _private: [u8; 0],
+    }
+
+    pub type Downmix = unsafe extern "C" fn(*const c_void, *mut f32, c_int, c_int, c_int, c_int, c_int);
+
+    unsafe extern "C" {
+        pub fn tonality_analysis_init(st: *mut u32, fs: i32);
+        #[allow(clippy::too_many_arguments)]
+        pub fn run_analysis(
+            st: *mut u32,
+            celt_mode: *const c_void,
+            analysis_pcm: *const c_void,
+            analysis_frame_size: c_int,
+            frame_size: c_int,
+            c1: c_int,
+            c2: c_int,
+            channels: c_int,
+            fs: i32,
+            lsb_depth: c_int,
+            downmix: Downmix,
+            info: *mut Info,
+        );
+        pub fn downmix_float(x: *const c_void, y: *mut f32, subframe: c_int, offset: c_int, c1: c_int, c2: c_int, c: c_int);
+        pub fn opus_custom_mode_create(fs: i32, frame_size: c_int, error: *mut c_int) -> *const c_void;
+        pub fn analysis_compute_dense(layer: *const Layer, output: *mut f32, input: *const f32);
+        pub fn analysis_compute_gru(layer: *const Layer, state: *mut f32, input: *const f32);
+        pub static layer0: Layer;
+        pub static layer1: Layer;
+        pub static layer2: Layer;
+    }
+}
+
+/// One case of the `analysis` command: an input rate, a channel count and
+/// a signal.
+#[cfg(feature = "analysis")]
+struct AnalysisCase {
+    name: &'static str,
+    rate: u32,
+    channels: usize,
+    signal: Signal,
+}
+
+#[cfg(feature = "analysis")]
+const ANALYSIS_CASES: [AnalysisCase; 6] = [
+    AnalysisCase { name: "16k_mono_speech", rate: 16000, channels: 1, signal: Signal::Speech },
+    AnalysisCase { name: "24k_mono_music", rate: 24000, channels: 1, signal: Signal::Music },
+    AnalysisCase { name: "48k_mono_music", rate: 48000, channels: 1, signal: Signal::Music },
+    AnalysisCase { name: "48k_mono_speech", rate: 48000, channels: 1, signal: Signal::Speech },
+    AnalysisCase { name: "48k_stereo_music", rate: 48000, channels: 2, signal: Signal::Music },
+    AnalysisCase { name: "48k_stereo_speech", rate: 48000, channels: 2, signal: Signal::Speech },
+];
+
+/// Times opus1's analysis of the whole clip, in 20 ms calls, as
+/// `OpusEncoder` calls it.
+#[cfg(feature = "analysis")]
+#[inline(never)]
+fn time_rust_analysis(case: &AnalysisCase, pcm: &[f32]) -> Duration {
+    use opus1::internals::analysis::{AnalysisPcm, PcmRef, SecondChannel, TonalityAnalysisState};
+    let frame = case.rate as usize / 50;
+    let step = frame * case.channels;
+    let mut st = Box::new(TonalityAnalysisState::new(case.rate as i32));
+    let mut valid = 0usize;
+    let start = Instant::now();
+    for chunk in pcm.chunks_exact(step) {
+        let input = AnalysisPcm {
+            pcm: PcmRef::F32(black_box(chunk)),
+            channels: case.channels,
+            c1: 0,
+            c2: SecondChannel::AllOthers,
+            frame_size: frame,
+        };
+        valid += usize::from(st.run(input, frame, 24).valid);
+    }
+    let elapsed = start.elapsed();
+    black_box((valid, &st));
+    elapsed
+}
+
+/// Times libopus's `run_analysis` on the same calls.
+#[cfg(feature = "analysis")]
+#[inline(never)]
+fn time_c_analysis(case: &AnalysisCase, pcm: &[f32], mode: *const std::os::raw::c_void) -> Duration {
+    let frame = case.rate as usize / 50;
+    let step = frame * case.channels;
+    let mut st = vec![0u32; c_analysis::STATE_WORDS];
+    // SAFETY: `st` has the size of the C state; init writes only into it.
+    unsafe { c_analysis::tonality_analysis_init(st.as_mut_ptr(), case.rate as i32) };
+    let mut info = c_analysis::Info::default();
+    let mut valid = 0usize;
+    let start = Instant::now();
+    for chunk in pcm.chunks_exact(step) {
+        let chunk = black_box(chunk);
+        // SAFETY: `chunk` holds `frame` samples of each channel, the state
+        // was initialised above, and `mode` is libopus's static mode.
+        unsafe {
+            c_analysis::run_analysis(
+                st.as_mut_ptr(),
+                mode,
+                chunk.as_ptr().cast(),
+                frame as c_int,
+                frame as c_int,
+                0,
+                -2,
+                case.channels as c_int,
+                case.rate as i32,
+                24,
+                c_analysis::downmix_float,
+                &mut info,
+            )
+        };
+        valid += usize::from(info.valid != 0);
+    }
+    let elapsed = start.elapsed();
+    black_box((valid, &st));
+    elapsed
+}
+
+/// The 25 inputs of the network for `frames` frames, from a fixed seed, in
+/// the range of the real features.
+#[cfg(feature = "analysis")]
+fn network_inputs(frames: usize) -> Vec<[f32; 25]> {
+    let mut rng = XorShift(0x5EED_A2A2_0000_0001);
+    (0..frames)
+        .map(|_| std::array::from_fn(|_| (rng.uniform() * 2.0) as f32))
+        .collect()
+}
+
+/// Times opus1's network (dense, recurrent, dense) on `inputs`.
+#[cfg(feature = "analysis")]
+#[inline(never)]
+fn time_rust_network(inputs: &[[f32; 25]]) -> Duration {
+    use opus1::internals::analysis::mlp::{LAYER0, LAYER1, LAYER2, compute_dense, compute_gru};
+    let mut state = [0.0f32; 32];
+    let mut sum = 0.0f32;
+    let start = Instant::now();
+    for x in inputs {
+        let mut hidden = [0.0f32; 32];
+        let mut probs = [0.0f32; 2];
+        compute_dense(&LAYER0, &mut hidden, black_box(x));
+        compute_gru(&LAYER1, &mut state, &hidden);
+        compute_dense(&LAYER2, &mut probs, &state);
+        sum += probs[0];
+    }
+    let elapsed = start.elapsed();
+    black_box((sum, &state));
+    elapsed
+}
+
+/// Times libopus's network on the same inputs.
+#[cfg(feature = "analysis")]
+#[inline(never)]
+fn time_c_network(inputs: &[[f32; 25]]) -> Duration {
+    let mut state = [0.0f32; 32];
+    let mut sum = 0.0f32;
+    let start = Instant::now();
+    for x in inputs {
+        let mut hidden = [0.0f32; 32];
+        let mut probs = [0.0f32; 2];
+        let x = black_box(x);
+        // SAFETY: the buffers have the sizes of the layers of libopus
+        // (25 inputs, 32 hidden values, 24 recurrent values, 2 outputs).
+        unsafe {
+            c_analysis::analysis_compute_dense(&c_analysis::layer0, hidden.as_mut_ptr(), x.as_ptr());
+            c_analysis::analysis_compute_gru(&c_analysis::layer1, state.as_mut_ptr(), hidden.as_ptr());
+            c_analysis::analysis_compute_dense(&c_analysis::layer2, probs.as_mut_ptr(), state.as_ptr());
+        }
+        sum += probs[0];
+    }
+    let elapsed = start.elapsed();
+    black_box((sum, &state));
+    elapsed
+}
+
+/// `analysis`: times the speech and music analysis of opus1 against
+/// libopus's `run_analysis`, without the encoder, and the network alone.
+///
+/// Each repetition runs the whole clip once with each library, in 20 ms
+/// calls from a fresh state. The two alternate, and the order turns on
+/// every repetition, as in `bench`.
+#[cfg(feature = "analysis")]
+fn cmd_analysis(opts: &Opts) -> Result<i32, String> {
+    let seconds: f64 = opts.number("--seconds", 10.0)?;
+    let reps: usize = opts.number("--reps", 15)?;
+    if reps == 0 || seconds.is_nan() || seconds <= 0.1 {
+        return Err("--reps must be at least 1 and --seconds more than 0.1".to_string());
+    }
+    let filter = opts.get("--filter");
+    let raised = raise_thread_priority();
+    let mut signals = Signals::load()?;
+    let mut err = 0;
+    // SAFETY: plain call; libopus returns its static 48 kHz mode.
+    let mode = unsafe { c_analysis::opus_custom_mode_create(48000, 960, &mut err) };
+    if mode.is_null() || err != 0 {
+        return Err(format!("opus_custom_mode_create failed: {err}"));
+    }
+    println!(
+        "speech and music analysis, {seconds} s per pass, {reps} passes, libopus {}{}",
+        libopus_version(),
+        if raised { "" } else { " (thread priority not raised)" }
+    );
+    println!("| Case | opus1 min µs | opus1 median µs | libopus min µs | libopus median µs | Ratio of medians |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    let mut json = String::new();
+    let mut report = |name: &str, rust: &[Duration], c: &[Duration], frames: usize| {
+        let r = stat(rust, frames);
+        let c = stat(c, frames);
+        println!(
+            "| {name} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
+            r.min_ns / 1e3,
+            r.median_ns / 1e3,
+            c.min_ns / 1e3,
+            c.median_ns / 1e3,
+            r.median_ns / c.median_ns
+        );
+        let _ = writeln!(
+            json,
+            "{{\"case\": {}, \"rust_min_ns\": {:.1}, \"rust_median_ns\": {:.1}, \"c_min_ns\": {:.1}, \"c_median_ns\": {:.1}}}",
+            json_string(name),
+            r.min_ns,
+            r.median_ns,
+            c.min_ns,
+            c.median_ns
+        );
+    };
+    for case in &ANALYSIS_CASES {
+        if !name_matches(case.name, filter) {
+            continue;
+        }
+        let sc = Scenario::new(Mode::Celt, case.rate, case.channels, 64_000, 9).signal(case.signal);
+        let clip = signals.clip(&sc, seconds, 0);
+        let (mut rust, mut c) = (Vec::new(), Vec::new());
+        // One warm-up pass of each, not counted.
+        time_rust_analysis(case, &clip.pcm);
+        time_c_analysis(case, &clip.pcm, mode);
+        for rep in 0..reps {
+            if rep % 2 == 0 {
+                rust.push(time_rust_analysis(case, &clip.pcm));
+                c.push(time_c_analysis(case, &clip.pcm, mode));
+            } else {
+                c.push(time_c_analysis(case, &clip.pcm, mode));
+                rust.push(time_rust_analysis(case, &clip.pcm));
+            }
+        }
+        report(case.name, &rust, &c, clip.frames);
+    }
+    if name_matches("network", filter) {
+        let frames = (seconds * 50.0) as usize;
+        let inputs = network_inputs(frames);
+        let (mut rust, mut c) = (Vec::new(), Vec::new());
+        time_rust_network(&inputs);
+        time_c_network(&inputs);
+        for rep in 0..reps {
+            if rep % 2 == 0 {
+                rust.push(time_rust_network(&inputs));
+                c.push(time_c_network(&inputs));
+            } else {
+                c.push(time_c_network(&inputs));
+                rust.push(time_rust_network(&inputs));
+            }
+        }
+        report("network", &rust, &c, frames);
+    }
+    if let Some(path) = opts.get("--json") {
+        write_file(path, &json)?;
+    }
     Ok(0)
 }
 
@@ -4272,6 +4573,12 @@ const USAGE: &str = "usage: perf_harness <command> [options]
       every median time from BASE to CAND, lowest to highest over the
       pairs, and marks changes that have the same sign in every pair.
 
+  analysis [--filter SUBSTR] [--reps N] [--seconds S] [--json PATH]
+      Time the speech and music analysis alone: opus1 against libopus's
+      run_analysis, in 20 ms calls, at 16, 24 and 48 kHz, and the network
+      alone. Defaults: 15 passes of 10 s. Needs the cargo feature
+      `analysis`.
+
 Code placement: the speed of some functions depends on where the linker puts
 them (up to about 2 % per scenario on Apple M4 Pro and on a Cortex-A76, 4 %
 for libopus on the A76). Build with PERF_HARNESS_PAD=<bytes>
@@ -4327,6 +4634,9 @@ fn main() {
         "resampler" => Opts::parse(rest, &[], &[]).and_then(|_| cmd_resampler()),
         "spread" => cmd_spread(rest),
         "pairs" => cmd_pairs(rest),
+        #[cfg(feature = "analysis")]
+        "analysis" => Opts::parse(rest, &["--seconds", "--reps", "--filter", "--json"], &[])
+            .and_then(|opts| cmd_analysis(&opts)),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(0)

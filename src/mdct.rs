@@ -110,6 +110,14 @@ impl MdctLookup {
         trig
     }
 
+    /// The FFT plan of the transform size `self.n >> shift`, with
+    /// `(self.n >> shift) / 4` points (libopus `mdct.kfft[shift]`). The speech and music analysis
+    /// uses the 480-point plan of the 48 kHz mode.
+    #[cfg_attr(not(feature = "analysis"), allow(dead_code))]
+    pub(crate) fn kfft(&self, shift: usize) -> Option<&KissFftState> {
+        self.kfft.get(shift).and_then(Option::as_ref)
+    }
+
     /// The plan of the transform size `self.n >> shift`.
     #[inline]
     fn plan(&self, shift: usize) -> Plan<'_> {

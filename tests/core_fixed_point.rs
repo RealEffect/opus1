@@ -9,6 +9,11 @@
 //! 32-bit hash (FNV-1a) of every packet that build wrote for the same input
 //! and the same settings, packet by packet.
 //!
+//! The fixed-point build runs its speech and music analysis at complexity
+//! 10 only, so every encoder here uses that gate
+//! (`AnalysisGate::FixedPointBuild`). At complexity 7 to 9 opus1 would
+//! otherwise run the analysis, as the float build does.
+//!
 //! The packets were made with the source of the official libopus 1.6.1
 //! release, built with `cc` and `-O2 -DFIXED_POINT -DOPUS_BUILD
 //! -DVAR_ARRAYS -DHAVE_LRINTF -DHAVE_LRINT` and no other options, driven by
@@ -28,6 +33,7 @@ mod k24_common;
 
 use opus1::internals::range_coder::RangeCoder;
 use opus1::internals::silk::dec_api::SilkDecoder;
+use opus1::internals::analysis::{AnalysisGate, set_analysis_gate};
 use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 
 /// FNV-1a, 32 bits.
@@ -56,6 +62,7 @@ struct Packet {
 fn first_difference(channels: usize, pcm: &[i16], script: &[Packet], want: &[u32]) -> Option<usize> {
     let frame = 320;
     let mut enc = OpusEncoder::new(16000, channels, Application::Voip).unwrap();
+    set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
     enc.set_bandwidth(Bandwidth::Wideband);
     let mut buf = vec![0u8; 4000];
@@ -340,6 +347,7 @@ fn hybrid_at_a_constant_bitrate_codes_the_silk_layer_of_libopus() {
     let pcm: Vec<i16> = speech_16k(3.0).iter().flat_map(|&v| [v, v, v]).collect();
     let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
     opus1::internals::silk_input::set_integer_hp_at_48k(&mut enc, true);
+    set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_complexity(9).unwrap();
     enc.set_vbr(false);
@@ -405,6 +413,7 @@ fn both_stereo_channels_make_room_for_the_redundant_frame_of_a_rate_switch() {
         .map(|&v| (v * 32768.0).round() as i16)
         .collect();
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     enc.set_complexity(9).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
@@ -513,6 +522,7 @@ fn stereo_that_starts_with_a_silk_rate_switch_runs_the_side_through_the_transiti
         .collect();
     let frame = 160;
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_complexity(5).unwrap();
     let mut buf = vec![0u8; 4000];
     let mut differ = Vec::new();
@@ -569,6 +579,7 @@ fn prediction_disabled_codes_every_silk_packet_alone_like_libopus() {
         .collect();
     let frame = 320;
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_complexity(9).unwrap();
     enc.set_inband_fec(true);
@@ -627,6 +638,7 @@ fn a_stereo_silk_rate_switch_gives_the_side_the_mids_low_pass_state() {
         .collect();
     let frame = 320;
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(40000)).unwrap();
     enc.set_complexity(5).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
@@ -665,4 +677,205 @@ const STEREO_RATE_SWITCH: [u32; 160] = [
     0x56498475, 0x56498475, 0x10cee923, 0x17c5fdc5, 0x56498475, 0x56498475, 0x10cee923, 0x17c5fdc5,
     0x56498475, 0x56498475, 0x10cee923, 0x17c5fdc5, 0x56498475, 0x56498475, 0x19fa72d9, 0xa077b81d,
     0xd1f93d49, 0xf817c8cb, 0x0aa733fe, 0x1722dfb7, 0x696d3578, 0xf167616e, 0x61757b3b, 0x2c2388e6,
+];
+
+/// Speech with three pauses, as 16-bit samples: digital silence (0.7 s),
+/// noise at -60 dBFS (0.9 s), and noise below the 16-bit step, which the
+/// conversion to 16 bits turns into digital silence (0.7 s). 4.8 s in all.
+fn speech_with_pauses(channels: usize) -> Vec<i16> {
+    let n = |s: f64| (s * 16000.0) as usize;
+    let mut seed = 7u32;
+    let mut noise = |len: usize, level: f32| -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                level * ((seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0)
+            })
+            .collect()
+    };
+    let talk = k24_common::speech(16000, 2.5);
+    let mut x = talk[..n(1.0)].to_vec();
+    x.extend(std::iter::repeat_n(0.0, n(0.7)));
+    x.extend_from_slice(&talk[n(1.0)..n(1.6)]);
+    x.extend(noise(n(0.9), 1e-3));
+    x.extend_from_slice(&talk[n(1.6)..n(2.1)]);
+    x.extend(noise(n(0.7), 1e-5));
+    x.extend_from_slice(&talk[n(2.1)..n(2.5)]);
+    let x = if channels == 2 { k24_common::to_stereo(&x, 16000) } else { x };
+    x.iter().map(|&v| (v * 32768.0).round() as i16).collect()
+}
+
+/// Discontinuous transmission (DTX) decided by SILK, as below the gate of
+/// the analysis: SILK counts the frames without speech, and from the 11th
+/// on returns no bytes for up to 20 frames (enc_API.c:273, 550-553;
+/// encode_frame_FIX.c:62-79). The packet is then its TOC byte, and the
+/// Opus layer skips the rest of the frame (opus_encoder.c:2242-2249).
+/// With the `Voip` application libopus codes speech with SILK when SILK's
+/// DTX is on (opus_encoder.c:1521).
+///
+/// Every packet is the fixed-point build's, and so is `in_dtx`
+/// (`OPUS_GET_IN_DTX`) after it: each hash covers the packet followed by
+/// one byte for `in_dtx`. The streams cover 20 to 120 ms, mono and stereo,
+/// VBR and CBR, and complexity 0 to 9. In a packet of several frames each
+/// frame is left out on its own, and with CBR the packet is padded unless
+/// every frame was left out (opus_encoder.c:1818-1831). Packets of several
+/// frames are compared with CBR only: with VBR opus1 leaves out libopus's
+/// limit of each frame to its share of the bitrate on purpose.
+///
+/// The hashes were recorded with the same build as the others in this
+/// file. Its Opus layer and SILK's DTX code (`src/opus_encoder.c`,
+/// `silk/enc_API.c`, `silk/fixed/encode_frame_FIX.c`, `silk/VAD.c`) are
+/// those of libopus 1.6.1 to the byte.
+#[test]
+fn silk_dtx_leaves_out_the_frames_of_libopus() {
+    /// One stream: channels, frame duration in ms, bitrate, complexity,
+    /// VBR, and the hashes of its packets.
+    struct Stream(usize, usize, i32, i32, bool, &'static [u32]);
+    let streams = [
+        ("mono 20 ms VBR c5", Stream(1, 20, 16000, 5, true, &DTX_MONO_20MS)),
+        ("stereo 20 ms VBR c9", Stream(2, 20, 24000, 9, true, &DTX_STEREO_20MS)),
+        ("mono 60 ms CBR c2", Stream(1, 60, 20000, 2, false, &DTX_MONO_60MS_CBR)),
+        ("mono 120 ms CBR c6", Stream(1, 120, 16000, 6, false, &DTX_MONO_120MS_CBR)),
+        ("stereo 100 ms CBR c8", Stream(2, 100, 20000, 8, false, &DTX_STEREO_100MS_CBR)),
+        ("mono 40 ms VBR c0", Stream(1, 40, 12000, 0, true, &DTX_MONO_40MS)),
+    ];
+    for (name, Stream(channels, frame_ms, bitrate, complexity, vbr, want)) in streams {
+        let pcm = speech_with_pauses(channels);
+        let frame = 16 * frame_ms;
+        let mut enc = OpusEncoder::new(16000, channels, Application::Voip).unwrap();
+        set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
+        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_complexity(complexity).unwrap();
+        enc.set_vbr(vbr);
+        enc.set_dtx(true);
+        let mut buf = vec![0u8; 4000];
+        let (mut differ, mut left_out) = (Vec::new(), 0);
+        assert_eq!(pcm.len() / (frame * channels), want.len(), "{name}");
+        for (i, input) in pcm.chunks_exact(frame * channels).enumerate() {
+            let n = enc.encode_i16(input, frame, &mut buf).unwrap();
+            let packet = &buf[..n];
+            let parsed = opus1::packet::parse(packet, false).unwrap();
+            left_out += parsed.frames(packet).filter(|f| f.is_empty()).count();
+            if fnv1a(&[packet, &[enc.in_dtx() as u8]].concat()) != want[i] {
+                differ.push(i);
+            }
+        }
+        assert!(differ.is_empty(), "{name}: packets that are not libopus's: {differ:?}");
+        assert!(left_out >= 14, "{name}: only {left_out} frames left out");
+    }
+}
+
+/// `silk_dtx_leaves_out_the_frames_of_libopus`.
+const DTX_MONO_20MS: [u32; 240] = [
+    0xebf099af, 0xfebe0f03, 0xdef3d58c, 0x11e9d1ef, 0xc603fbbc, 0x7fe9f6c0, 0x99d33672, 0x038f7b4c,
+    0xb55e7c53, 0x8818f299, 0x78a37a81, 0x8c676d39, 0xed9ba647, 0xd674c730, 0xbac79726, 0xddb794b0,
+    0xd59f2e67, 0xda3ea0f0, 0x93a0e210, 0x4489ce3a, 0x438de263, 0xcc5bbbb0, 0x6dd75a26, 0x7772d40b,
+    0x6a5de3fa, 0xd2b1142a, 0xff668bf1, 0xc9e650f9, 0xe147d885, 0xdb12bb28, 0x32893ade, 0xff3999ee,
+    0x99529ecc, 0xccf1fe2e, 0x0e18d2ed, 0x11db56e7, 0xcf03eee6, 0x2c990da2, 0xfff76aad, 0xfe5eb630,
+    0x890d7afa, 0x611ac57a, 0x647b02d9, 0x96b20530, 0xb07ff8e0, 0x1dc225ba, 0x3c8c4b1f, 0xd75d6c61,
+    0x09ac3dd2, 0x6dd5d642, 0xa7584573, 0x6bbf37da, 0x2f5103fa, 0xa2cd7ce9, 0xa2cd7ce9, 0xd7a41833,
+    0xd7a41833, 0xa2cd7ce9, 0xa2cd7ce9, 0xd6a416a0, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42,
+    0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42,
+    0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42,
+    0xd6a416a0, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xcc603190, 0x3f6fe998, 0x09e2e12b,
+    0x4c0823bb, 0x0834efa0, 0x1ba2f175, 0x52f80b89, 0x19fb8719, 0x3e6ae6ec, 0xcdf0a856, 0xb77e41a5,
+    0x0596c3c8, 0xac5e8442, 0x6cf18d25, 0xadaa6bfc, 0xb74bd128, 0x421f98f1, 0x8867655e, 0xbea20649,
+    0x458eda9d, 0x3bdeff12, 0x0e0d2acc, 0xa3b437ff, 0x51df6ba9, 0x40a31d74, 0x5d0e5d81, 0xedc2e5aa,
+    0x557b0c6c, 0x3595331d, 0x1d37db30, 0x484dfec9, 0x77a1b6a7, 0xa0d79298, 0xfa505b76, 0x588367d5,
+    0x383c249a, 0x66ab0595, 0xb4494d32, 0x2ae8f017, 0xfef4440d, 0x49a4daa8, 0xd9517c8d, 0x73db7fef,
+    0xa41bef2d, 0xa411251b, 0xec296848, 0x64019c5d, 0x06975cff, 0x401574f3, 0x37b52a10, 0xe3d31f6f,
+    0x58e7c67e, 0x83ff47d0, 0x3015b7bd, 0x259448e1, 0xce8b1fcc, 0x6a3f0d17, 0x2394e28b, 0x66c8e23d,
+    0xddfcecad, 0x58b4516d, 0x2fe5343c, 0xf7b41e99, 0x057a2546, 0x89caf0ff, 0x5dcd0a39, 0x40b7c201,
+    0xcff250a4, 0xe7528ffe, 0x65fb6f1c, 0xf5072701, 0xbf11c6d6, 0x00bf4dd1, 0xb938951a, 0xb7b91eb5,
+    0x91c14a66, 0x7e26637c, 0x8afa0043, 0x469b37b6, 0x9342fa5c, 0x4faed679, 0xcb8533ec, 0xd79b0397,
+    0x78c083f3, 0x5bb5ca53, 0x4cf1b1bf, 0x1fb64f22, 0x2d62f006, 0x2ce20636, 0x01743e9a, 0xe59ca78b,
+    0xb92eb253, 0x39a1b820, 0x4380e15e, 0x26edd5eb, 0xf6822892, 0x02188ab0, 0x79dc3389, 0x17141e80,
+    0x1b67e328, 0xb707a54b, 0x7dda8bbf, 0x76e5ca6d, 0xd7a41833, 0xfadc48c8, 0xa2cd7ce9, 0xd7a41833,
+    0xd7a41833, 0xa2cd7ce9, 0xa1cd7b56, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42,
+    0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42,
+    0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xd6a416a0,
+    0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0xbfebcf42, 0x26375f06, 0xfe59cd23, 0x3136b5ec, 0x3bcf65d7,
+    0x5a5e62a0, 0x05131965, 0xaf7a4eda, 0x656f7ecf, 0xda0ef76d, 0x9c0da479, 0x0881de30, 0xf54c5467,
+    0xcf46f725, 0x8914c02e, 0x7632e032, 0x3b7a8c46, 0x160fd93e, 0x6d6ad51b, 0x07f9907f, 0x2e651c71,
+];
+/// `silk_dtx_leaves_out_the_frames_of_libopus`.
+const DTX_STEREO_20MS: [u32; 240] = [
+    0x511353f9, 0x2d968e7f, 0xe2d35693, 0x00e446ca, 0x665acba8, 0xbc7063ae, 0x96aab41c, 0x04307134,
+    0xfd090b9b, 0xe07d0d8a, 0xef6fa7b2, 0xd9a64ed9, 0x23df7570, 0xe5341f48, 0xe1d71ac7, 0x57590a03,
+    0x61d25a8a, 0xb32a1eca, 0x62c48b21, 0x75a1ae4a, 0x5599ae63, 0xb3350f8a, 0x80721840, 0x83441744,
+    0xf951acc2, 0x997da629, 0x62d1dcc5, 0x8b470dab, 0xc4b0d42e, 0x8e87509f, 0x3733cc13, 0x1cf770e4,
+    0x7905c45e, 0xf58cca77, 0xbae0b99f, 0xf7f36c07, 0xca189488, 0x6f6f4e6a, 0x3d86e385, 0xf68d19ef,
+    0xa382b91d, 0x76af60d7, 0x9ee61cf8, 0x17748f83, 0x828f4be0, 0x510a1902, 0xd628d27d, 0xb7b12fc3,
+    0xea075b3b, 0x6432c46d, 0x65faf898, 0x672a185e, 0xace39c08, 0x3f683fc1, 0x3f683fc1, 0x3f683fc1,
+    0x3f683fc1, 0x3f683fc1, 0x3f683fc1, 0x3f683fc1, 0x3e683e2e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e,
+    0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e,
+    0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e,
+    0x27e1e59e, 0x3e683e2e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x83ca2366, 0x4236b9c8, 0xdf0804ca,
+    0xad4c896d, 0xdb320143, 0x2b617d0a, 0xa419b1f1, 0x6d4a2a4c, 0x228bc0a6, 0x7f8a1d9e, 0x40417ffc,
+    0xfbb80da4, 0x10e03bcd, 0x9b7d616b, 0x781c46be, 0x41fecf83, 0xdb086a95, 0x2d7bdc73, 0xfd587c91,
+    0x9b56156a, 0xef329401, 0xaef771ed, 0xacaa5b78, 0x2c7de5e9, 0x4112cfa1, 0xc1b11e9d, 0x9653111a,
+    0x3c95c4b4, 0x2f6555b6, 0x7f20fe84, 0x061530bf, 0x6cc54e81, 0x2960794d, 0x09e98a8a, 0x23b667b9,
+    0x6a85b4e0, 0xdb8d4d45, 0x4204582a, 0xf63f1daa, 0x120b200c, 0x631a25b2, 0xdd95219d, 0x886a0e57,
+    0xb05e6e52, 0x88844445, 0xc1ad4ac5, 0x161ea4ad, 0xce414165, 0xaf8197da, 0x696bf83e, 0x077a06b8,
+    0xd9c2cec2, 0x6fad9e1e, 0x3c4f5d24, 0x060816cf, 0x05e2d2c5, 0xe3fd0a25, 0xae67f735, 0x04157be2,
+    0xff22f136, 0x315bc1c8, 0x18f722c3, 0xc4d50865, 0x92caad3f, 0x1a404121, 0xa3ec3307, 0x2de27d1d,
+    0x5589b359, 0xc73ec0b2, 0x6a04a2d2, 0xc58655d2, 0x9b5dd280, 0x34969caf, 0x96cdb5e4, 0x1031e5eb,
+    0x52dd2812, 0x9db23f7d, 0x8e4383f2, 0x93b630df, 0xbd702922, 0xf196a604, 0x5746f9c8, 0x7e87dceb,
+    0xadd41561, 0xf1fcee3f, 0x3fa49242, 0xb64bfcf0, 0x9471bd39, 0x71c15c83, 0x6cb9a324, 0xd18c9d0f,
+    0x278494de, 0x70acc49a, 0x232735b2, 0x6210600c, 0x0b3ab087, 0xd2388b71, 0x261b85c5, 0x355c9ff1,
+    0x15631782, 0x0670a524, 0xabed3497, 0x91608cbd, 0x3f683fc1, 0x3f683fc1, 0x3f683fc1, 0x3f683fc1,
+    0x3f683fc1, 0x3f683fc1, 0x3f683fc1, 0x3e683e2e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e,
+    0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e,
+    0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e,
+    0x3e683e2e, 0x27e1e59e, 0x27e1e59e, 0x27e1e59e, 0x4b70a001, 0xc5dcde39, 0xf35758a7, 0x0dd7ad8c,
+    0x5886a1a8, 0xe22ef4c2, 0xe7002726, 0x1ad013fb, 0x120a977d, 0xc620444e, 0x98ae7a5d, 0xf1d0f08e,
+    0x0777781a, 0x98ae89f8, 0x1d396d21, 0x819121e5, 0x59b1ad9c, 0x55d67ac1, 0x2a949f7e, 0x5eae8316,
+];
+/// `silk_dtx_leaves_out_the_frames_of_libopus`.
+const DTX_MONO_60MS_CBR: [u32; 80] = [
+    0x88699aa9, 0xe39d3dda, 0xccddd8c9, 0x46a3fed1, 0xca78d579, 0x4ad54f42, 0xfbb5f80d, 0x932d21d1,
+    0x52a871dc, 0x0ddee95c, 0x31d2b0ca, 0x4d8d4376, 0x7fd2b4f0, 0x94d0ff18, 0x332e4f95, 0x6929b6c4,
+    0xb5a7ca0f, 0xc81c0b2a, 0x502d0953, 0x1ffc39b1, 0x201375d2, 0x201375d2, 0x201375d2, 0x201375d2,
+    0x201375d2, 0x201375d2, 0x201375d2, 0x1efc381e, 0x502499dc, 0x6294f899, 0x2c67939b, 0xffd2cef4,
+    0x8d347362, 0xba4475cf, 0x78551382, 0x202e0e3f, 0x395b24df, 0x1c9743fe, 0x71fc98bd, 0x9cd0ddeb,
+    0x89fcca27, 0x5873215a, 0xf06f3e71, 0x1f787726, 0xc2642c13, 0xda0505b6, 0x2e94a1b7, 0x55f12e40,
+    0xec5fe635, 0xd864ddbb, 0xe66e1d43, 0x1894a4b4, 0xe7d36ab6, 0xe092cf59, 0x2ce41eb8, 0x0e3e704e,
+    0xb50b1e86, 0x7834a7e4, 0x5abf65a2, 0x9ea3633c, 0x6390bb82, 0x3a993c45, 0xf088e739, 0x1ffc39b1,
+    0x6f2a740c, 0x201375d2, 0x201375d2, 0x201375d2, 0x201375d2, 0x201375d2, 0x201375d2, 0x201375d2,
+    0x702a759f, 0x2c5d9373, 0xafe08886, 0xc966107d, 0x5eb47d3d, 0x2064a587, 0xf6b56ddb, 0x7a331f72,
+];
+/// `silk_dtx_leaves_out_the_frames_of_libopus`.
+const DTX_MONO_120MS_CBR: [u32; 40] = [
+    0xbe65449b, 0xec89eef4, 0xfe5fbe8d, 0x734afcc6, 0x94683b66, 0x73798eea, 0x930eb1bb, 0x7cdb8410,
+    0x7c9f769e, 0xe4a67c07, 0x1bc0b47d, 0xfc10fe8f, 0xfc10fe8f, 0xfc10fe8f, 0x5ea2884c, 0x9bee1aa1,
+    0x55db3598, 0x53207fd0, 0x02a19bf6, 0x7eac000b, 0xb4e3a00e, 0xb71fca71, 0xcaee77de, 0x25e4a425,
+    0x7efbff26, 0xf4ed6a82, 0x206fffa5, 0x569f8e52, 0x6b38494f, 0x96607cd2, 0x46435406, 0x3d23d990,
+    0xbcb8f734, 0xfc10fe8f, 0xfc10fe8f, 0xfc10fe8f, 0x2017c1c7, 0x58fba625, 0xa49b7edf, 0x5e3eceb9,
+];
+/// `silk_dtx_leaves_out_the_frames_of_libopus`.
+const DTX_STEREO_100MS_CBR: [u32; 48] = [
+    0xf853a8c8, 0xf2c33287, 0x826a3d4a, 0x759ec947, 0xe926db97, 0xf7c292fb, 0xc3b2d22c, 0x0d5e025b,
+    0x09c14d2a, 0xb92ea288, 0x40987449, 0xedeea324, 0xeeeea4b7, 0x587e34a0, 0x587e34a0, 0x587e34a0,
+    0x587e34a0, 0xa9f5aca2, 0x068da599, 0xb8a095db, 0x81fea2c8, 0x9240af7f, 0x21be9f5d, 0xad0b05fc,
+    0x66fdfe1d, 0xeed9259a, 0x88ba25f8, 0xd5ddfbfe, 0x478fb24a, 0xdd08ff5e, 0x1de053ab, 0x4aebacb3,
+    0x2f69b295, 0x1a33dca2, 0x1b6546bc, 0x90055302, 0x6338f73a, 0xbe82347e, 0xedeea324, 0xeeeea4b7,
+    0x587e34a0, 0x587e34a0, 0x587e34a0, 0x587e34a0, 0x1c34cc17, 0xecb078e0, 0x8c5b97be, 0x3dfbf11c,
+];
+/// `silk_dtx_leaves_out_the_frames_of_libopus`.
+const DTX_MONO_40MS: [u32; 120] = [
+    0xcdd066c7, 0x9162432a, 0x4e96909b, 0xf16bf526, 0xa68de02c, 0x132a6562, 0xb4bb82fa, 0xc2a464c0,
+    0xb243e327, 0xb73b36bb, 0x69db8419, 0xe865f448, 0x3baeb864, 0xcca3fe42, 0x9c0f97b1, 0x7073699e,
+    0x7225807a, 0x594c8e51, 0xb7c71ed3, 0x96e75f42, 0x203ae2b4, 0xf0dd9bc0, 0x836cbd46, 0xec50913e,
+    0xb97a2071, 0xc2754c26, 0x6e1cb84c, 0xe43e9279, 0xb0a3c953, 0xe33e90e6, 0x709e3cca, 0x709e3cca,
+    0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca,
+    0xafa3c7c0, 0x709e3cca, 0xeae85d5e, 0x8ebdbfc9, 0x259de606, 0x404d3bb1, 0x6aa72941, 0xb4658880,
+    0xa3cb1795, 0x9833e274, 0x3cc0b479, 0x37c641ec, 0x59987270, 0x98027228, 0xdbbfdb15, 0x113d1f3f,
+    0x1009a055, 0x14fcf02f, 0x8b823d8d, 0x0ea930bc, 0xb69f7377, 0xe0a340ee, 0x6e15e376, 0xc86b13cc,
+    0xc1f5a932, 0xa5f0b85f, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca,
+    0x709e3cca, 0xa5d4d6b4, 0xd9eeb127, 0xc647b767, 0x9dce5e21, 0x5b90df24, 0xf59e6a53, 0x709e3cca,
+    0xcca4fb87, 0x37018bf9, 0xb4cacabb, 0x41f5f687, 0x98d12e20, 0x84b9994e, 0x680ba233, 0xa790902c,
+    0x839866c4, 0x1f6d47f9, 0x7f3fb8c2, 0xf0e9a427, 0xed125c40, 0x8c92a00e, 0xb0a3c953, 0xe43e9279,
+    0xb0a3c953, 0xe33e90e6, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca,
+    0x709e3cca, 0x709e3cca, 0x709e3cca, 0x709e3cca, 0xafa3c7c0, 0x709e3cca, 0xc086b048, 0xa0beca09,
+    0x83ecf4d4, 0x1b2bf2a6, 0xb599c924, 0xbf59d3d2, 0xe117b194, 0x6a2eadf0, 0x11fd6194, 0x1c11fa52,
 ];

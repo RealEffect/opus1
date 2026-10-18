@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use super::{Cfg, Format, celt_toc_lm, parse_frame};
+use opus1::internals::analysis::{AnalysisInfo, LEAK_BANDS};
 use opus1::internals::celt::CeltEncoder;
 use opus1::internals::modes::default_mode;
 use opus1::internals::range_coder::RangeCoder;
@@ -49,9 +50,47 @@ pub const CELT_SET_CHANNELS: c_int = 10008;
 pub const CELT_SET_START_BAND: c_int = 10010;
 pub const CELT_SET_END_BAND: c_int = 10012;
 pub const CELT_SET_SIGNALLING: c_int = 10016;
+pub const CELT_SET_ANALYSIS: c_int = 10022;
 pub const OPUS_SET_LFE: c_int = 10024;
 /// libopus `OPUS_BITRATE_MAX`.
 pub const BITRATE_MAX: i32 = -1;
+
+/// libopus `AnalysisInfo` (celt/celt.h:65-79), 64 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CAnalysisInfo {
+    pub valid: c_int,
+    pub tonality: f32,
+    pub tonality_slope: f32,
+    pub noisiness: f32,
+    pub activity: f32,
+    pub music_prob: f32,
+    pub music_prob_min: f32,
+    pub music_prob_max: f32,
+    pub bandwidth: c_int,
+    pub activity_probability: f32,
+    pub max_pitch_ratio: f32,
+    pub leak_boost: [u8; LEAK_BANDS],
+}
+
+impl From<&AnalysisInfo> for CAnalysisInfo {
+    fn from(a: &AnalysisInfo) -> Self {
+        CAnalysisInfo {
+            valid: a.valid as c_int,
+            tonality: a.tonality,
+            tonality_slope: a.tonality_slope,
+            noisiness: a.noisiness,
+            activity: a.activity,
+            music_prob: a.music_prob,
+            music_prob_min: a.music_prob_min,
+            music_prob_max: a.music_prob_max,
+            bandwidth: a.bandwidth,
+            activity_probability: a.activity_probability,
+            max_pitch_ratio: a.max_pitch_ratio,
+            leak_boost: a.leak_boost,
+        }
+    }
+}
 
 /// The CELT encoder of C libopus (`CELTEncoder`).
 pub struct CCelt {
@@ -84,6 +123,15 @@ impl CCelt {
     pub fn ctl(&mut self, request: c_int, value: c_int) {
         let ret = unsafe { opus_custom_encoder_ctl(self.ptr(), request, value) };
         assert_eq!(ret, 0, "opus_custom_encoder_ctl({request}, {value})");
+    }
+
+    /// `CELT_SET_ANALYSIS`: the analysis the next frames are coded with.
+    pub fn set_analysis(&mut self, info: &AnalysisInfo) {
+        let c_info = CAnalysisInfo::from(info);
+        let ret = unsafe {
+            opus_custom_encoder_ctl(self.ptr(), CELT_SET_ANALYSIS, &c_info as *const CAnalysisInfo)
+        };
+        assert_eq!(ret, 0, "CELT_SET_ANALYSIS");
     }
 
     /// `OPUS_RESET_STATE`.

@@ -167,9 +167,9 @@ impl Cfg {
     }
 }
 
-/// Complexity of both encoders. From 7 up libopus runs its tonality
-/// analysis, which opus1 does not have. CELT itself works the same at
-/// complexity 5, 6 and 7.
+/// Complexity of both encoders. From 7 up both run the tonality analysis
+/// of the Opus layer; these tests look at CELT without it. CELT itself
+/// works the same at complexity 5, 6 and 7.
 pub const COMPLEXITY: i32 = 6;
 
 /// Encode `pcm` (interleaved) with C libopus in CELT-only mode, 20 ms frames.

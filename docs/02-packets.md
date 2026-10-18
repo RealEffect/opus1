@@ -336,7 +336,7 @@ A packet that is only the TOC byte is called a TOC-only packet. Encoders write o
   - the packet is longer than 20 ms, and the bitrate is below 2400 bits per second or the output buffer holds fewer than 300 bytes per second of audio.
 
   For a 60 ms CELT-only or Hybrid packet the encoder adds a frame count byte (code 3, three frames of 0 bytes) when the output buffer has room for it. That packet then has 2 bytes. With CBR the encoder pads the packet to its constant size. `OpusEncoder::final_range` is 0 after such a packet.
-- libopus also writes TOC-only packets during discontinuous transmission (DTX). With DTX on, the encoder writes TOC-only packets during silence, and the application need not send them. `opus1` has no DTX.
+- The encoder also writes TOC-only packets during discontinuous transmission (DTX). With DTX on (`set_dtx(true)`), it writes TOC-only packets while the input is inactive, as libopus does, and the application need not send them. With CBR they are not padded.
 - A multistream encoder writes a TOC-only stream when the packet leaves that stream only 1 byte (see [Multichannel audio](05-multichannel.md)).
 
 ```rust

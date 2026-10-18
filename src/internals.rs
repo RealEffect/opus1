@@ -11,6 +11,47 @@
 //! uses. The exception is `silk_input`, which holds a test control of the
 //! encoder.
 
+pub mod analysis {
+    pub use crate::analysis::{
+        AnalysisGate, AnalysisInfo, AnalysisPcm, LEAK_BANDS, PcmRef, SecondChannel,
+        is_digital_silence,
+    };
+
+    /// Sets when `enc` runs the speech and music analysis. Tests that
+    /// compare with a fixed-point build of libopus use
+    /// [`AnalysisGate::FixedPointBuild`].
+    pub fn set_analysis_gate(enc: &mut crate::OpusEncoder, gate: AnalysisGate) {
+        enc.set_analysis_gate(gate);
+    }
+
+    /// The gate [`set_analysis_gate`] set.
+    pub fn analysis_gate(enc: &crate::OpusEncoder) -> AnalysisGate {
+        enc.analysis_gate()
+    }
+
+    /// The analysis the last frame `enc` coded went by: the `AnalysisInfo`
+    /// libopus hands to `opus_encode_frame_native`. Invalid when the
+    /// analysis did not run.
+    pub fn last_analysis_info(enc: &crate::OpusEncoder) -> AnalysisInfo {
+        enc.last_analysis_info()
+    }
+    #[cfg(feature = "analysis")]
+    pub use crate::analysis::{
+        ANALYSIS_BUF_SIZE, ANALYSIS_COUNT_MAX, DETECT_SIZE, NB_FRAMES, NB_TBANDS,
+        TonalityAnalysisState, fast_atan2f,
+    };
+    #[cfg(feature = "analysis")]
+    pub mod mlp {
+        pub use crate::analysis::mlp::{
+            DenseLayer, GruLayer, LAYER0, LAYER1, LAYER2, MAX_NEURONS, WEIGHTS_SCALE,
+            compute_dense, compute_gru, sigmoid_approx, tansig_approx,
+        };
+    }
+    #[cfg(feature = "analysis")]
+    pub mod mlp_data {
+        pub use crate::analysis::mlp_data::*;
+    }
+}
 pub mod bands {
     pub use crate::bands::{
         amp2log2, anti_collapse, compute_band_energies, denormalise_bands, log2amp,
@@ -35,12 +76,47 @@ pub mod eval {
 pub mod dnn {
     pub use crate::dnn::*;
 }
+/// libopus `compute_stereo_width` of the encoder, for the tests that compare
+/// it with the C function.
+pub mod stereo_width {
+    /// C `StereoWidthState` (src/opus_encoder.c), with the C layout.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct State {
+        pub xx: f32,
+        pub xy: f32,
+        pub yy: f32,
+        pub smoothed_width: f32,
+        pub max_follower: f32,
+    }
+
+    /// The width of a stereo frame of `frame_size` samples per channel at
+    /// `fs`, which also updates `state`.
+    pub fn compute(pcm: &[f32], frame_size: usize, fs: i32, state: &mut State) -> f32 {
+        let mut mem = crate::StereoWidthState {
+            xx: state.xx,
+            xy: state.xy,
+            yy: state.yy,
+            smoothed_width: state.smoothed_width,
+            max_follower: state.max_follower,
+        };
+        let width = crate::compute_stereo_width(pcm, frame_size, fs, &mut mem);
+        *state = State {
+            xx: mem.xx,
+            xy: mem.xy,
+            yy: mem.yy,
+            smoothed_width: mem.smoothed_width,
+            max_follower: mem.max_follower,
+        };
+        width
+    }
+}
 pub mod hp_cutoff {
     pub use crate::hp_cutoff::{dc_reject_float, hp_cutoff};
 }
 pub mod kiss_fft {
     pub use crate::kiss_fft::{
-        FFT_TWIDDLES_480, KissCpx, KissFftState, opus_fft_impl, opus_fft_impl_fused,
+        FFT_TWIDDLES_480, KissCpx, KissFftState, opus_fft, opus_fft_impl, opus_fft_impl_fused,
         opus_fft_impl_scalar,
     };
 }

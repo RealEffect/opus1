@@ -1536,6 +1536,20 @@ pub fn opus_fft_impl(st: &KissFftState, fout: &mut [KissCpx]) {
     fft_stages_scalar::<Separate>(st, fout);
 }
 
+/// libopus `opus_fft_c` (celt/kiss_fft.c:615-635): scales the input by
+/// `1 / nfft` (`st.scale()`), puts it in bit-reversed order and transforms
+/// it with `opus_fft_impl`. `fin` and `fout` hold `st.nfft()` samples each.
+///
+/// The speech and music analysis uses it, as libopus does.
+pub fn opus_fft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
+    let scale = st.scale;
+    let nfft = st.nfft;
+    for (x, &rev) in fin[..nfft].iter().zip(st.bitrev.iter()) {
+        fout[rev as usize] = KissCpx::new(x.r * scale, x.i * scale);
+    }
+    opus_fft_impl(st, fout);
+}
+
 /// The transform of `opus_fft_impl` with the portable butterflies and no
 /// fused product, on every target.
 ///
@@ -1987,21 +2001,6 @@ mod tests {
     use super::test_guard::{PLACEMENTS, Region};
     use super::*;
     use core::f32::consts::PI;
-
-    /// libopus `opus_fft_c`: scales the input by `1 / nfft`, puts it in
-    /// bit-reversed order and transforms it.
-    fn opus_fft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
-        let scale = st.scale;
-        let nfft = st.nfft;
-
-        for i in 0..nfft {
-            let x = &fin[i];
-            let rev = st.bitrev[i] as usize;
-            fout[rev] = KissCpx::new(x.r * scale, x.i * scale);
-        }
-
-        opus_fft_impl(st, fout);
-    }
 
     /// libopus `opus_ifft_c`: the inverse transform, without scaling.
     fn opus_ifft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {

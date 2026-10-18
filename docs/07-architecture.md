@@ -20,7 +20,7 @@ This document describes how the source code of `opus1` is organised, for maintai
 
 The public interface is the crate root and two modules:
 
-- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`. With a neural network feature also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)).
+- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec` and `pcm_soft_clip`. With a neural network feature also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)).
 - `packet`: reading, writing and padding packets.
 - `multistream`: the multistream encoder and decoder and their channel layouts.
 
@@ -30,7 +30,7 @@ Every other module is private. The tests, benchmarks, examples and fuzz targets 
 
 | File | What it does | libopus counterpart |
 |---|---|---|
-| `src/lib.rs` | `OpusEncoder` and `OpusDecoder`: mode and bandwidth decisions, in-band forward error correction (FEC) decisions, mode switches with redundant CELT frames, packets of 40 and 60 milliseconds (ms), packet loss, `pcm_soft_clip`. | `src/opus_encoder.c`, `src/opus_decoder.c`, `opus_pcm_soft_clip` in `src/opus.c` |
+| `src/lib.rs` | `OpusEncoder` and `OpusDecoder`: mode and bandwidth decisions, in-band forward error correction (FEC) decisions, mode switches with redundant CELT frames, packets of 40 to 120 milliseconds (ms), discontinuous transmission (DTX), packet loss, `pcm_soft_clip`. The encoder runs the speech and music analysis of `src/analysis/` and hands its result to these decisions and to the CELT encoder. | `src/opus_encoder.c`, `src/opus_decoder.c`, `opus_pcm_soft_clip` in `src/opus.c` |
 | `src/internals.rs` | The internal items that the tests, benchmarks, examples and fuzz targets use (see above). | none |
 | `src/packet.rs` | Reading, writing and padding packets; self-delimited framing; checks of multistream packets. | `opus_packet_parse_impl` in `src/opus.c`, `src/repacketizer.c`, `opus_multistream_packet_validate` in `src/opus_multistream_decoder.c` |
 | `src/hp_cutoff.rs` | The encoder's input filters: the high-pass filter for speech (`hp_cutoff`, `hp_cutoff_float`) and, for other audio, the filter that removes the constant (DC, direct current) part of the signal (`dc_reject_float`). The integer filters use the second-order filter of `src/silk/sigproc_fix.rs`. | `hp_cutoff` and `dc_reject` in `src/opus_encoder.c` |
@@ -38,6 +38,19 @@ Every other module is private. The tests, benchmarks, examples and fuzz targets 
 | `src/fixedvec.rs` | `FixedVec<T, N>`: a growable buffer with a fixed capacity, stored inline. See [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored). | none |
 | `src/compat.rs` | `OnceCell` (a value built once, without the heap), a stable insertion sort (`sort_by`), the x86 feature probes (`x86_has_avx` and others), and the `Math` trait that maps float functions to `libm` without `std`. | none |
 | `src/mathops.rs` | Float helpers that several modules share: `mac` and `mac_f64` (multiply-add, rounded as libopus rounds it on the target processor), `celt_log2` and `celt_exp2`. | `celt/mathops.h`, `celt/mathops.c` |
+
+### The speech and music analysis (`src/analysis/`)
+
+For each 20 ms of input, the analysis estimates how tonal the signal is, how likely it is music rather than speech, how likely it holds any sound, and which audio bandwidth it really uses. The encoder runs it from complexity 7 on, for input at 16, 24 or 48 kHz, as the floating-point build of libopus does. [The encoder](03-encoder.md#13-the-speech-and-music-analysis) describes what it computes and where the encoder uses it.
+
+| File | What it does | libopus counterpart |
+|---|---|---|
+| `src/analysis/mod.rs` | `AnalysisInfo` (the result for one frame), the description of the caller's samples (`PcmRef`, `SecondChannel`, `AnalysisPcm`), `AnalysisGate` (when the encoder runs the analysis, an internal setting for tests) and `is_digital_silence`. These items are compiled in every build, so the encoder can carry an invalid `AnalysisInfo` without the feature `analysis`. | `AnalysisInfo` in `celt/celt.h`, `is_digital_silence` in `src/opus_encoder.c` |
+| `src/analysis/tonality.rs` | `TonalityAnalysisState`: the downmix and the resampling to 24 kHz, the 480-point FFT of each block, the tonality of each FFT bin from its phase, the band energies, the leakage between bands, the bandwidth, the 25 features of the network (`tonality_analysis`), and the result for the frame being coded (`get_info`, libopus `tonality_get_info`). It also keeps the square roots of the band energies and the distances between the stored blocks, so that a block does not compute them again. | `src/analysis.c` |
+| `src/analysis/mlp.rs` | The network: a dense layer of 32 outputs, a gated recurrent unit (GRU) of 24 outputs, and a dense layer of 2 outputs. | `src/mlp.c` |
+| `src/analysis/mlp_data.rs` | The int8 weights of the network, written by `scripts/gen_analysis_mlp_data.py` from libopus's file. `mlp.rs` turns them into `f32` tables when the crate is compiled. | `src/mlp_data.c` |
+| `src/analysis/tables.rs` | The analysis window, the table of the cepstral transform and the band edges. | the tables of `src/analysis.c` |
+| `src/analysis/neon.rs` | NEON versions of the downmix, the windowing of the FFT input, the tonality of the FFT bins (four bins per vector), the recurrent layer and the activations of the network (64-bit ARM only). They give the bits of the scalar code, which unit tests check. | none |
 
 ### The CELT layer
 
@@ -183,8 +196,6 @@ The DRED networks (deep redundancy) are not included. The generator can write th
 
 [Differences from libopus](10-differences-from-libopus.md) lists these gaps together with the measured differences of the parts that are ported.
 
-- The speech/music and bandwidth analysis of libopus (`src/analysis.c`, `src/mlp.c`), which libopus runs at complexity 7 and above for 16 to 48 kHz input.
-- Discontinuous transmission (DTX).
 - The projection encoder and decoder (`src/opus_projection_*.c`, `src/mapping_matrix.c`), which code ambisonics through a mixing matrix (mapping family 3). Mapping family 2, ambisonics without a matrix, is supported by the multistream code.
 - The floating-point SILK encoder (`silk/float/`). `opus1` ports the fixed-point one.
 - The neural networks of libopus as parts of the decoder. The shared code, the weights and the decoder controls are ported (see [Neural network code](#neural-network-code-srcdnn)), but deep packet loss concealment, LACE, NoLACE and the bandwidth extension do not run in the decoder yet. Deep REDundancy (DRED) is not ported at all. libopus builds these parts only when asked to (`--enable-deep-plc`, `--enable-osce`, `--enable-dred`).
@@ -202,6 +213,7 @@ OpusEncoder                                   src/lib.rs
 │     │     (each SilkChannel: SilkEncoderState, SilkResampler, the packet
 │     │      at the internal rate)
 │     └── api_buf                             one input channel before resampling
+├── analysis: TonalityAnalysisState          src/analysis/tonality.rs (feature `analysis`)
 ├── rc: RangeCoder                            SILK and CELT write into it in turn
 └── input and delay buffers: FixedVec<..>
 
@@ -229,7 +241,7 @@ MultistreamDecoder                            src/multistream/decoder.rs
 
 Notes:
 
-- With the `heap` feature, `celt_enc`, `celt_dec`, `silk_dec`, each `SilkChannel`, `api_buf` and the large buffers each sit behind a `Box`. Without it they are stored inline (see [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored)).
+- With the `heap` feature, `celt_enc`, `celt_dec`, `silk_dec`, `analysis`, each `SilkChannel`, `api_buf` and the large buffers each sit behind a `Box`. Without it they are stored inline (see [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored)).
 - A stereo encoder has two SILK channels even when its packets code mono, because the channel count of the packets can change from one packet to the next. A mono encoder has one. libopus always keeps two states (`state_Fxx[0]` and `state_Fxx[1]`).
 - A Hybrid frame is one range-coded stream: SILK writes first, and CELT continues in the same `RangeCoder`. The decoder reads it in the same order.
 - `CeltMode` is shared. `modes::default_mode()` builds it at the first call into a `static` `OnceCell` and returns `&'static CeltMode` after that. It is the only global value that is written at run time, apart from the layers of the built-in networks: with a neural network feature, `dnn::builtin::models()` builds them the same way when the first decoder is built, and every decoder points at them.
@@ -238,6 +250,8 @@ Notes:
 
 ```text
 encode / encode_i16  (8-48 kHz, 1 or 2 channels, interleaved)
+  ├── is_digital_silence; at complexity 7-10 and 16-48 kHz the speech and
+  │   music analysis of the caller's buffer                   analysis/
   ├── decide_mode_and_bandwidth: mode, bandwidth, coded channels, FEC (once per packet)
   ├── CELT or Hybrid 40-120 ms, SILK 80-120 ms: encode_multiframe → two to six parts → packet::write
   └── encode_frame
@@ -246,7 +260,8 @@ encode / encode_i16  (8-48 kHz, 1 or 2 channels, interleaved)
         │     └── SilkEncoder::encode: resample to 8/12/16 kHz → RangeCoder   silk/enc_api.rs
         ├── Hybrid or CELT-only: CeltEncoder → same RangeCoder        celt.rs
         ├── at a switch to or from CELT-only: a redundant 5 ms CELT frame
-        └── TOC byte + range coder bytes → packet
+        ├── TOC byte + range coder bytes → packet
+        └── DTX (set_dtx): a TOC byte alone while the input is inactive
 
 decode / decode_i16 / decode_fec
   ├── empty packet → conceal in the previous mode (SILK PLC or CELT PLC)
@@ -267,14 +282,16 @@ decode / decode_i16 / decode_fec
 - **The Opus layer converts between them** in `src/lib.rs`:
   - Encoder: SILK needs 16-bit samples before its resampler. With `Application::Voip` at 8 to 24 kHz they come from the integer high-pass filter of the fixed-point build: `hp_cutoff` takes `f32` input and writes `i16`. With `Voip` at 48 kHz, and with the other applications, the float signal is filtered and then rounded to 16 bits (`SilkInput::Float`). CELT gets the float signal with a 4 ms delay buffer in front, unless the application is `RestrictedLowDelay`.
   - Decoder: SILK's 16-bit output is scaled by 1/32768 to `f32` (`int16_to_res`) and written into the output. In a Hybrid frame CELT adds its output to it.
-- `encode_i16` converts its input to float once, with `sample as f32 / 32768.0`, and then does what `encode` does. So `encode` and `encode_i16` write the same packets for the same audio. The conversion is exact, and the integer high-pass filter of `Voip` rounds the float samples back to the same 16-bit values. The float filter reads the same float samples either way.
+- `encode_i16` converts its input to float once, with `sample as f32 / 32768.0`, and then does what `encode` does, with an input precision (`lsb_depth`) of at most 16 bits, as libopus `opus_encode` does. The conversion is exact, and the integer high-pass filter of `Voip` rounds the float samples back to the same 16-bit values. So `encode_i16` writes the packets that `encode` writes for the same audio after `set_lsb_depth(16)`.
+- **The speech and music analysis is floating point**, as in the float build of libopus. The fixed-point build of libopus has its own integer version of it, which opus1 does not port.
 
 ## Feature flags and where state is stored
 
-The crate has three features that decide how it is built: `std` and `heap` (both on by default) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
+The crate has four features that decide how it is built: `std`, `heap` and `analysis` (all on by default) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
 
 - **`std`** selects `#![no_std]` when it is off (`#![cfg_attr(not(feature = "std"), no_std)]` in `src/lib.rs`). It also enables the run-time processor checks in `src/compat.rs` and `src/kiss_fft.rs`, and the `multistream` module, which uses `Vec`.
 - **`libm`** is required when `std` is off. `src/compat.rs` stops the build with `compile_error!` if both are missing. Its `Math` trait gives `f32` and `f64` the methods `sqrt`, `sin`, `exp2` and so on through the `libm` crate. Each module that needs them imports the trait under `#[cfg(not(feature = "std"))]`; with `std` the inherent methods of `f32` are used instead.
+- **`analysis`** compiles the speech and music analysis (`TonalityAnalysisState` and the network in `src/analysis/`). Without it the encoder decides as libopus does below complexity 7, at every complexity, and `OpusEncoder` is smaller. The types of `src/analysis/mod.rs` exist in both builds.
 - **`heap`** changes `src/lib.rs` and `src/silk/enc_api.rs`. Each large field of `OpusEncoder` and `OpusDecoder` is declared twice:
 
   ```rust,ignore
@@ -320,7 +337,7 @@ The loops that take most of the run time have several versions. The rule is the 
 
 The check happens inside the function that the rest of the codec calls, at every call. With `std` the probes use `std::arch::is_x86_feature_detected!`, which stores its answer after the first call. Without `std` they use `cfg!(target_feature = "...")`, which the compiler decides from the build flags.
 
-Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `silk/sigproc_fix.rs`. Files with aarch64 versions: those, plus, under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs`, `nlsf.rs`, `nsq_del_dec.rs`, `pitch_analysis.rs`, `resampler.rs` and `vq_wmat_ec.rs`.
+Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `silk/sigproc_fix.rs`. Files with aarch64 versions: those, plus `src/analysis/mod.rs` (the search for the largest sample of the digital silence test), `src/analysis/neon.rs` and, under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs`, `nlsf.rs`, `nsq_del_dec.rs`, `pitch_analysis.rs`, `resampler.rs` and `vq_wmat_ec.rs`. The analysis has no x86 vector code: on x86 it runs its scalar code.
 
 `src/mathops.rs` also depends on the processor, for rounding rather than speed. On aarch64, `mac` and `mac_f64` compute `acc + a * b` with one fused multiply-add, which rounds once. The arm64 build of libopus does the same, because clang fuses such C expressions there. On other targets the product is rounded first.
 
@@ -370,16 +387,17 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 
 ### `tests/`
 
-The repository holds 251 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
+The repository holds 263 test files test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
 
 | Prefix | Files | What the tests cover |
 |---|---:|---|
 | `perfk_` | 33 | Single kernels after performance work, against the same function inside libopus or a reference version: FFT, PVQ, range coder, pitch, SILK analysis and quantizer. Four `.expected` files hold reference output. |
-| `multistream_` | 31 | The multistream encoder and decoder: `multistream_c_*` against libopus's own functions, `multistream_enc_*` and `multistream_dec_*` for each side, `multistream_e2e_*` end to end, `multistream_surround_*` for the surround masking analysis. |
-| `core_` | 24 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits, the decoder controls of the neural network features. |
+| `multistream_` | 35 | The multistream encoder and decoder: `multistream_c_*` against libopus's own functions, `multistream_enc_*` and `multistream_dec_*` for each side, `multistream_e2e_*` end to end, `multistream_surround_*` for the surround masking analysis, `multistream_analysis_libopus`, `multistream_analysis_walk_libopus` and `multistream_dtx_libopus` for the analysis and DTX of each stream. |
+| `core_` | 31 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits, the speech and music analysis (`core_analysis_libopus`, `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`), the high-pass filter in front of SILK (`core_voip_input_filter`), the decoder controls of the neural network features. |
 | `dnn_` | 11 | The neural network code: kernels and their edge cases, layers of every network, weights, signal analysis. The 4 files that end in `_libopus` and `dnn_freq_burg.rs` need a libopus built with its neural network code (see [Testing](09-testing.md#tests-of-the-neural-network-code)). |
+| `analysis_` | 3 | The speech and music analysis alone against libopus's `run_analysis` and network, and its properties. |
 | `k24_` | 21 | The 24 kHz path: encoder modes, Hybrid super-wideband, SILK internals and loss, and the decoder matrix of every mode and bandwidth at every output rate. |
-| `celtenc_`, `celtdec_`, `celt_` | 16, 4, 8 | The CELT encoder and decoder. |
+| `celtenc_`, `celtdec_`, `celt_` | 19, 4, 8 | The CELT encoder and decoder. |
 | `silkenc_`, `silkdec_`, `silk_` | 6, 10, 14 | The SILK encoder and decoder. |
 | `mdct_` | 16 | The MDCT. |
 | `issue_`, `issues_` | 15 | Regression tests named after GitHub issues, each reproducing the reported fault. |
@@ -410,11 +428,11 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
   - `conformance.rs`: the RFC 8251 table of `eval conformance`.
   - `tier2.rs`: the bridge to external quality metrics (`--write-wav`, `merge`).
 - `opus_compare.rs`: libopus's test program `opus_compare`, with its command line and messages, on top of `src/eval/compare.rs`.
-- `perf_harness.rs`: the timing and comparison tool against libopus. Its commands are `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler` and `spread`. `cargo run --release --example perf_harness -- bench` produces the timings in the README.
+- `perf_harness.rs`: the timing and comparison tool against libopus. Its commands are `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler`, `spread`, `pairs` and `analysis` (the speech and music analysis alone). `cargo run --release --example perf_harness -- bench` produces the timings in the README.
 
 ### `benches/`
 
-`benches/dnn_bench.rs` (it needs the feature `dnn`) times the layer kernels of the neural networks for every `DnnArch`, and with `test-libopus-dnn` also the same calls of libopus. `benches/opus_bench.rs` holds Criterion benchmarks (`cargo bench`) of whole encoding (SILK, CELT, 16-bit input) and of single kernels: FFT, MDCT, PVQ, the SILK noise-shaping quantizer, pitch analysis, autocorrelation, Burg's method and others. The script `bench_quick.sh` at the repository root runs a shorter `perf_harness bench` (6 repetitions in one round) and saves its table to a Markdown file. It takes a label and an optional scenario filter.
+`benches/dnn_bench.rs` (it needs the feature `dnn`) times the layer kernels of the neural networks for every `DnnArch`, and with `test-libopus-dnn` also the same calls of libopus. `benches/opus_bench.rs` holds Criterion benchmarks (`cargo bench`) of whole encoding (SILK, CELT, 16-bit input) and of single kernels: FFT, MDCT, PVQ, the SILK noise-shaping quantizer, pitch analysis, autocorrelation, Burg's method, the speech and music analysis and its network, and others. The script `bench_quick.sh` at the repository root runs a shorter `perf_harness bench` (6 repetitions in one round) and saves its table to a Markdown file. It takes a label and an optional scenario filter.
 
 ### `fuzz/`
 

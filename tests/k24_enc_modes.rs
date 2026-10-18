@@ -9,8 +9,10 @@
 //!
 //! libopus also runs a tonality analysis from complexity 7 up that detects
 //! music and the bandwidth actually present in the input, and can move these
-//! choices. opus1 does not port it, so the comparisons here use complexity
-//! 5, where libopus decides from the bitrate alone.
+//! choices. opus1 runs the same analysis. Most comparisons here use
+//! complexity 5, where both decide from the bitrate alone;
+//! `low_bitrates_are_coded_narrower_and_as_well_as_libopus` runs at the
+//! default complexity 9.
 
 mod k24_enc_common;
 use k24_enc_common::*;
@@ -100,6 +102,7 @@ fn mode_and_bandwidth_are_libopus_s_at_every_packet_duration() {
 }
 
 /// Low bitrates must sound as libopus's do, at the bitrate asked for.
+#[cfg(feature = "analysis")]
 #[test]
 fn low_bitrates_are_coded_narrower_and_as_well_as_libopus() {
     let pcm = speech_24k()[FS..7 * FS].to_vec();
@@ -111,18 +114,13 @@ fn low_bitrates_are_coded_narrower_and_as_well_as_libopus() {
             (12_000, ("SILK", "WB")),
         ] {
             // Complexity 9 on both sides: this is what a caller gets. The
-            // fixture has no content above 8 kHz, so libopus's analysis
-            // does not move the choice.
-            let mut cfg = Cfg::new(app, bitrate);
-            if app == App::Audio && bitrate == 12_000 {
-                // Here libopus without its analysis codes Hybrid, as opus1 does.
-                cfg.c_complexity = Some(5);
-                cfg.complexity = 5;
-            }
+            // fixture has no content above 8 kHz, which both encoders'
+            // speech and music analysis finds: at 12 kb/s with `Audio`
+            // they code SILK wideband, where without the analysis they
+            // code Hybrid.
+            let cfg = Cfg::new(app, bitrate);
             let (rs, c) = (enc_rs(&cfg, &pcm).unwrap(), enc_c(&cfg, &pcm));
-            if !(app == App::Audio && bitrate == 12_000) {
-                assert_eq!(main_mode(&rs), mode, "{} {bitrate}", app.name());
-            }
+            assert_eq!(main_mode(&rs), mode, "{} {bitrate}", app.name());
             assert_eq!(main_mode(&rs), main_mode(&c), "{} {bitrate}", app.name());
             let q = |p: &[Vec<u8>]| measure(&pcm, &dec_c(p, FS, 1, cfg.frame).unwrap(), FS, FS / 5);
             let (rs_q, c_q) = (q(&rs), q(&c));

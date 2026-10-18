@@ -371,24 +371,20 @@ fn the_layouts_of_the_matrix_have_the_mapping_types_of_libopus() {
 
 /// The test signal has a little noise so that both encoders code the same
 /// audio bandwidth (see `multistream_e2e_common::program`). Without the
-/// noise the signal has nothing above 2.5 kHz. The analysis of libopus then
-/// lowers the bandwidth of a stream that picks its own
-/// (opus_encoder.c:1652-1673), and libopus puts its bits where the signal
-/// is. opus1 has no analysis and codes the bandwidth the bitrate allows.
+/// noise the signal has nothing above 2.5 kHz. The speech and music
+/// analysis then lowers the bandwidth of a stream that picks its own
+/// (opus_encoder.c:1652-1673), and the encoder puts its bits where the
+/// signal is.
 ///
 /// Shown on four CELT-only mono streams (family 2) at 24 kHz with 2.5 ms
-/// frames and 32 kb/s per channel. Measured without the noise: libopus
-/// codes narrowband in 964 of 1280 stream packets where opus1 codes
-/// wideband, and opus1 is 3.4 dB below libopus on average (8.6 dB when
-/// this test was written; opus1 has improved since). With the noise: the
-/// same bandwidth in every packet, and opus1 is 0.8 dB above.
-///
-/// The bound on the gap without the noise is relative to the gap with it,
-/// where both code the same bandwidth: the narrower bandwidth gains libopus
-/// at least 2 dB against opus1 (measured 4.2 dB). A fixed bound on the gap
-/// itself held opus1 to being far behind.
+/// frames and 32 kb/s per channel. Before opus1 ran the analysis, libopus
+/// coded narrowband in 964 of 1280 stream packets where opus1 coded
+/// wideband, and opus1 was 3.4 dB below libopus. Now opus1 codes the
+/// bandwidth of libopus in every packet, with and without the noise, and
+/// is level with it (measured: 0.0 dB with and without the noise).
+#[cfg(feature = "analysis")]
 #[test]
-fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
+fn a_signal_without_high_frequencies_gets_the_narrower_bandwidth_of_libopus() {
     let fs = 24_000;
     let case = LAYOUTS[10];
     let setting = Setting {
@@ -414,7 +410,8 @@ fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
         without.structure.compared,
         gap(&without)
     );
-    assert!(2 * without.structure.bandwidth > without.structure.compared);
+    assert_eq!(without.structure.bandwidth, 0);
+    assert!(gap(&without).abs() < 0.5, "without noise: opus1 {:+.1} dB", gap(&without));
 
     let with = measure_signal(setting, &program(fs, &case, samples));
     println!(
@@ -425,11 +422,6 @@ fn a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus() {
     );
     assert_eq!(with.structure.bandwidth, 0);
     assert!(gap(&with).abs() < 2.0);
-    assert!(
-        gap(&without) < gap(&with) - 2.0,
-        "the narrower bandwidth gains libopus {:.1} dB",
-        gap(&with) - gap(&without)
-    );
 }
 
 /// A single CELT stream of opus1 against libopus where it was furthest

@@ -12,27 +12,34 @@ TARGETS=(
     "wasm32-unknown-unknown"   # WebAssembly (no WASI)
 )
 
+# The feature sets to check: the codec alone, and with the speech and
+# music analysis of the encoder (feature `analysis`, on by default with
+# `std`).
+FEATURE_SETS=("libm" "libm,analysis")
+
 fail=0
-for t in "${TARGETS[@]}"; do
-    if rustup target list --installed 2>/dev/null | grep -q "$t"; then
-        echo ":: building opus1 (no_std + libm) for $t"
-        if ! cargo build --no-default-features --features libm --target "$t"; then
-            echo "!! FAILED: $t"
-            fail=1
+for features in "${FEATURE_SETS[@]}"; do
+    for t in "${TARGETS[@]}"; do
+        if rustup target list --installed 2>/dev/null | grep -q "$t"; then
+            echo ":: building opus1 (no_std, features $features) for $t"
+            if ! cargo build --no-default-features --features "$features" --target "$t"; then
+                echo "!! FAILED: $t ($features)"
+                fail=1
+            fi
+        else
+            echo "-- skip $t (not installed; run: rustup target add $t)"
         fi
-    else
-        echo "-- skip $t (not installed; run: rustup target add $t)"
-    fi
+    done
+
+    # Host no_std build (rlib, no panic handler needed for a library).
+    echo ":: building opus1 (no_std, features $features) for host"
+    cargo build --no-default-features --features "$features" || fail=1
+
+    # Host no_std test run. Without the `heap` feature the codec structs are
+    # large inline objects (about 135 KB encoder, 67 KB decoder, plus about
+    # 26 KB for the analysis), so the test threads need a big stack.
+    echo ":: testing opus1 (no_std, features $features) for host"
+    RUST_MIN_STACK=${RUST_MIN_STACK:-33554432} cargo test --no-default-features --features "$features" || fail=1
 done
-
-# Host no_std build (rlib, no panic handler needed for a library).
-echo ":: building opus1 (no_std + libm) for host"
-cargo build --no-default-features --features libm || fail=1
-
-# Host no_std test run. Without the `heap` feature the codec structs are
-# large inline objects (~135 KB encoder, ~67 KB decoder), so the test threads
-# need a big stack.
-echo ":: testing opus1 (no_std + libm) for host"
-RUST_MIN_STACK=${RUST_MIN_STACK:-33554432} cargo test --no-default-features --features libm || fail=1
 
 exit $fail

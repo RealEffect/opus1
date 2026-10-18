@@ -5,8 +5,9 @@
 //! `opus_encode_frame_native`).
 //!
 //! The reference is the C libopus encoder with the same settings, at
-//! complexity 5, where libopus decides without the speech/music analysis
-//! that opus1 does not have. Every packet is decoded by the C decoder.
+//! complexity 5, where both encoders decide without the speech/music
+//! analysis (both run it from complexity 7 on; `core_analysis_libopus.rs`
+//! compares that). Every packet is decoded by the C decoder.
 //!
 //! What a missing or wrong redundant frame looks like here:
 //!

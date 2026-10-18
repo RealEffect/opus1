@@ -47,17 +47,13 @@ fn sine_fixture_hex() -> Option<&'static str> {
     None
 }
 
-#[cfg(target_arch = "x86_64")]
-fn impulse_fixture_hex() -> Option<&'static str> {
-    // First 7 bytes match libopus 1.6.1; byte 7+ diverges because the Rust
-    // port does not run libopus' tonality analysis (analysis.c), which nudges
-    // alloc_trim via tonality_slope (C trim=1 vs Rust trim=0 here).
-    Some(
-        "f87346b9c0165858f73144258b8b79c2179a4272570325a2d263ab6067bb993375941787ac6e1904601599cafeb058f8eeb514adbb22ecb11412d9d75cf1169fdb36a4d7a7d06817cffc23fd39b6e3e7829db5edf6ed58cb3f58cb3f6a03976a5e05ee0ba8221ad585de11653bfacdcab607c26370d5f7945c3ca511ba07ffb4d8ff77d0c3d7e883f06d09b55d8db6a05ad7119fb82d72fb7375ccb483588e35",
-    )
-}
-
-#[cfg(not(target_arch = "x86_64"))]
+// The x86_64 impulse fixture was a recording of opus1 before it ran the
+// speech and music analysis (analysis.c). Its first 7 bytes matched
+// libopus 1.6.1; the rest diverged because the analysis changes the
+// allocation trim through `tonality_slope` (C trim 1, opus1 trim 0). opus1
+// now runs the analysis, so that recording is no longer its output, and
+// there is no x86 machine here to record a new one. On aarch64
+// `impulse_48k_mono_64k_is_the_packet_of_libopus` compares with libopus.
 fn impulse_fixture_hex() -> Option<&'static str> {
     None
 }
@@ -106,9 +102,13 @@ fn sine_48k_mono_64k_is_the_packet_of_libopus() {
 
 /// The impulse packet of `oracle_impulse_48k_mono_64k`, byte for byte
 /// against the packet the linked libopus writes for the same input.
+///
+/// Before opus1 ran the speech and music analysis, 7 of the 160 bytes were
+/// equal: the analysis changes the allocation trim of this frame. Now all
+/// 160 are.
+#[cfg(feature = "analysis")]
 #[test]
 #[cfg(target_arch = "aarch64")]
-#[ignore = "the 48 kHz impulse packet equals libopus 1.6.1 in its first 7 bytes only: opus1 does not run the tonality analysis of libopus (analysis.c), which changes the allocation trim of this frame"]
 fn impulse_48k_mono_64k_is_the_packet_of_libopus() {
     let mut pcm = vec![0.0f32; 960];
     pcm[0] = 1.0;

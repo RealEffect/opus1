@@ -210,6 +210,16 @@ pub struct SilkEncoderStateCommon {
     /// the decoder's LBRR gain decoding, separate from the main
     /// `sShape.LastGainIndex` chain (silk_LBRR_encode_FIX).
     pub lbrr_prev_last_gain_index: i8,
+    /// C `useDTX`: discontinuous transmission (DTX) is on. The packet's
+    /// control call sets it.
+    pub use_dtx: i32,
+    /// C `inDTX`: this packet is to be left out. Each packet starts with
+    /// the value of `use_dtx`, and a frame with speech, or one of the
+    /// first 10 frames without speech, clears it.
+    pub in_dtx: i32,
+    /// C `noSpeechCounter`: the frames without speech in a row. Above 30
+    /// it goes back to 10 and the frame is sent, so that a long pause
+    /// sends one frame in 21.
     pub no_speech_counter: i32,
     pub vad_flags: [i32; MAX_FRAMES_PER_PACKET],
 
@@ -267,6 +277,8 @@ impl Default for SilkEncoderStateCommon {
             packet_loss_perc: 0,
             lbrr_flag: 0,
             lbrr_prev_last_gain_index: 0,
+            use_dtx: 0,
+            in_dtx: 0,
             no_speech_counter: 0,
             vad_flags: [0; MAX_FRAMES_PER_PACKET],
             frame_counter: 0,

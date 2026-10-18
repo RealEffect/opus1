@@ -307,6 +307,11 @@ fn inband_fec_of_silk_streams_rebuilds_a_lost_frame_in_libopus() {
                 rust.set_packet_loss_perc(if fec { 25 } else { 0 }).unwrap();
                 c.set_inband_fec(fec)
                     .set_packet_loss_perc(if fec { 25 } else { 0 });
+                // Speech: without FEC the speech and music analysis of both
+                // encoders moves some of these streams to CELT (at 16 and
+                // 24 kHz, the same packets in both).
+                rust.set_signal(opus1::Signal::Voice);
+                c.ctl(audiopus_sys::OPUS_SET_SIGNAL_REQUEST, audiopus_sys::OPUS_SIGNAL_VOICE);
                 assert_eq!(rust.inband_fec(), fec);
                 let packets = rust_encode_all(&mut rust, &pcm, frame_size);
                 // The test is about SILK streams.
@@ -422,22 +427,17 @@ fn measure_rates() -> Vec<(String, f64, f64)> {
     rows
 }
 
-/// At 16 kHz and 16 kb/s a mono stream of opus1 codes this signal with
-/// SILK. At 48 kHz with the application `Voip` it codes it with Hybrid at
-/// 16 and 32 kb/s. SILK does not spend more than it needs for the signal,
-/// so the average rate falls below the request: by up to 34 % at 16 kHz
-/// (three mono streams, 16 kb/s each) and by up to 23 % at 48 kHz (three
-/// mono streams, 32 kb/s each). libopus stays within 3 % of the request
-/// there: its analysis of the signal moves the streams to CELT after about
-/// 0.4 s. tests/multistream_e2e_modes.rs shows that this is the whole
-/// difference in the choice of mode.
+/// The speech and music analysis of both encoders moves the streams that
+/// start in SILK or Hybrid to CELT after about 0.4 s on this signal, and
+/// CELT fills the bitrate (tests/multistream_e2e_modes.rs). Before opus1
+/// ran the analysis, its streams stayed in SILK or Hybrid, and SILK, which
+/// does not spend more than it needs, left up to 34 % of the request
+/// unused.
 ///
-/// A single mono stream shows the same (29 % below at 16 kHz and 16 kb/s),
-/// so the multistream encoder adds nothing to it. This test records the
-/// state: the rate never exceeds the request by more than 10 %, the limit
-/// of the design (measured: 9.7 % at most, a stereo stream at 48 kHz and
-/// 32 kb/s), and is never below 60 % of it (measured: 66 %). The limit of
-/// the design for the low side is in the ignored test below.
+/// This test keeps the wider limits of that time: the rate never exceeds
+/// the request by more than 10 %, the limit of the design, and is never
+/// below 60 % of it. Measured now: 87 % (three mono streams at 48 kHz,
+/// VoIP, 16 kb/s each; libopus 102 %) to 104 %.
 #[test]
 fn average_rate_at_16_khz_and_for_voip_stays_below_the_request() {
     let rows = measure_rates();
@@ -466,8 +466,9 @@ fn average_rate_at_16_khz_and_for_voip_stays_below_the_request() {
     }
 }
 
+/// The limits of the design: 85 % to 110 % of the request.
+#[cfg(feature = "analysis")]
 #[test]
-#[ignore = "single-stream encoder (src/lib.rs): no analysis of speech against music, so a stream stays SILK or Hybrid where libopus changes to CELT, and SILK leaves up to 34 % of the bitrate unused"]
 fn average_rate_at_16_khz_and_for_voip_is_within_the_design_limits() {
     let low: Vec<String> = measure_rates()
         .into_iter()

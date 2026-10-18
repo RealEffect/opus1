@@ -21,16 +21,16 @@ Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-appl
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 252 | 1172 |
-| Unit tests inside `src/` | - | 358 |
+| Integration tests in `tests/*.rs` | 263 | 1239 |
+| Unit tests inside `src/` | - | 372 |
 | Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (49) | - | 51 |
-| **Total** | | **1581** |
+| **Total** | | **1662** |
 
-28 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 13 directories of shared helper code (for example `tests/k24_common/`) and 6 files of recorded reference values (`*.expected`).
+27 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 14 directories of shared helper code (for example `tests/k24_common/` and `tests/analysis_common/`) and 6 files of recorded reference values (`*.expected`).
 
-A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1553 tests that are not ignored on Apple M4 Pro. It took 252 seconds, including the build of the test files that had changed.
+A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1635 tests that are not ignored on Apple M4 Pro. It took 201 seconds, including the build of the test files that had changed.
 
-The 11 files of the neural network code (`tests/dnn_*.rs`) have no tests in the default build: they need a model feature, and 5 of them also need `test-libopus-dnn` (see [Tests of the neural network code](#tests-of-the-neural-network-code)). With `--features osce-bwe` the suite has 1642 tests that pass and 29 that are ignored.
+The 11 files of the neural network code (`tests/dnn_*.rs`) have no tests in the default build: they need a model feature, and 5 of them also need `test-libopus-dnn` (see [Tests of the neural network code](#tests-of-the-neural-network-code)). With `--features osce-bwe` the suite has 1724 tests that pass and 28 that are ignored.
 
 
 ## How libopus is linked
@@ -115,11 +115,11 @@ A test file's name starts with a prefix that says what it covers. The counts are
 
 | Prefix | Files | Tests | What the files cover |
 |---|---:|---:|---|
-| `multistream_` | 32 | 279 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`) and the surround analysis (`_surround_*`). |
-| `core_` | 27 | 179 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the decoder controls of the neural network features. |
+| `multistream_` | 35 | 288 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`), the surround analysis (`_surround_*`), and the speech and music analysis and DTX of each stream (`_analysis_libopus`, `_analysis_walk_libopus`, `_dtx_libopus`). |
+| `core_` | 31 | 212 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the stereo width estimate (`core_stereo_width_libopus`, bit for bit against libopus's `compute_stereo_width`), the speech and music analysis (`core_analysis_libopus`, and with settings that change during a stream `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`) and the decoder controls of the neural network features. |
 | `dnn_` | 11 | 0 | The neural network code: kernels, the layers of every network, weights, signal analysis. Their tests compile only with a model feature (see [Tests of the neural network code](#tests-of-the-neural-network-code)). |
 | `perfk_` | 33 | 114 | Guards for the speed work. Each rewritten kernel is compared with the libopus function, with reference values recorded from libopus, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
-| `celtenc_` | 18 | 89 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching, the rate rules (`celtenc_rate_rules.rs`). |
+| `celtenc_` | 19 | 93 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching, the rate rules (`celtenc_rate_rules.rs`), the results of the speech and music analysis (`celtenc_analysis_info_libopus.rs`). |
 | `issue_` | 14 | 75 | Regression tests named after GitHub issues, most of them against libopus (for example `issue_42_stereo_channels.rs`). `issues_repro.rs` adds 14 more tests. |
 | `k24_` | 21 | 72 | The 24 kilohertz (kHz) path: decoding at every output rate, encoding in each mode, SILK loss handling. `k24_main_use.rs` lets libopus choose the mode, as in a real call. |
 | `silk_` | 14 | 66 | SILK parts tested one by one: the bitstream, Burg analysis, linear predictive coding (LPC), the normalized line spectral frequencies (NLSF), the quantizer, and packets of the fixed-point build. |
@@ -127,6 +127,7 @@ A test file's name starts with a prefix that says what it covers. The counts are
 | `silkdec_` | 10 | 31 | The SILK decoder alone (`SilkDecoder`), against libopus with SILK-only streams. These require identical 16-bit samples. |
 | `eval_` | 5 | 26 | The evaluation tools: the ports of `opus_compare`, MOC and the `opus_demo` loop against their C and Python originals, the RFC 8251 conformance test, and the paired-comparison harness (see [Evaluation tools](#evaluation-tools)). |
 | `silkenc_` | 6 | 25 | The SILK encoder: control, FEC data, mono coding of stereo input, pulses, restarts, robustness of its packet functions. |
+| `analysis_` | 3 | 21 | The speech and music analysis alone against libopus, and its properties (see [Checks of the speech and music analysis and of DTX](#checks-of-the-speech-and-music-analysis-and-of-dtx)). |
 | `hybrid_` | 4 | 19 | Hybrid mode encoding and decoding. |
 | `celt_` | 8 | 17 | CELT round trips and regressions. |
 | `mdct_` | 16 | 17 | The modified discrete cosine transform (MDCT): identity, gain and round trips. |
@@ -164,6 +165,14 @@ cargo run --release --example perf_harness -- golden --check target/golden_befor
 
 `--check` exits with status 1 when a field differs and names the fields that changed. The commit messages of the speed changes report the result of this check, for example "Golden check: 0 of 137 differ". A change that alters the output on purpose says so. For example, commit `390ab40` changed the FFT output on 64-bit ARM on purpose, and its message reports that 87 of 137 streams differ.
 
+The speech and music analysis changed the output on purpose. Against the golden file of round 7 (`target/perf/golden_r7.txt`), 56 of 137 streams differ, and `target/perf/golden_analysis.txt` holds the new hashes:
+
+- 44 CELT streams at complexity 7 to 10 and 16 to 48 kHz (`enc`, `enc_i16`, `dec_rust`): the analysis now runs. In 42 of them `enc` now equals `c_pk`, the packets of libopus. The other two are VBR packets of 40 and 60 ms, where opus1 leaves out libopus's limit of each frame on purpose. Over all 137 streams, `enc` equals `c_pk` in 49 (7 before).
+- 4 Hybrid streams at 48 kHz (`enc_i16` only): 16-bit input is now coded with an input precision of 16 bits, as libopus `opus_encode` codes it. This changes CELT's silence threshold and noise floor in the high band.
+- 8 mode-switching streams (`enc`, `dec_rust`, and in 5 of them the mix of modes): they now choose the modes, bandwidths and channel counts of libopus in all 8.
+
+No field of libopus's own packets (`c_pk`) and of the decoding of libopus's packets changed. The NEON code of the analysis changed nothing: its steps were checked against the golden file of the scalar analysis, 0 of 137 differ. On the phone, the harness wrote a golden file identical in every field to the one of the Mac.
+
 ### Vector kernels against scalar code
 
 The vector kernels have unit tests that compare them with scalar versions of the same code, bit for bit where the two must agree. Examples from `src/`:
@@ -172,6 +181,7 @@ The vector kernels have unit tests that compare them with scalar versions of the
 - `mdct::bit_exact_tests::neon_fold_matches_scalar`
 - `pitch::tests::neon::xcorr_by_sample_neon_matches_scalar`
 - `celt::comb_inplace_tests::const_part_neon_matches_portable_version`
+- `analysis::neon::tests::tonality_bins_match_the_scalar_code`, and the other tests of `src/analysis/neon.rs` (downmix, window, network) and `analysis::tests::vector_silence_test_matches_the_scalar_loop`
 
 Run them with `cargo test --release --lib`. The NEON tests run only on 64-bit ARM. The x86-64 vector code was only compiled in this release, not run (see [Differences from libopus](10-differences-from-libopus.md#platforms)).
 
@@ -414,6 +424,29 @@ The run of the `baseline` set on 2026-10-18 (233 items, 9,056 jobs, no job error
 
 `eval_selftest.rs` runs the self-test, the `quick` set (whose gates only warn), the settings check over the 156 conditions of the built-in sets, the resampler's pass band and stop band, the items and degradations, the statistics, the set files and the merge of external metrics. It takes about 5 s on Apple M4 Pro. `OPUS1_EVAL_RECORD=1` lets `eval_opus_compare.rs` and `eval_moc.rs` rewrite their `.expected` files from the C program or the Python script. Do this on 64-bit ARM macOS only, where the values are exact.
 
+## Checks of the speech and music analysis and of DTX
+
+The analysis (`src/analysis/`) is compared with libopus at three levels. The Homebrew library is static, and the analysis functions of libopus are not `static`, so the tests call them directly: `tonality_analysis_init`, `run_analysis`, `tonality_get_info`, `analysis_compute_dense`, `analysis_compute_gru` and the weight tables `layer0` to `layer2`. `tests/analysis_common/mod.rs` declares them, with `#[repr(C)]` copies of `TonalityAnalysisState` (14,004 bytes) and `AnalysisInfo` (64 bytes) whose sizes the tests check.
+
+| File | Tests | What it checks |
+|---|---:|---|
+| `analysis_libopus.rs` | 13 | `TonalityAnalysisState::run` against `run_analysis`: every `AnalysisInfo` and the whole C state after every call, bit for bit. 16, 24 and 48 kHz; frames of 2.5 to 120 ms; mono, stereo and the channel layouts of the multistream encoder up to 8 channels; float and 16-bit input; input precision 8 to 24 bits; buffers longer than the coded frame; NaN, infinities, huge and subnormal input; band energies of 1e9 and more; resets; 205 s of audio, which drives the block counter to its limit. |
+| `analysis_mlp_libopus.rs` | 5 | The weight tables equal the C arrays byte for byte. Each layer of the network equals the C layer on 200,000 random inputs and over a run of 10,000 steps; random int8 layers and a sweep of the activation functions too. |
+| `analysis_properties.rs` | 3 | Property tests (`proptest`, 1000 cases each): any `f32` input and call pattern gives no panic and no allocation, valid results have no NaN and stay in range, 40 and 60 ms calls leave the state of 20 ms calls, and `reset` gives the state of `new`. |
+| `celtenc_analysis_info_libopus.rs` | 4 | The CELT encoder given an `AnalysisInfo`, against libopus's CELT encoder given the same values (`CELT_SET_ANALYSIS`): 2,328 streams and 464,700 packets, all byte for byte, from 8 to 48 kHz, 2.5 to 20 ms, CBR and VBR, complexity 0 to 10, with opus1's own analysis and with random and extreme values. Another test shows that each field of `AnalysisInfo` changes libopus's packets. |
+| `core_analysis_libopus.rs` | 12 | `OpusEncoder` with the analysis against `opus_encode_float` and `opus_encode`: CELT-only packets at complexity 7 to 10 byte for byte in 948 streams (16 to 48 kHz, 2.5 to 60 ms, the three applications, the three signal types, 6 to 510 kb/s, float and 16-bit input); the `AnalysisInfo` of every frame against C `run_analysis`; expert frame durations; complexity changes; `reset_state`; the first bytes of streams where the encoder chooses the mode. One more test, ignored, prints the SNR of SILK and Hybrid streams against libopus. |
+| `core_analysis_walk_libopus.rs` | 3 | `OpusEncoder` against libopus while one setting changes every 2 to 20 packets: bitrate (with the automatic and the maximum bitrate), complexity across 7, signal type, bandwidth, maximum bandwidth, CBR/VBR/CVBR, input precision, packet loss and FEC, prediction, forced channels, DTX, expert frame duration, frame size from 2.5 to 120 ms, float or 16-bit input, output buffers of 1 to 12 bytes, and `reset_state`. 90 CELT-only streams at 8 to 48 kHz (54,000 packets): every packet, final range and `in_dtx` is libopus's. Mono streams that switch between CELT-only, SILK-only and Hybrid, forced or chosen by the analysis: every CELT-only packet and every redundant CELT frame of a switch is libopus's. |
+| `multistream_analysis_libopus.rs` | 4 | The analysis of each stream of the multistream encoder against `run_analysis` with the stream's channels, and CELT-only multistream packets byte for byte for every layout of the test matrix. |
+| `multistream_analysis_walk_libopus.rs` | 1 | `MultistreamEncoder` with every stream CELT-only while one setting changes every few packets, for every layout of the test matrix at 16, 24 and 48 kHz: every packet and final range is libopus's (33 streams, 9,900 packets). |
+| `core_dtx_libopus.rs` | 14 | DTX of `OpusEncoder` against libopus: the 1-byte packets, `in_dtx` and the CBR sizes in the same places. CELT-only DTX in 840 streams (920,530 packets) byte for byte; streams with SILK and Hybrid; packets of several frames; decoding of opus1's DTX streams. |
+| `multistream_dtx_libopus.rs` | 4 | DTX of `MultistreamEncoder` against libopus for every layout of the test matrix. |
+
+`core_fixed_point.rs` also holds the hashes of six DTX streams of the fixed-point build (768 packets). The tests that compare with the fixed-point build run opus1's analysis at complexity 10 only, as that build does (`set_analysis_gate(AnalysisGate::FixedPointBuild)`).
+
+Each kind of difference these tests guard was put into a copy of the code once, and the tests failed. For example: a sum of the band tonality without the fused rounding of the Homebrew build, the downmix without its fused sum, the input precision of 16-bit input, the read position of packets of several frames, the speech estimate kept across a reset, the symmetric distance cache of the spectral variability, and the CBR padding of packets whose frames were all left out by DTX.
+
+The NEON code of the analysis gives the bits of the scalar code. Its unit tests in `src/analysis/neon.rs` compare the two on random input, on the special values where the arithmetic changes branch, and on real blocks, and the libopus comparisons above run the NEON code.
+
 ## Fuzzing
 
 `fuzz/` is a separate package (`opus1-fuzz`) of 18 targets for libFuzzer, the coverage-guided fuzzing engine of LLVM. libFuzzer calls a target with generated inputs. It keeps the inputs that reach new code and changes them further. The targets build and run on the stable toolchain:
@@ -433,13 +466,15 @@ Six targets compare opus1 with libopus, which is linked as for the tests:
 | `fuzz_packet` | The `packet` module gives libopus's results: `parse` (plain and self-delimited), `nb_frames` and `nb_samples` against `opus_packet_parse_impl` and `opus_packet_get_nb_*`, `pad` and `multistream_pad` against `opus_packet_pad` and `opus_multistream_packet_pad` byte for byte, and `write` against the libopus repacketizer byte for byte. `multistream_validate` accepts what libopus's multistream decoder accepts. Written and padded packets parse to the frames they were made of. |
 | `fuzz_decoder_sequence` | A stream of packets into `OpusDecoder` and into libopus's decoder. The packets come from a libopus encoder whose settings change (2.5 to 120 ms, FEC, discontinuous transmission, forced modes and bandwidths), or from the input. Some are damaged or lost. The calls are `decode`, `decode_i16`, `decode_fec` and `decode_fec_i16`, on decoders of either channel count. After every call both decoders accept or refuse alike, return the same number of samples, and end in the same final range. While no packet was lost or damaged, the output is within 50 dB of libopus's. opus1's output buffer sometimes has more or less room than the frame size. More room changes nothing. With too little room opus1 may refuse, and then it keeps its state. |
 | `fuzz_multistream_decoder` | A layout and packets into `MultistreamDecoder` and into libopus's `opus_multistream_decoder`. Both accept or refuse the layout alike. After every call they accept or refuse alike, return the same number of samples, and end in the same final range. While no packet was lost or damaged, the output is within 50 dB of libopus's. opus1's output buffer sometimes has more or less room than the frame size. More room changes nothing. With too little room opus1 may refuse, and then it keeps its state. A decoder built from the layout as the channel mapping table of an Ogg Opus header is accepted too. opus1 writes only the samples it returns, with `f32` and with 16-bit output: the rest of its buffer keeps a marker value. |
-| `fuzz_multistream_encoder` | `MultistreamEncoder` with a layout, settings and audio from the input. libopus accepts and refuses the same layouts, and picks the same streams and mapping for a mapping family. Every packet decodes in libopus's multistream decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings, given `f32` samples where the first gets the same audio as `i16`, writes the same packets. One sample too few is refused, and the encoder keeps its state. With a constant bitrate that is explicit or the maximum, a packet has the length of libopus's rule (`opus_multistream_encoder.c` lines 918-928): the bytes of the bitrate, at least the smallest packet and at most the buffer, or the whole buffer at the maximum bitrate. |
-| `fuzz_encoder_settings` | `OpusEncoder` with settings that change between frames: bitrate (also automatic and maximum), variable or constant bitrate and the constraint of variable bitrate, complexity, forced mode, bandwidth, forced channel count, FEC, loss percentage, the low-frequency-effects (LFE) flag, energy mask, prediction and frame size. A setting libopus refuses is refused. Every valid frame is encoded. With a constant bitrate every packet has the length of libopus's rule in `opus_encode_native` (`cbr_packet_len` in `fuzz/fuzz_targets/common/mod.rs`). Every packet decodes in libopus's decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings, given `f32` samples where the first gets the same audio as `i16`, writes the same packets. One sample too few is refused, and the encoder keeps its state. |
+| `fuzz_multistream_encoder` | `MultistreamEncoder` with a layout, settings and audio from the input. libopus accepts and refuses the same layouts, and picks the same streams and mapping for a mapping family. Every packet decodes in libopus's multistream decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings and an input precision of 16 bits (`set_lsb_depth(16)`), given `f32` samples where the first gets the same audio as `i16`, writes the same packets. DTX is switched on and off between frames. One sample too few is refused, and the encoder keeps its state. With a constant bitrate that is explicit or the maximum, a packet has the length of libopus's rule (`opus_multistream_encoder.c` lines 918-928): the bytes of the bitrate, at least the smallest packet and at most the buffer, or the whole buffer at the maximum bitrate. |
+| `fuzz_encoder_settings` | `OpusEncoder` with settings that change between frames: bitrate (also automatic and maximum), variable or constant bitrate and the constraint of variable bitrate, complexity, forced mode, bandwidth, forced channel count, FEC, loss percentage, DTX, the low-frequency-effects (LFE) flag, energy mask, prediction and frame size. A setting libopus refuses is refused. Every valid frame is encoded. With a constant bitrate every packet has the length of libopus's rule in `opus_encode_native` (`cbr_packet_len` in `fuzz/fuzz_targets/common/mod.rs`). Every packet decodes in libopus's decoder to one frame, in the encoder's final range. Until a frame is concealed, opus1's decoder gives output within 50 dB of libopus's. A second encoder with the same settings and an input precision of 16 bits, given `f32` samples where the first gets the same audio as `i16`, writes the same packets. One sample too few is refused, and the encoder keeps its state. |
 | `fuzz_channel_order` | A stereo `OpusEncoder`, or a `MultistreamEncoder` with the layout of a mapping family or with channels, streams and a mapping, gets a tone of its own in every input channel. libopus's encoder codes the same tones with the same settings, and libopus's decoders decode both. For each output channel the check measures the strongest tone of another input channel, relative to its level at the input (the leakage). Wherever libopus's leakage is -20 dB or less, opus1's must be below -6 dB. A channel on the wrong output gives a leakage of about 0 dB. Stereo streams that an encoder codes as mono, and those that SILK codes with a constant bitrate, are left out, see below. |
 
 The output is compared only while both decoders have decoded the same packets in full. opus1's decoder differs from libopus's only in rounding, so 50 dB leaves a wide margin. After a lost or damaged packet the output is no longer compared. The concealment searches the decoded signal for its pitch, and a rounding difference can change what it finds. A frame of 0 or 1 bytes is concealed as well, so it also ends the comparison. So does a packet that switches from CELT-only to SILK or Hybrid. Unless such a packet carries a redundant CELT frame, the decoder conceals 5 ms in CELT and fades them into the new frame. The targets do not look for the redundant frame, so they stop comparing after every such switch. The fuzzer found a switch without a redundant frame at 8 kHz. On the CELT packets before it, the two decoders agreed to 127 dB or better. On the 20 ms SILK frame of the switch they agreed to 33 dB. The difference lay in the first 5 ms of that frame, which hold the concealed CELT audio. There the decoders agreed to 27 dB, and on the other 15 ms to 294 dB.
 
 The other 13 targets (`fuzz_encoder`, `fuzz_decoder`, `fuzz_roundtrip`, `fuzz_silk_encoder`, `fuzz_celt_encoder`, `fuzz_overflow`, `fuzz_celt_large_frame`, `fuzz_celt_decoder_boundary`, `fuzz_silk_decoder`, `fuzz_hybrid_mode`, `fuzz_encoder_boundary`, `fuzz_multi_frame`, `fuzz_packet_parsing`) run opus1 alone, with extreme settings, frame sizes and packets. Nothing may panic. Those that encode and decode also check that the decoder returns one frame and ends in the encoder's final range.
+
+With the speech and music analysis and DTX, `fuzz_encoder_settings` and `fuzz_multistream_encoder` ran 150 s each (158,650 and 52,775 inputs) without a failure.
 
 When fuzzing finds a failure in opus1, the fix follows what libopus does. The minimized input becomes a test in `tests/fuzz_regressions.rs`, as a byte array in the test, so the test needs no file. The runs below found no such failure, so that file does not exist yet.
 
@@ -528,7 +563,7 @@ Each check ran for 12 minutes as one process, the first three at the same time a
 - A stereo stream that SILK coded with a constant bitrate at 12 kHz lost its stereo image in opus1. The fixed-point build of libopus, which opus1's SILK encoder ports, loses it too (built with `cc`, see [Checks against the fixed-point build](#checks-against-the-fixed-point-build-of-libopus)); the float build keeps it. Such streams are left out of the check.
 - 7.1 sound at 24 kHz with the automatic bitrate: the encoders chose other bandwidths on purpose (D1 in [Differences from libopus](10-differences-from-libopus.md)). Surround layouts get an explicit bitrate since.
 - A stereo stream that both encoders coded as mono. Such streams are left out.
-- Three mono streams at 24 kHz in 2.5 ms frames at complexity 7: opus1 lost the tone of one channel where libopus kept it. libopus runs its speech and music analysis there, which opus1 does not have. The check now measures how loud another channel's tone comes out, so a lost tone no longer counts.
+- Three mono streams at 24 kHz in 2.5 ms frames at complexity 7: opus1 lost the tone of one channel where libopus kept it. libopus ran its speech and music analysis there, which opus1 did not have then. The check now measures how loud another channel's tone comes out, so a lost tone no longer counts.
 
 Defects put into a copy of the code show that the new checks find what they look for. Each run started from a copy of the target's corpus from the runs above and failed while it replayed the saved inputs:
 
@@ -565,24 +600,21 @@ The four targets then ran again without a defect, 10.5 minutes each, as four pro
 
 Without its default features, opus1 builds as `#![no_std]` with no heap allocation (see the [README](../README.md)). `scripts/check_no_std.sh` checks this:
 
-1. It builds with `--no-default-features --features libm` for `thumbv7em-none-eabi` (ARM Cortex-M) and `wasm32-unknown-unknown` (WebAssembly). A target that is not installed is skipped with a message. Add it with `rustup target add <target>`.
-2. It builds the same configuration for the host.
-3. It runs `cargo test --no-default-features --features libm` on the host with `RUST_MIN_STACK=33554432` (32 mebibytes). Without the `heap` feature, the encoder and decoder hold all their buffers inline: 135,192 and 67,432 bytes on aarch64 (see [Size of the encoder and the decoder](06-using-the-library.md#size-of-the-encoder-and-the-decoder)). So test threads need a large stack.
+It does each step twice: with `--features libm`, and with `--features libm,analysis`, which adds the speech and music analysis.
 
-The multistream module needs `std`. The multistream test files that use it (30 of 31) are compiled only with the `std` feature, so they are left out of this run. `tests/stack_usage_test.rs` checks the sizes for both builds: small structs with `heap`, large ones without it.
+1. It builds with `--no-default-features` and those features for `thumbv7em-none-eabi` (ARM Cortex-M) and `wasm32-unknown-unknown` (WebAssembly). A target that is not installed is skipped with a message. Add it with `rustup target add <target>`.
+2. It builds the same configuration for the host.
+3. It runs `cargo test --no-default-features` with those features on the host with `RUST_MIN_STACK=33554432` (32 mebibytes). Without the `heap` feature, the encoder and decoder hold all their buffers inline: 127,936 bytes (153,904 with `analysis`) and 59,728 bytes on aarch64 (see [Size of the encoder and the decoder](06-using-the-library.md#size-of-the-encoder-and-the-decoder)). So test threads need a large stack.
+
+The multistream module needs `std`. The multistream test files that use it (30 of 31) are compiled only with the `std` feature, so they are left out of this run. At git commit `f952b46`, the run with `--features libm,analysis` passed 985 tests (26 ignored), in a debug build. `tests/stack_usage_test.rs` checks the sizes for both builds: small structs with `heap`, large ones without it.
 
 ## Ignored tests
 
-27 tests are marked `#[ignore]`, and one documentation example is not run.
+26 tests are marked `#[ignore]`, and one documentation example is not run.
 
-- 22 print report tables or are tools, not checks: `celtenc_bands_libopus` (2), `celtenc_gap_report` (3), `celtenc_prefilter` (1), `k24_enc_report` (15) and `perfk_rc_timing` (1).
+- 23 print report tables or are tools, not checks: `celtenc_bands_libopus` (2), `celtenc_gap_report` (3), `celtenc_prefilter` (1), `core_analysis_libopus` (1, the SNR of SILK and Hybrid streams against libopus), `k24_enc_report` (15) and `perfk_rc_timing` (1).
 - 3 unit tests inside `src/` measure the speed of one function and print it: `celt::deemph_segments_tests::deemphasis_timing`, `mdct::bit_exact_tests::transform_timing` and `pitch::tests::prefilter_timing`.
-- 2 describe known gaps, both caused by the missing speech and music analysis:
-  - `oracle_celt::impulse_48k_mono_64k_is_the_packet_of_libopus`
-  - `multistream_enc_signals::average_rate_at_16_khz_and_for_voip_is_within_the_design_limits`
-
-  [Differences from libopus](10-differences-from-libopus.md) gives their figures.
-
+- No test is ignored because of a known gap. The two that were, both because of the missing speech and music analysis, pass since its port: `oracle_celt::impulse_48k_mono_64k_is_the_packet_of_libopus` and `multistream_enc_signals::average_rate_at_16_khz_and_for_voip_is_within_the_design_limits`. [Differences from libopus](10-differences-from-libopus.md#tests-that-track-these-gaps) gives their figures.
 - With a neural network feature, `dnn_frecpe::software_frecpe_matches_the_instruction_on_all_inputs` checks all 2^32 inputs of the software FRECPE (about 10 s on Apple M4, 30 s on the Cortex-A76, 84 s on the Cortex-A55). It is ignored in the default run of those tests and not compiled without the features.
 - 1 documentation example is marked `rust,ignore`: the fields of `OpusEncoder` with and without the `heap` feature in [Architecture](07-architecture.md#feature-flags-and-where-state-is-stored). It shows part of a struct, so it cannot run on its own.
 
@@ -773,9 +805,20 @@ Results on the phone (HONOR CLK-AN00, 2026-10-18), on a Cortex-A76 (CPU 7) and a
 
 ### Results on the phone
 
-Run on 2026-10-17 at git commit `56ca2dd` (round 8 and the frames of 80 to 120 ms merged), against libopus 1.6.1 built by `build-libopus.sh` at `-O2` with the NDK's clang 18: 235 test programs with 1470 tests. 1435 passed, 8 failed and 27 were ignored. The run took 675 seconds, with the tests already built, including copying them to the phone. The logs are in `target/perf/merge_56ca2dd/phone_tests/`. The same 8 tests failed at `c96e936`, before round 8.
+Run on 2026-10-18 at git commit `f952b46` (the speech and music analysis and DTX), against libopus 1.6.1 built by `build-libopus.sh` at `-O2` with the NDK's clang 18: 243 test programs with 1553 tests. 1498 passed, 29 failed and 26 were ignored. The run took 796 seconds, with the tests already built, including copying them to the phone. The logs are in `target/perf/analysis_c7/phone_tests_O2/`.
 
-None of the 8 failures comes from opus1. Each failing test compares opus1 with libopus at the last bit, or makes its input with the C library's sine function. The difference is on that side:
+The same programs, built against libopus 1.6.1 at `-Os` (`OPUS_EXTRA_CFLAGS=-Os`), passed every one of the 28 failing tests that compare with libopus (logs in `target/perf/analysis_c7/phone_tests_Os/`). Only `issue_15_loss_concealment` still failed there; it makes its input with the C library's sine (see below). So the 28 failures come from the code that clang generates for libopus at `-O2`, not from opus1:
+
+| Failing tests | Cause |
+|---|---|
+| The 8 of the earlier runs: `celtdec_plc` (5), `celtenc_bands_libopus::stereo_angles_are_the_ones_libopus_computes`, `perfk_pitch_libopus::periodic_signals_give_the_lag_of_libopus`, `issue_15_loss_concealment::silk_concealment_extrapolates_the_signal` | The vector code of libopus's loss concealment, `stereo_itheta` and pitch search, and the C library's sine. The table below explains each. |
+| 11 tests of `analysis_libopus`, 3 of `core_analysis_libopus` (the analysis of each frame, 124 streams; the expert frame duration, 3 of 72 streams; CELT-only at 48 kHz, 11 of 252 streams), `multistream_analysis_libopus::the_analysis_of_each_stream_is_libopus` (132 runs) and `core_dtx_libopus::celt_only_streams_are_libopus_at_48_khz` (7 of 168 streams) | The speech and music analysis at `-O2`: clang's vector code rounds some products of the band sums before it adds them (analysis.c, lines 657 and 658, and in the NDK's build also line 864), where the Homebrew build fuses them (see [Differences from libopus](10-differences-from-libopus.md#what-the-figures-were-measured-against)). The first difference is in the last bit of a probability, a slope or a state value, for example `tonality_slope` 0x3c48abd0 against 0x3c48abd1. Where a test compares packets, a few streams then take another decision. |
+| `celtenc_analysis::the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it`, `core_lowdelay::the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it` and `core_dtx_libopus::celt_only_streams_are_libopus_at_8_and_12_khz` (3 of 168 streams) | CELT encoding of signals at very low levels, where libopus's `EPSILON` terms matter, at `-O2`. These tests run no analysis (complexity 5, the CELT encoder alone, or 8 and 12 kHz). The two tests of the DC filter came after the last phone run. They pass against the `-Os` build, so the code of libopus's CELT encoder at `-O2` is the cause; which loop was not looked for. |
+| `core_dtx_libopus::opus1_dtx_streams_decode_like_libopus` (85 packets) and `multistream_dtx_libopus::opus1_dtx_packets_decode_like_libopus` (149 packets) | The decoders conceal the 1-byte packets of DTX. This is the vector code of libopus's loss concealment, the cause of the `celtdec_plc` failures. |
+
+The run of 2026-10-17 at git commit `56ca2dd` (round 8 and the frames of 80 to 120 ms merged) had 235 test programs with 1470 tests: 1435 passed, 8 failed and 27 were ignored (logs in `target/perf/merge_56ca2dd/phone_tests/`). The same 8 tests had failed at `c96e936`, before round 8.
+
+The 8 failures of the earlier runs, in detail. None of them comes from opus1. Each failing test compares opus1 with libopus at the last bit, or makes its input with the C library's sine function. The difference is on that side:
 
 | Failing tests | Cause | How it was found |
 |---|---|---|
@@ -795,7 +838,7 @@ The earlier runs linked the main branch of libopus (see [Which libopus source to
 - 8 tests of LFE streams and mode switches: `celtenc_known_gaps` (2), `celtenc_lfe`, `celtenc_lfe_formats`, `celtenc_lfe_header`, `multistream_e2e_matrix` (2) and `core_redundancy`.
 - `celtenc_gap_report::sample_of_rows_is_the_packets_of_libopus` and `celtenc_rate_rules::bitrate_is_limited_to_750_kbps_per_channel`.
 
-`golden.sh --check target/perf/golden_r6.txt` found 0 of 137 streams that differ, against the `-O2` build of 1.6.1 and against the build without vector loops. The golden file of the phone is identical in every field to the one of the Mac, whether the Mac links the Homebrew library or a build of 1.6.1 at `-O2` or `-Os`. So neither the vector code of `-O2` nor Android's C library changes a hash of these streams. Android's `acos`, `cos`, `exp` and `log` give other last bits than Apple's for some inputs. With the main branch, 86 of the 137 streams differed in the fields that depend on libopus's packets: `c_pk`, `dec_c`, `dec_c_plc` and `dec_c_burst`, and in 7 of them also `fec_silk`.
+At git commit `f952b46`, the harness on the phone wrote a golden file identical in every field to `target/perf/golden_analysis.txt` of the Mac, against the `-O2` build of 1.6.1. Both encoders run the speech and music analysis in 104 of these streams (complexity 7 to 10 at 16 to 48 kHz, among them the 8 mode-switching streams), and the last bits of libopus's analysis at `-O2` changed none of libopus's packets there. Earlier, `golden.sh --check target/perf/golden_r6.txt` found 0 of 137 streams that differ, against the `-O2` build of 1.6.1 and against the build without vector loops. The golden file of the phone is identical in every field to the one of the Mac, whether the Mac links the Homebrew library or a build of 1.6.1 at `-O2` or `-Os`. So neither the vector code of `-O2` nor Android's C library changes a hash of these streams. Android's `acos`, `cos`, `exp` and `log` give other last bits than Apple's for some inputs. With the main branch, 86 of the 137 streams differed in the fields that depend on libopus's packets: `c_pk`, `dec_c`, `dec_c_plc` and `dec_c_burst`, and in 7 of them also `fec_silk`.
 
 ## How to run each part
 

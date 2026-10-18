@@ -203,7 +203,7 @@ The redundant frame sits at the end of the frame's bytes. The main frame's CELT 
 | Hybrid to SILK-only | Decodes 2.5 ms of CELT from a frame of two 0xFF bytes and adds it, so that the CELT layer's last window fades out. This is skipped when this frame starts with a redundant frame for a switch from CELT-only and the frame before ended with one for a switch to CELT-only. |
 | SILK-only to Hybrid | Nothing extra. The CELT decoder starts from a reset state. |
 
-The cross-fades use the squared CELT window (`smooth_fade`). The redundant frame's final range is combined by exclusive or (XOR) into the frame's final range.
+The cross-fades use the squared CELT window (`smooth_fade`). Each sample is `w * in2 + (1 - w) * in1`, with the first product fused into the sum as the libopus build on 64-bit ARM computes it (`mac`). The redundant frame's final range is combined by exclusive or (XOR) into the frame's final range.
 
 ## 7. Packets with another channel count
 
@@ -400,7 +400,7 @@ assert_eq!(output.len(), packets.len() * frame);
 
 1. The packet is decoded to float into a buffer for the whole packet (`decode_native` with `soft_clip` set). The buffer holds 120 ms, the longest packet. A longer loss is concealed 60 ms at a time. This gives the same samples as concealing it in one call.
 2. A decoded packet is soft-clipped (`pcm_soft_clip`, the port of `opus_pcm_soft_clip`):
-   - Where the signal goes beyond ±1, the samples between the zero crossings around that place are replaced by `x + a * x * x`.
+   - Where the signal goes beyond ±1, the samples between the zero crossings around that place are replaced by `x + a * x * x`. As in the libopus build on 64-bit ARM, `a * x` is rounded and the second product is fused into the sum, so the output is libopus's bit for bit.
    - The value `a` is chosen so that the peak lands on ±1.
    - When such a stretch reaches the end of the packet, a value per channel (`softclip_mem`) keeps its `a`. The next packet applies the same curve to its first samples, up to the first zero crossing. So packets join without a step.
    - Concealed and FEC output is not soft-clipped, as in libopus.
@@ -452,8 +452,9 @@ for k in 0..10 {
 
 These figures come from the project's comparison of both decoders on packets from the libopus encoder (Apple M4 Pro, libopus 1.6.1). [10-differences-from-libopus.md](10-differences-from-libopus.md) collects the differences of the whole library.
 
-- SILK: 48 of 49 test streams decode to the same samples as libopus. The other one, with FEC, agrees to 186 dB.
-- Hybrid: 25 of 29 test streams decode to the same samples. Three 10 ms streams and one FEC stream agree to 167-221 dB.
-- CELT: 8 of 51 test streams decode to the same samples. The others agree to 136-146 dB; they are the streams that use the post-filter.
+- SILK: 49 of 49 test streams of `perf_harness modes` decode to the same samples as libopus.
+- Hybrid: 29 of 29 test streams decode to the same samples.
+- CELT: 51 of 51 test streams decode to the same samples.
+- Mode switches: the 8 switching test streams decode to the same samples.
 - The neural concealment of libopus is not ported.
 - Packet extensions that libopus 1.5 and later store in the padding are not read (`src/packet.rs`).

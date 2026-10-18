@@ -6,10 +6,10 @@
 //! of VBR, the complexity, the forced mode, the bandwidth and the maximum
 //! bandwidth, the forced channel count, in-band forward error correction
 //! (FEC) and the expected packet loss, the low-frequency-effects (LFE)
-//! flag, the energy mask, prediction, the expert frame duration, the frame
-//! size, the size of the output buffer, the input signal and its format
-//! (`f32` or `i16`), or reset the encoder. A setting libopus refuses must
-//! be refused.
+//! flag, the energy mask, prediction, the expert frame duration,
+//! discontinuous transmission (DTX), the frame size, the size of the output
+//! buffer, the input signal and its format (`f32` or `i16`), or reset the
+//! encoder. A setting libopus refuses must be refused.
 //!
 //! What must hold for every frame:
 //!
@@ -20,15 +20,17 @@
 //!   `frame_size_select` refuses is refused.
 //! - The packet fits the buffer, and libopus's decoder decodes it to
 //!   exactly one frame. With a constant bitrate it has the length libopus's
-//!   rule gives (`cbr_packet_len`). Its final range (the state of the
-//!   range decoder after the packet) equals the encoder's final range.
+//!   rule gives (`cbr_packet_len`), unless DTX left out all its frames.
+//!   Its final range (the state of the range decoder after the packet)
+//!   equals the encoder's final range.
 //! - opus1's decoder does the same. Its output is within 50 dB of
 //!   libopus's until a packet has a frame of 0 or 1 bytes, which the
 //!   decoders conceal, or switches from CELT-only to SILK or Hybrid.
 //! - A second encoder with the same settings, always given `f32` samples
-//!   (for 16-bit input the samples `s as f32 / 32768.0`), writes the same
-//!   packets: `encode_i16` promises this, and an encoder must not depend
-//!   on anything but its settings and input.
+//!   (for 16-bit input the samples `s as f32 / 32768.0`, coded with an
+//!   LSB depth of 16), writes the same packets: `encode_i16` promises
+//!   this, and an encoder must not depend on anything but its settings and
+//!   input.
 
 #![no_main]
 
@@ -57,7 +59,7 @@ const BANDWIDTHS: [Bandwidth; 6] = [
 
 /// One change of a setting, made on both encoders.
 fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) -> Result<()> {
-    match u.int_in_range(0..=13)? {
+    match u.int_in_range(0..=14)? {
         0 | 1 => {
             let v = match u.int_in_range(0..=9)? {
                 0 => Bitrate::BitsPerSecond(u.arbitrary()?),
@@ -165,6 +167,12 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
                 e.set_expert_frame_duration(d);
             }
         }
+        13 => {
+            let v = u.arbitrary()?;
+            for e in encs {
+                e.set_dtx(v);
+            }
+        }
         _ => {
             for e in encs {
                 e.reset_state();
@@ -266,6 +274,9 @@ fn run(data: &[u8]) -> Result<()> {
             enc.encode(&pcm, size, out)
         };
         let twin_out = &mut twin_packet[..out_len];
+        // `encode_i16` codes with an LSB depth of at most 16, as libopus's
+        // `opus_encode` does.
+        twin.set_lsb_depth(if i16_in { 16 } else { 24 }).unwrap();
         let twin_r = twin.encode(&pcm, size, twin_out);
         match (&r, &twin_r) {
             (Ok(a), Ok(b)) => {
@@ -290,7 +301,11 @@ fn run(data: &[u8]) -> Result<()> {
         };
         assert!((1..=out_len).contains(&len), "frame {n}: packet of {len} bytes for a buffer of {out_len}");
         let p = &packet[..len];
-        if !enc.vbr() {
+        // DTX leaves a frame out as its TOC byte, without padding. A packet
+        // whose frames DTX all left out is not padded either
+        // (opus_encoder.c:1831).
+        let all_left_out = c_parse(p, false).is_ok_and(|parsed| parsed.sizes.iter().all(|&n| n == 0));
+        if !enc.vbr() && !(enc.dtx() && all_left_out) {
             let setting = enc.bitrate_setting();
             let (lo, hi) = cbr_packet_len(setting, fs, channels, coded, out_len, p[0]);
             assert!(

@@ -34,17 +34,23 @@ pub fn silk_encode_do_vad(ps_enc: &mut SilkEncoderState, input: &[i16], activity
         ps_enc.s_cmn.speech_activity_q8 = activity_threshold - 1;
     }
 
+    // "Convert speech activity into VAD and DTX flags" (encode_frame_FIX.c
+    // 62-79). The packet starts with `in_dtx` equal to `use_dtx`. The
+    // first 10 frames without speech (200 ms) are still sent, the next 20
+    // are left out, and then one is sent again.
     if ps_enc.s_cmn.speech_activity_q8 < activity_threshold {
         ps_enc.s_cmn.indices.signal_type = TYPE_NO_VOICE_ACTIVITY as i8;
-        // libopus's count of frames without speech for its discontinuous
-        // transmission (DTX). opus1 has no DTX, so the count is only kept.
         ps_enc.s_cmn.no_speech_counter += 1;
-        if ps_enc.s_cmn.no_speech_counter > MAX_CONSECUTIVE_DTX + NB_SPEECH_FRAMES_BEFORE_DTX {
+        if ps_enc.s_cmn.no_speech_counter <= NB_SPEECH_FRAMES_BEFORE_DTX {
+            ps_enc.s_cmn.in_dtx = 0;
+        } else if ps_enc.s_cmn.no_speech_counter > MAX_CONSECUTIVE_DTX + NB_SPEECH_FRAMES_BEFORE_DTX {
             ps_enc.s_cmn.no_speech_counter = NB_SPEECH_FRAMES_BEFORE_DTX;
+            ps_enc.s_cmn.in_dtx = 0;
         }
         ps_enc.s_cmn.vad_flags[ps_enc.s_cmn.n_frames_encoded as usize] = 0;
     } else {
         ps_enc.s_cmn.no_speech_counter = 0;
+        ps_enc.s_cmn.in_dtx = 0;
         ps_enc.s_cmn.indices.signal_type = TYPE_UNVOICED as i8;
         ps_enc.s_cmn.vad_flags[ps_enc.s_cmn.n_frames_encoded as usize] = 1;
     }
@@ -878,6 +884,10 @@ pub fn silk_encode_packet(
     for (n, symbol) in lbrr_symbols.iter_mut().enumerate().take(n_channels) {
         let ch = channel(mid, &mut side, n);
         ch.s_cmn.n_frames_encoded = 0;
+        // enc_API.c:273: each coded channel starts the packet in DTX when
+        // DTX is on. Its voice activity detector clears that for a frame
+        // with speech or for one of the first 10 without.
+        ch.s_cmn.in_dtx = ch.s_cmn.use_dtx;
         if ch.s_cmn.first_frame_after_reset != 0 || transition {
             ch.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
         }
@@ -1038,10 +1048,24 @@ pub fn silk_encode_packet(
     }
     rc.patch_initial_bits(flags, n_flag_bits);
 
-    let n_bytes_out = (rc.tell() + 7) >> 3;
+    // enc_API.c:550-553: "Return zero bytes if all channels DTXed". The
+    // bit reservoir then counts the packet as empty.
+    let n_bytes_out = if silk_packet_in_dtx(mid, side.as_deref()) {
+        0
+    } else {
+        (rc.tell() + 7) >> 3
+    };
     silk_update_bit_reservoir(mid, target_rate_bps, n_bytes_out);
     mid.stereo.n_prev_channels_internal = n_channels as i32;
     SILK_NO_ERROR
+}
+
+/// Whether the packet just coded has no SILK bytes because every coded
+/// channel is in discontinuous transmission (DTX): libopus's test before
+/// it sets `*nBytesOut` to 0 (enc_API.c:550-553). `side` is the side
+/// channel when the packet coded two channels.
+pub fn silk_packet_in_dtx(mid: &SilkEncoderState, side: Option<&SilkEncoderState>) -> bool {
+    mid.s_cmn.in_dtx != 0 && side.is_none_or(|side| side.s_cmn.in_dtx != 0)
 }
 
 /// Coded channel `n` of a packet: the mono or mid channel for 0, the side
@@ -1136,6 +1160,9 @@ fn silk_mono_to_stereo(mid: &mut SilkEncoderState, side: &mut SilkEncoderState) 
         mid.s_cmn.complexity,
     );
     side.s_cmn.use_cbr = mid.s_cmn.use_cbr;
+    // libopus gives both channels the DTX setting of the same control call
+    // (control_codec.c:75).
+    side.s_cmn.use_dtx = mid.s_cmn.use_dtx;
     side.s_cmn.packet_loss_perc = mid.s_cmn.packet_loss_perc;
     ret += silk_setup_lbrr(side, mid.s_cmn.lbrr_enabled);
     ret
@@ -1371,6 +1398,10 @@ pub struct SilkControl {
     /// SILK's own voice activity detector (libopus passes 1 or -1,
     /// `VAD_NO_DECISION`).
     pub activity: i32,
+    /// SILK's discontinuous transmission (`useDTX`): after 10 frames
+    /// without speech the packet has no SILK bytes, for up to 20 frames in
+    /// a row.
+    pub use_dtx: bool,
     /// The last packet with two channels before stereo input goes on as one
     /// channel (`toMono`): its stereo width falls to zero.
     pub to_mono: bool,
@@ -1395,6 +1426,10 @@ pub struct SilkControl {
     /// Out: the stereo width of the packet in Q14 (`stereoWidth_Q14`), 0
     /// with `to_mono`.
     pub stereo_width_q14: i32,
+    /// Out: every coded channel is in DTX, and the packet has no SILK bytes
+    /// (libopus `*nBytesOut` 0). The range coder still holds the coded
+    /// packet, which the caller drops.
+    pub zero_bytes: bool,
 }
 
 /// One channel of [`SilkEncoder`].
@@ -1556,6 +1591,8 @@ impl SilkEncoder {
             // control_codec.c:76. SILK's noise shaping reads the flag
             // (noise_shape_analysis_FIX.c:171).
             ch.state.s_cmn.use_cbr = ctl.use_cbr as i32;
+            // control_codec.c:75.
+            ch.state.s_cmn.use_dtx = ctl.use_dtx as i32;
             // enc_API.c:262-267: the redundant frames kept for the next
             // packet belong to the old packet layout.
             if new_rate || new_packet_size {
@@ -1615,6 +1652,8 @@ impl SilkEncoder {
         if ret != 0 {
             return Err("SILK encoding failed");
         }
+        let side = self.side.as_deref().filter(|_| sch == 2).map(|ch| &ch.state);
+        ctl.zero_bytes = silk_packet_in_dtx(&self.mid.state, side);
 
         // enc_API.c:559-583: SILK allows a bandwidth switch while its speech
         // activity is under a bar that starts at 5 % and is gone after 5 s

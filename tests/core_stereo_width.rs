@@ -4,8 +4,9 @@
 //! (1429-1451).
 //!
 //! The reference is the C libopus encoder with the same settings, at
-//! complexity 5, where libopus decides without the speech/music analysis
-//! that opus1 does not have.
+//! complexity 5, where both encoders decide without the speech/music
+//! analysis (both run it from complexity 7 on; `core_analysis_libopus.rs`
+//! compares that).
 
 mod core_common;
 mod k24_common;

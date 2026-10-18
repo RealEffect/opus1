@@ -70,10 +70,10 @@ The C encoder is forced to the mode, the audio bandwidth and the channel count t
 
 The reason is that an encoder that chooses its own mode can pick a different one than the other encoder. For example, one might code a frame with SILK while the other codes it with CELT. Their times would then measure different work. The mode-switching streams of `golden` and `modes` are the exception: there only the channel count is forced.
 
-Two differences remain, and the harness reports them:
+Two differences remained, and the harness reports them:
 
 1. The libopus that the harness links is a floating-point build. Its SILK encoder is the floating-point one (`silk/float`). The SILK encoder of opus1 is a port of the fixed-point one (`silk/fixed`).
-2. libopus runs its speech and music analysis (`run_analysis` in `analysis.c`) at complexity 7 and above when the input rate is 16 kHz or more. opus1 has no port of it. The C encode time of such a scenario includes the analysis, so its encode ratio favours opus1. The `bench` table names this step in the column `only C runs`.
+2. Up to commit `d541821`, libopus ran its speech and music analysis (`run_analysis` in `analysis.c`) at complexity 7 and above when the input rate is 16 kHz or more, and opus1 had no port of it. The `bench` table named this step in the column `only C runs`, and the encode ratios of these scenarios favoured opus1. Now opus1 runs the analysis too (cargo feature `analysis`, on by default), so the column is empty and the encode ratios compare the same work. A harness built without the feature names the step again.
 
 Both decoders decode the same packets: the packets that libopus encoded.
 
@@ -225,51 +225,122 @@ On the phone, `scripts/android/build-variant.sh` builds the programs and `script
 
 ## Latest results
 
-Measured on 2026-10-17 with the code of git commit `b7a8b64` (branch `round8-merge`: opus1 0.2.0 with the work of round 8 merged on `c96e936`; see [Round 8: more work for in-order cores](#round-8-more-work-for-in-order-cores)). Machine: Apple M4 Pro, macOS. opus1 was built with the default release profile. The C references are the two of [The C reference](#the-c-reference): libopus 1.6.1 at `-O2` with run-time CPU detection, and the Homebrew libopus 1.6.1. The code before round 8 (`c96e936`) and after it ran in turns, each linked with each of the two references: four harness programs, three passes of the bench set. The load average of the machine stayed between 1.7 and 2.5. Source: `target/perf/round8/merge/mac/bench/`.
+Measured on 2026-10-18 with the code of git commit `f952b46` (branch `next-analysis`: the speech and music analysis, DTX and their NEON code, on `d541821`; see [The speech and music analysis](#the-speech-and-music-analysis)). Machine: Apple M4 Pro, macOS. opus1 was built with the default release profile. The C references are the two of [The C reference](#the-c-reference): libopus 1.6.1 at `-O2` with run-time CPU detection, and the Homebrew libopus 1.6.1. The code before the analysis (`d541821`) and after it ran in turns, each linked with each of the two references: four harness programs, three passes of the bench set and of the two scenarios at complexity 7. Other programs kept the load average of the machine between 7 and 53, so single repetitions were often disturbed; the medians below held. Source: `target/perf/analysis_c7/mac_bench/`.
 
-Times are medians per frame in microseconds (µs). The opus1 time is the median over the six runs of the code after round 8, three with each reference. The libopus time is the median over the three runs of the `-O2` reference. A ratio is opus1 / libopus, the median over the three passes. A ratio below 1 means opus1 is faster. Between the three passes, the `-O2` ratio of a scenario changed by at most 2.4 % for encoding and 0.7 % for decoding, and the geometric means by at most 0.001.
+Times are medians per frame in microseconds (µs). The opus1 time is the median over the six runs of the code after the analysis, three with each reference. The libopus time is the median over the six runs with the `-O2` reference. A ratio is opus1 / libopus, the median over the three passes. A ratio below 1 means opus1 is faster. Both encoders now run the speech and music analysis at complexity 7 to 10 (the column `only C runs` of earlier tables is gone), so every ratio compares the same work, except that the SILK encoders are the fixed-point one in opus1 and the floating-point one in libopus.
 
-| Scenario | opus1 encode µs | libopus -O2 encode µs | Encode ratio, -O2 | Encode ratio, Homebrew | opus1 decode µs | libopus -O2 decode µs | Decode ratio, -O2 | Decode ratio, Homebrew | Only C runs |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| `silk_nb_8k_mono_12k_vbr_c0_20ms` | 8.9 | 12.5 | 0.707 | 0.623 | 2.0 | 3.1 | 0.644 | 0.618 | - |
-| `silk_nb_8k_mono_12k_vbr_c5_20ms` | 19.6 | 29.9 | 0.652 | 0.620 | 2.0 | 3.2 | 0.645 | 0.625 | - |
-| `silk_nb_8k_mono_12k_vbr_c10_20ms` | 24.7 | 42.2 | 0.584 | 0.431 | 2.1 | 3.2 | 0.651 | 0.627 | - |
-| `silk_wb_16k_mono_20k_vbr_c0_20ms` | 14.4 | 21.6 | 0.667 | 0.584 | 3.5 | 5.9 | 0.595 | 0.571 | - |
-| `silk_wb_16k_mono_20k_vbr_c5_20ms` | 33.9 | 54.9 | 0.616 | 0.583 | 3.8 | 6.2 | 0.605 | 0.585 | - |
-| `silk_wb_16k_mono_20k_vbr_c10_20ms` | 42.9 | 88.3 | 0.485 | 0.362 | 3.8 | 6.3 | 0.607 | 0.586 | analysis |
-| `silk_wb_16k_mono_20k_vbr_c9_10ms` | 23.8 | 47.2 | 0.503 | 0.378 | 2.0 | 3.2 | 0.618 | 0.592 | analysis |
-| `silk_wb_16k_stereo_32k_vbr_c9_20ms` | 85.3 | 161.2 | 0.528 | 0.379 | 6.9 | 11.4 | 0.602 | 0.572 | analysis |
-| `silk_wb_16k_mono_24k_vbr_c9_20ms_fec10` | 55.7 | 113.9 | 0.488 | 0.354 | 4.3 | 6.8 | 0.639 | 0.612 | analysis |
-| `hybrid_swb_24k_mono_24k_cbr_c9_20ms` | 59.3 | 120.6 | 0.491 | 0.356 | 7.2 | 11.7 | 0.610 | 0.537 | analysis |
-| `hybrid_swb_24k_stereo_36k_cbr_c9_20ms` | 115.8 | 217.9 | 0.531 | 0.373 | 12.0 | 21.3 | 0.562 | 0.518 | analysis |
-| `hybrid_fb_48k_mono_32k_cbr_c9_20ms` | 63.2 | 116.2 | 0.544 | 0.400 | 8.3 | 13.9 | 0.594 | 0.515 | analysis |
-| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms` | 123.5 | 224.8 | 0.548 | 0.388 | 13.5 | 24.1 | 0.561 | 0.500 | analysis |
-| `celt_fb_48k_mono_64k_vbr_c0_20ms` | 11.3 | 18.9 | 0.598 | 0.565 | 8.0 | 10.4 | 0.774 | 0.723 | - |
-| `celt_fb_48k_mono_64k_vbr_c5_20ms` | 20.3 | 39.7 | 0.511 | 0.444 | 9.4 | 12.3 | 0.760 | 0.631 | - |
-| `celt_fb_48k_mono_64k_vbr_c10_20ms` | 20.3 | 47.8 | 0.424 | 0.362 | 9.5 | 12.5 | 0.764 | 0.630 | analysis |
-| `celt_fb_48k_stereo_128k_vbr_c0_20ms` | 21.7 | 37.9 | 0.572 | 0.537 | 15.6 | 19.1 | 0.814 | 0.751 | - |
-| `celt_fb_48k_stereo_128k_vbr_c5_20ms` | 34.1 | 64.5 | 0.530 | 0.449 | 18.6 | 23.5 | 0.791 | 0.625 | - |
-| `celt_fb_48k_stereo_128k_vbr_c10_20ms` | 52.6 | 98.6 | 0.534 | 0.434 | 18.7 | 23.6 | 0.792 | 0.626 | analysis |
-| `celt_fb_48k_stereo_128k_vbr_c9_2p5ms` | 10.6 | 15.9 | 0.664 | 0.567 | 3.1 | 3.8 | 0.820 | 0.742 | analysis |
-| `celt_fb_48k_stereo_128k_vbr_c9_5ms` | 17.4 | 28.8 | 0.604 | 0.505 | 5.5 | 6.7 | 0.816 | 0.701 | analysis |
-| `celt_fb_48k_stereo_128k_vbr_c9_10ms` | 26.7 | 48.2 | 0.553 | 0.459 | 9.8 | 12.3 | 0.798 | 0.648 | analysis |
-| `celt_swb_24k_mono_48k_vbr_c9_20ms` | 17.2 | 40.9 | 0.422 | 0.371 | 7.6 | 10.0 | 0.760 | 0.670 | analysis |
-| `celt_swb_24k_stereo_96k_vbr_c9_20ms` | 45.6 | 85.3 | 0.535 | 0.446 | 14.4 | 19.1 | 0.752 | 0.629 | analysis |
-| `celt_fb_48k_mono_24k_vbr_c9_20ms` | 15.4 | 40.7 | 0.378 | 0.322 | 5.5 | 8.4 | 0.658 | 0.504 | analysis |
-| `celt_fb_48k_stereo_256k_vbr_c9_20ms` | 64.1 | 109.5 | 0.585 | 0.521 | 26.7 | 32.8 | 0.815 | 0.765 | analysis |
-| `hybrid_fb_48k_mono_32k_cbr_c9_20ms_music` | 55.5 | 100.6 | 0.550 | 0.398 | 8.2 | 13.7 | 0.598 | 0.510 | analysis |
-| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms_music` | 109.7 | 193.3 | 0.567 | 0.400 | 13.3 | 23.8 | 0.556 | 0.498 | analysis |
+| Scenario | opus1 encode µs | libopus -O2 encode µs | Encode ratio, -O2 | Encode ratio, Homebrew | opus1 decode µs | libopus -O2 decode µs | Decode ratio, -O2 | Decode ratio, Homebrew |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `silk_nb_8k_mono_12k_vbr_c0_20ms` | 9.1 | 12.9 | 0.711 | 0.625 | 2.0 | 3.1 | 0.636 | 0.623 |
+| `silk_nb_8k_mono_12k_vbr_c5_20ms` | 20.0 | 31.0 | 0.654 | 0.593 | 2.1 | 3.3 | 0.649 | 0.628 |
+| `silk_nb_8k_mono_12k_vbr_c10_20ms` | 25.3 | 43.2 | 0.579 | 0.412 | 2.1 | 3.2 | 0.648 | 0.629 |
+| `silk_wb_16k_mono_20k_vbr_c0_20ms` | 14.9 | 22.2 | 0.676 | 0.590 | 3.6 | 6.0 | 0.607 | 0.581 |
+| `silk_wb_16k_mono_20k_vbr_c5_20ms` | 34.7 | 56.3 | 0.621 | 0.582 | 3.9 | 6.4 | 0.615 | 0.587 |
+| `silk_wb_16k_mono_20k_vbr_c10_20ms` | 46.7 | 89.8 | 0.516 | 0.385 | 3.9 | 6.4 | 0.617 | 0.588 |
+| `silk_wb_16k_mono_20k_vbr_c9_10ms` | 25.8 | 48.1 | 0.532 | 0.393 | 2.1 | 3.3 | 0.627 | 0.598 |
+| `silk_wb_16k_stereo_32k_vbr_c9_20ms` | 90.7 | 165.2 | 0.546 | 0.392 | 7.0 | 11.6 | 0.611 | 0.570 |
+| `silk_wb_16k_mono_24k_vbr_c9_20ms_fec10` | 60.3 | 116.9 | 0.513 | 0.371 | 4.5 | 6.9 | 0.649 | 0.615 |
+| `hybrid_swb_24k_mono_24k_cbr_c9_20ms` | 62.9 | 124.1 | 0.505 | 0.368 | 7.3 | 12.1 | 0.604 | 0.533 |
+| `hybrid_swb_24k_stereo_36k_cbr_c9_20ms` | 121.1 | 224.0 | 0.538 | 0.379 | 12.3 | 21.9 | 0.562 | 0.515 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms` | 68.1 | 120.5 | 0.566 | 0.420 | 8.5 | 14.4 | 0.589 | 0.506 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms` | 130.3 | 229.8 | 0.564 | 0.397 | 13.9 | 24.8 | 0.561 | 0.493 |
+| `celt_fb_48k_mono_64k_vbr_c0_20ms` | 11.8 | 19.2 | 0.619 | 0.574 | 8.3 | 10.8 | 0.752 | 0.701 |
+| `celt_fb_48k_mono_64k_vbr_c5_20ms` | 21.2 | 40.5 | 0.525 | 0.453 | 9.6 | 12.9 | 0.727 | 0.612 |
+| `celt_fb_48k_mono_64k_vbr_c10_20ms` | 24.8 | 49.6 | 0.501 | 0.428 | 9.8 | 13.1 | 0.734 | 0.608 |
+| `celt_fb_48k_stereo_128k_vbr_c0_20ms` | 22.7 | 38.5 | 0.596 | 0.545 | 16.1 | 20.2 | 0.779 | 0.722 |
+| `celt_fb_48k_stereo_128k_vbr_c5_20ms` | 35.7 | 66.0 | 0.544 | 0.457 | 19.2 | 24.9 | 0.748 | 0.602 |
+| `celt_fb_48k_stereo_128k_vbr_c10_20ms` | 58.0 | 101.0 | 0.577 | 0.463 | 19.2 | 24.9 | 0.751 | 0.602 |
+| `celt_fb_48k_stereo_128k_vbr_c9_2p5ms` | 11.1 | 16.3 | 0.682 | 0.585 | 3.2 | 3.9 | 0.807 | 0.737 |
+| `celt_fb_48k_stereo_128k_vbr_c9_5ms` | 18.6 | 29.4 | 0.637 | 0.530 | 5.6 | 6.9 | 0.799 | 0.690 |
+| `celt_fb_48k_stereo_128k_vbr_c9_10ms` | 29.6 | 49.5 | 0.598 | 0.489 | 10.1 | 12.9 | 0.768 | 0.632 |
+| `celt_swb_24k_mono_48k_vbr_c9_20ms` | 20.0 | 42.1 | 0.477 | 0.415 | 7.8 | 10.5 | 0.734 | 0.649 |
+| `celt_swb_24k_stereo_96k_vbr_c9_20ms` | 49.5 | 87.8 | 0.567 | 0.467 | 14.8 | 19.9 | 0.726 | 0.609 |
+| `celt_fb_48k_mono_24k_vbr_c9_20ms` | 19.5 | 40.9 | 0.477 | 0.395 | 5.7 | 8.9 | 0.617 | 0.487 |
+| `celt_fb_48k_stereo_256k_vbr_c9_20ms` | 69.9 | 112.1 | 0.624 | 0.549 | 27.5 | 34.0 | 0.803 | 0.756 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms_music` | 60.1 | 103.0 | 0.581 | 0.417 | 8.5 | 14.2 | 0.593 | 0.503 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms_music` | 115.8 | 197.9 | 0.583 | 0.411 | 13.5 | 24.5 | 0.558 | 0.494 |
+| `silk_wb_16k_mono_20k_vbr_c7_20ms` | 41.6 | 81.4 | 0.508 | 0.423 | 3.9 | 6.3 | 0.616 | 0.588 |
+| `celt_fb_48k_stereo_128k_vbr_c7_20ms` | 38.8 | 75.1 | 0.524 | 0.440 | 19.1 | 24.7 | 0.750 | 0.602 |
 
 How to read the table:
 
-- **Decoding** takes 0.556 to 0.820 of the time of libopus at `-O2`, and 0.498 to 0.765 of the time of the Homebrew build. Both decoders do the same work, so this is a like-for-like comparison.
-- **Encoding at complexity 0 and 5** takes 0.511 to 0.707 of the time of libopus at `-O2` (Homebrew: 0.444 to 0.623). At these settings libopus runs none of the large encoder steps that opus1 lacks.
-- **Encoding at complexity 9 and 10** takes 0.378 to 0.664 of the time of libopus at `-O2` (Homebrew: 0.322 to 0.567). Part of the gap is the speech and music analysis that only libopus runs (`analysis` in the last column).
-- Geometric means over the 28 scenarios: encoding 0.544 against libopus at `-O2` and 0.442 against Homebrew; decoding 0.680 and 0.607.
-- The code before round 8 (`c96e936`) gave 0.565 and 0.458 for encoding and 0.695 and 0.619 for decoding in the same passes.
-- The measurement of the C references themselves ([The C reference](#the-c-reference), records in `target/perf/round8/ref/mac_bench2/`) also timed `c96e936` against the `-O2` build without run-time detection, which calls libopus's C quantizer as the Homebrew library does: 0.510 for encoding and 0.694 for decoding. Against the `-Os` build: 0.464 and 0.620.
+- **Decoding** takes 0.558 to 0.807 of the time of libopus at `-O2`, and 0.487 to 0.756 of the time of the Homebrew build.
+- **Encoding at complexity 0 and 5** takes 0.525 to 0.711 of the time of libopus at `-O2` (Homebrew: 0.453 to 0.625).
+- **Encoding at complexity 7 to 10** takes 0.477 to 0.682 of the time of libopus at `-O2` (Homebrew: 0.368 to 0.585). Both encoders run the analysis here. [The speech and music analysis](#the-speech-and-music-analysis) gives the ratios from before the port.
+- Geometric means over the 28 scenarios of the bench set: encoding 0.572 against libopus at `-O2` and 0.461 against Homebrew; decoding 0.669 and 0.598. Before the analysis (`d541821`, in the same passes) encoding was 0.546 and 0.443, with the analysis in libopus's time only.
 - SILK encode ratios compare the fixed-point SILK encoder of opus1 with the floating-point one of libopus.
-- The harness marked some operations unsteady in single runs, mostly the decoding of SILK at 8 and 16 kHz, which takes 2 to 4 µs per frame. The table uses medians, which are the numbers to use for them.
+- The harness marked some operations unsteady in single runs, because other programs ran. The table uses medians, which are the numbers to use for them.
+
+### The speech and music analysis
+
+From complexity 7 on, for input at 16 to 48 kHz, both encoders run the speech and music analysis of libopus (`src/analysis.c` and `src/mlp.c`; in opus1 `src/analysis/`, see [The encoder](03-encoder.md#13-the-speech-and-music-analysis)). It runs once per 20 ms of input and stream. The command `perf_harness analysis` times it alone: opus1's `TonalityAnalysisState::run` against libopus's `run_analysis`, on the same 20 ms calls of 10 s of the harness's speech and music signals, 9 or 15 passes that alternate the two libraries.
+
+Time of one 20 ms call, median, and the ratio opus1 / libopus. The Mac links the Homebrew libopus. The phone links libopus 1.6.1 built by `build-libopus.sh` at `-O2` and runs pinned to CPU 7 (Cortex-A76) and CPU 5 (Cortex-A55). Measured on 2026-10-18 with the code of commit `1856a50`, three interleaved passes on the phone and four on the Mac, where other programs kept the load average at about 25:
+
+| Input | M4 Pro opus1 µs | M4 Pro libopus µs | Ratio | A76 opus1 µs | A76 libopus µs | Ratio | A55 opus1 µs | A55 libopus µs | Ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 kHz mono speech | 2.82 | 10.13 | 0.279 | 10.49 | 27.30 | 0.384 | 32.99 | 84.10 | 0.392 |
+| 24 kHz mono music | 1.81 | 7.00 | 0.258 | 8.88 | 24.76 | 0.359 | 29.47 | 78.99 | 0.373 |
+| 48 kHz mono music | 2.85 | 10.26 | 0.278 | 11.59 | 29.10 | 0.398 | 34.69 | 90.53 | 0.383 |
+| 48 kHz mono speech | 2.89 | 10.68 | 0.271 | 11.64 | 29.23 | 0.398 | 34.82 | 90.50 | 0.385 |
+| 48 kHz stereo music | 2.93 | 10.97 | 0.271 | 12.07 | 30.25 | 0.399 | 36.72 | 95.56 | 0.384 |
+| 48 kHz stereo speech | 2.96 | 11.33 | 0.262 | 12.07 | 30.39 | 0.397 | 36.73 | 95.79 | 0.383 |
+| the network alone | 0.21 | 1.64 | 0.126 | 0.54 | 4.86 | 0.111 | 2.71 | 22.59 | 0.120 |
+
+In these short sessions the A76 cluster ran mostly at 2.0 GHz instead of 2.4 GHz (cpufreq statistics), so its times can be up to 20 % high. Its ratios hold, because both libraries ran in the same passes.
+
+The first port was scalar and followed the C code line by line. It took 0.59 to 0.72 of libopus's time on the Mac, 0.81 to 0.86 on the A76 and 0.79 to 0.88 on the A55. Then the busiest loops got NEON versions and caches. Each step keeps the arithmetic of the scalar code, lane by lane, so the results stay the bits of libopus; unit tests compare each kernel with the scalar code, and the libopus comparison tests ran after each step. Each step was kept only if it was faster in interleaved runs against the code before it:
+
+| Step (commit) | What changed | M4 Pro | Cortex-A76 | Cortex-A55 |
+|---|---|---:|---:|---:|
+| Input (`68681b9`, `f5756b4`) | The digital silence test searches the largest sample four at a time and runs libopus's loop only when a NaN is present. The downmix runs four or eight samples at a time. The 16 kHz path makes three outputs from two samples instead of computing the index of each repeated sample. | -12.5 to -22.9 % | -10.3 to -18.3 % | -7.0 to -17.2 % |
+| Bins (`035055a`) | The phase tonality of the FFT bins, four bins per vector, with one division per `fast_atan2f` instead of a branch. The energy of each bin is computed once instead of twice. | -33.8 to -44.7 % | -34.4 to -40.6 % | -29.8 to -35.0 % |
+| Caches (`b96e886`) | The state keeps the square roots of the band energies and the distances between the stored blocks: 18 square roots and 7 distances per block instead of 144 and 56. | -1.7 to -5.8 % | -3.3 to -6.6 % | -7.4 to -10.0 % |
+| Window (`6e4896b`) | The window, the scaling and the bit-reversed order of the FFT input in one NEON pass. | not measured alone | -1.5 to -3.8 % | -1.5 to -6.3 % |
+| Network (`fba40c0`) | The recurrent layer keeps the 18 sums of its three gates in vector registers; the activations run four at a time. | network 0.32 to 0.20 µs | -5.4 to -9.4 % | -7.5 to -11.4 % |
+| Bins (`6266595`) | Two groups of four bins per pass. | not measured alone | -3.0 to -4.5 % | -1.2 to +0.2 % |
+| Decimator (`745fc74`, `1856a50`) | The 48 kHz decimator makes four outputs per pass, so the compiler interleaves the sums of one output with the recursive filters of the next. 48 kHz cases only. | not measured alone | within ±2 % | -5.4 to -7.4 % |
+
+The ranges are over the six input cases (four for the decimator) and the passes. A pass in which the libopus control moved by more than 10 % was left out (two of them, both from other programs on the machine). On the A55 the time of the network alone moved by up to 12 % between builds whose network code was the same, so the A55 is not free of code placement effects for single small loops.
+
+What did not change: the FFT is opus1's FFT of the CELT encoder, and the 20 logarithms in double precision (19 natural, one to base 10) and the recursive filters of the decimator are kept as libopus computes them. The filters of the decimator are chains in which each step waits for the one before (a subtraction, a product and a sum per sample), so they need at least three times the latency of one operation per output sample: on the A55, with 4 cycles per operation, about 5,800 cycles for the 480 outputs of a frame.
+
+#### The encoder before and after the analysis
+
+The measurement of [Latest results](#latest-results) ran the code before the port (`d541821`) and after it in turns. The table gives the scenarios in which the analysis now runs (complexity 7 to 10, 16 to 48 kHz): opus1's median encode time per frame before and after, the time the analysis added, and the encode ratios against both references. Before the port only libopus ran the analysis, so the ratios before favoured opus1; the ratios after compare the same work.
+
+| Scenario | opus1 encode µs before | after | Added µs | Encode ratio, -O2, before | after | Encode ratio, Homebrew, before | after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `silk_wb_16k_mono_20k_vbr_c10_20ms` | 44.1 | 46.7 | +2.6 | 0.490 | 0.516 | 0.362 | 0.385 |
+| `silk_wb_16k_mono_20k_vbr_c9_10ms` | 24.6 | 25.8 | +1.2 | 0.509 | 0.532 | 0.379 | 0.393 |
+| `silk_wb_16k_stereo_32k_vbr_c9_20ms` | 87.8 | 90.7 | +2.9 | 0.534 | 0.546 | 0.380 | 0.392 |
+| `silk_wb_16k_mono_24k_vbr_c9_20ms_fec10` | 57.4 | 60.3 | +2.9 | 0.493 | 0.513 | 0.355 | 0.371 |
+| `hybrid_swb_24k_mono_24k_cbr_c9_20ms` | 60.8 | 62.9 | +2.1 | 0.490 | 0.505 | 0.355 | 0.368 |
+| `hybrid_swb_24k_stereo_36k_cbr_c9_20ms` | 118.9 | 121.1 | +2.3 | 0.533 | 0.538 | 0.372 | 0.379 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms` | 64.9 | 68.1 | +3.2 | 0.539 | 0.566 | 0.398 | 0.420 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms` | 126.6 | 130.3 | +3.7 | 0.551 | 0.564 | 0.387 | 0.397 |
+| `celt_fb_48k_mono_64k_vbr_c10_20ms` | 20.9 | 24.8 | +3.9 | 0.422 | 0.501 | 0.365 | 0.428 |
+| `celt_fb_48k_stereo_128k_vbr_c10_20ms` | 54.1 | 58.0 | +3.8 | 0.533 | 0.577 | 0.437 | 0.463 |
+| `celt_fb_48k_stereo_128k_vbr_c9_2p5ms` | 10.9 | 11.1 | +0.3 | 0.667 | 0.682 | 0.571 | 0.585 |
+| `celt_fb_48k_stereo_128k_vbr_c9_5ms` | 17.9 | 18.6 | +0.7 | 0.610 | 0.637 | 0.510 | 0.530 |
+| `celt_fb_48k_stereo_128k_vbr_c9_10ms` | 27.6 | 29.6 | +2.0 | 0.561 | 0.598 | 0.462 | 0.489 |
+| `celt_swb_24k_mono_48k_vbr_c9_20ms` | 17.5 | 20.0 | +2.5 | 0.421 | 0.477 | 0.372 | 0.415 |
+| `celt_swb_24k_stereo_96k_vbr_c9_20ms` | 46.9 | 49.5 | +2.6 | 0.534 | 0.567 | 0.445 | 0.467 |
+| `celt_fb_48k_mono_24k_vbr_c9_20ms` | 15.8 | 19.5 | +3.7 | 0.386 | 0.477 | 0.324 | 0.395 |
+| `celt_fb_48k_stereo_256k_vbr_c9_20ms` | 66.0 | 69.9 | +3.9 | 0.584 | 0.624 | 0.522 | 0.549 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms_music` | 56.7 | 60.1 | +3.4 | 0.554 | 0.581 | 0.397 | 0.417 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms_music` | 112.6 | 115.8 | +3.2 | 0.571 | 0.583 | 0.398 | 0.411 |
+| `silk_wb_16k_mono_20k_vbr_c7_20ms` | 38.7 | 41.6 | +3.0 | 0.474 | 0.508 | 0.393 | 0.423 |
+| `celt_fb_48k_stereo_128k_vbr_c7_20ms` | 35.2 | 38.8 | +3.6 | 0.466 | 0.524 | 0.397 | 0.440 |
+ratio change per pass, analysis scenarios: min -28.7% max +55.1% positive 119 of 126
+ratio change per pass, other scenarios: min -4.8% max +4.7%
+
+- The analysis adds 2.1 to 3.9 µs per 20 ms frame and stream on Apple M4 Pro. With frames of 2.5, 5 and 10 ms it adds about an eighth, a quarter and a half of that per frame, because it runs once per 20 ms of input. A little more than the analysis alone (about 2.9 µs at 48 kHz) goes to what the encoder does with its result, for example the energy of each frame and the other bits that CELT spends.
+- Geometric means over these 21 scenarios: encoding takes 0.551 of the time of libopus at `-O2` (0.516 before) and 0.431 of the Homebrew build (0.404 before). opus1's own encode time grew by 6.9 %.
+- Over the 9 other scenarios, where neither encoder runs the analysis, opus1's encode time moved by +0.6 % and the ratios by at most 4.8 % in single passes, the code placement and the load of the machine.
+- In 119 of the 126 single passes (21 scenarios, three passes, two references) the ratio after was higher than before. Single passes moved by up to 55 % in both directions while other programs loaded the machine, so only the medians are given.
+
+The phone measured the same before and after: see [On an Android phone](#on-an-android-phone).
 
 ### Round 8: more work for in-order cores
 
@@ -645,14 +716,47 @@ Build such a program with `--release`. All numbers in this document are for rele
 
 ## On an Android phone
 
-Measured on 2026-10-17 with the code of git commit `b7a8b64` (the work of round 8 merged), with the scripts in `scripts/android/` (see [Testing](09-testing.md#tests-on-an-android-phone)). The phone is a HONOR CLK-AN00 with a MediaTek MT6833 and Android 14. `ab.sh` pinned the harness with `taskset` to one core of each kind:
+Measured on 2026-10-18 with the code of git commit `f952b46` (the speech and music analysis and DTX on `d541821`), with the scripts in `scripts/android/` (see [Testing](09-testing.md#tests-on-an-android-phone)). The phone is a HONOR CLK-AN00 with a MediaTek MT6833 and Android 14. The harness was pinned with `taskset` to one core of each kind:
 
 - CPU 7, a Cortex-A76 at up to 2.4 GHz. It reorders instructions, so independent ones run at the same time.
 - CPU 5, a Cortex-A55 at up to 2.0 GHz. It runs instructions in program order, at most two per cycle.
 
 opus1 was built with the default release profile. The C reference is libopus 1.6.1, built by `scripts/android/build-libopus.sh --src <1.6.1 source>` with the NDK's clang 18. The script uses the flags that libopus's own `configure` picks for Android: `-O2`, the NEON code presumed, and run-time CPU detection. So the SILK encoder runs libopus's NEON quantizer, as the `-O2` reference on the Mac does (see [The C reference](#the-c-reference)).
 
-`ab.sh` ran the code before round 8 (`c96e936`) and after it in turns, two pairs of the bench set on each core (see [Round 8: more work for in-order cores](#round-8-more-work-for-in-order-cores)). The A76 ran both pairs in one session, the A55 one pair in each of two sessions. The tables below give the runs of the code after round 8. The cluster of the pinned core spent 86.8 % (A76) and 94.2 % to 94.3 % (A55) of each session at its highest clock (cpufreq statistics). Most of the rest falls in the pauses between the measuring processes. The processor was at 32 °C to 35 °C when a session started and reached at most 47.8 °C. Between the two runs of the merged code on one core, the median time of an operation changed by at most 0.9 % on the A76 and 1.1 % on the A55, and the opus1 / libopus ratio by at most 1.2 % on both. The records are in `target/perf/round8/merge/android/` (`a76/`, `a55_p1/` and `a55_p2/`).
+The code before the analysis (`d541821`) and after it (`f952b46`) ran in turns as one job, in the way of `ab.sh`: two passes of the bench set and of the two scenarios at complexity 7, on each core. The tables below give the runs of the code after the analysis. While a core ran, its cluster was at its highest clock: the A76 cluster spent 24.1 % of the session at 2.4 GHz and nearly all the rest idle at 725 MHz while the A55 ran, and the A55 cluster spent 70.0 % at 2.0 GHz. The processor was at 32 °C when the session started and reached at most 45.7 °C. Between the two runs of the same code on one core, the opus1 / libopus ratio of a scenario changed by at most 0.9 % (A76) and 0.6 % (A55). The records are in `target/perf/analysis_c7/phone_bench/`.
+
+Encoding at complexity 7 to 10, before and after the analysis. Before, only libopus ran the analysis; after, both do. Times are opus1's median per frame (the lower of the two runs), the ratio is opus1 / libopus (the mean of the two runs):
+
+| Scenario | A76 µs before | after | added | A76 ratio before | after | A55 µs before | after | added | A55 ratio before | after |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `silk_wb_16k_mono_20k_vbr_c10_20ms` | 142.8 | 155.8 | +13.0 | 0.580 | 0.633 | 384.1 | 427.9 | +43.8 | 0.591 | 0.659 |
+| `silk_wb_16k_mono_20k_vbr_c9_10ms` | 81.4 | 88.1 | +6.7 | 0.609 | 0.659 | 218.2 | 241.8 | +23.6 | 0.617 | 0.683 |
+| `silk_wb_16k_stereo_32k_vbr_c9_20ms` | 286.2 | 300.7 | +14.6 | 0.636 | 0.668 | 767.8 | 812.8 | +45.0 | 0.650 | 0.689 |
+| `silk_wb_16k_mono_24k_vbr_c9_20ms_fec10` | 177.4 | 190.7 | +13.3 | 0.572 | 0.617 | 465.8 | 509.5 | +43.7 | 0.595 | 0.650 |
+| `hybrid_swb_24k_mono_24k_cbr_c9_20ms` | 191.0 | 202.3 | +11.3 | 0.570 | 0.605 | 523.5 | 561.5 | +38.0 | 0.603 | 0.647 |
+| `hybrid_swb_24k_stereo_36k_cbr_c9_20ms` | 380.4 | 392.8 | +12.4 | 0.630 | 0.651 | 1028.8 | 1063.3 | +34.5 | 0.660 | 0.683 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms` | 195.1 | 210.4 | +15.2 | 0.598 | 0.646 | 538.8 | 581.0 | +42.2 | 0.622 | 0.672 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms` | 395.4 | 411.7 | +16.3 | 0.637 | 0.664 | 1065.2 | 1109.0 | +43.8 | 0.656 | 0.686 |
+| `celt_fb_48k_mono_64k_vbr_c10_20ms` | 58.8 | 73.2 | +14.4 | 0.473 | 0.588 | 199.8 | 247.5 | +47.7 | 0.515 | 0.638 |
+| `celt_fb_48k_stereo_128k_vbr_c10_20ms` | 147.8 | 163.7 | +15.9 | 0.597 | 0.658 | 471.6 | 519.6 | +48.1 | 0.636 | 0.704 |
+| `celt_fb_48k_stereo_128k_vbr_c9_2p5ms` | 31.5 | 34.1 | +2.6 | 0.680 | 0.730 | 120.7 | 129.9 | +9.1 | 0.766 | 0.819 |
+| `celt_fb_48k_stereo_128k_vbr_c9_5ms` | 51.5 | 56.3 | +4.7 | 0.656 | 0.713 | 184.0 | 199.0 | +15.0 | 0.735 | 0.792 |
+| `celt_fb_48k_stereo_128k_vbr_c9_10ms` | 77.4 | 86.3 | +8.9 | 0.612 | 0.678 | 260.1 | 287.2 | +27.1 | 0.666 | 0.736 |
+| `celt_swb_24k_mono_48k_vbr_c9_20ms` | 51.2 | 62.4 | +11.2 | 0.473 | 0.575 | 178.4 | 218.5 | +40.1 | 0.516 | 0.633 |
+| `celt_swb_24k_stereo_96k_vbr_c9_20ms` | 133.0 | 145.8 | +12.8 | 0.604 | 0.661 | 433.1 | 475.0 | +42.0 | 0.642 | 0.706 |
+| `celt_fb_48k_mono_24k_vbr_c9_20ms` | 46.4 | 60.3 | +14.0 | 0.429 | 0.558 | 166.5 | 212.0 | +45.4 | 0.476 | 0.609 |
+| `celt_fb_48k_stereo_256k_vbr_c9_20ms` | 184.0 | 199.5 | +15.5 | 0.653 | 0.706 | 572.2 | 618.8 | +46.6 | 0.706 | 0.766 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms_music` | 178.2 | 192.6 | +14.4 | 0.628 | 0.679 | 493.8 | 536.2 | +42.5 | 0.641 | 0.698 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms_music` | 359.7 | 375.9 | +16.2 | 0.662 | 0.693 | 977.7 | 1022.3 | +44.6 | 0.675 | 0.708 |
+| `silk_wb_16k_mono_20k_vbr_c7_20ms` | 123.2 | 136.5 | +13.3 | 0.588 | 0.652 | 336.1 | 379.4 | +43.3 | 0.584 | 0.659 |
+| `celt_fb_48k_stereo_128k_vbr_c7_20ms` | 100.3 | 116.1 | +15.7 | 0.538 | 0.619 | 331.3 | 379.2 | +47.9 | 0.581 | 0.667 |
+
+- The analysis adds 11.2 to 16.3 µs per 20 ms frame and stream on the A76 and 34.5 to 48.1 µs on the A55. The analysis alone takes about 11.6 and 34.7 µs at 48 kHz (see [The speech and music analysis](#the-speech-and-music-analysis)).
+- Over these 21 scenarios opus1's encode time grew by 10.5 % (A76) and 10.7 % (A55), and the geometric mean of the encode ratio went from 0.588 to 0.649 (A76) and from 0.622 to 0.689 (A55). Over the 9 other scenarios opus1's time moved by +0.6 % and +1.1 %, code placement.
+
+The paragraphs below describe earlier measurements on the phone.
+
+Round 8 (`b7a8b64`, 2026-10-17): `ab.sh` ran the code before round 8 (`c96e936`) and after it in turns, two pairs of the bench set on each core (see [Round 8: more work for in-order cores](#round-8-more-work-for-in-order-cores)). The A76 ran both pairs in one session, the A55 one pair in each of two sessions. The cluster of the pinned core spent 86.8 % (A76) and 94.2 % to 94.3 % (A55) of each session at its highest clock (cpufreq statistics). Most of the rest falls in the pauses between the measuring processes. The processor was at 32 °C to 35 °C when a session started and reached at most 47.8 °C. Between the two runs of the merged code on one core, the median time of an operation changed by at most 0.9 % on the A76 and 1.1 % on the A55, and the opus1 / libopus ratio by at most 1.2 % on both. The records are in `target/perf/round8/merge/android/` (`a76/`, `a55_p1/` and `a55_p2/`).
 
 Before the merge, the code of `c96e936` was measured with `bench.sh`, two runs on each core (records in `target/perf/round8/ref/phone_bench/`). It gave the encode ratios 0.628 (A76) and 0.663 (A55) and the decode ratios 0.773 and 0.842. In the runs of `c96e936` in turns with the merged code, they were 0.635 and 0.663, and 0.774 and 0.842. The A76 encode ratio differs by 1.1 % between two builds of the same code: on the A76, code placement alone moves libopus's SILK and Hybrid encoding by up to 4 % ([Code placement](#code-placement)).
 
@@ -671,58 +775,63 @@ Ratio opus1 / libopus of the median times, over the 28 scenarios of the bench se
 
 | | M4 Pro, Homebrew libopus | M4 Pro, libopus 1.6.1 at `-O2` | Cortex-A76 | Cortex-A55 |
 |---|---:|---:|---:|---:|
-| Encode, geometric mean | 0.442 | 0.544 | 0.625 | 0.651 |
-| Encode, range | 0.322 to 0.623 | 0.378 to 0.707 | 0.431 to 0.774 | 0.479 to 0.767 |
-| Decode, geometric mean | 0.607 | 0.680 | 0.759 | 0.821 |
-| Decode, range | 0.498 to 0.765 | 0.556 to 0.820 | 0.673 to 0.847 | 0.734 to 0.937 |
+| Encode, geometric mean | 0.461 | 0.572 | 0.668 | 0.698 |
+| Encode, range | 0.368 to 0.625 | 0.477 to 0.711 | 0.558 to 0.775 | 0.609 to 0.819 |
+| Decode, geometric mean | 0.598 | 0.669 | 0.768 | 0.824 |
+| Decode, range | 0.487 to 0.756 | 0.558 to 0.807 | 0.675 to 0.853 | 0.731 to 0.935 |
+| Encode, geometric mean before the analysis | 0.443 | 0.546 | 0.625 | 0.650 |
+| Encode, geometric mean in round 8 | 0.442 | 0.544 | 0.625 | 0.651 |
+| Decode, geometric mean in round 8 | 0.607 | 0.680 | 0.759 | 0.821 |
 | Encode, geometric mean before round 8 | 0.458 | 0.565 | 0.635 | 0.663 |
 | Decode, geometric mean before round 8 | 0.619 | 0.695 | 0.774 | 0.842 |
 
-The rows "before round 8" come from the runs of `c96e936` in the same sessions. Round 7 measured that code against the main branch of libopus, built with run-time detection: 0.567 and 0.694 on the Mac at `-O2`, 0.636 and 0.771 on the A76, 0.663 and 0.840 on the A55. Round 6 had measured 0.692 and 0.755 for encoding and 0.790 and 0.864 for decoding on the phone, at commit `bd080de`, before the work of round 7.
+The first four rows are the code after the analysis, in which both encoders run the analysis from complexity 7 on. The row "before the analysis" comes from the runs of `d541821` in the same sessions, in which only libopus ran it. The rows of round 8 come from the sessions of round 8: "in round 8" is `b7a8b64`, "before round 8" is `c96e936`. Round 7 measured that code against the main branch of libopus, built with run-time detection: 0.567 and 0.694 on the Mac at `-O2`, 0.636 and 0.771 on the A76, 0.663 and 0.840 on the A55. Round 6 had measured 0.692 and 0.755 for encoding and 0.790 and 0.864 for decoding on the phone, at commit `bd080de`, before the work of round 7.
 
 ### Results per scenario
 
-Times are opus1's median per frame in microseconds (µs), the lower of the two runs of the merged code. The ratio is opus1 / libopus, the mean of the two runs.
+Times are opus1's median per frame in microseconds (µs), the lower of the two runs of the code after the analysis (`f952b46`). The ratio is opus1 / libopus, the mean of the two runs.
 
 | Scenario | A76 encode µs | A76 encode ratio | A55 encode µs | A55 encode ratio | A76 decode µs | A76 decode ratio | A55 decode µs | A55 decode ratio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `silk_nb_8k_mono_12k_vbr_c0_20ms` | 31.7 | 0.774 | 97.0 | 0.713 | 5.8 | 0.819 | 15.8 | 0.935 |
-| `silk_nb_8k_mono_12k_vbr_c5_20ms` | 63.0 | 0.765 | 179.3 | 0.687 | 5.9 | 0.816 | 16.3 | 0.932 |
-| `silk_nb_8k_mono_12k_vbr_c10_20ms` | 83.4 | 0.709 | 232.7 | 0.745 | 6.0 | 0.819 | 16.3 | 0.937 |
-| `silk_wb_16k_mono_20k_vbr_c0_20ms` | 49.4 | 0.728 | 143.3 | 0.653 | 10.2 | 0.721 | 27.7 | 0.812 |
-| `silk_wb_16k_mono_20k_vbr_c5_20ms` | 107.1 | 0.728 | 290.2 | 0.638 | 10.9 | 0.728 | 29.8 | 0.810 |
-| `silk_wb_16k_mono_20k_vbr_c10_20ms` | 143.0 | 0.582 | 384.4 | 0.592 | 10.9 | 0.729 | 29.9 | 0.812 |
-| `silk_wb_16k_mono_20k_vbr_c9_10ms` | 81.5 | 0.611 | 217.9 | 0.617 | 5.9 | 0.732 | 17.2 | 0.835 |
-| `silk_wb_16k_stereo_32k_vbr_c9_20ms` | 287.0 | 0.638 | 767.5 | 0.651 | 20.8 | 0.739 | 56.9 | 0.837 |
-| `silk_wb_16k_mono_24k_vbr_c9_20ms_fec10` | 177.5 | 0.575 | 465.5 | 0.594 | 12.1 | 0.753 | 32.5 | 0.834 |
-| `hybrid_swb_24k_mono_24k_cbr_c9_20ms` | 191.2 | 0.572 | 525.6 | 0.606 | 22.8 | 0.706 | 72.8 | 0.763 |
-| `hybrid_swb_24k_stereo_36k_cbr_c9_20ms` | 381.5 | 0.632 | 1027.6 | 0.659 | 40.9 | 0.681 | 130.8 | 0.741 |
-| `hybrid_fb_48k_mono_32k_cbr_c9_20ms` | 195.4 | 0.600 | 538.9 | 0.623 | 26.0 | 0.694 | 82.9 | 0.749 |
-| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms` | 396.4 | 0.641 | 1063.8 | 0.657 | 46.0 | 0.678 | 149.2 | 0.738 |
-| `celt_fb_48k_mono_64k_vbr_c0_20ms` | 33.8 | 0.685 | 105.4 | 0.760 | 21.4 | 0.829 | 59.8 | 0.863 |
-| `celt_fb_48k_mono_64k_vbr_c5_20ms` | 58.7 | 0.627 | 199.6 | 0.694 | 24.9 | 0.771 | 71.3 | 0.817 |
-| `celt_fb_48k_mono_64k_vbr_c10_20ms` | 58.8 | 0.472 | 201.1 | 0.518 | 25.3 | 0.773 | 72.6 | 0.819 |
-| `celt_fb_48k_stereo_128k_vbr_c0_20ms` | 65.0 | 0.661 | 210.3 | 0.758 | 40.9 | 0.847 | 112.9 | 0.888 |
-| `celt_fb_48k_stereo_128k_vbr_c5_20ms` | 101.0 | 0.649 | 330.4 | 0.708 | 49.3 | 0.799 | 136.9 | 0.829 |
-| `celt_fb_48k_stereo_128k_vbr_c10_20ms` | 148.7 | 0.598 | 472.3 | 0.638 | 49.4 | 0.799 | 137.1 | 0.829 |
-| `celt_fb_48k_stereo_128k_vbr_c9_2p5ms` | 31.6 | 0.678 | 120.7 | 0.767 | 9.0 | 0.796 | 31.0 | 0.838 |
-| `celt_fb_48k_stereo_128k_vbr_c9_5ms` | 51.7 | 0.657 | 185.0 | 0.737 | 15.4 | 0.807 | 49.6 | 0.861 |
-| `celt_fb_48k_stereo_128k_vbr_c9_10ms` | 78.0 | 0.612 | 260.8 | 0.668 | 26.7 | 0.812 | 79.4 | 0.862 |
-| `celt_swb_24k_mono_48k_vbr_c9_20ms` | 51.5 | 0.475 | 180.4 | 0.520 | 20.9 | 0.777 | 62.0 | 0.807 |
-| `celt_swb_24k_stereo_96k_vbr_c9_20ms` | 134.1 | 0.607 | 434.5 | 0.645 | 39.1 | 0.792 | 112.1 | 0.801 |
-| `celt_fb_48k_mono_24k_vbr_c9_20ms` | 46.6 | 0.431 | 167.6 | 0.479 | 16.9 | 0.705 | 54.4 | 0.759 |
-| `celt_fb_48k_stereo_256k_vbr_c9_20ms` | 184.8 | 0.653 | 573.9 | 0.707 | 65.5 | 0.824 | 167.9 | 0.860 |
-| `hybrid_fb_48k_mono_32k_cbr_c9_20ms_music` | 178.5 | 0.630 | 493.9 | 0.641 | 26.1 | 0.697 | 83.5 | 0.754 |
-| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms_music` | 360.7 | 0.665 | 976.1 | 0.676 | 45.7 | 0.673 | 149.6 | 0.734 |
+| `silk_nb_8k_mono_12k_vbr_c0_20ms` | 31.7 | 0.775 | 98.4 | 0.717 | 5.9 | 0.846 | 15.8 | 0.935 |
+| `silk_nb_8k_mono_12k_vbr_c5_20ms` | 63.0 | 0.761 | 180.0 | 0.687 | 6.1 | 0.843 | 16.2 | 0.929 |
+| `silk_nb_8k_mono_12k_vbr_c10_20ms` | 83.4 | 0.708 | 233.4 | 0.743 | 6.0 | 0.845 | 16.2 | 0.932 |
+| `silk_wb_16k_mono_20k_vbr_c0_20ms` | 49.7 | 0.730 | 144.9 | 0.657 | 10.3 | 0.740 | 27.7 | 0.814 |
+| `silk_wb_16k_mono_20k_vbr_c5_20ms` | 107.2 | 0.728 | 291.4 | 0.638 | 11.0 | 0.744 | 29.9 | 0.812 |
+| `silk_wb_16k_mono_20k_vbr_c10_20ms` | 155.8 | 0.633 | 427.9 | 0.659 | 11.1 | 0.745 | 29.9 | 0.812 |
+| `silk_wb_16k_mono_20k_vbr_c9_10ms` | 88.1 | 0.659 | 241.8 | 0.683 | 5.9 | 0.749 | 17.2 | 0.831 |
+| `silk_wb_16k_stereo_32k_vbr_c9_20ms` | 300.7 | 0.668 | 812.8 | 0.689 | 21.0 | 0.754 | 57.2 | 0.842 |
+| `silk_wb_16k_mono_24k_vbr_c9_20ms_fec10` | 190.7 | 0.617 | 509.5 | 0.650 | 12.3 | 0.774 | 32.6 | 0.839 |
+| `hybrid_swb_24k_mono_24k_cbr_c9_20ms` | 202.3 | 0.605 | 561.5 | 0.647 | 22.9 | 0.709 | 72.6 | 0.767 |
+| `hybrid_swb_24k_stereo_36k_cbr_c9_20ms` | 392.8 | 0.651 | 1063.3 | 0.683 | 41.2 | 0.684 | 130.2 | 0.746 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms` | 210.4 | 0.646 | 581.0 | 0.672 | 26.1 | 0.697 | 82.1 | 0.747 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms` | 411.7 | 0.664 | 1109.0 | 0.686 | 46.1 | 0.679 | 147.4 | 0.735 |
+| `celt_fb_48k_mono_64k_vbr_c0_20ms` | 34.9 | 0.707 | 108.7 | 0.790 | 21.4 | 0.836 | 59.8 | 0.868 |
+| `celt_fb_48k_mono_64k_vbr_c5_20ms` | 59.0 | 0.630 | 201.3 | 0.701 | 24.9 | 0.776 | 71.6 | 0.821 |
+| `celt_fb_48k_mono_64k_vbr_c10_20ms` | 73.2 | 0.588 | 247.5 | 0.638 | 25.3 | 0.778 | 72.5 | 0.824 |
+| `celt_fb_48k_stereo_128k_vbr_c0_20ms` | 66.5 | 0.677 | 214.5 | 0.779 | 40.9 | 0.853 | 113.5 | 0.901 |
+| `celt_fb_48k_stereo_128k_vbr_c5_20ms` | 101.9 | 0.654 | 334.7 | 0.717 | 49.2 | 0.799 | 137.1 | 0.836 |
+| `celt_fb_48k_stereo_128k_vbr_c10_20ms` | 163.7 | 0.658 | 519.6 | 0.704 | 49.3 | 0.800 | 136.9 | 0.835 |
+| `celt_fb_48k_stereo_128k_vbr_c9_2p5ms` | 34.1 | 0.730 | 129.9 | 0.819 | 9.0 | 0.788 | 31.1 | 0.832 |
+| `celt_fb_48k_stereo_128k_vbr_c9_5ms` | 56.3 | 0.713 | 199.0 | 0.792 | 15.4 | 0.808 | 49.6 | 0.861 |
+| `celt_fb_48k_stereo_128k_vbr_c9_10ms` | 86.3 | 0.678 | 287.2 | 0.736 | 26.7 | 0.812 | 79.7 | 0.867 |
+| `celt_swb_24k_mono_48k_vbr_c9_20ms` | 62.4 | 0.575 | 218.5 | 0.633 | 21.0 | 0.786 | 61.9 | 0.808 |
+| `celt_swb_24k_stereo_96k_vbr_c9_20ms` | 145.8 | 0.661 | 475.0 | 0.706 | 39.1 | 0.793 | 112.2 | 0.807 |
+| `celt_fb_48k_mono_24k_vbr_c9_20ms` | 60.3 | 0.558 | 212.0 | 0.609 | 16.9 | 0.708 | 54.5 | 0.765 |
+| `celt_fb_48k_stereo_256k_vbr_c9_20ms` | 199.5 | 0.706 | 618.8 | 0.766 | 65.5 | 0.828 | 168.2 | 0.863 |
+| `hybrid_fb_48k_mono_32k_cbr_c9_20ms_music` | 192.6 | 0.679 | 536.2 | 0.698 | 26.2 | 0.700 | 82.7 | 0.752 |
+| `hybrid_fb_48k_stereo_40k_cbr_c9_20ms_music` | 375.9 | 0.693 | 1022.3 | 0.708 | 45.9 | 0.675 | 148.0 | 0.731 |
+| `silk_wb_16k_mono_20k_vbr_c7_20ms` | 136.5 | 0.652 | 379.4 | 0.659 | 11.1 | 0.744 | 29.9 | 0.815 |
+| `celt_fb_48k_stereo_128k_vbr_c7_20ms` | 116.1 | 0.619 | 379.2 | 0.667 | 49.5 | 0.803 | 137.7 | 0.836 |
 
 How to read the table:
 
-- opus1 is faster than libopus in every scenario, for encoding and decoding, on both cores.
-- The slowest operation on the A55, the encoding of 48 kHz stereo Hybrid, takes 1.06 ms per 20 ms frame. That is 5.3 % of one core.
-- From the M4 Pro to the A76, the time of opus1 grows 3.12 times for encoding and 2.89 times for decoding (geometric means; the M4 Pro times of [Latest results](#latest-results)). The time of the same libopus build grows 2.72 and 2.59 times. Round 8 made opus1 faster on the M4 Pro than on the A76, so this growth was 3.02 and 2.82 times before.
-- From the A76 to the A55, the time of opus1 grows 3.02 times for encoding and 2.93 times for decoding. The time of libopus grows 2.90 and 2.70 times. Before round 8, in the same sessions, opus1's grew 3.03 and 2.93 times.
+- opus1 is faster than libopus in every scenario, for encoding and decoding, on both cores, also at complexity 7 to 10, where both run the analysis.
+- The slowest operation on the A55, the encoding of 48 kHz stereo Hybrid, takes 1.11 ms per 20 ms frame. That is 5.5 % of one core.
+- From the M4 Pro to the A76, the time of opus1 grows 3.10 times for encoding and 2.83 times for decoding (geometric means over the bench set; the M4 Pro times of [Latest results](#latest-results)). The time of the `-O2` libopus build grows 2.66 and 2.47 times.
+- From the A76 to the A55, the time of opus1 grows 3.03 times for encoding and 2.90 times for decoding. The time of libopus grows 2.90 and 2.71 times.
 - The A55 still costs opus1 most in CELT encoding at complexity 5 and above: 3.1 to 3.8 times its A76 time, against 2.9 to 3.4 times for libopus.
-- SILK encoding at complexity 0 and 5 is the other way round: opus1 grows 2.7 to 3.1 times, libopus 3.1 to 3.3 times.
+- SILK encoding at complexity 0 and 5 is the other way round: opus1 grows 2.7 to 3.1 times, libopus 3.1 to 3.4 times.
 
 ### Where the time goes on the phone
 

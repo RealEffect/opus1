@@ -952,6 +952,61 @@ fn bench_opus_encode_i16(c: &mut Criterion) {
     group.finish();
 }
 
+/// The speech and music analysis of the encoder, alone: one 20 ms call
+/// per iteration on a state that has run before (perf_harness `analysis`
+/// compares it with libopus), and the network alone.
+#[cfg(feature = "analysis")]
+fn bench_analysis(c: &mut Criterion) {
+    use opus1::internals::analysis::mlp::{LAYER0, LAYER1, LAYER2, compute_dense, compute_gru};
+    use opus1::internals::analysis::{AnalysisPcm, PcmRef, SecondChannel, TonalityAnalysisState};
+    let mut group = c.benchmark_group("analysis");
+    for (rate, channels) in [(16000usize, 1usize), (24000, 1), (48000, 1), (48000, 2)] {
+        let frame = rate / 50;
+        // One second of a tone with a little noise, in 20 ms calls.
+        let mut seed = 1u32;
+        let pcm: Vec<f32> = (0..rate * channels)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                0.3 * ((i / channels) as f32 * 0.031).sin() + 0.01 * noise
+            })
+            .collect();
+        let mut st = Box::new(TonalityAnalysisState::new(rate as i32));
+        let mut k = 0usize;
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(BenchmarkId::new("run_20ms", format!("{}k_{channels}ch", rate / 1000)), |b| {
+            b.iter(|| {
+                let start = (k % 50) * frame * channels;
+                k += 1;
+                let input = AnalysisPcm {
+                    pcm: PcmRef::F32(black_box(&pcm[start..start + frame * channels])),
+                    channels,
+                    c1: 0,
+                    c2: SecondChannel::AllOthers,
+                    frame_size: frame,
+                };
+                st.run(input, frame, 24)
+            })
+        });
+    }
+    let features: [f32; 25] = std::array::from_fn(|i| (i as f32 * 0.37).sin());
+    let mut state = [0.0f32; 32];
+    group.bench_function("network", |b| {
+        b.iter(|| {
+            let mut hidden = [0.0f32; 32];
+            let mut probs = [0.0f32; 2];
+            compute_dense(&LAYER0, &mut hidden, black_box(&features));
+            compute_gru(&LAYER1, &mut state, &hidden);
+            compute_dense(&LAYER2, &mut probs, &state);
+            probs
+        })
+    });
+    group.finish();
+}
+
+#[cfg(not(feature = "analysis"))]
+fn bench_analysis(_: &mut Criterion) {}
+
 criterion_group! {
     name = benches;
     config = configure_criterion();
@@ -973,5 +1028,6 @@ criterion_group! {
         bench_pvq,
         bench_celt_internal,
         bench_rate,
+        bench_analysis,
 }
 criterion_main!(benches);

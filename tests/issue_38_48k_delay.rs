@@ -27,14 +27,23 @@
 //! dev-dependency) after the 312-sample (6.5 ms) pre-skip, per 100 ms window,
 //! exactly like the issue's harness. Reference values for libopus's own
 //! encoder on the same signal: Voip 32 kbps lags -5..-2 samples at
-//! corr ≥ 0.99 after a weaker first window; Audio 20-24 kbps forced
-//! CELT-only is lag 0, corr 1.00 from the first window. (libopus's mode
-//! choice at Audio 24 kbps depends on its tonality analysis, which opus1
-//! does not port, so only libopus's CELT output is a like-for-like reference.)
+//! corr ≥ 0.99 after a weaker first window, then 29 samples in the window
+//! where its speech and music analysis moves the stream from Hybrid to
+//! CELT-only (1.0 to 1.1 s), and 0 after it. opus1 makes the same switch at
+//! the same packet, and the test compares the two profiles window by
+//! window. Audio 20-24 kbps forced CELT-only is lag 0 (-1 in the first
+//! window at 20 kbps), corr ≥ 0.99 from the first window, and opus1's
+//! packets are libopus's byte for byte. (Without forcing, libopus and opus1 code the chirp as
+//! Hybrid at Audio 20-32 kbps until the same switch, so the CELT tests
+//! below force CELT-only.)
+// Some helpers serve only the tests that need the speech and music analysis.
+#![cfg_attr(not(feature = "analysis"), allow(dead_code))]
 
-use opus::{Channels as CCh, Decoder as CDec};
+use opus::{
+    Application as CApp, Bitrate as CBitrate, Channels as CCh, Decoder as CDec, Encoder as CEnc,
+};
 use opus1::internals::range_coder::RangeCoder;
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
 
 const SR: usize = 48000;
 const FRAME: usize = 960;
@@ -52,10 +61,14 @@ fn chirp(sr: usize, seconds: usize) -> Vec<f32> {
 }
 
 /// Encode the chirp with opus1 in 20 ms frames; returns input and packets.
+/// `Audio` is forced to CELT-only, the encoder the Audio tests look at.
 fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
     let input = chirp(SR, 13);
     let mut enc = OpusEncoder::new(SR as i32, 1, app).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    if app == Application::Audio {
+        enc.set_force_mode(Some(ForcedMode::CeltOnly));
+    }
     let mut pkt = vec![0u8; 1500];
     let packets = input
         .as_chunks::<FRAME>().0.iter()
@@ -71,9 +84,27 @@ fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
 /// per-window (best lag, correlation) after the 312-sample pre-skip.
 fn lag_profile(app: Application, bitrate: i32) -> Vec<(i64, f64)> {
     let (input, packets) = encode_chirp(app, bitrate);
+    profile_of(&input, &packets)
+}
+
+/// The same profile for libopus's own encoder, Voip at `bitrate`.
+fn libopus_voip_profile(bitrate: i32) -> Vec<(i64, f64)> {
+    let input = chirp(SR, 13);
+    let mut enc = CEnc::new(SR as u32, CCh::Mono, CApp::Voip).unwrap();
+    enc.set_bitrate(CBitrate::Bits(bitrate)).unwrap();
+    let packets: Vec<Vec<u8>> = input
+        .as_chunks::<FRAME>().0.iter()
+        .map(|frame| enc.encode_vec_float(frame, 1500).unwrap())
+        .collect();
+    profile_of(&input, &packets)
+}
+
+/// Decode `packets` with libopus and return the per-window (best lag,
+/// correlation) against `input` after the 312-sample pre-skip.
+fn profile_of(input: &[f32], packets: &[Vec<u8>]) -> Vec<(i64, f64)> {
     let mut dec = CDec::new(SR as u32, CCh::Mono).unwrap();
     let mut pcm = Vec::new();
-    for pkt in &packets {
+    for pkt in packets {
         let mut buf = vec![0f32; FRAME * 2];
         let got = dec.decode_float(pkt, &mut buf, false).unwrap_or(0);
         pcm.extend_from_slice(&buf[..got]);
@@ -138,33 +169,72 @@ fn celt_transient_flag(packet: &[u8]) -> bool {
     rc.tell() + 3 <= total_bits && rc.decode_bit_logp(3)
 }
 
+#[cfg(feature = "analysis")]
 #[test]
 fn voip_48k_tracks_libopus_preskip() {
     let profile = lag_profile(Application::Voip, 32000);
-    // Steady state (from the second window on): within a couple of samples of
-    // the pre-skip at waveform fidelity. libopus's own encoder measures
-    // -5..-2 with the same harness.
-    for (w, &(lag, corr)) in profile.iter().enumerate().skip(1) {
+    let reference = libopus_voip_profile(32000);
+    assert_eq!(profile.len(), reference.len());
+    // Every window has libopus's lag within a sample and its correlation
+    // within 0.01. In the Hybrid part (from the second window to the
+    // switch to CELT-only) that is within a couple of samples of the
+    // pre-skip at waveform fidelity; libopus's own encoder measures -5..-2.
+    for (w, (&(lag, corr), &(c_lag, c_corr))) in profile.iter().zip(&reference).enumerate() {
         assert!(
-            lag.abs() <= 5,
-            "Voip window {w}: lag {lag} vs libopus's -5..-2; profile {profile:?}"
+            (lag - c_lag).abs() <= 1 && corr >= c_corr - 0.01,
+            "Voip window {w}: lag {lag}, corr {corr:.3} vs libopus's {c_lag}, {c_corr:.3}; \
+             profile {profile:?}, libopus {reference:?}"
         );
-        assert!(
-            corr >= 0.98,
-            "Voip window {w}: correlation {corr:.3}; profile {profile:?}"
-        );
+        if (1..10).contains(&w) {
+            assert!(lag.abs() <= 5 && corr >= 0.98, "Voip window {w}: lag {lag}, corr {corr:.3}");
+        }
     }
 }
 
+/// libopus's packets for the chirp, Audio, forced CELT-only.
+fn libopus_celt_packets(bitrate: i32) -> Vec<Vec<u8>> {
+    use audiopus_sys as sys;
+    let input = chirp(SR, 13);
+    let mut err = 0;
+    let st = unsafe { sys::opus_encoder_create(SR as i32, 1, sys::OPUS_APPLICATION_AUDIO, &mut err) };
+    assert_eq!(err, 0);
+    unsafe {
+        sys::opus_encoder_ctl(st, sys::OPUS_SET_BITRATE_REQUEST, bitrate);
+        // OPUS_SET_FORCE_MODE (opus_private.h) to MODE_CELT_ONLY.
+        sys::opus_encoder_ctl(st, 11002, 1002);
+    }
+    let packets = input
+        .as_chunks::<FRAME>().0.iter()
+        .map(|frame| {
+            let mut out = vec![0u8; 1500];
+            let n = unsafe {
+                sys::opus_encode_float(st, frame.as_ptr(), FRAME as i32, out.as_mut_ptr(), 1500)
+            };
+            assert!(n > 0);
+            out.truncate(n as usize);
+            out
+        })
+        .collect();
+    unsafe { sys::opus_encoder_destroy(st) };
+    packets
+}
+
+#[cfg(feature = "analysis")]
 #[test]
 fn audio_low_rate_celt_startup_is_clean() {
     // Previously corr 0.56-0.66 for the first ~200 ms. libopus forced to
-    // CELT-only is lag 0, corr 1.00 from the first window.
+    // CELT-only is lag 0 (-1 in the first window at 20 kb/s, where its
+    // speech and music analysis has not settled), corr ≥ 0.99 from the
+    // first window. On 64-bit ARM opus1's packets are libopus's.
     for bitrate in [20000, 24000] {
+        let (_, packets) = encode_chirp(Application::Audio, bitrate);
+        if cfg!(target_arch = "aarch64") {
+            assert!(packets == libopus_celt_packets(bitrate), "Audio {bitrate}: not libopus's packets");
+        }
         let profile = lag_profile(Application::Audio, bitrate);
         for (w, &(lag, corr)) in profile.iter().enumerate() {
             assert!(
-                lag == 0 && corr >= 0.99,
+                (lag == 0 || (w == 0 && lag == -1)) && corr >= 0.99,
                 "Audio {bitrate} window {w}: lag {lag}, correlation {corr:.3}; \
                  profile {profile:?}"
             );

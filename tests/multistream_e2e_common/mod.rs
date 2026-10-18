@@ -107,11 +107,10 @@ pub const NOISE_FLOOR: f32 = 0.002;
 /// that swell and fade.
 ///
 /// The noise is there because `voiced` has nothing above 2.5 kHz. The
-/// analysis of libopus notices that and codes a narrower audio bandwidth
-/// than the bitrate allows (opus_encoder.c:1652-1673), which opus1,
-/// without the analysis, does not. With the noise both encoders code the
-/// same bandwidth, and the tests compare the rest.
-/// `a_signal_without_high_frequencies_gets_a_narrower_bandwidth_in_libopus`
+/// speech and music analysis notices that and codes a narrower audio
+/// bandwidth than the bitrate allows (opus_encoder.c:1652-1673). Before
+/// opus1 ran the analysis, the noise kept the two encoders on the same
+/// bandwidth. `a_signal_without_high_frequencies_gets_the_narrower_bandwidth_of_libopus`
 /// shows the signal without it.
 pub fn program(fs: i32, case: &Case, samples: usize) -> Vec<f32> {
     let mut pcm = program_without_noise(fs, case, samples);

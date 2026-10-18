@@ -103,20 +103,23 @@ The encoder chooses the mode again for every packet. It looks at:
 
 A `RestrictedLowDelay` encoder always codes CELT-only. `OpusEncoder::set_force_mode` asks for a mode instead of the automatic choice.
 
-The floating-point build of libopus also runs a speech/music detector on the input. It runs at complexity 7 and above, for input at 16 kHz or more. opus1 has no such detector. It uses the fixed estimates that libopus uses when the detector does not run: `Voip` input counts as mostly speech, and `Audio` input as mostly music.
+The floating-point build of libopus also runs a speech and music analysis on the input. It runs at complexity 7 and above, for input at 16 kHz or more. It estimates for every packet how likely the input is speech or music, and which bandwidth it really uses. opus1 runs the same analysis and gets the same results. Below complexity 7, and at 8 and 12 kHz, both use fixed estimates instead: `Voip` input counts as mostly speech, and `Audio` input as mostly music.
 
-The table below shows what opus1 chooses for 48 kHz mono input. The settings are 20 ms frames, a variable bitrate and complexity 9. The input is a steady two-tone test signal. The table gives the packets after one second.
+The table below shows what opus1 chooses for 48 kHz mono input. The settings are 20 ms frames and a variable bitrate. The input is two steady tones (300 Hz and 2.4 kHz) with white noise 40 dB below them. The table gives packet 51, after one second. libopus 1.6.1 chooses the same in every cell.
 
-| Bitrate asked for | `Application::Voip` | `Application::Audio` |
-|---|---|---|
-| 6 and 8 kb/s | SILK-only, NB | SILK-only, NB |
-| 10 kb/s | SILK-only, WB | SILK-only, WB |
-| 12 kb/s | SILK-only, WB | Hybrid, SWB |
-| 16 kb/s | Hybrid, FB | Hybrid, FB |
-| 20 to 56 kb/s | Hybrid, FB | CELT-only, FB |
-| 64 to 128 kb/s | CELT-only, FB | CELT-only, FB |
+| Bitrate asked for | `Voip`, complexity 9 | `Audio`, complexity 9 | `Voip`, complexity 6 | `Audio`, complexity 6 |
+|---|---|---|---|---|
+| 6 and 8 kb/s | SILK-only, NB | SILK-only, NB | SILK-only, NB | SILK-only, NB |
+| 10 kb/s | SILK-only, WB | SILK-only, WB | SILK-only, WB | SILK-only, WB |
+| 12 kb/s | SILK-only, WB | SILK-only, WB | SILK-only, WB | Hybrid, SWB |
+| 16 kb/s | Hybrid, FB | CELT-only, FB | Hybrid, FB | Hybrid, FB |
+| 20 kb/s | Hybrid, FB | CELT-only, FB | Hybrid, FB | CELT-only, FB |
+| 24 to 64 kb/s | CELT-only, FB | CELT-only, FB | Hybrid, FB | CELT-only, FB |
+| 96 and 128 kb/s | CELT-only, FB | CELT-only, FB | CELT-only, FB | CELT-only, FB |
 
-With 16 kHz input the bandwidth stops at wideband. `Voip` then codes SILK-only up to 56 kb/s and CELT-only from 64 kb/s. `Audio` codes SILK-only up to 16 kb/s and CELT-only from 20 kb/s. The exact switch points move with the frame duration, the complexity, the choice of constant or variable bitrate, the packet loss and the previous mode. [The encoder](03-encoder.md) gives the rules in full.
+At complexity 9 the analysis takes the tones for music, so `Voip` moves to CELT-only from 24 kb/s. At complexity 6 `Voip` keeps the estimate for speech and stays Hybrid up to 64 kb/s.
+
+With 16 kHz input the bandwidth stops at wideband. With the same signal at complexity 9, `Voip` then codes SILK-only up to 48 kb/s and CELT-only from 56 kb/s, and `Audio` SILK-only up to 40 kb/s and CELT-only from 48 kb/s, as libopus does. The exact switch points move with the frame duration, the complexity, the choice of constant or variable bitrate, the packet loss and the previous mode. [The encoder](03-encoder.md) gives the rules in full.
 
 ### Switching between modes
 
@@ -296,7 +299,7 @@ Real-time audio usually travels over the User Datagram Protocol (UDP). UDP can l
 |---|---|---|
 | **Packet loss concealment (PLC)** | The decoder makes up audio for a lost packet, from the audio before it. | Yes. Pass an empty packet to `OpusDecoder::decode`. The SILK and CELT concealment are ports of libopus. |
 | **In-band forward error correction (FEC)** | A SILK frame can carry a low-bitrate copy of the frame before it, called **low bitrate redundancy (LBRR)**. When a packet is lost, the decoder rebuilds it from the copy in the next packet. | Yes. Encoder: `use_inband_fec` and `packet_loss_perc`. Decoder: `OpusDecoder::decode_fec`. |
-| **Discontinuous transmission (DTX)** | During silence the encoder sends almost nothing. The decoder fills the gaps with comfort noise. | Decoder only. The decoder conceals the missing packets and the 1-byte packets of a DTX stream, as libopus does. SILK's concealment adds comfort noise. The encoder has no DTX. |
+| **Discontinuous transmission (DTX)** | During silence the encoder sends almost nothing. The decoder fills the gaps with comfort noise. | Yes. Encoder: `set_dtx(true)`, with both kinds of DTX of libopus (that of the Opus layer and that of SILK). The decoder conceals the missing packets and the 1-byte packets of a DTX stream, as libopus does. SILK's concealment adds comfort noise. |
 
 Notes on these tools:
 
@@ -404,9 +407,8 @@ opus1 is a port of libopus 1.6 to Rust. It has no C code and no C dependency. Bu
 
 The main gaps:
 
-- the speech/music and tonality analysis of the encoder (libopus `analysis.c`);
-- DTX in the encoder;
-- some controls, for example phase inversion, signal type, and a decoder output gain;
+- the integer version of the speech/music analysis that the fixed-point build of libopus runs (opus1 ports the floating-point version);
+- some controls, for example phase inversion and a decoder output gain;
 - the machine-learning tools (deep PLC, DRED, OSCE), the quality extension, and packet extensions;
 - ambisonics with a demixing matrix (mapping family 3);
 - on x86-64, the code compiles but has not been run.

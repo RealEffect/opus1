@@ -7,12 +7,17 @@ use k24_enc_common::*;
 
 use audiopus_sys::OPUS_BANDWIDTH_SUPERWIDEBAND;
 
-/// libopus forced to Hybrid super-wideband, so both sides code the same way.
+/// Both encoders forced to Hybrid super-wideband. Without forcing, both code
+/// these signals the same way, partly as SILK wideband or CELT-only: their
+/// speech and music analysis finds no audio above 8 kHz in the speech, and
+/// moves the higher bitrates to CELT.
 fn hybrid_cfg(bitrate: i32, cbr: bool) -> Cfg {
     let mut cfg = Cfg::new(App::Voip, bitrate);
     cfg.cbr = cbr;
     cfg.c_force_mode = Some(MODE_HYBRID);
     cfg.c_bandwidth = Some(OPUS_BANDWIDTH_SUPERWIDEBAND);
+    cfg.rs_force_mode = Some(opus1::ForcedMode::Hybrid);
+    cfg.rs_bandwidth = Some(opus1::Bandwidth::Superwideband);
     cfg
 }
 

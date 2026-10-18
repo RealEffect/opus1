@@ -459,3 +459,72 @@ fn float_input_that_is_not_a_sane_signal_is_coded_as_silence_like_libopus() {
         }
     }
 }
+
+/// A frame whose filtered samples have a sum of squares at the limit of
+/// libopus's test for insane input (1e9) is cleared exactly when libopus
+/// clears it. libopus takes that sum with `celt_inner_prod`, whose vector
+/// version adds in another order than one sample after the other; the order
+/// decides frames within a few parts in ten million of the limit. For each
+/// noise frame the scale is bisected until libopus's decision flips, and
+/// opus1 must decide as libopus on both sides of the flip.
+#[test]
+fn the_limit_of_the_insane_input_test_is_that_of_libopus() {
+    fn noise(n: usize, seed: u64, scale: f64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (scale * (((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0)) as f32
+            })
+            .collect()
+    }
+    // Whether libopus and opus1 clear the frame (a cleared frame is coded
+    // as digital silence, in a few bytes).
+    fn cleared(channels: usize, frame: usize, pcm: &[f32]) -> (bool, bool) {
+        let mut rs = OpusEncoder::new(48_000, channels, Application::RestrictedLowDelay).unwrap();
+        rs.set_force_mode(Some(ForcedMode::CeltOnly));
+        let mut c = CEncoder::new(48_000, channels, APP_LOWDELAY);
+        c.force_mode(MODE_CELT);
+        let c_packet = c.encode_max(pcm, 1276);
+        let mut out = vec![0u8; 1276];
+        let len = rs.encode(pcm, frame, &mut out).unwrap();
+        (c_packet.len() < 10, len < 10)
+    }
+    let (mut flips, mut failures) = (0, Vec::new());
+    for channels in [1usize, 2] {
+        for frame in [120usize, 480, 960] {
+            let n = frame * channels;
+            // Uniform noise in [-s, s] has a sum of squares of about n*s^2/3.
+            let s0 = (3.0e9f64 / n as f64).sqrt();
+            for seed in 0..20u64 {
+                let (mut lo, mut hi) = (0.9 * s0, 1.1 * s0);
+                if !cleared(channels, frame, &noise(n, seed, hi)).0 || cleared(channels, frame, &noise(n, seed, lo)).0 {
+                    continue;
+                }
+                for _ in 0..60 {
+                    let mid = 0.5 * (lo + hi);
+                    if cleared(channels, frame, &noise(n, seed, mid)).0 {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                flips += 1;
+                for scale in [lo, hi] {
+                    let (c, rs) = cleared(channels, frame, &noise(n, seed, scale));
+                    if c != rs {
+                        failures.push(format!("{channels} ch, {frame} samples, seed {seed}, scale {scale}: libopus clears {c}, opus1 {rs}"));
+                    }
+                }
+            }
+        }
+    }
+    println!("{flips} flip points");
+    for f in failures.iter().take(10) {
+        println!("  {f}");
+    }
+    assert!(flips > 50, "too few flip points: {flips}");
+    if cfg!(target_arch = "aarch64") {
+        assert!(failures.is_empty(), "{} decisions differ from libopus", failures.len());
+    }
+}

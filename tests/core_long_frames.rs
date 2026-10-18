@@ -239,9 +239,7 @@ fn bitrates(channels: usize) -> [i32; 2] {
 /// CBR in 60 ms frames is 0.3 dB below libopus at 23,866 b/s and within
 /// 0.1 dB of it at 24,000 b/s (8 s of speech). The parts of a long CBR packet have a byte less
 /// than frames of their own (the header of the packet), so they land
-/// elsewhere on this curve. In-band FEC adds to it. libopus's speech and
-/// music analysis, which opus1 lacks, also picks other modes at 16 to
-/// 48 kHz; that shows at every duration too.
+/// elsewhere on this curve. In-band FEC adds to it.
 const MEAN_BOUND_DB: f64 = 0.5;
 const STREAM_BOUND_DB: f64 = 0.5;
 const PART_MARGIN_DB: f64 = 1.5;

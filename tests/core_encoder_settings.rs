@@ -4,9 +4,9 @@
 //! encoder: the automatic bitrate, which is the default, the maximum
 //! bitrate, and unconstrained variable bitrate (VBR).
 //!
-//! The encoders run at complexity 5 where packets are compared. libopus
-//! then makes its decisions without the speech/music analysis that opus1
-//! does not have.
+//! The encoders run at complexity 5 where packets are compared. Both then
+//! make their decisions without the speech/music analysis, which they run
+//! from complexity 7 on (`core_analysis_libopus.rs` compares that).
 
 mod core_common;
 mod k24_common;

@@ -10,9 +10,9 @@
 //! Then the input gives frames, and between them changes the bitrate
 //! (automatic, maximum or a value), VBR or CBR, the complexity, in-band
 //! forward error correction (FEC) and the expected loss, the bandwidth and
-//! the maximum bandwidth, the forced mode, settings of single streams, the
-//! frame size, the output buffer, the signal and its format, or resets the
-//! encoder. What must hold for every frame:
+//! the maximum bandwidth, the forced mode, discontinuous transmission
+//! (DTX), settings of single streams, the frame size, the output buffer,
+//! the signal and its format, or resets the encoder. What must hold for every frame:
 //!
 //! - With an output buffer of 4000 bytes per stream the frame is encoded.
 //! - Every packet is accepted by libopus's multistream decoder, which
@@ -24,8 +24,8 @@
 //!   decoders conceal, or switches a stream from CELT-only to SILK or
 //!   Hybrid.
 //! - A second encoder with the same layout and settings, always given
-//!   `f32` samples (for 16-bit input the samples `s as f32 / 32768.0`),
-//!   writes the same packets.
+//!   `f32` samples (for 16-bit input the samples `s as f32 / 32768.0`,
+//!   coded with an LSB depth of 16), writes the same packets.
 
 #![no_main]
 
@@ -138,7 +138,7 @@ fn build(u: &mut Unstructured, fs: i32, app: Application) -> Result<Option<Multi
 
 /// One change of a setting, made on both encoders.
 fn change(u: &mut Unstructured, encs: [&mut MultistreamEncoder; 2]) -> Result<()> {
-    match u.int_in_range(0..=10)? {
+    match u.int_in_range(0..=11)? {
         0 | 1 => {
             let b = match u.int_in_range(0..=5)? {
                 0 => Bitrate::Auto,
@@ -200,6 +200,12 @@ fn change(u: &mut Unstructured, encs: [&mut MultistreamEncoder; 2]) -> Result<()
                     let _ = stream.set_force_channels(channels);
                     stream.set_prediction_disabled(disabled);
                 }
+            }
+        }
+        9 => {
+            let v = u.arbitrary()?;
+            for e in encs {
+                e.set_dtx(v);
             }
         }
         _ => {
@@ -285,6 +291,9 @@ fn run(data: &[u8]) -> Result<()> {
         } else {
             enc.encode(&pcm, frame_size, out)
         };
+        // `encode_i16` codes with an LSB depth of at most 16, as libopus's
+        // `opus_multistream_encode` does.
+        twin.set_lsb_depth(if i16_in { 16 } else { 24 }).unwrap();
         let twin_r = twin.encode(&pcm, frame_size, &mut twin_packet[..out_len]);
         match (&r, &twin_r) {
             (Ok(a), Ok(b)) => {

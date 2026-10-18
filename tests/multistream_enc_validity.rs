@@ -226,13 +226,11 @@ fn c_decodes_every_packet_16k_cbr() {
 
 /// The matrix with every coupled stream forced to two channels. Left to
 /// themselves, both encoders code most stereo streams of the matrix as mono
-/// at 8 kb/s per channel, and opus1, which has no speech analysis, codes
-/// the higher rates as CELT. Measured on this matrix at 48 and 24 kHz,
-/// packets with a stereo Hybrid stream:
-///
-/// - 8 kb/s per channel: libopus 128, opus1 0; forced to two channels,
-///   libopus 310, opus1 220.
-/// - 24 kb/s per channel: libopus 111, opus1 0, forced or not.
+/// at 8 kb/s per channel. Measured on this matrix at 48 and 24 kHz,
+/// packets with a stereo Hybrid stream, forced to two channels: 421 in
+/// opus1 (93, 91, 111 and 126 in the four runs below), as in libopus (310
+/// at 8 kb/s and 111 at 24 kb/s per channel). Before opus1 ran the speech
+/// and music analysis, it coded the higher rates as CELT and had 220.
 #[test]
 fn final_range_of_packets_with_a_stereo_hybrid_stream() {
     let mut packets = 0;
@@ -395,6 +393,9 @@ fn sixteen_bit_input_gives_the_bytes_of_float_input() {
                             .unwrap();
                         enc.set_vbr(vbr);
                     }
+                    // 16-bit input is coded at a depth of 16 bits, as libopus
+                    // `opus_multistream_encode` codes it.
+                    float_enc.set_lsb_depth(16).unwrap();
                     let size = max_packet_bytes(float_enc.layout().streams());
                     let (mut a, mut b) = (vec![0u8; size], vec![0u8; size]);
                     let step = frame_size * case.channels;

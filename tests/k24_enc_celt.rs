@@ -38,9 +38,8 @@ fn quality(pcm: &[f32], packets: &[Vec<u8>], lag: usize) -> (f64, f64) {
 /// 128 kb/s measured 31.1 dB (worst 20 ms window 25.2 dB) against libopus's
 /// 42.0 dB (41.6 dB), and a 100 Hz - 11 kHz chirp 35.9 dB against 41.6 dB.
 ///
-/// Complexity 5 keeps libopus's tonality analysis off (it starts at
-/// complexity 7 and opus1 does not port it), so both sides run the same
-/// algorithms.
+/// Complexity 5 keeps the tonality analysis off on both sides (it starts
+/// at complexity 7), so the test looks at the comb filter alone.
 #[test]
 fn comb_filter_tap_shape_matches_the_decoder() {
     for (app, hz, lag) in [(App::Audio, 9000.0, 156), (App::LowDelay, 9300.0, 60)] {
@@ -143,13 +142,15 @@ fn two_byte_cbr_packets_are_valid() {
 /// What issue #54 left open: from 24 kHz, CELT at 64 kb/s on the issue's
 /// chirp measured 36.2 dB against libopus's 38.8 dB.
 ///
-/// The gap is libopus's tonality analysis and nothing else. libopus runs it
+/// The gap was libopus's tonality analysis and nothing else. libopus runs it
 /// from complexity 7 up (opus_encoder.c:1252) and no other CELT-only
 /// decision changes between complexity 6 and 7. Both streams are CELT-only
 /// at the same bitrate, so the gain comes from where the bits go, not from
-/// more bits. With the analysis off, opus1 is level with libopus.
+/// more bits. With the analysis off, opus1 is level with libopus; with the
+/// analysis, which opus1 now runs too, it gains as much as libopus.
+#[cfg(feature = "analysis")]
 #[test]
-fn issue_54_gap_is_the_tonality_analysis() {
+fn issue_54_gap_closes_with_the_tonality_analysis() {
     // The issue's chirp: 200 Hz rising at 1200 Hz/s for 1.3 s, amplitude 0.4.
     let n = FS * 13 / 10;
     let mut pcm: Vec<f32> = (0..n)
@@ -180,18 +181,16 @@ fn issue_54_gap_is_the_tonality_analysis() {
         rs6 >= c6 - 0.5,
         "analysis off: opus1 {rs6:.2} dB, libopus {c6:.2} dB"
     );
-    // Analysis on in libopus (complexity 7): libopus gains about 4 dB at the
-    // same bitrate; opus1 has no analysis and does not move.
+    // Analysis on (complexity 7): libopus gains about 4 dB at the same
+    // bitrate, and opus1 gains as much.
     let (rs7, c7, rs7_rate, c7_rate) = run(7, 7);
     assert!((rs7_rate - c7_rate).abs() < 1000.0, "bitrates {rs7_rate} / {c7_rate}");
-    assert!((rs7 - rs6).abs() < 0.1, "opus1 changed at complexity 7: {rs6:.2} -> {rs7:.2}");
     assert!(
         c7 >= c6 + 2.5,
         "libopus's analysis no longer explains the gap: {c6:.2} dB -> {c7:.2} dB"
     );
-    // The gap that remains is no larger than what the analysis gives libopus.
     assert!(
-        c7 - rs7 <= c7 - c6 + 0.5,
-        "opus1 {rs7:.2} dB is further behind libopus {c7:.2} dB than the analysis explains ({c6:.2} dB without it)"
+        rs7 >= c7 - 0.5,
+        "with the analysis: opus1 {rs7:.2} dB, libopus {c7:.2} dB"
     );
 }

@@ -24,9 +24,16 @@
 //! 1.5.2 has no `cancel_pitch` at all, so it is a reference for quality, not
 //! for bits: the assertions are relative to libopus's own encoder and to
 //! opus1's lower bitrates, never absolute dB.
+//!
+//! Both encoders run at the default complexity 9, with libopus's speech and
+//! music analysis. At 64 and 128 kbps both code the chirp as CELT
+//! super-wideband, and opus1's packets are libopus's byte for byte. At
+//! 32 kbps both code it as Hybrid, so the test of the rising SNR forces
+//! opus1 to CELT-only.
+#![cfg(feature = "analysis")]
 
 use opus::{Application as CApp, Bitrate, Channels as CCh, Decoder as CDec, Encoder as CEnc};
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, ForcedMode, OpusEncoder};
 
 const PRE_SKIP: usize = 312;
 
@@ -51,9 +58,13 @@ fn input(rate: usize, level: f64) -> Vec<f32> {
     x
 }
 
-fn opus1_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
+/// opus1's packets, CELT-only when `force_celt`.
+fn opus1_packets(rate: usize, bitrate: i32, level: f64, force_celt: bool) -> Vec<Vec<u8>> {
     let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
     enc.set_bitrate(opus1::Bitrate::BitsPerSecond(bitrate)).unwrap();
+    if force_celt {
+        enc.set_force_mode(Some(ForcedMode::CeltOnly));
+    }
     let frame = rate / 50;
     let mut pkt = [0u8; 4000];
     input(rate, level)
@@ -68,10 +79,6 @@ fn opus1_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
 fn libopus_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
     let mut enc = CEnc::new(rate as u32, CCh::Mono, CApp::Audio).unwrap();
     enc.set_bitrate(Bitrate::Bits(bitrate)).unwrap();
-    // Complexity 6 keeps libopus's tonality analysis off (opus_encoder.c:1252).
-    // opus1 does not port it, and from 24 kHz its leakage boosts are worth
-    // another ~3 dB at 64 kbps; with it off the CELT paths compare like-for-like.
-    enc.set_complexity(6).unwrap();
     // Same look-ahead as opus1, so the same pre-skip applies to both.
     assert_eq!(
         enc.get_lookahead().unwrap() as usize * 48_000 / rate,
@@ -85,6 +92,34 @@ fn libopus_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
             pkt[..n].to_vec()
         })
         .collect()
+}
+
+/// libopus's packets forced to CELT-only (`OPUS_SET_FORCE_MODE`, which the
+/// `opus` crate does not offer).
+fn libopus_celt_packets(rate: usize, bitrate: i32, level: f64) -> Vec<Vec<u8>> {
+    use audiopus_sys as sys;
+    let mut err = 0;
+    let st = unsafe { sys::opus_encoder_create(rate as i32, 1, sys::OPUS_APPLICATION_AUDIO, &mut err) };
+    assert_eq!(err, 0);
+    unsafe {
+        sys::opus_encoder_ctl(st, sys::OPUS_SET_BITRATE_REQUEST, bitrate);
+        // OPUS_SET_FORCE_MODE (opus_private.h) to MODE_CELT_ONLY.
+        sys::opus_encoder_ctl(st, 11002, 1002);
+    }
+    let packets = input(rate, level)
+        .chunks(rate / 50)
+        .map(|f| {
+            let mut out = vec![0u8; 4000];
+            let n = unsafe {
+                sys::opus_encode_float(st, f.as_ptr(), (rate / 50) as i32, out.as_mut_ptr(), 4000)
+            };
+            assert!(n > 0);
+            out.truncate(n as usize);
+            out
+        })
+        .collect();
+    unsafe { sys::opus_encoder_destroy(st) };
+    packets
 }
 
 /// SNR (dB) of the libopus 48 kHz decode against the analytic chirp.
@@ -115,8 +150,11 @@ fn non_celt_swb(packets: &[Vec<u8>]) -> usize {
 fn celt_24k_tracks_libopus() {
     for level in [0.9, 1.0, 1.1] {
         for bitrate in [64_000, 128_000] {
-            let ours = opus1_packets(24_000, bitrate, level);
+            let ours = opus1_packets(24_000, bitrate, level, false);
             let theirs = libopus_packets(24_000, bitrate, level);
+            if cfg!(target_arch = "aarch64") {
+                assert!(ours == theirs, "{bitrate} b/s, level {level}: not libopus's packets");
+            }
             assert_eq!(non_celt_swb(&ours), 0, "opus1 left CELT SWB at {bitrate}");
             assert_eq!(
                 non_celt_swb(&theirs),
@@ -133,20 +171,33 @@ fn celt_24k_tracks_libopus() {
     }
 }
 
+/// The SNR of CELT from 24 kHz input rises with the bitrate: by at least
+/// 2 dB per doubling (the bug left it within 1 dB from 32 to 128 kbps).
+/// Forced to CELT-only, opus1's packets are libopus's, so libopus's CELT
+/// encoder rises by exactly as much. (Before the speech and music analysis
+/// was ported, opus1 rose by 3 dB or more per doubling here. With the
+/// analysis, opus1 and libopus rise by 2.7 dB from 64 to 128 kbps at level
+/// 0.9: 39.7 to 42.4 dB.)
 #[test]
 fn celt_24k_snr_rises_with_bitrate() {
     for level in [0.9, 1.0, 1.1] {
         let mut prev = f64::NEG_INFINITY;
         for bitrate in [32_000, 64_000, 128_000] {
-            let packets = opus1_packets(24_000, bitrate, level);
+            let packets = opus1_packets(24_000, bitrate, level, true);
             assert_eq!(
                 non_celt_swb(&packets),
                 0,
                 "opus1 left CELT SWB at {bitrate}"
             );
+            if cfg!(target_arch = "aarch64") {
+                assert!(
+                    packets == libopus_celt_packets(24_000, bitrate, level),
+                    "{bitrate} b/s, level {level}: not libopus's CELT packets"
+                );
+            }
             let db = snr(24_000, &packets, level);
             assert!(
-                db >= prev + 3.0,
+                db >= prev + 2.0,
                 "24 kHz SNR stopped rising at {} kbps (level {level}): {db:.1} dB after {prev:.1} dB",
                 bitrate / 1000
             );

@@ -230,8 +230,10 @@ fn c_soft_clip(pcm: &[f32], frame_size: usize, channels: usize, mem: &mut [f32])
     out
 }
 
-/// `pcm_soft_clip` gives the output of `opus_pcm_soft_clip`, buffer after
-/// buffer with the memory carried along, for buffers of many lengths.
+/// `pcm_soft_clip` gives the output of `opus_pcm_soft_clip` bit for bit,
+/// buffer after buffer with the memory carried along, for buffers of many
+/// lengths. libopus rounds as clang does on 64-bit ARM; elsewhere the
+/// output must agree within 2e-6.
 #[test]
 fn pcm_soft_clip_matches_libopus() {
     let mut seed = 12345u32;
@@ -259,13 +261,16 @@ fn pcm_soft_clip_matches_libopus() {
                 let expected = c_soft_clip(&pcm, n, channels, &mut c_mem);
                 let mut ours = pcm.clone();
                 pcm_soft_clip(&mut ours, n, channels, &mut rs_mem);
+                let exact = cfg!(target_arch = "aarch64");
                 for (i, (a, b)) in expected.iter().zip(&ours).enumerate() {
                     worst = worst.max((a - b).abs());
-                    assert!((a - b).abs() <= 2e-6, "gain {gain}, offset {offset}, {channels} ch, round {round}, sample {i}: libopus {a}, opus1 {b}");
+                    let limit = if exact { 0.0 } else { 2e-6 };
+                    assert!((a - b).abs() <= limit, "gain {gain}, offset {offset}, {channels} ch, round {round}, sample {i}: libopus {a}, opus1 {b}");
                     assert!(b.abs() <= 1.0, "sample {i} is {b}");
                 }
                 for (a, b) in c_mem.iter().zip(&rs_mem) {
-                    assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "memory: libopus {a}, opus1 {b}");
+                    let limit = if exact { 0.0 } else { 1e-6 * a.abs().max(1.0) };
+                    assert!((a - b).abs() <= limit, "memory: libopus {a}, opus1 {b}");
                 }
                 clipped_buffers += (expected != pcm) as usize;
             }

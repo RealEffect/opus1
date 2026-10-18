@@ -38,7 +38,7 @@ This glossary defines, in alphabetical order, the terms that these documents use
 - **Deep PLC**: Packet loss concealment with a neural network, added to libopus 1.5 as a build option. opus1 does not have it.
 - **Delayed decision**: A way of quantizing the SILK excitation. It keeps several candidate results and chooses between them only some samples later, which lowers the error. SILK uses 2 candidates from complexity 2, 3 from complexity 6 and 4 from complexity 8.
 - **DRED (Deep REDundancy)**: Redundancy coded with a neural network, added to libopus 1.5 as a build option. opus1 does not have it. It carries a compact description of earlier speech in the padding of later packets.
-- **DTX (discontinuous transmission)**: During silence or steady background noise, the encoder sends a packet only now and then. The decoder fills the gaps with comfort noise. The opus1 decoder plays DTX streams, but the opus1 encoder cannot produce them.
+- **DTX (discontinuous transmission)**: During silence or steady background noise, the encoder sends a packet only now and then. The decoder fills the gaps with comfort noise. The opus1 encoder produces such streams with `OpusEncoder::set_dtx(true)`.
 - **Dual stereo**: A CELT stereo option that codes the left and the right channel of a band separately, instead of as mid and side. It applies to the bands below the intensity band.
 
 ## E
@@ -139,7 +139,7 @@ This glossary defines, in alphabetical order, the terms that these documents use
 - **Sampling rate**: The number of samples per second of a signal. Opus accepts and produces 8, 12, 16, 24 and 48 kHz.
 - **Self-delimited framing**: A variant of the packet format (RFC 6716 appendix B) that also stores the size of the last frame, so that a reader knows where the packet ends. Multistream packets use it for every stream but the last.
 - **Short blocks**: See transient.
-- **Signal type (encoder setting)**: A hint to the libopus encoder that the input is voice or music (`OPUS_SET_SIGNAL`). opus1 has no such setting and takes the hint from the application instead.
+- **Signal type (encoder setting)**: A hint to the encoder that the input is voice or music (`OPUS_SET_SIGNAL`, in opus1 `OpusEncoder::set_signal`). Without it, the speech and music analysis estimates this from complexity 7 on, and the application decides below.
 - **SILK**: The speech layer of Opus, based on linear prediction and derived from the SILK codec of Skype (the name is not an abbreviation). It works at 8, 12 or 16 kHz with frames of 10 or 20 ms, and codes audio up to 8 kHz.
 - **SIMD (single instruction, multiple data)**: Processor instructions that work on several numbers at once, such as NEON on aarch64, and the Streaming SIMD Extensions (SSE) and Advanced Vector Extensions 2 (AVX2) on x86-64. opus1 uses them in its most frequent loops.
 - **SNR (signal-to-noise ratio)**: The power of a reference signal divided by the power of the difference from it, in decibels. These documents use it to compare decoded audio with the input, or the output of opus1 with that of libopus.
@@ -153,7 +153,7 @@ This glossary defines, in alphabetical order, the terms that these documents use
 
 - **TF resolution (time-frequency resolution)**: The balance between detail in time and detail in frequency of the MDCT coefficients of a band. CELT can change it band by band (`tf_res` in the code). It uses Haar transforms across short blocks or across neighbouring coefficients.
 - **TOC byte (table-of-contents byte)**: The first byte of every Opus packet: 5 bits of configuration (mode, bandwidth and frame duration), 1 stereo bit and the 2 bits of the frame count code. [Opus packets](02-packets.md) lists the 32 configurations.
-- **Tonality analysis**: The libopus analysis of the encoder input (`analysis.c`) that estimates how tonal the signal is, whether it is speech or music, and its bandwidth. The floating-point build of libopus runs it at complexity 7 and above. opus1 does not have it.
+- **Tonality analysis**: The libopus analysis of the encoder input (`analysis.c`) that estimates how tonal the signal is, whether it is speech or music, and its bandwidth. The floating-point build of libopus runs it at complexity 7 and above, and so does opus1 (`src/analysis/`). Also called the speech and music analysis.
 - **Transient**: A sudden change in the signal, such as a drum hit. CELT codes a transient frame with several short MDCTs (short blocks) instead of one long one, for example eight MDCTs of 2.5 ms in a 20 ms frame.
 
 ## V

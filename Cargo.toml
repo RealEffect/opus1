@@ -17,7 +17,7 @@ exclude = [
 ]
 
 [features]
-default = ["std", "heap"]
+default = ["std", "heap", "analysis"]
 # `std` enables OS-backed runtime x86 SIMD detection (CPUID); without it, x86
 # SIMD falls back to compile-time `target_feature` detection.
 std = []
@@ -37,6 +37,12 @@ heap = ["std"]
 # needed when `std` is enabled. Enable with:
 #   opus1 = { version = "...", default-features = false, features = ["libm"] }
 libm = ["dep:libm"]
+# The speech and music analysis of the encoder (libopus `src/analysis.c` and
+# `src/mlp.c`), which libopus runs from complexity 7 on. It adds about 28 KB
+# of code, 24 KB of tables (mostly the network weights) and 26 KB of state
+# per encoder. Without it, the encoder behaves as libopus below complexity
+# 7: no speech or music probability, no detected bandwidth.
+analysis = []
 
 # Neural network features of libopus 1.5 and later. All are off by default,
 # as in libopus. They work with and without `std` (a `no_std` build needs

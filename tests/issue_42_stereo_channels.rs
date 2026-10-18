@@ -22,7 +22,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, OpusDecoder, OpusEncoder, Signal};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -186,6 +186,17 @@ fn run(cfg: &Config) -> Measured {
     let mut rs_enc = OpusEncoder::new(sr as i32, CH, Application::Voip).unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     rs_enc.set_vbr(!cfg.cbr);
+    // opus1 runs the speech and music analysis as libopus does. It reads
+    // the tone as music, and finds no audio above 2 kHz, which lowers the
+    // bandwidth it codes. Pin the signal type and the bandwidth as for
+    // libopus below.
+    rs_enc.set_signal(Signal::Voice);
+    rs_enc.set_bandwidth(match cfg.bandwidth {
+        CBw::Wideband => Bandwidth::Wideband,
+        CBw::Superwideband => Bandwidth::Superwideband,
+        CBw::Fullband => Bandwidth::Fullband,
+        other => panic!("no such bandwidth in this test: {other:?}"),
+    });
 
     // libopus at opus1's settings. A steady harmonic tone can read as music
     // and pull libopus into CELT, and below ~18 kb/s libopus would switch to

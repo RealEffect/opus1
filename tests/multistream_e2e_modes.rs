@@ -11,23 +11,23 @@
 //!
 //! That choice goes by the bitrate and by an estimate of how likely the
 //! input is speech. From complexity 7 on libopus takes the estimate from
-//! its analysis of the signal (analysis.c). opus1 has no such analysis
-//! and uses the fixed estimate libopus uses without it. The tests show:
+//! its analysis of the signal (analysis.c), which each stream encoder runs
+//! on the stream's channels of the whole input. opus1 does the same. The
+//! tests show:
 //!
-//! - Without the analysis of libopus (complexity 6) every stream of
-//!   opus1 has the mode of the libopus stream in every frame.
-//! - With it (complexity 9) libopus starts in the same mode and, on the
-//!   test signal, changes the stream to CELT after about 0.4 s. CELT fills
-//!   the bitrate; SILK and Hybrid do not. opus1 stays where it started.
-//!
-//! So the multistream layer has nothing to follow here. Forcing CELT on
-//! these streams would not be what libopus does: on a signal its analysis
-//! takes for speech, libopus stays with SILK as well.
+//! - Without the analysis (complexity 6) every stream of opus1 has the
+//!   mode of the libopus stream in every frame.
+//! - With it (complexity 9) both start in the same mode and, on the test
+//!   signal, change the stream to CELT at the same frame, after about
+//!   0.4 s. Every stream of opus1 has the mode of the libopus stream in
+//!   every frame here too.
 //!
 //! A second difference shows in the same numbers and has nothing to do
 //! with the analysis: in the same mode, a SILK or Hybrid stream of opus1
 //! uses up to 19 % fewer bits than the libopus stream.
 #![cfg(feature = "std")]
+// Some helpers serve only the tests that need the speech and music analysis.
+#![cfg_attr(not(feature = "analysis"), allow(dead_code))]
 
 mod ms_support;
 mod multistream_e2e_common;
@@ -172,7 +172,7 @@ fn run_all(complexity: i32) -> Vec<Run> {
 }
 
 /// libopus runs its analysis from complexity 7 (opus_encoder.c:1252). At
-/// complexity 6 it goes by the application alone, as opus1 always does.
+/// complexity 6 it goes by the application alone, and so does opus1.
 ///
 /// Measured over 52 settings: no stream packet of 7800 has another mode.
 /// Also at 16 kHz with the VoIP application and 64 kb/s per channel, where
@@ -231,27 +231,25 @@ fn without_the_analysis_of_libopus_every_stream_has_the_mode_of_libopus() {
     assert!(libopus_far_above <= 2, "{libopus_far_above} settings");
 }
 
-/// With its analysis libopus takes the test signal for music. A stream
-/// that starts in SILK or Hybrid then changes to CELT, which uses the whole
-/// bitrate. Measured: in 24 of the 52 settings libopus changes streams to
-/// CELT, 36 streams in all, at frame 17 to 21, which is 0.34 to 0.42 s.
-/// A stream of opus1 codes the mode of its first frame in every frame.
+/// With the analysis both encoders take the test signal for music. A
+/// stream that starts in SILK or Hybrid then changes to CELT, which uses
+/// the whole bitrate. Measured: in 24 of the 52 settings libopus changes
+/// streams to CELT, 36 streams in all, at frame 17 to 21, which is 0.34 to
+/// 0.42 s. opus1 does the same in the same frames: no stream packet of
+/// 16,900 has another mode. 16 of the 52 settings give libopus's packets
+/// byte for byte in all 100 frames; in most others the frames before the
+/// switch differ, where SILK codes them.
 ///
-/// - In 16 of the 24 settings opus1 starts in SILK or Hybrid, as libopus
-///   does, and stays there. Its packets then hold less than was asked for:
-///   49 % of the request at worst (three mono streams at 16 kHz, VoIP,
-///   32 kb/s each), where libopus has 94 %.
-/// - In the other 8 opus1 codes CELT from the first frame, where libopus
-///   codes SILK or Hybrid for its first 17 or 18 frames.
-///
-/// At 48 kHz with 12 kb/s per channel the analysis has another effect: it
-/// finds no signal above 8 kHz, so libopus codes SILK wideband where
-/// opus1 codes Hybrid.
+/// Before opus1 ran the analysis, its streams kept the mode of their first
+/// frame: 16 of the 24 settings stayed in SILK or Hybrid, at 49 % of the
+/// request at worst.
 ///
 /// libopus itself is at 78 to 110 % of the request, apart from 5.1 at
-/// 48 kHz and 12 kb/s per channel (146 %, see the test above).
+/// 48 kHz and 12 kb/s per channel (146 %, see the test above). opus1 is at
+/// 63 to 104 %; its lowest rates are SILK at 16 kHz, as in the test above.
+#[cfg(feature = "analysis")]
 #[test]
-fn the_analysis_of_libopus_moves_streams_to_celt_and_opus1_stays() {
+fn with_the_analysis_every_stream_has_the_mode_of_libopus() {
     let runs = run_all(9);
     let (mut moved, mut settings_moved) = (0, 0);
     let (mut first, mut last) = (FRAMES, 0);
@@ -261,12 +259,8 @@ fn the_analysis_of_libopus_moves_streams_to_celt_and_opus1_stays() {
         lowest = lowest.min(r.rate[RUST]);
         libopus_lowest = libopus_lowest.min(r.rate[C]);
         let before = moved;
-        for &(frame, rust_keeps_its_mode) in &r.to_celt {
-            assert!(
-                rust_keeps_its_mode,
-                "{}: opus1 changed its mode; is the analysis ported?",
-                r.label
-            );
+        assert_eq!(r.mode_differs, 0, "{}", r.label);
+        for &(frame, _) in &r.to_celt {
             let Some(frame) = frame else { continue };
             moved += 1;
             first = first.min(frame);

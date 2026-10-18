@@ -33,19 +33,19 @@
 //!   later encode call with a number that is no duration fails.
 //!   [`MultistreamEncoder::set_expert_frame_duration`] takes a
 //!   [`FrameDuration`], which holds only the numbers libopus accepts.
-//! - **D5, controls.** Missing at the multistream level are the LSB depth,
-//!   the signal type, discontinuous transmission, the forced channel
-//!   count, and the switches for prediction and phase inversion. [`OpusEncoder`] has the forced channel
-//!   count and the prediction switch; they can be set on each stream
-//!   through [`MultistreamEncoder::stream_encoder_mut`]. It has none of the
-//!   others.
+//! - **D5, controls.** Missing at the multistream level are the forced
+//!   channel count and the switches for prediction and phase inversion.
+//!   [`OpusEncoder`] has the forced channel count and the prediction
+//!   switch; they can be set on each stream through
+//!   [`MultistreamEncoder::stream_encoder_mut`]. It has no switch for
+//!   phase inversion.
 //! - **D6, energy mask.** libopus gives each stream encoder a pointer to the
 //!   mask. Here the values are copied into the stream encoder.
 //!
-//! One thing libopus does has no counterpart here, because the stream
-//! encoder has none: libopus gives each stream encoder the whole input and
-//! the channels of the stream, for its analysis of speech against music.
-//! [`OpusEncoder`] has no such analysis.
+//! As in libopus, each stream encoder runs its own speech and music
+//! analysis (from complexity 7 on) on the whole interleaved input: a
+//! coupled stream on the mean of its two channels, a mono stream on its
+//! one channel.
 
 use super::{ChannelSource, Interleaved, Sample};
 use super::layout::{ChannelLayout, MappingType};
@@ -54,8 +54,11 @@ use super::rate_alloc::{
     cbr_max_data_bytes, clamp_user_bitrate, rate_allocation, smallest_packet, stream_max_bytes,
 };
 use super::surround::{MASK_BANDS, SurroundAnalysis};
+use crate::analysis::{AnalysisPcm, SecondChannel};
 use crate::packet;
-use crate::{Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, OpusEncoder};
+use crate::{
+    Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, InbandFec, OpusEncoder, Signal,
+};
 
 const BUFFER_TOO_SMALL: &str = "Output buffer too small";
 
@@ -323,31 +326,33 @@ impl MultistreamEncoder {
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
-        let frame_size = self.check_input(pcm.len(), frame_size)?;
+        let selected = self.check_input(pcm.len(), frame_size)?;
         let src = Interleaved {
             pcm,
             channels: self.layout.channels(),
         };
-        self.encode_native(&src, frame_size, output)
+        self.encode_native(&src, selected, frame_size, output)
     }
 
     /// Encodes one frame of interleaved 16-bit samples. libopus
     /// `opus_multistream_encode`.
     ///
     /// The arguments are those of [`encode`](Self::encode). The packet is
-    /// the one `encode` writes for the samples `s as f32 / 32768.0`.
+    /// the one `encode` writes for the samples `s as f32 / 32768.0` with an
+    /// LSB depth of at most 16, as libopus `opus_multistream_encode` codes
+    /// it (see [`OpusEncoder::encode_i16`]).
     pub fn encode_i16(
         &mut self,
         pcm: &[i16],
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
-        let frame_size = self.check_input(pcm.len(), frame_size)?;
+        let selected = self.check_input(pcm.len(), frame_size)?;
         let src = Interleaved {
             pcm,
             channels: self.layout.channels(),
         };
-        self.encode_native(&src, frame_size, output)
+        self.encode_native(&src, selected, frame_size, output)
     }
 
     /// The frame to code: libopus `frame_size_select` with the expert frame
@@ -365,11 +370,14 @@ impl MultistreamEncoder {
     }
 
     /// libopus `opus_multistream_encode_native`. `frame_size` has been
-    /// checked, and `src` holds a frame of every input channel.
+    /// checked, and `src` holds `analysis_frame_size` samples of every
+    /// input channel: the caller's frame size, which is at least
+    /// `frame_size`.
     fn encode_native<T: Sample>(
         &mut self,
         src: &Interleaved<'_, T>,
         frame_size: usize,
+        analysis_frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
         let fs = self.sampling_rate;
@@ -512,11 +520,25 @@ impl MultistreamEncoder {
             }
             // libopus calls `opus_encode_native`: the frame size is chosen,
             // and an expert frame duration set on a stream encoder plays no
-            // part.
+            // part. The stream's analysis reads the whole input (C
+            // 1027-1028): channel `c1`, plus `c2` for a coupled stream,
+            // whose sum it halves.
+            let analysis_pcm = AnalysisPcm {
+                pcm: T::analysis_pcm(src.pcm),
+                channels: src.channels,
+                c1,
+                c2: match c2 {
+                    Some(c2) => SecondChannel::Channel(c2),
+                    None => SecondChannel::None,
+                },
+                frame_size: analysis_frame_size,
+            };
             let len = enc.encode_impl(
                 &self.buf[..frame_size * stream_channels],
                 frame_size,
                 &mut self.tmp[..curr_max],
+                analysis_pcm,
+                T::LSB_DEPTH,
             )?;
 
             // The stream encoder can return more than one frame (a 60 ms
@@ -653,6 +675,72 @@ impl MultistreamEncoder {
     /// libopus `OPUS_GET_INBAND_FEC`.
     pub fn inband_fec(&self) -> bool {
         self.encoders.first().is_some_and(|enc| enc.inband_fec())
+    }
+
+    /// Sets one of the three in-band FEC settings of libopus on every
+    /// stream (`OPUS_SET_INBAND_FEC` 0, 1 or 2). See
+    /// [`OpusEncoder::set_inband_fec_mode`].
+    pub fn set_inband_fec_mode(&mut self, mode: InbandFec) {
+        for enc in &mut self.encoders {
+            enc.set_inband_fec_mode(mode);
+        }
+    }
+
+    /// The in-band FEC setting of the first stream (libopus
+    /// `OPUS_GET_INBAND_FEC`).
+    pub fn inband_fec_mode(&self) -> InbandFec {
+        self.encoders.first().map_or(InbandFec::Off, |enc| enc.inband_fec_mode())
+    }
+
+    /// Says what the input is, on every stream. libopus `OPUS_SET_SIGNAL`.
+    /// See [`OpusEncoder::set_signal`].
+    pub fn set_signal(&mut self, signal: Signal) {
+        for enc in &mut self.encoders {
+            enc.set_signal(signal);
+        }
+    }
+
+    /// The signal type of the first stream. libopus `OPUS_GET_SIGNAL`.
+    pub fn signal(&self) -> Signal {
+        self.encoders.first().map_or(Signal::Auto, |enc| enc.signal())
+    }
+
+    /// Sets the precision of the input in bits, 8 to 24, on every stream.
+    /// libopus `OPUS_SET_LSB_DEPTH`. See [`OpusEncoder::set_lsb_depth`]. Any
+    /// other value is an error, and the setting stays.
+    pub fn set_lsb_depth(&mut self, depth: i32) -> Result<(), &'static str> {
+        if !(8..=24).contains(&depth) {
+            return Err("Invalid LSB depth");
+        }
+        for enc in &mut self.encoders {
+            enc.set_lsb_depth(depth)?;
+        }
+        Ok(())
+    }
+
+    /// The input precision of the first stream. libopus
+    /// `OPUS_GET_LSB_DEPTH`.
+    pub fn lsb_depth(&self) -> i32 {
+        self.encoders.first().map_or(24, |enc| enc.lsb_depth())
+    }
+
+    /// Turns discontinuous transmission (DTX) on or off on every stream.
+    /// libopus `OPUS_SET_DTX`. See [`OpusEncoder::set_dtx`]. Each stream
+    /// decides on its own: a stream it leaves out takes 1 byte in the
+    /// packet, 2 when it is not the last stream.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        for enc in &mut self.encoders {
+            enc.set_dtx(enabled);
+        }
+    }
+
+    /// Whether DTX is on in the first stream. libopus `OPUS_GET_DTX`.
+    ///
+    /// libopus has no `OPUS_GET_IN_DTX` for a multistream encoder.
+    /// [`OpusEncoder::in_dtx`] of each stream encoder
+    /// ([`stream_encoder`](Self::stream_encoder)) tells it per stream.
+    pub fn dtx(&self) -> bool {
+        self.encoders.first().is_some_and(|enc| enc.dtx())
     }
 
     /// Sets the expected packet loss, 0 to 100 percent, on every stream.

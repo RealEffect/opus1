@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use audiopus_sys as sys;
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
 use std::os::raw::c_int;
 
 /// The input rate under test.
@@ -240,6 +240,12 @@ pub struct Cfg {
     /// libopus only: complexity, when it must differ from `complexity`
     /// (complexity 6 and below turns libopus's tonality analysis off).
     pub c_complexity: Option<i32>,
+    /// opus1 only: `set_force_mode`. Since opus1 runs libopus's speech and
+    /// music analysis, it takes the same decisions as libopus without
+    /// forcing, and a test that forces libopus forces opus1 the same way.
+    pub rs_force_mode: Option<ForcedMode>,
+    /// opus1 only: `set_bandwidth`.
+    pub rs_bandwidth: Option<Bandwidth>,
 }
 
 impl Cfg {
@@ -259,6 +265,8 @@ impl Cfg {
             c_max_bandwidth: None,
             c_signal: None,
             c_complexity: None,
+            rs_force_mode: None,
+            rs_bandwidth: None,
         }
     }
 }
@@ -287,6 +295,10 @@ pub fn rs_encoder(cfg: &Cfg) -> OpusEncoder {
     enc.set_complexity(cfg.complexity).unwrap();
     enc.set_inband_fec(cfg.fec);
     enc.set_packet_loss_perc(cfg.loss).unwrap();
+    enc.set_force_mode(cfg.rs_force_mode);
+    if let Some(bandwidth) = cfg.rs_bandwidth {
+        enc.set_bandwidth(bandwidth);
+    }
     enc
 }
 

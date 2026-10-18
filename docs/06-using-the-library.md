@@ -82,6 +82,10 @@ These settings of `OpusEncoder` can be changed at any time. The next `encode` ca
 | `set_vbr(bool)` | `vbr()` | `true` | `false` gives every packet the same size (constant bitrate, CBR). `true` lets the size follow the signal (variable bitrate, VBR). |
 | `set_vbr_constraint(bool)` | `vbr_constraint()` | `true` | With VBR, `true` keeps the size of CELT-only packets close to the bitrate. `false` lets it follow the signal more freely. |
 | `set_inband_fec(bool)` | `inband_fec()` | `false` | `true` lets SILK and Hybrid packets carry a low-bitrate copy of the previous frame, so a lost packet can be rebuilt (in-band forward error correction, FEC). |
+| `set_inband_fec_mode(InbandFec)` | `inband_fec_mode()` | `InbandFec::Off` | The three values of libopus `OPUS_SET_INBAND_FEC`: `Off`, `On` (as `set_inband_fec(true)`) and `OnUnlessMusic`, which does not move the encoder to SILK for FEC when the input is clearly music. |
+| `set_signal(Signal)` | `signal()` | `Signal::Auto` | What the input is: `Voice`, `Music`, or `Auto` to let the speech and music analysis decide (from complexity 7 on). See below. |
+| `set_lsb_depth(i32)` | `lsb_depth()` | 24 | The precision of the input in bits, 8 to 24. Other values are refused. Samples below `2^-depth` count as silence, and the bandwidth detection ignores noise at that level. `encode_i16` uses at most 16. |
+| `set_dtx(bool)` | `dtx()`, `in_dtx()` | `false` | Discontinuous transmission (DTX): while the input is inactive, the encoder sends packets of one byte. `in_dtx()` says whether it is in such a pause. See below. |
 | `set_packet_loss_perc(i32)` | `packet_loss_perc()` | 0 | The packet loss the network is expected to have, 0 to 100 percent. Other values are refused. |
 | `set_expert_frame_duration(FrameDuration)` | `expert_frame_duration()` | `FrameDuration::Argument` | The duration of the frame each `encode` call codes. `Argument` takes the `frame_size` of the call. See [Frame duration](#frame-duration). |
 
@@ -91,7 +95,11 @@ The three `Application` values give the encoder a hint about the signal. They ma
 - `Application::Audio`: music and other sound. The encoder prefers CELT.
 - `Application::RestrictedLowDelay`: every packet is CELT-only, and the encoder leaves out the 4 ms that align CELT with SILK. Its delay (`lookahead()`) is 2.5 ms instead of 6.5 ms.
 
-For every packet the encoder chooses the mode, the audio bandwidth and the number of coded channels. It decides from the bitrate, the application, the sampling rate, the frame duration and the FEC settings. It uses the thresholds of libopus 1.6. libopus also runs a speech/music analysis at complexity 7 and above, for 16 to 48 kHz input. `opus1` does not have that analysis. So where libopus would look at the signal, the choice of `opus1` depends on the application alone. [The encoder](03-encoder.md) explains each step of the choice in its section 1.3.
+For every packet the encoder chooses the mode, the audio bandwidth and the number of coded channels. It decides from the bitrate, the application, the sampling rate, the frame duration and the FEC settings. It uses the thresholds of libopus 1.6.
+
+From complexity 7 on (the default is 9), for input at 16, 24 or 48 kHz, the encoder also runs the speech and music analysis of libopus. It estimates for every packet how likely the input is speech or music, and which bandwidth the input really uses. The choice of mode and bandwidth then follows the signal, as in libopus: music goes to CELT sooner, and a narrowband recording is coded narrower. The CELT encoder also uses the analysis for its bit allocation. Below complexity 7, and at 8 and 12 kHz, the choice depends on the application instead. `set_signal(Signal::Voice)` or `Signal::Music` tells the encoder what the input is when you know it better than the analysis. [The encoder](03-encoder.md) explains the analysis in its section 1.3 and each step of the choice in its section 1.4.
+
+With `set_dtx(true)` the encoder sends a packet of one byte instead of a coded frame while the input is inactive (silence or steady background noise), after 200 ms of it. After each 400 ms left out, one frame is coded again. The decoder conceals the one-byte packets like lost ones and plays comfort noise after SILK frames. This saves bits in calls with pauses.
 
 ### The default bitrate
 
@@ -215,20 +223,29 @@ Settings and the reason for each:
 - 16-32 kb/s: 24 kb/s is a good start. With in-band FEC at 10 % loss, use 32 kb/s to keep super-wideband. At 24 kb/s the encoder drops to SILK wideband to make room for FEC.
 - 20 ms frames for a conversation. A stream that is not interactive can use 40 or 60 ms frames. Fewer packets per second means less transport overhead per second.
 - Encode the 16-bit samples directly with `encode_i16`.
+- `Signal::Voice`: the input is speech. From complexity 7 on (the default is 9) the encoder otherwise estimates this from the input with its speech and music analysis, and may code a voice it takes for music as CELT.
 
 ```rust
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder, Signal};
 
 const RATE: i32 = 24_000;
 const FRAME: usize = 480; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
+encoder.set_signal(Signal::Voice);
 
-// One utterance from the TTS engine (a stand-in signal here). It does not
-// end on a frame boundary.
+// One utterance from the TTS engine (a stand-in signal here: a tone and
+// some noise, which reaches up to 12 kHz as speech does). It does not end
+// on a frame boundary.
+let mut seed = 1u32;
 let tts: Vec<i16> = (0..RATE as usize + 100)
-    .map(|i| (5000.0 * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / RATE as f32).sin()) as i16)
+    .map(|i| {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = (seed >> 16) as f32 / 32768.0 - 1.0;
+        let tone = (2.0 * std::f32::consts::PI * 150.0 * i as f32 / RATE as f32).sin();
+        (5000.0 * tone + 500.0 * noise) as i16
+    })
     .collect();
 
 let mut packets = Vec::new();
@@ -555,7 +572,7 @@ match decoder.set_osce_bwe(true) {
 
 ## 16-bit input and output
 
-- `encode_i16` takes interleaved `i16` samples. It converts every sample to float as `sample as f32 / 32768.0` and then encodes as `encode` does, so it writes the same packets.
+- `encode_i16` takes interleaved `i16` samples. It converts every sample to float as `sample as f32 / 32768.0` and then encodes as `encode` does, with an input precision of at most 16 bits, as libopus `opus_encode` does. So it writes the packets that `encode` writes for the same audio after `set_lsb_depth(16)`. The precision changes the silence threshold and the noise floor of the analysis, so from complexity 7 on `encode` with the default 24 bits can give other packets.
 - `decode_i16` writes interleaved `i16` samples, as libopus `opus_decode` does. It decodes to float first and then applies a soft clipper, which rounds off peaks beyond full scale instead of cutting them. The public function `opus1::pcm_soft_clip` does the same for float buffers.
 - `decode_fec_i16` is `decode_fec` with 16-bit output.
 
@@ -569,10 +586,12 @@ let pcm: Vec<i16> = (0..960).map(|i| ((i % 100) as i16 - 50) * 200).collect();
 let mut packet = [0u8; 1276];
 let len = encoder.encode_i16(&pcm, 960, &mut packet).unwrap();
 
-// The same audio as float gives the same packet.
+// The same audio as float, coded with the precision of 16-bit input,
+// gives the same packet.
 let pcm_f32: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
 let mut packet_f32 = [0u8; 1276];
 let mut encoder_f32 = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+encoder_f32.set_lsb_depth(16).unwrap();
 let len_f32 = encoder_f32.encode(&pcm_f32, 960, &mut packet_f32).unwrap();
 assert_eq!(packet[..len], packet_f32[..len_f32]);
 
@@ -615,6 +634,7 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 |---|---|---|
 | `std` | on | Links the standard library. On x86-64 it detects the vector instructions AVX and AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add) at run time. On aarch64 it detects FEAT_FCMA (the complex-number instructions of ARMv8.3) at run time where the target does not include them already. Without `std` the crate is `#![no_std]`. |
 | `heap` | on | Keeps the large codec state behind `Box`, so `OpusEncoder` and `OpusDecoder` themselves are small. Requires `std`. |
+| `analysis` | on | The speech and music analysis of the encoder. It adds about 28 KB of machine code and 24 KB of tables, most of them the weights of its network as `f32` (measured in a release build for aarch64-apple-darwin that encodes one frame). Without it the encoder decides at every complexity as at complexity 6, and `OpusEncoder` is 25,968 bytes smaller without `heap` (see below). It works with and without `std`. |
 | `libm` | off | Provides `sin`, `cos`, `sqrt` and the other float functions through the `libm` crate, a pure-Rust port of the musl C library's math functions. A build without `std` needs it. |
 | `deep-plc`, `osce`, `osce-bwe` | off | The neural network features of the decoder, with the weights of libopus 1.6.1 (see [Neural network features of the decoder](#neural-network-features-of-the-decoder)). Each one turns on the one before it, and `dnn`. |
 | `dnn` | off | The code that the neural network features share. The features above turn it on. |
@@ -622,31 +642,42 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 
 Three builds are possible:
 
-- Default (`std` and `heap`): no dependencies at run time.
-- `std` without `heap` (`default-features = false, features = ["std"]`): the codec state is stored inline, and the `multistream` module is available.
-- `#![no_std]` without `alloc` (`default-features = false, features = ["libm"]`): no allocator is needed at all. One dependency, `libm`. The `multistream` module is not available. A build with neither `std` nor `libm` stops with a compile error that names the missing feature.
+- Default (`std`, `heap` and `analysis`): no dependencies at run time.
+- `std` without `heap` (`default-features = false, features = ["std", "analysis"]`): the codec state is stored inline, and the `multistream` module is available.
+- `#![no_std]` without `alloc` (`default-features = false, features = ["libm", "analysis"]`): no allocator is needed at all. One dependency, `libm`. The `multistream` module is not available. A build with neither `std` nor `libm` stops with a compile error that names the missing feature.
 
 ```toml
 [dependencies.opus1]
 version = "0.2"
 default-features = false
-features = ["libm"]
+features = ["libm", "analysis"]
 ```
 
 The neural network features work in all three builds. Without `heap`, `DnnBlob::from_bytes` is missing, and a blob must live as long as the program (`DnnBlob::from_static`). Without `std`, the networks take `exp`, `log` and the other functions they need from the `libm` crate, whose last bits can differ from those of the platform's C library.
+
+Leave out `analysis` to save its code and tables and the 26 KB of its state, for example on a small processor that encodes at complexity 6 or below anyway.
 
 Without `std`, the x86-64 code uses AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"`. NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M) and `wasm32-unknown-unknown` when those targets are installed, then runs the tests without `std`.
 
 ### Size of the encoder and the decoder
 
-Measured with `size_of` and a counting allocator, release build, Rust 1.98 on aarch64-apple-darwin, on the branch of the neural network features (`next-dnn`). The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
+The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of the speech and music analysis), the decoder sizes on the branch of the neural network features (`next-dnn`). Both use `size_of` and a counting allocator, a release build, and Rust 1.98 on aarch64-apple-darwin. The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
 
-| Build | `OpusEncoder` | `OpusDecoder` |
-|---|---|---|
-| Default (`heap`) | 2,560 bytes, plus 115,352 bytes on the heap in 7 allocations (mono) or 125,280 bytes in 8 allocations (stereo) | 104 bytes, plus 105,760 bytes on the heap in 5 allocations |
-| Default with `osce-bwe` | the same | 112 bytes, plus 106,376 bytes on the heap in 6 allocations |
-| Without `heap` (with or without `std`) | 127,776 bytes | 59,736 bytes |
-| Without `heap`, with `osce-bwe` | the same | 72,320 bytes |
+| Build | `OpusEncoder` |
+|---|---|
+| Default (`heap`, `analysis`) | 2,656 bytes, plus 141,384 bytes on the heap in 8 allocations (mono) or 151,320 bytes in 9 allocations (stereo) |
+| `heap` without `analysis` | 2,648 bytes, plus 115,416 bytes in 7 allocations (mono) or 125,352 bytes in 8 allocations (stereo) |
+| Without `heap` (with or without `std`), with `analysis` | 153,904 bytes |
+| Without `heap` and without `analysis` | 127,936 bytes |
+
+| Build | `OpusDecoder` |
+|---|---|
+| Default (`heap`) | 104 bytes, plus 105,760 bytes on the heap in 5 allocations |
+| Default with `osce-bwe` | 112 bytes, plus 106,376 bytes on the heap in 6 allocations |
+| Without `heap` (with or without `std`) | 59,736 bytes |
+| Without `heap`, with `osce-bwe` | 72,320 bytes |
+
+The state of the speech and music analysis takes 25,968 bytes: 14,004 bytes as in libopus, plus the FFT buffer and the per-bin values that libopus keeps on the stack, and two caches: the square roots of the band energies and the distances between the stored blocks.
 
 With a neural network feature, the decoder holds references to the layer tables of the built-in networks, which every decoder shares. Without `heap`, it also has room for the layer tables of every group that a blob can load (12,584 bytes with `osce-bwe`). The weights themselves are not copied: the embedded ones stay in the program, and a blob's bytes stay in the blob.
 
@@ -796,10 +827,10 @@ assert!(worker.join().unwrap() > 0);
 ## Memory use
 
 - `encode`, `encode_i16`, `decode`, `decode_fec`, `decode_i16`, `decode_fec_i16` and the multistream `encode` and `decode` allocate nothing. All memory is taken when the encoder or decoder is built.
-- One exception in the default build: `OpusEncoder::reset_state` builds a fresh encoder with the same settings. So it allocates the 115,352 bytes (mono) or 125,280 bytes (stereo) of a new state and frees the old one. `OpusDecoder::reset_state` allocates nothing.
+- One exception in the default build: `OpusEncoder::reset_state` builds a fresh encoder with the same settings. So it allocates the 141,384 bytes (mono) or 151,320 bytes (stereo) of a new state and frees the old one. `OpusDecoder::reset_state` allocates nothing.
 - `DnnBlob::from_bytes` allocates a copy of the blob, and `OpusDecoder::set_dnn_blob` allocates the layer tables of each group of networks it loads.
 - The sizes of one encoder and one decoder are in [Size of the encoder and the decoder](#size-of-the-encoder-and-the-decoder).
-- A multistream encoder or decoder holds one `OpusEncoder` or `OpusDecoder` per stream. For 5.1 sound (4 streams) a `MultistreamEncoder` allocated 599,166 bytes and a `MultistreamDecoder` 469,536 bytes in the measurement above (472,032 bytes with `osce-bwe`). The repository's tests `multistream_enc_no_alloc` and `multistream_dec_no_alloc` check that they allocate nothing after they are built.
+- A multistream encoder or decoder holds one `OpusEncoder` or `OpusDecoder` per stream. For 5.1 sound (4 streams) a `MultistreamEncoder` allocated 703,694 bytes (with the analysis) and a `MultistreamDecoder` 469,536 bytes (472,032 bytes with `osce-bwe`) in the measurements above. The repository's tests `multistream_enc_no_alloc` and `multistream_dec_no_alloc` check that they allocate nothing after they are built.
 
 ## Build settings for speed
 

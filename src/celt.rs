@@ -1,3 +1,4 @@
+use crate::analysis::{AnalysisInfo, LEAK_BANDS};
 use crate::bands::{
     SPREAD_NONE, SPREAD_NORMAL, compute_band_energies, haar1, log2amp,
     normalise_bands, quant_all_bands, spreading_decision,
@@ -2026,6 +2027,9 @@ fn run_prefilter(
     // C `enabled`: when false, no new filter is searched for. The gain is
     // zero and only the previous frame's filter is faded out.
     enabled: bool,
+    // C `analysis->max_pitch_ratio` when the analysis is valid: the share
+    // of the energy below 6 kHz, which scales the gain.
+    max_pitch_ratio: Option<f32>,
 ) -> (bool, f32, usize) {
     let max_period = COMBFILTER_MAXPERIOD;
     let min_period = COMBFILTER_MINPERIOD;
@@ -2097,6 +2101,11 @@ fn run_prefilter(
     } else {
         gain1 = 0.0;
         pitch_index = COMBFILTER_MINPERIOD;
+    }
+    // C 1492-1495: the analysis lowers the gain of a signal with much
+    // energy above 6 kHz, where the comb filter does more harm than good.
+    if let Some(ratio) = max_pitch_ratio {
+        gain1 *= ratio;
     }
 
     let mut pf_threshold = 0.2f32;
@@ -2355,6 +2364,10 @@ pub struct CeltEncoder {
     /// Hybrid only (libopus `silk_info.signalType`): 0 no voice activity,
     /// 1 unvoiced, 2 voiced.
     silk_signal_type: i32,
+    /// libopus `st->analysis` (`CELT_SET_ANALYSIS`): the speech and music
+    /// analysis of the Opus layer for the next frame. Invalid unless the
+    /// Opus layer sets one; a reset makes it invalid again.
+    analysis: AnalysisInfo,
     /// libopus `st->lfe` (`OPUS_SET_LFE`): this encoder codes the
     /// low-frequency effects channel of a surround stream.
     lfe: bool,
@@ -2431,6 +2444,8 @@ fn alloc_trim_analysis(
     intensity: i32,
     surround_trim: f32,
     equiv_rate: i32,
+    // C `analysis->tonality_slope` when the analysis is valid.
+    tonality_slope: Option<f32>,
 ) -> i32 {
     let mut trim = 5.0f32;
     // "At low bitrate, reducing the trim seems to help."
@@ -2480,6 +2495,15 @@ fn alloc_trim_analysis(
     trim -= (-2.0f32).max(2.0f32.min((diff + 1.0) / 6.0));
     trim -= surround_trim;
     trim -= 2.0 * tf_estimate;
+    // C 935-939: a signal whose tonality rises towards the high bands gets
+    // a lower trim (more bits up there), within 2 steps either way. The
+    // limits are the ternaries `MIN16` and `MAX16`.
+    if let Some(slope) = tonality_slope {
+        let t = 2.0 * (slope + 0.05);
+        let t = if 2.0 < t { 2.0 } else { t };
+        let t = if -2.0 > t { -2.0 } else { t };
+        trim -= t;
+    }
 
     let trim_index = (trim + 0.5).floor() as i32;
     trim_index.clamp(0, 10)
@@ -2731,6 +2755,12 @@ struct VbrFrame {
     /// How far this frame's spectrum is above its slow average.
     temporal_vbr: f32,
     silence: bool,
+    /// C `st->analysis`: the speech and music analysis of the Opus layer,
+    /// or an invalid one.
+    analysis: AnalysisInfo,
+    /// C `pitch_change`: the pitch period moved by more than a quarter
+    /// while the pre-filter was strong (see `CeltEncoder::encode`).
+    pitch_change: bool,
 }
 
 /// The state of the VBR rate control, which keeps the average size of the
@@ -2850,9 +2880,9 @@ impl VbrState {
 }
 
 /// libopus `compute_vbr`: the bit target of a CELT-only frame under VBR, in
-/// 1/8 bit, from `base_target`. libopus also moves the target with the
-/// result of its tonality analysis (`analysis->valid`). opus1 has no such
-/// analysis, so those terms are left out.
+/// 1/8 bit, from `base_target`. With a valid analysis from the Opus layer,
+/// the target goes down for a frame of little activity, and up for a tonal
+/// one and for a change of pitch.
 fn compute_vbr(frame: &VbrFrame, base_target: i32) -> i32 {
     let mode = frame.mode;
     let lm = frame.lm as i32;
@@ -2874,6 +2904,11 @@ fn compute_vbr(frame: &VbrFrame, base_target: i32) -> i32 {
         coded_bins += mode.e_bands[idx] as i32 * (1 << lm);
     }
     let mut target = base_target;
+    let analysis = &frame.analysis;
+    // C 1630-1633. `activity < .4` compares in double precision.
+    if analysis.valid && (analysis.activity as f64) < 0.4 {
+        target -= ((coded_bins << BITRES) as f32 * (0.4 - analysis.activity)) as i32;
+    }
     if c == 2 {
         // "Stereo savings". A saving below 0.1 raises the target, as in
         // libopus.
@@ -2891,6 +2926,18 @@ fn compute_vbr(frame: &VbrFrame, base_target: i32) -> i32 {
     // libopus `SHL32(MULT16_32_Q15(tf_estimate-0.044, target), 1)`, which
     // is `(tf_estimate - 0.044) * target` in the float build.
     target += ((tf_estimate - 0.044) * target as f32) as i32;
+    // C 1655-1673: "Apply tonality boost", compensating for the average
+    // tonality. The limit is the ternary `MAX16`.
+    if analysis.valid && !lfe {
+        let above = analysis.tonality - 0.15;
+        let tonal = (if 0.0 > above { 0.0 } else { above }) - 0.12;
+        let bins = (coded_bins << BITRES) as f32;
+        let mut tonal_target = target + ((bins * 1.2) * tonal) as i32;
+        if frame.pitch_change {
+            tonal_target += (bins * 0.8) as i32;
+        }
+        target = tonal_target;
+    }
     if has_surround_mask && !lfe {
         let surround_target =
             target + (frame.surround_masking * coded_bins as f32 * (1 << BITRES) as f32) as i32;
@@ -2955,6 +3002,8 @@ fn dynalloc_analysis(
     spread_weight: &mut [i32],
     tone_freq: f32,
     toneishness: f32,
+    // C `analysis->leak_boost` when the analysis is valid.
+    leak_boost: Option<&[u8; LEAK_BANDS]>,
 ) -> Dynalloc {
     let nb = mode.nb_ebands;
     let e_bands = mode.e_bands;
@@ -3111,6 +3160,13 @@ fn dynalloc_analysis(
             if freq_bin >= e_bands[end] as i32 && end >= 2 {
                 follower[end - 1] += 2.0;
                 follower[end - 2] += 1.0;
+            }
+        }
+        // C 1223-1231: the analysis asks for more precision in bands that
+        // leak into their neighbours, in steps of 1/64.
+        if let Some(leak) = leak_boost {
+            for i in start..end.min(LEAK_BANDS) {
+                follower[i] += (1.0 / 64.0) * leak[i] as f32;
             }
         }
         for i in start..end {
@@ -4218,6 +4274,7 @@ impl CeltEncoder {
             loss_rate: 0,
             silk_offset: 0,
             silk_signal_type: 0,
+            analysis: AnalysisInfo::default(),
             lfe: false,
             energy_mask: None,
             stream_channels: channels,
@@ -4246,6 +4303,7 @@ impl CeltEncoder {
     ///   spectral average of the temporal VBR and the count of transient
     ///   frames to 0;
     /// - the SILK information to 0;
+    /// - the analysis of the Opus layer becomes invalid;
     /// - the energy mask is removed.
     ///
     /// It then sets the decision states to their start values: spreading
@@ -4270,6 +4328,7 @@ impl CeltEncoder {
         self.rng = 0;
         self.silk_signal_type = 0;
         self.silk_offset = 0;
+        self.analysis = AnalysisInfo::default();
         self.preemph_mem.fill(0.0);
         self.vbr_state = VbrState::default();
         self.overlap_max = 0.0;
@@ -4389,6 +4448,20 @@ impl CeltEncoder {
     pub fn set_silk_info(&mut self, signal_type: i32, offset_q10: i32) {
         self.silk_signal_type = signal_type;
         self.silk_offset = offset_q10;
+    }
+    /// libopus `CELT_SET_ANALYSIS`: the result of the speech and music
+    /// analysis for the next frames. The Opus layer sets it before every
+    /// CELT or Hybrid frame. When `info.valid` is set, the encoder reads:
+    ///
+    /// - `tonality_slope` for the allocation trim,
+    /// - `leak_boost` for the dynamic allocation,
+    /// - `max_pitch_ratio` for the gain of the pitch pre-filter,
+    /// - `tonality` and `activity` for the VBR target,
+    /// - `bandwidth` for the highest band the allocation may skip to.
+    ///
+    /// The value stays until the next call or [`reset_state`](Self::reset_state).
+    pub fn set_analysis(&mut self, info: &AnalysisInfo) {
+        self.analysis = *info;
     }
     /// Low-frequency effects mode (libopus `OPUS_SET_LFE`, celt_encoder.c).
     /// Use it for the LFE channel of a surround stream, which is mono.
@@ -4679,6 +4752,7 @@ impl CeltEncoder {
                 toneishness,
                 self.complexity,
                 pf_enabled,
+                self.analysis.valid.then_some(self.analysis.max_pitch_ratio),
             )
         } else {
             // Nothing to search for and nothing to fade out: `run_prefilter`
@@ -4693,6 +4767,18 @@ impl CeltEncoder {
                 );
             }
             (false, 0.0f32, COMBFILTER_MINPERIOD)
+        };
+        // C 2042-2044: the pitch period jumped by more than a quarter while
+        // the filter of this or the last frame was strong. Only the VBR
+        // target reads it, and only with a valid analysis. libopus compares
+        // with the old period after `run_prefilter` raised it to at least
+        // `COMBFILTER_MINPERIOD`, and in double precision.
+        let pitch_change = {
+            let old_period = self.prefilter_period.max(COMBFILTER_MINPERIOD) as f64;
+            let pitch = pitch_index as f64;
+            (gain1 > 0.4 || self.prefilter_gain > 0.4)
+                && (!self.analysis.valid || self.analysis.tonality as f64 > 0.3)
+                && (pitch > 1.26 * old_period || pitch < 0.79 * old_period)
         };
 
         // Save the prefiltered overlap for the next frame (C run_prefilter:
@@ -4905,6 +4991,7 @@ impl CeltEncoder {
             &mut spread_weight,
             tone_freq,
             toneishness,
+            self.analysis.valid.then_some(&self.analysis.leak_boost),
         );
 
         self.w_tf_res[..nb_ebands].fill(0);
@@ -5128,6 +5215,7 @@ impl CeltEncoder {
                     self.intensity,
                     surround_trim,
                     equiv_rate,
+                    self.analysis.valid.then_some(self.analysis.tonality_slope),
                 );
             }
             rc.encode_icdf(alloc_trim, &TRIM_ICDF, 7);
@@ -5155,6 +5243,8 @@ impl CeltEncoder {
                 surround_masking,
                 temporal_vbr,
                 silence,
+                analysis: self.analysis,
+                pitch_change,
             };
             nb_compressed_bytes =
                 self.vbr_state
@@ -5195,11 +5285,30 @@ impl CeltEncoder {
         };
         alloc_bits -= anti_collapse_rsv;
 
-        // C 2620-2633: `signalBandwidth`, the last band the allocator may
-        // keep when it skips bands from the top: `end - 1` (libopus lowers
-        // it with its tonality analysis, which opus1 does not have). LFE
-        // keeps bands 0 and 1 only.
-        let signal_bandwidth = if self.lfe { 1 } else { end as i32 - 1 };
+        // C 2603-2624: `signalBandwidth`, the last band the allocator may
+        // keep when it skips bands from the top: `end - 1`. With a valid
+        // analysis, the bandwidth the analysis found, but at least a band
+        // that grows with the rate per coded channel. LFE keeps bands 0 and
+        // 1 only.
+        let mut signal_bandwidth = end as i32 - 1;
+        if self.analysis.valid {
+            let c = channels as i32;
+            let min_bandwidth = if equiv_rate < 32000 * c {
+                13
+            } else if equiv_rate < 48000 * c {
+                16
+            } else if equiv_rate < 60000 * c {
+                18
+            } else if equiv_rate < 80000 * c {
+                19
+            } else {
+                20
+            };
+            signal_bandwidth = self.analysis.bandwidth.max(min_bandwidth);
+        }
+        if self.lfe {
+            signal_bandwidth = 1;
+        }
         let coded_bands = clt_compute_allocation(
             mode,
             start_band,
@@ -8670,6 +8779,7 @@ mod tests {
             0.0,
             9,
             true,
+            None,
         );
         assert!(!pf_on && gain == 0.0, "expected a cancelled filter");
         let body = &in_buf[overlap..];

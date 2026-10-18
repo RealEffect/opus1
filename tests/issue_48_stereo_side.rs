@@ -16,7 +16,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, OpusDecoder, OpusEncoder, Signal};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -293,6 +293,17 @@ fn run(case: &Case) -> Measured {
     // A stereo stream, as libopus below: both encoders would otherwise code
     // the input as mono below ~18 kb/s.
     rs_enc.set_force_channels(Some(CH)).unwrap();
+    // The signal type and the bandwidth, as for libopus below: opus1 runs
+    // the speech and music analysis as libopus does, which would read the
+    // tones as music and lower the bandwidth of signals without high
+    // frequencies.
+    rs_enc.set_signal(Signal::Voice);
+    rs_enc.set_bandwidth(match case.bandwidth {
+        CBw::Wideband => Bandwidth::Wideband,
+        CBw::Superwideband => Bandwidth::Superwideband,
+        CBw::Fullband => Bandwidth::Fullband,
+        other => panic!("no such bandwidth in this test: {other:?}"),
+    });
 
     // libopus at opus1's settings, pinned to voice and to a stereo stream
     // (below ~18 kb/s it would otherwise switch to mono).

@@ -4,8 +4,9 @@
 //! rules of `opus_encode_native` give what libopus gives.
 //!
 //! The reference is the C libopus encoder, fed the same input with the same
-//! settings and the same buffer, at a complexity below 7, where libopus
-//! decides without the speech/music analysis that opus1 does not have.
+//! settings and the same buffer, at a complexity below 7, where both
+//! encoders decide without the speech/music analysis (both run it from
+//! complexity 7 on; `core_analysis_libopus.rs` compares that).
 //! The C encoder is told to keep stereo input stereo
 //! (`OPUS_SET_FORCE_CHANNELS(2)`), because opus1 does not code stereo
 //! input as mono yet.
