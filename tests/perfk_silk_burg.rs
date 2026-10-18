@@ -4,10 +4,15 @@
 //! The libopus that the tests link is the floating-point build, which does
 //! not contain this function. The reference values in
 //! `perfk_silk_burg.expected` were therefore computed once by the C function
-//! itself: the libopus 1.6.1 source compiled with `FIXED_POINT`, called on
-//! the signals that `Generator` below produces. The generator uses integers
-//! only, so the C program and this test produce the same samples; each row
-//! carries a checksum of its input to make sure of that.
+//! itself: the source of the official libopus 1.6.1 release compiled with
+//! `FIXED_POINT`, called on the signals that `Generator` below produces. The
+//! generator uses integers only, so the C program and this test produce the
+//! same samples; each row carries a checksum of its input to make sure of
+//! that.
+//!
+//! libopus's main branch adds 1 to the frame energy (line 72 of
+//! burg_modified_FIX.c). Its results differ from the 1.6.1 release in 622
+//! of the 1000 cases. opus1 follows the release.
 //!
 //! The function is fixed-point: the residual energy, its Q value and every
 //! coefficient must be identical.

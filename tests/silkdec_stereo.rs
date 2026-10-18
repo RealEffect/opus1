@@ -75,6 +75,7 @@ fn stream(bandwidth: i32, frame_ms: usize, dip: bool, fec_loss: Option<i32>) -> 
     packets
 }
 
+#[allow(clippy::type_complexity)]
 const LOSSES: [(&str, fn(usize) -> bool); 4] = [
     ("no loss", |_| false),
     ("first packet lost", |i| i == 0),

@@ -891,3 +891,62 @@ fn lookahead_matches_libopus() {
         }
     }
 }
+
+/// The voice activity flag of SILK frames of digital silence is libopus's.
+///
+/// libopus tells SILK that a frame of digital silence has no voice
+/// activity (`is_digital_silence`, opus_encoder.c:1246 and 1909-1914), and
+/// SILK then clears the flag. SILK's voice activity detector is the same
+/// integer code in the float build of libopus, so the flag can be compared
+/// with the linked library even where the rest of a SILK frame differs.
+/// The flag is the first bit after the TOC byte of a 20 ms SILK-only
+/// packet. Before, opus1 set it in 5 to 11 silent frames per stream where
+/// libopus did not.
+#[test]
+fn silk_voice_activity_flag_of_digital_silence_is_libopus() {
+    let mut seed = 0x6c07_8965_d1b5_4a32u64;
+    let mut pick = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 16) as usize % n
+    };
+    // A debug build (the `no_std` check runs one) codes one sampling rate.
+    let debug = cfg!(debug_assertions);
+    let seconds = if debug { 3.0 } else { 12.0 };
+    let rates: &[usize] = if debug { &[16000] } else { &[8000, 16000, 48000] };
+    for &rate in rates {
+        // Speech in stretches of 150 to 500 ms, with digital silence of
+        // 100 to 900 ms between them.
+        let mut input = speech_fullband(rate, seconds);
+        let (mut pos, mut silent) = (0, false);
+        while pos < input.len() {
+            let ms = if silent { 100 + pick(801) } else { 150 + pick(351) };
+            let len = (rate * ms / 1000).min(input.len() - pos);
+            if silent {
+                input[pos..pos + len].fill(0.0);
+            }
+            silent = !silent;
+            pos += len;
+        }
+        for (name, c_app, app) in [("VoIP", APP_VOIP, Application::Voip), ("audio", APP_AUDIO, Application::Audio)] {
+            let frame = rate / 50;
+            let mut enc = OpusEncoder::new(rate as i32, 1, app).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+            enc.set_force_mode(Some(ForcedMode::SilkOnly));
+            let mut c_enc = CEncoder::new(rate, 1, c_app);
+            c_enc.bitrate(20000).force_mode(MODE_SILK);
+            let mut buf = vec![0u8; 1500];
+            let mut silent_frames = 0;
+            for (i, pcm) in input.chunks_exact(frame).enumerate() {
+                enc.encode(pcm, frame, &mut buf).unwrap();
+                let c_packet = c_enc.try_encode(pcm, frame, 1500).unwrap();
+                if pcm.iter().all(|&v| v == 0.0) {
+                    silent_frames += 1;
+                    assert_eq!(buf[1] >> 7, c_packet[1] >> 7, "{rate} Hz {name}: voice activity flag of packet {i}");
+                }
+            }
+            assert!(silent_frames > 50, "{rate} Hz {name}: {silent_frames} silent frames");
+        }
+    }
+}

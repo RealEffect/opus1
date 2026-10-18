@@ -13,6 +13,7 @@ mod silkdec_common;
 use silkdec_common::*;
 
 /// The loss patterns every stream is decoded with.
+#[allow(clippy::type_complexity)]
 const PATTERNS: [(&str, fn(usize) -> bool); 4] = [
     ("first packet lost", |i| i == 0),
     ("one packet in seven lost", |i| i % 7 == 3),

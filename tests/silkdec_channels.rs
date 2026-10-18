@@ -21,6 +21,7 @@
 mod silkdec_common;
 use silkdec_common::*;
 
+#[allow(clippy::type_complexity)]
 const LOSSES: [(&str, fn(usize) -> bool); 4] = [
     ("no loss", |_| false),
     ("first packet lost", |i| i == 0),
@@ -91,7 +92,7 @@ fn mono_stream_in_a_stereo_decoder_matches_libopus() {
 #[test]
 fn stereo_stream_in_a_mono_decoder_matches_libopus() {
     let mut pcm = stereo_pcm();
-    for frame in pcm[..2 * 16000].chunks_exact_mut(2) {
+    for frame in pcm[..2 * 16000].as_chunks_mut::<2>().0 {
         frame[1] = frame[0];
     }
     let mut failures = Vec::new();
@@ -124,7 +125,7 @@ fn encoder_switching_stream(bandwidth: i32, frame_ms: usize, period_ms: usize) -
     enc.fec(20);
     let mut packets = Vec::new();
     for (i, frame) in pcm.chunks_exact(16 * frame_ms * 2).enumerate() {
-        let stereo = (i * frame_ms / period_ms) % 2 == 0;
+        let stereo = (i * frame_ms / period_ms).is_multiple_of(2);
         enc.force_channels(if stereo { 2 } else { 1 });
         packets.push(enc.encode(frame));
     }
@@ -212,7 +213,7 @@ fn abrupt_switches_match_libopus() {
             // next one. Without FEC both are concealed. With FEC the first
             // one is concealed with the old channel count and the second
             // one is recovered from a packet with the new one.
-            let around_switch = |i: usize| i % SEGMENT == SEGMENT - 1 || (i % SEGMENT == 0 && i > 0);
+            let around_switch = |i: usize| i % SEGMENT == SEGMENT - 1 || (i.is_multiple_of(SEGMENT) && i > 0);
             let last_before = |i: usize| i % SEGMENT == SEGMENT - 1;
             for (pattern, lost, fec) in [
                 ("both packets at a switch lost", &around_switch as &dyn Fn(usize) -> bool, false),

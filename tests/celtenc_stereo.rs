@@ -84,3 +84,58 @@ fn frames_of_2_5_ms_are_coded_as_mid_and_side() {
     assert!(dual(&c) * 2 > c.len());
     assert!(dual(&rs) * 2 > rs.len());
 }
+
+/// Stereo input whose right channel is the left one times a constant (one
+/// source panned to one side). Every band then has the angle 0, and libopus
+/// codes it from the mix of `intensity_stereo` (celt/bands.c, lines
+/// 379-403). Tones from -134 to -20 dBFS, 128 to 750 kb/s per channel,
+/// frames of 2.5 to 20 ms, constant and variable bitrate: every packet is
+/// libopus's.
+///
+/// Before `intensity_stereo` added libopus's `EPSILON` terms and fused its
+/// products as clang does, 30 of these 103,500 packets differed, in 4
+/// streams (at -110 dBFS and at -40 dBFS).
+#[test]
+fn a_source_panned_to_one_side_is_coded_as_libopus_codes_it() {
+    let fs = 48_000usize;
+    // A debug build (the `no_std` check runs one) codes the levels and
+    // settings where packets differed before, and fewer of the others.
+    let debug = cfg!(debug_assertions);
+    let levels: &[f64] = if debug { &[-110.0, -40.0] } else { &[-134.0, -110.0, -90.0, -70.0, -40.0, -20.0] };
+    let tones: &[(f64, f32)] = if debug { &[(440.0, 0.5), (1000.0, 0.25)] } else { &[(440.0, 0.5), (1000.0, 0.25), (3000.0, 0.7)] };
+    let frames: &[usize] = if debug { &[10, 40] } else { &[5, 10, 20, 40] };
+    let rates: &[i32] = if debug { &[128, 510] } else { &[128, 256, 510, 750] };
+    let mut packets = 0;
+    for &db in levels {
+        for &(freq, gain_right) in tones {
+            let amp = 10f64.powf(db / 20.0);
+            let pcm: Vec<f32> = (0..fs)
+                .flat_map(|i| {
+                    let left = (amp * (std::f64::consts::TAU * freq * i as f64 / fs as f64).sin()) as f32;
+                    [left, gain_right * left]
+                })
+                .collect();
+            for &frame_ms_x2 in frames {
+                for &kbps in rates {
+                    for vbr in [false, true] {
+                        let mut st = Stream::new(fs, 2, frame_ms_x2, kbps * 1000 * 2);
+                        st.vbr = vbr;
+                        if !vbr && st.cbr_bytes() > 1275 {
+                            continue;
+                        }
+                        let (c, rs) = (st.enc_c(&pcm), st.enc_rs(&pcm));
+                        for (k, (a, b)) in c.iter().zip(&rs).enumerate() {
+                            assert!(
+                                a == b,
+                                "{db} dBFS, {freq} Hz, right = {gain_right} x left, frame {frame_ms_x2}/2 ms, \
+                                 {kbps} kb/s per channel, vbr {vbr}: frame {k} differs"
+                            );
+                        }
+                        packets += c.len();
+                    }
+                }
+            }
+        }
+    }
+    println!("{packets} packets, all equal to libopus's");
+}

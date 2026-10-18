@@ -42,7 +42,7 @@ fn encode_symbols(rc: &mut RangeCoder, r: &mut Rng, n: usize) {
     for _ in 0..n {
         match r.next() % 4 {
             0 => rc.encode_icdf((r.next() % 8) as i32, &ICDF8, 8),
-            1 => rc.encode_bit_logp(r.next() % 8 == 0, 3),
+            1 => rc.encode_bit_logp(r.next().is_multiple_of(8), 3),
             2 => {
                 let ft = 2 + r.next() % 1000;
                 let fl = r.next() % ft;

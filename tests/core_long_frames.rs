@@ -661,3 +661,60 @@ fn maximum_bitrate_with_cbr_fills_the_buffer_as_libopus_does() {
         }
     }
 }
+
+#[test]
+fn silence_flag_of_stereo_input_coded_as_mono_is_libopus() {
+    // A stereo encoder with a small buffer codes one channel. Its CELT
+    // encoder then sets the silence flag from the first half of each frame
+    // only, as libopus does (see `silence_flag_of_stereo_input_coded_as_mono`
+    // in celtenc_rate_rules.rs). The input passes the DC filter of the Opus
+    // layer, whose output takes about 0.6 s to decay below the silence
+    // threshold of 2^-24 after a signal stops. So the signal is speech in
+    // stretches of 50 to 400 ms, with digital silence of 0.8 to 1.6 s
+    // between them. It is coded as CELT-only at 8 kHz, where libopus runs
+    // no speech and music analysis. Every packet is libopus's. With a
+    // 100-byte buffer the stream codes two channels; those packets check
+    // the stereo frames of the decaying DC tail (see core_lowdelay.rs).
+    let mut seed = 0x6c07_8965_d1b5_4a32u64;
+    let mut pick = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 16) as usize % n
+    };
+    let fs = 8000;
+    let seconds = if cfg!(debug_assertions) { 4.0 } else { 12.0 };
+    let mut input = signal(fs, 2, seconds);
+    let samples = input.len() / 2;
+    let (mut pos, mut silent) = (0, false);
+    while pos < samples {
+        let ms = if silent { 800 + pick(801) } else { 50 + pick(351) };
+        let len = (fs * ms / 1000).min(samples - pos);
+        if silent {
+            input[2 * pos..2 * (pos + len)].fill(0.0);
+        }
+        silent = !silent;
+        pos += len;
+    }
+    let mut packets = 0;
+    for ms in [10, 20, 80, 100, 120] {
+        for out_len in [10, 25, 50, 100] {
+            let frame = fs * ms / 1000;
+            let mut rs = OpusEncoder::new(fs as i32, 2, Application::RestrictedLowDelay).unwrap();
+            rs.set_bitrate(Bitrate::BitsPerSecond(510_000)).unwrap();
+            rs.set_complexity(9).unwrap();
+            let mut c = CEncoder::new(fs, 2, APP_LOWDELAY);
+            c.bitrate(510_000).vbr(true).complexity(9);
+            let mut buf = vec![0u8; out_len];
+            for (k, pcm) in input.chunks_exact(frame * 2).enumerate() {
+                let label = format!("{ms} ms, {out_len}-byte buffer: packet {k}");
+                let n = rs.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("{label}: {e}"));
+                let c_packet = c.try_encode(pcm, frame, out_len).unwrap();
+                assert_eq!(&buf[..n], &c_packet[..], "{label}");
+                assert_eq!(rs.final_range(), c.final_range(), "{label}");
+                packets += 1;
+            }
+        }
+    }
+    println!("{packets} packets compared");
+}

@@ -389,3 +389,78 @@ fn short_vbr_frames_stay_below_510_kbps() {
         assert!(same * 100 >= c.len() * 99);
     }
 }
+
+/// The decaying output of the Opus layer's DC filter, after a signal stops.
+///
+/// The filter (libopus `dc_reject`, 3 Hz) keeps an estimate of the DC offset
+/// of each channel. When the input becomes digital silence, the filter's
+/// output is minus that estimate, which decays by 0.24 % per sample at
+/// 8 kHz. It takes about half a second to fall below the silence threshold
+/// of 2^-24. In that time the CELT encoder codes a signal with a peak level
+/// of about 1e-3 down to 1e-7, whose two channels are scaled copies of each
+/// other. At such levels the `EPSILON` terms of libopus matter:
+///
+/// - in the transient analysis, which adds `EPSILON` (1e-15) to the mean
+///   energy of the high-passed signal and to each value of its envelope;
+/// - in `intensity_stereo` (see celtenc_bands_libopus.rs).
+///
+/// Every packet must be libopus's: mono and stereo input, one or two coded
+/// channels, 8, 16 and 48 kHz, frames of 2.5 to 20 ms, constant and
+/// variable bitrate.
+#[test]
+fn the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it() {
+    use opus1::internals::hp_cutoff::dc_reject_float;
+    // A debug build (the `no_std` check runs one) codes a part of the matrix.
+    let debug = cfg!(debug_assertions);
+    let rates: &[usize] = if debug { &[48_000, 8_000] } else { &[48_000, 16_000, 8_000] };
+    let durations: &[usize] = if debug { &[10, 40] } else { &[5, 10, 20, 40] };
+    let settings: &[(i32, bool)] =
+        if debug { &[(64_000, false), (48_000, true)] } else { &[(24_000, false), (64_000, false), (160_000, false), (48_000, true)] };
+    let mut frames = 0;
+    for &fs in rates {
+        // 0.3 s of music, then 1.7 s of digital silence, twice.
+        let mut left = music(fs, 4, 0);
+        let mut right = music(fs, 4, 1);
+        for x in [&mut left, &mut right] {
+            for (i, v) in x.iter_mut().enumerate() {
+                if i % (2 * fs) >= 3 * fs / 10 {
+                    *v = 0.0;
+                }
+            }
+        }
+        for channels in [1usize, 2] {
+            let raw: Vec<f32> = if channels == 1 {
+                left.clone()
+            } else {
+                left.iter().zip(&right).flat_map(|(&l, &r)| [l, r]).collect()
+            };
+            for &frame_ms_x2 in durations {
+                // The input as the Opus layer gives it to CELT.
+                let frame = fs * frame_ms_x2 / 2000;
+                let mut pcm = vec![0f32; raw.len()];
+                let mut mem = [0f32; 4];
+                for (i, o) in raw.chunks(frame * channels).zip(pcm.chunks_mut(frame * channels)) {
+                    dc_reject_float(i, 3, o, &mut mem, frame, channels, fs as i32);
+                }
+                for stream_channels in 1..=channels {
+                    for &(bitrate, vbr) in settings {
+                        let mut st = Stream::new(fs, channels, frame_ms_x2, bitrate * channels as i32);
+                        st.stream_channels = stream_channels;
+                        st.vbr = vbr;
+                        st.complexity = 5;
+                        let (c, rs) = (st.enc_c(&pcm), st.enc_rs(&pcm));
+                        for (k, (a, b)) in c.iter().zip(&rs).enumerate() {
+                            assert!(
+                                a == b,
+                                "{fs} Hz, {channels} ch coded as {stream_channels}, frame {frame_ms_x2}/2 ms, \
+                                 {bitrate} b/s per channel, vbr {vbr}: frame {k} differs"
+                            );
+                        }
+                        frames += c.len();
+                    }
+                }
+            }
+        }
+    }
+    println!("{frames} frames, all equal to libopus's");
+}

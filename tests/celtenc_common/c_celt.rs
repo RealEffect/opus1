@@ -338,7 +338,7 @@ impl Stream {
         let reference: Vec<f32> = if self.stream_channels < self.channels {
             // The stream carries the mean of the two channels, and the
             // decoder plays it on both.
-            pcm.chunks_exact(2)
+            pcm.as_chunks::<2>().0.iter()
                 .flat_map(|s| {
                     let m = 0.5 * (s[0] + s[1]);
                     [m, m]

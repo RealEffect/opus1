@@ -372,6 +372,7 @@ The module is a port of the framing code of libopus 1.6. It reads the frames out
 | `nb_frames(data)` | `opus_packet_get_nb_frames` | The number of frames the packet says it holds. |
 | `nb_samples(data, sampling_rate)` | `opus_packet_get_nb_samples` | The duration of the packet in samples per channel. |
 | `samples_per_frame(toc, sampling_rate)` | `opus_packet_get_samples_per_frame` | The duration of one frame in samples per channel. |
+| `has_lbrr(data)` | `opus_packet_has_lbrr` | Whether the first frame carries a low-bitrate copy (LBRR) of the frame before it, for in-band FEC. `false` for CELT-only packets. |
 | `multistream_validate(data, nb_streams, sampling_rate)` | `opus_multistream_packet_validate` | Checks a multistream packet. Returns its duration. |
 | `multistream_pad(data, len, new_len, nb_streams)` | `opus_multistream_packet_pad` | Pads a multistream packet in place. The padding goes into the last stream. |
 

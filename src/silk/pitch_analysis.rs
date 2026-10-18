@@ -1096,7 +1096,7 @@ mod div_tests {
                     if value == 0 { 1 } else { value }
                 })
                 .collect();
-            check(&a, &b, (round % 25) as i32);
+            check(&a, &b, round % 25);
         }
     }
 

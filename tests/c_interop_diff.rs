@@ -50,8 +50,10 @@ fn load_ref(path_prefix: &str, sampling_rate: i32, channels: usize) -> Option<Re
     }
 
     let ref_pcm: Vec<f32> = pcm_raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
         .collect();
 
     Some(RefData {

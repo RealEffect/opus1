@@ -83,7 +83,7 @@ fn libopus_stream_with_changing_bitrate_decodes_like_libopus() {
     let plan = [9000, 40000, 13000, 28000, 64000, 16000, 48000, 11000, 36000, 20000, 80000, 24000];
     let mut enc = CEnc::voip(24000, 1);
     let mut packets = Vec::new();
-    for (i, frame) in pcm.chunks_exact(480).enumerate() {
+    for (i, frame) in pcm.as_chunks::<480>().0.iter().enumerate() {
         // A new bitrate every 250 ms.
         enc.bitrate(plan[(i * 20 / 250) % plan.len()]);
         packets.push(enc.encode(frame));
@@ -107,7 +107,7 @@ fn own_encoder_stream_decodes_like_libopus() {
             let mut out_f = vec![0u8; 4000];
             let mut out_i = vec![0u8; 4000];
             let mut packets = Vec::new();
-            for (f, i) in pcm_f32.chunks_exact(480).zip(pcm_i16.chunks_exact(480)) {
+            for (f, i) in pcm_f32.as_chunks::<480>().0.iter().zip(pcm_i16.as_chunks::<480>().0) {
                 let n = enc_f.encode(f, 480, &mut out_f).unwrap();
                 let m = enc_i.encode_i16(i, 480, &mut out_i).unwrap();
                 assert_eq!(out_f[..n], out_i[..m], "{signal}, {bitrate} b/s: encode and encode_i16 differ");

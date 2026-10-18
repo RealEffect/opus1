@@ -364,7 +364,7 @@ fn a_changing_energy_mask_moves_celt_packet_sizes_like_libopus() {
         let frame = stream.rate * stream.frame_ms / 1000;
         for (deep, shallow) in [(-2.0f32, 0.0f32), (-1.0, 0.0), (-2.0, -0.5), (-0.5, 0.25)] {
             const PERIOD: usize = 8;
-            let is_deep = |i: usize| (i / PERIOD) % 2 == 0;
+            let is_deep = |i: usize| (i / PERIOD).is_multiple_of(2);
             let mut c_enc = CEncoder::new(stream.rate, stream.channels, APP_AUDIO);
             c_enc.force_mode(stream.mode.1).bandwidth(stream.bandwidth.1).bitrate(stream.bitrate);
             let mut enc = OpusEncoder::new(stream.rate as i32, stream.channels, Application::Audio).unwrap();
@@ -470,7 +470,7 @@ fn a_mask_cannot_make_a_hybrid_stream_run_away() {
         enc.set_energy_mask(Some(&[mask_value; 21]));
         let mut dec = CDecoder::new(48000, 1);
         let mut buf = vec![0u8; 4000];
-        for (i, f) in pcm.chunks_exact(960).enumerate() {
+        for (i, f) in pcm.as_chunks::<960>().0.iter().enumerate() {
             let n = enc.encode(f, 960, &mut buf).unwrap();
             assert_eq!(toc(buf[0]).mode, "Hybrid", "packet {i}");
             dec.decode(Some(&buf[..n]), 960, false).unwrap_or_else(|e| panic!("packet {i}: libopus error {e}"));

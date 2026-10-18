@@ -35,7 +35,7 @@ pub fn load_speech_16k() -> Vec<f32> {
         if id == b"data" {
             let data = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
             return data
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                 .collect();
         }
@@ -168,7 +168,7 @@ pub fn multitone(rate: usize, n: usize) -> Vec<f32> {
             let step = (t / 0.25) as usize;
             let mut v = 0.0;
             for (k, base) in notes.iter().enumerate() {
-                if (step + k) % 3 == 0 {
+                if (step + k).is_multiple_of(3) {
                     continue;
                 }
                 for h in 1..=4 {
@@ -655,6 +655,7 @@ impl std::fmt::Display for Cmp {
 /// SNR of `test` against `reference` after shifting `test` by the best lag
 /// within +-`max_lag` samples. Used for end-to-end quality against the
 /// original input, where the codec delay is not known in advance.
+#[allow(clippy::needless_range_loop)]
 pub fn aligned_snr(reference: &[f32], test: &[f32], max_lag: isize) -> (f64, isize) {
     let n = reference.len().min(test.len());
     let mut best = (f64::NEG_INFINITY, 0isize);

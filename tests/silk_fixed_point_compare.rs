@@ -4,11 +4,10 @@
 // constant bitrate, opus_encode with 16-bit input).
 // Each config encodes 20 frames of 20ms (fs/50 samples per frame).
 //
-// All 280 packets are the ones the libopus 1.6.1 source gives. The packets
-// were first recorded from a source without line 72 of
-// silk/fixed/burg_modified_FIX.c as it is in 1.6 (it adds 1 to the frame
-// energy). That line changes 16 of the 20 packets of test_wb_c10 and none
-// of the other streams; those 16 were recorded again from 1.6.1.
+// All 280 packets are the ones the source of the official libopus 1.6.1
+// release gives. libopus's main branch adds 1 to the frame energy of the
+// Burg analysis (line 72 of silk/fixed/burg_modified_FIX.c). With that line,
+// packets 4 to 19 of test_wb_c10 differ, and no packet of the other streams.
 
 fn gen_pcm(fs: i32, num_samples: usize) -> Vec<f32> {
     // Use integer phase reduction to keep the sin() argument in [0, 2π],
@@ -473,22 +472,22 @@ fn test_wb_c10() {
             "4b01b149822404fc7c7f3ae4393128af6fa218cd73d0553aa7ae9914e06246360f5c4ca94b2ae6c4d4aaecd67b1f8b3bcac0",
             "4b41039d69cc09b4200ed32ecb1c6933e73387e202fa8b1fd7d8a9973a8bde062c13eb279af566bd998bf84d224ab0000000",
             "4b41049bf5f586e105ddf9422cfe289acf2ac92ec1d0119ab7879ec1c7caf95b989b58d60424a8203a8f690fcc4200000000",
-            "4b41029ab2df7329206569542a9cbf5287de87ae2c78912a3641936cbbc3278a4a19afaa11642e3f704976b8de14f4780000",
-            "4b41009aafb9fc3b89ce1b4ce3c2aba5f12f8a93f5043eecf1bae718f599c3ab25331af8bcf794755a5c034445f715c2c9b0",
-            "4b41049a3aa1f1eeea9c8695b6cd367451a1dfe6a17dfac15e2173f130fe1086b53212f9dd85af58b971b5a5e89800000000",
-            "4b41059a3a9f7329206ac27dc41f4c87b0ba0cc4883f3b5b3cc8a02b230ce53a7e084b1e28eda8246ba8824d6f0000000000",
-            "489a3779fc3b89ce00946d799f8ad1eb24aa34f9bb6f5ce21969bc9efcf9dd322a3a2d7eebd0ba97e4b3b041e861e920c25a",
-            "489ad84c9a33dca0ea61ebccfb70db1d869c82db28ce7fbac563d0073c4f9940fb54982c42ebe01f171a53e1bc89bc1b6596",
-            "4b41029ba039fc3b89ce1b4cea41880a771a18782988281324131950ac0ac3bd158875f88114cb43a18008603572cae00000",
-            "4b41049a3aa1f1eeea9c869b6cc149013be74de595aaa5c2d397d7b5534fac6a3ed062b511880f181960ed0464a000000000",
-            "4b41039a3a9f73258b8b3fc9a5c692a3d5e0d77fda1899e9939b8743c4d6d80180a818c9884de05308c77d1220dd8d000000",
-            "489a3779fc3b89ce009470df8ccfacc6863aab51bb4270915b589f090c6ea191903f72bbb55a9770694476e54d006a238119",
-            "4b019bc84c75fcf98de4722bd0414b4d1ad0d59bd8428ef5a3d6f70526290a0c1ab71ba3e01c18d0d78b291e96883099bb1c",
-            "4b41009a14f586e105ddff88daf7153dcc0c2d349a8bb16503b7f40a74fb649708858566499b827273d00223af9ef27234c0",
-            "4b41039ba039fc3b4c1f01f3c2eeaa019e3590b822abd1183d5a32e63c4caf683a40a99b867f910b28b82418d5e520000000",
-            "4b019a3a9f732dd2310ed808ecc10a7b84a60176c95aa7c7c450218897d9fcf835fd484d06251c192317055ee882d3a90578",
-            "4b41049c1b9f732dd231490522368584f07d1efcfa337a1013f58e2def8d2b96f60ed8b9597e3cee6e446b91579800000000",
-            "4b41019ab2e1f1eeea9c980f7b0296fc4bef56dbe1f780229c74faa67425faabb3d495cf79c0cd5cc3f5c00a86583c241000",
+            "489b2b1f73258b8731309f06489b85523159689abb05a558ead2f7d7a559943f188c1c55bcd10a5266603bdc7dc84114cea6",
+            "4b41009aafb9fc3b89ce1b4ce8103850c6df2305e4c9cbe0a7479a40589c35bab9bee44d233cb2ff2ce87e67d4330cdc3d20",
+            "4b41059a3aa1f1eeea9c8695b6aab951db62eb782a7649905e7acc7a9e7883c94e9ba76e24aab72bdd7daaf43e0000000000",
+            "4b41009a3a9f7329206ac27e49aaa7fefacda81102b6ff17df9ee6cbe834895b134270e1121978f93c51c013c4bc695215e4",
+            "4b41009aafb9fc3b89ce00946bce7cf7dadcec49e1dd7f9e319467bd6396f6e4dcf970ee5b792c1767a5ccd977d5227ff9ac",
+            "4b41019b2b1f73258b87312f430dfd546151b17325525afa7f95e05b8f056a49a789a837b47b6b86edbb05e20489fc46c600",
+            "4b41019b27f9fc3b89ce1b4ce85bc1524ba6cf6bd87a336351c6a1f63c0a04e1aa73ef8349d776e5c23cbbdc540c04991400",
+            "4b41049a3aa1f1eeea9c869b6cc0bec45a20494713d56fd898409ae70acd2c68acd71276ef8fbe1356da0dd35a8000000000",
+            "4b41039a3a9f73258b8b3fc94b79e5dd52bed84cdc3bb4e59f68b5ed1152b52df973daddf215a0b654e5560f8c7c80000000",
+            "489b27f9fc3b89ce00946d80ad151423b6aae072cccddc29ef880e77da7f263412ca370949812910087d02a10f4eb8332bd8",
+            "4b41089c1879fc3b4c1f73079d94b4b85f755514b54ae227886ab57c3ef5e25703bd01ffeabf14bde5280000000000000000",
+            "489a14f586e105ddff88db7db608536471c20ed08cc21d5ceb1ba0ebd46c7ce44a2c11a5662e9b1d822ee19a336e6dd84280",
+            "4b019b32e3e180f98dd274760e5b29a1020fc9ea1964b1a496bc7aa03780cecc29d5bd03605f5d57383195c8d155892cb3d0",
+            "4b41049ba35f732dd2310ed83cf8922987f9aa23411098ea914ed5d27bd193bab43f9185d2cf9a109aa4bf0e03c400000000",
+            "489ba35f732dd2314905a113fb10fcfc2588faa8d1b27e990b8d447875ae1e619a1c69a54c0294f793ae0513902db821b056",
+            "4b41059ab2e1f1eeea9c980f7cca6addfc4706a697b336dd3b7b66a58717705d712d85ec719cd03f7dc668b5680000000000",
         ],
         "wb_c10",
     );
@@ -530,7 +529,8 @@ fn test_wb_32k_c5() {
 /// a pulse train whose period changes every quarter second (100 to 159
 /// samples at 16 kHz) through two resonators, with a little noise. Integer
 /// arithmetic only, so the C program that recorded the reference
-/// (voiced_gen.c in target/perf/silk-enc-fixed-ref/) makes the same samples.
+/// (voiced_gen.c in target/perf/fixed-1.6.1/drivers/) makes the same
+/// samples.
 fn voiced_signal(samples: usize) -> Vec<i16> {
     let mut seed: u32 = 0x600d_c0de;
     let (mut y1, mut y2, mut z1, mut z2) = (0i64, 0i64, 0i64, 0i64);
@@ -557,7 +557,7 @@ fn voiced_signal(samples: usize) -> Vec<i16> {
 }
 
 /// Six seconds of loud voiced input: 300 packets against the fixed-point
-/// build of libopus 1.6 (16 kHz mono, VoIP, 20 kb/s, variable bitrate,
+/// build of libopus 1.6.1 (16 kHz mono, VoIP, 20 kb/s, variable bitrate,
 /// complexity 5, 16-bit input). The reference is one FNV-1a hash per 25
 /// packets, over the length (two bytes, low byte first) and the bytes of
 /// each packet.
@@ -572,27 +572,29 @@ fn voiced_signal(samples: usize) -> Vec<i16> {
 /// - `SILK_FIX_CONST( VARIABLE_HP_SMTH_COEF1, 16 )` is 6554;
 ///   src/silk/hp_variable_cutoff.rs had 6553. Corrected.
 /// - `SILK_FIX_CONST( VARIABLE_HP_SMTH_COEF2, 16 )` is 983 (libopus
-///   src/opus_encoder.c, line 1975); src/lib.rs has
-///   `VARIABLE_HP_SMTH_COEF2_Q16 = 984`. Still open.
+///   src/opus_encoder.c, line 1975); src/lib.rs had
+///   `VARIABLE_HP_SMTH_COEF2_Q16 = 984`. Corrected.
 ///
-/// Measured: 206 of the 300 packets equal libopus with both constants off,
-/// 238 with the first one corrected (the first eight blocks), 300 with both.
+/// Measured against the fixed-point build of libopus's main branch, from
+/// which this test first took its hashes: 206 of the 300 packets equal
+/// libopus with both constants off, 238 with the first one corrected (the
+/// first eight blocks), 300 with both.
 #[test]
 fn long_voiced_stream_is_the_stream_of_fixed_point_libopus() {
     use opus1::{Application, Bitrate, OpusEncoder};
     const C_BLOCK_HASHES: [u64; 12] = [
-        0x4919c56ab5c5a233,
-        0x99c741894692a57d,
-        0x73970b0e9e6dc715,
-        0xc31cbf3ceb9e27aa,
-        0xeebfc0f9114e191c,
-        0x67c6ac73656a1b78,
-        0x8a4d951172cd0b79,
-        0x786c875208c465b7,
-        0x7a2565fb4c1cf701,
-        0xf1183d8594e9c3a2,
-        0xfa45cdb65679046e,
-        0xcec5b9a2e83641ba,
+        0x0cde87c1ac673f44,
+        0x2278e54455228cd2,
+        0x109fb5d24e717323,
+        0x455e66a499cd95e4,
+        0xb34ac52f47d59464,
+        0xafa4795da17f7944,
+        0x843a6e32fdff32fa,
+        0x305be2dc8359a5db,
+        0x8a706ba0466d82aa,
+        0xec4b246ce316cf6b,
+        0xf4ca6e2bdf687fdf,
+        0x42feef8c6c9e1740,
     ];
     let frame_size = 320;
     let pcm = voiced_signal(frame_size * 25 * C_BLOCK_HASHES.len());

@@ -59,6 +59,7 @@ fn stream(celt_between: impl Fn(usize) -> bool) -> Vec<Vec<u8>> {
     packets
 }
 
+#[allow(clippy::type_complexity)]
 const LOSSES: [(&str, fn(usize) -> bool); 3] = [
     ("no loss", |_| false),
     ("one packet in four lost", |i| i % 4 == 2),

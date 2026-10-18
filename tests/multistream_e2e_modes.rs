@@ -57,6 +57,7 @@ struct Run {
     to_celt: Vec<(Option<usize>, bool)>,
 }
 
+#[allow(clippy::needless_range_loop)]
 fn run(
     case: &Case,
     fs: i32,

@@ -43,7 +43,7 @@ pub fn load_speech_16k() -> Vec<i16> {
         if id == b"data" {
             let data = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
             return data
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|b| i16::from_le_bytes([b[0], b[1]]))
                 .collect();
         }
@@ -929,7 +929,7 @@ pub fn random_fates(seed: u32, packets: usize, fec: bool) -> Vec<Fate> {
         i += 1;
     }
     // Every stream also starts with a loss half of the time.
-    lost[0] = seed % 2 == 0;
+    lost[0] = seed.is_multiple_of(2);
     (0..packets)
         .map(|i| {
             if !lost[i] {

@@ -218,6 +218,7 @@ fn cbr_run(rate: usize, channels: usize, mode: usize, frame_2_5ms: usize, pcm: &
 ///   within 2 dB of what it gets from libopus's packets. For packets with a
 ///   SILK layer see the next test.
 #[test]
+#[allow(clippy::needless_range_loop)]
 fn forced_modes_with_16_bit_input_at_a_constant_bitrate() {
     let (mut streams, mut compared) = (0, 0);
     for rate in [8000usize, 12000, 16000, 24000, 48000] {
@@ -262,6 +263,7 @@ fn forced_modes_with_16_bit_input_at_a_constant_bitrate() {
 /// (silk/fixed/pitch_analysis_core_FIX.c), these streams were 2 to 10 dB
 /// below libopus.
 #[test]
+#[allow(clippy::needless_range_loop)]
 fn forced_silk_and_hybrid_on_tonal_input_are_within_2_db_of_libopus() {
     let mut failures = Vec::new();
     for rate in [8000usize, 12000, 16000, 24000, 48000] {

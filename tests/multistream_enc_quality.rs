@@ -232,7 +232,9 @@ fn coupled_streams_equal_to_a_stereo_encoder(vbr: bool, given: MaskGiven) -> (us
     // The mask of every frame: 21 values per input channel.
     let mut probe = SurroundProbe::new(8, FS);
     let masks: Vec<Vec<f32>> = pcm
-        .chunks_exact(FRAME * 8)
+        .as_chunks::<{ FRAME * 8 }>()
+        .0
+        .iter()
         .map(|frame| {
             let mut band_smr = vec![0f32; 21 * 8];
             assert!(probe.run(frame, FRAME, &mut band_smr));
@@ -250,9 +252,11 @@ fn coupled_streams_equal_to_a_stereo_encoder(vbr: bool, given: MaskGiven) -> (us
         single.set_force_mode(Some(ForcedMode::CeltOnly));
         single.set_bandwidth(Bandwidth::Fullband);
         let mut out = vec![0u8; 1500];
-        for (f, frame) in pcm.chunks_exact(FRAME * 8).enumerate() {
+        for (f, frame) in pcm.as_chunks::<{ FRAME * 8 }>().0.iter().enumerate() {
             let stereo: Vec<f32> = frame
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .flat_map(|x| [x[left], x[right]])
                 .collect();
             let of = |c: usize| &masks[f][21 * c..21 * c + 21];

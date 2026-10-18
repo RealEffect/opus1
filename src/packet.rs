@@ -162,6 +162,42 @@ pub fn nb_samples(data: &[u8], sampling_rate: i32) -> Result<usize, &'static str
     Ok(samples)
 }
 
+/// libopus `opus_packet_has_lbrr`: whether a packet carries a low-bitrate
+/// redundant (LBRR) copy of the frame before it in its first SILK frame,
+/// the copy that in-band forward error correction (FEC) decodes.
+///
+/// - A CELT-only packet has none. It gives `false` without being parsed.
+/// - Other packets are parsed, and an invalid packet is an error.
+/// - The flag is read from the first byte of the first frame: the LBRR flag
+///   of the mid channel, and for a stereo packet also that of the side
+///   channel. A first frame of 0 bytes has none.
+///
+/// An empty `data` is an error. (libopus reads the byte before it checks
+/// the length.)
+pub fn has_lbrr(data: &[u8]) -> Result<bool, &'static str> {
+    let Some(&toc) = data.first() else {
+        return Err(INVALID_PACKET);
+    };
+    if toc & 0x80 != 0 {
+        return Ok(false);
+    }
+    // The SILK frames of one Opus frame: one per 20 ms.
+    let frame_size = samples_per_frame(toc, 48000);
+    let nb_frames = if frame_size > 960 { frame_size / 960 } else { 1 };
+    let stereo = toc & 0x4 != 0;
+    let parsed = parse(data, false)?;
+    let Some(&first) = parsed.frame(data, 0).first() else {
+        return Ok(false);
+    };
+    // The first byte starts with the activity flag of each SILK frame and
+    // then the LBRR flag, for the mid channel and then the side channel.
+    let mut lbrr = (first >> (7 - nb_frames)) & 1 != 0;
+    if stereo {
+        lbrr = lbrr || (first >> (6 - 2 * nb_frames)) & 1 != 0;
+    }
+    Ok(lbrr)
+}
+
 /// libopus `encode_size` (opus.c): the number of bytes a frame size takes.
 #[inline]
 pub(crate) fn size_field_len(size: u16) -> usize {

@@ -440,9 +440,32 @@ fn silk_bandwidth_switches_match_libopus() {
                 assert!(differ * 100 <= outcome.tocs.len(), "{what}: {differ} first bytes differ");
                 // SILK changes its rate in a pause, where the level is low and
                 // the signal-to-noise ratio says little. libopus restarts
-                // SILK there, and so does opus1. Measured against libopus:
-                // 6.7 dB at most around a switch (16 kHz, CBR), 0.8 dB on
-                // average, 0.1 dB over the stream.
+                // SILK there, and so does opus1, on the same packets. The
+                // windows around a switch then hold digital silence, so their
+                // "SNR" compares how much each SILK encoder leaves in the
+                // decoded silence (-88 to -111 dB against a reference of
+                // 1e-12). Measured against libopus: 5.5 dB at most around a
+                // switch (48 kHz, VBR), 1.8 dB on average (48 kHz, VBR;
+                // 16 kHz VBR 0.3 dB, CBR -1.4 and -1.5 dB), 0.3 dB over the
+                // stream. Before the frames of digital silence told SILK
+                // that there was no voice activity, the switches came one
+                // packet after libopus's, and the windows were others.
+                //
+                // What is left is the difference between the fixed-point SILK
+                // encoder, which opus1 ports, and the float one of the
+                // linked libopus. The fixed-point build of libopus 1.6.1,
+                // given the same audio as 16-bit samples, is itself below
+                // the float build in these windows: 7.0 dB at most and 2.0 dB
+                // on average at 16 kHz with VBR, 0.2 dB on average with CBR,
+                // 0.4 and -0.7 dB at 48 kHz. opus1 does not write that
+                // build's packets here: with the `Audio` application its
+                // SILK reads the frame that the float `dc_reject` filtered
+                // (see `OpusEncoder::encode_impl`). With `Voip` and 16-bit
+                // input, where its SILK packets are those of the
+                // fixed-point build, 23 of the 24 worst windows of opus1
+                // equal that build's to 0.1 dB. The other one (48 kHz, CBR)
+                // is 1.2 dB off: the redundant CELT frames of a switch
+                // differ, because that build's CELT encoder is fixed-point.
                 //
                 // The redundant frame at the end of the last packet at the
                 // old rate starts from a reset CELT encoder, which first
@@ -450,7 +473,7 @@ fn silk_bandwidth_switches_match_libopus() {
                 // (opus_encoder.c:2523-2538). Without those 2.5 ms the
                 // frame was coded against an empty overlap: 3.3 dB below
                 // libopus on average (48 kHz, CBR).
-                check(&what, &outcome, 4, &Margins { window: 9.0, mean: 1.5, stream: 3.0 });
+                check(&what, &outcome, 4, &Margins { window: 9.0, mean: 3.0, stream: 3.0 });
             }
         }
     }

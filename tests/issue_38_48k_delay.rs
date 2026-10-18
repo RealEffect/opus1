@@ -58,7 +58,7 @@ fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     let mut pkt = vec![0u8; 1500];
     let packets = input
-        .chunks_exact(FRAME)
+        .as_chunks::<FRAME>().0.iter()
         .map(|frame| {
             let len = enc.encode(frame, FRAME, &mut pkt).unwrap();
             pkt[..len].to_vec()

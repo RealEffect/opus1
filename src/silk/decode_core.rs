@@ -1272,8 +1272,7 @@ mod tests {
         nb_subfr: i32,
         wild: bool,
     ) -> (SilkDecoderState, SilkDecoderControl, [i16; MAX_FRAME_LENGTH]) {
-        let mut dec = SilkDecoderState::default();
-        dec.nb_subfr = nb_subfr;
+        let mut dec = SilkDecoderState { nb_subfr, ..Default::default() };
         assert_eq!(silk_decoder_set_fs(&mut dec, fs_khz, 48000), 0);
 
         for v in dec.out_buf.iter_mut() {
@@ -1284,7 +1283,7 @@ mod tests {
         }
         dec.prev_gain_q16 = rng.range(1 << 16, 1 << 28);
         dec.lag_prev = if wild { rng.range(0, 400) } else { rng.range(2 * fs_khz, 18 * fs_khz) };
-        dec.loss_cnt = if rng.next() % 3 == 0 { 1 } else { 0 };
+        dec.loss_cnt = if rng.next().is_multiple_of(3) { 1 } else { 0 };
         dec.prev_signal_type = rng.range(0, 2);
         dec.indices.signal_type = rng.range(0, 2) as i8;
         dec.indices.quant_offset_type = rng.range(0, 1) as i8;
@@ -1299,7 +1298,7 @@ mod tests {
             } else {
                 (base_lag + rng.range(-9, 9)).clamp(2 * fs_khz, 18 * fs_khz)
             };
-            ctrl.gains_q16[k] = if rng.next() % 4 == 0 {
+            ctrl.gains_q16[k] = if rng.next().is_multiple_of(4) {
                 dec.prev_gain_q16
             } else {
                 rng.range(1 << 16, 1 << 28)

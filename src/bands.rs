@@ -1592,6 +1592,16 @@ fn stereo_split(x: &mut [f32], y: &mut [f32], n: usize) {
     }
 }
 
+/// libopus `intensity_stereo` (celt/bands.c, lines 379-403, float build):
+/// `x` becomes the mix of both channels that the band codes, weighted by
+/// the band energies of the two channels. The side is not coded.
+///
+/// `EPSILON` (1e-15) is added under the square root and to the root, as
+/// libopus does. It matters in bands whose energies are near 1e-7 or
+/// below, such as the decaying output of the DC filter after a signal
+/// stops. clang fuses the sum of squares into two fused multiply-adds, and
+/// the mix into one product and one fused multiply-add, on 64-bit ARM.
+/// `mac` rounds the same way there.
 #[inline(always)]
 fn intensity_stereo(
     m: &CeltMode,
@@ -1601,13 +1611,14 @@ fn intensity_stereo(
     band: usize,
     n: usize,
 ) {
-    let left = band_e[band].max(MIN_STEREO_ENERGY);
-    let right = band_e[m.nb_ebands + band].max(MIN_STEREO_ENERGY);
-    let norm = (left * left + right * right).sqrt().max(MIN_STEREO_ENERGY);
+    const EPSILON: f32 = 1e-15;
+    let left = band_e[band];
+    let right = band_e[m.nb_ebands + band];
+    let norm = EPSILON + mac(mac(EPSILON, left, left), right, right).sqrt();
     let a1 = left / norm;
     let a2 = right / norm;
     for (xv, &yv) in x[..n].iter_mut().zip(&y[..n]) {
-        *xv = a1 * *xv + a2 * yv;
+        *xv = mac(a2 * yv, a1, *xv);
     }
 }
 
@@ -3193,12 +3204,13 @@ mod tests {
                     let (mut x, mut y) = (x0.clone(), y0.clone());
                     let mut xr = x0.clone();
                     intensity_stereo(mode, &mut x, &mut y, &band_e, 3, n);
-                    let left = band_e[3].max(MIN_STEREO_ENERGY);
-                    let right = band_e[mode.nb_ebands + 3].max(MIN_STEREO_ENERGY);
-                    let norm = (left * left + right * right).sqrt().max(MIN_STEREO_ENERGY);
+                    // celt/bands.c 389-401 with EPSILON 1e-15.
+                    let left = band_e[3];
+                    let right = band_e[mode.nb_ebands + 3];
+                    let norm = 1e-15 + mac_model(mac_model(1e-15, left, left), right, right).sqrt();
                     let (a1, a2) = (left / norm, right / norm);
                     for i in 0..n {
-                        xr[i] = a1 * xr[i] + a2 * y0[i];
+                        xr[i] = mac_model(a2 * y0[i], a1, xr[i]);
                     }
                     assert_same_bits(&x, &xr, &format!("intensity_stereo x, {what}"));
                     assert_same_bits(&y, &y0, &format!("intensity_stereo y, {what}"));

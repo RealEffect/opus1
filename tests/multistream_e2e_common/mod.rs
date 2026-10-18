@@ -308,8 +308,8 @@ pub fn measure_signal(setting: Setting, pcm: &[f32]) -> Measured {
     let frames = pcm.len() / (frame_size * channels);
     assert_eq!(pcm.len(), frames * frame_size * channels, "{label}");
     let packets = [
-        rust_encode_all(&mut rust, &pcm, frame_size),
-        c.encode_all(&pcm, frame_size),
+        rust_encode_all(&mut rust, pcm, frame_size),
+        c.encode_all(pcm, frame_size),
     ];
     assert_eq!(packets[RUST].len(), frames, "{label}");
     assert_eq!(packets[C].len(), frames, "{label}");
@@ -389,7 +389,7 @@ pub fn measure_signal(setting: Setting, pcm: &[f32]) -> Measured {
     let skip = fs as usize / 5;
     let channel_snrs = (0..channels)
         .map(|ch| {
-            let input = channel(&pcm, channels, ch);
+            let input = channel(pcm, channels, ch);
             let mut snr = [0f64; 4];
             for (path, out) in decoded.iter().enumerate() {
                 assert_eq!(out.len(), pcm.len(), "{label}: path {path}: decoded length");

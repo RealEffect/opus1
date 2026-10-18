@@ -1,6 +1,6 @@
 # Testing
 
-This document explains how opus1 is tested. Most tests run the C library libopus in the same process and compare its output with the output of opus1. The sections below cover how libopus is linked, what the tests check, and the groups of test files. They then cover the checks against a fixed-point build of libopus, fuzzing, the `#![no_std]` checks, the ignored tests and the documentation examples. The last section gives the command for each part.
+This document explains how opus1 is tested. Most tests run the C library libopus in the same process and compare its output with the output of opus1. The sections below cover how libopus is linked, what the tests check, and the groups of test files. They then cover the checks against a fixed-point build of libopus, and the evaluation tools: the conformance test of RFC 8251 and the comparison of decoded audio with the original. Then come fuzzing, the `#![no_std]` checks, the ignored tests and the documentation examples. The last section gives the command for each part.
 
 ## Terms used here
 
@@ -21,14 +21,14 @@ Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-appl
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 234 | 1128 |
-| Unit tests inside `src/` | - | 342 |
+| Integration tests in `tests/*.rs` | 239 | 1162 |
+| Unit tests inside `src/` | - | 356 |
 | Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (48) | - | 50 |
-| **Total** | | **1520** |
+| **Total** | | **1568** |
 
-28 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 11 directories of shared helper code (for example `tests/k24_common/`) and 4 files of recorded reference values (`*.expected`).
+28 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 12 directories of shared helper code (for example `tests/k24_common/`) and 6 files of recorded reference values (`*.expected`).
 
-A full run, `cargo test --release`, passed all 1492 tests that are not ignored on Apple M4 Pro. It took 255 seconds with the build.
+A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1540 tests that are not ignored on Apple M4 Pro. It took 163 seconds, including the build of the test files that had changed.
 
 ## How libopus is linked
 
@@ -121,6 +121,7 @@ A test file's name starts with a prefix that says what it covers. The counts are
 | `silk_` | 14 | 66 | SILK parts tested one by one: the bitstream, Burg analysis, linear predictive coding (LPC), the normalized line spectral frequencies (NLSF), the quantizer, and packets of the fixed-point build. |
 | `celtdec_` | 4 | 38 | The CELT decoder: channel conversions, edge cases, loss concealment and robustness, against libopus. |
 | `silkdec_` | 10 | 31 | The SILK decoder alone (`SilkDecoder`), against libopus with SILK-only streams. These require identical 16-bit samples. |
+| `eval_` | 5 | 26 | The evaluation tools: the ports of `opus_compare`, MOC and the `opus_demo` loop against their C and Python originals, the RFC 8251 conformance test, and the paired-comparison harness (see [Evaluation tools](#evaluation-tools)). |
 | `silkenc_` | 6 | 25 | The SILK encoder: control, FEC data, mono coding of stereo input, pulses, restarts, robustness of its packet functions. |
 | `hybrid_` | 4 | 19 | Hybrid mode encoding and decoding. |
 | `celt_` | 8 | 17 | CELT round trips and regressions. |
@@ -174,17 +175,239 @@ Run them with `cargo test --release --lib`. The NEON tests run only on 64-bit AR
 
 The SILK encoder of opus1 is a port of the fixed-point SILK encoder of libopus (`silk/fixed`). The linked libopus is a floating-point build, so it does not contain that encoder. The fixed-point comparisons therefore use values recorded from a separate build:
 
-1. The libopus 1.6.1 C source is compiled with `cc` and the defines `-DFIXED_POINT -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF -DHAVE_LRINT`.
-2. A small C program drives it: either `opus_encode` with the controls a test names, or one internal function (for example `silk_burg_modified_c`).
+1. The source of the official libopus 1.6.1 release (the tarball named in [Which libopus source to build](#which-libopus-source-to-build)) is compiled with `cc` alone, without `configure` or cmake. The C files are the ones that `opus_sources.mk`, `celt_sources.mk` and `silk_sources.mk` list (`OPUS_SOURCES`, `OPUS_SOURCES_FLOAT`, `CELT_SOURCES`, `SILK_SOURCES` and `SILK_SOURCES_FIXED`). The flags are `-O2 -DFIXED_POINT -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF -DHAVE_LRINT`.
+2. A small C program drives it: either `opus_encode` with the controls a test names, or one internal function (for example `silk_burg_modified_c`). For `opus_encode`, each control is set before the first packet and again whenever its value changes.
 3. Its output is recorded into the test files:
    - packet bytes as hexadecimal text (`tests/silk_fixed_point_compare.rs`, 280 packets),
    - a 32-bit FNV-1a (Fowler-Noll-Vo) hash of every packet (`tests/core_fixed_point.rs`),
    - function results in `tests/perfk_silk_burg.expected`, `tests/perfk_silk_nsq_plain.expected`, `tests/perfk_silk_pitch_core.expected` and `tests/perfk_silk_process_nlsfs.expected`.
-4. The C program and the Rust test make their input with the same integer-only generator. Each recorded row carries a checksum of its input, so a test can tell that both used the same samples.
+4. The C program and the Rust test make their input with the same integer-only generator. Each recorded row carries a checksum of its input, so a test can tell that both used the same samples. For the tests that code speech, the input is the test's own 16-bit samples, written to a file.
 
-The fixed-point build and its driver program are kept outside git. Only the recorded values are in the repository, so the tests run without the C build.
+Do not build this reference from the libopus source that the crate `opus-head-sys` vendors. That source is libopus's main branch (commit `228a0f85`). Its fixed-point SILK encoder adds 1 to the frame energy of the Burg analysis (`silk/fixed/burg_modified_FIX.c`, line 72), which the 1.6.1 release does not. With it, the packets of every stream in `tests/core_fixed_point.rs` differ from 1.6.1's from packet 0 to 13 on, and 622 of the 1000 rows of `tests/perfk_silk_burg.expected` differ. Until October 2026 several of these tests held values from that source. They now hold the values of the release (see [Differences from libopus](10-differences-from-libopus.md#libopus-main-branch-and-the-161-release)).
 
-These tests require identical results: the same packets, or the same integers. In the recorded streams, the SILK-only packets of opus1 with the `Voip` application and 16-bit input (`OpusEncoder::encode_i16`) are byte for byte those of the fixed-point build. [Differences from libopus](10-differences-from-libopus.md#silk) lists the cases where the packets of longer streams start to differ.
+The fixed-point build and its driver programs are kept outside git, in the git-ignored folder `target/perf/fixed-1.6.1/`: `build.py SRC OUT [driver.c ...]` builds the library `OUT/libopus_fixed.a` and links each driver program in `drivers/`. Only the recorded values are in the repository, so the tests run without the C build.
+
+These tests require identical results: the same packets, or the same integers. In the recorded streams, the SILK-only packets of opus1 with the `Voip` application and 16-bit input (`OpusEncoder::encode_i16`) are byte for byte those of the fixed-point build. The same holds for 46 of the 49 SILK streams of the golden file.
+
+The fixed-point build runs libopus's speech and music analysis only at complexity 10, for input at 16 to 48 kHz (the float build runs it from complexity 7). opus1 has no such analysis. In the recorded streams at complexity 10 with 16 kHz input, and in `silk_wb_16k_mono_20k_vbr_c10_20ms` of the golden file, the packets are equal all the same. [Differences from libopus](10-differences-from-libopus.md#silk) lists the cases where the packets of longer streams start to differ.
+
+## Evaluation tools
+
+The tests above ask whether opus1 gives libopus's bits. The evaluation tools ask a different question: how far is the decoded audio from the original, with opus1's encoder and with libopus's, for the same input? They also run the conformance test of the Opus standard. They are:
+
+- three ports, in `src/eval/`: libopus's test program `opus_compare`, the MOC distance of `moc.py`, and the decoding loop of libopus's test program `opus_demo`;
+- the paired-comparison harness `examples/eval/`;
+- the program `examples/opus_compare.rs`, with the command line of libopus's `opus_compare`;
+- the scripts in `scripts/eval/`;
+- the tests `tests/eval_*.rs`, with their shared code in `tests/eval_common/`.
+
+The ports are reached as `opus1::internals::eval`. Like the rest of `internals`, this module is not part of the public application programming interface (API) (see [Architecture](07-architecture.md#the-public-interface-and-internals)). It is compiled only with the `std` feature, because it allocates and calls the platform's math library.
+
+Terms of this section:
+
+- An **item** is one audio clip. A **condition** is one set of encoder settings. A **job** codes one item under one condition, once with opus1's encoder and once with libopus's.
+- A **corpus** is a collection of items that is not in the repository.
+- The **internal weighted error** (`err`) is the result of `opus_compare`: 0 for identical spectra, larger for a larger difference. Its quality value is `Q = 100 * (1 - 0.5 * ln(1 + err) / ln(1.13))`. A decoded signal passes the conformance test when `Q` is at least 0, that is when `err` is at most about 0.2769.
+- **MOC** ("modified opus_compare") is the distance that the objective test of the Opus Speech Coding Enhancement draft (OSCE, `draft-ietf-mlcodec-opus-speech-coding-enhancement`) uses.
+- A **geometric mean** of ratios is `exp(mean(ln r))`. A **bootstrap** confidence interval is computed by drawing the items again, with replacement, many times.
+
+### The ports in `opus1::internals::eval`
+
+| Module | Port of | What it offers |
+|---|---|---|
+| `compare` | `src/opus_compare.c` of libopus 1.6.1 | `opus_compare` (one test signal against one reference), `opus_compare_many` (several of each; each spectrum is computed once), `Comparison` (error, quality, frame count, worst frame) |
+| `moc` | `compare` in `moc.py` of the libopus git repository (`dnn/torch/osce/stndrd/evaluation/moc.py`, BSD licence) | `moc`, `moc_i16`, and `moc_relative`, the value D of the draft's relative test |
+| `demo` | the decoding loop of `opus_demo -d` (`src/opus_demo.c`) | `parse_bitstream`, `decode_bitstream` over the `DemoDecoder` trait, `opus_demo_s16` (one sample of the 16-bit output of `opus_demo`) |
+
+**`opus_compare`.** The C program cuts both signals into 10 ms windows, one every 2.5 ms. It computes the power of each 100 Hz bin, spreads the reference's band energies across bands, over time and between the channels, and adds a tenth of that to both spectra. Per bin it takes `r - ln(r) - 1`, with `r` the ratio of the two powers. Bins near 8 kHz count less. The error is pooled over the 21 bands and over the frames. At a test rate below 48 kHz, only the bands below that rate's Nyquist frequency are compared, and the top 300 Hz are left out (except at 12 kHz).
+
+The port gives the bits of the C program built with clang at `-O2` for the same processor:
+
+- On 64-bit ARM, clang fuses some products and sums of the C code into one fused multiply-add. The port uses `mathops::mac` and `mac_f64` at exactly these places. On other processors both round twice.
+- It calls the platform's `cos`, `sin`, `log` and `pow`, as the C program does. Each table is built in its own function, so that the compiler cannot merge a `cos` and a `sin` of the same angle into one `sincos` call, which can round differently.
+- `ln(1.13)` is the constant that clang folds it to (`0x3FBF49A79F8B9187`).
+
+The C program keeps the spectra of all frames. The port keeps only the frame before, so it needs a few kilobytes whatever the length. Its transform computes several bins side by side in NEON lanes. Each lane does the operations of the C loop in the same order, so the result does not change. On 20 s of stereo audio at 48 kHz the port took 0.18 s of processor time and the C program 3.25 s. Both gave the error 0.30854032158860312.
+
+How the port is checked:
+
+- `tests/eval_opus_compare.rs` holds 40 cases with values recorded from the C program (`tests/eval_opus_compare.expected`): every rate, mono and stereo, identical signals, silence, noise at several levels, a low-pass, a 1 ms shift, clipping, exactly one window, a partial last frame, a tone near 8 kHz, and 5 cases of the error messages. On 64-bit ARM macOS, the error and the quality must have the recorded bits. On other platforms they must agree to a relative 1e-6, because their math libraries can round `cos`, `sin`, `log` and `pow` differently. On the Android phone all 55 recorded values had the bits of the Mac.
+- With `OPUS1_OPUS_COMPARE_C` naming the C program, the same test runs it on the cases and compares the printed lines too. `scripts/eval/check-opus-compare.sh --src <libopus 1.6.1 source>` builds it twice: as libopus ships it, and through `scripts/eval/opus_compare_exact.c`, which prints the numbers with 17 digits. The script checks that both builds contain the same number of fused multiply-adds (33) and that neither calls `sincos`.
+- Property tests (with `proptest`) check that random inputs give an error of at least 0, that identical signals give 0, and that a mono reference equals a stereo reference with the same samples on both sides, bit for bit.
+- Unit tests in `src/eval/compare.rs` compare the port with a direct transcription of the C code, and the vector kernel with the scalar loop, bit for bit.
+
+**MOC.** MOC compares two 16 kHz mono signals in the way of `opus_compare`, with these differences:
+
+- 10 ms windows every 2.5 ms with a Hamming window, and 81 bins of 100 Hz;
+- 17 bands up to 7.5 kHz;
+- the distortion of a bin is `ln(r)^2`;
+- the error of a frame is the mean over the bands, and the result is the 6th root of the mean of its cube;
+- with the activity detection, frames where the reference is quiet are left out.
+
+The port computes in `f64`, and in `f32` where numpy keeps `float32` (numpy 2 rules). Its transform is a direct discrete Fourier transform instead of numpy's fast Fourier transform (FFT). So it agrees with numpy to about 1e-15, not to the bit. `tests/eval_moc.rs` compares 18 inputs, each with and without the activity detection, with values recorded from `scripts/eval/moc_reference.py`, a numpy-only transcription of `moc.py`. The limit is a relative 1e-9. With `OPUS1_EVAL_PYTHON` naming a Python 3 with numpy, the test runs the script itself. With `OPUS1_MOC_PY` naming the original `moc.py` as well, the script first checks its transcription against that file. The largest difference measured was a relative 9.8e-16, and 8.2e-16 on the phone.
+
+`moc.py` comes from a snapshot of the libopus git repository that is older than libopus 1.6. Draft 04 of the OSCE draft replaced it by a C program, `osce_compare.c`, which is not available here and may compute other numbers.
+
+**The `opus_demo` loop.** An `opus_demo` bitstream is a sequence of records. Each record holds a 4-byte big-endian length, the encoder's final range in 4 bytes, and the packet. A length of 0 marks a lost packet. `decode_bitstream` decodes such a stream as `opus_demo -d <rate> <channels> -ignore_extensions` does:
+
+1. A lost packet is decoded at the next packet that arrived. The last lost packet is recovered with forward error correction (FEC) when that packet carries a redundant copy (`opus1::packet::has_lbrr`). The others are concealed. Both use the duration of the last packet (`OpusDecoder::last_packet_duration`).
+2. A loss at the end of the stream is not decoded, as in `opus_demo`.
+3. The decoder writes 24-bit integers, as libopus's `opus_decode24` does, and the loop rounds them to 16 bits as `opus_demo` does.
+4. After each packet that arrived, when the packet before it also arrived, the decoder's final range must equal the one in the record. Otherwise the loop stops, as `opus_demo` does.
+
+The `DemoDecoder` trait is implemented for `OpusDecoder`. The tests implement it for libopus as well (`tests/eval_common/libopus_demo.rs`), so the same loop drives both decoders. `tests/eval_demo.rs` checks the loop with both decoders: CELT, SILK, Hybrid and freely chosen modes, with and without FEC, with single losses and bursts, at 4 output configurations; a damaged final range; an invalid packet after a loss; losses before the first packet and at the end; and a cut bitstream. It also compares `packet::has_lbrr` with `opus_packet_has_lbrr` on 15,076 packets, and `last_packet_duration` with `OPUS_GET_LAST_PACKET_DURATION` over 27 steps at 3 rates. Streams without losses must give libopus's 16-bit output on every platform. Streams with losses are compared bit for bit only on 64-bit ARM macOS, and only reported elsewhere: against a libopus built at `-O2`, as on the phone, concealed CELT frames differ in their last bits (see [Results on the phone](#results-on-the-phone)).
+
+### The conformance test of RFC 8251
+
+The test vectors of RFC 8251 are 12 bitstreams in the format of `opus_demo` (`testvectorNN.bit`), with two sets of reference outputs: `testvectorNN.dec`, and `testvectorNNm.dec`, which is decoded without the phase inversion of stereo CELT. libopus's script `tests/run_vectors.sh` decodes each bitstream at 48, 24, 16, 12 and 8 kHz, in mono and in stereo, which makes 120 runs. It compares each output with both reference sets with `opus_compare`. A run passes when either comparison passes. The script then prints a mean quality per rate and channel count. For each reference set this is the mean over the 12 vectors, counted only when all 12 passed against that set. The script prints the larger of the two means.
+
+`tests/eval_rfc8251.rs` does the same with opus1's decoder. It is stricter than the script: a final range mismatch, a failed decode call, a missing file or a cut bitstream fails the test. A second test decodes every vector with libopus through the same loop and requires opus1's 16-bit output to be identical. The command `cargo run --release --example eval -- conformance` prints the same table.
+
+Results on 2026-10-18, the same on the Mac and on the phone:
+
+- All 120 runs pass. The final range was checked about 200,000 times, with no mismatch and no failed decode call.
+- All 120 outputs are identical to those of libopus 1.6.1 through the same loop.
+- The mean quality, as `run_vectors.sh` computes it:
+
+  | Output | 48 kHz | 24 kHz | 16 kHz | 12 kHz | 8 kHz | From |
+  |---|---:|---:|---:|---:|---:|---|
+  | mono | 97.4083 | 91.6250 | 84.7167 | 81.9500 | 73.2250 | `m.dec` |
+  | stereo | 99.7000 | 91.9083 | 84.6500 | 82.1417 | 73.5167 | `.dec` |
+
+- Mono output passes against `m.dec` in all 60 runs. Against `.dec` it fails in 20 runs (vectors 01, 05 and 06 at 48 and 24 kHz, 07 and 08 at every rate, 09 at every rate but 8 kHz). There the phase inversion of stereo CELT meets the mono mix. Stereo output passes against `.dec` in all 60 runs, and fails against `m.dec` in the 5 runs of vector 07. libopus's outputs are the same, so it shows the same pattern.
+- The test takes 2.3 s on Apple M4 Pro and 30.8 s on the phone.
+
+### Corpora
+
+The corpora are not in the repository. The tools look for them under the directory that `OPUS1_CORPUS` names. Without it they look in `corpus/` at the root of the crate, which git ignores and the crate package leaves out. A worktree has its own crate root, so set `OPUS1_CORPUS` there. A test that needs a corpus prints "skipped" and passes when the corpus is missing.
+
+| Corpus | Archive | Layout under the corpus root | Used by |
+|---|---|---|---|
+| The RFC 8251 test vectors | 74,624,664 bytes, from `https://opus-codec.org/docs/opus_testvectors-rfc8251.tar.gz` (libopus's `README`) | `rfc8251/opus_newvectors/testvectorNN.bit`, `.dec`, `m.dec` (the tools also accept `rfc8251/` itself, or `OPUS1_TESTVECTORS`) | the conformance test |
+| The TSP speech database at 48 kHz, McGill University | 253,816,919 bytes; the page is `https://www.mmsp.ece.mcgill.ca/Documents/Data/` | `tsp48k/48k/<talker>/<file>.wav`: 1,444 files of English speech in 25 talker directories, with the simplified BSD licence in `48k/Licence.txt` | the `tsp` set of the harness |
+
+`scripts/eval/fetch-corpus.sh` gets and checks them:
+
+```text
+scripts/eval/fetch-corpus.sh rfc8251
+scripts/eval/fetch-corpus.sh tsp <URL of the 48 kHz archive>
+scripts/eval/fetch-corpus.sh --verify rfc8251
+```
+
+- It asks before it downloads, unless `--yes` is given. It accepts `https:` and `file:` URLs only.
+- It checks the size and the SHA-256 (Secure Hash Algorithm, 256 bits) sum of the archive. For the test vectors the sum is the one in libopus's `releases.sha2`. After unpacking, it also checks the SHA-1 sum of all 36 vector files against the list in `draft-ietf-codec-opus-update`, the draft of RFC 8251. The TSP archive has no published sum, so the script holds the size and sum of the download of 2026-10-18 and compares later downloads with them.
+- It refuses archive entries with absolute paths or `..`, and it never runs anything from an archive.
+- It writes the sums into `SHA256SUMS` in the corpus root. `--verify` checks a corpus that is already there.
+
+`fixtures/tsp/` holds the first 2.5 s of four TSP files (`FA01_05`, `MD19_04`, `FJ55_02`, `MH43_04`; 960,176 bytes in all), with the licence text unchanged and a `README.txt`. The built-in `quick` and `selftest` sets use them, so these sets run without a corpus.
+
+### The paired-comparison harness
+
+The harness is the multi-file example `examples/eval/`. One job of the harness:
+
+1. The item is a 16-bit reference at 48 kHz, mono or stereo. Its length is cut to a multiple of 12 samples, so that it divides into whole samples at every rate that `opus_compare` accepts.
+2. The encoder input is the item at the condition's rate and channel count. Below 48 kHz it is resampled with a Kaiser-windowed sinc filter. The filter is flat within 0.1 dB up to 300 Hz below the lower Nyquist frequency, the band that `opus_compare` compares, and it attenuates by at least 90 dB above that frequency. A mono condition on a stereo item codes `(L+R)/2`, the mix that `opus_compare` compares with.
+3. opus1's encoder and libopus's `opus_encode_float` code the input with the same settings. Before any job, `eval run` reads the settings back from both encoders and stops when they differ: application, rate, channels, bitrate, bitrate mode and its constraint, complexity, FEC, expected loss, forced channels, frame duration, prediction, look-ahead, and the controls that the harness leaves at their defaults (bandwidth limit, signal type, bit depth, discontinuous transmission, phase inversion). Nothing is forced unless the condition forces a coding mode or an audio bandwidth, which it then forces on both encoders. libopus codes a forced SILK mode as Hybrid when the bandwidth is wider than wideband, so a SILK condition at 24 or 48 kHz also forces wideband.
+4. libopus's decoder decodes both packet streams with the `opus_demo` loop. `--decoder opus1` uses opus1's decoder instead. The loop compares the decoder's final range with the one of opus1's encoder after every packet whose predecessor arrived, so a packet that libopus reads differently from how opus1 wrote it stops the job. Conditions with FEC drop 10 % of the packets before decoding (fixed seed, the same packets on both sides).
+5. Both encoders must report the same look-ahead. The first look-ahead samples of the output are dropped, and the rest is cut to the length of the input.
+6. Each side is measured: `opus_compare` against the 48 kHz reference (error, quality, worst frame); the signal-to-noise ratio against the encoder input; the time shift within 1 ms that correlates best with the input; for speech in mono, MOC with and without the activity detection, after both signals are resampled to 16 kHz; bytes, kilobits per second, and how often each configuration of the table-of-contents byte occurs.
+7. The pair gives `ratio_err = (err_opus1 + 1e-6) / (err_libopus + 1e-6)`, where a value below 1 means that opus1's output is closer to the reference. It also gives `delta_snr_db` (opus1's SNR minus libopus's), `ratio_bytes` (opus1's bytes divided by libopus's), and `moc_d`, the D of the OSCE draft with libopus as the reference decoder.
+
+The alignment by the look-ahead was measured on the TSP excerpts, music and pink noise. CELT-only streams of the `Audio` and `RestrictedLowDelay` applications are best aligned at a shift of 0, for both encoders, at each rate measured (8, 16, 24 and 48 kHz). In `Voip` the high-pass filter shifts the phase of the low frequencies, and SILK output at 24 and 48 kHz comes 1 or 2 samples early with any application. Both encoders show the same shift there, and `opus_compare`'s 10 ms windows hardly notice it.
+
+The built-in sets (`examples/eval/sets.rs`):
+
+| Set | Items | Conditions | Jobs | Time on M4 Pro |
+|---|---|---|---:|---:|
+| `quick` (default) | 11 in the repository: the 4 TSP excerpts, speech with pauses, quiet speech, music, castanets, tones, pink noise, vowels | 30 in 6 groups: `silk_low`, `speech_mid`, `celt_mid`, `celt_high`, `lowdelay`, `switch` | 239 | about 4 s |
+| `selftest` | 4 | 6 | 18 | 1.3 s |
+| `tsp` | 222 TSP files, 9 per talker (`examples/eval/sets/tsp_speech.txt`) | 40: `Voip`, mono, 48 kHz, 6 to 128 kb/s, 20 and 60 ms, complexity 5 and 10, in the groups `tsp_low`, `tsp_mid` and `tsp_high` | 8,880 | |
+| `music` | 11 synthetic stereo items of 6 s | 16: `Audio`, stereo, 48 kHz, 64 to 160 kb/s, 20 and 60 ms, complexity 5 and 10, in the group `music_high` | 176 | |
+| `baseline` | `tsp` and `music` | 56 | 9,056 | 171.8 s |
+
+The synthetic items are not perceptually representative. They show sensitivity and regressions only. A condition at complexity 7 or more and at 16 kHz or more carries the tag `analysis`: there libopus runs its speech and music analysis, which opus1 does not have. An item belongs to the hold-out split when the FNV-1a hash of its name is a multiple of 4. The reports give the tuning and the hold-out items separately. Work that tunes the encoder should look at the tuning items only.
+
+### Gates
+
+A gate is a rule with a limit for one group of conditions. `eval list` prints the gates of each group.
+
+| Gate | Rule | Default limit |
+|---|---|---|
+| `geomean_err` | The geometric mean of `ratio_err` at each bitrate of the group. | at most 1.20; 1.35 for `silk_low`, `speech_mid`, `tsp_low` and `tsp_mid` |
+| `max_err` | The largest `ratio_err` of any job. | at most 1.50; 2.00 for the same four groups |
+| `bytes` | The largest `ratio_bytes` of the jobs with a variable bitrate and frames below 40 ms. | at most 1.02; 1.05 (`speech_mid`, `tsp_mid`); 1.10 (`silk_low`, `tsp_low`) |
+| `bytes_long` | The same for frames of 40 ms and more, where opus1 differs on purpose (see [Differences from libopus](10-differences-from-libopus.md#deliberate-differences)). | at most 1.10 |
+| `bytes_min` | The smallest `ratio_bytes` of the jobs with a variable bitrate. | at least 0.95; 0.90 for the same four groups |
+| `bytes_cbr` | The largest `abs(ratio_bytes - 1)` of the jobs with a constant bitrate. | 0 |
+| `moc_clip` | The smallest `moc_d` (speech only). | at least -0.1 |
+| `moc_mean` | The mean `moc_d` (speech only). | at least -0.025 |
+| `align` | Jobs where opus1's best shift is not 0 while libopus's is (CELT, music, low delay). | 0 |
+| `delta_snr` | The mean `delta_snr_db` (CELT, music, low delay, `tsp_high`). | at least -1 dB |
+| `baseline_geomean` | With `--baseline`: the geometric mean of opus1's `err` now divided by its `err` in the stored run. | at most 1.02 |
+| `baseline_max` | With `--baseline`: the largest such ratio. | at most 1.10 |
+| `libopus_changed` | With `--baseline`: jobs whose libopus `err` differs from the stored one. A comparison with a stored run is valid only when this is 0, that is with the same libopus build. | 0 |
+| `baseline_snr` | With `--baseline`, for groups with `delta_snr`: the mean change of opus1's SNR. | at least -0.5 dB |
+
+The error limits start from values that the research notes behind these tools proposed. Nobody calibrated them by listening. The MOC limits are those of the OSCE draft's relative test. Where opus1 at commit `d541821` already exceeds a default limit, the list `CALIBRATED` in `examples/eval/sets.rs` sets the limit just above the measured value: 5 % above for `geomean_err`, 10 % above for `max_err`, 0.01 for the bytes gates, and 0.05 or 0.01 for the MOC gates. Each of its 28 entries carries the measured value in a comment. These limits warn when a gap grows. They are not quality targets.
+
+Gates only warn. `eval run` exits with 1 when a job fails, for example on a final range mismatch, a failed decode call or a different look-ahead. With `--strict` it also exits with 1 when a gate fails. In `cargo test` the gates of the `quick` set only warn too. The conformance test is the one quality check that makes the test suite fail.
+
+### The self-test
+
+The self-test shows that the gates see a degradation. It runs on the `selftest` set (6 conditions, 4 items). It runs every job once without a degradation, and then:
+
+- Two identity checks: libopus against libopus and opus1 against opus1. Each pair must be exactly neutral (`ratio_err` and `ratio_bytes` 1, `delta_snr_db` and `moc_d` 0), and pass every gate.
+- Seven degradations of the opus1 side, applied from outside the codec. Each must make at least one gate fail that passes without it, in a group it applies to. The gates of `--baseline` count, with the undegraded run as the stored run.
+
+| Degradation | What it does | Gates it trips | For example |
+|---|---|---:|---|
+| `lowpass` | A 4th-order Butterworth low-pass on the decoded signal, run forward and backward: 7 kHz at 24 and 48 kHz, 3.5 kHz at 12 and 16 kHz, 2 kHz at 8 kHz. | 8 | `celt_high delta_snr` -4.15 dB; `silk_low moc_mean` -0.206 |
+| `noise:30`, `noise:20` | White noise 30 or 20 dB below the level of the decoded signal. | 17, 25 | `celt_high geomean_err 96000` 2.23; `silk_low max_err` 7.31 |
+| `shift:1ms` | The decoded signal is delayed by 1 ms. | 12 | `celt_mid align` 4 jobs; `celt_mid delta_snr` -16.4 dB |
+| `underspend:0.75` | opus1 codes at 75 % of the bitrate. | 19 | `silk_low bytes_min` 0.74; `celt_mid bytes_cbr` 0.25 |
+| `overspend:1.10` | opus1 codes at 110 % of the bitrate. | 4 | `celt_high bytes` 1.101; `celt_mid bytes_cbr` 0.10 |
+| `alloc:mask` | CELT with a constant bitrate only: an energy mask of -2.0 on bands 0 to 10 and +0.25 on bands 11 to 20. The packets keep their size, only the allocation of bits to bands changes. | 3 | `celt_mid baseline_geomean` 1.0222; `baseline_snr` -0.86 dB |
+
+What the self-test shows about the gates:
+
+- `opus_compare` hardly sees the low-pass: the geometric mean of `ratio_err` over the 18 jobs only moves from 1.1503 to 1.1513. Removing the high band of CELT also removes its coding noise. The gates of the signal-to-noise ratio and of MOC catch it.
+- The energy mask raises `err` by only 2.2 %. Only the gates of `--baseline` catch it, and by small margins. With their limits loosened to 1.03, 1.11 and -1.0 dB, it goes unseen and the self-test fails. Loosening the bytes limits by 0.15 lets `overspend:1.10` through in the same way. Without the MOC gates, or without the gates of the signal-to-noise ratio and the alignment, every degradation is still caught by another gate.
+- `tests/eval_selftest.rs` also evaluates the same runs with every limit out of reach, and requires the self-test to fail. It checks as well that a gate that fails without a degradation is not counted for any degradation.
+
+### Running the harness
+
+```text
+cargo run --release --example eval -- list [--set NAME]
+cargo run --release --example eval -- run [--set NAME] [--json PATH] [--md PATH] [--text PATH]
+    [--baseline JSON] [--degrade KIND] [--write-wav DIR] [--decoder libopus|opus1]
+    [--filter TEXT] [--items FILE] [--item-filter TEXT] [--max-items N] [--corpus DIR]
+    [--threads N] [--strict]
+cargo run --release --example eval -- selftest
+cargo run --release --example eval -- conformance [--vectors DIR]
+cargo run --release --example eval -- moc REF.wav TEST.wav [--apply-vad]
+cargo run --release --example eval -- corpus-index --root DIR --out FILE [--per-group N] [--class CLASS]
+cargo run --release --example eval -- merge RUN.json TIER2.jsonl [--json PATH]
+```
+
+- `run` prints a text report: per condition the geometric mean of `ratio_err` with its 95 % bootstrap interval, the largest ratio and its item, the bytes ratio, `delta_snr_db`, the mean `moc_d`, and libopus's error. Then the gates and the worst jobs.
+- `--json` writes one result row per line, with the settings of each condition, the git commit, the libopus version and library directory, and a hash of the items. `--baseline` reads such a file and adds the gates of a comparison with it. `--md` writes one Markdown table per group.
+- `--filter` keeps the conditions whose name or group contains one of its comma-separated parts.
+- `corpus-index` writes a set file from a directory of WAV files: one item per line, `path class start duration`, with N files per directory, evenly spaced.
+- `--write-wav DIR` writes, for each job, the reference, the input and both decoded signals, plus 16 kHz versions of speech in mono, and a `manifest.jsonl`. `scripts/eval/tier2.py DIR/manifest.jsonl` runs the external metrics that are installed (ViSQOL, PESQ wideband, SCOREQ, PLCMOS) and installs nothing. `merge` then adds their paired differences, with bootstrap intervals, and lists the items where a metric and `opus_compare` disagree on which side is better.
+
+The run of the `baseline` set on 2026-10-18 (233 items, 9,056 jobs, no job error, 171.8 s on 12 threads; at commit `5e07998`, whose codec is that of `d541821`) is kept outside git in `target/perf/eval/baseline_d541821.json`, with its text and Markdown reports. [Differences from libopus](10-differences-from-libopus.md#paired-comparison-with-the-evaluation-harness) summarizes what it found.
+
+### The evaluation tests
+
+| Test file | Tests | Needs |
+|---|---:|---|
+| `eval_opus_compare.rs` | 5 | nothing; the C program for its live part |
+| `eval_moc.rs` | 3 | nothing; Python with numpy for its live part |
+| `eval_demo.rs` | 7 | nothing |
+| `eval_rfc8251.rs` | 2 | the RFC 8251 vectors |
+| `eval_selftest.rs` | 9 | nothing: the `quick` and `selftest` sets use the fixtures |
+
+`eval_selftest.rs` runs the self-test, the `quick` set (whose gates only warn), the settings check over the 92 conditions of the built-in sets, the resampler's pass band and stop band, the items and degradations, the statistics, the set files and the merge of external metrics. It takes about 5 s on Apple M4 Pro. `OPUS1_EVAL_RECORD=1` lets `eval_opus_compare.rs` and `eval_moc.rs` rewrite their `.expected` files from the C program or the Python script. Do this on 64-bit ARM macOS only, where the values are exact.
 
 ## Fuzzing
 
@@ -412,6 +635,7 @@ Some details:
 
 - The tests open `fixtures/answer_16k.wav` through a path that is fixed when they are compiled (`env!("CARGO_MANIFEST_DIR")`). While cargo compiles opus1, `rustc-wrapper.sh` sets that variable to `DEVICE_DIR`. The scripts copy `fixtures/` there.
 - Each test program runs with `RUST_MIN_STACK=33554432`, as on macOS.
+- The conformance test of RFC 8251 needs the test vectors on the phone. The default corpus root there is `corpus/` under `DEVICE_DIR`. Without the vectors the test passes with a "skipped" message (see [Corpora](#corpora)).
 - The documentation tests do not run on the phone. Stable Rust cannot run them for another target.
 - The programs run on the phone detached from adb (`setsid`). A dropped USB connection does not stop them. `test.sh --collect` waits for such a run and collects its logs.
 - `test.sh` copies the logs of each run to a new directory, `target/android/test-logs/<date>-<time>/`, so a later run does not delete them. `test-logs/latest` points at the newest one.
@@ -484,6 +708,11 @@ The earlier runs linked the main branch of libopus (see [Which libopus source to
 | Golden hashes | `cargo run --release --example perf_harness -- golden --check <file>` |
 | `no_std` builds and tests | `scripts/check_no_std.sh` |
 | Fuzzing (stable toolchain) | `fuzz/fuzz.sh <target> <seconds>` |
+| RFC 8251 conformance | `OPUS1_CORPUS=<corpus> cargo test --release --test eval_rfc8251 -- --nocapture` |
+| `opus_compare` against the C program | `scripts/eval/check-opus-compare.sh --src <libopus 1.6.1 source>`, then `OPUS1_OPUS_COMPARE_C=target/eval/opus_compare/opus_compare_exact cargo test --release --test eval_opus_compare` |
+| Paired comparison with libopus | `cargo run --release --example eval -- run` (the `quick` set) |
+| The self-test of the gates | `cargo run --release --example eval -- selftest` |
+| Get a corpus | `scripts/eval/fetch-corpus.sh rfc8251` |
 | Tests on an Android phone | `scripts/android/build-libopus.sh --src <libopus 1.6.1 source>`, then `scripts/android/test.sh` |
 | Golden hashes on a phone | `scripts/android/golden.sh --check <file>` |
 | Timings on a phone | `scripts/android/bench.sh --runs 2` |

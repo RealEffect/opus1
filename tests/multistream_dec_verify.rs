@@ -117,7 +117,7 @@ fn sweep_with_clicks(fs: i32, channels: usize, samples: usize) -> Vec<f32> {
             let mut v = 0.2 * phase.sin();
             let since_click = i % click_period;
             if since_click < 48 {
-                v += 0.6 * (1.0 - since_click as f64 / 48.0) * if since_click % 2 == 0 { 1.0 } else { -1.0 };
+                v += 0.6 * (1.0 - since_click as f64 / 48.0) * if since_click.is_multiple_of(2) { 1.0 } else { -1.0 };
             }
             pcm[i * channels + c] = v as f32;
         }
@@ -324,6 +324,7 @@ fn changing_frame_sizes_and_bitrates_match_libopus() {
     const ALL: &[usize] = &[960, 120, 2880, 480, 240, 1920, 960];
     const FROM_10_MS: &[usize] = &[960, 2880, 480, 1920, 960];
     // (encoder rate, application, complexity, frame sizes, kb/s per channel)
+    #[allow(clippy::type_complexity)]
     let cases: [(i32, i32, i32, &[usize], [i32; 5]); 6] = [
         (48000, APP_LOWDELAY, 10, ALL, [48, 9, 20, 64, 14]),
         (48000, APP_LOWDELAY, 3, ALL, [48, 24, 32, 64, 40]),
@@ -595,7 +596,7 @@ fn sixteen_bit_output_routes_and_silences_like_libopus() {
         assert_eq!(enc.stream_ctl(0, OPUS_SET_FORCE_CHANNELS_REQUEST, 2), 0);
         enc.set_bitrate(kbps * 1000 * 3);
         let pcm: Vec<f32> = sweep_with_clicks(FS, 3, FS as usize / 2).iter().map(|v| v * gain).collect();
-        let packets: Vec<Vec<u8>> = pcm.chunks_exact(480 * 3).map(|c| enc.encode_float(c, 480, max_packet_bytes(2)).unwrap()).collect();
+        let packets: Vec<Vec<u8>> = pcm.as_chunks::<{ 480 * 3 }>().0.iter().map(|c| enc.encode_float(c, 480, max_packet_bytes(2)).unwrap()).collect();
         // Outputs: right, silent, mono, left, mono, silent, right.
         let mapping = [1u8, 255, 2, 0, 2, 255, 1];
         let ch = mapping.len();
@@ -641,7 +642,7 @@ fn float_and_sixteen_bit_calls_alternate_like_libopus() {
     }
     enc.set_bitrate(4 * 40_000);
     let pcm: Vec<f32> = voiced(FS, 4, FS as usize).iter().map(|v| v * 7.0).collect();
-    let packets: Vec<Vec<u8>> = pcm.chunks_exact(960 * 4).map(|c| enc.encode_float(c, 960, max_packet_bytes(2)).unwrap()).collect();
+    let packets: Vec<Vec<u8>> = pcm.as_chunks::<{ 960 * 4 }>().0.iter().map(|c| enc.encode_float(c, 960, max_packet_bytes(2)).unwrap()).collect();
     for fs in [16000, 48000] {
         let mut c_dec = CMsDecoder::new(fs, 4, 2, 2, &[0, 1, 2, 3]).unwrap();
         let mut r_dec = MultistreamDecoder::with_layout(fs, 4, 2, 2, &[0, 1, 2, 3]).unwrap();

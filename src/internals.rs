@@ -22,6 +22,12 @@ pub mod celt {
 pub mod celt_lpc {
     pub use crate::celt_lpc::{autocorr, lpc};
 }
+/// The evaluation tools of `src/eval/`: `opus_compare`, MOC and the
+/// `opus_demo -d` decoding loop.
+#[cfg(feature = "std")]
+pub mod eval {
+    pub use crate::eval::*;
+}
 pub mod hp_cutoff {
     pub use crate::hp_cutoff::{dc_reject_float, hp_cutoff};
 }

@@ -6,9 +6,9 @@
 //!
 //! The linked libopus is the float build and does not contain that function.
 //! The "C reference" lines were printed by the C function itself, compiled
-//! from the fixed-point source (silk/fixed/burg_modified_FIX.c) and called
-//! with the same input and arguments. The libopus 1.6.1 source gives these
-//! values for all five inputs.
+//! from the fixed-point source (silk/fixed/burg_modified_FIX.c) of the
+//! official libopus 1.6.1 release and called with the same input and
+//! arguments.
 
 #[cfg(test)]
 mod tests {
@@ -149,14 +149,14 @@ mod tests {
         );
 
         // C reference (libopus 1.6.1): res_nrg=15780 res_nrg_Q=7
-        // A_Q16=[69820,26559,-7459,-23256,-2242,0,0,0,0,0,0,0,0,0,0,0]
+        // A_Q16=[71536,26422,-10006,-24432,0,0,0,0,0,0,0,0,0,0,0,0]
         //
-        // This quiet input is the one case in this file where line 72 of
-        // burg_modified_FIX.c matters: libopus 1.6 adds 1 to the frame
-        // energy ("make sure the noise corresponds to at least a unit
-        // pulse"). Without that line the same C function gives
-        // [71536,26422,-10006,-24432,0,...], the values this test held
-        // before.
+        // This quiet input is the one case in this file where the main
+        // branch of libopus differs from the 1.6.1 release. The main branch
+        // adds 1 to the frame energy (line 72 of burg_modified_FIX.c: "make
+        // sure the noise corresponds to at least a unit pulse") and gives
+        // [69820,26559,-7459,-23256,-2242,0,...] with the same residual
+        // energy. The 1.6.1 release has no such line.
         println!("TEST_LOW_AMP:");
         println!("  res_nrg={} res_nrg_q={}", res_nrg, res_nrg_q);
         print!("  A_Q16=[");
@@ -169,7 +169,7 @@ mod tests {
         println!("]");
 
         let c_a_q16 = [
-            69820, 26559, -7459, -23256, -2242, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            71536, 26422, -10006, -24432, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         // The results are integers and opus1 has the C values exactly.
         assert_eq!((res_nrg, res_nrg_q), (15780, 7));

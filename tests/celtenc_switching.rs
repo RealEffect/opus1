@@ -54,7 +54,7 @@ fn signal(kind: u32, n: usize, channels: usize, noise: &mut Noise, phase: &mut f
         if channels == 2 {
             // The second channel is the first turned upside down for the
             // even kinds: all side, no mid.
-            x[2 * i + 1] = if kind % 2 == 0 { -s } else { 0.5 * s };
+            x[2 * i + 1] = if kind.is_multiple_of(2) { -s } else { 0.5 * s };
         }
     }
     x
@@ -90,7 +90,7 @@ fn settings_changed_between_frames() {
         let mut out = vec![0.0f32; fs / 50 * channels];
         for k in 0..400 {
             let lm = pick(4);
-            let n = fs / 400 << lm;
+            let n = (fs / 400) << lm;
             let vbr = pick(2) == 0;
             let bitrate = [6_000, 12_000, 24_000, 48_000, 96_000, 160_000, 320_000, 510_000][pick(8)];
             let bytes = if vbr {

@@ -76,7 +76,7 @@ fn bandwidth_changes_match_libopus() {
     let mut enc = CEnc::audio(48000, 1);
     enc.force_mode(MODE_CELT).bitrate(64000);
     let packets: Vec<Vec<u8>> = pcm
-        .chunks_exact(960)
+        .as_chunks::<960>().0.iter()
         .enumerate()
         .map(|(i, f)| {
             enc.bandwidth(plan[(i / 10) % plan.len()]);

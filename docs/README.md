@@ -14,8 +14,8 @@ These documents explain the Opus audio codec and `opus1`. Opus is defined in RFC
 | [06 Using the library](06-using-the-library.md) | Recipes for calls, voice agents and music; choosing frame duration, bitrate and complexity; packet loss; the `#![no_std]` build; errors, threads and memory. |
 | [07 Architecture](07-architecture.md) | Every source file and the libopus file it ports, the main types, floating point and fixed point, feature flags, processor-specific code, `unsafe` code and the layout of the tests. |
 | [08 Performance](08-performance.md) | How speed is measured against libopus, the latest results, the changes that made the code fast, and how to reproduce the numbers. |
-| [09 Testing](09-testing.md) | How libopus is linked for the tests, what the tests compare, the groups of test files, the documentation examples, fuzzing, and the command for each part. |
-| [10 Differences from libopus](10-differences-from-libopus.md) | What `opus1` does not implement, where it differs on purpose, and how far its output differs from libopus, with the measured figures. |
+| [09 Testing](09-testing.md) | How libopus is linked for the tests, what the tests compare, the groups of test files, the evaluation tools (the RFC 8251 conformance test, and the comparison of decoded audio with libopus's), the documentation examples, fuzzing, and the command for each part. |
+| [10 Differences from libopus](10-differences-from-libopus.md) | What `opus1` does not implement, where it differs on purpose, and how far its output differs from libopus, with the measured figures and the results of the evaluation tools. |
 | [Glossary](glossary.md) | The terms used in these documents, in alphabetical order. |
 
 ## Reading order for users

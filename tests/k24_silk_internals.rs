@@ -66,7 +66,7 @@ fn decode_pulses_matches_libopus() {
                 0 => rng.next() as u8,
                 1 => (rng.next() % 8) as u8,
                 2 => 255 - (rng.next() % 8) as u8,
-                _ => if rng.next() % 3 == 0 { rng.next() as u8 } else { 0 },
+                _ => if rng.next().is_multiple_of(3) { rng.next() as u8 } else { 0 },
             })
             .collect();
         let signal_type = rng.range(0, 2);
@@ -331,7 +331,7 @@ fn nlsf2a_matches_libopus_on_resonant_filters() {
             let mut v: Vec<i32> = Vec::new();
             let centre = rng.range(300, 32000);
             while v.len() < order {
-                let x = if rng.next() % 3 == 0 {
+                let x = if rng.next().is_multiple_of(3) {
                     rng.range(100, 32600)
                 } else {
                     centre + rng.range(-200, 200)

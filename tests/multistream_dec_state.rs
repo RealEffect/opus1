@@ -439,7 +439,7 @@ fn random_call_orders_on_silk_streams_match_libopus() {
             for fs in [8000, 12000, 24000] {
                 seed += 1;
                 let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9));
-                let steps = random_steps(e.packets.len(), frame / 120, &mut rng, seed % 3 == 0);
+                let steps = random_steps(e.packets.len(), frame / 120, &mut rng, seed.is_multiple_of(3));
                 total.add(&run_steps_against_c(&e, fs, &steps));
             }
         }
@@ -816,7 +816,7 @@ fn damaged_packets_on_the_widest_layouts_get_the_verdict_of_libopus() {
     let stereo = encode_bursts(enc, 12, 480, 60, 1.0, "127 stereo streams and 1 mono stream");
     assert_eq!((stereo.streams, stereo.coupled), (128, 127));
 
-    let mut rng = Rng(0xBADC_0DE);
+    let mut rng = Rng(0x0BAD_C0DE);
     let (mut accepted, mut rejected, mut skipped) = (0, 0, 0);
     for (e, fs) in [(&mono, 8000), (&stereo, 16000)] {
         assert!(!e.has_mono_coded_stereo_stream(), "{}", e.label);
@@ -829,11 +829,11 @@ fn damaged_packets_on_the_widest_layouts_get_the_verdict_of_libopus() {
             let original = &e.packets[rng.below(e.packets.len())];
             // One packet in four is fed as it is.
             let packet = if round % 4 == 0 { original.clone() } else { damage(original, &mut rng) };
-            if let Ok(parts) = split_streams(&packet, e.streams) {
-                if parts.iter().enumerate().any(|(s, part)| toc(part.toc).stereo != (s < e.coupled)) {
-                    skipped += 1;
-                    continue;
-                }
+            if let Ok(parts) = split_streams(&packet, e.streams)
+                && parts.iter().enumerate().any(|(s, part)| toc(part.toc).stereo != (s < e.coupled))
+            {
+                skipped += 1;
+                continue;
             }
             let what = format!("{} at {fs} Hz, round {round}, {} bytes", e.label, packet.len());
             let fec = rng.below(8) == 0;
@@ -929,10 +929,10 @@ fn made_up_packets_get_the_verdict_of_libopus() {
                         packet.truncate(rng.below(packet.len() + 1));
                     }
                 }
-                if let Ok(parts) = split_streams(&packet, streams) {
-                    if parts.iter().enumerate().any(|(s, part)| toc(part.toc).stereo != (s < coupled)) {
-                        continue;
-                    }
+                if let Ok(parts) = split_streams(&packet, streams)
+                    && parts.iter().enumerate().any(|(s, part)| toc(part.toc).stereo != (s < coupled))
+                {
+                    continue;
                 }
                 // Mostly room for 120 ms, sometimes any number of samples.
                 let frame_size = match rng.below(6) {

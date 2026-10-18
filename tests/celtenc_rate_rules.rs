@@ -124,3 +124,76 @@ fn silent_frames_under_vbr() {
         }
     }
 }
+
+/// The silence flag of a stereo input coded as mono.
+///
+/// libopus measures the peak level of a frame over `C*(N-overlap)` and
+/// `C*overlap` samples of the input (celt_encoder.c, lines 1969-1971).
+/// `C` is the number of coded channels, but the input holds both input
+/// channels, interleaved. So with one coded channel libopus measures only
+/// the first half of the frame. A frame whose first half is digital silence
+/// is coded as a silent frame even when its second half has a signal.
+///
+/// The signal has stretches of digital silence of 13 to 96 ms, so their
+/// ends fall at every place in a frame. The test counts the frames where
+/// measuring the whole frame would give another flag, and requires some.
+#[test]
+fn silence_flag_of_stereo_input_coded_as_mono() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut pick = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 16) as usize % n
+    };
+    // A debug build (the `no_std` check runs one) codes a part of the matrix.
+    let debug = cfg!(debug_assertions);
+    let rates: &[usize] = if debug { &[48_000, 8_000] } else { &[48_000, 16_000, 8_000] };
+    let durations: &[usize] = if debug { &[5, 20] } else { &[5, 10, 20, 40] };
+    let settings: &[(bool, i32)] = if debug { &[(true, 0), (false, 0)] } else { &[(true, 0), (true, 5), (false, 0), (false, 10)] };
+    for &fs in rates {
+        let left = music(fs, 2, 0);
+        let right = music(fs, 2, 1);
+        let mut pcm: Vec<f32> = left.iter().zip(&right).flat_map(|(&l, &r)| [l, r]).collect();
+        let mut pos = 0;
+        let mut silent = false;
+        while pos < left.len() {
+            let len = (fs * (13 + pick(84)) / 1000).min(left.len() - pos);
+            if silent {
+                pcm[2 * pos..2 * (pos + len)].fill(0.0);
+            }
+            silent = !silent;
+            pos += len;
+        }
+        let threshold = 1.0 / (1u32 << 24) as f32;
+        for &frame_ms_x2 in durations {
+            let mut st = Stream::new(fs, 2, frame_ms_x2, 32_000);
+            st.stream_channels = 1;
+            // Frames where libopus's measure and a measure of the whole
+            // frame disagree.
+            let api_overlap = 120 * fs / 48_000;
+            let (mut first_half_max, mut whole_max) = (0f32, 0f32);
+            let mut disagree = 0;
+            for frame in pcm.chunks_exact(st.frame * 2) {
+                let peak = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let body = st.frame - api_overlap;
+                let first_half = peak(&frame[..body]).max(first_half_max);
+                first_half_max = peak(&frame[body..st.frame]);
+                let whole = peak(&frame[..2 * body]).max(whole_max);
+                whole_max = peak(&frame[2 * body..]);
+                let by_libopus = first_half.max(first_half_max) <= threshold;
+                let by_whole_frame = whole.max(whole_max) <= threshold;
+                disagree += (by_libopus != by_whole_frame) as usize;
+            }
+            assert!(disagree > 0, "{fs} Hz, frame {frame_ms_x2}/2 ms: no frame shows the rule");
+            for &(vbr, complexity) in settings {
+                st.vbr = vbr;
+                st.complexity = complexity;
+                let what = format!(
+                    "{fs} Hz, frame {frame_ms_x2}/2 ms, vbr {vbr}, complexity {complexity}, {disagree} frames"
+                );
+                assert_same_packets(&st, &pcm, &what);
+            }
+        }
+    }
+}

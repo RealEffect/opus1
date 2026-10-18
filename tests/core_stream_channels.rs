@@ -117,7 +117,7 @@ fn sweep(
 fn down_and_up(frame_ms_x10: usize) -> impl Fn(usize) -> i32 {
     move |i| {
         let step = (i * frame_ms_x10 / 800) % 64;
-        8000 + 1000 * if step < 32 { 32 - step } else { step - 32 } as i32
+        8000 + 1000 * step.abs_diff(32) as i32
     }
 }
 
@@ -259,7 +259,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
             assert_eq!(got, want, "{frame_ms} ms, at {ms} ms: channels");
             // Stereo at first, mono from the low bitrate on, also at 64 kb/s,
             // and stereo again once the caller clears the setting.
-            let expected = if ms < 1200 || ms >= 4800 { 2 } else if ms >= 1200 + 2 * frame_ms { 1 } else { want };
+            let expected = if !(1200..4800).contains(&ms) { 2 } else if ms >= 1200 + 2 * frame_ms { 1 } else { want };
             assert_eq!(want, expected, "{frame_ms} ms, at {ms} ms: libopus");
             if (1200 + 2 * frame_ms..4800).contains(&ms) {
                 assert_eq!(forced, Some(1), "{frame_ms} ms, at {ms} ms");

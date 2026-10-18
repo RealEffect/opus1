@@ -1397,14 +1397,14 @@ mod tests {
         /// odd ones.
         fn signal(&mut self, n: usize, trial: usize) -> Vec<i16> {
             (0..n)
-                .map(|_| if trial % 2 == 0 { self.range(-12000, 12000) as i16 } else { self.i16_edgy() })
+                .map(|_| if trial.is_multiple_of(2) { self.range(-12000, 12000) as i16 } else { self.i16_edgy() })
                 .collect()
         }
         /// Filter states: of the size real signals produce for even trials,
         /// anything for odd ones.
         fn states<const N: usize>(&mut self, trial: usize) -> [i32; N] {
             core::array::from_fn(|_| {
-                if trial % 2 == 0 { self.range(-(1 << 26), 1 << 26) } else { self.i32_edgy() }
+                if trial.is_multiple_of(2) { self.range(-(1 << 26), 1 << 26) } else { self.i32_edgy() }
             })
         }
     }
@@ -1545,7 +1545,7 @@ mod tests {
             for &n in &LENGTHS {
                 for trial in 0..6 {
                     // Exactly as long as the last output sample needs.
-                    let last_pos = if n == 0 { 0 } else { ((n as i64 - 1) * inc as i64 >> 16) as usize };
+                    let last_pos = if n == 0 { 0 } else { (((n as i64 - 1) * inc as i64) >> 16) as usize };
                     let buf = rng.signal(last_pos + RESAMPLER_ORDER_FIR_12, trial);
                     let mut expect = vec![0i16; n];
                     iir_fir_interpol_reference(&mut expect, &buf, inc);
@@ -1657,7 +1657,7 @@ mod tests {
     /// A work buffer for `n` output samples: exactly as long as the last
     /// one needs.
     fn down_fir_buf(rng: &mut Lcg, n: usize, inc: i32, order: usize, trial: usize) -> Vec<i32> {
-        let last_pos = if n == 0 { 0 } else { ((n as i64 - 1) * inc as i64 >> 16) as usize };
+        let last_pos = if n == 0 { 0 } else { (((n as i64 - 1) * inc as i64) >> 16) as usize };
         (0..last_pos + order)
             .map(|_| match trial % 3 {
                 0 => rng.range(-(1 << 23), 1 << 23),
@@ -1750,7 +1750,7 @@ mod tests {
                 for inc in increments(false) {
                     // The buffer the last of `n` samples needs, minus some.
                     let short = |window: usize| -> Vec<i32> {
-                        let last_pos = ((n as i64 - 1) * inc as i64 >> 16) as usize;
+                        let last_pos = (((n as i64 - 1) * inc as i64) >> 16) as usize;
                         vec![1i32; (last_pos + window).saturating_sub(missing)]
                     };
                     let what = format!("n={n} missing={missing} inc={inc}");
@@ -1781,7 +1781,7 @@ mod tests {
                     );
                 }
                 for inc in increments(true) {
-                    let last_pos = ((n as i64 - 1) * inc as i64 >> 16) as usize;
+                    let last_pos = (((n as i64 - 1) * inc as i64) >> 16) as usize;
                     let len = (last_pos + RESAMPLER_ORDER_FIR_12).saturating_sub(missing);
                     let buf = vec![1i16; len];
                     assert!(

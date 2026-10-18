@@ -57,3 +57,71 @@ fn low_delay_input_is_dc_rejected_like_libopus() {
         assert!((bytes as f64 / c_bytes as f64 - 1.0).abs() < 0.05, "{what}: {bytes} bytes, libopus {c_bytes}");
     }
 }
+
+/// After a stereo signal stops, the output of the DC filter decays for
+/// about half a second before it falls below CELT's silence threshold. Its
+/// two channels are then scaled copies of each other, at peak levels from
+/// about 1e-3 down to 6e-8. Every packet of these frames must be libopus's:
+/// CELT-only at 8, 16 and 48 kHz, 10 and 20 ms, constant and variable
+/// bitrate, with output buffers from 25 bytes (a mono stream with a
+/// narrowed stereo image, `stereo_fade`) to 1275 bytes (stereo at
+/// 510 kb/s).
+///
+/// Before, a few packets in each stream differed (up to 6 of 600). The
+/// causes were the `EPSILON` terms of `intensity_stereo` and of the
+/// transient analysis, and the rounding of the gain in `stereo_fade`.
+#[test]
+fn the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it() {
+    let mut seed = 0x6c07_8965_d1b5_4a32u64;
+    let mut pick = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 16) as usize % n
+    };
+    // A debug build (the `no_std` check runs one) codes a part of the matrix.
+    let debug = cfg!(debug_assertions);
+    let seconds = if debug { 2.0 } else { 12.0 };
+    let rates: &[usize] = if debug { &[8000, 48000] } else { &[8000, 16000, 48000] };
+    let durations: &[usize] = if debug { &[20] } else { &[10, 20] };
+    let buffers: &[usize] = if debug { &[25, 1275] } else { &[25, 50, 100, 1275] };
+    let mut packets = 0;
+    for &rate in rates {
+        // Speech in stretches of 50 to 400 ms, with digital silence of 0.8
+        // to 1.6 s between them.
+        let mut input = to_stereo(&speech_fullband(rate, seconds), rate);
+        let samples = input.len() / 2;
+        let (mut pos, mut silent) = (0, false);
+        while pos < samples {
+            let ms = if silent { 800 + pick(801) } else { 50 + pick(351) };
+            let len = (rate * ms / 1000).min(samples - pos);
+            if silent {
+                input[2 * pos..2 * (pos + len)].fill(0.0);
+            }
+            silent = !silent;
+            pos += len;
+        }
+        for &frame_ms in durations {
+            let frame = rate * frame_ms / 1000;
+            for &out_len in buffers {
+                for vbr in [false, true] {
+                    let what = format!("{rate} Hz, {frame_ms} ms, {out_len}-byte buffer, vbr {vbr}");
+                    let mut enc = OpusEncoder::new(rate as i32, 2, Application::RestrictedLowDelay).unwrap();
+                    enc.set_bitrate(Bitrate::BitsPerSecond(510_000)).unwrap();
+                    enc.set_complexity(5).unwrap();
+                    enc.set_vbr(vbr);
+                    let mut c_enc = CEncoder::new(rate, 2, APP_LOWDELAY);
+                    c_enc.bitrate(510_000).vbr(vbr).complexity(5);
+                    let mut buf = vec![0u8; out_len];
+                    for (i, pcm) in input.chunks_exact(frame * 2).enumerate() {
+                        let n = enc.encode(pcm, frame, &mut buf).unwrap();
+                        let c_packet = c_enc.try_encode(pcm, frame, out_len).unwrap();
+                        assert_eq!(&buf[..n], &c_packet[..], "{what}: packet {i}");
+                        packets += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!("{packets} packets, all equal to libopus's");
+}

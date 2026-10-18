@@ -952,7 +952,7 @@ mod tests {
         let mut rate_row = [0u8; MAX_LPC_ORDER];
         let whole_tables = case.ec_ix[..order]
             .iter()
-            .all(|&offset| offset as usize % NLSF_EC_TABLE_LEN == 0);
+            .all(|&offset| (offset as usize).is_multiple_of(NLSF_EC_TABLE_LEN));
         if whole_tables {
             let (tables, _) = case.ec_rates_q5.as_chunks::<NLSF_EC_TABLE_LEN>();
             for (cost, table) in rate_cost.iter_mut().zip(tables) {

@@ -495,7 +495,7 @@ fn mask_has_no_effect_on_hybrid_frames() {
         enc.set_vbr(vbr);
         enc.set_energy_mask(mask);
         enc.set_start_band(start_band).unwrap();
-        pcm.chunks_exact(FRAME)
+        pcm.as_chunks::<FRAME>().0.iter()
             .map(|frame| {
                 let mut rc = RangeCoder::new_encoder(60);
                 enc.encode(frame, FRAME, &mut rc);

@@ -389,6 +389,7 @@ mod tests {
     #[test]
     fn family_1_table_matches_vorbis_mappings() {
         // (channels, streams, coupled, mapping, LFE stream)
+        #[allow(clippy::type_complexity)]
         let rows: [(usize, usize, usize, &[u8], Option<usize>); 8] = [
             (1, 1, 0, &[0], None),
             (2, 1, 1, &[0, 1], None),

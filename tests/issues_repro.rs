@@ -270,7 +270,7 @@ fn issue_7_stereo_silk_channels_differ() {
     );
     // Right should differ substantially from Left (not a mono copy).
     let frames = out.len() / 2;
-    let l_minus_r: f32 = out.chunks_exact(2).map(|p| (p[0] - p[1]).abs()).sum();
+    let l_minus_r: f32 = out.as_chunks::<2>().0.iter().map(|p| (p[0] - p[1]).abs()).sum();
     assert!(
         l_minus_r / frames as f32 > 0.005,
         "L and R should differ (M/S decoding), got avg diff={}",

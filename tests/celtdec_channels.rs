@@ -195,7 +195,7 @@ fn mono_stream_gives_two_equal_channels() {
     let mut dec = RsCelt::new(48000, 2);
     for p in &packets {
         let out = dec.decode(Some(p), 960);
-        assert!(out.chunks_exact(2).all(|s| s[0] == s[1]));
+        assert!(out.as_chunks::<2>().0.iter().all(|s| s[0] == s[1]));
     }
 }
 
@@ -266,7 +266,7 @@ fn mono_decoder_does_not_apply_phase_inversion() {
         mixed.extend(
             stereo_dec
                 .decode(Some(p), 960)
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|s| 0.5 * (s[0] + s[1])),
         );
     }

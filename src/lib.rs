@@ -17,6 +17,13 @@ mod compat;
 mod fixedvec;
 mod mathops;
 
+/// Tools that measure decoded audio: a port of libopus `opus_compare`, the
+/// MOC distance of the OSCE draft and the decoding loop of `opus_demo -d`.
+/// Reached as `internals::eval`; not part of the stable API. It needs
+/// `std`.
+#[cfg(feature = "std")]
+mod eval;
+
 mod bands;
 mod celt;
 mod celt_lpc;
@@ -85,6 +92,7 @@ use crate::compat::Math;
 use crate::fixedvec::FixedVec;
 use celt::{CeltDecoder, CeltEncoder};
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float};
+use mathops::mac;
 use range_coder::RangeCoder;
 use silk::enc_api::{SilkControl, SilkEncoder, SilkInput, SilkPrefill};
 use silk::lin2log::silk_lin2log;
@@ -359,6 +367,10 @@ fn compute_redundancy_bytes(
 /// interleaved stereo frame. A gain of 1 keeps the signal and a gain of 0
 /// leaves the average of the two channels in both. The gain moves from `g1`
 /// to `g2` over CELT's overlap (2.5 ms), following the squared CELT window.
+///
+/// libopus computes the gain as `MAC16_16(MULT16_16(w,g2), Q15ONE-w, g1)`.
+/// clang on 64-bit ARM rounds `(1 - w) * g1` and fuses `w * g2` into the
+/// sum, at -Os, -O2 and -O3 alike; `mac` does the same.
 fn stereo_fade(pcm: &mut [f32], g1: f32, g2: f32, frame_size: usize, fs: i32) {
     let window = modes::default_mode().window;
     let inc = celt::resampling_factor(fs).unwrap_or(1);
@@ -368,7 +380,7 @@ fn stereo_fade(pcm: &mut [f32], g1: f32, g2: f32, frame_size: usize, fs: i32) {
     for i in 0..frame_size {
         let g = if i < overlap {
             let w = window[i * inc] * window[i * inc];
-            w * g2 + (1.0 - w) * g1
+            mac((1.0 - w) * g1, w, g2)
         } else {
             g2
         };
@@ -614,14 +626,15 @@ pub struct OpusEncoder {
 
 /// libopus `gain_fade` (opus_encoder.c:581): scale an interleaved frame by a
 /// gain that moves from `g1` to `g2` over CELT's overlap (2.5 ms), following
-/// the squared CELT window, and stays at `g2` after it.
+/// the squared CELT window, and stays at `g2` after it. The gain is
+/// rounded as in `stereo_fade`.
 fn gain_fade(pcm: &mut [f32], g1: f32, g2: f32, frame_size: usize, channels: usize, fs: i32) {
     let window = modes::default_mode().window;
     let inc = celt::resampling_factor(fs).unwrap_or(1);
     let overlap = (window.len() / inc).min(frame_size);
     for i in 0..overlap {
         let w = window[i * inc] * window[i * inc];
-        let g = w * g2 + (1.0 - w) * g1;
+        let g = mac((1.0 - w) * g1, w, g2);
         for c in 0..channels {
             pcm[i * channels + c] *= g;
         }
@@ -2058,6 +2071,16 @@ impl OpusEncoder {
         let mode = d.mode;
         let frame_bandwidth = d.bandwidth;
         let lbrr_coded = d.lbrr_coded;
+        // C 1246 and 1802, `is_digital_silence`: no input sample of the
+        // frame is above 2^-24 (the threshold of `lsb_depth` 24, see
+        // difference 6 of `encode_impl`). C 1888 and 1909-1914: SILK is then
+        // told that the frame has no voice activity (`VAD_NO_ACTIVITY`, 0),
+        // and it lowers its own speech activity below the threshold of its
+        // voice activity flag. Otherwise libopus passes `VAD_NO_DECISION`
+        // (-1), because without the speech and music analysis it has no
+        // decision of its own. SILK acts only on 0.
+        let silk_activity =
+            if celt::max_abs(&input[..frame_size * ch], 0.0) <= 1.0 / (1u32 << 24) as f32 { 0 } else { -1 };
         let f2_5 = fs as usize / 400;
         let f5 = 2 * f2_5;
 
@@ -2403,7 +2426,7 @@ impl OpusEncoder {
                 complexity: self.complexity,
                 packet_loss_perc: self.packet_loss_perc,
                 lbrr_coded: lbrr_coded != 0,
-                activity: 1,
+                activity: silk_activity,
                 to_mono: self.silk_to_mono,
                 reduced_dependency: self.prediction_disabled,
                 opus_can_switch: self.silk_opus_can_switch,
@@ -3058,6 +3081,10 @@ pub struct OpusDecoder {
     /// C `st->rangeFinal`: the state of the range decoder after the last
     /// frame, 0 after a lost frame.
     range_final: u32,
+    /// C `st->last_packet_duration`: samples per channel of the last
+    /// successful decode call, see
+    /// [`last_packet_duration`](Self::last_packet_duration).
+    last_packet_duration: usize,
     /// C `st->softclip_mem`: what the soft clipper of `decode_i16` carries
     /// from one packet to the next, per channel.
     softclip_mem: [f32; OPUS_MAX_CHANNELS],
@@ -3122,6 +3149,7 @@ impl OpusDecoder {
             frame_size: sampling_rate as usize / 400,
             stream_channels: channels,
             range_final: 0,
+            last_packet_duration: 0,
             softclip_mem: [0.0; OPUS_MAX_CHANNELS],
             silk_channels_internal: 0,
             silk_internal_rate: 0,
@@ -3270,6 +3298,8 @@ impl OpusDecoder {
         // is borrowed while it fills the buffer. Without `heap` it is an
         // uninitialized array on the stack; only the part a call fills is
         // touched.
+        let split = lost && frame_size > max_samples;
+        let saved_duration = self.last_packet_duration;
         #[cfg(feature = "heap")]
         let mut pcm = self.w_pcm_float.take().unwrap_or_default();
         #[cfg(not(feature = "heap"))]
@@ -3315,6 +3345,12 @@ impl OpusDecoder {
         {
             self.w_pcm_float = Some(pcm);
         }
+        if split {
+            // libopus conceals the whole loss in one call, which sets the
+            // duration once: to the whole loss, or not at all when the call
+            // fails.
+            self.last_packet_duration = if result.is_ok() { frame_size } else { saved_duration };
+        }
         result
     }
 
@@ -3356,6 +3392,7 @@ impl OpusDecoder {
                 .filter(|&len| len <= output.len())
                 .ok_or("Output buffer too small for packet")?;
             self.conceal(frame_size, &mut output[..lost_len])?;
+            self.last_packet_duration = frame_size;
             return Ok((frame_size, 0));
         }
 
@@ -3376,6 +3413,7 @@ impl OpusDecoder {
                 || self.mode == Some(OpusMode::CeltOnly)
             {
                 self.conceal(frame_size, &mut output[..frame_size * channels])?;
+                self.last_packet_duration = frame_size;
                 return Ok((frame_size, parsed.packet_offset));
             }
             let frame = parsed.frame(data, 0);
@@ -3384,6 +3422,9 @@ impl OpusDecoder {
             let lead = frame_size - packet_frame_size;
             if lead != 0 {
                 self.conceal(lead, &mut output[..lead * channels])?;
+                // C: the concealment is a call of its own, which sets the
+                // duration. It stays when the FEC frame below fails.
+                self.last_packet_duration = lead;
             }
             // Complete with FEC.
             self.mode = Some(packet_mode);
@@ -3397,6 +3438,7 @@ impl OpusDecoder {
                 &mut output[lead * channels..frame_size * channels],
                 true,
             )?;
+            self.last_packet_duration = frame_size;
             return Ok((frame_size, parsed.packet_offset));
         }
 
@@ -3428,6 +3470,7 @@ impl OpusDecoder {
                 false,
             )?;
         }
+        self.last_packet_duration = decoded_total;
         // C: the soft clipper runs on a decoded packet only. Concealed and
         // FEC output returns above, without it, and leaves its memory alone.
         if soft_clip {
@@ -3475,6 +3518,22 @@ impl OpusDecoder {
         self.range_final
     }
 
+    /// libopus `OPUS_GET_LAST_PACKET_DURATION`: the samples per channel of
+    /// the last packet that was decoded or concealed with success, 0 before
+    /// the first one and after [`reset_state`](Self::reset_state).
+    ///
+    /// A decoded packet sets it to its own duration, a concealment or an FEC
+    /// call to the duration it was asked for. A failed call leaves it as it
+    /// was. One exception, as in libopus: when an FEC call must conceal a
+    /// part of the loss before the recovered frame and the recovered frame
+    /// then fails, the value is the concealed part.
+    ///
+    /// After a loss, a caller can use it as the duration to conceal or to
+    /// recover with [`decode_fec`](Self::decode_fec), as `opus_demo` does.
+    pub fn last_packet_duration(&self) -> usize {
+        self.last_packet_duration
+    }
+
     /// libopus `OPUS_RESET_STATE`: forget the stream decoded so far. The
     /// decoder then behaves like a new one with the same sampling rate and
     /// channel count.
@@ -3492,6 +3551,7 @@ impl OpusDecoder {
         self.frame_size = self.sampling_rate as usize / 400;
         self.stream_channels = self.channels;
         self.range_final = 0;
+        self.last_packet_duration = 0;
         self.softclip_mem = [0.0; OPUS_MAX_CHANNELS];
     }
 

@@ -329,6 +329,7 @@ mod tests {
 
     /// `Send` and `Sync` come from the element type.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn auto_traits_follow_the_element_type() {
         fn is_send<T: Send>() {}
         fn is_sync<T: Sync>() {}
@@ -357,6 +358,7 @@ mod tests {
     /// capacities on both sides of the size at which the buffer is filled
     /// through a separate call, and for every length from 0 to the capacity.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn constructors_match_vec_small_and_large() {
         fn check<const N: usize>() {
             let src: Vec<u32> = (0..N as u32).map(|i| i.wrapping_mul(2654435761)).collect();
@@ -465,6 +467,7 @@ mod tests {
     /// is checked on both sides of the 1 kB limit and at lengths 0, 1,
     /// capacity - 1 and capacity, plus random lengths.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn constructors_match_vec_for_other_element_types() {
         fn check<T, const N: usize>(make: impl Fn(u64) -> T, rng: &mut Lcg)
         where

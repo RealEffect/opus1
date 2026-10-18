@@ -328,7 +328,7 @@ fn encoder_matches_the_entenc_model() {
                     }
                     6..=8 => {
                         let logp = 1 + r.next() % 15;
-                        let bit = r.next() % 4 == 0;
+                        let bit = r.next().is_multiple_of(4);
                         rc.encode_bit_logp(bit, logp);
                         model.encode_bit_logp(bit, logp);
                     }

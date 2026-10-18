@@ -729,6 +729,83 @@ fn bands_of_hybrid_and_narrow_frames_are_coded_as_libopus_codes_them() {
     println!("{frames} frames, all equal to libopus's");
 }
 
+/// Stereo bands whose two channels are scaled copies of each other, at very
+/// low levels. This is what the DC filter of the Opus layer leaves after a
+/// stereo signal stops: each channel decays at the same rate, so the right
+/// channel is the left one times a constant.
+///
+/// The normalized shapes of the two channels are then the same, the angle
+/// of every band is 0, and libopus mixes the channels with
+/// `intensity_stereo`. Its weights add `EPSILON` (1e-15) under the square
+/// root of the energies and to the root. At band energies of 1e-6 and
+/// below this changes the weights, and so the pulses.
+#[test]
+fn stereo_bands_that_are_scaled_copies_at_low_levels_are_coded_as_libopus_codes_them() {
+    let m = default_mode();
+    let mut noise = Noise(91);
+    let mut frames = 0;
+    for complexity in [5, 9] {
+        for (lm, bytes) in [(3usize, 1200usize), (3, 160), (3, 50), (2, 80), (1, 40), (0, 25)] {
+            for k in 0..60 {
+                let n = 120 << lm;
+                let mut x = vec![0f32; 2 * n];
+                let mut band_e = vec![0f32; 42];
+                // The level of the frame: band energies from 1e-4 down to
+                // 1e-9, the range of the decaying output of the DC filter.
+                let level = [1e-4f32, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9][k % 6];
+                let ratio = 0.2 + 1.5 * noise.next().abs();
+                for i in 0..21 {
+                    let lo = (m.e_bands[i] as usize) << lm;
+                    let hi = (m.e_bands[i + 1] as usize) << lm;
+                    let band = &mut x[lo..hi];
+                    for v in band.iter_mut() {
+                        *v = noise.next();
+                    }
+                    let e: f32 = band.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    for v in band.iter_mut() {
+                        *v /= 1e-27 + e;
+                    }
+                    let (left, right) = x.split_at_mut(n);
+                    right[lo..hi].copy_from_slice(&left[lo..hi]);
+                    // Higher bands are quieter, as for a decaying DC offset.
+                    let e = level * (0.5 + noise.next().abs()) / (1 + i * i) as f32;
+                    band_e[i] = e;
+                    band_e[21 + i] = ratio * e;
+                }
+                let short_blocks = lm > 0 && k % 3 == 1;
+                let tf = tf_choice(lm, short_blocks, k);
+                let f = frame_settings(
+                    2,
+                    lm,
+                    bytes,
+                    short_blocks,
+                    [2, 1, 0, 3][k % 4],
+                    complexity,
+                    &tf,
+                    band_e,
+                    noise.0,
+                    stereo_choice(k),
+                );
+                let c = run_c(&f, &x);
+                let r = run_rs(&f, &x);
+                let what = format!(
+                    "c{complexity} LM {lm} {bytes} bytes frame {k}, level {level:e} \
+                     (dual {}, intensity {})",
+                    f.dual_stereo, f.intensity
+                );
+                assert_eq!(c.bytes, r.bytes, "{what}: bytes");
+                assert_eq!(c.masks, r.masks, "{what}: collapse masks");
+                assert_eq!(c.seed, r.seed, "{what}: seed");
+                if complexity >= 8 && !f.dual_stereo {
+                    assert!(same_bits(&c.x, &r.x), "{what}: decoded bands");
+                }
+                frames += 1;
+            }
+        }
+    }
+    println!("{frames} frames, all equal to libopus's");
+}
+
 /// Decodes `bytes` with libopus's `quant_all_bands` and with opus1's, for
 /// the frame `f`. Returns the decoded bands, collapse masks and seeds.
 fn decode_both(f: &Frame, bytes: &[u8]) -> (Coded, Coded) {

@@ -309,6 +309,7 @@ struct DamageResult {
 /// eleven is lost. The comparison stops at the first packet after which the
 /// two decoders report different final ranges: their states differ from
 /// there on.
+#[allow(clippy::too_many_arguments)]
 fn damaged_stream(
     packets: &[Vec<u8>],
     rate: usize,

@@ -1,0 +1,44 @@
+# Outputs of libopus 1.6.1 src/opus_compare.c (scripts/eval/opus_compare_exact.c) for
+# tests/eval_common/cases.rs::compare_cases. Fields: case, FNV-1a of the inputs, exit code,
+# bits of the internal weighted error, bits of Q (passing cases only), error message.
+# Recorded on aarch64-macos with OPUS1_EVAL_RECORD=1.
+voice_n40_48k_m	96a473338ec2d59f	0	3f715c452ed1f2d6	42c48a18	-
+voice_n40_48k_s	82f1098e621d48dc	0	3f708ec7ece61b57	42c4b2f9	-
+voice_n40_24k_m	8253f82a15f6162c	0	3f80d9226e21822c	42c14be0	-
+voice_n40_24k_s	bf38bc6fb41960ef	0	3f7d7cf98a777be1	42c2216d	-
+voice_n40_16k_m	716a111206a10871	0	3f839af7c4ebea9c	42c0345f	-
+voice_n40_16k_s	fb99e268ee5b8725	0	3f822751e5d216b1	42c0c77e	-
+voice_n40_12k_m	8836cb437eb7e82e	0	3f829878ddbd4c66	42c09ab0	-
+voice_n40_12k_s	31f49b19eda4d394	0	3f831eee55e91c9d	42c06576	-
+voice_n40_8k_m	b518584f675a914f	0	3f8e6841ab4c76db	42bbf0e9	-
+voice_n40_8k_s	360598a42672a852	0	3f908ec55fafdf92	42bae029	-
+voice_n30_24k_m	87e7ab3003784c74	0	3fb728ed48cc4692	4281230d	-
+voice_n30_24k_s	fe3ca45b5390987d	0	3fb4eb587458f369	4287bafd	-
+voice_n30_12k_s	562cc758970f2cec	0	3fb29602f0fbf655	428ea768	-
+voice_n30_8k_s	4bac01be59755a5b	0	3f920fc4ee87436f	42b9b1a6	-
+voice_n20_48k_m	4da1266d9d5eedcb	1	400193ead2970c37	-	-
+voice_n20_48k_s	950a61e47daf5b31	1	400100dce19eb052	-	-
+voice_n20_16k_m	e54cd3667d01afea	1	400710f12cc49f13	-	-
+voice_n20_16k_s	893094037d8885fc	1	4006330f9e2fd28e	-	-
+identical_48k_s	1b587de0cf244e2e	0	0000000000000000	42c80000	-
+identical_48k_m	ffb6d14768ce5d83	0	0000000000000000	42c80000	-
+silence_48k_s	446006dac2a3858a	0	0000000000000000	42c80000	-
+silence_16k_m	90f879ba0c1a563e	0	0000000000000000	42c80000	-
+lowpass_48k_s	b3af121bc3cde894	1	3fe48ace83bc08c1	-	-
+shift_48k_m	49c86805ddc5bf8c	1	3fde06f506c4727f	-	-
+shift_16k_s	80268c02575f71ae	1	3fe48111d5baf0d2	-	-
+clip_48k_s	e1ba6b179233e03b	1	3fe1174579ee6d58	-	-
+one_frame_48k_s	a9ffb034285798e0	1	3ff6545223deb79d	-	-
+one_frame_8k_m	99d642b5478e70dc	0	3f90c9e59d4d5bed	42bab1ad	-
+tone8k_48k_m	985bba9e7ff32170	1	402c877789c0bd62	-	-
+tone8k_24k_s	e28c160cabf6e9bf	1	402c5a7113ae93a6	-	-
+top_bins_12k_m	8947b9f010cb58b6	1	400a3ee74a1714e3	-	-
+top_bins_16k_s	3bb813be3a0549a3	1	400f13b77170d6a5	-	-
+music_1s_48k_s	e93ac7b603b50014	0	3fbf2c39c75fd597	4253f6cd	-
+noise_full_48k_s	fc05d17294e312de	1	3ff4812b613b8122	-	-
+partial_frame_48k_s	9a019538adf5c256	1	3fe1308e252282eb	-	-
+bad_rate_44100	4b2466213dde1ab9	1	-	-	Sampling rate must be 8000, 12000, 16000, 24000, or 48000
+mismatch_48k_s	e24d28e449bf4f0f	1	-	-	Sample counts do not match (24000!=23999).
+mismatch_16k_m	4340452f1aa7a033	1	-	-	Sample counts do not match (24000!=23997).
+too_short_48k_s	a7ab991ea84d169e	1	-	-	Insufficient sample data (479<480).
+too_short_8k_m	1b3a2caa1ed2f80f	1	-	-	Insufficient sample data (474<480).

@@ -64,7 +64,7 @@ fn main() -> Result<(), &'static str> {
     // three overtones that swells and fades. The LFE channel has a 50 Hz
     // tone.
     let mut pcm = vec![0f32; FRAMES * FRAME * CHANNELS];
-    for (i, frame) in pcm.chunks_exact_mut(CHANNELS).enumerate() {
+    for (i, frame) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
         let t = i as f32 / SAMPLE_RATE as f32;
         let turn = 2.0 * std::f32::consts::PI * t;
         for (c, sample) in frame.iter_mut().enumerate() {

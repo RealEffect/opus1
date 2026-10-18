@@ -127,6 +127,17 @@ Signal processing and tables:
 | `tables_nlsf.rs` | NLSF codebooks. | `silk/tables_NLSF_CB_NB_MB.c`, `silk/tables_NLSF_CB_WB.c` |
 | `mod.rs` | Module list and re-exports. | none |
 
+### Evaluation tools (`src/eval/`, needs `std`)
+
+These files are not part of the codec. They port libopus's test programs, so that tests and the harness `examples/eval` can measure the decoded audio. They are reached as `opus1::internals::eval` (see [Testing](09-testing.md#evaluation-tools)).
+
+| File | What it does | libopus counterpart |
+|---|---|---|
+| `mod.rs` | Module documentation and re-exports. | none |
+| `compare.rs` | `opus_compare` and `opus_compare_many`: the weighted spectral error of the conformance test, bit for bit as the C program built with clang. | `src/opus_compare.c` |
+| `moc.rs` | `moc`, `moc_i16`, `moc_relative`: the MOC distance of the Opus Speech Coding Enhancement draft. | `moc.py` of the libopus git repository (`dnn/torch/osce/stndrd/evaluation/`) |
+| `demo.rs` | `parse_bitstream`, `decode_bitstream`, the `DemoDecoder` trait and `opus_demo_s16`: the decoding loop of `opus_demo -d` and its 16-bit output. | `src/opus_demo.c` |
+
 ### Multistream (`src/multistream/`, needs `std`)
 
 | File | What it does | libopus counterpart |
@@ -307,7 +318,7 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 
 ### `tests/`
 
-The repository holds 234 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
+The repository holds 239 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
 
 | Prefix | Files | What the tests cover |
 |---|---:|---|
@@ -320,9 +331,10 @@ The repository holds 234 test files in `tests/`, plus helper modules in subdirec
 | `mdct_` | 16 | The MDCT. |
 | `issue_`, `issues_` | 15 | Regression tests named after GitHub issues, each reproducing the reported fault. |
 | `verify_`, `pvq_`, `hybrid_` | 5, 4, 4 | Checks of band, PVQ, quantization and SILK functions, and of Hybrid mode. |
+| `eval_` | 5 | The evaluation tools of `src/eval/` against the C program `opus_compare` and the Python script `moc.py`, the `opus_demo` decoding loop with both decoders, the RFC 8251 conformance test, and the paired-comparison harness. Two `.expected` files hold reference values. |
 | others | 19 | Single topics, for example `stack_usage_test.rs` (struct sizes and stack use), `panic_surface_repro.rs` (inputs that once panicked), `quality_regression_test.rs`, `proptest_encode_indices.rs` (property-based tests with `proptest`). |
 
-Helper directories are named after the tests that use them: `celtdec_common/`, `celtenc_common/`, `core_common/`, `k24_common/`, `k24_enc_common/`, `ms_support/`, `multistream_dec_common/`, `multistream_e2e_common/`, `multistream_enc_common/`, `silkdec_common/`, `silkenc_common/`. Each holds a `mod.rs` that a test includes with `mod <name>;`. Several of them wrap the raw C application programming interface (API) of libopus (`audiopus_sys`) for the controls the `opus` crate does not offer, such as forcing the coding mode.
+Helper directories are named after the tests that use them: `celtdec_common/`, `celtenc_common/`, `core_common/`, `eval_common/`, `k24_common/`, `k24_enc_common/`, `ms_support/`, `multistream_dec_common/`, `multistream_e2e_common/`, `multistream_enc_common/`, `silkdec_common/`, `silkenc_common/`. Each holds a `mod.rs` that a test includes with `mod <name>;`. Several of them wrap the raw C application programming interface (API) of libopus (`audiopus_sys`) for the controls the `opus` crate does not offer, such as forcing the coding mode.
 
 Tests marked `#[ignore]` either print measurement tables and assert nothing, or record a known difference from libopus. Run one with `cargo test --release --test <name> -- --ignored --nocapture`.
 
@@ -332,6 +344,8 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
 
 - `multistream.rs`: encodes and decodes two seconds of a 5.1 test signal and prints the layout, packet sizes and signal-to-noise ratio of every channel.
 - `wav_test.rs`: encodes and decodes a WAV (Waveform Audio File Format) file (by default `fixtures/answer_16k.wav`) and writes the decoded files into `fixtures/`.
+- `eval/`: the paired-comparison harness. opus1 and libopus code the same items with the same settings, libopus decodes both, and `opus_compare` and MOC score each output against the original. It also runs the RFC 8251 conformance check and a self-test of its gates. See [Testing](09-testing.md#the-paired-comparison-harness).
+- `opus_compare.rs`: libopus's test program `opus_compare`, with its command line and messages, on top of `src/eval/compare.rs`.
 - `perf_harness.rs`: the timing and comparison tool against libopus. Its commands are `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler` and `spread`. `cargo run --release --example perf_harness -- bench` produces the timings in the README.
 
 ### `benches/`
@@ -345,3 +359,5 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
 ### `scripts/`
 
 `scripts/check_no_std.sh` builds the crate without `std` for `thumbv7em-none-eabi` and `wasm32-unknown-unknown` (when installed) and for the host, then runs the test suite without `std`.
+
+`scripts/eval/` holds the scripts of the evaluation tools: `fetch-corpus.sh` (downloads and checks the corpora), `check-opus-compare.sh` and `opus_compare_exact.c` (build libopus's `opus_compare` as the reference of the port), `moc_reference.py` (the numpy reference of MOC) and `tier2.py` (runs external quality metrics that are installed). See [Testing](09-testing.md#evaluation-tools).

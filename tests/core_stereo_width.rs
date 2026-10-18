@@ -18,7 +18,7 @@ use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
 /// plus right), in dB. It goes down as a stereo image gets narrower.
 fn side_level_db(pcm: &[f32]) -> f64 {
     let (mut mid, mut side) = (0f64, 0f64);
-    for lr in pcm.chunks_exact(2) {
+    for lr in pcm.as_chunks::<2>().0 {
         mid += ((lr[0] + lr[1]) as f64).powi(2);
         side += ((lr[0] - lr[1]) as f64).powi(2);
     }
@@ -136,7 +136,7 @@ fn stereo_input_at_low_bitrates_has_the_channel_count_of_libopus() {
         for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
             // Down from 40 to 8 kb/s and up again, 1 kb/s every 80 ms.
             let step = (i / 4) % 64;
-            let bitrate = 8000 + 1000 * if step < 32 { 32 - step } else { step - 32 } as i32;
+            let bitrate = 8000 + 1000 * step.abs_diff(32) as i32;
             c_enc.bitrate(bitrate);
             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             let n = enc.encode(pcm, frame, &mut buf).unwrap();

@@ -28,7 +28,7 @@ impl SplitMix {
     }
     /// Uniform in `0..n`.
     fn below(&mut self, n: u32) -> u32 {
-        ((self.next() >> 32) * n as u64 >> 32) as u32
+        (((self.next() >> 32) * n as u64) >> 32) as u32
     }
     /// Uniform in [-1, 1).
     fn unit(&mut self) -> f32 {

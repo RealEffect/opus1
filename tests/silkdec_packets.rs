@@ -201,6 +201,7 @@ fn concealment_in_pieces_matches_libopus() {
 fn fec_for_another_duration_than_the_next_packet_matches_libopus() {
     // Duration asked for, in units of 2.5 ms, as a function of the packet
     // duration in the same units.
+    #[allow(clippy::type_complexity)]
     let asks: [(&str, fn(usize) -> usize); 5] = [
         ("twice the packet", |d| 2 * d),
         ("three times the packet", |d| 3 * d),

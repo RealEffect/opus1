@@ -283,7 +283,7 @@ fn max_abs_neon(x: &[f32], init: f32) -> f32 {
 
 /// Largest of `init` and every `|x[i]|`; see `max_abs_scalar`.
 #[inline]
-fn max_abs(x: &[f32], init: f32) -> f32 {
+pub(crate) fn max_abs(x: &[f32], init: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
         max_abs_neon(x, init)
@@ -631,6 +631,12 @@ impl TransientForward {
     /// `mean` and goes through the forward smoothing filter with the decay
     /// `forward_decay`; `keep` is `1 - forward_decay`. `blank` is set for
     /// the first 6 steps: libopus clears the first 12 filtered samples.
+    ///
+    /// In the float build of libopus, `PSHR32` is no shift at all, so the
+    /// energy is not scaled. clang fuses the energy of the two samples and
+    /// the smoothing into fused multiply-adds on 64-bit ARM (`mac`). The
+    /// half of `mem1` in the high-pass filter is exact, so fusing it changes
+    /// nothing.
     #[inline(always)]
     fn step(&mut self, xa: f32, xb: f32, blank: bool, forward_decay: f32, keep: f32) -> f32 {
         let mut ya = self.mem0 + xa;
@@ -647,10 +653,11 @@ impl TransientForward {
             ya = 0.0;
             yb = 0.0;
         }
-        let x2 = (ya * ya + yb * yb) / 16.0;
-        // C float build: PSHR32(x2, 12) is an identity, so mean += x2
+        // C: x2 = PSHR32(MULT16_16(a,a) + MULT16_16(b,b), 4), and
+        // mean += PSHR32(x2, 12). Both shifts are identities in float.
+        let x2 = mac(yb * yb, ya, ya);
         self.mean += x2;
-        self.smooth = x2 + keep * self.smooth;
+        self.smooth = mac(x2, keep, self.smooth);
         forward_decay * self.smooth
     }
 }
@@ -662,7 +669,7 @@ const TRANSIENT_BLANK_STEPS: usize = 6;
 /// `mem` is the filter memory and `max_e` the largest output so far.
 #[inline(always)]
 fn transient_backward_step(e: &mut f32, mem: &mut f32, max_e: &mut f32) {
-    *mem = *e + 0.875 * *mem;
+    *mem = mac(*e, 0.875, *mem);
     *e = 0.125 * *mem;
     if *e > *max_e {
         *max_e = *e;
@@ -826,7 +833,10 @@ fn transient_decision(
         let max_e = passes.max_e[c];
         let mut mean = passes.mean[c];
 
-        mean = (mean * max_e * 0.5 * (len2 as f32)).sqrt();
+        // C: celt_sqrt(mean * maxE*.5*len2). The product of the two floats
+        // is rounded to float. The constant .5 is a double, so the rest and
+        // the square root are computed in double precision.
+        mean = (f64::from(mean * max_e) * 0.5 * len2 as f64).sqrt() as f32;
         // C (float build): norm = len2 / (EPSILON + mean)  [EPSILON = 1e-15f]
         let norm = (len2 as f32) / (1e-15 + mean);
 
@@ -861,8 +871,13 @@ fn transient_decision(
 
     // C (celt_encoder.c:460-461): tf_max = max(0, sqrt(27*mask_metric) - 42);
     // tf_estimate = sqrt(max(0, 0.0069*min(163, tf_max) - 0.139))  [float build]
+    //
+    // `MULT16_16` rounds the product to float. The constant 0.139
+    // (`QCONST32` is no conversion in float) is a double, so the
+    // subtraction and the square root are computed in double precision.
     let tf_max = ((27.0 * mask_metric).sqrt() - 42.0).max(0.0);
-    *tf_estimate = (0.0069 * tf_max.min(163.0) - 0.139).max(0.0).sqrt();
+    let x = f64::from(0.0069f32 * tf_max.min(163.0)) - 0.139;
+    *tf_estimate = (if x > 0.0 { x } else { 0.0 }).sqrt() as f32;
 
     is_transient
 }
@@ -3675,23 +3690,23 @@ mod enc_kernel_tests {
             let mut mean = 0.0f32;
             mem0 = 0.0f32;
             for i in 0..len2 {
-                let x2 = (tmp[2 * i] * tmp[2 * i] + tmp[2 * i + 1] * tmp[2 * i + 1]) / 16.0;
+                let x2 = mac(tmp[2 * i + 1] * tmp[2 * i + 1], tmp[2 * i], tmp[2 * i]);
                 mean += x2;
-                mem0 = x2 + (1.0 - forward_decay) * mem0;
+                mem0 = mac(x2, 1.0 - forward_decay, mem0);
                 tmp2[i] = forward_decay * mem0;
             }
 
             mem0 = 0.0f32;
             let mut max_e = 0.0f32;
             for i in (0..len2).rev() {
-                mem0 = tmp2[i] + 0.875 * mem0;
+                mem0 = mac(tmp2[i], 0.875, mem0);
                 tmp2[i] = 0.125 * mem0;
                 if tmp2[i] > max_e {
                     max_e = tmp2[i];
                 }
             }
 
-            mean = (mean * max_e * 0.5 * (len2 as f32)).sqrt();
+            mean = (f64::from(mean * max_e) * 0.5 * len2 as f64).sqrt() as f32;
             let norm = (len2 as f32) / (1e-15 + mean);
             let mut unmask: i32 = 0;
             for i in (12..(len2 - 5)).step_by(4) {
@@ -3715,7 +3730,8 @@ mod enc_kernel_tests {
             weak_transient = true;
         }
         let tf_max = ((27.0 * mask_metric).sqrt() - 42.0).max(0.0);
-        let tf_estimate = (0.0069 * tf_max.min(163.0) - 0.139).max(0.0).sqrt();
+        let x = (0.0069f32 * tf_max.min(163.0)) as f64 - 0.139;
+        let tf_estimate = x.max(0.0).sqrt() as f32;
         (is_transient, tf_estimate, tf_chan, weak_transient)
     }
 
@@ -4491,14 +4507,21 @@ impl CeltEncoder {
         let mut tf_chan = 0;
         let mut weak_transient = false;
 
-        // C 1970-2005: silence detection (sample_max, overlap_max and
+        // C 1969-2005: silence detection (sample_max, overlap_max and
         // lsb_depth). libopus measures the maxima on the API-rate `pcm`:
-        // `(N-overlap)/upsample` and `overlap/upsample` samples.
-        // The order of the samples does not change a maximum, so all
-        // channels are measured together.
+        // the first `C*(N-overlap)/upsample` samples, then the next
+        // `C*overlap/upsample` ones. The order of the samples does not
+        // change a maximum, so all channels are measured together.
+        //
+        // `C` is the number of coded channels (`channels`), but `pcm` holds
+        // the `cc` input channels interleaved. So when a stereo input is
+        // coded as mono, libopus measures only the first half of the frame,
+        // with both input channels in it. The rest of the frame takes no
+        // part in the silence flag. opus1 does the same.
         let api_overlap = overlap / upsample;
         let n_nonoverlap = api_frame_size.saturating_sub(api_overlap);
-        let (body, tail) = pcm.split_at(n_nonoverlap * cc);
+        let (body, rest) = pcm.split_at(n_nonoverlap * channels);
+        let tail = &rest[..api_overlap * channels];
         let mut sample_max = max_abs(body, self.overlap_max);
         let new_overlap_max = max_abs(tail, 0.0);
         self.overlap_max = new_overlap_max;

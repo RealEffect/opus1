@@ -13,6 +13,7 @@ exclude = [
     "opus-1.6.1/",
     "fuzz/",
     "fixtures/",
+    "corpus/",
 ]
 
 [features]

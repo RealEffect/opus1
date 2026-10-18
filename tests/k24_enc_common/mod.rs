@@ -35,7 +35,7 @@ pub fn load_speech_16k() -> Vec<f32> {
         if id == b"data" {
             let data = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
             return data
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                 .collect();
         }
@@ -595,7 +595,7 @@ pub fn toc_summary(packets: &[Vec<u8>]) -> String {
         *counts.entry(toc(p)).or_default() += 1;
     }
     let mut v: Vec<_> = counts.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|a| std::cmp::Reverse(a.1));
     v.iter()
         .map(|(t, n)| {
             let frames = if t.frames == 1 {

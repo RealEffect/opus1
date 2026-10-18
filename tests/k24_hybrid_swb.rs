@@ -73,7 +73,7 @@ fn own_encoder_24k_voip_packets_decode_like_libopus() {
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     let mut buf = [0u8; 1500];
     let packets: Vec<Vec<u8>> = pcm
-        .chunks_exact(480)
+        .as_chunks::<480>().0.iter()
         .map(|f| {
             let n = enc.encode(f, 480, &mut buf).unwrap();
             buf[..n].to_vec()

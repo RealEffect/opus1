@@ -76,6 +76,7 @@ fn issue46_low_cbr() {
 /// small CELT (not PLC placeholders) and decode to real audio through both
 /// opus1 and libopus.
 #[test]
+#[allow(clippy::needless_range_loop)]
 fn issue46_low_cbr_decodes_as_celt() {
     use opus::{Channels as CCh, Decoder as CDec};
     for (sr, ms, bps, floor) in [

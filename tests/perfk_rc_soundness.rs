@@ -28,7 +28,7 @@ fn overfill(rc: &mut RangeCoder, rng: &mut Lcg) {
     for _ in 0..40_000 {
         match rng.next() % 4 {
             0 => rc.encode_icdf((rng.next() % 4) as i32, &ICDF4, 8),
-            1 => rc.encode_bit_logp(rng.next() % 2 == 0, 1 + rng.next() % 3),
+            1 => rc.encode_bit_logp(rng.next().is_multiple_of(2), 1 + rng.next() % 3),
             2 => rc.enc_bits(rng.next() & 0xFFF, 12),
             _ => {
                 let fl = rng.next() % 100;

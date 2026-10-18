@@ -72,10 +72,10 @@ impl Signal {
                 _ => rng.next() as i16,
             },
             Signal::Square(period) => {
-                if (t / (period / 2).max(1)) % 2 == 0 { i16::MAX } else { i16::MIN }
+                if (t / (period / 2).max(1)).is_multiple_of(2) { i16::MAX } else { i16::MIN }
             }
             Signal::Impulses => {
-                if t % 97 == 0 { i16::MAX } else { 0 }
+                if t.is_multiple_of(97) { i16::MAX } else { 0 }
             }
             Signal::Constant => i16::MIN,
         }

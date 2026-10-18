@@ -245,13 +245,7 @@ fn c_sub_sat32(a: i32, b: i32) -> i32 {
 /// `silk_SAT16(a)`:
 /// `((a) > silk_int16_MAX ? silk_int16_MAX : ((a) < silk_int16_MIN ? silk_int16_MIN : (a)))`
 fn c_sat16(a: i32) -> i32 {
-    if a > 32767 {
-        32767
-    } else if a < -32768 {
-        -32768
-    } else {
-        a
-    }
+    a.clamp(-32768, 32767)
 }
 
 /// `silk_ADD_SAT16(a, b)`: `(opus_int16)silk_SAT16(silk_ADD32((opus_int32)(a), (b)))`
@@ -368,9 +362,9 @@ fn c_ror32(a: i32, rot: i32) -> i32 {
     if rot == 0 {
         a
     } else if rot < 0 {
-        ((x << m) | (x >> (32 - m))) as i32
+        x.rotate_left(m) as i32
     } else {
-        ((x << (32 - r)) | (x >> r)) as i32
+        x.rotate_right(r) as i32
     }
 }
 

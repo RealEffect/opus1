@@ -132,8 +132,8 @@ fn decode_with_ffmpeg(packets: &[Vec<u8>]) -> Option<Vec<f32>> {
     }
     let raw = std::fs::read(&raw_path).ok()?;
     let mut pcm = Vec::with_capacity(raw.len() / 4);
-    for chunk in raw.chunks_exact(4) {
-        pcm.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    for &chunk in raw.as_chunks::<4>().0 {
+        pcm.push(f32::from_le_bytes(chunk));
     }
     let _ = std::fs::remove_file(&ogg_path);
     let _ = std::fs::remove_file(&raw_path);

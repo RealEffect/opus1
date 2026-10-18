@@ -1365,8 +1365,11 @@ pub struct SilkControl {
     /// This packet's frames leave LBRR frames (in-band FEC) for the next
     /// packet (`LBRR_coded`).
     pub lbrr_coded: bool,
-    /// 1 when the frame may hold speech, 0 when the caller's analysis found
-    /// none (libopus's `activity` argument of `silk_Encode`).
+    /// libopus's `activity` argument of `silk_Encode`: 0
+    /// (`VAD_NO_ACTIVITY`) when the caller found no voice activity, for
+    /// example in digital silence; any other value leaves the decision to
+    /// SILK's own voice activity detector (libopus passes 1 or -1,
+    /// `VAD_NO_DECISION`).
     pub activity: i32,
     /// The last packet with two channels before stereo input goes on as one
     /// channel (`toMono`): its stereo width falls to zero.

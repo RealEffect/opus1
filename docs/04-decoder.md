@@ -65,6 +65,7 @@ All decoding goes through `decode_native` in `src/lib.rs`, the port of libopus `
 | `decode_fec(data, frame_size, out)` | `opus_decode_float` with `decode_fec = 1` | Rebuilds the packet before `data` from the FEC copy in `data`. |
 | `decode_fec_i16(data, frame_size, out)` | `opus_decode` with `decode_fec = 1` | As `decode_fec`, with 16-bit output. |
 | `final_range()` | `OPUS_GET_FINAL_RANGE` | The range decoder state after the last frame. |
+| `last_packet_duration()` | `OPUS_GET_LAST_PACKET_DURATION` | The samples per channel of the last successful decode, concealment or FEC call. 0 at the start and after `reset_state`. |
 | `reset_state()` | `OPUS_RESET_STATE` | Forgets the stream decoded so far. |
 
 All of them return the number of samples per channel written. The output is interleaved: left, right, left, right for two channels.
@@ -345,6 +346,8 @@ The whole duration is concealed instead when:
 When `frame_size` is longer than one frame of the packet, the start is concealed and the copy fills the end.
 
 The copy codes SILK only. In a Hybrid stream the band above 8 kHz is concealed with CELT noise and added. No redundant frame is read during FEC decoding.
+
+`packet::has_lbrr(packet_n_plus_1)` tells whether the packet carries a copy at all, and `last_packet_duration()` gives a duration to rebuild: libopus's test program `opus_demo` uses both for the last of the lost packets.
 
 When the next packet has not arrived yet, a receiver conceals with an empty packet instead. Which of the two to use is up to the receiver's jitter buffer (the queue that holds received packets until it is time to play them).
 

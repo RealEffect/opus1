@@ -216,7 +216,7 @@ fn alternating_stream(kind: &Kind, pcm: &[f32], period: usize, fec: bool) -> Vec
     enc.fec(fec, if fec { 20 } else { 0 });
     let mut packets = Vec::new();
     for (i, frame) in pcm.chunks_exact(kind.frame() * 2).enumerate() {
-        let ch = if (i / period) % 2 == 0 { 2 } else { 1 };
+        let ch = if (i / period).is_multiple_of(2) { 2 } else { 1 };
         enc.force_channels(ch).bitrate(kind.bitrate * ch);
         packets.push(enc.encode(frame));
     }

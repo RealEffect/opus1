@@ -88,7 +88,7 @@ fn channel(pcm: &[f32], c: usize) -> Vec<f32> {
 }
 
 fn mid(pcm: &[f32]) -> Vec<f32> {
-    pcm.chunks_exact(CH).map(|p| (p[0] + p[1]) / 2.0).collect()
+    pcm.as_chunks::<CH>().0.iter().map(|p| (p[0] + p[1]) / 2.0).collect()
 }
 
 /// Sums over `reference[start..start + len]` against `test` shifted by `lag`:

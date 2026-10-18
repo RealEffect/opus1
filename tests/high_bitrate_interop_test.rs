@@ -16,7 +16,7 @@ const FRAME_SIZE: usize = 960; // 20 ms @ 48 kHz
 
 fn make_sine_stereo(freq_l: f32, freq_r: f32, n_frames: usize) -> Vec<f32> {
     let mut pcm = vec![0.0f32; n_frames * FRAME_SIZE * 2];
-    for (i, x) in pcm.chunks_exact_mut(2).enumerate() {
+    for (i, x) in pcm.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let t = i as f32 / 48000.0;
         x[0] = 0.5 * (2.0 * std::f32::consts::PI * freq_l * t).sin();
         x[1] = 0.5 * (2.0 * std::f32::consts::PI * freq_r * t).sin();
@@ -28,7 +28,7 @@ fn make_complex_stereo(n_frames: usize) -> Vec<f32> {
     // Three-tone chord per channel plus a little noise.
     let mut pcm = vec![0.0f32; n_frames * FRAME_SIZE * 2];
     let mut seed = 0x12345678u32;
-    for (i, x) in pcm.chunks_exact_mut(2).enumerate() {
+    for (i, x) in pcm.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let t = i as f32 / 48000.0;
         let mut l = 0.0f32;
         let mut r = 0.0f32;
@@ -210,8 +210,8 @@ fn decode_with_ffmpeg(packets: &[Vec<u8>]) -> Option<Vec<f32>> {
     }
     let raw = std::fs::read(&raw_path).ok()?;
     let mut pcm = Vec::with_capacity(raw.len() / 4);
-    for chunk in raw.chunks_exact(4) {
-        pcm.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    for &chunk in raw.as_chunks::<4>().0 {
+        pcm.push(f32::from_le_bytes(chunk));
     }
     Some(pcm)
 }

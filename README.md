@@ -411,7 +411,13 @@ test that compares opus1 with the C library under the same settings.
   20 ms, CBR and VBR, complexity 4 to 9), up from 91.2 %. Through `OpusEncoder`
   the remaining differences at complexity 7 and above come from the missing
   speech and music analysis. Stereo input whose channels are scaled copies of
-  each other still gives a few other packets at 128 kb/s per channel and more.
+  each other, and very quiet signals such as the decaying output of the DC
+  filter after a signal stops, give the packets of libopus too
+  (`intensity_stereo`, the transient analysis and the fades of the Opus layer
+  now round as libopus does).
+- Digital silence is handled as libopus handles it: CELT measures the silence
+  flag of a stereo input coded as mono over the first half of the frame, and
+  SILK is told that a frame of digital silence has no voice activity.
 - The CELT decoder gives the samples of libopus: 51 of 51 CELT streams and 28 of
   29 Hybrid streams of `perf_harness modes` (8 and 25 before), and every
   concealed frame of the CELT loss tests and the multistream loss tests.
