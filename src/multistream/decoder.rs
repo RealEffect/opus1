@@ -220,6 +220,54 @@ impl MultistreamDecoder {
         }
     }
 
+    /// libopus `OPUS_SET_COMPLEXITY` of a multistream decoder: sets the
+    /// decoder complexity of every stream decoder (see
+    /// [`OpusDecoder::set_complexity`]). A value outside 0 to 10 is refused
+    /// with `"Invalid complexity"` and no stream changes.
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+        if !(0..=10).contains(&complexity) {
+            return Err("Invalid complexity");
+        }
+        for dec in &mut self.decoders {
+            dec.set_complexity(complexity)?;
+        }
+        Ok(())
+    }
+
+    /// libopus `OPUS_GET_COMPLEXITY` of a multistream decoder: the
+    /// complexity of the first stream decoder.
+    pub fn complexity(&self) -> i32 {
+        self.decoders.first().map_or(0, OpusDecoder::complexity)
+    }
+
+    /// [`OpusDecoder::set_osce_bwe`] for every stream decoder. libopus's
+    /// multistream decoder does not forward `OPUS_SET_OSCE_BWE`; there each
+    /// stream decoder must be set on its own. Without the cargo feature
+    /// `osce-bwe` this returns `"Request not implemented"`.
+    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), &'static str> {
+        for dec in &mut self.decoders {
+            dec.set_osce_bwe(enabled)?;
+        }
+        Ok(())
+    }
+
+    /// [`OpusDecoder::set_dnn_blob`] for every stream decoder: each one
+    /// loads the model groups of this build that `blob` holds completely.
+    /// Returns those groups, or `"DNN blob holds no model of this build"`,
+    /// and then no stream changes. libopus's multistream decoder does not
+    /// forward `OPUS_SET_DNN_BLOB`; there each stream decoder must load the
+    /// blob on its own.
+    #[cfg(feature = "dnn")]
+    pub fn set_dnn_blob(&mut self, blob: &crate::DnnBlob) -> Result<crate::DnnModels, &'static str> {
+        // Every stream decoder has the same build, so the first one's
+        // result is everyone's: when it fails, none would load.
+        let mut loaded = Err(crate::dnn::models::ERR_NO_MODEL);
+        for dec in &mut self.decoders {
+            loaded = Ok(dec.set_dnn_blob(blob)?);
+        }
+        loaded
+    }
+
     /// The decoder of stream `stream`: libopus
     /// `OPUS_MULTISTREAM_GET_DECODER_STATE`. `None` when there is no such
     /// stream.

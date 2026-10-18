@@ -1,0 +1,12 @@
+[package]
+name = "dnn-gen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Writes the libopus neural network weights and the opus1 layer descriptors"
+license = "BSD-3-Clause"
+
+# Its own workspace, so that it is not part of the opus1 package.
+[workspace]
+
+[dependencies]

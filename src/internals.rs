@@ -28,6 +28,12 @@ pub mod celt_lpc {
 pub mod eval {
     pub use crate::eval::*;
 }
+/// The neural network code (`src/dnn/`), whole: every public item of every
+/// submodule, for the tests that compare it with a DNN-enabled libopus.
+#[cfg(feature = "dnn")]
+pub mod dnn {
+    pub use crate::dnn::*;
+}
 pub mod hp_cutoff {
     pub use crate::hp_cutoff::{dc_reject_float, hp_cutoff};
 }

@@ -15,6 +15,13 @@ opus1 = { path = ".." }
 # docs/09-testing.md, "How libopus is linked").
 audiopus_sys = "0.2"
 
+# `dnn`: opus1's neural network features, for `fuzz_dnn_blob` only. That
+# target requires it, and `fuzz.sh` builds it in a separate cargo call, so
+# the other targets keep opus1's default features (the neural network
+# features change what the decoder does on lost packets).
+[features]
+dnn = ["opus1/osce-bwe"]
+
 [dev-dependencies]
 
 [[bin]]
@@ -149,6 +156,14 @@ path = "fuzz_targets/fuzz_channel_order.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_dnn_blob"
+path = "fuzz_targets/fuzz_dnn_blob.rs"
+test = false
+doc = false
+bench = false
+required-features = ["dnn"]
 
 [profile.release]
 debug = 1

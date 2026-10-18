@@ -38,6 +38,39 @@ heap = ["std"]
 #   opus1 = { version = "...", default-features = false, features = ["libm"] }
 libm = ["dep:libm"]
 
+# Neural network features of libopus 1.5 and later. All are off by default,
+# as in libopus. They work with and without `std` (a `no_std` build needs
+# `libm`, as above).
+#
+# `dnn`: the shared inference layer (layer kernels, weight blob parser).
+# Not meant to be selected alone: each feature below that needs it turns
+# it on.
+dnn = []
+# `deep-plc`: deep packet loss concealment (PitchDNN, the PLC model and
+# FARGAN), like libopus's `--enable-deep-plc`. It runs at decoder
+# complexity 5 and above.
+deep-plc = ["dnn"]
+# `osce`: the LACE and NoLACE speech enhancers of SILK, which run at
+# decoder complexity 6 and at 7 and above. It turns on `deep-plc`, as
+# libopus's `--enable-osce` does.
+osce = ["deep-plc"]
+# `osce-bwe`: the bandwidth extension of SILK wideband to 48 kHz (BBWENet).
+# It turns on `osce`.
+osce-bwe = ["osce"]
+# A later `dred` feature (deep redundancy) is planned; it is not part of
+# this release.
+#
+# `test-libopus-dnn`: TEST-ONLY. It adds nothing to the library. It only
+# compiles the test files that begin with
+# `#![cfg(feature = "test-libopus-dnn")]`. Those tests call the neural
+# network functions of a libopus built with them (for example
+# `scripts/android/build-libopus.sh --dnn`), linked through
+# `LIBOPUS_LIB_DIR`, `LIBOPUS_NO_PKG=1` and `LIBOPUS_STATIC=1`, in their own
+# `CARGO_TARGET_DIR`. Against a libopus without that code (such as the
+# Homebrew build) they fail to link, so `cargo test --all-features` fails
+# there. Applications never enable it.
+test-libopus-dnn = []
+
 [dependencies]
 libm = { version = "0.2", optional = true, default-features = false }
 
@@ -53,3 +86,7 @@ audiopus_sys = "0.2"
 [[bench]]
 name = "opus_bench"
 harness = false
+[[bench]]
+name = "dnn_bench"
+harness = false
+required-features = ["dnn"]

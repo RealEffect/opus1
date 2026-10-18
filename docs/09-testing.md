@@ -21,14 +21,16 @@ Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-appl
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 239 | 1162 |
+| Integration tests in `tests/*.rs` | 251 | 1168 |
 | Unit tests inside `src/` | - | 356 |
-| Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (48) | - | 50 |
-| **Total** | | **1568** |
+| Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (49) | - | 51 |
+| **Total** | | **1575** |
 
-28 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 12 directories of shared helper code (for example `tests/k24_common/`) and 6 files of recorded reference values (`*.expected`).
+28 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 13 directories of shared helper code (for example `tests/k24_common/`) and 6 files of recorded reference values (`*.expected`).
 
-A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1540 tests that are not ignored on Apple M4 Pro. It took 163 seconds, including the build of the test files that had changed.
+A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1547 tests that are not ignored on Apple M4 Pro. It took 170 seconds, including the build of the test files that had changed.
+
+The 10 files of the neural network code (`tests/dnn_*.rs`) have no tests in the default build: they need a model feature, and 5 of them also need `test-libopus-dnn` (see [Tests of the neural network code](#tests-of-the-neural-network-code)). With `--features osce-bwe` the suite has 1636 tests that pass and 29 that are ignored.
 
 ## How libopus is linked
 
@@ -113,7 +115,8 @@ A test file's name starts with a prefix that says what it covers. The counts are
 | Prefix | Files | Tests | What the files cover |
 |---|---:|---:|---|
 | `multistream_` | 31 | 276 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`) and the surround analysis (`_surround_*`). |
-| `core_` | 22 | 142 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output. |
+| `core_` | 23 | 148 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the decoder controls of the neural network features. |
+| `dnn_` | 10 | 0 | The neural network code: kernels, the layers of every network, weights, signal analysis. Their tests compile only with a model feature (see [Tests of the neural network code](#tests-of-the-neural-network-code)). |
 | `perfk_` | 33 | 116 | Guards for the speed work. Each rewritten kernel is compared with the libopus function, with reference values recorded from libopus, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
 | `celtenc_` | 17 | 82 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching, the rate rules (`celtenc_rate_rules.rs`). |
 | `issue_` | 14 | 75 | Regression tests named after GitHub issues, most of them against libopus (for example `issue_42_stereo_channels.rs`). `issues_repro.rs` adds 14 more tests. |
@@ -578,6 +581,7 @@ The multistream module needs `std`. The multistream test files that use it (30 o
 
   [Differences from libopus](10-differences-from-libopus.md) gives their figures.
 
+- With a neural network feature, `dnn_frecpe::software_frecpe_matches_the_instruction_on_all_inputs` checks all 2^32 inputs of the software FRECPE (about 10 s on Apple M4, 30 s on the Cortex-A76, 84 s on the Cortex-A55). It is ignored in the default run of those tests and not compiled without the features.
 - 1 documentation example is marked `rust,ignore`: the fields of `OpusEncoder` with and without the `heap` feature in [Architecture](07-architecture.md#feature-flags-and-where-state-is-stored). It shows part of a struct, so it cannot run on its own.
 
 ## Documentation examples
@@ -601,7 +605,7 @@ They were written on, and first run on, a HONOR CLK-AN00: MediaTek MT6833, Andro
 
 | Script | What it does |
 |---|---|
-| `build-libopus.sh --src DIR` | Builds the libopus source tree DIR as a static library with the NDK's clang (see [Which libopus source to build](#which-libopus-source-to-build)). It uses the settings that libopus's own `configure` picks for this target: `-O2`, NEON intrinsics presumed, run-time detection for the DotProd code. They were checked against what `configure` of libopus 1.6.1 writes. The script writes every flag to `target/android/libopus/build-flags.txt`. |
+| `build-libopus.sh --src DIR` | Builds the libopus source tree DIR as a static library with the NDK's clang (see [Which libopus source to build](#which-libopus-source-to-build)). It uses the settings that libopus's own `configure` picks for this target: `-O2`, NEON intrinsics presumed, run-time detection for the DotProd code. They were checked against what `configure` of libopus 1.6.1 writes. The script writes every flag to `target/android/libopus/build-flags.txt`. `--dnn` adds the neural network features (see [Builds with the neural network features](#builds-with-the-neural-network-features)). |
 | `test.sh` | Builds every test program with `cargo ndk -t arm64-v8a test --release --no-run` against that libopus. It copies the programs and `fixtures/` to the phone and runs them one after the other. Then it prints one line per program and the totals. `--build-only` stops after the build, and `--no-build` runs the programs of the last build. So a phone that several people use is taken only while the tests run. |
 | `golden.sh` | Writes the golden hashes on the phone. With `--check FILE` it also checks them against a golden file from another machine. |
 | `bench.sh` | Runs `perf_harness bench`, pinned with `taskset` to one CPU of the fast cluster and one of the slow cluster (see [Performance](08-performance.md#on-an-android-phone)). |
@@ -667,6 +671,104 @@ The optimization level matters as well:
 
 `build-libopus.sh --host` builds the same way for a Mac with Apple silicon. There, `configure` builds no run-time CPU detection, and libopus's SILK encoder then calls the C version of its delayed-decision quantizer, as the Homebrew library does. `--rtcd` adds the detection, so the NEON version runs, as on the phone (see [The C reference](08-performance.md#the-c-reference)). The outputs are the same. Linking the harness or the tests against such a build is described at the top of the script.
 
+### Builds with the neural network features
+
+libopus 1.5 and later have decoder features that run small neural networks (DNN, deep neural network). A default build leaves them out. opus1 has the code they share, their weights and their decoder controls, but does not run them in the decoder yet:
+
+- Decoder complexity 5 and higher turns on deep packet loss concealment (deep PLC).
+- Complexity 6 turns on the speech enhancement LACE, and complexity 7 and higher NoLACE. Both are part of OSCE (Opus Speech Coding Enhancement), which works on SILK frames.
+- `OPUS_SET_OSCE_BWE(1)` turns on the bandwidth extension (BWE) of OSCE. It extends 16 kHz SILK frames to 48 kHz output.
+
+`build-libopus.sh --dnn` builds a libopus with these features. It adds the defines and sources that `./configure --enable-osce` of libopus 1.6.1 adds: `ENABLE_DEEP_PLC`, `ENABLE_OSCE` and `ENABLE_OSCE_BWE`. It also compiles the weights of the two networks of DRED (deep redundancy), so that tests can use them, but not DRED itself. DRED would change the encoder. The options `--deep-plc`, `--osce`, `--dred`, `--rdovae-weights` and `--dnn-weights-file` build single parts. The top of the script explains each option and gives the commands.
+
+These four builds of the release 1.6.1 are the references for that work. All use run-time CPU detection, so the network code takes its DotProd (dot product) kernels on processors that have the instruction:
+
+| Directory in `target/android/` | Computer | Compiler flags | Use |
+|---|---|---|---|
+| `libopus-host-1.6.1-dnn-novec` | Mac | `-O2 -fno-vectorize -fno-slp-vectorize` | The bit-exact reference for opus1's neural network code |
+| `libopus-host-1.6.1-dnn` | Mac | `-O2` | Timings, and tests with a tolerance |
+| `libopus-1.6.1-dnn-novec` | phone | `-O2 -fno-vectorize -fno-slp-vectorize` | The same reference on the phone |
+| `libopus-1.6.1-dnn` | phone | `-O2` | Timings on the phone |
+
+Why the builds without vector loops are the reference: at `-O2`, clang turns some loops into vector code that rounds products before it adds them. The networks turn such last-bit differences into large ones. A small C program decoded the same packets with each build (a 16 kb/s SILK wideband stream and a 32 kb/s CELT stream, with losses, at 12 settings of complexity, output rate and BWE):
+
+- The Mac and the phone builds without vector loops gave the same output for all 12 settings, on the Cortex-A76 and on the Cortex-A55.
+- The two `-O2` builds gave different output for 7 of the 12 settings: those with deep PLC, LACE or NoLACE. They agree at complexity 0 and 4, also with BWE at complexity 4.
+
+Tests that call such a library are compiled only with the test-only cargo feature `test-libopus-dnn`. Their files start with `#![cfg(feature = "test-libopus-dnn")]`. They run in a cargo directory of their own, because cargo does not notice that another libopus is linked:
+
+```text
+LIBOPUS_LIB_DIR=$PWD/target/android/libopus-host-1.6.1-dnn-novec LIBOPUS_NO_PKG=1 \
+  LIBOPUS_STATIC=1 CARGO_TARGET_DIR=target/dnn-ref \
+  cargo test --release --features test-libopus-dnn,<model features> --test <name>
+```
+
+The whole suite of git commit `d541821`, linked against `libopus-host-1.6.1-dnn-novec`, gave 1425 passed, 75 failed and 28 ignored tests (in 28 test files). The 7 tests that fail against the `-O2` build of [Results on the phone](#results-on-the-phone) pass, as with every build without vector loops. The 75 failures come from two changes that the DNN defines make in libopus at every decoder complexity, also at 0. opus1 does not make them yet:
+
+- With `ENABLE_DEEP_PLC`, `silk_PLC_glue_frames` skips its fade-in for 16 kHz frames (`silk/PLC.c` 477-480). So the first good 16 kHz SILK frame after a loss differs. This affects 71 tests.
+- With `ENABLE_OSCE`, every 16 kHz SILK frame of 20 ms passes through `osce_enhance_frame`, which changes a sample of -32768 to -32767 (`dnn/osce.c` 1672-1679). The resampler and the stereo conversion spread the change to the neighbouring samples. This affects 12 tests, 4 of them only for this reason.
+
+A build of the same source with both changes undone passed all 174 tests of the 28 files.
+
+With `--host`, the script also builds two programs that write weight blobs. A weight blob is the file format that `OPUS_SET_DNN_BLOB` loads, for a library built with `--dnn-weights-file`, which has no built-in weights:
+
+- `bin/dump_weights_blob` is libopus's own `dnn/write_lpcnet_weights.c`. Its blob has every network except BBWENet, the network of the BWE. With that blob, `OPUS_SET_DNN_BLOB` returns 1, and LACE and NoLACE stay unloaded too. With BWE on, libopus 1.6.1 then aborts at the first SILK frame that it decodes at 48 kHz: a memory copy in `compute_generic_conv1d` runs past its buffer, which the check of `_FORTIFY_SOURCE` catches.
+- `bin/dump_weights_blob_all` (`scripts/android/dump_weights_blob_all.c`) writes the same records followed by those of BBWENet. With its blob, the library decodes exactly as with built-in weights.
+
+The blobs of both programs are in `target/android/dnn-blob-1.6.1/`, with a note of how they were made.
+
+### Tests of the neural network code
+
+The neural network code of `src/dnn/` (see [Architecture](07-architecture.md#neural-network-code-srcdnn)) has tests of its own. They need a model feature, for example `--features osce-bwe`, which includes all networks. The files whose names end in `_libopus`, and `dnn_freq_burg.rs`, also need `test-libopus-dnn` and a libopus built with `--dnn` (see above). Every comparison with libopus is bit for bit; two NaN values (not-a-number) count as equal.
+
+| File | What it checks | Needs libopus with DNN |
+|---|---|---|
+| `dnn_kernels_libopus.rs` | The kernels and layer functions on random and edge inputs, against libopus's own functions (`compute_linear_c`, `compute_linear_dotprod`, `compute_activation_*`, `compute_conv2d_*`, `compute_generic_dense`, `_gru`, `_conv1d`, `_conv1d_dilation`, `compute_glu`), for every `DnnArch` the processor runs. The edge cases of `dnn_edges.rs` (sparse tables, int8 extremes, special inputs, odd GRU and GLU sizes) are compared with libopus too. | yes |
+| `dnn_layers_libopus.rs` | Every layer of the six networks of 1.6.1 (PitchDNN, PLC, FARGAN, LACE, NoLACE, BBWENet), with the real weights on both sides and inputs from the speech of `fixtures/answer_16k.wav`. Each network runs as libopus runs it, call by call: activations, input sizes, convolution memories, recurrent states. Check 1 compares every call, passing libopus's result on. Check 2 runs each side on its own outputs and compares every layer output. The pitch computed from PitchDNN's output must equal the pitch of libopus's own `compute_pitchdnn`. | yes |
+| `dnn_weights_libopus.rs` | The blobs of `dnn-weights/` against libopus's built-in arrays, record by record; their concatenation against the blobs that libopus's `dump_weights_blob` writes; each network's layers against those of libopus's `init_*` functions; the parser against libopus's `parse_weights` on about 90 changed blobs. | yes |
+| `dnn_freq_burg.rs` | The signal analysis (`freq.rs`, `burg.rs`, the tables) against libopus on speech, noise and test signals. | yes |
+| `dnn_decoder_controls_libopus.rs` | The decoder controls against a libopus with the features: complexity, the BWE switch and its values, and that libopus has no `OPUS_SET_DNN_BLOB` when it has built-in weights. | yes |
+| `dnn_weights.rs` | The blobs and the loader without libopus: the SHA-256 sums, every network loads with the shapes of its descriptors, groups load on their own, and malformed blobs give errors (property tests included). | no |
+| `dnn_props.rs` | Properties of the kernels (`proptest`): every `DnnArch` gives the bits of `Portable`, activations stay in range, quantization rounds as specified. | no |
+| `dnn_edges.rs` | Edge cases of the kernels on every `DnnArch`: sparse index tables with empty row blocks and repeated or falling positions, int8 weights of ±127 with inputs that quantize to -128 and 127 (up to 2048 inputs), NaN, infinities and subnormal numbers as inputs, GRU and GLU layers of odd sizes, layers without inputs or outputs, and invalid layers and short slices, which must panic. It also checks the arithmetic of the x86 kernels in scalar form (their FRECPE and their int8 quantization), because they cannot run here. | no |
+| `dnn_frecpe.rs` | The software FRECPE against the ARM instruction: about 2^17 inputs; all 2^32 inputs in an ignored test. | no |
+| `dnn_no_alloc.rs` | The layer functions allocate nothing. | no |
+| `dnn_dsp_props.rs` | Properties of the signal analysis: energy kept by the transform, stable filters. | no |
+| `core_decoder_dnn_controls.rs` | The decoder controls against the Homebrew libopus (part of the default suite): complexity range and errors, `"Request not implemented"` without `osce-bwe`, multistream forwarding, blob loading, and that the controls do not change the decoded output yet. | no |
+
+Commands (from the repository root; `target/dnn-ref` keeps this build apart from the normal one):
+
+```text
+# Without libopus:
+cargo test --release --features osce-bwe --test dnn_weights --test dnn_props --test dnn_no_alloc \
+  --test dnn_edges --test dnn_dsp_props --test dnn_frecpe --test core_decoder_dnn_controls --lib dnn::
+
+# Against the bit-exact reference:
+LIBOPUS_LIB_DIR=$PWD/target/android/libopus-host-1.6.1-dnn-novec LIBOPUS_NO_PKG=1 LIBOPUS_STATIC=1 \
+  CARGO_TARGET_DIR=target/dnn-ref cargo test --release --features test-libopus-dnn,osce-bwe \
+  --test dnn_kernels_libopus --test dnn_layers_libopus --test dnn_weights_libopus \
+  --test dnn_freq_burg --test dnn_decoder_controls_libopus
+
+# Against the -O2 build, measuring instead of requiring equal bits:
+OPUS1_DNN_REF_O2=1 LIBOPUS_LIB_DIR=$PWD/target/android/libopus-host-1.6.1-dnn LIBOPUS_NO_PKG=1 \
+  LIBOPUS_STATIC=1 CARGO_TARGET_DIR=target/dnn-ref-o2 cargo test --release \
+  --features test-libopus-dnn,osce-bwe --test dnn_layers_libopus -- --nocapture --test-threads=1
+```
+
+`OPUS1_DNN_REF_O2=1` works for `dnn_kernels_libopus.rs` and `dnn_layers_libopus.rs`. With it, these tests require equal bits except where the `-O2` build sums in another order, and print the largest difference. `dnn_freq_burg.rs` has no such mode: against an `-O2` build it fails ([Differences from libopus](10-differences-from-libopus.md#neural-network-code) gives the differences).
+
+Results on the Mac (Apple M4 Pro):
+
+- Against `libopus-host-1.6.1-dnn-novec`: all pass. `dnn_layers_libopus.rs` makes 357,192 uses of a layer (a GRU step uses two) on 1804 frames of speech, each through libopus and the three variants `Portable`, `Neon` and `NeonDotprod`, and every output, state and memory is equal. The pitch equals that of `compute_pitchdnn` in all 1804 frames.
+- Against `libopus-host-1.6.1-dnn` with `OPUS1_DNN_REF_O2=1`: only float layers with one output differ, as expected. [Differences from libopus](10-differences-from-libopus.md#neural-network-code) gives the measured differences.
+
+Results on the phone (HONOR CLK-AN00, 2026-10-18), on a Cortex-A76 (CPU 7) and a Cortex-A55 (CPU 5), with the 11 files of the table other than `dnn_edges.rs` (added later) and the unit tests of `src/dnn/`, built with `--features test-libopus-dnn,osce-bwe`:
+
+- Against `libopus-1.6.1-dnn-novec`: all pass on both cores. `dnn_layers_libopus.rs` took 14 s on the Cortex-A76 and 51 s on the Cortex-A55.
+- Against `libopus-1.6.1-dnn` (NDK clang 18 at `-O2`): every layer of the six networks is bit-exact, on both cores. Two checks fail, as on the Mac: 4 of the 9 tests of `dnn_freq_burg.rs` (band energies, Burg's method, the Burg cepstrum, `lpc_from_cepstrum`), and the pitch check of `dnn_layers_libopus.rs`. With `OPUS1_DNN_REF_O2=1` the pitch differs in 375 of 1804 frames, by at most 4.8e-7.
+
+`scripts/android/test.sh` does not pass cargo features yet. This run used `cargo ndk -t arm64-v8a -P 21 test --release --no-run --features test-libopus-dnn,osce-bwe` with the settings of `cargo_android` in `scripts/android/env.sh` (`LIBOPUS_LIB_DIR`, `LIBOPUS_STATIC=1`, `RUSTC_WRAPPER` and `OPUS1_DEVICE_DIR`), and copied `fixtures/`, `dnn-weights/` and the blobs of `target/android/dnn-blob-1.6.1/` (named by `OPUS1_DNN_BLOB_DIR`) to the phone.
+
 ### Results on the phone
 
 Run on 2026-10-17 at git commit `56ca2dd` (round 8 and the frames of 80 to 120 ms merged), against libopus 1.6.1 built by `build-libopus.sh` at `-O2` with the NDK's clang 18: 235 test programs with 1470 tests. 1435 passed, 8 failed and 27 were ignored. The run took 675 seconds, with the tests already built, including copying them to the phone. The logs are in `target/perf/merge_56ca2dd/phone_tests/`. The same 8 tests failed at `c96e936`, before round 8.
@@ -714,6 +816,7 @@ The earlier runs linked the main branch of libopus (see [Which libopus source to
 | The self-test of the gates | `cargo run --release --example eval -- selftest` |
 | Get a corpus | `scripts/eval/fetch-corpus.sh rfc8251` |
 | Tests on an Android phone | `scripts/android/build-libopus.sh --src <libopus 1.6.1 source>`, then `scripts/android/test.sh` |
+| Tests of the neural network code | see [Tests of the neural network code](#tests-of-the-neural-network-code) |
 | Golden hashes on a phone | `scripts/android/golden.sh --check <file>` |
 | Timings on a phone | `scripts/android/bench.sh --runs 2` |
 | Hardware counters and hot functions on a phone | `scripts/android/profile.sh --little <scenario> enc rust` |

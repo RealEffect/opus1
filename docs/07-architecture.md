@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes how the source code of `opus1` is organised, for maintainers and for readers who want to find the code behind a feature. It lists every file under `src/` with the libopus file it ports. It shows which types own which, and explains where the code uses floating point and where it uses fixed point. It then covers the three feature flags and how they change where state is stored, the code written for specific processors, and the rules for `unsafe` code. The last sections cover error handling, and the layout of the tests, examples, benchmarks and fuzz targets. How to call the library is in [Using the library](06-using-the-library.md), and the [documentation index](README.md) lists the other documents.
+This document describes how the source code of `opus1` is organised, for maintainers and for readers who want to find the code behind a feature. It lists every file under `src/` with the libopus file it ports. It shows which types own which, and explains where the code uses floating point and where it uses fixed point. It then covers the feature flags and how they change where state is stored, the code written for specific processors, and the rules for `unsafe` code. The last sections cover error handling, and the layout of the tests, examples, benchmarks and fuzz targets. How to call the library is in [Using the library](06-using-the-library.md), and the [documentation index](README.md) lists the other documents.
 
 ## Terms
 
@@ -20,7 +20,7 @@ This document describes how the source code of `opus1` is organised, for maintai
 
 The public interface is the crate root and two modules:
 
-- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`.
+- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`. With a neural network feature also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)).
 - `packet`: reading, writing and padding packets.
 - `multistream`: the multistream encoder and decoder and their channel layouts.
 
@@ -149,6 +149,36 @@ These files are not part of the codec. They port libopus's test programs, so tha
 | `rate_alloc.rs` | How the encoder divides the bitrate and the packet bytes among the streams. | `surround_rate_allocation`, `ambisonics_rate_allocation`, `rate_allocation` in `src/opus_multistream_encoder.c` |
 | `surround.rs` | Surround masking analysis: how far each band of each channel lies above what the other channels mask. | `surround_analysis` in `src/opus_multistream_encoder.c` |
 
+### Neural network code (`src/dnn/`)
+
+libopus 1.5 and later run small neural networks in the decoder: deep packet loss concealment (deep PLC) with the networks PitchDNN, PLC and FARGAN, the speech enhancers LACE and NoLACE, and the bandwidth extension (BWE) with the network BBWENet. LACE, NoLACE and the BWE make up OSCE (Opus Speech Coding Enhancement). libopus keeps this code in its folder `dnn/`. opus1 compiles `src/dnn/` only with the feature `dnn`, which the features `deep-plc`, `osce` and `osce-bwe` turn on (see [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored)).
+
+In this version `src/dnn/` holds what the networks share: the layer functions, their kernels, the weights and their loader, and the signal processing that the networks' input needs. The networks themselves (`plc/`, `osce/`) are empty modules, and the decoder does not call into `src/dnn/` while it decodes. `src/dnn/` computes the bits of libopus 1.6.1 for 64-bit ARM, built without loop vectorization (see [Code for specific processors](#code-for-specific-processors)).
+
+| File | What it does | libopus counterpart |
+|---|---|---|
+| `mod.rs` | Module list, `Activation` (the activation functions of a layer) and the size limits of the layer functions. It stops a build for a big-endian target, because the weight blobs are little-endian. | `dnn/nnet.h` |
+| `nnet.rs` | `LinearLayer` and `Conv2dLayer`, and the layer functions: `compute_linear`, `compute_activation`, `compute_generic_dense`, `compute_generic_gru` (gated recurrent unit), `compute_glu` (gated linear unit), `compute_generic_conv1d` with and without dilation, `compute_conv2d`. They check their slices with `assert!`, then run the kernels of the chosen `DnnArch`. | `dnn/nnet.c`, `dnn/nnet_arch.h` |
+| `arch.rs` | `DnnArch`, the kernel variants: `Portable`, `Neon`, `NeonDotprod` (the `sdot` instruction of 64-bit ARM), and on x86-64 `Avx2Fma`, `AvxVnni`, `Avx512Vnni`. `detect()` picks the best one the processor runs; `usable()` replaces a variant it cannot run. | `opus_select_arch`, `dnn/arm/arm_dnn_map.c`, `dnn/x86/x86_dnn_map.c` |
+| `vec_portable.rs` | The kernels in plain Rust: products of int8 and float weights (dense and sparse), the activations, the quantization of inputs to int8, and a software copy of the ARM reciprocal estimate (FRECPE). It is the specification that the other variants must match. | `dnn/vec_neon.h` (its numerics), `dnn/vec.h` |
+| `vec_neon.rs` | The NEON and DotProd kernels, with intrinsics. | `dnn/vec_neon.h`, `dnn/arm/nnet_neon.c`, `dnn/arm/nnet_dotprod.c` |
+| `vec_x86.rs` | The AVX2, AVX-VNNI and AVX-512 VNNI kernels (VNNI: vector neural network instructions). They compute the bits of the 64-bit ARM kernels, not those of libopus's x86 kernels. | none (libopus's `dnn/vec_avx.h` rounds differently) |
+| `weights.rs` | `WeightList`, the parser of weight blobs, and `linear_init` and `conv2d_init`, which build a layer from the arrays of a list. They refuse what libopus refuses, and more (see [Differences from libopus](10-differences-from-libopus.md#neural-network-weights)). | `dnn/parse_lpcnet_weights.c` |
+| `models/` | One file per network with its layer struct, its `init` function, the constants of its C header and `LAYERS`, a table of the arrays and the shape of each layer. `tools/dnn-gen` writes these files. `models/mod.rs`, written by hand, has the shared types and `ModelSet`, which loads the four groups (deep PLC, LACE, NoLACE, BBWENet) one by one. | `dnn/*_data.h`, the `init_*` functions of `dnn/*_data.c` |
+| `builtin.rs` | The weights of libopus 1.6.1, embedded with `include_bytes!` in 64-byte aligned statics, each by the feature that needs it. `weights()` parses them once and `models()` builds their layers once per process. | the arrays of `dnn/*_data.c` |
+| `holder.rs` | `DnnBlob` (a parsed blob: the built-in weights, a `'static` slice, or a heap copy), `DnnModels` (a set of groups) and `DecoderDnn`, what an `OpusDecoder` stores: the kernel variant and the layers of each loaded group. | `OPUS_SET_DNN_BLOB` in `src/opus_decoder.c` |
+| `freq.rs` | The feature analysis of deep PLC: band energies, the Burg cepstrum, the discrete cosine transform (DCT) and the LPC (linear prediction) coefficients from a cepstrum, on a 320-point FFT. | `dnn/freq.c` |
+| `burg.rs` | Burg's method for LPC in floating point (`silk_burg_analysis`), a copy of SILK's float version that deep PLC uses. | `dnn/burg.c` |
+| `lpcnet_tables.rs` | The tables of `freq.rs`: the plan of the 320-point FFT (bit reversal, twiddles, factors), the half window and the DCT table. | `dnn/lpcnet_tables.c` |
+| `plc/`, `osce/` | Empty until deep PLC and OSCE are ported. | `dnn/lpcnet_plc.c`, `dnn/fargan.c`, `dnn/pitchdnn.c`, `dnn/osce.c`, `dnn/nndsp.c` |
+
+The weights are files of the repository, not Rust code:
+
+- `dnn-weights/` holds one blob per network in libopus's blob format (`pitchdnn.bin`, `plc.bin`, `fargan.bin`, `lace.bin`, `nolace.bin`, `bbwenet.bin`), their SHA-256 sums (Secure Hash Algorithm, 256 bits; file `SHA256SUMS`), the libopus version and the sums of the C files they come from (`VERSION`), and libopus's licence (`COPYING`).
+- `tools/dnn-gen/` is a separate Cargo package, not published. It reads `dnn/*_data.c` and `dnn/*_data.h` of a libopus release and writes `dnn-weights/`, `src/dnn/models/<network>.rs` and `tests/dnn_gen/mod.rs` (the C structs and symbols that the tests against libopus use). Run again on the same release, it writes the same files. Its `README.md` explains how to update the weights to a later release.
+
+The DRED networks (deep redundancy) are not included. The generator can write them, for a later `dred` feature.
+
 ### What is not ported
 
 [Differences from libopus](10-differences-from-libopus.md) lists these gaps together with the measured differences of the parts that are ported.
@@ -157,7 +187,7 @@ These files are not part of the codec. They port libopus's test programs, so tha
 - Discontinuous transmission (DTX).
 - The projection encoder and decoder (`src/opus_projection_*.c`, `src/mapping_matrix.c`), which code ambisonics through a mixing matrix (mapping family 3). Mapping family 2, ambisonics without a matrix, is supported by the multistream code.
 - The floating-point SILK encoder (`silk/float/`). `opus1` ports the fixed-point one.
-- The neural-network parts of libopus, such as deep packet loss concealment and Deep REDundancy (DRED). libopus builds them only when asked to (`--enable-dred` and similar options).
+- The neural networks of libopus as parts of the decoder. The shared code, the weights and the decoder controls are ported (see [Neural network code](#neural-network-code-srcdnn)), but deep packet loss concealment, LACE, NoLACE and the bandwidth extension do not run in the decoder yet. Deep REDundancy (DRED) is not ported at all. libopus builds these parts only when asked to (`--enable-deep-plc`, `--enable-osce`, `--enable-dred`).
 - The scalable quality extension (QEXT), which libopus 1.6 builds only with `--enable-qext`.
 
 ## Main types and what they own
@@ -180,7 +210,12 @@ OpusDecoder                                   src/lib.rs
 │     └── mode: &'static CeltMode
 ├── silk_dec: SilkDecoder                     src/silk/dec_api.rs
 │     └── channel_state: [SilkDecoderState; 2]   each with its resampler, PLC and CNG state
-└── output buffers: FixedVec<..>
+├── output buffers: FixedVec<..>
+├── complexity, osce_bwe                      decoder settings; a reset keeps them
+└── dnn: DecoderDnn                           src/dnn/holder.rs, with a neural network feature
+      ├── arch: DnnArch                       chosen once, when the decoder is built
+      └── one slot per group of networks      &'static to the shared built-in layers,
+                                              or layers built from a blob plus a clone of the blob
 
 MultistreamEncoder                            src/multistream/encoder.rs
 ├── layout: ChannelLayout
@@ -197,7 +232,7 @@ Notes:
 - With the `heap` feature, `celt_enc`, `celt_dec`, `silk_dec`, each `SilkChannel`, `api_buf` and the large buffers each sit behind a `Box`. Without it they are stored inline (see [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored)).
 - A stereo encoder has two SILK channels even when its packets code mono, because the channel count of the packets can change from one packet to the next. A mono encoder has one. libopus always keeps two states (`state_Fxx[0]` and `state_Fxx[1]`).
 - A Hybrid frame is one range-coded stream: SILK writes first, and CELT continues in the same `RangeCoder`. The decoder reads it in the same order.
-- `CeltMode` is shared. `modes::default_mode()` builds it at the first call into a `static` `OnceCell` and returns `&'static CeltMode` after that. It is the only global value that is written at run time.
+- `CeltMode` is shared. `modes::default_mode()` builds it at the first call into a `static` `OnceCell` and returns `&'static CeltMode` after that. It is the only global value that is written at run time, apart from the layers of the built-in networks: with a neural network feature, `dnn::builtin::models()` builds them the same way when the first decoder is built, and every decoder points at them.
 
 ### The path of one frame
 
@@ -236,7 +271,7 @@ decode / decode_i16 / decode_fec
 
 ## Feature flags and where state is stored
 
-The crate has three features: `std` and `heap` (both on by default) and `libm`. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
+The crate has three features that decide how it is built: `std` and `heap` (both on by default) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
 
 - **`std`** selects `#![no_std]` when it is off (`#![cfg_attr(not(feature = "std"), no_std)]` in `src/lib.rs`). It also enables the run-time processor checks in `src/compat.rs` and `src/kiss_fft.rs`, and the `multistream` module, which uses `Vec`.
 - **`libm`** is required when `std` is off. `src/compat.rs` stops the build with `compile_error!` if both are missing. Its `Math` trait gives `f32` and `f64` the methods `sqrt`, `sin`, `exp2` and so on through the `libm` crate. Each module that needs them imports the trait under `#[cfg(not(feature = "std"))]`; with `std` the inherent methods of `f32` are used instead.
@@ -256,6 +291,12 @@ Below the Opus layer nothing allocates. The CELT, SILK and range coder states st
 - SILK mostly uses plain arrays, sized by the largest frame (for example `x_buf: [i16; 2 * MAX_FRAME_LENGTH + LA_SHAPE_MAX]`).
 - CELT, the FFT, the MDCT and the range coder use `FixedVec<T, N>` from `src/fixedvec.rs`. It stores up to `N` elements in `[MaybeUninit<T>; N]` and keeps a length. It offers the part of the `Vec` interface the codec uses (`push`, `resize`, `truncate`, `extend_from_slice`, slicing through `Deref`). Every operation that could go past the capacity checks this with `assert!`, and panics instead of going past it. It never drops its elements, so a `FixedVec` of a type with a destructor does not compile.
 - The capacities are constants for the largest case: 2 channels, 120 ms at 48 kHz, 1276-byte packets (`OPUS_MAX_CHANNELS`, `OPUS_MAX_FRAME`, `OPUS_MAX_PACKET_BYTES` and others at the top of `src/lib.rs`). This is why the size of an encoder does not depend on its sampling rate or channel count.
+
+The neural network features follow the same rules:
+
+- `dnn` compiles `src/dnn/`. `deep-plc`, `osce` and `osce-bwe` each turn on the one before and `dnn`. Each embeds the weights of its networks and adds its groups to `ModelSet` and `DecoderDnn`. `#[cfg(feature = "...")]` on the fields and match arms keeps a build without a feature free of its code and its weights.
+- With `heap`, `OpusDecoder` holds `DecoderDnn` in a `Box`, and the layers of a group loaded from a blob are in a `Box` too. Without `heap`, `DecoderDnn` is inline and has room for the layers of every group. Blobs then must be `'static`, because there is no heap to copy them to.
+- `test-libopus-dnn` adds nothing to the library. Test files that call a libopus built with its neural network code start with `#![cfg(feature = "test-libopus-dnn")]` (see [Testing](09-testing.md#tests-of-the-neural-network-code)).
 
 The measured sizes of both builds are in [Using the library](06-using-the-library.md#size-of-the-encoder-and-the-decoder).
 
@@ -285,6 +326,16 @@ Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch
 
 For this release the x86 code was compiled but not run on an x86 processor (the README lists this among the known gaps). The aarch64 code runs in every test on Apple silicon.
 
+### The kernels of the neural networks
+
+`src/dnn/` follows another rule, because its results must not depend on the processor:
+
+- Every kernel variant gives the same bits: those of libopus 1.6.1 on 64-bit ARM, built at `-O2` without loop vectorization (`-fno-vectorize -fno-slp-vectorize`). The tests compare every variant with that build of libopus and with `vec_portable.rs`.
+- The variant is chosen once per decoder (`DnnArch`, from `arch::detect()`), as libopus chooses `arch` once. Every layer call takes it as an argument. `arch::usable()` replaces a variant the processor cannot run, so a wrong value cannot reach an instruction the processor lacks.
+- On 64-bit ARM, `NeonDotprod` needs the DotProd extension. It is known at compile time on Apple targets. Elsewhere `std::arch::is_aarch64_feature_detected!("dotprod")` asks the operating system; without `std` the variant is `Neon`.
+- On other targets the kernels compute the 64-bit ARM bits too: products and sums that clang fuses on 64-bit ARM use `mul_add`, and the ARM reciprocal estimate (FRECPE) is computed in software. So the x86 kernels do not follow libopus's x86 kernels, which round differently and differ between Intel and AMD processors.
+- `freq.rs` and `burg.rs` use fused multiply-adds exactly where the libopus object code has them, which was read from the disassembly of the reference build.
+
 ### The FFT and FEAT_FCMA
 
 FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fcmla` (complex multiply-add) and `fcadd` (complex add with a rotation by 90 or 270 degrees). Their Rust intrinsics are not stable, so `src/kiss_fft.rs` writes them with `core::arch::asm!` in the macros `cmul_fcma` and `pm_i_fcma`.
@@ -296,6 +347,7 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 ## Unsafe code
 
 - `src/lib.rs` and `src/multistream/` contain no `unsafe` code. The codec's control logic and the public types are safe Rust.
+- In `src/dnn/`, `unsafe` appears in the kernels of `vec_neon.rs` and `vec_x86.rs`, which `nnet.rs` calls only after it has checked the slices and the index tables of sparse layers; in `weights.rs`, which views the bytes of a blob as `f32`, `i32` or `i8` arrays with `align_to` after it checked the alignment; and in `holder.rs`. There `DnnBlob::from_bytes` gives the parsed list of a heap copy the lifetime `'static`. That is sound because the copy is never moved, changed or freed while a clone of the blob exists, and `DecoderDnn` keeps a clone next to every layer it builds from it and lends the layers out only for the lifetime of a borrow of itself. The copy is owned through a raw pointer and freed in `Drop`, not held in a `Box`: moving a `Box` asserts that no other pointer to its memory exists, which the parsed list contradicts.
 - `unsafe` appears in four kinds of places:
   - the kernels: vector intrinsics and raw pointer loads;
   - `FixedVec` and `OnceCell`, which manage uninitialized storage;
@@ -318,13 +370,14 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 
 ### `tests/`
 
-The repository holds 239 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
+The repository holds 251 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
 
 | Prefix | Files | What the tests cover |
 |---|---:|---|
 | `perfk_` | 33 | Single kernels after performance work, against the same function inside libopus or a reference version: FFT, PVQ, range coder, pitch, SILK analysis and quantizer. Four `.expected` files hold reference output. |
 | `multistream_` | 31 | The multistream encoder and decoder: `multistream_c_*` against libopus's own functions, `multistream_enc_*` and `multistream_dec_*` for each side, `multistream_e2e_*` end to end, `multistream_surround_*` for the surround masking analysis. |
-| `core_` | 23 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits. |
+| `core_` | 24 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits, the decoder controls of the neural network features. |
+| `dnn_` | 11 | The neural network code: kernels and their edge cases, layers of every network, weights, signal analysis. The 4 files that end in `_libopus` and `dnn_freq_burg.rs` need a libopus built with its neural network code (see [Testing](09-testing.md#tests-of-the-neural-network-code)). |
 | `k24_` | 21 | The 24 kHz path: encoder modes, Hybrid super-wideband, SILK internals and loss, and the decoder matrix of every mode and bandwidth at every output rate. |
 | `celtenc_`, `celtdec_`, `celt_` | 16, 4, 8 | The CELT encoder and decoder. |
 | `silkenc_`, `silkdec_`, `silk_` | 6, 10, 14 | The SILK encoder and decoder. |
@@ -334,7 +387,7 @@ The repository holds 239 test files in `tests/`, plus helper modules in subdirec
 | `eval_` | 5 | The evaluation tools of `src/eval/` against the C program `opus_compare` and the Python script `moc.py`, the `opus_demo` decoding loop with both decoders, the RFC 8251 conformance test, and the paired-comparison harness. Two `.expected` files hold reference values. |
 | others | 19 | Single topics, for example `stack_usage_test.rs` (struct sizes and stack use), `panic_surface_repro.rs` (inputs that once panicked), `quality_regression_test.rs`, `proptest_encode_indices.rs` (property-based tests with `proptest`). |
 
-Helper directories are named after the tests that use them: `celtdec_common/`, `celtenc_common/`, `core_common/`, `eval_common/`, `k24_common/`, `k24_enc_common/`, `ms_support/`, `multistream_dec_common/`, `multistream_e2e_common/`, `multistream_enc_common/`, `silkdec_common/`, `silkenc_common/`. Each holds a `mod.rs` that a test includes with `mod <name>;`. Several of them wrap the raw C application programming interface (API) of libopus (`audiopus_sys`) for the controls the `opus` crate does not offer, such as forcing the coding mode.
+Helper directories are named after the tests that use them: `celtdec_common/`, `celtenc_common/`, `core_common/`, `dnn_gen/`, `eval_common/`, `k24_common/`, `k24_enc_common/`, `ms_support/`, `multistream_dec_common/`, `multistream_e2e_common/`, `multistream_enc_common/`, `silkdec_common/`, `silkenc_common/`. `dnn_gen/` is written by `tools/dnn-gen`. Each holds a `mod.rs` that a test includes with `mod <name>;`. Several of them wrap the raw C application programming interface (API) of libopus (`audiopus_sys`) for the controls the `opus` crate does not offer, such as forcing the coding mode.
 
 Tests marked `#[ignore]` either print measurement tables and assert nothing, or record a known difference from libopus. Run one with `cargo test --release --test <name> -- --ignored --nocapture`.
 
@@ -350,14 +403,14 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
 
 ### `benches/`
 
-`benches/opus_bench.rs` holds Criterion benchmarks (`cargo bench`) of whole encoding (SILK, CELT, 16-bit input) and of single kernels: FFT, MDCT, PVQ, the SILK noise-shaping quantizer, pitch analysis, autocorrelation, Burg's method and others. The script `bench_quick.sh` at the repository root runs a shorter `perf_harness bench` (6 repetitions in one round) and saves its table to a Markdown file. It takes a label and an optional scenario filter.
+`benches/dnn_bench.rs` (it needs the feature `dnn`) times the layer kernels of the neural networks for every `DnnArch`, and with `test-libopus-dnn` also the same calls of libopus. `benches/opus_bench.rs` holds Criterion benchmarks (`cargo bench`) of whole encoding (SILK, CELT, 16-bit input) and of single kernels: FFT, MDCT, PVQ, the SILK noise-shaping quantizer, pitch analysis, autocorrelation, Burg's method and others. The script `bench_quick.sh` at the repository root runs a shorter `perf_harness bench` (6 repetitions in one round) and saves its table to a Markdown file. It takes a label and an optional scenario filter.
 
 ### `fuzz/`
 
-`fuzz/` is a separate Cargo package of 19 targets for libFuzzer. `fuzz/fuzz.sh` builds them with the stable toolchain and runs them. Six targets compare opus1 with libopus: `fuzz_packet`, `fuzz_decoder_sequence`, `fuzz_multistream_decoder`, `fuzz_multistream_encoder`, `fuzz_encoder_settings` and `fuzz_channel_order`. Their wrappers of the libopus C functions are in `fuzz/fuzz_targets/common/mod.rs`. The other 13 targets run opus1 alone. `fuzz/README.md` and [Testing](09-testing.md#fuzzing) describe what each target checks.
+`fuzz/` is a separate Cargo package of 20 targets for libFuzzer. `fuzz/fuzz.sh` builds them with the stable toolchain and runs them. Six targets compare opus1 with libopus: `fuzz_packet`, `fuzz_decoder_sequence`, `fuzz_multistream_decoder`, `fuzz_multistream_encoder`, `fuzz_encoder_settings` and `fuzz_channel_order`. Their wrappers of the libopus C functions are in `fuzz/fuzz_targets/common/mod.rs`. The other 14 targets run opus1 alone; one of them, `fuzz_dnn_blob`, loads weight blobs and needs the package feature `dnn`. `fuzz/README.md` and [Testing](09-testing.md#fuzzing) describe what each target checks.
 
 ### `scripts/`
 
-`scripts/check_no_std.sh` builds the crate without `std` for `thumbv7em-none-eabi` and `wasm32-unknown-unknown` (when installed) and for the host, then runs the test suite without `std`.
+`scripts/android/build-libopus.sh` builds the libopus references for the phone and the Mac; with `--dnn` it builds them with the neural network code (see [Testing](09-testing.md#builds-with-the-neural-network-features)). `scripts/check_no_std.sh` builds the crate without `std` for `thumbv7em-none-eabi` and `wasm32-unknown-unknown` (when installed) and for the host, then runs the test suite without `std`.
 
 `scripts/eval/` holds the scripts of the evaluation tools: `fetch-corpus.sh` (downloads and checks the corpora), `check-opus-compare.sh` and `opus_compare_exact.c` (build libopus's `opus_compare` as the reference of the port), `moc_reference.py` (the numpy reference of MOC) and `tier2.py` (runs external quality metrics that are installed). See [Testing](09-testing.md#evaluation-tools).

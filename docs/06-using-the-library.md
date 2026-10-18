@@ -1,6 +1,6 @@
 # Using the library
 
-This document shows how to use `opus1` in an application. It starts with one frame through the encoder and the decoder. It then explains the default settings and how the encoder chooses its coding mode. Three recipes follow: a voice over Internet Protocol (VoIP) call at 16 kilohertz (kHz), a voice agent at 24 kHz, and music at 48 kHz. Then come the settings that matter most (frame duration, bitrate, complexity), packet loss and 16-bit samples. The last sections cover the build without the standard library, errors, threads, memory, the build settings that make the codec faster, and how to build and test the crate on a machine without cmake. Readers new to Opus can start with [What Opus is](01-what-is-opus.md). The byte layout of a packet is in [Opus packets](02-packets.md). Audio with more than two channels is in [Multichannel audio](05-multichannel.md). The [documentation index](README.md) lists the other documents.
+This document shows how to use `opus1` in an application. It starts with one frame through the encoder and the decoder. It then explains the default settings and how the encoder chooses its coding mode. Three recipes follow: a voice over Internet Protocol (VoIP) call at 16 kilohertz (kHz), a voice agent at 24 kHz, and music at 48 kHz. Then come the settings that matter most (frame duration, bitrate, complexity), packet loss, the neural network features of the decoder and 16-bit samples. The last sections cover the build without the standard library, errors, threads, memory, the build settings that make the codec faster, and how to build and test the crate on a machine without cmake. Readers new to Opus can start with [What Opus is](01-what-is-opus.md). The byte layout of a packet is in [Opus packets](02-packets.md). Audio with more than two channels is in [Multichannel audio](05-multichannel.md). The [documentation index](README.md) lists the other documents.
 
 Every `rust` example below is a complete program fragment. `cargo test --doc` compiles and runs each of them against this crate.
 
@@ -26,7 +26,7 @@ opus1 = "0.2"
 
 The crate was published as `opus-rs` up to version 0.1.37. Code that used `opus_rs::` now uses `opus1::`.
 
-The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`) and the modules `packet` and `multistream`. The crate also has a module `internals` for the tests of its repository. That module is hidden from the documentation, and any release may change it.
+The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`, and with a neural network feature also `DnnBlob` and `DnnModels`) and the modules `packet` and `multistream`. The crate also has a module `internals` for the tests of its repository. That module is hidden from the documentation, and any release may change it.
 
 ## One frame through the encoder and the decoder
 
@@ -488,6 +488,71 @@ assert_eq!(decoded, 30 * FRAME);
 
 If packet 11 had not arrived either, the decoder would call `decoder.decode(&[], FRAME, &mut out)` for packet 10 instead.
 
+## Neural network features of the decoder
+
+libopus 1.5 and later can run small neural networks in the decoder. A default build of libopus leaves them out, and so does a default build of opus1. In opus1 they are cargo features, all off by default:
+
+| Feature | What it adds | libopus `configure` option | Weights it embeds |
+|---|---|---|---:|
+| `deep-plc` | Deep packet loss concealment (deep PLC): the networks PitchDNN, PLC and FARGAN make up lost speech. | `--enable-deep-plc` | 1,432,768 bytes |
+| `osce` | LACE and NoLACE, the two speech enhancers of OSCE (Opus Speech Coding Enhancement), for SILK frames. It turns on `deep-plc`, as `--enable-osce` does. | `--enable-osce` | 1,573,440 bytes more |
+| `osce-bwe` | The bandwidth extension (BWE) of OSCE: the network BBWENet extends 16 kHz SILK speech to 48 kHz output. It turns on `osce`. | `--enable-osce` (only the `configure` build of libopus) | 685,888 bytes more |
+| `dnn` | The code that the networks share. Each feature above turns it on. It is not meant to be selected alone. | | |
+
+The weights are those of libopus 1.6.1. They are files in the crate (`dnn-weights/`), and each feature embeds the files of its networks in the program. The features work with and without `std` and `heap`.
+
+In this version the networks are not yet connected to the decoder. The code that runs them and their weights are in place, and every layer of every network gives the bits of libopus (see [Testing](09-testing.md#tests-of-the-neural-network-code)). The controls below are in place too. But the decoded output does not depend on the features or on the controls yet. The next version connects deep PLC, LACE, NoLACE and the BWE to the decoder.
+
+The controls follow libopus:
+
+| Call | libopus request | What it does |
+|---|---|---|
+| `OpusDecoder::set_complexity`, `complexity` | `OPUS_SET_COMPLEXITY`, `OPUS_GET_COMPLEXITY` of the decoder | The decoder complexity, 0 to 10. The default is 0. It selects the networks: deep PLC from 5, LACE at 6, NoLACE from 7, and the BWE from 4 when it is switched on. It exists in every build; without the features it is only stored, as in libopus. |
+| `OpusDecoder::set_osce_bwe`, `osce_bwe` | `OPUS_SET_OSCE_BWE`, `OPUS_GET_OSCE_BWE` | Switches the BWE on or off. The default is off. Without the `osce-bwe` feature both return `"Request not implemented"`, as libopus returns `OPUS_UNIMPLEMENTED`. |
+| `OpusDecoder::set_dnn_blob`, `dnn_models` | `OPUS_SET_DNN_BLOB` | Loads other weights from a blob in the libopus format, and tells which groups of networks are loaded. Only with a neural network feature. |
+| `MultistreamDecoder::set_complexity`, `complexity` | `OPUS_SET_COMPLEXITY`, `OPUS_GET_COMPLEXITY` | Sets every stream; reads the first stream, as libopus does. |
+| `MultistreamDecoder::set_osce_bwe`, `set_dnn_blob` | none | Set every stream. libopus's multistream decoder does not forward these requests. |
+
+`reset_state` keeps the complexity, the BWE switch and the loaded weights.
+
+A new decoder has the built-in weights of every network of its build. `set_dnn_blob` replaces them with the weights of a blob, such as the file that libopus's program `dump_weights_blob` writes. The networks load in four groups: deep PLC (PitchDNN, PLC and FARGAN together), LACE, NoLACE and BBWENet. A group is replaced only when the blob holds all of its arrays. The other groups keep their weights. A blob without any complete group is refused, and nothing changes. `DnnBlob::builtin()` brings back the built-in weights.
+
+A `DnnBlob` is made in one of three ways:
+
+- `DnnBlob::from_bytes(&bytes)` copies the bytes into memory that starts on a 64-byte boundary. It needs the `heap` feature.
+- `DnnBlob::from_static(bytes)` uses bytes that live as long as the program, without a copy. Every array of the blob must start on a 4-byte boundary.
+- `DnnBlob::builtin()` is the built-in weights (with `deep-plc`, `osce` or `osce-bwe`).
+
+Cloning a `DnnBlob` does not copy the bytes. A decoder keeps a clone of the blob for as long as it uses its weights. `set_dnn_blob` allocates the layer tables of each group it loads (with `heap`); decoding allocates nothing.
+
+```rust
+use opus1::OpusDecoder;
+
+let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+assert_eq!(decoder.complexity(), 0);
+// Deep PLC and NoLACE, in a build with those features.
+decoder.set_complexity(7).unwrap();
+assert_eq!(decoder.set_complexity(11), Err("Invalid complexity"));
+assert_eq!(decoder.complexity(), 7);
+
+// The bandwidth extension needs the `osce-bwe` feature.
+match decoder.set_osce_bwe(true) {
+    Ok(()) => assert_eq!(decoder.osce_bwe(), Ok(true)),
+    Err(message) => assert_eq!(message, "Request not implemented"),
+}
+
+#[cfg(feature = "deep-plc")]
+{
+    use opus1::{DnnBlob, DnnModels};
+    assert!(decoder.dnn_models().contains(DnnModels::DEEP_PLC));
+    // Bytes that are not a blob are refused.
+    assert_eq!(DnnBlob::from_bytes(&[1, 2, 3]).err(), Some("Invalid DNN blob"));
+    // Back to the built-in weights, after another blob was loaded.
+    let loaded = decoder.set_dnn_blob(&DnnBlob::builtin()).unwrap();
+    assert!(loaded.contains(DnnModels::DEEP_PLC));
+}
+```
+
 ## 16-bit input and output
 
 - `encode_i16` takes interleaved `i16` samples. It converts every sample to float as `sample as f32 / 32768.0` and then encodes as `encode` does, so it writes the same packets.
@@ -551,6 +616,9 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 | `std` | on | Links the standard library. On x86-64 it detects the vector instructions AVX and AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add) at run time. On aarch64 it detects FEAT_FCMA (the complex-number instructions of ARMv8.3) at run time where the target does not include them already. Without `std` the crate is `#![no_std]`. |
 | `heap` | on | Keeps the large codec state behind `Box`, so `OpusEncoder` and `OpusDecoder` themselves are small. Requires `std`. |
 | `libm` | off | Provides `sin`, `cos`, `sqrt` and the other float functions through the `libm` crate, a pure-Rust port of the musl C library's math functions. A build without `std` needs it. |
+| `deep-plc`, `osce`, `osce-bwe` | off | The neural network features of the decoder, with the weights of libopus 1.6.1 (see [Neural network features of the decoder](#neural-network-features-of-the-decoder)). Each one turns on the one before it, and `dnn`. |
+| `dnn` | off | The code that the neural network features share. The features above turn it on. |
+| `test-libopus-dnn` | off | For the tests of this repository only. It adds nothing to the library. It compiles the tests that call a libopus built with its neural network code. `cargo test --all-features` fails to link against a libopus without that code, such as the Homebrew build. |
 
 Three builds are possible:
 
@@ -565,16 +633,22 @@ default-features = false
 features = ["libm"]
 ```
 
+The neural network features work in all three builds. Without `heap`, `DnnBlob::from_bytes` is missing, and a blob must live as long as the program (`DnnBlob::from_static`). Without `std`, the networks take `exp`, `log` and the other functions they need from the `libm` crate, whose last bits can differ from those of the platform's C library.
+
 Without `std`, the x86-64 code uses AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"`. NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M) and `wasm32-unknown-unknown` when those targets are installed, then runs the tests without `std`.
 
 ### Size of the encoder and the decoder
 
-Measured with `size_of` and a counting allocator, release build, Rust 1.98 on aarch64-apple-darwin. The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
+Measured with `size_of` and a counting allocator, release build, Rust 1.98 on aarch64-apple-darwin, on the branch of the neural network features (`next-dnn`). The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
 
 | Build | `OpusEncoder` | `OpusDecoder` |
 |---|---|---|
-| Default (`heap`) | 2,544 bytes, plus 122,784 bytes on the heap in 7 allocations (mono) or 132,712 bytes in 8 allocations (stereo) | 96 bytes, plus 113,464 bytes on the heap in 5 allocations |
-| Without `heap` (with or without `std`) | 135,192 bytes | 67,432 bytes |
+| Default (`heap`) | 2,560 bytes, plus 115,352 bytes on the heap in 7 allocations (mono) or 125,280 bytes in 8 allocations (stereo) | 104 bytes, plus 105,760 bytes on the heap in 5 allocations |
+| Default with `osce-bwe` | the same | 112 bytes, plus 106,376 bytes on the heap in 6 allocations |
+| Without `heap` (with or without `std`) | 127,776 bytes | 59,736 bytes |
+| Without `heap`, with `osce-bwe` | the same | 72,320 bytes |
+
+With a neural network feature, the decoder holds references to the layer tables of the built-in networks, which every decoder shares. Without `heap`, it also has room for the layer tables of every group that a blob can load (12,584 bytes with `osce-bwe`). The weights themselves are not copied: the embedded ones stay in the program, and a blob's bytes stay in the blob.
 
 The heap of the decoder includes a 46,088-byte float buffer for `decode_i16` and `decode_fec_i16`. Without `heap`, these two calls use a buffer of the same size on the stack instead.
 
@@ -643,7 +717,11 @@ What is rejected:
 | `decode` and the other decode calls | an output buffer shorter than the samples to be written | `"Output buffer too small for packet"` |
 | `decode` with an empty packet, `decode_fec` | a `frame_size` that is not a multiple of 2.5 ms | `"Lost frame: frame_size must be a multiple of 2.5 ms"` |
 | `set_bitrate` | `Bitrate::BitsPerSecond(n)` with `n` of 0 or less | `"Invalid bitrate"` |
-| `set_complexity` | a value outside 0 to 10 | `"Invalid complexity"` |
+| `set_complexity` of the encoder, the decoder and the multistream decoder | a value outside 0 to 10 | `"Invalid complexity"` |
+| `OpusDecoder::set_osce_bwe`, `osce_bwe`, `MultistreamDecoder::set_osce_bwe` | a build without the `osce-bwe` feature | `"Request not implemented"` |
+| `DnnBlob::from_bytes`, `DnnBlob::from_static` | bytes that are not a blob in the libopus format | `"Invalid DNN blob"` |
+| `DnnBlob::from_static` | a blob with an array that does not start on a 4-byte boundary | `"DNN blob is not aligned"` |
+| `set_dnn_blob` | a blob that holds no complete group of networks of this build | `"DNN blob holds no model of this build"` |
 | `set_packet_loss_perc` | a value outside 0 to 100 | `"Invalid packet loss percentage"` |
 | `set_max_bandwidth` | `Bandwidth::Auto` | `"Invalid maximum bandwidth"` |
 | `set_force_channels` | more channels than the encoder has, or 0 | `"Invalid forced channel count"` |
@@ -695,7 +773,7 @@ match decoder.decode(&[], 100, &mut out) {
 - To share one between threads, put it in a `Mutex`.
 - Separate streams need separate encoders and decoders. They do not share mutable state, so they can run in parallel on different threads.
 
-Apart from constant tables, the crate has one global value: the CELT mode, which holds the band layout, the window and the transform tables of the CELT layer. It is built once, at first use, and then only read.
+Apart from constant tables, the crate has one global value: the CELT mode, which holds the band layout, the window and the transform tables of the CELT layer. It is built once, at first use, and then only read. With a neural network feature there is a second one: the layer tables of the built-in networks. The first decoder builds them, and reads one byte of every 4 KiB page of the weights, so that the first use of a network does not wait for the system to load those pages. Then they are only read.
 
 ```rust
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
@@ -718,9 +796,10 @@ assert!(worker.join().unwrap() > 0);
 ## Memory use
 
 - `encode`, `encode_i16`, `decode`, `decode_fec`, `decode_i16`, `decode_fec_i16` and the multistream `encode` and `decode` allocate nothing. All memory is taken when the encoder or decoder is built.
-- One exception in the default build: `OpusEncoder::reset_state` builds a fresh encoder with the same settings. So it allocates the 122,784 bytes (mono) or 132,712 bytes (stereo) of a new state and frees the old one. `OpusDecoder::reset_state` allocates nothing.
+- One exception in the default build: `OpusEncoder::reset_state` builds a fresh encoder with the same settings. So it allocates the 115,352 bytes (mono) or 125,280 bytes (stereo) of a new state and frees the old one. `OpusDecoder::reset_state` allocates nothing.
+- `DnnBlob::from_bytes` allocates a copy of the blob, and `OpusDecoder::set_dnn_blob` allocates the layer tables of each group of networks it loads.
 - The sizes of one encoder and one decoder are in [Size of the encoder and the decoder](#size-of-the-encoder-and-the-decoder).
-- A multistream encoder or decoder holds one `OpusEncoder` or `OpusDecoder` per stream. For 5.1 sound (4 streams) a `MultistreamEncoder` allocated 605,822 bytes and a `MultistreamDecoder` 500,320 bytes in the measurement above. The repository's tests `multistream_enc_no_alloc` and `multistream_dec_no_alloc` check that they allocate nothing after they are built.
+- A multistream encoder or decoder holds one `OpusEncoder` or `OpusDecoder` per stream. For 5.1 sound (4 streams) a `MultistreamEncoder` allocated 599,166 bytes and a `MultistreamDecoder` 469,536 bytes in the measurement above (472,032 bytes with `osce-bwe`). The repository's tests `multistream_enc_no_alloc` and `multistream_dec_no_alloc` check that they allocate nothing after they are built.
 
 ## Build settings for speed
 

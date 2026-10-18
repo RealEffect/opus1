@@ -27,6 +27,10 @@ mod eval;
 mod bands;
 mod celt;
 mod celt_lpc;
+#[cfg(feature = "dnn")]
+mod dnn;
+#[cfg(feature = "dnn")]
+pub use dnn::{DnnBlob, DnnModels};
 mod hp_cutoff;
 #[doc(hidden)]
 pub mod internals;
@@ -3113,7 +3117,26 @@ pub struct OpusDecoder {
     /// `None` while a call uses it.
     #[cfg(feature = "heap")]
     w_pcm_float: Option<Box<FixedVec<f32, OPUS_PCM_PACKET>>>,
+
+    /// C `st->complexity`: the decoder complexity, 0 to 10, set with
+    /// `OPUS_SET_COMPLEXITY`. A reset keeps it, as in libopus.
+    complexity: i32,
+    /// C `st->DecControl.enable_osce_bwe`, set with `OPUS_SET_OSCE_BWE`. A
+    /// reset keeps it, as in libopus.
+    #[cfg(feature = "osce-bwe")]
+    osce_bwe: bool,
+    /// The neural network models of the decoder and the kernel variant
+    /// they run on. A reset keeps them (libopus reloads PitchDNN).
+    #[cfg(all(feature = "dnn", feature = "heap"))]
+    dnn: Box<dnn::DecoderDnn>,
+    #[cfg(all(feature = "dnn", not(feature = "heap")))]
+    dnn: dnn::DecoderDnn,
 }
+
+/// The error of a request that this build does not implement, like
+/// libopus's `OPUS_UNIMPLEMENTED` ("request not implemented").
+#[cfg_attr(feature = "osce-bwe", allow(dead_code))]
+const ERR_UNIMPLEMENTED: &str = "Request not implemented";
 
 impl OpusDecoder {
     pub fn new(sampling_rate: i32, channels: usize) -> Result<Self, &'static str> {
@@ -3165,6 +3188,15 @@ impl OpusDecoder {
             w_silk_out: Box::new(FixedVec::from_value(0.0f32, 960 * channels)),
             #[cfg(feature = "heap")]
             w_pcm_float: Some(Box::default()),
+
+            // C `opus_decoder_init`: `st->complexity = 0`.
+            complexity: 0,
+            #[cfg(feature = "osce-bwe")]
+            osce_bwe: false,
+            #[cfg(all(feature = "dnn", feature = "heap"))]
+            dnn: Box::new(dnn::DecoderDnn::new()),
+            #[cfg(all(feature = "dnn", not(feature = "heap")))]
+            dnn: dnn::DecoderDnn::new(),
         })
     }
 
@@ -3536,13 +3568,17 @@ impl OpusDecoder {
 
     /// libopus `OPUS_RESET_STATE`: forget the stream decoded so far. The
     /// decoder then behaves like a new one with the same sampling rate and
-    /// channel count.
+    /// channel count. The settings stay: the complexity, the bandwidth
+    /// extension switch and the loaded neural network weights.
     pub fn reset_state(&mut self) {
         // C opus_decoder_ctl, OPUS_RESET_STATE: clear the stream state,
         // reset both layers, and put back the two values that do not start
         // at zero. `st->DecControl` is not part of what libopus clears, so
         // the SILK channel count and rate of the last frame stay. They are
-        // not used before the next SILK frame sets them again.
+        // not used before the next SILK frame sets them again. The
+        // complexity and the BWE switch lie outside what libopus clears
+        // too. The neural network models stay as well; libopus reloads
+        // PitchDNN here (`dnn/lpcnet_enc.c:53-57`).
         self.celt_dec.reset_state();
         self.silk_dec.reset();
         self.mode = None;
@@ -3558,6 +3594,106 @@ impl OpusDecoder {
     /// The sampling rate of the output in Hz (`OPUS_GET_SAMPLE_RATE`).
     pub fn sampling_rate(&self) -> i32 {
         self.sampling_rate
+    }
+
+    /// libopus `OPUS_SET_COMPLEXITY` of the decoder: 0 to 10. The default
+    /// is 0. A value outside that range is refused with
+    /// `"Invalid complexity"` and the setting stays as it was.
+    ///
+    /// Since libopus 1.5 the decoder complexity turns on the neural network
+    /// features that were compiled in: deep packet loss concealment from 5
+    /// (cargo feature `deep-plc`), the LACE speech enhancer at 6 and NoLACE
+    /// from 7 (feature `osce`), and from 4 the bandwidth extension, when it
+    /// is switched on with [`set_osce_bwe`](Self::set_osce_bwe) (feature
+    /// `osce-bwe`). Without these features the value is only stored, as in
+    /// a libopus built without them.
+    ///
+    /// In this version of opus1 the features are not connected to the
+    /// decoder yet: the value is stored and reported, and the decoded
+    /// output does not depend on it.
+    ///
+    /// [`reset_state`](Self::reset_state) keeps the value.
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+        if !(0..=10).contains(&complexity) {
+            return Err("Invalid complexity");
+        }
+        self.complexity = complexity;
+        Ok(())
+    }
+
+    /// The complexity set with [`set_complexity`](Self::set_complexity)
+    /// (`OPUS_GET_COMPLEXITY`).
+    pub fn complexity(&self) -> i32 {
+        self.complexity
+    }
+
+    /// libopus `OPUS_SET_OSCE_BWE`: switches the bandwidth extension of
+    /// SILK wideband speech to 48 kHz on or off. The default is off. It
+    /// works at a complexity of 4 and above, when the output is 48 kHz.
+    ///
+    /// Without the cargo feature `osce-bwe` this returns
+    /// `"Request not implemented"`, as libopus returns `OPUS_UNIMPLEMENTED`
+    /// when it was built without the extension.
+    ///
+    /// In this version of opus1 the extension is not connected to the
+    /// decoder yet: the switch is stored and reported only.
+    /// [`reset_state`](Self::reset_state) keeps it.
+    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), &'static str> {
+        #[cfg(feature = "osce-bwe")]
+        {
+            self.osce_bwe = enabled;
+            Ok(())
+        }
+        #[cfg(not(feature = "osce-bwe"))]
+        {
+            let _ = enabled;
+            Err(ERR_UNIMPLEMENTED)
+        }
+    }
+
+    /// The switch set with [`set_osce_bwe`](Self::set_osce_bwe)
+    /// (`OPUS_GET_OSCE_BWE`). Without the cargo feature `osce-bwe` this
+    /// returns `"Request not implemented"`, as libopus does.
+    pub fn osce_bwe(&self) -> Result<bool, &'static str> {
+        #[cfg(feature = "osce-bwe")]
+        {
+            Ok(self.osce_bwe)
+        }
+        #[cfg(not(feature = "osce-bwe"))]
+        {
+            Err(ERR_UNIMPLEMENTED)
+        }
+    }
+
+    /// libopus `OPUS_SET_DNN_BLOB`: loads neural network weights from a
+    /// blob in the libopus format, such as the file that libopus's
+    /// `dump_weights_blob` writes, in place of the weights the decoder has.
+    ///
+    /// Every model group of this build that the blob holds completely is
+    /// loaded: deep PLC (PitchDNN, the PLC model and FARGAN together),
+    /// LACE, NoLACE and BBWENet. Each group is replaced only when all of
+    /// its arrays load; the groups that the blob lacks keep the weights
+    /// they had. Returns the groups loaded by this call, or
+    /// `"DNN blob holds no model of this build"`, and then nothing changes.
+    /// [`DnnBlob::builtin`] brings back the built-in weights.
+    ///
+    /// The decoder keeps a clone of `blob` (the bytes are not copied) for
+    /// as long as it uses the models. A new decoder starts with the
+    /// built-in weights of every model this build contains.
+    /// [`reset_state`](Self::reset_state) keeps the loaded models.
+    ///
+    /// libopus differs: the request exists only in a libopus built with
+    /// `USE_WEIGHTS_FILE` (and so without built-in weights), returns 1 on
+    /// any failure, and can leave a model half loaded.
+    #[cfg(feature = "dnn")]
+    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<DnnModels, &'static str> {
+        self.dnn.load(blob)
+    }
+
+    /// The model groups the decoder has loaded.
+    #[cfg(feature = "dnn")]
+    pub fn dnn_models(&self) -> DnnModels {
+        self.dnn.models()
     }
 
     /// The number of output channels.

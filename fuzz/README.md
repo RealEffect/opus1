@@ -55,6 +55,7 @@ cargo build --release --target "$(rustc -vV | sed -n 's/^host: //p')" \
 - `--target` is needed. Without it, `RUSTFLAGS` also applies to build scripts, which then fail to link.
 - Run the command from the root of the repository. Its paths are relative to it. cargo also reads `.cargo/config.toml` from the directory it runs in, so settings kept there apply only then. `fuzz.sh` runs cargo in `fuzz/`, so it can be called from any directory.
 - The programs are in `fuzz/target/<host>/release/`. One runs as `fuzz_packet fuzz/corpus/fuzz_packet -max_total_time=60`.
+- `--bins` leaves out `fuzz_dnn_blob`, which requires the package feature `dnn`. Build it with `--bin fuzz_dnn_blob --features dnn` in place of `--bins`, as `fuzz.sh` does.
 
 ### With cargo-fuzz on nightly
 
@@ -113,6 +114,7 @@ The output check allows 50 dB because opus1's decoder differs from libopus's onl
 | `fuzz_encoder_boundary` | Encodes with every rate, channel count and application, extreme settings and output buffers of 1 to 4000 bytes. |
 | `fuzz_multi_frame` | Encodes and decodes a run of frames. Each must decode in the encoder's final range to finite samples. |
 | `fuzz_packet_parsing` | Decodes the input with all 256 first bytes at every rate. |
+| `fuzz_dnn_blob` | Loads weight blobs of the neural network models: the input as a blob, or a built-in blob with changed headers and data, cut short or not. Nothing may panic. Every model that loads must have the layer shapes of its descriptors, and every array it reads must lie inside the blob. The same bytes, copied with `DnnBlob::from_bytes` and loaded with `OpusDecoder::set_dnn_blob`, must either load some groups of networks or change nothing, and the decoder must then still conceal a lost packet at complexity 10. Built with the package feature `dnn`, which turns on opus1's `osce-bwe`; `fuzz.sh` builds it in a cargo call of its own, so the other targets keep opus1's default features. |
 
 ## Adding a target
 

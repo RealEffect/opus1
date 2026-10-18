@@ -301,6 +301,22 @@ impl KissFftState {
         Self::build(nfft, &twiddles, shift)
     }
 
+    /// The plan for `twiddles.len()` points, with a given twiddle table
+    /// instead of one computed with `cos` and `sin`. Entry `i` of the table
+    /// must be `exp(-2 * pi * i / n)`, `n = twiddles.len()`.
+    ///
+    /// libopus has such fixed tables, for example `kfft` of
+    /// `dnn/lpcnet_tables.c` (320 points). The factors and the bit-reversal
+    /// table are computed as for `new`; they are the ones of libopus.
+    #[cfg(feature = "dnn")]
+    pub(crate) fn with_twiddles(twiddles: &[KissCpx]) -> Option<Self> {
+        let nfft = twiddles.len();
+        if nfft == 0 || nfft > KISS_MAX_N {
+            return None;
+        }
+        Self::build(nfft, twiddles, 0)
+    }
+
     /// Builds the plan for `nfft` points.
     ///
     /// `twiddles` is the table of the FFT size `nfft << shift`. Entry `i` of
@@ -1548,6 +1564,33 @@ pub fn opus_fft_impl_fused(st: &KissFftState, fout: &mut [KissCpx]) {
         st.nfft
     );
     fft_stages_scalar::<Fused>(st, &mut fout[..st.nfft]);
+}
+
+/// libopus `opus_fft_c` (celt/kiss_fft.c:615-635) with the products fused
+/// as clang fuses them for arm64, on every target: each input value times
+/// the plan's scale, stored at its bit-reversed place in `fout`, then the
+/// transform of `opus_fft_impl_fused`.
+///
+/// The neural network code uses it, because it computes the bits of libopus
+/// for arm64 on every target. On aarch64 it runs the vector butterflies of
+/// `opus_fft_impl`, which give the same bits.
+///
+/// Panics when `fin` or `fout` holds fewer than `st.nfft()` values.
+#[cfg(feature = "dnn")]
+pub(crate) fn opus_fft_fused(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
+    let n = st.nfft;
+    let fin = &fin[..n];
+    let fout = &mut fout[..n];
+    let scale = st.scale;
+    // `bitrev` is a permutation of `0..n` (checked in `build`), so every
+    // value of `fout` is written.
+    for (x, &place) in fin.iter().zip(st.bitrev.iter()) {
+        fout[place as usize] = KissCpx::new(x.r * scale, x.i * scale);
+    }
+    #[cfg(target_arch = "aarch64")]
+    opus_fft_impl(st, fout);
+    #[cfg(not(target_arch = "aarch64"))]
+    opus_fft_impl_fused(st, fout);
 }
 
 /// The twiddle table of the 480-point FFT: entry `i` is

@@ -17,6 +17,8 @@ opus1 follows libopus 1.6, the reference implementation of Opus in C. This docum
 - **Forward error correction (FEC)** in Opus is a low-bitrate copy of the previous frame inside a SILK packet.
 - A **fused multiply-add (FMA)** computes `a * b + c` with a single rounding step instead of two.
 - **Multistream** is the Opus format that packs several streams into one packet, for example for 5.1 surround sound.
+- The **neural network features** of libopus 1.5 and later are deep packet loss concealment (deep PLC), the speech enhancers LACE and NoLACE, and the bandwidth extension (BWE). LACE, NoLACE and the BWE make up OSCE (Opus Speech Coding Enhancement). A **weight blob** is a file of network weights in libopus's format.
+- A **novec** build of libopus is built at `-O2` with `-fno-vectorize -fno-slp-vectorize`, so the compiler turns no loop into vector code.
 
 ## What the figures were measured against
 
@@ -52,7 +54,7 @@ This causes several of the differences listed below: in CELT packets at complexi
 
 ### Decoder controls
 
-The decoder decodes every valid packet, up to 120 ms. These libopus decoder controls have no equivalent in `OpusDecoder`:
+The decoder decodes every valid packet, up to 120 ms. The decoder complexity (`OPUS_SET_COMPLEXITY`), the BWE switch (`OPUS_SET_OSCE_BWE`) and weight blobs (`OPUS_SET_DNN_BLOB`) exist, but in this version they do not change the decoded output (see [Optional libopus features](#optional-libopus-features)). These libopus decoder controls have no equivalent in `OpusDecoder`:
 
 - the output gain (`OPUS_SET_GAIN`),
 - phase inversion disabling (`OPUS_SET_PHASE_INVERSION_DISABLED`). The decoder does what libopus does by default: it disables phase inversion only when it mixes a stereo stream down to mono output,
@@ -81,7 +83,14 @@ libopus has features that are compiled only when it is configured with them. The
 - Opus Speech Coding Enhancement (OSCE, `--enable-osce`);
 - the scalable quality extension (`--enable-qext`).
 
-These options are listed in libopus's `configure.ac`. opus1 implements none of them.
+These options are listed in libopus's `configure.ac`. For deep PLC and OSCE, opus1 has the cargo features `deep-plc`, `osce` and `osce-bwe` (see [Using the library](06-using-the-library.md#neural-network-features-of-the-decoder)). In this version they bring the code that the networks share, the weights of libopus 1.6.1 and the decoder controls, all checked against libopus (see [Neural network code](#neural-network-code)). The networks do not run in the decoder yet, so the decoded output is that of a libopus without the features at every complexity.
+
+A libopus built with the features also changes two things at every decoder complexity, even at 0. opus1 does not make these changes yet; they come with the networks:
+
+- With deep PLC compiled, `silk_PLC_glue_frames` skips its fade-in for 16 kHz SILK frames (`silk/PLC.c` lines 477-480).
+- With OSCE compiled, a sample of -32768 in a 20 ms SILK frame at 16 kHz becomes -32767 (`dnn/osce.c` lines 1672-1679).
+
+opus1 implements neither DRED nor the scalable quality extension.
 
 ## Deliberate differences
 
@@ -97,7 +106,20 @@ These differences are intended. Most are listed in the comment above `OpusEncode
 | Switch to CELT-only without room for the redundant frame | The CELT encoder is still reset. | Goes on from its last CELT frame. | The decoder then starts the CELT-only packets from the same reset state. |
 | Energy mask (surround) | Copied, and applied again on the next frame after a CELT reset. | Keeps a pointer, which is lost after a CELT reset until the caller sets it again. | Rust ownership. The values are the same. |
 | Multistream bandwidth with the automatic or maximum bitrate in surround mode (D1) | Chosen from the bitrate that was allocated. Codes fullband. | Compares the raw setting and always chooses narrowband. | Narrowband 5.1 at a high bitrate is not useful. |
+| BWE switch and weight blobs on a multistream decoder | `MultistreamDecoder::set_osce_bwe` and `set_dnn_blob` set every stream. | The multistream decoder answers `OPUS_SET_OSCE_BWE` and `OPUS_SET_DNN_BLOB` with `OPUS_UNIMPLEMENTED`; each stream must be set through `OPUS_MULTISTREAM_GET_DECODER_STATE`. | Convenience. `stream_decoder_mut` still sets one stream. |
+| The BWE switch | `set_osce_bwe` takes a `bool`. | `OPUS_SET_OSCE_BWE` takes an integer and refuses values other than 0 and 1 with `OPUS_BAD_ARG`. | A `bool` has no other values. |
 | Expert frame duration of the multistream encoder | `set_expert_frame_duration` takes a `FrameDuration`, which holds only the ten values libopus defines. | `OPUS_SET_EXPERT_FRAME_DURATION` stores any number, and every later encode call fails when it is no duration. | A `FrameDuration` cannot hold another number. For the ten values both encoders take and refuse the same calls. |
+
+### Neural network weights
+
+| What | opus1 | libopus 1.6.1 | Why |
+|---|---|---|---|
+| Where `set_dnn_blob` exists | In every build with a neural network feature. A new decoder has the built-in weights; a blob replaces them. | `OPUS_SET_DNN_BLOB` exists only in a build with `USE_WEIGHTS_FILE`, which has no built-in weights. Otherwise it returns `OPUS_UNIMPLEMENTED`. | One build serves both uses. `DnnBlob::builtin()` brings back the built-in weights. |
+| What a blob loads | Each group of networks on its own: deep PLC (PitchDNN, PLC and FARGAN), LACE, NoLACE, BBWENet. A group is replaced only when all its arrays load; the others keep their weights. | One request loads everything. A blob without BBWENet (such as the one of libopus's own `dump_weights_blob`) leaves LACE and NoLACE unloaded too in a build with the BWE, and with the BWE switched on libopus 1.6.1 then aborts at the first SILK frame at 48 kHz (a buffer overrun in `compute_generic_conv1d` that `_FORTIFY_SOURCE` stops). | The official blob works. |
+| A blob that fails | Returns an error string and changes nothing. | Returns 1, which is not an Opus error code. The models loaded before the failing one stay replaced, and the failing layer keeps the arrays found before the failure. | No half-loaded network. |
+| A malformed blob | Refused by `DnnBlob::from_bytes` or `from_static`, without reading out of bounds. | `parse_weights` fails, but every caller ignores that: the decoder request then crashes in `lpcnet_plc_load_model`. A blob without the index table of a sparse layer makes libopus read uninitialized memory. | Safety. |
+| What the layer loader also refuses | Arrays that do not start on a 4-byte boundary; int8 weights equal to -128; a layer with neither int8 nor float weights; int8 layers whose output count is not a multiple of 8 or whose input count is not a multiple of 4 or above 2048; a diagonal array whose size is not 3 times the input count; negative counts or positions in a sparse index table; sizes whose byte count overflows. | Accepts all of these. Some of them make its kernels read or write out of bounds later; with -128 its kernel variants give different results. | Safety. The 1.6.1 weights have none of these. |
+| `reset_state` | Keeps every loaded network. | `OPUS_RESET_STATE` reinitializes PitchDNN from the built-in arrays. In a build with `USE_WEIGHTS_FILE`, PitchDNN is then empty while the decoder counts deep PLC as loaded. | A reset should not lose weights. |
 
 ## Where the numbers differ
 
@@ -253,9 +275,26 @@ Files in only one of the two trees: main has the tool `celt/dump_modes/`, the TI
 
 So opus1 followed the main branch in one place, the Burg energy, and now follows 1.6.1 there too. Some main changes fix memory errors: the cleared DRED decoder (1.6.1 leaves its memory uninitialized), the assertion on `nb_latents`, and `RESTORE_STACK`. Others fix wrong output: the range decoder after the bandwidth extension, the `extra_quant` index of QEXT, and `Y` beyond `effEBands`. None of them is in code that opus1 ports, so no main-branch change is kept.
 
+### Neural network code
+
+The code that the networks share (`src/dnn/`, see [Architecture](07-architecture.md#neural-network-code-srcdnn)) follows libopus 1.6.1 as built for 64-bit ARM at `-O2` without loop vectorization (novec), on every target. Against that build, on the Mac and on the phone (Cortex-A76 and Cortex-A55), every result is bit-exact:
+
+- every kernel and layer function, for every kernel variant (`Portable`, `Neon`, `NeonDotprod`), on random and edge inputs;
+- every layer of the six networks PitchDNN, PLC, FARGAN, LACE, NoLACE and BBWENet, with the real weights and inputs from speech: 357,192 uses of a layer on 1804 frames of 10 ms, call by call and also with each side running on its own outputs (`tests/dnn_layers_libopus.rs`);
+- the pitch that PitchDNN gives, against libopus's `compute_pitchdnn`;
+- the signal analysis of `dnn/freq.c` and `dnn/burg.c`.
+
+Builds of libopus that turn loops into vector code differ in the last bits. Measured with the same tests:
+
+- **Apple clang 21 at `-O2` (Mac).** It sums the products of float layers with one output in another order. Only these layers differ: `sig_net_cond_gain_dense` of FARGAN; the gains of LACE (`lace_cf1_gain`, `lace_cf1_global_gain`, `lace_cf2_gain`, `lace_cf2_global_gain`, `lace_af1_gain`); the gains of NoLACE (`nolace_cf1_gain`, `nolace_cf1_global_gain`, `nolace_cf2_gain`, `nolace_cf2_global_gain`, `nolace_af4_gain`); and `bbwenet_af3_gain`. With the same inputs, the largest difference was 4.2e-6 (in `lace_cf2_global_gain`), or 1.04e-6 of the sum of the absolute products of that output. That is at most 0.068 of the bound `2·M·2^-24·Σ|w·x|` for a sum of `M` products. When FARGAN runs on its own output, as it does during a loss, such a difference grows: its gain enters the excitation it feeds back, and after a few frames the two runs differ by up to 1.8 in the states of its recurrent layers. The networks that do not feed back their output keep the single-call differences. The last step of `compute_pitchdnn`, which takes the weighted mean of 5 outputs around the maximum, also rounds differently: the pitch differs in 386 of 1804 frames, by at most 4.8e-7.
+- **NDK clang 18 at `-O2` (phone).** Every layer of the six networks is bit-exact, on both cores. As on the Mac, the pitch of `compute_pitchdnn` differs: in 375 of 1804 frames, by at most 4.8e-7. `dnn/freq.c` and `dnn/burg.c` differ too, because their sums are vector code.
+- **`dnn/freq.c` and `dnn/burg.c` at `-O2` on the Mac.** The band energies differ in 14,976 of 88,452 values, by at most 2.7e-7 of the value. Burg's method differs in 78 of 377,951 values, by one step of the float format. The Burg cepstrum differs in 42,246 of 152,028 values, by at most 5.3e-6 (the values reach 23). `lpc_from_cepstrum` differs in the last bits of 41,770 of 93,772 values; in one case one build stops the recursion early and the other does not. The FFT, the window and the DCT give the same bits.
+
+Without `std`, the networks' `log10` and `pow` come from the `libm` crate instead of the platform's C library. Their differences were not measured.
+
 ## Platforms
 
-- **x86-64 was only compiled in this release, not run.** Its vector kernels for the pulse search, the band energies and the renormalization are not ports of libopus's SSE2 code. Its kernels for the inner products and correlations of the pitch analysis do not follow libopus's x86 kernels in every detail either. SSE2 (Streaming SIMD Extensions 2, where SIMD means single instruction, multiple data) is the baseline vector instruction set of x86-64. The [README](../README.md) keeps an older x86-64 speed measurement of opus-rs 0.1.x.
+- **x86-64 was only compiled in this release, not run.** This includes the x86-64 kernels of the neural network code (AVX2, AVX-VNNI and AVX-512 VNNI), which compute the bits of the 64-bit ARM kernels. `tests/dnn_edges.rs` checks their arithmetic in scalar form on every input class. 32-bit x86 (`i686-unknown-linux-gnu`) was compiled once, without `std`, with `libm` and every neural network feature, with and without the AVX target features. The Rust standard library for that target is not installed here, so `core` was built from the `rust-src` component for this check; it is not part of the regular checks. The vector kernels for the pulse search, the band energies and the renormalization are not ports of libopus's SSE2 code. The kernels for the inner products and correlations of the pitch analysis do not follow libopus's x86 kernels in every detail either. SSE2 (Streaming SIMD Extensions 2, where SIMD means single instruction, multiple data) is the baseline vector instruction set of x86-64. The [README](../README.md) keeps an older x86-64 speed measurement of opus-rs 0.1.x.
 - **64-bit ARM rounding follows clang.** clang compiles C with `-ffp-contract=on` by default. Where a product and a sum stand in one expression, it emits one fused multiply-add. opus1 copies this in its FFT, its MDCT, the pitch analysis and the comb filter of CELT, the coarse energy and several other places. So on 64-bit ARM they give the same bits as the arm64 build of libopus. A libopus built without contraction, or built by GCC (the GNU Compiler Collection) with `-ffp-contract=fast`, rounds differently. On other targets, the FFT of opus1 rounds each product before the addition.
 - **Speed cost of following libopus:**
   - `theta_rdo` adds 34 % to 73 % encode time on the six stereo bench scenarios at c9 and c10. The opus1 / libopus encode time ratio stays 0.53 to 0.63.

@@ -221,6 +221,9 @@ pub trait Math {
     fn cbrt(self) -> Self;
     fn hypot(self, other: Self) -> Self;
     fn mul_add(self, a: Self, b: Self) -> Self;
+    /// Rounds to the nearest integer, and a value halfway between two
+    /// integers to the even one (the inherent `round_ties_even` of `std`).
+    fn round_ties_even(self) -> Self;
 }
 
 #[cfg(all(not(feature = "std"), feature = "libm"))]
@@ -309,6 +312,9 @@ impl Math for f32 {
     fn mul_add(self, a: Self, b: Self) -> Self {
         libm::fmaf(self, a, b)
     }
+    fn round_ties_even(self) -> Self {
+        libm::rintf(self)
+    }
 }
 
 #[cfg(all(not(feature = "std"), feature = "libm"))]
@@ -396,6 +402,31 @@ impl Math for f64 {
     }
     fn mul_add(self, a: Self, b: Self) -> Self {
         libm::fma(self, a, b)
+    }
+    fn round_ties_even(self) -> Self {
+        libm::rint(self)
+    }
+}
+
+// The `no_std` unit tests link `std`, whose inherent float methods win over
+// `Math`, so these tests call the trait methods by their full path.
+#[cfg(all(test, not(feature = "std"), feature = "libm"))]
+mod math_tests {
+    use super::Math;
+
+    #[test]
+    fn round_ties_even_breaks_ties_to_even() {
+        assert_eq!(Math::round_ties_even(0.5f32), 0.0);
+        assert_eq!(Math::round_ties_even(1.5f32), 2.0);
+        assert_eq!(Math::round_ties_even(2.5f32), 2.0);
+        assert_eq!(Math::round_ties_even(-2.5f32), -2.0);
+        assert_eq!(Math::round_ties_even(190.5f32), 190.0);
+        assert_eq!(Math::round_ties_even(2.4f32), 2.0);
+        assert_eq!(Math::round_ties_even(-2.6f32), -3.0);
+        assert_eq!(Math::round_ties_even(1e10f32), 1e10);
+        assert!(Math::round_ties_even(f32::NAN).is_nan());
+        assert_eq!(Math::round_ties_even(2.5f64), 2.0);
+        assert_eq!(Math::round_ties_even(3.5f64), 4.0);
     }
 }
 

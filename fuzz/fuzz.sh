@@ -50,6 +50,10 @@ build() {
     # runs in fuzz/. Then the settings of the repository apply wherever
     # this script is called from.
     (cd "$FUZZ_DIR" && cargo build --release --target "$HOST" --manifest-path "$FUZZ_DIR/Cargo.toml" --bins)
+    # fuzz_dnn_blob needs opus1's neural network features. A cargo call of
+    # its own keeps them out of the other targets.
+    (cd "$FUZZ_DIR" && cargo build --release --target "$HOST" --manifest-path "$FUZZ_DIR/Cargo.toml" \
+        --bin fuzz_dnn_blob --features dnn)
 }
 
 run() {
