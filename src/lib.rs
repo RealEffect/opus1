@@ -595,6 +595,13 @@ pub struct OpusEncoder {
 
     variable_hp_smth2_q15: i32,
     hp_mem: FixedVec<i32, OPUS_HP_MEM>,
+    /// With `Voip` at 48 kHz, SILK reads the output of the integer
+    /// `hp_cutoff`, as in the fixed-point build of libopus. Off by default:
+    /// that filter's rounding adds a constant of about -9 to its output at
+    /// 48 kHz and the 60 Hz cutoff (about -2 at 24 kHz, -0.5 at 16 kHz),
+    /// and SILK codes it. Only tests that compare packets with the
+    /// fixed-point build turn it on (`internals::silk_input`).
+    integer_hp_at_48k: bool,
 
     #[cfg(not(feature = "heap"))]
     buf_filtered: FixedVec<i16, OPUS_MAX_FRAME>,
@@ -1153,6 +1160,7 @@ impl OpusEncoder {
             mode: opus_mode,
             variable_hp_smth2_q15,
             hp_mem: FixedVec::from_value(0, channels * 2),
+            integer_hp_at_48k: false,
 
             #[cfg(not(feature = "heap"))]
             buf_filtered: FixedVec::new(),
@@ -1686,6 +1694,12 @@ impl OpusEncoder {
         self.prediction_disabled
     }
 
+    /// The test control of `internals::silk_input`: with `true`, SILK reads
+    /// the output of the integer `hp_cutoff` with `Voip` at 48 kHz too.
+    pub(crate) fn set_integer_hp_at_48k(&mut self, on: bool) {
+        self.integer_hp_at_48k = on;
+    }
+
     /// libopus `OPUS_SET_EXPERT_FRAME_DURATION`: the duration of the frames
     /// the encoder codes.
     ///
@@ -1840,6 +1854,8 @@ impl OpusEncoder {
         fresh.silk_lbrr_coded = self.silk_lbrr_coded;
         fresh.silk_allow_bandwidth_switch = self.silk_allow_bandwidth_switch;
         fresh.silk_in_wb_mode_without_variable_lp = self.silk_in_wb_mode_without_variable_lp;
+        // A test control, not codec state.
+        fresh.integer_hp_at_48k = self.integer_hp_at_48k;
         *self = fresh;
     }
 
@@ -1942,12 +1958,13 @@ impl OpusEncoder {
     ///    constant per application, the bandwidth the analysis detects is
     ///    not applied (C 1651-1673), and the CELT encoder gets no analysis.
     /// 2. No discontinuous transmission (C 1455-1461, 1904-1927, 2564-2577).
-    /// 3. SILK's input with the `Voip` application. The float build of
-    ///    libopus feeds SILK the float `pcm_buf`, filtered by `hp_cutoff`
-    ///    and rounded to 16 bits. Here SILK gets the output of the integer
-    ///    `hp_cutoff` of the fixed-point build, which has its own filter
-    ///    state and only runs on frames that SILK codes. The other
-    ///    applications follow the float build.
+    /// 3. SILK's input with the `Voip` application at 8 to 24 kHz. The
+    ///    float build of libopus feeds SILK the float `pcm_buf`, filtered
+    ///    by `hp_cutoff` and rounded to 16 bits. Here SILK gets the output
+    ///    of the integer `hp_cutoff` of the fixed-point build. That filter
+    ///    has its own state and runs on every frame, as in that build. At
+    ///    48 kHz, and with the other applications, SILK follows the float
+    ///    build.
     /// 4. Packets made of several frames (CELT and Hybrid at 40 to 120 ms,
     ///    SILK-only at 80 to 120 ms) with a variable bitrate: the limit of
     ///    each frame to its share of the bitrate (C 1785) is left out on
@@ -2200,6 +2217,37 @@ impl OpusEncoder {
             }
         }
 
+        // SILK's 16-bit input with `Voip` at 8 to 24 kHz, and at 48 kHz with
+        // the test control `integer_hp_at_48k`: the integer `hp_cutoff` of
+        // libopus's fixed-point build. As in that build (C 1980-1983), the
+        // filter runs on every frame, CELT-only frames included. Its state
+        // then follows the input when SILK starts again after CELT-only
+        // frames. Run on SILK's frames only, the filter started such a frame
+        // from the state of the last SILK frame, and SILK coded the step as
+        // energy below 200 Hz.
+        let integer_hp = self.application == Application::Voip
+            && (self.sampling_rate != 48000 || self.integer_hp_at_48k);
+        if integer_hp {
+            let required_size = frame_size * ch;
+            self.buf_filtered.resize(required_size, 0);
+            if frame_cleared {
+                // C 2023-2027: the frame is cleared for SILK as well, and
+                // the filter starts again.
+                state_mut(&mut self.buf_filtered)[..required_size].fill(0);
+                self.hp_mem.fill(0);
+            } else {
+                hp_cutoff(
+                    input,
+                    cutoff_hz,
+                    state_mut(&mut self.buf_filtered),
+                    &mut self.hp_mem,
+                    frame_size,
+                    ch,
+                    fs,
+                );
+            }
+        }
+
         // C `internalSampleRate` of the SILK encoder, 0 for CELT-only frames.
         let mut silk_fs_khz = 0;
         if mode == OpusMode::SilkOnly || mode == OpusMode::Hybrid {
@@ -2343,34 +2391,22 @@ impl OpusEncoder {
 
             // SILK's input: the filtered frame.
             //
-            // - VoIP: the fixed-point build of libopus, whose `hp_cutoff`
-            //   is an integer filter on the 16-bit input. SILK-only VoIP
-            //   packets are byte for byte those of that build
-            //   (tests/silk_fixed_point_compare.rs).
-            // - Otherwise: the float build. SILK reads the frame of
-            //   `pcm_buf` that `dc_reject` filtered (opus_encoder.c:2211).
-            //   An offset in the input is then gone in SILK packets as it is
-            //   in CELT ones, and the decoded signal does not step by the
-            //   offset when the mode changes.
+            // - VoIP at 8 to 24 kHz: the fixed-point build of libopus, whose
+            //   `hp_cutoff` is an integer filter on the 16-bit input (run on
+            //   every frame above). SILK-only VoIP packets are byte for byte
+            //   those of that build (tests/silk_fixed_point_compare.rs).
+            // - VoIP at 48 kHz, and the other applications: the float
+            //   build. SILK reads the frame of `pcm_buf` that `hp_cutoff` or
+            //   `dc_reject` filtered (opus_encoder.c:2211). At 48 kHz the
+            //   integer filter adds a constant of about -9 (in 16-bit
+            //   units) at its lowest cutoff of 60 Hz, which SILK codes and
+            //   the decoder plays as low-frequency energy in quiet frames
+            //   (see `integer_hp_at_48k`).
+            // - With `Audio`, an offset in the input is then gone in SILK
+            //   packets as it is in CELT ones, and the decoded signal does
+            //   not step by the offset when the mode changes.
             let required_size = frame_size * ch;
-            let silk_input = if self.application == Application::Voip {
-                self.buf_filtered.resize(required_size, 0);
-                if frame_cleared {
-                    // C 2023-2027: the frame is cleared for SILK as well, and
-                    // the filter starts again.
-                    state_mut(&mut self.buf_filtered)[..required_size].fill(0);
-                    self.hp_mem.fill(0);
-                } else {
-                    hp_cutoff(
-                        input,
-                        cutoff_hz,
-                        state_mut(&mut self.buf_filtered),
-                        &mut self.hp_mem,
-                        frame_size,
-                        ch,
-                        fs,
-                    );
-                }
+            let silk_input = if integer_hp {
                 SilkInput::Int16(&self.buf_filtered[..required_size])
             } else {
                 SilkInput::Float(&self.buf_celt_pcm[prefix..prefix + required_size])

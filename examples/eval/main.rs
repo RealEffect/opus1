@@ -22,7 +22,7 @@
 //! ```
 //!
 //! The sets are `quick` (default; no download needed), `selftest`, `tsp`,
-//! `music` and `baseline` (see `sets.rs`). The corpus root is `--corpus`,
+//! `tsp_rates`, `music` and `baseline` (see `sets.rs`). The corpus root is `--corpus`,
 //! else `OPUS1_CORPUS`, else `<repository>/corpus`.
 //!
 //! Gates only warn: `run` exits with 1 when a job fails (for example on a

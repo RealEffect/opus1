@@ -6,6 +6,8 @@
 //! - `tsp`: TSP speech from the corpus (the items of
 //!   `examples/eval/sets/tsp_speech.txt`), VoIP mono at 48 kHz, 6 to
 //!   128 kb/s, 20 and 60 ms frames, complexity 5 and 10.
+//! - `tsp_rates`: the items of `tsp`, VoIP mono at 16 and 24 kHz, 6 to
+//!   64 kb/s, 20 and 60 ms frames, complexity 5 and 10.
 //! - `music`: synthetic music-like items in stereo at 64 to 160 kb/s.
 //! - `baseline`: `tsp` and `music` together.
 
@@ -64,7 +66,7 @@ impl EvalSet {
     }
 }
 
-pub const SET_NAMES: [&str; 5] = ["quick", "selftest", "tsp", "music", "baseline"];
+pub const SET_NAMES: [&str; 6] = ["quick", "selftest", "tsp", "tsp_rates", "music", "baseline"];
 
 /// A built-in set by name.
 pub fn builtin(name: &str, corpus_root: &Path) -> Result<EvalSet, String> {
@@ -72,6 +74,7 @@ pub fn builtin(name: &str, corpus_root: &Path) -> Result<EvalSet, String> {
         "quick" => Ok(quick()),
         "selftest" => Ok(selftest()),
         "tsp" => tsp(corpus_root),
+        "tsp_rates" => tsp_rates(corpus_root),
         "music" => Ok(music()),
         "baseline" => Ok(tsp(corpus_root)?.merge(music(), "baseline")),
         _ => Err(format!("unknown set {name}; the sets are {}", SET_NAMES.join(", "))),
@@ -353,22 +356,36 @@ pub const SPEECH_BITRATES: [i32; 10] = [6, 9, 12, 16, 24, 32, 48, 64, 96, 128];
 
 /// TSP speech: VoIP, mono, 48 kHz.
 pub fn tsp(corpus_root: &Path) -> Result<EvalSet, String> {
+    tsp_at("tsp", &[48_000], &SPEECH_BITRATES, corpus_root)
+}
+
+/// TSP speech: VoIP, mono, 16 and 24 kHz, up to 64 kb/s. These rates are
+/// the control for changes that should only affect 48 kHz.
+pub fn tsp_rates(corpus_root: &Path) -> Result<EvalSet, String> {
+    tsp_at("tsp_rates", &[16_000, 24_000], &SPEECH_BITRATES[..8], corpus_root)
+}
+
+/// The items of `tsp_speech.txt` in VoIP mono at each of `rates` and
+/// `bitrates` (kb/s), with 20 and 60 ms frames at complexity 5 and 10.
+fn tsp_at(name: &str, rates: &[u32], bitrates: &[i32], corpus_root: &Path) -> Result<EvalSet, String> {
     let items = corpus::read_set_file(&tsp_set_file(), corpus_root)?;
     let mut conditions = Vec::new();
-    for &frame in &[20_000, 60_000] {
-        for &complexity in &[5, 10] {
-            for &rate in &SPEECH_BITRATES {
-                let group = match rate {
-                    0..=16 => "tsp_low",
-                    17..=48 => "tsp_mid",
-                    _ => "tsp_high",
-                };
-                conditions.push(Condition::new(group, App::Voip, 48_000, 1, rate * 1000, complexity, frame));
+    for &sample_rate in rates {
+        for &frame in &[20_000, 60_000] {
+            for &complexity in &[5, 10] {
+                for &rate in bitrates {
+                    let group = match rate {
+                        0..=16 => "tsp_low",
+                        17..=48 => "tsp_mid",
+                        _ => "tsp_high",
+                    };
+                    conditions.push(Condition::new(group, App::Voip, sample_rate, 1, rate * 1000, complexity, frame));
+                }
             }
         }
     }
     Ok(EvalSet {
-        name: "tsp".into(),
+        name: name.into(),
         groups: vec![group("tsp_low", SPEECH), group("tsp_mid", SPEECH), group("tsp_high", SPEECH)],
         conditions,
         items,

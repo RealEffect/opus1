@@ -170,9 +170,18 @@
 #   tar xzf opus-1.6.1.tar.gz
 #   scripts/android/build-libopus.sh --src opus-1.6.1
 #
-# Without --src and OPUS_SRC, the script falls back to the copy that the
-# crate opus-head-sys 0.3.3 vendors, which is in the cargo registry after
-# any build of the tests. Its file vendored/OPUS_VERSION names commit
+# Without --src and OPUS_SRC, the script uses the release 1.6.1 unpacked at
+# its default place, target/perf/libopus-1.6.1-src/opus-1.6.1 under the
+# repository root. From a git worktree it also looks there under the main
+# checkout (the parent of the git common directory). Unpack the release
+# there once:
+#
+#   mkdir -p target/perf/libopus-1.6.1-src
+#   tar xzf opus-1.6.1.tar.gz -C target/perf/libopus-1.6.1-src
+#
+# When that tree is missing too, the script falls back to the copy that
+# the crate opus-head-sys 0.3.3 vendors, which is in the cargo registry
+# after any build of the tests. Its file vendored/OPUS_VERSION names commit
 # 228a0f85 of the xiph/opus main branch (2026-08-28). That is newer than
 # 1.6.1, and it writes other packets than 1.6.1 for many SILK, Hybrid and
 # LFE streams. The script prints a warning when it uses it.
@@ -223,7 +232,9 @@
 # Settings (environment variables; see scripts/android/env.sh for the
 # common ones):
 #   ANDROID_NDK_HOME  required, except with --host.
-#   OPUS_SRC          The libopus source tree, as --src. Default: the copy
+#   OPUS_SRC          The libopus source tree, as --src. Default:
+#                     target/perf/libopus-1.6.1-src/opus-1.6.1 under the
+#                     repository root or the main checkout, else the copy
 #                     in the cargo registry, vendored by the crate
 #                     opus-head-sys 0.3.3 (see above).
 #   OPUS_VERSION      The version that opus_get_version_string() reports.
@@ -300,12 +311,26 @@ else
     LIBOPUS_PREFIX=${PREFIX_FROM_USER:-$ANDROID_OUT/libopus$DNN_SUFFIX}
 fi
 
+# The default place of the release 1.6.1: under this checkout, then under
+# the main checkout when this is a git worktree.
+RELEASE_SUBDIR=target/perf/libopus-1.6.1-src/opus-1.6.1
+if [ -z "${OPUS_SRC:-}" ]; then
+    MAIN_ROOT=$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    MAIN_ROOT=${MAIN_ROOT:+$(dirname "$MAIN_ROOT")}
+    for root in "$REPO_ROOT" "$MAIN_ROOT"; do
+        if [ -n "$root" ] && [ -f "$root/$RELEASE_SUBDIR/celt_sources.mk" ]; then
+            OPUS_SRC=$root/$RELEASE_SUBDIR
+            echo "no --src given; building the release 1.6.1 in $OPUS_SRC" >&2
+            break
+        fi
+    done
+fi
 if [ -z "${OPUS_SRC:-}" ]; then
     for d in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/opus-head-sys-0.3.3/vendored/opus; do
         [ -f "$d/celt_sources.mk" ] && OPUS_SRC=$d
     done
     if [ -n "${OPUS_SRC:-}" ]; then
-        echo "warning: no --src given; building the vendored libopus main branch, not the release 1.6.1" >&2
+        echo "warning: no --src given and no $RELEASE_SUBDIR; building the vendored libopus main branch, not the release 1.6.1" >&2
     fi
 fi
 if [ -z "${OPUS_SRC:-}" ] || [ ! -f "$OPUS_SRC/celt_sources.mk" ]; then

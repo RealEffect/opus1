@@ -171,7 +171,13 @@ fn quick_set_runs_without_errors() {
 /// limit, bit depth, discontinuous transmission, phase inversion).
 #[test]
 fn both_encoders_get_the_same_settings() {
-    let sets = [sets::quick(), sets::selftest(), sets::music(), sets::tsp(Path::new("/corpus")).expect("tsp set")];
+    let sets = [
+        sets::quick(),
+        sets::selftest(),
+        sets::music(),
+        sets::tsp(Path::new("/corpus")).expect("tsp set"),
+        sets::tsp_rates(Path::new("/corpus")).expect("tsp_rates set"),
+    ];
     for set in &sets {
         for cond in &set.conditions {
             let opus1 = pipeline::encoder_settings(Codec::Opus1, cond).expect("opus1 encoder");

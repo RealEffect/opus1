@@ -8,7 +8,8 @@
 //!
 //! Each module here has the name and the place of the internal module whose
 //! items it re-exports, and only the items that code outside the crate
-//! uses.
+//! uses. The exception is `silk_input`, which holds a test control of the
+//! encoder.
 
 pub mod bands {
     pub use crate::bands::{
@@ -202,5 +203,20 @@ pub mod silk {
     }
     pub mod tables_nlsf {
         pub use crate::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
+    }
+}
+
+/// A test control of `OpusEncoder`, not part of the API: which high-pass
+/// filter feeds SILK with the `Voip` application at 48 kHz.
+pub mod silk_input {
+    /// With `true`, SILK reads the output of the integer high-pass filter
+    /// `hp_cutoff` of libopus's fixed-point build at 48 kHz too, as it does
+    /// at 8 to 24 kHz. Its SILK packets are then those of that build. The
+    /// default, `false`, gives SILK the float filter's output at 48 kHz, as
+    /// the float build does: the integer filter adds a constant of about -9
+    /// to the 16-bit signal there. For tests that compare packets with the
+    /// fixed-point build. The setting survives `reset_state`.
+    pub fn set_integer_hp_at_48k(enc: &mut crate::OpusEncoder, on: bool) {
+        enc.set_integer_hp_at_48k(on);
     }
 }

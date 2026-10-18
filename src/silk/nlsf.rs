@@ -592,7 +592,7 @@ pub fn silk_nlsf_vq_weights_laroia(p_w_q5: &mut [i16], p_nlsf_q15: &[i16], d: us
         k += 2;
     }
 
-    tmp1_int = ((32767 - p_nlsf_q15[d - 1]) as i32).max(1);
+    tmp1_int = ((1 << 15) - p_nlsf_q15[d - 1] as i32).max(1);
     tmp1_int = silk_div32_16(NUMER, tmp1_int);
     p_w_q5[d - 1] = silk_limit(tmp2_int + tmp1_int, 0, i16::MAX as i32) as i16;
 }
@@ -762,6 +762,48 @@ mod a2nlsf_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod laroia_tests {
+    use super::*;
+
+    /// The weights that the fixed-point build of libopus 1.6.1 computed for
+    /// the side channel of the first frame of a stereo SILK stream (16 kHz,
+    /// 32 kb/s, VBR, complexity 9; `silk_NLSF_VQ_weights_laroia`, read in
+    /// `silk_NLSF_encode`). The last weight divides by `(1 << 15) - NLSF[15]`
+    /// = 2149, which gives 60; dividing by 32767 - NLSF[15] gives 61. That
+    /// one step was enough to make opus1 choose other NLSF indices than
+    /// libopus after 274 packets of 20 ms.
+    #[test]
+    fn weights_are_those_of_the_fixed_point_build() {
+        let nlsf: [i16; 16] = [
+            606, 1902, 3565, 5387, 7331, 9351, 11415, 13509, 15619, 17746, 19880, 22019, 24166, 26314,
+            28465, 30619,
+        ];
+        let want: [i16; 16] = [317, 179, 149, 138, 131, 127, 125, 124, 123, 122, 122, 122, 122, 121, 120, 120];
+        let mut w = [0i16; 16];
+        silk_nlsf_vq_weights_laroia(&mut w, &nlsf, 16);
+        assert_eq!(w, want);
+    }
+
+    /// The last weight is `2^17 / (2^15 - NLSF[D-1])` plus the share of
+    /// the distance to the coefficient before, limited to 32767. Checked for
+    /// every last value from 27001 to 32767.
+    #[test]
+    fn last_weight_measures_the_distance_to_one() {
+        let mut nlsf = [0i16; 10];
+        for (i, v) in nlsf.iter_mut().enumerate() {
+            *v = 3000 * (i as i16 + 1);
+        }
+        let mut w = [0i16; 10];
+        for last in 27001..=32767i32 {
+            nlsf[9] = last as i16;
+            silk_nlsf_vq_weights_laroia(&mut w, &nlsf, 10);
+            let want = ((1 << 17) / (32768 - last) + (1 << 17) / (last - 27000)).min(32767);
+            assert_eq!(w[9] as i32, want, "last NLSF {last}");
         }
     }
 }

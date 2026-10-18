@@ -265,9 +265,9 @@ decode / decode_i16 / decode_fec
 - **CELT is floating point.** `celt.rs`, `bands.rs`, `pvq.rs`, `mdct.rs`, `kiss_fft.rs`, `pitch.rs`, `celt_lpc.rs` and `quant_bands.rs` compute in `f32`, as the float build of libopus does. The bit allocation in `rate.rs` is integer arithmetic, as in libopus.
 - **SILK is fixed point.** Everything under `src/silk/` works on `i16` and `i32` values in Q formats, as the fixed-point build of libopus (`silk/fixed/`) does. The float build of libopus uses the floating-point SILK encoder instead, so SILK packets from `opus1` and from a float build of libopus differ. Both are valid, and any Opus decoder reads them.
 - **The Opus layer converts between them** in `src/lib.rs`:
-  - Encoder: SILK needs 16-bit samples before its resampler. With `Application::Voip` they come from the integer high-pass filter of the fixed-point build: `hp_cutoff` takes `f32` input and writes `i16`. With the other applications the float signal is filtered and then rounded to 16 bits (`SilkInput::Float`). CELT gets the float signal with a 4 ms delay buffer in front, unless the application is `RestrictedLowDelay`.
+  - Encoder: SILK needs 16-bit samples before its resampler. With `Application::Voip` at 8 to 24 kHz they come from the integer high-pass filter of the fixed-point build: `hp_cutoff` takes `f32` input and writes `i16`. With `Voip` at 48 kHz, and with the other applications, the float signal is filtered and then rounded to 16 bits (`SilkInput::Float`). CELT gets the float signal with a 4 ms delay buffer in front, unless the application is `RestrictedLowDelay`.
   - Decoder: SILK's 16-bit output is scaled by 1/32768 to `f32` (`int16_to_res`) and written into the output. In a Hybrid frame CELT adds its output to it.
-- `encode_i16` converts its input to float once, with `sample as f32 / 32768.0`, and then does what `encode` does. So `encode` and `encode_i16` write the same packets for the same audio. The conversion is exact, and the integer high-pass filter of `Voip` rounds the float samples back to the same 16-bit values.
+- `encode_i16` converts its input to float once, with `sample as f32 / 32768.0`, and then does what `encode` does. So `encode` and `encode_i16` write the same packets for the same audio. The conversion is exact, and the integer high-pass filter of `Voip` rounds the float samples back to the same 16-bit values. The float filter reads the same float samples either way.
 
 ## Feature flags and where state is stored
 
@@ -397,7 +397,18 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
 
 - `multistream.rs`: encodes and decodes two seconds of a 5.1 test signal and prints the layout, packet sizes and signal-to-noise ratio of every channel.
 - `wav_test.rs`: encodes and decodes a WAV (Waveform Audio File Format) file (by default `fixtures/answer_16k.wav`) and writes the decoded files into `fixtures/`.
-- `eval/`: the paired-comparison harness. opus1 and libopus code the same items with the same settings, libopus decodes both, and `opus_compare` and MOC score each output against the original. It also runs the RFC 8251 conformance check and a self-test of its gates. See [Testing](09-testing.md#the-paired-comparison-harness).
+- `eval/`: the paired-comparison harness. opus1 and libopus code the same items with the same settings, libopus decodes both, and `opus_compare` and MOC score each output against the original. It also runs the RFC 8251 conformance check and a self-test of its gates. See [Testing](09-testing.md#the-paired-comparison-harness). Its files:
+  - `main.rs` and `cli.rs`: the commands and their options.
+  - `sets.rs`: the built-in sets, their conditions and gates; `sets/tsp_speech.txt` lists the TSP items.
+  - `corpus.rs`: items, set files, the corpus root and the `corpus-index` command.
+  - `signals.rs`: WAV input and output, the resampler and the synthetic items.
+  - `pipeline.rs`: one job: encode with both encoders, decode, align and measure.
+  - `libopus.rs`: libopus's encoder and decoder through `audiopus_sys`.
+  - `stats.rs`: geometric means, bootstrap intervals, aggregates and gates.
+  - `report.rs`: the JSON, text and Markdown output, and the reader for `--baseline` and `merge`.
+  - `degrade.rs`: the degradations of the self-test.
+  - `conformance.rs`: the RFC 8251 table of `eval conformance`.
+  - `tier2.rs`: the bridge to external quality metrics (`--write-wav`, `merge`).
 - `opus_compare.rs`: libopus's test program `opus_compare`, with its command line and messages, on top of `src/eval/compare.rs`.
 - `perf_harness.rs`: the timing and comparison tool against libopus. Its commands are `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler` and `spread`. `cargo run --release --example perf_harness -- bench` produces the timings in the README.
 

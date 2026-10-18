@@ -30,6 +30,12 @@ fn compute_hp_coeffs(cutoff_hz: i32, fs: i32) -> ([i32; 3], [i32; 2]) {
 /// (`hp_cutoff`, opus_encoder.c), on float input (1.0 = 32768). The input
 /// is first rounded to 16 bits: half up, then limited to the 16-bit range.
 ///
+/// The filter truncates its products, and its gain at 0 Hz is high when
+/// the cutoff is low against the sampling rate, so its output carries a
+/// constant: about -9 at 48 kHz and a 60 Hz cutoff, -2 at 24 kHz, -0.5 at
+/// 16 kHz. The encoder uses it for SILK's input with `Voip` at 8 to 24 kHz
+/// only.
+///
 /// Mono filters the shorter of `input` and `output`. Stereo filters `len`
 /// interleaved sample pairs. `hp_mem` holds 2 state values per channel.
 pub fn hp_cutoff(

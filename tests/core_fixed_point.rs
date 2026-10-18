@@ -2,10 +2,12 @@
 //!
 //! With the `Voip` application and 16-bit input, the SILK-only packets of
 //! opus1 are byte for byte those of the fixed-point build: its SILK
-//! encoder is a port of `silk/fixed`, and it filters the input with the
-//! integer `hp_cutoff` (see `OpusEncoder::encode_i16`). The tests here hold
-//! a 32-bit hash (FNV-1a) of every packet that build wrote for the same
-//! input and the same settings, packet by packet.
+//! encoder is a port of `silk/fixed`, and at 8 to 24 kHz it filters the
+//! input with the integer `hp_cutoff` of that build. At 48 kHz opus1 gives
+//! SILK the float filter's output instead, so a test at 48 kHz first sets
+//! `internals::silk_input::set_integer_hp_at_48k`. The tests here hold a
+//! 32-bit hash (FNV-1a) of every packet that build wrote for the same input
+//! and the same settings, packet by packet.
 //!
 //! The packets were made with the source of the official libopus 1.6.1
 //! release, built with `cc` and `-O2 -DFIXED_POINT -DOPUS_BUILD
@@ -225,6 +227,76 @@ const STEREO_WITH_MONO_STRETCHES: [u32; 140] = [
     0xaf572a5d, 0x6d0543d8, 0x8b18db7f, 0xadbf31f5,
 ];
 
+/// Stereo speech at 32 kb/s with a variable bitrate, 8 s. opus1 computed
+/// the weight of the last NLSF coefficient from its distance to 32767
+/// (`silk_NLSF_VQ_weights_laroia` uses `1 << 15`). The weight was 1 too
+/// large for some vectors, and from packet 274 on the NLSF indices of the
+/// mid channel were not libopus's.
+#[test]
+fn stereo_speech_at_32_kbps_codes_the_packets_of_libopus() {
+    let pcm: Vec<i16> = k24_common::to_stereo(&k24_common::speech(16000, 8.0), 16000)
+        .iter()
+        .map(|&v| (v * 32768.0).round() as i16)
+        .collect();
+    let script = [Packet { bitrate: 32000, complexity: 9, channels: None }; 400];
+    let first = first_difference(2, &pcm, &script, &STEREO_SPEECH_32K);
+    assert_eq!(first, None, "first packet that is not libopus's");
+}
+
+/// `stereo_speech_at_32_kbps_codes_the_packets_of_libopus`.
+const STEREO_SPEECH_32K: [u32; 400] = [
+    0x7e3b4254, 0xfb616cc3, 0x2dfc07b1, 0xecede0eb, 0xa7a32d4a, 0x7c755246, 0x3f861397, 0x265d65d7,
+    0xad6207dc, 0x971a3053, 0x730fdfa3, 0xc2792040, 0x6ce5e5ce, 0x0be5f208, 0x795e8090, 0x36e4ba33,
+    0x1f528af6, 0x1ce0758e, 0x93d44072, 0x350c5036, 0x3c1f43e5, 0x7e0f74b0, 0xecd52868, 0x943cf334,
+    0x0270e3f9, 0x3d337ea0, 0x301d5544, 0xd80d9f36, 0x01a5b8eb, 0xf2be1ff6, 0x79cf3b20, 0x1b711adc,
+    0xfa34bbbe, 0xa2cd4e42, 0x6a37d81d, 0x345cb608, 0xd9232d48, 0xa655ebad, 0xa59e72a3, 0x1d958199,
+    0x496b9af3, 0x40caef71, 0x89b9923e, 0x0d204784, 0x6c10a3c8, 0x95434aba, 0x1e1762e9, 0xf4f6b0ca,
+    0xccbd74eb, 0x70d4c64b, 0x3df45953, 0x0bb501bb, 0x42434108, 0x5a3cb006, 0x5ede0c77, 0x3bd60b99,
+    0xf8717df1, 0xd41b2ef5, 0xe336c9d7, 0x595a5367, 0x0be6209e, 0xc2c3720e, 0xf23cd6e6, 0x14def784,
+    0x86fded5e, 0xbcf81f3d, 0x8e0270c0, 0xad218825, 0x4e7cf4f8, 0x80578c8e, 0x9326ed53, 0x0473d638,
+    0xa13c5e25, 0x107c9718, 0x41df61d7, 0xbd98c154, 0x2ab14683, 0xddb924a0, 0x7b665755, 0x07ef4252,
+    0x6ccb1353, 0xb6dbe7cf, 0x743d50c7, 0x6f10d29a, 0x6d0b2e9b, 0x413d6d9c, 0xda26ab98, 0x8de396c2,
+    0xe696b3f4, 0x4ebf8300, 0x42b42e76, 0x27c05b60, 0x292d3545, 0xe5060845, 0xc53dd070, 0xebcca233,
+    0x7ae08e90, 0x46cc2cea, 0x29cef329, 0xc66f2502, 0x80208c08, 0x4be16f5c, 0x5e4bc781, 0xabb40c6a,
+    0xec951325, 0xed1ff184, 0x129a149a, 0x3d13ad98, 0x08b93cfc, 0xb352d396, 0xbe2fcd22, 0x5add3f53,
+    0xc36a573a, 0x5f058b2f, 0xe68422a2, 0x2a964317, 0x68dd8ec5, 0xb0d18e77, 0x8b54ed53, 0x90a5a71e,
+    0x76c2311a, 0x51178d15, 0x15c18606, 0x7dd4e7d0, 0x80e26a6a, 0xf6bb43c5, 0x50c372a2, 0x7fcaa188,
+    0xba95e134, 0x6cacfc04, 0x583fdbbf, 0x43f71642, 0x7917b170, 0x115cc353, 0xf66b08ee, 0xecf44e3c,
+    0xd40b8445, 0x145e2a65, 0xbf71577f, 0x625604e7, 0x5a013417, 0xe52fe938, 0x32a35c07, 0x8e3e18b2,
+    0xb4324983, 0x7bd07521, 0xd770d5dc, 0x50448a54, 0x69430f20, 0xf26b9741, 0x7d730600, 0x815296e4,
+    0xaf1f2cb2, 0x61cb285e, 0xa6843733, 0xd39a38d1, 0x352cfdab, 0xd73b3934, 0x47e5f16c, 0xccc51949,
+    0x7890ba3f, 0x2c17e102, 0xe6752664, 0xa101a640, 0x386522c1, 0x3a415e98, 0x90974f7d, 0x477ef538,
+    0x0a0505f5, 0x0bb0f9db, 0x998ad0da, 0xe2a6ac1d, 0xbdfabe00, 0x7054b22f, 0x9d619842, 0x2a92a597,
+    0x08245873, 0xf59e87bc, 0xe3b9322d, 0xfd6b229f, 0xa380c6f0, 0x53cd9965, 0xe71e03be, 0xf7f2d268,
+    0x43e57b41, 0x2a1476d4, 0x87a47cbe, 0xb547b4a1, 0x134b596a, 0xd05d0fa8, 0x021010b5, 0xbc790a70,
+    0xd414dba5, 0x9b01c258, 0x5fdcf066, 0x8665890a, 0x5a0c1804, 0x8c0895ba, 0x2b6a9a41, 0xa6ec9fd9,
+    0xf6ffdd35, 0x6bdefb24, 0xb9a4b681, 0x2a52ff29, 0x6e866c6e, 0xdbae9287, 0x70d1ddcf, 0xa42b89d2,
+    0x523ed5b7, 0x4013cf5d, 0x924f13b0, 0x67a5701c, 0x2a3ad875, 0x84642993, 0xc9fdbd0a, 0x2db17bdd,
+    0xee90ccf1, 0xabfeecd6, 0x902209f5, 0x7dd5b8b1, 0xced07ba9, 0x1d22bc99, 0xc62af3bc, 0x77985d0c,
+    0x7755902c, 0xe3e6fc92, 0x5f8f953d, 0xb3b73da6, 0x2a884951, 0x3bd07771, 0xb28b85dd, 0x11c470e4,
+    0xb1b49bc1, 0xe9d32d3a, 0x40650341, 0x128132a1, 0x090a1446, 0xcd2fc7d6, 0x97de2eb6, 0xe21005e8,
+    0x534a4593, 0x675bf0d0, 0x5719a44e, 0xb031cb8b, 0x6e709f5f, 0xe0a65afc, 0xd8313cb4, 0xe70dd8b3,
+    0x3928e5b5, 0x0f4c3d36, 0x16e3ad1a, 0x4aa15e7c, 0x856a157e, 0xadcb53a0, 0xd70130ba, 0x312a82df,
+    0xb623c750, 0xf88a04fd, 0x8731b18f, 0x05220e64, 0x1bacc022, 0x404b820b, 0xfcfa9c86, 0x61b4e126,
+    0x6470eb08, 0xd132b9f0, 0xea064cf5, 0x85f28dd6, 0x68512a99, 0x9e9f69bc, 0x55b75304, 0x99adcbc8,
+    0x05e31173, 0x64729f5a, 0x61553e2c, 0x40edb1fc, 0x651a6898, 0xd41eb149, 0x77dbae87, 0xbda9b7c7,
+    0xf2740694, 0xb88e3898, 0x5f6965ac, 0x6e7d45b3, 0x1311f3c3, 0x9bfe758f, 0x1dc9b690, 0xa310fff1,
+    0x00a45532, 0xa18b338e, 0x9aa5d72c, 0xb17828f7, 0xdc0ed139, 0xbb5dd624, 0xa751b690, 0xf8553de0,
+    0xa54ddea8, 0x9f83e1a8, 0xe96e94c9, 0x9247aab1, 0xf9fe504e, 0x4b20eb66, 0x7375af55, 0x379428ad,
+    0xbab2842d, 0x44ff192c, 0xaa060d0d, 0x0f76cc85, 0x6ef9d7c1, 0x73e0ae6f, 0x59a18f1f, 0x0f1c554a,
+    0x5b21be5c, 0xe8d4f51a, 0xb343dad4, 0xdfee3791, 0x22a99ae5, 0x4dbedd75, 0x806d1c99, 0x22c75fa6,
+    0xd5cc8563, 0x7b37077b, 0x56f97864, 0xa6bc0960, 0xbefb5449, 0x6a8f2209, 0x2bddcd8e, 0x1b186129,
+    0x3a6e395b, 0xf60d41c4, 0xac447545, 0xd339d90f, 0x234c0c4b, 0x94f55efb, 0x55efb8e0, 0x011ee841,
+    0xa9321cff, 0x6fc654af, 0x6441834f, 0x8e29fa1a, 0x7444f5a0, 0xf2f3e766, 0x76d844f4, 0x8bc6d1e2,
+    0xed5bc0b2, 0x6e6d63ff, 0x6b615d0b, 0x8d9fda49, 0xabf991c6, 0x9b7edd37, 0x3e17db77, 0x7f00ab22,
+    0x40b37d35, 0x3a7bcccb, 0xa44cc3ee, 0x17bab31e, 0x96a7f667, 0x6d6f1441, 0xe7f48527, 0x2c8f06e9,
+    0x01d46de0, 0xa23573c6, 0x4b2e5f6e, 0xce8577cb, 0x133fc743, 0x99aa4e69, 0x1531ad46, 0xffdd7848,
+    0x013745dc, 0xab3968ab, 0x9aaa8ccc, 0x26a2d945, 0xace0202d, 0xbc9f88e7, 0x9dd4a3a2, 0x4a0e98b9,
+    0xc9737c02, 0x41c4a171, 0x66e981b0, 0x87ac1da5, 0x53ff5c08, 0xf241105d, 0xf2aae8f1, 0x33e70b90,
+    0xe2c1189e, 0x88adede7, 0x593682e7, 0x4d1c3aa4, 0xab1b0852, 0x8d0f3035, 0xc18f6fa8, 0xbbf01ef7,
+    0x6dfd8f74, 0x798d16a4, 0x76d42d01, 0x299b8ae8, 0xbc1d48d4, 0x1d9c972c, 0xa84c97b6, 0x2a93e176,
+];
+
 /// The SILK layer of each packet, decoded at 16 kHz by the SILK decoder of
 /// this crate: a hash of the decoded samples and of the number of bits the
 /// layer takes. A CELT layer or a redundant CELT frame is not compared: the
@@ -260,11 +332,14 @@ fn silk_layers(packets: &[Vec<u8>], channels: usize) -> Vec<u32> {
 /// Input: the 16 kHz speech with every sample repeated three times, which
 /// is 48 kHz input with images above 8 kHz for the CELT layer, made
 /// without arithmetic that could round differently elsewhere. Fullband
-/// Hybrid at 32 kb/s, VoIP, complexity 9.
+/// Hybrid at 32 kb/s, VoIP, complexity 9. SILK reads the integer
+/// `hp_cutoff`, as in the fixed-point build; without that control the
+/// first SILK layer differs (packet 0).
 #[test]
 fn hybrid_at_a_constant_bitrate_codes_the_silk_layer_of_libopus() {
     let pcm: Vec<i16> = speech_16k(3.0).iter().flat_map(|&v| [v, v, v]).collect();
     let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
+    opus1::internals::silk_input::set_integer_hp_at_48k(&mut enc, true);
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_complexity(9).unwrap();
     enc.set_vbr(false);

@@ -404,6 +404,23 @@ test that compares opus1 with the C library under the same settings.
   pre-filter, `theta_rdo` at complexity 8 and above, SILK pitch analysis, pulse
   search, band energies, FFT and MDCT rounding on aarch64). A voiced 300-packet
   SILK stream is byte-identical to fixed-point libopus.
+- With `Voip` at 48 kHz, SILK now reads the float high-pass filter's output,
+  as the float build of libopus does. The integer filter of the fixed-point
+  build added a constant of about -9 to the 16-bit signal there, which SILK
+  coded as low-frequency energy in 7.6 to 9.2 % of the 10 ms frames of speech.
+  On 222 TSP speech files the error against the original, relative to
+  libopus's, fell from between 1.21 and 3.28 to between 0.98 and 1.09
+  (complexity 5, 20 ms, 6 to 64 kb/s). At 8 to 24 kHz SILK keeps the integer
+  filter ([docs/10](docs/10-differences-from-libopus.md#paired-comparison-with-the-evaluation-harness)).
+- With `Voip` at 8 to 24 kHz the integer high-pass filter in front of SILK
+  runs on every frame, as in the fixed-point build of libopus. It ran only on
+  frames that SILK coded, so the first SILK frame after CELT-only frames
+  started from an old filter state, which SILK coded as energy below 200 Hz.
+  Streams that change between SILK and CELT-only no longer have that energy.
+  Streams without CELT-only frames do not change.
+- SILK's NLSF weights follow libopus for the last coefficient (distance to
+  `1 << 15`, not to 32767). Stereo SILK streams that left the fixed-point
+  build's packets after 274 and 322 packets now stay byte-identical.
 
 **Closer to libopus** (aarch64, against libopus 1.6.1)
 - The CELT encoder writes the packets of libopus: all 1,080,000 packets of the
