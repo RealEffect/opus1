@@ -149,14 +149,32 @@ pub fn silk_reset_decoder(ps_dec: &mut SilkDecoderState) -> i32 {
     plc.enable_deep_plc = 0;
     silk_plc_reset(ps_dec);
 
+    // libopus init_decoder.c:61-64: OSCE goes back to its default method.
+    // The bandwidth extension state lies before the part libopus clears,
+    // so it stays.
+    #[cfg(feature = "osce")]
+    crate::dnn::osce::osce_reset(&mut ps_dec.osce, crate::dnn::osce::OSCE_DEFAULT_METHOD);
+
     0
 }
 
 /// Initialise one channel (libopus `silk_init_decoder`). In libopus this
 /// clears the state and then calls `silk_reset_decoder`, which clears it
-/// too, so the two do the same.
+/// too, so the two do the same, except for the bandwidth extension state:
+/// only `silk_init_decoder` clears it (to zero, not to the state of
+/// `osce_bwe_reset`). libopus runs it when a decoder is created and for
+/// the second channel when the stream changes from mono to stereo.
 pub fn silk_init_decoder(ps_dec: &mut SilkDecoderState) -> i32 {
+    #[cfg(feature = "osce-bwe")]
+    clear_bwe(&mut ps_dec.osce_bwe);
     silk_reset_decoder(ps_dec)
+}
+
+/// Sets a bandwidth extension state to zero, as `silk_init_decoder`
+/// leaves it.
+#[cfg(feature = "osce-bwe")]
+fn clear_bwe(state: &mut crate::dnn::osce::OsceBweChannel) {
+    *state = crate::dnn::osce::OsceBweChannel::new();
 }
 
 pub fn silk_create_decoder() -> SilkDecoderState {

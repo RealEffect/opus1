@@ -20,6 +20,7 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 - **Multichannel:** multistream encoder and decoder (mapping families 0, 1, 2 and 255), interoperable with libopus
 - **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels, signal type, input bit depth, DTX)
 - **The speech and music analysis of libopus:** from complexity 7 on, the encoder estimates whether the input is speech or music and which bandwidth it uses, as libopus does, with the same results to the last bit on 64-bit ARM. CELT-only packets at complexity 7 to 10 are libopus's byte for byte
+- **The neural decoder features of libopus 1.5 and 1.6 (optional):** deep packet loss concealment, the LACE and NoLACE speech enhancement of SILK, and the bandwidth extension of SILK wideband to fullband. Each is compiled only with its cargo feature and runs only when the decoder complexity is raised, as in libopus: `set_complexity(5)` for deep PLC (packet loss concealment), 6 for LACE, 7 for NoLACE, and 4 with `set_osce_bwe(true)` for the bandwidth extension. On 64-bit ARM the output is that of libopus 1.6.1 built with these features (without loop vectorization) to the last bit.
 - **`#![no_std]` + no `alloc`:** fully heap-free — runs on bare metal, RTOS, and WebAssembly with **no global allocator**
 
 ## Quick Start
@@ -154,6 +155,10 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 | `std`    | yes     | Enables OS-backed runtime x86 SIMD detection (CPUID). Without it the crate is `#![no_std]`. |
 | `heap`   | yes     | Allocates the large codec state on the heap (`Box`), shrinking `OpusEncoder`/`OpusDecoder` to a few KB so they can live on ordinary stacks. Requires `std`. |
 | `analysis` | yes   | The speech and music analysis of the encoder (libopus `analysis.c`), which runs from complexity 7 on. Without it the encoder decides as libopus does below complexity 7, and its state is about 26 KB smaller. Works with and without `std`. |
+| `deep-plc` | no    | Deep packet loss concealment (PitchDNN, the PLC network, FARGAN) with its built-in weights (1,432,768 bytes). Runs at decoder complexity 5 and above. |
+| `osce`   | no      | LACE and NoLACE, the speech enhancement of SILK (decoder complexity 6 and 7; weights 1,573,440 bytes). Turns on `deep-plc`, as libopus's `--enable-osce` does. |
+| `osce-bwe` | no    | The bandwidth extension of SILK wideband to 48 kHz fullband output, switched on with `set_osce_bwe` (weights 685,888 bytes). Turns on `osce`. |
+| `test-libopus-dnn` | no | Test only: compiles the tests that compare with a libopus built with its neural network code (see [docs/09](docs/09-testing.md#tests-of-the-neural-network-code)). |
 | `libm`   | no      | Required for `#![no_std]` builds — provides float math via a pure-Rust port of musl `libm`. Not needed when `std` is on. |
 
 > Runtime dependency footprint: `std` build → **0 deps**; `no_std` build → **1 dep** (`libm`, pure Rust).
@@ -416,6 +421,9 @@ test that compares opus1 with the C library under the same settings.
   `set_inband_fec_mode` with the type `InbandFec` (`OPUS_SET_INBAND_FEC` 2,
   FEC that does not move music to SILK). The multistream encoder forwards
   them to every stream.
+- The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity`, `set_osce_bwe` and `set_dnn_blob` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/10](docs/10-differences-from-libopus.md)).
+- `OpusDecoder::last_packet_duration()` and `packet::has_lbrr()`, as libopus has them.
+- Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/09](docs/09-testing.md#evaluation-tools)).
 
 **Behaviour changes**
 - Float output is no longer clamped to [-1, 1] (libopus does not clip float output).

@@ -45,7 +45,7 @@ opus1 follows libopus 1.6, the reference implementation of Opus in C. This docum
 
 ### Decoder controls
 
-The decoder decodes every valid packet, up to 120 ms. The decoder complexity (`OPUS_SET_COMPLEXITY`), the BWE switch (`OPUS_SET_OSCE_BWE`) and weight blobs (`OPUS_SET_DNN_BLOB`) exist, but in this version they do not change the decoded output (see [Optional libopus features](#optional-libopus-features)). These libopus decoder controls have no equivalent in `OpusDecoder`:
+The decoder decodes every valid packet, up to 120 ms. The decoder complexity (`OPUS_SET_COMPLEXITY`), the BWE switch (`OPUS_SET_OSCE_BWE`) and weight blobs (`OPUS_SET_DNN_BLOB`) exist, and act as in libopus when the matching feature is compiled: deep PLC from complexity 5, LACE at 6, NoLACE from 7, and the BWE from 4 (see [Optional libopus features](#optional-libopus-features)). These libopus decoder controls have no equivalent in `OpusDecoder`:
 
 - the output gain (`OPUS_SET_GAIN`),
 - phase inversion disabling (`OPUS_SET_PHASE_INVERSION_DISABLED`). The decoder does what libopus does by default: it disables phase inversion only when it mixes a stereo stream down to mono output,
@@ -74,9 +74,9 @@ libopus has features that are compiled only when it is configured with them. The
 - Opus Speech Coding Enhancement (OSCE, `--enable-osce`);
 - the scalable quality extension (`--enable-qext`).
 
-These options are listed in libopus's `configure.ac`. For deep PLC and OSCE, opus1 has the cargo features `deep-plc`, `osce` and `osce-bwe` (see [Using the library](06-using-the-library.md#neural-network-features-of-the-decoder)). In this version they bring the code that the networks share, the weights of libopus 1.6.1 and the decoder controls, all checked against libopus (see [Neural network code](#neural-network-code)). The networks do not run in the decoder yet, so the decoded output is that of a libopus without the features at every complexity.
+These options are listed in libopus's `configure.ac`. For deep PLC and OSCE, opus1 has the cargo features `deep-plc`, `osce` and `osce-bwe` (see [Using the library](06-using-the-library.md#neural-network-features-of-the-decoder)). Deep PLC, LACE, NoLACE and the bandwidth extension run in the decoder, and the decoded output is that of libopus 1.6.1 built with them (see [Neural network code](#neural-network-code)), with one exception: CELT-only frames that follow frames with the bandwidth extension. libopus 1.6.1 skips their CELT decoding and outputs silence until the next SILK frame; opus1 decodes them, as libopus main does (see [Deliberate differences](#deliberate-differences)).
 
-A libopus built with the features also changes two things at every decoder complexity, even at 0. opus1 does not make these changes yet; they come with the networks:
+A libopus built with the features also changes two things at every decoder complexity, even at 0. opus1 makes both changes when the feature is compiled:
 
 - With deep PLC compiled, `silk_PLC_glue_frames` skips its fade-in for 16 kHz SILK frames (`silk/PLC.c` lines 477-480).
 - With OSCE compiled, a sample of -32768 in a 20 ms SILK frame at 16 kHz becomes -32767 (`dnn/osce.c` lines 1672-1679).
@@ -97,6 +97,7 @@ These differences are intended. Most are listed in the comment above `OpusEncode
 | Energy mask (surround) | Copied, and applied again on the next frame after a CELT reset. | Keeps a pointer, which is lost after a CELT reset until the caller sets it again. | Rust ownership. The values are the same. |
 | Multistream bandwidth with the automatic or maximum bitrate in surround mode (D1) | Chosen from the bitrate that was allocated. Codes fullband. | Compares the raw setting and always chooses narrowband. | Narrowband 5.1 at a high bitrate is not useful. |
 | BWE switch and weight blobs on a multistream decoder | `MultistreamDecoder::set_osce_bwe` and `set_dnn_blob` set every stream. | The multistream decoder answers `OPUS_SET_OSCE_BWE` and `OPUS_SET_DNN_BLOB` with `OPUS_UNIMPLEMENTED`; each stream must be set through `OPUS_MULTISTREAM_GET_DECODER_STATE`. | Convenience. `stream_decoder_mut` still sets one stream. |
+| CELT-only frames after frames with the bandwidth extension (BWE) | Decoded. | libopus 1.6.1 keeps the extended mode of the last SILK frame, so with the BWE on it skips the CELT decoding of the following CELT-only frames (and of their concealment): the output is silence until the next SILK or Hybrid frame, and the range decoder is not read. The final range of such a frame is the state of the range decoder before it reads the frame. | A defect, fixed in libopus main by commit `228a0f85` (2026-08-28), which sets the extended mode to CELT-only for those frames. opus1 follows main. The CELT-only frames then decode as with the BWE off. |
 | The BWE switch | `set_osce_bwe` takes a `bool`. | `OPUS_SET_OSCE_BWE` takes an integer and refuses values other than 0 and 1 with `OPUS_BAD_ARG`. | A `bool` has no other values. |
 | Expert frame duration of the multistream encoder | `set_expert_frame_duration` takes a `FrameDuration`, which holds only the ten values libopus defines. | `OPUS_SET_EXPERT_FRAME_DURATION` stores any number, and every later encode call fails when it is no duration. | A `FrameDuration` cannot hold another number. For the ten values both encoders take and refuse the same calls. |
 
@@ -238,18 +239,47 @@ The harness `examples/eval` (see [Testing](09-testing.md#the-paired-comparison-h
 
 ### Decoder
 
-On 64-bit ARM the decoder gives the samples of libopus for the packets of libopus:
+On 64-bit ARM the decoder gives the samples of libopus, in float (`decode`) and in 16 bits (`decode_i16`):
 
-- **CELT:** 51 of 51 streams of `perf_harness modes` are identical. Before this release round 8 were; the others agreed to 136 to 146 dB. The causes were four filter taps of the post-filter written with too few digits, the rounding of the post-filter, and the rounding of the coarse energy prediction in frames shorter than 20 ms.
-- **Hybrid:** 29 of 29 streams are identical.
-- **SILK:** 49 of 49 streams are identical.
-- **Mode switches:** the 8 switching streams of `perf_harness modes` are identical, and so are the packets of opus1's encoder that switch (`core_dtx_libopus`, `multistream_dtx_libopus`). Before, the cross-fade between a frame and the redundant CELT frame of a switch (`smooth_fade`) rounded both of its products, where the libopus build fuses one of them into the sum. The 2.5 ms of each cross-fade then differed in the last bit of some samples: the switching streams agreed to 172 to 192 dB, and two FEC streams with a switch of SILK's bandwidth to 185 and 186 dB.
+- **`perf_harness modes`:** all 137 streams decode to libopus's samples: 51 CELT, 29 Hybrid and 49 SILK streams, and the 8 streams that switch modes. Earlier in this release, only 8 of the CELT streams were identical and the others agreed to 136 to 146 dB. The causes were four filter taps of the post-filter written with too few digits, the rounding of the post-filter, and the rounding of the coarse energy prediction in frames shorter than 20 ms. After that fix, the 8 switching streams and two FEC streams (`silk_wb_16k_mono_24k_vbr_c9_10ms_fec10`, and `hybrid_swb_24k_mono_24k_cbr_c9_20ms_fec10`, which libopus codes as SILK) still agreed only to 172 to 192 dB, because of the rounding of `smooth_fade` (see below). The packets of opus1's encoder that switch modes decode identically too (`core_dtx_libopus`, `multistream_dtx_libopus`).
+- **A wider search** (`tests/core_decode_search.rs`, ignored tests that take about 4 minutes) compared every decode call, sample by sample, in float and in 16 bits, and the final range after every packet:
+  - 228 streams coded by libopus and by opus1: 8 s of speech from the TSP speech database (see [Testing](09-testing.md#corpora)) mixed with tones, near silence and loud passages; 8, 12, 16, 24 and 48 kHz; mono and stereo; the applications `Voip`, `Audio` and `RestrictedLowDelay`; a bitrate that changes every 10 packets, so that the mode switches; frames of 2.5 to 120 ms; FEC; DTX (discontinuous transmission, libopus streams only); forced Hybrid. Each was decoded at every output rate with 1 and 2 channels: without loss, with random and burst losses, with a loss concealed in pieces of 2.5 ms, 7.5 ms and the rest, with 8 packets concealed in one call, and with one or two lost packets rebuilt from FEC data. That makes 13,160 decodes.
+  - The 12 test vectors of RFC 8251, decoded in the same ways: 840 decodes.
+  - 1,500 multistream streams of libopus (10 layouts, 3 encoder settings, 5 bitrates, 5 frame sizes, 2 signals, some loud enough for the soft clipper), each decoded at every output rate with concealment and FEC: 7,500 decodes.
+
+  Every sample and every final range was libopus's.
 
 An agreement of 172 dB means the difference is 172 dB below the signal. That is far smaller than the error of rounding to 16-bit samples, which alone limits the SNR of a full-scale sine to about 98 dB.
 
+Three last-bit differences were fixed in October 2026 to get there:
+
+- **`smooth_fade`** (`src/opus_decoder.c`), the fade between SILK or Hybrid output and a CELT frame at a mode switch or a redundant CELT frame: `w*in2 + (1-w)*in1`. clang rounds `(1-w)*in1` and adds `w*in2` in one fused multiply-add. opus1 rounded both products. For example, libopus codes `fixtures/answer_16k.wav` (16 kHz mono, VoIP, 24 kb/s, 20 ms frames) as SILK for 28 packets, then as CELT. Packet 27 carries a redundant CELT frame, and 9 of its float samples differed at 16 kHz output (14 at 48 kHz). Test: `tests/core_decode_bitexact.rs`.
+- **`opus_pcm_soft_clip`** (`src/opus.c`), the soft clipper of the 16-bit output: `x + a*x*x` is `a*x` rounded, then one fused multiply-add, and the boost `a + a*2.4e-7` is a fused multiply-add too. opus1 rounded every step, so a soft-clipped 16-bit sample could be one step off. `pcm_soft_clip` now gives the bits of `opus_pcm_soft_clip` (`tests/core_decode_i16.rs`).
+- **The rounding of halfway values to 16 bits**, described next.
+
+#### Rounding to 16 bits
+
+`opus_decode` converts its float output to 16 bits with `celt_float2int16`. A value that lies exactly halfway between two integers after the scaling by 32768 (for example 9470.5) is rounded by a rule that depends on the processor. opus1 follows the rule of the libopus built for the same target:
+
+| Target | libopus 1.6.1 | Halfway values |
+|---|---|---|
+| 64-bit ARM | `celt_float2int16_neon` (`celt/arm/celt_neon_intr.c`). libopus's build enables NEON (ARM vector instructions) by default, and every 64-bit ARM processor has them, so this version runs with and without run-time CPU detection. | Away from zero (`vcvtaq_s32_f32`) in whole blocks of 16 values from the start of the call. To the even integer (`vcvtns_s32_f32` in `FLOAT2INT16`) for the values after the last whole block. |
+| 32-bit ARM | `celt_float2int16_neon` on a processor with NEON, chosen at run time or at build time. opus1 assumes a processor with NEON, as the Android NDK's default build for `armeabi-v7a` does. | In the blocks, ARMv7 adds 0.5 with the sign of the value and truncates: away from zero. ARMv8 in 32-bit mode uses `vcvtaq_s32_f32`; the two differ only for the scaled value ±0.49999997. opus1 follows ARMv7. After the blocks: to the even integer (`lrintf`). |
+| x86 | `celt_float2int16_c`. libopus 1.6.1 has no x86 version of it. `FLOAT2INT16` rounds with `_mm_cvt_ss2si`. | To the even integer. |
+| Other targets | `celt_float2int16_c`; `FLOAT2INT16` rounds with `lrintf`. A build without `lrintf` uses `floor(0.5 + x)`, which rounds halfway values up; opus1 does not follow that case. | To the even integer. |
+
+Before, opus1 rounded every halfway value to the even integer. On 64-bit ARM, a sample in a block that libopus rounds away from zero was then one step off. For example, in the stream above (902 packets), 47 packets had such a sample at 16 kHz output (48 samples), and 129 packets at 48 kHz (137 samples).
+
+The other integer outputs convert each sample on its own, as libopus does, and round halfway values to the even integer on every target:
+
+- `MultistreamDecoder::decode_i16`: libopus `opus_multistream_decode` converts each sample with `FLOAT2INT16` (`RES2INT16`).
+- The 24-bit output of the evaluation tools (`internals::eval::res2int24`, like libopus `opus_decode24`): `RES2INT24` is `float2int` of each sample. opus1 has no public 24-bit decode call.
+
+`tests/core_decode_i16_ties.rs` decodes loud CELT and Hybrid streams at every output rate, mono and stereo, with losses, and finds the halfway values in the float output of libopus. It requires the 16-bit samples of libopus, with halfway values both in the blocks and after them, and does the same for the multistream decoder.
+
 **Conformance (RFC 8251):** opus1's decoder passes all 120 runs of the test vectors (12 vectors, 48 to 8 kHz, mono and stereo), as libopus's `tests/run_vectors.sh` runs them. The 16-bit outputs are identical to libopus 1.6.1's in all 120 runs, on the Mac and on the phone. The mean quality and the details are in [Testing](09-testing.md#the-conformance-test-of-rfc-8251).
 
-Concealment is identical too. The concealed frames of all 127 loss cases of `celtdec_plc` (2.5 to 20 ms, decoders at 8 to 48 kHz, CELT and Hybrid) are libopus's to the last bit, and so are the concealed frames of `multistream_dec_loss` for every layout. (Its streams with FEC agree with libopus to 156 to 200 dB.) Before, a small difference in the decoded signal could change the pitch the concealment found. Fuzzing found such a case ([Testing](09-testing.md#fuzzing)): an 8 kHz stream that switched from CELT-only to SILK without a redundant CELT frame, where the 5 ms that the decoder conceals in CELT agreed with libopus to 27 dB. That was measured before the CELT decoder became bit-exact.
+Concealment and FEC are identical too. The concealed frames of all 127 loss cases of `celtdec_plc` (2.5 to 20 ms, decoders at 8 to 48 kHz, CELT and Hybrid) are libopus's to the last bit, and so are the concealed and rebuilt frames of the wider search above, for single streams and for every multistream layout. Before, a small difference in the decoded signal could change the pitch the concealment found. Fuzzing found such a case ([Testing](09-testing.md#fuzzing)): an 8 kHz stream that switched from CELT-only to SILK without a redundant CELT frame, where the 5 ms that the decoder conceals in CELT agreed with libopus to 27 dB. That was measured before the CELT decoder became bit-exact.
 
 ## libopus main branch and the 1.6.1 release
 
@@ -264,8 +294,8 @@ The crate `opus-head-sys` 0.3.3, a dependency of the tests, vendors the C source
 | celt/pitch.c | after 536 | For a period shorter than twice the minimum, `remove_doubling` computes the pitch gain at 5/8 and at 6/8 of the period, and sets the gain to 0 when either is at least as large. | 1.6.1: no such check. |
 | celt/bands.c | 1750-1753 | For bands at or above `effEBands`, `Y` points to `norm2` instead of `norm`, and an assertion is added. | Not reachable: opus1 has only the standard mode, where `effEBands` equals the 21 bands. |
 | celt/bands.c, celt/celt_encoder.c, celt/celt_decoder.c, celt/rate.c, celt/vq.c, celt/modes.c | bands.c 847, 1091, 1675-1676; celt_encoder.c 2557, after 2590, 2659, 2688; celt_decoder.c 1474, 1507; rate.c 752-851; vq.c 526; modes.c 487 | The scalable quality extension (QEXT, `ENABLE_QEXT`): more extra bits per band (12 to 14), a new depth allocation, a cap of 1275 bytes without the extension, bits counted on the extension's range coder, `extra_quant[nbEBands+1]` corrected to `[nbEBands+i]`, `ec_enc_refine`, a comment. | Not ported: opus1 has no QEXT. |
-| celt/celt_decoder.c | 644-645, after 671 | Deep PLC (`update_plc_state`): two buffers move from the C stack to `ALLOC`. Same output. | Not ported yet (deep PLC is off by default in libopus). |
-| src/opus_decoder.c | after 496, after 497 | With the OSCE bandwidth extension, a CELT-only frame resets `osce_extended_mode`. In 1.6.1 a CELT-only frame after bandwidth-extended SILK frames skips its CELT decode, and the range decoder loses its place. | Not ported: opus1 has no OSCE. Work that adds the bandwidth extension takes main's fix. |
+| celt/celt_decoder.c | 644-645, after 671 | Deep PLC (`update_plc_state`): two buffers move from the C stack to `ALLOC`. Same output. | No change needed: `DeepPlc::update_from_celt` keeps them on the stack (8 KB and 1.3 KB), with the same output. |
+| src/opus_decoder.c | after 496, after 497 | With the OSCE bandwidth extension, a CELT-only frame resets `osce_extended_mode`. In 1.6.1 a CELT-only frame after bandwidth-extended SILK frames skips its CELT decode, and the range decoder loses its place. | main (see [Deliberate differences](#deliberate-differences)). |
 | src/opus_decoder.c | after 735, 1442, after 1530, 1562-1566, after 1597, 1615 | DRED (deep redundancy): rejects a DRED state that was not processed, returns the result of loading a model through `ret`, clears a new DRED decoder, changes how many features are decoded, adds an assertion on `nb_latents`, removes a blank line. | Not ported: opus1 has no DRED. |
 | src/repacketizer.c | 169 | A packet whose extensions cannot be parsed gives `OPUS_INVALID_PACKET` instead of `OPUS_INTERNAL_ERROR`. | Not ported: opus1 does not read extensions (see [Packet padding extensions](#packet-padding-extensions)). |
 | src/repacketizer.c | 265, after 352, after 353 | `RESTORE_STACK` on two error paths. It matters only for builds with libopus's own stack (neither `VAR_ARRAYS` nor `alloca`). | Not applicable. |
@@ -276,7 +306,7 @@ The crate `opus-head-sys` 0.3.3, a dependency of the tests, vendors the C source
 
 Files in only one of the two trees: main has the tool `celt/dump_modes/`, the TI DSP headers `celt/fixed_c5x.h` and `celt/fixed_c6x.h`, the Xtensa headers in `silk/xtensa/`, and `src/tansig_table.h`, which no file includes. 1.6.1 has the generated assembly file `celt/arm/celt_pitch_xcorr_arm-gnu.S`. None of them is ported.
 
-So opus1 followed the main branch in one place, the Burg energy, and now follows 1.6.1 there too. Some main changes fix memory errors: the cleared DRED decoder (1.6.1 leaves its memory uninitialized), the assertion on `nb_latents`, and `RESTORE_STACK`. Others fix wrong output: the range decoder after the bandwidth extension, the `extra_quant` index of QEXT, and `Y` beyond `effEBands`. None of them is in code that opus1 ports, so no main-branch change is kept.
+So opus1 followed the main branch in one place, the Burg energy, and now follows 1.6.1 there too. Some main changes fix memory errors: the cleared DRED decoder (1.6.1 leaves its memory uninitialized), the assertion on `nb_latents`, and `RESTORE_STACK`. Others fix wrong output: the range decoder after the bandwidth extension, the `extra_quant` index of QEXT, and `Y` beyond `effEBands`. Of these, only the fix after the bandwidth extension is in code that opus1 ports, and opus1 keeps it. It is the only main-branch change that opus1 follows.
 
 ### Neural network code
 
@@ -286,6 +316,7 @@ The code that the networks share (`src/dnn/`, see [Architecture](07-architecture
 - every layer of the six networks PitchDNN, PLC, FARGAN, LACE, NoLACE and BBWENet, with the real weights and inputs from speech: 357,192 uses of a layer on 1804 frames of 10 ms, call by call and also with each side running on its own outputs (`tests/dnn_layers_libopus.rs`);
 - the pitch that PitchDNN gives, against libopus's `compute_pitchdnn`;
 - the signal analysis of `dnn/freq.c` and `dnn/burg.c`.
+- LACE, NoLACE and the bandwidth extension (`src/dnn/osce/`), with their features and filters: every output sample of real speech decoded by opus1's SILK decoder, over the whole TSP corpus, with method switches and resets (Mac only; see [Testing](09-testing.md#tests-of-the-neural-network-code)).
 
 Builds of libopus that turn loops into vector code differ in the last bits. Measured with the same tests:
 
@@ -293,7 +324,47 @@ Builds of libopus that turn loops into vector code differ in the last bits. Meas
 - **NDK clang 18 at `-O2` (phone).** Every layer of the six networks is bit-exact, on both cores. As on the Mac, the pitch of `compute_pitchdnn` differs: in 375 of 1804 frames, by at most 4.8e-7. `dnn/freq.c` and `dnn/burg.c` differ too, because their sums are vector code.
 - **`dnn/freq.c` and `dnn/burg.c` at `-O2` on the Mac.** The band energies differ in 14,976 of 88,452 values, by at most 2.7e-7 of the value. Burg's method differs in 78 of 377,951 values, by one step of the float format. The Burg cepstrum differs in 42,246 of 152,028 values, by at most 5.3e-6 (the values reach 23). `lpc_from_cepstrum` differs in the last bits of 41,770 of 93,772 values; in one case one build stops the recursion early and the other does not. The FFT, the window and the DCT give the same bits.
 
-Without `std`, the networks' `log10` and `pow` come from the `libm` crate instead of the platform's C library. Their differences were not measured.
+- **OSCE against the `-O2` build of the Mac.** Besides the gain layers above, this build sums the kernel norm of `nndsp.c` and the filter banks of the features in another order. Measured with `tests/dnn_osce_libopus.rs` over the whole TSP corpus (one stream of 1444 files per model, decoded by opus1's SILK decoder):
+
+  | Model | Frames that differ | Largest difference | SNR of the difference |
+  |---|---:|---:|---:|
+  | LACE | 4,280 of 195,082 | 142 LSB | 70.2 dB |
+  | NoLACE | 8,362 of 194,504 | 89 LSB | 73.1 dB |
+  | method switches (NONE, LACE, NoLACE) | 3,028 of 196,996 | 31 LSB | 84.4 dB |
+  | bandwidth extension (10 and 20 ms calls) | 70,152 of 231,721 calls | 166 LSB | 66.4 dB |
+  | NoLACE, then the bandwidth extension | 194,717 of 195,081 | 190 LSB | 60.8 dB |
+
+  LSB is one step of a 16-bit sample. On shorter streams (48 files, about 4,400 enhanced frames per model) LACE differed in 133 frames and NoLACE in 216, each by at most 1 LSB (103.9 and 101.9 dB). The bandwidth extension differed in 2,519 of 7,742 calls by up to 130 LSB (63.5 dB).
+
+The models of deep PLC (`src/dnn/plc/`: the feature analysis, PitchDNN, FARGAN and the state machine of `dnn/lpcnet_plc.c`) are bit-exact against the build without vector loops: every concealed frame and the state after every call, for every kernel variant, on the speech fixture and the 1,444 files of the TSP corpus on the Mac, and on the fixture and 50 corpus files on the phone (Cortex-A76 and Cortex-A55) (`tests/dnn_plc_libopus.rs`).
+
+They run in the decoder, and the decoder with them is bit-exact against the same build: every float sample, every 16-bit sample and every final range of `OpusDecoder` and `MultistreamDecoder`, for streams of libopus's and opus1's encoders in every mode, at every output rate, with single losses, bursts, losses longer than 200 ms, FEC, resets and complexity changes (`tests/dnn_plc_decoder_libopus.rs`, Mac). This includes complexities 6 to 10, where LACE and NoLACE run as well.
+
+LACE, NoLACE and the bandwidth extension run in the decoder too, and the decoder is bit-exact against the same build at every complexity, with the BWE on and off, at every output rate, in mono, stereo and multistream decoders, with losses, FEC, resets and switches of the complexity, of the BWE and of the coding mode (`tests/dnn_osce_decoder_libopus.rs`, Mac). The exception is the defect of libopus 1.6.1 with CELT-only frames after frames with the BWE ([Deliberate differences](#deliberate-differences)): a comparison stops at the first such frame. Against the `-O2` build of the Mac, the decoded output of the streams of that test without CELT-only packets (mono and stereo, 48 kHz, no loss; `distance_to_an_o2_build`) differs as follows:
+
+| Setting | Decode calls that differ | Largest difference | SNR of the difference |
+|---|---:|---:|---:|
+| LACE (complexity 6) | 114 of 19,552 | 2 LSB | 96.9 dB |
+| NoLACE (complexity 7) | 196 of 19,552 | 3 LSB | 94.1 dB |
+| BWE (complexity 4) | 2,360 of 19,552 | 12 LSB | 71.3 dB |
+| NoLACE and BWE (complexity 7) | 5,683 of 19,552 | 46 LSB | 64.6 dB |
+
+With speech of the TSP corpus and streams of 8 s (`OPUS1_DNN_OSCE_ALL=1`, 39,108 calls per setting), LACE differed in 280 calls by at most 3 LSB (97.8 dB), NoLACE in 862 calls by at most 56 LSB (62.1 dB), the BWE in 7,155 calls by at most 14 LSB (71.8 dB), and NoLACE with the BWE in 14,091 calls by at most 99 LSB (60.5 dB).
+
+Against the `-O2` build of the Mac, the differences above grow, because the networks feed back their outputs:
+
+- The features differ in 343,519 of 343,656 frames (the fixture and the whole corpus); the largest difference, 2.56, is in the pitch.
+- PitchDNN, run on its own state with the same inputs, gives another pitch in 74,764 of 343,656 frames.
+- FARGAN, run on its own output for whole files, differs at 14.0 dB SNR.
+- The concealed frames differ at 15.7 dB SNR (scripted losses on the fixture) and 13.2 dB (random losses on all 1,445 signals, 56,800 concealed frames). Builds of libopus differ from each other by about as much: 10.0 to 15.4 dB between the Mac `-O2`, the Mac `-Os` and the Android `-O2` builds.
+- In the decoder (`OpusDecoder` at complexity 5, mono 48 kHz output, 62 streams of every mode, with single losses, bursts and long losses; `distance_to_an_o2_build` in `tests/dnn_plc_decoder_libopus.rs`), the concealed audio differs at 13.5 dB SNR (12.1 dB with speech of the TSP corpus, 20,370 concealed calls), and the audio decoded after the losses, which continues from the concealed state, at 26.9 dB (27.3 dB). The `-O2` build also rounds the filters of the CELT part of deep PLC (`update_plc_state` and the upsampler) and the pitch-based CELT concealment differently.
+
+Two places of the deep PLC models are written for memory safety. Only DRED features (deep redundancy, not ported yet) reach them:
+
+- A DRED feature vector beyond the 104 places of the queue is dropped. libopus stops with an assertion, or, built without assertions, writes past the queue.
+- A DRED pitch above 7.5 gives FARGAN the period 0. libopus then reads past the end of its pitch buffer, into the next field of `FARGANState`. opus1 reads the same values from that field, so the output is the same, without reading out of bounds.
+
+Without `std`, the networks' `log10`, `pow`, `exp`, `exp2` and `log`, and the `sin` and `cos` of OSCE, come from the `libm` crate instead of the platform's C library. Their differences were not measured.
 
 ## Platforms
 

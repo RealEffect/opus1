@@ -30,7 +30,7 @@ mod multistream_dec_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_dec_common::*;
-use opus1::OpusDecoder;
+use opus1::{OpusDecoder, pcm_soft_clip};
 use std::f64::consts::PI;
 
 const OPUS_SET_FORCE_CHANNELS_REQUEST: i32 = 4022;
@@ -366,9 +366,13 @@ fn run_steps_against_c(e: &Encoded, fs: i32, steps: &[Step]) -> Tally {
             assert_eq!((c.is_ok(), r.is_ok()), (spec.ok, spec.ok), "{}: C {:?}, opus1 {r:?}", what(), c.as_ref().map(|pcm| pcm.len() / ch));
             if let (Ok(c), Ok(n)) = (c, r) {
                 assert_eq!(c.len(), n * ch, "{}: samples", what());
+                // On 64-bit ARM the soft clipper and the rounding are
+                // libopus's, so every sample is equal. Elsewhere a sample
+                // may be one step away.
+                let limit = if cfg!(target_arch = "aarch64") { 0 } else { 1 };
                 for (&c, &r) in c.iter().zip(&out16[..n * ch]) {
                     let d = (c as i32 - r as i32).abs();
-                    assert!(d <= 1, "{}: C {c}, opus1 {r}", what());
+                    assert!(d <= limit, "{}: C {c}, opus1 {r}", what());
                     tally.differing_16 += (d != 0) as usize;
                     tally.full_scale_16 += (c == i16::MAX || c == i16::MIN) as usize;
                 }
@@ -481,10 +485,18 @@ fn route<T: Copy + Default>(e: &Encoded, decoded: &[Vec<T>], samples: usize) -> 
 /// not given to the stream decoders at all, so it must leave the multistream
 /// decoder as it was. The C decoder must give the same verdict and number of
 /// samples. Returns the number of calls that succeeded.
+///
+/// The stream decoders always decode to float. For a 16-bit call the
+/// reference follows libopus `opus_multistream_decode`: a decoded packet of
+/// a stream is soft-clipped with the memory of that stream, and each sample
+/// is rounded with `FLOAT2INT16`. A float call with a packet clears that
+/// memory, and a reset too. `OpusDecoder::decode_i16` is not the reference:
+/// like `opus_decode`, it rounds halfway values in blocks of 16 on ARM.
 fn run_steps_against_stream_decoders(e: &Encoded, fs: i32, steps: &[Step]) -> usize {
     let mut c_dec = RawCDecoder::for_packets(e, fs);
     let (_, mut ms) = e.decoders(fs);
     let mut singles: Vec<OpusDecoder> = (0..e.streams).map(|s| OpusDecoder::new(fs, if s < e.coupled { 2 } else { 1 }).unwrap()).collect();
+    let mut clip_memory = vec![[0f32; 2]; e.streams];
     let ch = e.channels;
     let unit = fs as usize / 400;
     let max_frame = 48 * unit;
@@ -498,6 +510,7 @@ fn run_steps_against_stream_decoders(e: &Encoded, fs: i32, steps: &[Step]) -> us
                 c_dec.reset_state();
                 ms.reset_state();
                 singles.iter_mut().for_each(|dec| dec.reset_state());
+                clip_memory.fill([0.0; 2]);
                 continue;
             }
             Step::Call(spec) => spec,
@@ -537,11 +550,19 @@ fn run_steps_against_stream_decoders(e: &Encoded, fs: i32, steps: &[Step]) -> us
             let stream_channels = if s < e.coupled { 2 } else { 1 };
             let stream_packet: &[u8] = parts.as_ref().map_or(&[], |p| &p[s].packet);
             if spec.sixteen {
-                let mut buf = vec![0i16; frame_size * stream_channels];
-                let got = if spec.fec { dec.decode_fec_i16(stream_packet, frame_size, &mut buf) } else { dec.decode_i16(stream_packet, frame_size, &mut buf) };
+                let mut buf = vec![0f32; frame_size * stream_channels];
+                let got = if spec.fec { dec.decode_fec(stream_packet, frame_size, &mut buf) } else { dec.decode(stream_packet, frame_size, &mut buf) };
                 assert_eq!(got, Ok(n), "{}: stream {s}", what());
-                want16.push(buf);
+                // Concealed and rebuilt frames are not soft-clipped, and
+                // keep the memory.
+                if !spec.fec && !stream_packet.is_empty() {
+                    pcm_soft_clip(&mut buf, n, stream_channels, &mut clip_memory[s]);
+                }
+                want16.push(to_i16(&buf[..n * stream_channels]));
             } else {
+                if !spec.fec && !stream_packet.is_empty() {
+                    clip_memory[s] = [0.0; 2];
+                }
                 let mut buf = vec![0f32; frame_size * stream_channels];
                 let got = if spec.fec { dec.decode_fec(stream_packet, frame_size, &mut buf) } else { dec.decode(stream_packet, frame_size, &mut buf) };
                 assert_eq!(got, Ok(n), "{}: stream {s}", what());

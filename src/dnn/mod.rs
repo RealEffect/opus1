@@ -21,18 +21,19 @@
 //! - `builtin`: the 1.6.1 weights embedded in the crate;
 //! - `holder`: the weights and models that a decoder holds;
 //! - `freq`, `burg`, `lpcnet_tables`: the signal processing of `freq.c`,
-//!   `burg.c` and `lpcnet_tables.c`.
+//!   `burg.c` and `lpcnet_tables.c`;
+//! - `plc`: the models and the state machine of deep PLC;
+//! - `osce`: LACE, NoLACE and the bandwidth extension.
 //!
 //! All kernels compute the bits of libopus 1.6.1 on 64-bit ARM, built
 //! without loop vectorization, on every target (see
 //! `target/perf/next/plan.md` and `nnet.md` in the repository's working
 //! notes).
 //!
-//! The models themselves (`plc` for deep PLC, `osce` for LACE, NoLACE and
-//! the bandwidth extension) are empty modules until they are ported. The
-//! decoder already stores the complexity, the bandwidth extension switch
-//! and the loaded weights (`holder`), but nothing reads them during
-//! decoding yet.
+//! The decoder runs all of them: `OpusDecoder` holds a `plc::DeepPlc` and
+//! passes it to SILK and CELT (see `crate::deep_plc`), and it passes the
+//! OSCE method, the BWE mode and the OSCE layers to SILK (see
+//! `crate::osce_args`), whose channels hold the OSCE states.
 
 #[cfg(target_endian = "big")]
 compile_error!(
@@ -55,7 +56,6 @@ pub mod vec_neon;
 pub mod vec_x86;
 pub mod weights;
 
-// Filled in the second wave.
 #[cfg(feature = "deep-plc")]
 pub mod plc;
 #[cfg(feature = "osce")]

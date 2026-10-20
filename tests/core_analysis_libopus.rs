@@ -33,6 +33,12 @@
 //! The packets depend on the rounding of the analysis, which is libopus's
 //! on 64-bit ARM. Elsewhere the tests only print what they find.
 #![cfg(feature = "analysis")]
+// With `test-libopus-dnn` the tests link a libopus built with its neural
+// network code and without vector loops. Its analysis rounds two sums of
+// the cepstrum differently from the Homebrew build that opus1 follows
+// (docs/10-differences-from-libopus.md), so these tests run only without
+// that feature.
+#![cfg(not(feature = "test-libopus-dnn"))]
 
 mod analysis_common;
 mod core_common;

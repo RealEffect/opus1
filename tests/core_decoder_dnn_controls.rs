@@ -10,8 +10,10 @@
 //! `OPUS_UNIMPLEMENTED`. `dnn_decoder_controls_libopus.rs` compares the
 //! same requests with a libopus built with the features.
 //!
-//! In this version the features are not connected to the decoder yet, so
-//! the controls must not change the decoded output.
+//! In a build without the features `deep-plc` and `osce`, the controls
+//! must not change the decoded output. With deep PLC the complexity
+//! changes the concealment; `dnn_plc_decoder_libopus.rs` compares that
+//! with a libopus that has it.
 
 use audiopus_sys as sys;
 use opus1::OpusDecoder;
@@ -137,6 +139,7 @@ fn the_bwe_switch_starts_off_and_survives_a_reset() {
 }
 
 /// A mono 16 kHz speech-like signal: a vowel-like pulse train with noise.
+#[cfg(not(any(feature = "deep-plc", feature = "osce")))]
 fn speech(len: usize) -> Vec<f32> {
     let mut seed = 1u32;
     (0..len)
@@ -155,6 +158,7 @@ fn speech(len: usize) -> Vec<f32> {
 /// Packets of 20 ms from the libopus encoder, at the given bitrate and
 /// with the mode left to the encoder, from 16 kHz input: SILK at
 /// 12 kb/s, CELT at 24 kb/s.
+#[cfg(not(any(feature = "deep-plc", feature = "osce")))]
 fn packets(bitrate: i32) -> Vec<Vec<u8>> {
     let mut err = 0;
     let enc = unsafe { sys::opus_encoder_create(16000, 1, sys::OPUS_APPLICATION_VOIP, &mut err) };
@@ -174,10 +178,12 @@ fn packets(bitrate: i32) -> Vec<Vec<u8>> {
 }
 
 /// Every 7th packet is lost.
+#[cfg(not(any(feature = "deep-plc", feature = "osce")))]
 fn lost(i: usize) -> bool {
     i % 7 == 3
 }
 
+#[cfg(not(any(feature = "deep-plc", feature = "osce")))]
 fn decode_all(d: &mut OpusDecoder, packets: &[Vec<u8>], rate: i32) -> Vec<f32> {
     let frame = rate as usize / 50;
     let mut out = Vec::new();
@@ -190,10 +196,10 @@ fn decode_all(d: &mut OpusDecoder, packets: &[Vec<u8>], rate: i32) -> Vec<f32> {
     out
 }
 
-/// The neural network features are not connected to the decoder in this
-/// version: the complexity, the BWE switch and a reloaded blob must not
-/// change the output. (When deep PLC and OSCE are connected, this holds
-/// only for builds without them.)
+/// Without deep PLC and OSCE compiled in, the complexity must not change
+/// the output, as in a libopus built without them. (The BWE switch and
+/// built-in blobs need those features.)
+#[cfg(not(any(feature = "deep-plc", feature = "osce")))]
 #[test]
 fn the_controls_do_not_change_the_output_yet() {
     for bitrate in [12_000, 24_000] {
@@ -204,10 +210,6 @@ fn the_controls_do_not_change_the_output_yet() {
             for complexity in [0, 4, 5, 6, 7, 10] {
                 let mut d = OpusDecoder::new(rate, 1).unwrap();
                 d.set_complexity(complexity).unwrap();
-                #[cfg(feature = "osce-bwe")]
-                d.set_osce_bwe(true).unwrap();
-                #[cfg(feature = "deep-plc")]
-                d.set_dnn_blob(&opus1::DnnBlob::builtin()).unwrap();
                 let got = decode_all(&mut d, &packets, rate);
                 assert!(
                     want.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()) && want.len() == got.len(),

@@ -40,6 +40,9 @@
 #
 # Settings: see scripts/android/env.sh (ANDROID_NDK_HOME, ADB, DEVICE_DIR,
 # ANDROID_OUT, ...).
+# CARGO_FEATURES: cargo features for the build, for example
+#   CARGO_FEATURES=test-libopus-dnn,osce-bwe with LIBOPUS_PREFIX set to a
+#   libopus built with --dnn (docs/09-testing.md).
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
@@ -65,7 +68,7 @@ if [ "$BUILD" = 1 ]; then
     echo ":: building the tests for $RUST_TARGET (API $ANDROID_API)"
     rm -rf "$STAGE"
     mkdir -p "$STAGE/bin"
-    cargo_android test --release --no-run
+    cargo_android test --release --no-run ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
     # cargo ndk does not print where the programs are. Each test program is
     # deps/<name>-<hash>, where <name> is `opus1` for the unit tests or the
     # name of a file of tests/. The newest such file is the one just built.
@@ -108,9 +111,13 @@ if [ "$RUN" = 1 ]; then
         exit 2
     fi
 
-    echo ":: copying $(wc -l < "$SELECTED" | tr -d ' ') programs and fixtures/ to $DEVICE_DIR"
-    dev "mkdir -p $DEVICE_DIR/tests/bin $DEVICE_DIR/fixtures"
+    echo ":: copying $(wc -l < "$SELECTED" | tr -d ' ') programs, fixtures/, dnn-weights/ and examples/eval/sets/ to $DEVICE_DIR"
+    dev "mkdir -p $DEVICE_DIR/tests/bin $DEVICE_DIR/fixtures $DEVICE_DIR/dnn-weights $DEVICE_DIR/examples/eval/sets"
     "$ADB" push -q --sync "$REPO_ROOT/fixtures/." "$DEVICE_DIR/fixtures/" >/dev/null
+    # Tests read the weight files (core_decoder_dnn_controls) and the item
+    # lists of the evaluation sets (eval_selftest) from the repository.
+    "$ADB" push -q --sync "$REPO_ROOT/dnn-weights/." "$DEVICE_DIR/dnn-weights/" >/dev/null
+    "$ADB" push -q --sync "$REPO_ROOT/examples/eval/sets/." "$DEVICE_DIR/examples/eval/sets/" >/dev/null
     "$ADB" push -q --sync "$STAGE/bin/." "$DEVICE_DIR/tests/bin/" >/dev/null
     "$ADB" push -q "$SELECTED" "$DEVICE_DIR/tests/selected.txt" >/dev/null
 

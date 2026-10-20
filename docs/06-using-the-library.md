@@ -518,14 +518,81 @@ libopus 1.5 and later can run small neural networks in the decoder. A default bu
 
 The weights are those of libopus 1.6.1. They are files in the crate (`dnn-weights/`), and each feature embeds the files of its networks in the program. The features work with and without `std` and `heap`.
 
-In this version the networks are not yet connected to the decoder. The code that runs them and their weights are in place, and every layer of every network gives the bits of libopus (see [Testing](09-testing.md#tests-of-the-neural-network-code)). The controls below are in place too. But the decoded output does not depend on the features or on the controls yet. The next version connects deep PLC, LACE, NoLACE and the BWE to the decoder.
+All of them run in the decoder. The decoded output is that of libopus 1.6.1 built with `--enable-osce` (which includes deep PLC), bit for bit, with one exception: opus1 decodes CELT-only frames that follow frames with the BWE, which libopus 1.6.1 replaces by silence (see [LACE, NoLACE and the bandwidth extension](#lace-nolace-and-the-bandwidth-extension)). [Testing](09-testing.md#tests-of-the-neural-network-code) says how this is checked.
+
+### Deep packet loss concealment
+
+With the feature `deep-plc`, the decoder conceals as libopus 1.6.1 built with `--enable-deep-plc` does, bit for bit (see [Testing](09-testing.md#tests-of-the-neural-network-code) for how this is checked):
+
+- At complexity 5 and above, a lost SILK frame at the 16 kHz SILK rate is made up by deep PLC, 10 ms at a time. That covers wideband SILK and the SILK layer of Hybrid. Narrowband and mediumband SILK keep the classic concealment.
+- At complexity 5 and above, a lost CELT-only frame is made up by deep PLC for the first 200 ms of a loss. After that the decoder turns to shaped noise, as without deep PLC after 100 ms. Deep PLC is mono: a stereo decoder gets the same concealed signal on both channels. The CELT layer of Hybrid keeps its noise concealment.
+- A switch to or from CELT-only without a redundancy frame is bridged with 5 ms of concealment in the old mode. At complexity 5 and above deep PLC makes these 5 ms, so the output changes also on streams without any loss.
+- Forward error correction (`decode_fec`) uses deep PLC wherever it has to conceal.
+- At every complexity, each decoded 16 kHz SILK frame goes into deep PLC's history of 150 ms. And a build with the feature skips the fade-in of the first 16 kHz SILK frame after a loss. So a build with `deep-plc` decodes streams with losses differently from a build without it, also at complexity 0, as libopus builds with and without `--enable-deep-plc` do.
+- `reset_state` clears deep PLC's state except the state of FARGAN, as libopus does. Concealment after a reset can therefore differ from that of a new decoder, once deep PLC has concealed a loss.
+- Each decoder holds about 43 KB more (see [Size of the encoder and the decoder](#size-of-the-encoder-and-the-decoder)). Decoding still allocates nothing.
+
+Deep PLC defers its work to the first lost frame: that frame analyses the history (up to 15 frames of 10 ms) before it conceals. On an Apple M4 Pro, the first lost 20 ms packet of a loss took about 0.36 ms (SILK) and 0.33 ms (CELT), and each further lost packet about 0.09 ms, against 0.005 to 0.008 ms for a packet that arrived. On a Cortex-A55, the deep PLC part of a first lost 20 ms packet takes about 6.9 ms, about 19 times as long as on the M4. [Performance](08-performance.md#deep-plc-in-the-decoder) gives the measurements.
+
+### LACE, NoLACE and the bandwidth extension
+
+With the feature `osce`, the decoder enhances SILK speech as libopus 1.6.1 built with `--enable-osce` does, bit for bit:
+
+- LACE runs at complexity 6, NoLACE at 7 and above. Both are post-filters: a small network computes, every 5 ms, the coefficients of adaptive filters that reduce the coding noise of the decoded speech. NoLACE is larger and adds a non-linear stage.
+- They enhance SILK frames of 20 ms at the 16 kHz SILK rate: wideband SILK-only packets of 20, 40 and 60 ms, and the SILK layer of Hybrid packets of 20 ms. Narrowband and mediumband SILK, 10 ms SILK frames and CELT are left as they are. A lost frame is not enhanced.
+- The enhancement starts afresh after a frame it does not enhance, a lost frame, a decoder reset and a change of complexity that changes the method. The first frame that could be enhanced then comes out unenhanced, and the next one fades from the unenhanced to the enhanced signal over its first 10 ms. Stereo SILK enhances the mid and the side signal separately. A side signal that a packet does not code keeps its state until it is coded again.
+- At every complexity, a build with the feature changes a sample of -32768 to -32767 in these frames, as libopus built with OSCE does.
+
+With the feature `osce-bwe` and `set_osce_bwe(true)`, the bandwidth extension (BWE) makes the 48 kHz output of SILK at the 16 kHz SILK rate, with the band from 8 to 20 kHz that SILK does not code, in place of the resampler:
+
+- It runs at complexity 4 and above, only when the decoder's output rate is 48 kHz. It takes the SILK frames (10 or 20 ms) of SILK-only wideband packets, and the concealment of lost SILK wideband and Hybrid frames (also DTX frames, which are concealed). It does not run on Hybrid packets that arrive: their CELT layer codes the upper band.
+- When a Hybrid frame is lost, the BWE makes the whole band, and CELT does not conceal; 2.5 ms of CELT silence let the CELT layer fade out, as libopus does.
+- A switch between the BWE and the resampler fades over 10 ms, as in libopus. After CELT-only frames, or when the SILK rate changes, there is no fade, and the BWE starts afresh.
+- The BWE output is delayed by 21 samples (0.44 ms) against the resampler's.
+- libopus 1.6.1 does not decode CELT-only frames that follow frames with the BWE: it outputs silence until the next SILK frame, and its range decoder loses its place. libopus main fixed this (commit `228a0f85`), and opus1 follows main. So a stream that switches from SILK wideband to CELT-only with the BWE on is not bit-exact against libopus 1.6.1 from the first CELT-only frame on.
+- `reset_state` keeps the state of the BWE, as libopus does: after a reset in the middle of a stream with the BWE on, it continues from where it was.
+
+Cost, measured on an Apple M4 Pro with `tests/dnn_osce_decoder_libopus.rs` (test `timing`: the median decode call of a 20 ms SILK wideband packet at 20 kb/s, no loss, mono 48 kHz output, release build, median of 5 runs), in microseconds (µs) per call. A 20 ms packet lasts 20,000 µs.
+
+| Setting | opus1 | libopus 1.6.1, `-O2` without loop vectorization | libopus 1.6.1, `-O2` |
+|---|---:|---:|---:|
+| Complexity 5 (no enhancement) | 4.6 | 14.9 | 12.6 |
+| LACE (complexity 6) | 21.3 | 32.0 | 27.6 |
+| NoLACE (complexity 7) | 61.3 | 83.9 | 77.1 |
+| BWE (complexity 4) | 56.2 | 93.3 | 84.5 |
+| NoLACE and BWE (complexity 7) | 112.9 | 162.2 | 148.6 |
+
+At complexities below 6 libopus still computes the features of LACE and NoLACE for every 20 ms frame at 16 kHz, although it does not use them; opus1 skips them, with the same output.
+
+Cost on an Android phone (HONOR CLK-AN00, measured on 2026-10-20 at commit `94f10e3`): the same `timing` tests of `tests/dnn_osce_decoder_libopus.rs` and `tests/dnn_plc_decoder_libopus.rs`, run on one Cortex-A55 (cpu5) and on one Cortex-A76 (cpu7) with `taskset`. They ran twice, linked with libopus 1.6.1 built with its neural network code by the NDK's clang at `-O2` and without loop vectorization. The opus1 code is the same in both runs, so its two values show how much a run varies. Medians of 5 runs, in µs per decode call of a 20 ms packet (10 ms where named), mono 48 kHz output. Records: `target/perf/final/phone_timing/` (not in git).
+
+| Setting | opus1, A55 | libopus `-O2`, A55 | opus1, A76 | libopus `-O2`, A76 |
+|---|---:|---:|---:|---:|
+| Complexity 5, SILK wideband, no loss | 53 to 54 | 147 | 17 | 48 |
+| LACE (complexity 6) | 440 to 454 | 483 | 103 to 106 | 122 |
+| NoLACE (complexity 7) | 1,630 to 1,712 | 1,924 | 335 to 345 | 389 |
+| BWE (complexity 4) | 1,684 to 1,691 | 1,789 | 350 to 357 | 438 |
+| NoLACE and BWE (complexity 7) | 3,335 to 3,378 | 3,556 | 704 to 725 | 788 |
+| Deep PLC, SILK wideband: first lost packet | 6,892 to 8,086 | 9,388 | 1,711 to 1,908 | 2,059 |
+| Deep PLC, SILK wideband: further lost packet | 2,138 to 2,619 | 2,951 | 530 to 593 | 576 |
+| Deep PLC, CELT 20 ms: first lost packet | 7,532 to 7,979 | 8,678 | 1,729 to 1,761 | 1,987 |
+| Deep PLC, CELT 20 ms: further lost packet | 2,488 to 2,883 | 2,917 | 534 to 536 | 592 |
+| Deep PLC, CELT 10 ms: first lost packet | 6,195 to 6,279 | 6,975 | 1,259 to 1,305 | 1,492 |
+| Deep PLC, CELT 10 ms: further lost packet | 1,436 to 1,531 | 1,636 | 282 to 285 | 315 |
+
+- The heaviest case on the small core is NoLACE with the BWE: about 3.4 ms per 20 ms packet, 17 % of one Cortex-A55. On the Cortex-A76 it is about 0.7 ms (3.5 %).
+- The first lost packet of a loss is the most expensive call: deep PLC first analyses up to 15 frames of history. On the Cortex-A55 it takes 6.2 to 8.1 ms, which fits in a 20 ms packet but not with much room on a busy core.
+- libopus built without loop vectorization was slower than at `-O2` in every row but one (for example NoLACE and BWE: 3,763 µs on the A55, 840 µs on the A76). The exception is a further lost SILK packet on the A55: 2,655 µs without loop vectorization, 2,951 µs at `-O2`.
+- At complexity 5 without loss, libopus also computes the features of LACE and NoLACE, which it does not use there; that is most of the difference in the first row.
+
+Each SILK channel holds 14,344 bytes of OSCE state and 8,220 bytes of BWE state (on the heap with `heap`); see [Size of the encoder and the decoder](#size-of-the-encoder-and-the-decoder). Decoding still allocates nothing.
 
 The controls follow libopus:
 
 | Call | libopus request | What it does |
 |---|---|---|
 | `OpusDecoder::set_complexity`, `complexity` | `OPUS_SET_COMPLEXITY`, `OPUS_GET_COMPLEXITY` of the decoder | The decoder complexity, 0 to 10. The default is 0. It selects the networks: deep PLC from 5, LACE at 6, NoLACE from 7, and the BWE from 4 when it is switched on. It exists in every build; without the features it is only stored, as in libopus. |
-| `OpusDecoder::set_osce_bwe`, `osce_bwe` | `OPUS_SET_OSCE_BWE`, `OPUS_GET_OSCE_BWE` | Switches the BWE on or off. The default is off. Without the `osce-bwe` feature both return `"Request not implemented"`, as libopus returns `OPUS_UNIMPLEMENTED`. |
+| `OpusDecoder::set_osce_bwe`, `osce_bwe` | `OPUS_SET_OSCE_BWE`, `OPUS_GET_OSCE_BWE` | Switches the BWE on or off. The default is off. It acts at complexity 4 and above with 48 kHz output. Without the `osce-bwe` feature both return `"Request not implemented"`, as libopus returns `OPUS_UNIMPLEMENTED`. |
 | `OpusDecoder::set_dnn_blob`, `dnn_models` | `OPUS_SET_DNN_BLOB` | Loads other weights from a blob in the libopus format, and tells which groups of networks are loaded. Only with a neural network feature. |
 | `MultistreamDecoder::set_complexity`, `complexity` | `OPUS_SET_COMPLEXITY`, `OPUS_GET_COMPLEXITY` | Sets every stream; reads the first stream, as libopus does. |
 | `MultistreamDecoder::set_osce_bwe`, `set_dnn_blob` | none | Set every stream. libopus's multistream decoder does not forward these requests. |
@@ -661,7 +728,7 @@ Without `std`, the x86-64 code uses AVX, AVX2 and FMA only when the build enable
 
 ### Size of the encoder and the decoder
 
-The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of the speech and music analysis), the decoder sizes on the branch of the neural network features (`next-dnn`). Both use `size_of` and a counting allocator, a release build, and Rust 1.98 on aarch64-apple-darwin. The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
+The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of the speech and music analysis), the decoder sizes on the branch that connects deep PLC and OSCE (`next-wave2`). Both use `size_of` and a counting allocator, a release build, and Rust 1.98 on aarch64-apple-darwin. The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
 
 | Build | `OpusEncoder` |
 |---|---|
@@ -672,14 +739,22 @@ The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of
 
 | Build | `OpusDecoder` |
 |---|---|
-| Default (`heap`) | 104 bytes, plus 105,760 bytes on the heap in 5 allocations |
-| Default with `osce-bwe` | 112 bytes, plus 106,376 bytes on the heap in 6 allocations |
-| Without `heap` (with or without `std`) | 59,736 bytes |
-| Without `heap`, with `osce-bwe` | 72,320 bytes |
+| Default (`heap`) | 112 bytes, plus 105,768 bytes on the heap in 5 allocations |
+| Default with `deep-plc` | 128 bytes, plus 149,228 bytes on the heap in 7 allocations |
+| Default with `osce` | 128 bytes, plus 178,236 bytes on the heap in 9 allocations |
+| Default with `osce-bwe` | 128 bytes, plus 194,844 bytes on the heap in 11 allocations |
+| Without `heap` (with or without `std`) | 59,752 bytes |
+| Without `heap`, with `deep-plc` | 107,288 bytes |
+| Without `heap`, with `osce` | 142,136 bytes |
+| Without `heap`, with `osce-bwe` | 160,752 bytes |
 
 The state of the speech and music analysis takes 25,968 bytes: 14,004 bytes as in libopus, plus the FFT buffer and the per-bin values that libopus keeps on the stack, and two caches: the square roots of the band energies and the distances between the stored blocks.
 
 With a neural network feature, the decoder holds references to the layer tables of the built-in networks, which every decoder shares. Without `heap`, it also has room for the layer tables of every group that a blob can load (12,584 bytes with `osce-bwe`). The weights themselves are not copied: the embedded ones stay in the program, and a blob's bytes stay in the blob.
+
+With `deep-plc`, the decoder also holds the state of deep PLC: 42,012 bytes (on the heap with `heap`), and 1,292 bytes of 16 kHz samples and filter memory in the CELT decoder.
+
+With `osce`, each of the two SILK channels holds the state of LACE or NoLACE and their features, 14,344 bytes; with `osce-bwe` also the state of the BWE, 8,220 bytes. With `heap` each of these states is an allocation of its own, so that building a decoder does not hold them on the stack.
 
 The heap of the decoder includes a 46,088-byte float buffer for `decode_i16` and `decode_fec_i16`. Without `heap`, these two calls use a buffer of the same size on the stack instead.
 
@@ -689,6 +764,8 @@ Without `heap`, `OpusEncoder::new` and `OpusDecoder::new` return the whole state
 |---|---|---|
 | Build a 48 kHz stereo encoder and encode one 20 ms frame | 416 kibibytes (KiB, 1024 bytes) was enough, 400 KiB was not | 128 KiB was enough, 112 KiB was not |
 | Build a 48 kHz stereo decoder, conceal one frame with `decode`, decode one packet with `decode_i16` | 240 KiB was enough, 224 KiB was not | 96 KiB was enough, 80 KiB was not |
+| The same with `deep-plc` at complexity 5, after 40 packets (CELT-only or SILK wideband), so that deep PLC conceals the frame | 344 KiB was enough, 336 KiB was not (208 KiB and 192 KiB without `deep-plc`) | 80 KiB was enough, 64 KiB was not (the same without `deep-plc`) |
+| The same with `osce-bwe` at complexity 10 with the BWE on, after 40 packets of stereo SILK wideband (NoLACE, BWE and deep PLC run) | 584 KiB was enough, 576 KiB was not | 84 KiB was enough, 80 KiB was not |
 
 These figures depend on the code around the codec, and debug builds need more. A second program ran each case in a function of its own. Its encoder case needed 432 KiB without `heap` and 144 KiB with it. When its `decode_i16` call concealed a frame instead of decoding a packet, the decoder case needed 272 KiB without `heap` and 128 KiB with it. The repository's `tests/stack_usage_test.rs` checks that, with `heap`, building, encoding and decoding fit in 768 KiB.
 
@@ -830,7 +907,7 @@ assert!(worker.join().unwrap() > 0);
 - One exception in the default build: `OpusEncoder::reset_state` builds a fresh encoder with the same settings. So it allocates the 141,384 bytes (mono) or 151,320 bytes (stereo) of a new state and frees the old one. `OpusDecoder::reset_state` allocates nothing.
 - `DnnBlob::from_bytes` allocates a copy of the blob, and `OpusDecoder::set_dnn_blob` allocates the layer tables of each group of networks it loads.
 - The sizes of one encoder and one decoder are in [Size of the encoder and the decoder](#size-of-the-encoder-and-the-decoder).
-- A multistream encoder or decoder holds one `OpusEncoder` or `OpusDecoder` per stream. For 5.1 sound (4 streams) a `MultistreamEncoder` allocated 703,694 bytes (with the analysis) and a `MultistreamDecoder` 469,536 bytes (472,032 bytes with `osce-bwe`) in the measurements above. The repository's tests `multistream_enc_no_alloc` and `multistream_dec_no_alloc` check that they allocate nothing after they are built.
+- A multistream encoder or decoder holds one `OpusEncoder` or `OpusDecoder` per stream. For 5.1 sound (4 streams) a `MultistreamEncoder` allocated 703,694 bytes (with the analysis) and a `MultistreamDecoder` 469,600 bytes (643,504 bytes with `deep-plc`, 759,536 bytes with `osce` and 825,968 bytes with `osce-bwe`) in the measurements above. The repository's tests `multistream_enc_no_alloc` and `multistream_dec_no_alloc` check that they allocate nothing after they are built.
 
 ## Build settings for speed
 

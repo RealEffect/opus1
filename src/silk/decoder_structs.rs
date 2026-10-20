@@ -1,6 +1,29 @@
+#[cfg(feature = "osce-bwe")]
+use crate::dnn::osce::OsceBweChannel;
+#[cfg(feature = "osce")]
+use crate::dnn::osce::OsceChannel;
 use crate::silk::define::*;
 use crate::silk::resampler::SilkResampler;
 use crate::silk::structs::{NLSFCodebook, SideInfoIndices};
+
+/// Where a channel keeps its OSCE states (14 KB and 8 KB): behind a `Box`
+/// with the feature `heap`, inline without it. A `SilkDecoder` with them
+/// inline would be built on the stack before `OpusDecoder` boxes it, which
+/// doubles the stack that building a decoder needs.
+#[cfg(all(feature = "osce", feature = "heap"))]
+pub type OsceHeld<T> = Box<T>;
+/// Where a channel keeps its OSCE states: inline without `heap`.
+#[cfg(all(feature = "osce", not(feature = "heap")))]
+pub type OsceHeld<T> = T;
+
+#[cfg(all(feature = "osce", feature = "heap"))]
+fn osce_held<T>(value: T) -> OsceHeld<T> {
+    Box::new(value)
+}
+#[cfg(all(feature = "osce", not(feature = "heap")))]
+fn osce_held<T>(value: T) -> OsceHeld<T> {
+    value
+}
 
 #[derive(Clone)]
 pub struct SilkCNGState {
@@ -85,6 +108,16 @@ pub struct SilkDecoderState {
     pub loss_cnt: i32,
     pub prev_signal_type: i32,
     pub s_plc: SilkPLCState,
+    /// The OSCE state of the channel (libopus `psDec->osce`): its method,
+    /// the feature history and the state of LACE or NoLACE.
+    /// `silk_reset_decoder` resets it to `OSCE_DEFAULT_METHOD`.
+    #[cfg(feature = "osce")]
+    pub osce: OsceHeld<OsceChannel>,
+    /// The bandwidth extension state of the channel (libopus
+    /// `psDec->osce_bwe`). `silk_init_decoder` clears it to zero;
+    /// `silk_reset_decoder` keeps it, as libopus does.
+    #[cfg(feature = "osce-bwe")]
+    pub osce_bwe: OsceHeld<OsceBweChannel>,
 }
 
 impl Default for SilkDecoderState {
@@ -125,6 +158,10 @@ impl Default for SilkDecoderState {
             loss_cnt: 0,
             prev_signal_type: TYPE_NO_VOICE_ACTIVITY,
             s_plc: SilkPLCState::default(),
+            #[cfg(feature = "osce")]
+            osce: osce_held(OsceChannel::new()),
+            #[cfg(feature = "osce-bwe")]
+            osce_bwe: osce_held(OsceBweChannel::new()),
         }
     }
 }

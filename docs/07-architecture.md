@@ -37,6 +37,8 @@ Every other module is private. The tests, benchmarks, examples and fuzz targets 
 | `src/range_coder.rs` | `RangeCoder`: the range encoder and decoder, bit counting (`tell`, `tell_frac`), Laplace-distributed symbols. | `celt/entenc.c`, `celt/entdec.c`, `celt/entcode.c`, `celt/laplace.c` |
 | `src/fixedvec.rs` | `FixedVec<T, N>`: a growable buffer with a fixed capacity, stored inline. See [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored). | none |
 | `src/compat.rs` | `OnceCell` (a value built once, without the heap), a stable insertion sort (`sort_by`), the x86 feature probes (`x86_has_avx` and others), and the `Math` trait that maps float functions to `libm` without `std`. | none |
+| `src/deep_plc.rs` | `DeepPlcArgs`: what `OpusDecoder` passes down to the SILK and CELT decoders so that they can run deep packet loss concealment (the state, the models and the kernel variant). Without the feature `deep-plc` it is a type without values, so the argument is always `None`. | the `LPCNetPLCState *lpcnet` argument of `silk_Decode`, `silk_decode_frame`, `silk_PLC` and `celt_decode_with_ec_dred` |
+| `src/osce_args.rs` | `OsceArgs`: what `OpusDecoder` passes to the SILK decoder for each frame so that it can run OSCE: the method (LACE, NoLACE or none), the extended mode (whether the bandwidth extension replaces the resampler) and the layers. Without the feature `osce` it is a type without values. | the fields `osce_method`, `osce_extended_mode` of `silk_DecControlStruct` and the `OSCEModel` argument of `silk_decode_frame` |
 | `src/mathops.rs` | Float helpers that several modules share: `mac` and `mac_f64` (multiply-add, rounded as libopus rounds it on the target processor), `celt_log2` and `celt_exp2`. | `celt/mathops.h`, `celt/mathops.c` |
 
 ### The speech and music analysis (`src/analysis/`)
@@ -166,7 +168,7 @@ These files are not part of the codec. They port libopus's test programs, so tha
 
 libopus 1.5 and later run small neural networks in the decoder: deep packet loss concealment (deep PLC) with the networks PitchDNN, PLC and FARGAN, the speech enhancers LACE and NoLACE, and the bandwidth extension (BWE) with the network BBWENet. LACE, NoLACE and the BWE make up OSCE (Opus Speech Coding Enhancement). libopus keeps this code in its folder `dnn/`. opus1 compiles `src/dnn/` only with the feature `dnn`, which the features `deep-plc`, `osce` and `osce-bwe` turn on (see [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored)).
 
-In this version `src/dnn/` holds what the networks share: the layer functions, their kernels, the weights and their loader, and the signal processing that the networks' input needs. The networks themselves (`plc/`, `osce/`) are empty modules, and the decoder does not call into `src/dnn/` while it decodes. `src/dnn/` computes the bits of libopus 1.6.1 for 64-bit ARM, built without loop vectorization (see [Code for specific processors](#code-for-specific-processors)).
+`src/dnn/` holds what the networks share: the layer functions, their kernels, the weights and their loader, and the signal processing that the networks' input needs. It also holds the models of deep PLC (`plc/`) and LACE, NoLACE and the bandwidth extension (`osce/`). The decoder runs all of them (see [Deep PLC in the decoder](#deep-plc-in-the-decoder) and [OSCE in the decoder](#osce-in-the-decoder)). `src/dnn/` computes the bits of libopus 1.6.1 for 64-bit ARM, built without loop vectorization (see [Code for specific processors](#code-for-specific-processors)).
 
 | File | What it does | libopus counterpart |
 |---|---|---|
@@ -183,7 +185,15 @@ In this version `src/dnn/` holds what the networks share: the layer functions, t
 | `freq.rs` | The feature analysis of deep PLC: band energies, the Burg cepstrum, the discrete cosine transform (DCT) and the LPC (linear prediction) coefficients from a cepstrum, on a 320-point FFT. | `dnn/freq.c` |
 | `burg.rs` | Burg's method for LPC in floating point (`silk_burg_analysis`), a copy of SILK's float version that deep PLC uses. | `dnn/burg.c` |
 | `lpcnet_tables.rs` | The tables of `freq.rs`: the plan of the 320-point FFT (bit reversal, twiddles, factors), the half window and the DCT table. | `dnn/lpcnet_tables.c` |
-| `plc/`, `osce/` | Empty until deep PLC and OSCE are ported. | `dnn/lpcnet_plc.c`, `dnn/fargan.c`, `dnn/pitchdnn.c`, `dnn/osce.c`, `dnn/nndsp.c` |
+| `plc/features.rs` | The feature analysis of deep PLC: 36 values per 10 ms of 16 kHz audio (cepstrum, pitch, pitch correlation, LPC coefficients), with the state `LpcnetEncState`. It has its own copies of the CELT helpers it needs (`celt_inner_prod`, `celt_pitch_xcorr`, `celt_fir`, `celt_log2`), with the rounding of 64-bit ARM on every target. | `dnn/lpcnet_enc.c` |
+| `plc/pitchdnn.rs` | PitchDNN, the pitch estimator, with its state `PitchDnnState`. | `dnn/pitchdnn.c` |
+| `plc/fargan.rs` | FARGAN, the vocoder that turns 20 features into 10 ms of audio (`fargan_cont`, `fargan_synthesize`, `fargan_synthesize_int`), with its state `FarganState`. | `dnn/fargan.c` |
+| `plc/lpcnet_plc.rs` | `DeepPlc`, the state of deep PLC for one decoder: 150 ms of history at 16 kHz, the deferred analysis of good frames, the PLC network (`compute_plc_pred`), the attenuation of long losses, and the queue of DRED features. `update_from_celt` feeds it with CELT history (libopus `update_plc_state`). The weights and the `DnnArch` are arguments of `conceal`; the state holds no weights. | `dnn/lpcnet_plc.c`, `update_plc_state` of `celt/celt_decoder.c` |
+| `osce/mod.rs` | The entry points of OSCE for the SILK decoder: `OsceFrame` (the values of one decoded SILK frame that OSCE reads), `OsceChannel` and `osce_enhance_frame` (LACE or NoLACE on one 20 ms frame at 16 kHz, with the reset and bypass rules), `OsceBweChannel` and `osce_bwe` (16 to 48 kHz), `osce_reset`, `osce_bwe_reset`, the two 10 ms cross-fades, `OsceMethod`, `OsceExtMode` and `OsceModels` (the layers a decoder holds). The module documentation lists the rules. | `dnn/osce.c` (`osce_enhance_frame`, `osce_bwe`, the resets), `dnn/osce.h`, `dnn/osce_structs.h` |
+| `osce/features.rs` | The 93 features per 5 ms of LACE and NoLACE (LPC spectrum, cepstrum, correlation at the pitch lag, LTP coefficients, log gain), the 114 features per 10 ms of the bandwidth extension, and the cross-fades. | `dnn/osce_features.c`, `dnn/osce_config.h` |
+| `osce/nndsp.rs` | The adaptive filters: AdaConv (convolution), AdaComb (comb filter at the pitch lag), AdaShape (temporal envelope), and the overlap windows as tables. | `dnn/nndsp.c` |
+| `osce/lace.rs`, `osce/nolace.rs`, `osce/bbwenet.rs` | The three models: feature network, filter stages, state per channel. `bbwenet.rs` also has the resamplers (2x all-pass, 3/2 interpolation) and the non-linear function of BBWENet. It runs all steps for one 5 ms subframe before the next one, which gives libopus's results with smaller buffers. | `dnn/osce.c` |
+| `osce/math.rs` | Fused multiply-adds, the calls into the C math library, and `celt_log2`, `celt_log`, `celt_cos_norm2` and `celt_sin` with the roundings of the 64-bit ARM build on every target. | `celt/mathops.h`, `celt/float_cast.h` |
 
 The weights are files of the repository, not Rust code:
 
@@ -198,7 +208,7 @@ The DRED networks (deep redundancy) are not included. The generator can write th
 
 - The projection encoder and decoder (`src/opus_projection_*.c`, `src/mapping_matrix.c`), which code ambisonics through a mixing matrix (mapping family 3). Mapping family 2, ambisonics without a matrix, is supported by the multistream code.
 - The floating-point SILK encoder (`silk/float/`). `opus1` ports the fixed-point one.
-- The neural networks of libopus as parts of the decoder. The shared code, the weights and the decoder controls are ported (see [Neural network code](#neural-network-code-srcdnn)), but deep packet loss concealment, LACE, NoLACE and the bandwidth extension do not run in the decoder yet. Deep REDundancy (DRED) is not ported at all. libopus builds these parts only when asked to (`--enable-deep-plc`, `--enable-osce`, `--enable-dred`).
+- Deep REDundancy (DRED), which libopus builds only with `--enable-dred`. Deep packet loss concealment, LACE, NoLACE and the bandwidth extension are ported and run in the decoder (see [Neural network code](#neural-network-code-srcdnn)); libopus builds them only with `--enable-deep-plc` and `--enable-osce`.
 - The scalable quality extension (QEXT), which libopus 1.6 builds only with `--enable-qext`.
 
 ## Main types and what they own
@@ -221,13 +231,19 @@ OpusDecoder                                   src/lib.rs
 ├── celt_dec: CeltDecoder                     src/celt.rs
 │     └── mode: &'static CeltMode
 ├── silk_dec: SilkDecoder                     src/silk/dec_api.rs
-│     └── channel_state: [SilkDecoderState; 2]   each with its resampler, PLC and CNG state
+│     ├── channel_state: [SilkDecoderState; 2]   each with its resampler, PLC and CNG state,
+│     │                                       and with `osce` its OSCE state (`osce`) and
+│     │                                       with `osce-bwe` its BWE state (`osce_bwe`)
+│     └── prev_osce_extended_mode             with `osce-bwe`: the mode of the last SILK frame
 ├── output buffers: FixedVec<..>
 ├── complexity, osce_bwe                      decoder settings; a reset keeps them
-└── dnn: DecoderDnn                           src/dnn/holder.rs, with a neural network feature
-      ├── arch: DnnArch                       chosen once, when the decoder is built
-      └── one slot per group of networks      &'static to the shared built-in layers,
-                                              or layers built from a blob plus a clone of the blob
+├── dnn: DecoderDnn                           src/dnn/holder.rs, with a neural network feature
+│     ├── arch: DnnArch                       chosen once, when the decoder is built
+│     └── one slot per group of networks      &'static to the shared built-in layers,
+│                                             or layers built from a blob plus a clone of the blob
+└── deep_plc: DeepPlc                         src/dnn/plc/lpcnet_plc.rs, with `deep-plc`:
+                                              150 ms of history at 16 kHz, the analysis,
+                                              the PLC network and FARGAN states
 
 MultistreamEncoder                            src/multistream/encoder.rs
 ├── layout: ChannelLayout
@@ -264,16 +280,51 @@ encode / encode_i16  (8-48 kHz, 1 or 2 channels, interleaved)
         └── DTX (set_dtx): a TOC byte alone while the input is inactive
 
 decode / decode_i16 / decode_fec
-  ├── empty packet → conceal in the previous mode (SILK PLC or CELT PLC)
+  ├── empty packet → conceal in the previous mode (SILK PLC or CELT PLC;
+  │     deep PLC at complexity 5 and above for SILK at 16 kHz and CELT-only)
   ├── packet::parse → frames
   └── decode_frame, for each frame
         ├── SILK-only or Hybrid: SilkDecoder → 16-bit samples at the output rate
+        │     (with `osce`: LACE or NoLACE on each 20 ms frame at 16 kHz; with
+        │      `osce-bwe` and BWE on: BBWENet in place of the resampler)
         │     → f32, written into the output
         ├── Hybrid or CELT-only: CeltDecoder::decode reads on in the same range decoder
         │     → f32, written into the output (CELT-only) or added to it (Hybrid)
         ├── a redundant frame: cross-faded with the main frame
         └── decode_i16 only: pcm_soft_clip on a decoded packet, then rounding to 16 bits
 ```
+
+### Deep PLC in the decoder
+
+With the feature `deep-plc`, `OpusDecoder` holds one `DeepPlc`. libopus passes its deep PLC state as a pointer from `opus_decode_frame` down to SILK and CELT. opus1 passes `Option<&mut DeepPlcArgs>` (`src/deep_plc.rs`) along the same calls. It holds the state, the models (`None` when they are not loaded) and the kernel variant. The public `SilkDecoder::decode`, `SilkDecoder::decode_with_control`, `CeltDecoder::decode` and `CeltDecoder::decode_lost` keep their signatures and pass `None`; crate-private variants (`SilkDecoder::decode_with_dnn`, `CeltDecoder::decode_with_deep_plc` and `decode_lost_with_deep_plc`) take the argument.
+
+| Where | What happens | libopus |
+|---|---|---|
+| `OpusDecoder::decode_silk` (`src/lib.rs`) | Every SILK call gets the state and the switch `complexity >= 5`. | `src/opus_decoder.c:443`, `474-479` |
+| `SilkDecoder::decode_to_silk_rate` (`src/silk/dec_api.rs`) | The switch goes into the PLC state of the mid channel. Only the mid channel gets the deep PLC state. | `silk/dec_API.c:330`, `355-362` |
+| `silk_plc` (`src/silk/plc.rs`) | A decoded 16 kHz frame goes into the history, 10 ms at a time (`DeepPlc::update`). A lost 16 kHz frame is first concealed as without deep PLC. Then, when the models are loaded and deep PLC is switched on (or DRED features are queued), `DeepPlc::conceal` replaces it 10 ms at a time, and the LPC state of SILK is computed back from it. Otherwise the classic output goes into the history. | `silk/PLC.c:105-112`, `399-416` |
+| `silk_plc_glue_frames` (`src/silk/plc.rs`) | The fade-in of the first good frame after a loss is skipped at 16 kHz, in every build with the feature and at every complexity. | `silk/PLC.c:477-480` |
+| `CeltDecoder::decode_with_deep_plc` (`src/celt.rs`) | A frame with data ends the loss of deep PLC (`DeepPlc::clear_blend`). | `celt/celt_decoder.c:1288-1293` |
+| `CeltDecoder::conceal` (`src/celt.rs`) | Deep PLC takes over when the start band is 0, the models are loaded, the complexity is 5 or more, the loss is shorter than 200 ms and noise is not forced (`skip_plc`). On the first such frame the last 2048 samples of the history go to `DeepPlc::update_from_celt` before the history moves. On later frames the pitch period repetition is skipped, because deep PLC overwrites all it would write. `conceal_neural` then fills `plc_pcm` with deep PLC output, upsamples it from 16 to 48 kHz, applies the pre-emphasis, copies channel 0 to channel 1, and on the first frame cross-fades from the pitch period repetition. | `celt/celt_decoder.c:726-736`, `820-831`, `1020-1075` |
+| `OpusDecoder::reset_state` | `DeepPlc::reset` clears everything but FARGAN. `CeltDecoder::reset_state` clears `plc_pcm` and its fill level and memory; `set_complexity` passes the complexity to the CELT decoder, and a reset keeps it. | `src/opus_decoder.c:1064`, `1120`; `celt/celt_decoder.c:1729-1738` |
+
+The CELT decoder gets the deep PLC state in the main call of a frame: for a frame with data, a lost frame, the concealment of the CELT layer in an FEC decode, and the 5 ms of concealment that bridge a mode switch without a redundancy frame. The redundancy frames and the 2.5 ms fade-out frame get `None`, as libopus passes `NULL` there.
+
+### OSCE in the decoder
+
+With the feature `osce`, each `SilkDecoderState` holds an `OsceChannel` (field `osce`), and with `osce-bwe` an `OsceBweChannel` (field `osce_bwe`), as libopus keeps `silk_OSCE_struct` and `silk_OSCE_BWE_struct` in `silk_decoder_state`. With `heap` each is a `Box` of its own (`OsceHeld`), so that `OpusDecoder::new` does not build them on the stack. The models stay in `OpusDecoder` (`DecoderDnn`). For each SILK frame, `OpusDecoder::decode_silk` builds an `OsceArgs` (`src/osce_args.rs`) with the method, the extended mode and the layers, and passes it to `SilkDecoder::decode_with_dnn`. The public `SilkDecoder::decode` and `decode_with_control` pass `None`, which is method NONE without BWE, as a libopus `silk_Decode` whose control has no OSCE settings.
+
+| Where | What happens | libopus |
+|---|---|---|
+| `OpusDecoder::decode_silk` (`src/lib.rs`) | The method follows the complexity (`OsceMethod::for_complexity`: NONE below 6, LACE at 6, NoLACE from 7). The extended mode is `SilkBbwe` at complexity 4 or more with the BWE switch on, 48 kHz output, SILK at 16 kHz and a SILK-only frame or a frame without data; otherwise the mode of the frame. After a CELT-only frame the previous extended mode becomes `CeltOnly`. | `src/opus_decoder.c:444-466` |
+| `OpusDecoder::conceal` (`src/lib.rs`) | A lost Hybrid frame in BBWE mode is not concealed by CELT; 2.5 ms of CELT silence are decoded on top of SILK's output instead (`silk_bwe_replaces_celt`). | `src/opus_decoder.c:595-627` |
+| `SilkDecoder::decode_to_silk_rate` (`src/silk/dec_api.rs`) | Before each `silk_decode_frame`, a channel whose method differs from the frame's is reset to it (`osce_reset`). A side channel that a mid-only frame does not code is neither reset nor run. | `silk/dec_API.c:350-354` |
+| `silk_decode_frame` (`src/silk/decode_frame.rs`) | The bits of the frame are counted from before `silk_decode_indices`. After the update of `out_buf` and before `silk_plc`, `osce_enhance_frame` runs with the frame's parameters (`OsceFrame`) at every complexity: method NONE only clips -32768 to -32767. A lost frame resets the channel's OSCE state with its method. | `silk/decode_frame.c:74-77`, `109-114`, `139-141` |
+| `OutputStage` in `src/silk/dec_api.rs` | Per output channel: in BBWE mode `osce_bwe` instead of the resampler, with `osce_bwe_reset` when the previous frame was not BBWE and a 10 ms fade from the resampler's output after a SILK-only or Hybrid frame. Otherwise the resampler, with a 10 ms fade from `osce_bwe` after a BBWE frame when the SILK rate is still 16 kHz. Then `prev_osce_extended_mode` takes the frame's mode. The right channel of the first mono frame after stereo goes through its resampler, also in BBWE mode. | `silk/dec_API.c:389-454` |
+| `silk_reset_decoder`, `silk_init_decoder` (`src/silk/init_decoder.rs`) | A reset sets the OSCE state to `OSCE_DEFAULT_METHOD` (NoLACE) and keeps the BWE state. Only `silk_init_decoder`, which runs for a new decoder and for channel 1 on a switch from mono to stereo, clears the BWE state to zero. | `silk/init_decoder.c:61-64`, `73-83`, `silk/dec_API.c:177-179` |
+| `OpusDecoder::reset_state` | `SilkDecoder::reset` keeps the BWE states and `prev_osce_extended_mode`, which libopus keeps in `DecControl`. | `src/opus_decoder.c:1109-1121` |
+
+libopus 1.6.1 sets the extended mode only in its SILK section, so after BBWE frames it skips the CELT layer of CELT-only frames. opus1 follows libopus main (commit `228a0f85`), which sets the extended mode to CELT-only for those frames. The extended mode is therefore computed for each frame and not stored in `OpusDecoder`: a frame with data is in BBWE mode only when it is SILK-only.
 
 ## Floating point and fixed point
 
@@ -387,14 +438,14 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 
 ### `tests/`
 
-The repository holds 263 test files test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
+The repository holds 273 test files test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
 
 | Prefix | Files | What the tests cover |
 |---|---:|---|
 | `perfk_` | 33 | Single kernels after performance work, against the same function inside libopus or a reference version: FFT, PVQ, range coder, pitch, SILK analysis and quantizer. Four `.expected` files hold reference output. |
 | `multistream_` | 35 | The multistream encoder and decoder: `multistream_c_*` against libopus's own functions, `multistream_enc_*` and `multistream_dec_*` for each side, `multistream_e2e_*` end to end, `multistream_surround_*` for the surround masking analysis, `multistream_analysis_libopus`, `multistream_analysis_walk_libopus` and `multistream_dtx_libopus` for the analysis and DTX of each stream. |
-| `core_` | 31 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits, the speech and music analysis (`core_analysis_libopus`, `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`), the high-pass filter in front of SILK (`core_voip_input_filter`), the decoder controls of the neural network features. |
-| `dnn_` | 11 | The neural network code: kernels and their edge cases, layers of every network, weights, signal analysis. The 4 files that end in `_libopus` and `dnn_freq_burg.rs` need a libopus built with its neural network code (see [Testing](09-testing.md#tests-of-the-neural-network-code)). |
+| `core_` | 34 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits, the speech and music analysis (`core_analysis_libopus`, `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`), the high-pass filter in front of SILK (`core_voip_input_filter`), the decoder controls of the neural network features. |
+| `dnn_` | 18 | The neural network code: kernels and their edge cases, layers of every network, weights, signal analysis, the models of deep PLC and OSCE, and both inside the decoder. The 8 files that end in `_libopus` and `dnn_freq_burg.rs` need a libopus built with its neural network code (see [Testing](09-testing.md#tests-of-the-neural-network-code)). |
 | `analysis_` | 3 | The speech and music analysis alone against libopus's `run_analysis` and network, and its properties. |
 | `k24_` | 21 | The 24 kHz path: encoder modes, Hybrid super-wideband, SILK internals and loss, and the decoder matrix of every mode and bandwidth at every output rate. |
 | `celtenc_`, `celtdec_`, `celt_` | 19, 4, 8 | The CELT encoder and decoder. |
@@ -405,7 +456,7 @@ The repository holds 263 test files test files in `tests/`, plus helper modules 
 | `eval_` | 5 | The evaluation tools of `src/eval/` against the C program `opus_compare` and the Python script `moc.py`, the `opus_demo` decoding loop with both decoders, the RFC 8251 conformance test, and the paired-comparison harness. Two `.expected` files hold reference values. |
 | others | 19 | Single topics, for example `stack_usage_test.rs` (struct sizes and stack use), `panic_surface_repro.rs` (inputs that once panicked), `quality_regression_test.rs`, `proptest_encode_indices.rs` (property-based tests with `proptest`). |
 
-Helper directories are named after the tests that use them: `celtdec_common/`, `celtenc_common/`, `core_common/`, `dnn_gen/`, `eval_common/`, `k24_common/`, `k24_enc_common/`, `ms_support/`, `multistream_dec_common/`, `multistream_e2e_common/`, `multistream_enc_common/`, `silkdec_common/`, `silkenc_common/`. `dnn_gen/` is written by `tools/dnn-gen`. Each holds a `mod.rs` that a test includes with `mod <name>;`. Several of them wrap the raw C application programming interface (API) of libopus (`audiopus_sys`) for the controls the `opus` crate does not offer, such as forcing the coding mode.
+Helper directories are named after the tests that use them: `celtdec_common/`, `celtenc_common/`, `core_common/`, `dnn_dec_common/`, `dnn_gen/`, `dnn_plc_common/`, `eval_common/`, `k24_common/`, `k24_enc_common/`, `ms_support/`, `multistream_dec_common/`, `multistream_e2e_common/`, `multistream_enc_common/`, `silkdec_common/`, `silkenc_common/`. `dnn_gen/` is written by `tools/dnn-gen`. Each holds a `mod.rs` that a test includes with `mod <name>;`. Several of them wrap the raw C application programming interface (API) of libopus (`audiopus_sys`) for the controls the `opus` crate does not offer, such as forcing the coding mode.
 
 Tests marked `#[ignore]` either print measurement tables and assert nothing, or record a known difference from libopus. Run one with `cargo test --release --test <name> -- --ignored --nocapture`.
 

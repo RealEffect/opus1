@@ -342,6 +342,57 @@ ratio change per pass, other scenarios: min -4.8% max +4.7%
 
 The phone measured the same before and after: see [On an Android phone](#on-an-android-phone).
 
+### Deep PLC models
+
+The ignored test `timing` of `tests/dnn_plc_libopus.rs` measures each call next to libopus's own function (`-- --ignored --nocapture timing`). It runs the two sides in turns, in batches, and takes the median. Apple M4 Pro, 2026-10-18, opus1 with `NeonDotprod`, libopus 1.6.1 with run-time CPU detection (arch 4, DotProd); the results did not change with a load average of 25 to 44 from other jobs. Microseconds per call:
+
+| Call | opus1 | libopus without vector loops | libopus `-O2` |
+|---|---:|---:|---:|
+| Feature analysis of 10 ms, PitchDNN included | 5.5 | 11.8 | 9.4 |
+| PitchDNN | 1.9 | 4.0 | 2.2 |
+| `fargan_cont` | 42.2 | 48.0 | 45.7 |
+| `fargan_synthesize`, 10 ms | 39.3 | 44.3 | 42.1 |
+| `update`, 10 ms | 0.09 | 0.14 | 0.09 |
+| `conceal`, first lost frame after 40 good frames | 311 | 476 | 421 |
+| `conceal`, each further lost frame | 44.9 | 53.4 | 51.2 |
+| `update_from_celt`, stereo (libopus `update_plc_state`) | 4.1 | 13.0 | 7.2 |
+
+The `-O2` column comes from a separate run against `libopus-host-1.6.1-dnn`, in which opus1 took the same times.
+
+On the phone (HONOR CLK-AN00, the same test against `libopus-1.6.1-dnn-novec`, pinned with `taskset`), microseconds per call:
+
+| Call | Cortex-A76 opus1 | Cortex-A76 libopus | Cortex-A55 opus1 | Cortex-A55 libopus |
+|---|---:|---:|---:|---:|
+| Feature analysis of 10 ms, PitchDNN included | 19.4 | 35.3 | 84.9 | 148.6 |
+| PitchDNN | 7.2 | 16.5 | 36.9 | 82.0 |
+| `fargan_cont` | 177 | 190 | 729 | 906 |
+| `fargan_synthesize`, 10 ms | 163 | 171 | 662 | 824 |
+| `conceal`, first lost frame after 40 good frames | 1,337 | 1,779 | 5,765 | 7,829 |
+| `conceal`, each further lost frame | 263 | 277 | 1,091 | 1,313 |
+| `update_from_celt`, stereo | 9.8 | 34.0 | 37.6 | 111.8 |
+
+The first lost frame of a loss analyses up to 15 frames of history and starts FARGAN, so it costs about seven times a later one. `cargo bench --features deep-plc --bench deep_plc_bench` measures the opus1 side alone with Criterion.
+
+### Deep PLC in the decoder
+
+The ignored test `timing` of `tests/dnn_plc_decoder_libopus.rs` times whole decode calls of `OpusDecoder` and of libopus's `opus_decode_float` at complexity 5, mono, 48 kHz output, on 10 s of speech coded by libopus, with 3 packets lost after every 22 that arrive (`-- --ignored --nocapture --test-threads=1 timing`). The first lost packet conceals after 440 ms of good audio, so deep PLC analyses its whole history. Apple M4 Pro, 2026-10-18, load average 5 to 10 from other jobs. Medians of 5 runs, microseconds per call:
+
+| Stream | Call | opus1 | libopus without vector loops | libopus `-O2` |
+|---|---|---:|---:|---:|
+| SILK wideband, 20 ms | first lost packet | 358 | 525 | 464 |
+| SILK wideband, 20 ms | further lost packet | 95 | 111 | 105 |
+| SILK wideband, 20 ms | packet that arrived | 4.6 | 14.7 | 12.9 |
+| CELT fullband, 20 ms | first lost packet | 327 | 461 | 406 |
+| CELT fullband, 20 ms | further lost packet | 91 | 116 | 107 |
+| CELT fullband, 20 ms | packet that arrived | 8.1 | 11.1 | 11.2 |
+| CELT fullband, 10 ms | first lost packet | 250 | 358 | 317 |
+| CELT fullband, 10 ms | further lost packet | 46 | 60 | 55 |
+| CELT fullband, 10 ms | packet that arrived | 4.3 | 5.7 | 5.5 |
+
+opus1 took the same times in the run against the `-O2` build. A lost SILK packet of 20 ms is two calls of deep PLC; a lost CELT packet of 20 ms is two, and three on the first lost packet, which also feeds the CELT history into deep PLC. libopus spends more on a SILK packet that arrived because its build has OSCE, which computes the features of each 20 ms frame also at complexity 5; opus1 skips them as long as the method is NONE.
+
+These calls were not timed on the phone. From the model measurements above (two calls of `conceal` per 20 ms), the deep PLC part of a first lost 20 ms packet takes about 1.6 ms on a Cortex-A76 and 6.9 ms on a Cortex-A55, and that of each further lost 20 ms packet about 0.5 ms and 2.2 ms.
+
 ### Round 8: more work for in-order cores
 
 Round 8 is the eighth round of speed work on opus1. It made the release libopus 1.6.1 the C reference on the Mac and on the phone (see [The C reference](#the-c-reference)). It also went on with the work for in-order cores, in the SILK quantizer, the PVQ search and the bit allocation of CELT, the pitch analysis and the CELT decoder. Five parts were done separately and then merged (`git log --first-parent c96e936..b7a8b64`):
@@ -785,7 +836,7 @@ Ratio opus1 / libopus of the median times, over the 28 scenarios of the bench se
 | Encode, geometric mean before round 8 | 0.458 | 0.565 | 0.635 | 0.663 |
 | Decode, geometric mean before round 8 | 0.619 | 0.695 | 0.774 | 0.842 |
 
-The first four rows are the code after the analysis, in which both encoders run the analysis from complexity 7 on. The row "before the analysis" comes from the runs of `d541821` in the same sessions, in which only libopus ran it. The rows of round 8 come from the sessions of round 8: "in round 8" is `b7a8b64`, "before round 8" is `c96e936`. Round 7 measured that code against the main branch of libopus, built with run-time detection: 0.567 and 0.694 on the Mac at `-O2`, 0.636 and 0.771 on the A76, 0.663 and 0.840 on the A55. Round 6 had measured 0.692 and 0.755 for encoding and 0.790 and 0.864 for decoding on the phone, at commit `bd080de`, before the work of round 7.
+The first four rows are the code after the analysis, in which both encoders run the analysis from complexity 7 on. A check at commit `c7744f6`, after the neural network features were merged (default features, so none of them is built), gave the same picture on the M4 Pro in two runs of the bench set: encode 0.566 and 0.568, decode 0.684 and 0.685 against `-O2`; encode 0.461 and 0.462, decode 0.606 against Homebrew. Records: `target/perf/final/`. The row "before the analysis" comes from the runs of `d541821` in the same sessions, in which only libopus ran it. The rows of round 8 come from the sessions of round 8: "in round 8" is `b7a8b64`, "before round 8" is `c96e936`. Round 7 measured that code against the main branch of libopus, built with run-time detection: 0.567 and 0.694 on the Mac at `-O2`, 0.636 and 0.771 on the A76, 0.663 and 0.840 on the A55. Round 6 had measured 0.692 and 0.755 for encoding and 0.790 and 0.864 for decoding on the phone, at commit `bd080de`, before the work of round 7.
 
 ### Results per scenario
 

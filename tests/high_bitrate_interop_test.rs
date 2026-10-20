@@ -194,9 +194,11 @@ fn mux_ogg(packets: &[Vec<u8>]) -> Vec<u8> {
 
 fn decode_with_ffmpeg(packets: &[Vec<u8>]) -> Option<Vec<f32>> {
     let ogg = mux_ogg(packets);
+    // The process id keeps runs of this test in other checkouts, at the
+    // same time, from writing the same files.
     let dir = std::env::temp_dir();
-    let ogg_path = dir.join("opusrs_repro.ogg");
-    let raw_path = dir.join("opusrs_repro.raw");
+    let ogg_path = dir.join(format!("opusrs_repro_{}.ogg", std::process::id()));
+    let raw_path = dir.join(format!("opusrs_repro_{}.raw", std::process::id()));
     std::fs::write(&ogg_path, &ogg).ok()?;
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-i"])
@@ -209,6 +211,8 @@ fn decode_with_ffmpeg(packets: &[Vec<u8>]) -> Option<Vec<f32>> {
         return None;
     }
     let raw = std::fs::read(&raw_path).ok()?;
+    let _ = std::fs::remove_file(&ogg_path);
+    let _ = std::fs::remove_file(&raw_path);
     let mut pcm = Vec::with_capacity(raw.len() / 4);
     for &chunk in raw.as_chunks::<4>().0 {
         pcm.push(f32::from_le_bytes(chunk));

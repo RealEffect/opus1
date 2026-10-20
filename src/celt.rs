@@ -16,6 +16,7 @@ use crate::rate::{BITRES, clt_compute_allocation};
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
+use crate::deep_plc::DeepPlcArgs;
 use crate::fixedvec::FixedVec;
 use crate::{OPUS_BITRATE_MAX, bitrate_to_bits};
 
@@ -5546,7 +5547,8 @@ const PLC_MAX_PERIOD: usize = 1024;
 const MAX_CELT_FRAME_BITS: i32 = (crate::range_coder::RANGE_BUF_MAX * 8) as i32;
 
 /// What the previous call to the decoder produced (libopus `FRAME_NONE`,
-/// `FRAME_NORMAL`, `FRAME_PLC_NOISE` and `FRAME_PLC_PERIODIC`).
+/// `FRAME_NORMAL`, `FRAME_PLC_NOISE`, `FRAME_PLC_PERIODIC` and
+/// `FRAME_PLC_NEURAL`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrameType {
     /// Nothing yet since the decoder was created or reset.
@@ -5557,7 +5559,15 @@ enum FrameType {
     PlcNoise,
     /// A lost frame, concealed by repeating the last pitch period.
     PlcPeriodic,
+    /// A lost frame, concealed with deep PLC (feature `deep-plc`).
+    #[cfg(feature = "deep-plc")]
+    PlcNeural,
 }
+
+/// The samples of `plc_pcm` (libopus `PLC_UPDATE_SAMPLES`): four frames of
+/// 10 ms at 16 kHz.
+#[cfg(feature = "deep-plc")]
+const PLC_UPDATE_SAMPLES: usize = 4 * crate::dnn::plc::LPCNET_FRAME_SIZE;
 
 /// Constant part of the in-place comb filter, for `n` samples from `at` of
 /// each channel in `bufs`:
@@ -7475,6 +7485,10 @@ pub struct CeltDecoder {
     /// Frames are decoded and concealed within this range. A reset does
     /// not change it.
     end_band: usize,
+    /// The decoder complexity, 0 to 10 (libopus `complexity`, set with
+    /// `OPUS_SET_COMPLEXITY`). From 5, a lost CELT-only frame is concealed
+    /// with deep PLC when the decoder has it. A reset does not change it.
+    complexity: i32,
 
     // Everything below is cleared by `reset_state`.
     rng: u32,
@@ -7528,6 +7542,19 @@ pub struct CeltDecoder {
     /// Predictor of each channel for the pitch-based concealment (libopus
     /// `lpc`).
     plc_lpc: [f32; CELT_MAX_CHANNELS * PLC_LPC_ORDER],
+    /// Deep PLC output at 16 kHz that is not used yet (libopus `plc_pcm`).
+    /// The first `plc_fill` samples are valid.
+    #[cfg(feature = "deep-plc")]
+    plc_pcm: [i16; PLC_UPDATE_SAMPLES],
+    /// libopus `plc_fill`.
+    #[cfg(feature = "deep-plc")]
+    plc_fill: usize,
+    /// The memory of the pre-emphasis of deep PLC's output (libopus
+    /// `plc_preemphasis_mem`): the last sample of the history after
+    /// de-emphasis when deep PLC starts, then the last sample of each
+    /// frame it conceals, before pre-emphasis.
+    #[cfg(feature = "deep-plc")]
+    plc_preemphasis_mem: f32,
 
     w_tf_res: FixedVec<i32, CELT_NB_EBANDS>,
     w_cap: FixedVec<i32, CELT_NB_EBANDS>,
@@ -7567,6 +7594,7 @@ impl CeltDecoder {
             downsample: resampling_factor(sampling_rate).unwrap_or(1),
             start_band: 0,
             end_band: mode.eff_ebands,
+            complexity: 0,
 
             rng: 0,
             last_pitch_index: 0,
@@ -7593,6 +7621,12 @@ impl CeltDecoder {
             old_band_e3: FixedVec::from_value(OLD_LOG_E_RESET, nb_x_ch),
             background_log_e: FixedVec::from_value(0.0, nb_x_ch),
             plc_lpc: [0.0; CELT_MAX_CHANNELS * PLC_LPC_ORDER],
+            #[cfg(feature = "deep-plc")]
+            plc_pcm: [0; PLC_UPDATE_SAMPLES],
+            #[cfg(feature = "deep-plc")]
+            plc_fill: 0,
+            #[cfg(feature = "deep-plc")]
+            plc_preemphasis_mem: 0.0,
 
             w_tf_res: FixedVec::from_value(0, nb_ebands),
             w_cap: FixedVec::from_value(0, nb_ebands),
@@ -7632,6 +7666,30 @@ impl CeltDecoder {
         self.old_band_e3.fill(OLD_LOG_E_RESET);
         self.background_log_e.fill(0.0);
         self.plc_lpc.fill(0.0);
+        #[cfg(feature = "deep-plc")]
+        {
+            self.plc_pcm.fill(0);
+            self.plc_fill = 0;
+            self.plc_preemphasis_mem = 0.0;
+        }
+    }
+
+    /// Set the decoder complexity, 0 to 10 (libopus `OPUS_SET_COMPLEXITY`
+    /// on the CELT decoder, which the Opus decoder forwards). Other values
+    /// are refused and change nothing. From 5, a lost CELT-only frame is
+    /// concealed with deep PLC, when the caller passes the deep PLC state
+    /// (only `OpusDecoder` does). A reset keeps the value.
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+        if !(0..=10).contains(&complexity) {
+            return Err("Invalid complexity");
+        }
+        self.complexity = complexity;
+        Ok(())
+    }
+
+    /// The complexity set with `set_complexity` (0 at the start).
+    pub fn complexity(&self) -> i32 {
+        self.complexity
     }
 
     /// Set how many channels the next packets carry (libopus
@@ -7707,13 +7765,27 @@ impl CeltDecoder {
         pcm: &mut [f32],
         layout: PcmLayout,
     ) -> Result<usize, &'static str> {
+        self.decode_lost_with_deep_plc(frame_size, pcm, layout, None)
+    }
+
+    /// `decode_lost` with the deep PLC state of the decoder (libopus
+    /// `celt_decode_with_ec_dred` with `lpcnet` and no data). With the
+    /// models loaded, complexity 5 or more and start band 0, a lost frame
+    /// is concealed with deep PLC for up to 200 ms of loss.
+    pub(crate) fn decode_lost_with_deep_plc(
+        &mut self,
+        frame_size: usize,
+        pcm: &mut [f32],
+        layout: PcmLayout,
+        deep_plc: Option<&mut DeepPlcArgs>,
+    ) -> Result<usize, &'static str> {
         let Some((n, lm)) = self.frame_geometry(frame_size) else {
             return Err("CELT: frame size is not 2.5, 5, 10 or 20 ms");
         };
         if pcm.len() < frame_size * self.channels {
             return Err("CELT: output buffer too small");
         }
-        self.conceal(n, lm);
+        self.conceal(n, lm, deep_plc);
         self.deemphasis(pcm, n, frame_size, layout);
         Ok(frame_size)
     }
@@ -7783,6 +7855,23 @@ impl CeltDecoder {
         pcm: &mut [f32],
         layout: PcmLayout,
     ) -> usize {
+        self.decode_with_deep_plc(rc, total_bits, frame_size, pcm, layout, None)
+    }
+
+    /// `decode` with the deep PLC state of the decoder, as the main CELT
+    /// call of an Opus frame passes it (libopus `celt_decode_with_ec_dred`
+    /// with `lpcnet`). A frame with data ends a deep PLC loss
+    /// (`lpcnet->blend = 0`); a lost frame may be concealed with deep PLC
+    /// (see `decode_lost_with_deep_plc`).
+    pub(crate) fn decode_with_deep_plc(
+        &mut self,
+        rc: &mut RangeCoder,
+        total_bits: i32,
+        frame_size: usize,
+        pcm: &mut [f32],
+        layout: PcmLayout,
+        deep_plc: Option<&mut DeepPlcArgs>,
+    ) -> usize {
         let mode = self.mode;
         // `channels` is the number of output channels and `c` the number of
         // channels coded in the packet (libopus `CC` and `C`).
@@ -7818,10 +7907,18 @@ impl CeltDecoder {
         // libopus celt_decode_with_ec: `data == NULL || len <= 1` is a lost
         // frame.
         if total_bits <= 8 {
-            self.conceal(frame_size, lm);
+            self.conceal(frame_size, lm, deep_plc);
             self.deemphasis(pcm, frame_size, api_frame_size, layout);
             return api_frame_size;
         }
+        // libopus: "This is a bit of a hack just to make sure
+        // opus_decode_native() knows we're no longer in PLC."
+        #[cfg(feature = "deep-plc")]
+        if let Some(p) = deep_plc {
+            p.state.clear_blend();
+        }
+        #[cfg(not(feature = "deep-plc"))]
+        let _ = deep_plc;
 
         // The pitch-based concealment is allowed again once two packets in a
         // row have arrived.
@@ -8480,10 +8577,28 @@ impl CeltDecoder {
         PLC_PITCH_LAG_MAX - lag
     }
 
+    /// Whether the last frame was concealed with deep PLC.
+    #[inline]
+    fn last_frame_neural(&self) -> bool {
+        #[cfg(feature = "deep-plc")]
+        {
+            self.last_frame_type == FrameType::PlcNeural
+        }
+        #[cfg(not(feature = "deep-plc"))]
+        {
+            false
+        }
+    }
+
     /// Produce one concealed frame of `n` samples (at 48 kHz) at the end of
-    /// each channel's history. Port of libopus `celt_decode_lost`, without
-    /// the neural concealment.
-    fn conceal(&mut self, n: usize, lm: usize) {
+    /// each channel's history. Port of libopus `celt_decode_lost`.
+    ///
+    /// There are three methods. Shaped noise conceals the CELT layer of a
+    /// Hybrid stream, the first frames after a reset, and losses longer
+    /// than 100 ms. Otherwise the last pitch period is repeated. With deep
+    /// PLC (`deep_plc` given, its models loaded, complexity 5 or more),
+    /// deep PLC conceals instead, for up to 200 ms of loss.
+    fn conceal(&mut self, n: usize, lm: usize, deep_plc: Option<&mut DeepPlcArgs>) {
         let mode = self.mode;
         let start = self.start_band;
         let channels = self.channels;
@@ -8493,7 +8608,33 @@ impl CeltDecoder {
         let at = DECODE_BUFFER_SIZE - n;
         let loss_duration = self.loss_duration;
 
-        let noise_based = self.plc_duration >= 40 || start != 0 || self.skip_plc;
+        #[allow(unused_mut)]
+        let mut noise_based = self.plc_duration >= 40 || start != 0 || self.skip_plc;
+        // libopus celt_decoder.c:726-731: deep PLC takes over from the
+        // other two methods, also from noise between 100 and 200 ms of
+        // loss.
+        #[cfg(feature = "deep-plc")]
+        let mut neural = match deep_plc {
+            Some(p)
+                if start == 0
+                    && p.models.is_some()
+                    && self.complexity >= 5
+                    && self.plc_duration < 80
+                    && !self.skip_plc =>
+            {
+                Some(p)
+            }
+            _ => None,
+        };
+        #[cfg(feature = "deep-plc")]
+        let curr_neural = neural.is_some();
+        #[cfg(not(feature = "deep-plc"))]
+        let (curr_neural, _) = (false, deep_plc);
+        if curr_neural {
+            noise_based = false;
+        }
+        let last_neural = self.last_frame_neural();
+
         if noise_based {
             // Noise with the spectral shape of the last frame, decaying
             // towards the background noise level.
@@ -8547,7 +8688,8 @@ impl CeltDecoder {
             self.skip_plc = true;
         } else {
             // Repeat the last pitch period of the output.
-            let first_loss = self.last_frame_type != FrameType::PlcPeriodic;
+            let first_loss =
+                self.last_frame_type != FrameType::PlcPeriodic && !(last_neural && curr_neural);
             let mut fade = 1.0f32;
             let pitch_index = if first_loss {
                 self.last_pitch_index = self.plc_pitch_search();
@@ -8556,6 +8698,24 @@ impl CeltDecoder {
                 fade = 0.8;
                 self.last_pitch_index
             };
+            // libopus celt_decoder.c:829-831: the first frame of deep PLC
+            // feeds it the last 40 ms of the history, which must be read
+            // before the history moves.
+            #[cfg(feature = "deep-plc")]
+            if let Some(p) = neural.as_deref_mut()
+                && !last_neural
+            {
+                let h0 = self.hist_start(0);
+                let h1 = self.hist_start(1);
+                let mem = &self.decode_mem;
+                let ch0 = &mem[h0..h0 + DECODE_BUFFER_SIZE];
+                if channels == 2 {
+                    let ch1 = &mem[h1..h1 + DECODE_BUFFER_SIZE];
+                    p.state.update_from_celt(&[ch0, ch1], &mut self.plc_preemphasis_mem);
+                } else {
+                    p.state.update_from_celt(&[ch0], &mut self.plc_preemphasis_mem);
+                }
+            }
 
             // The excitation of two pitch periods shows whether the signal
             // is decaying. No more than PLC_MAX_PERIOD samples are kept.
@@ -8565,7 +8725,12 @@ impl CeltDecoder {
             // now just before `at`. The frame and the `overlap` samples
             // after it are written below.
             self.advance_history(n);
-            for ch in 0..channels {
+            // After a frame of deep PLC, deep PLC replaces all that the
+            // pitch period repetition would write, and libopus uses none of
+            // it (its `buf_copy` serves only the first frame of deep PLC),
+            // so the repetition is skipped. It changes no other state then.
+            let channels_to_extrapolate = if last_neural && curr_neural { 0 } else { channels };
+            for ch in 0..channels_to_extrapolate {
                 let hist = self.hist_start(ch);
                 let buf = &mut self.decode_mem[hist..hist + chan_mem];
                 // `exc_all[PLC_LPC_ORDER + i]` is libopus `exc[i]`. The
@@ -8670,6 +8835,10 @@ impl CeltDecoder {
                     }
                 }
             }
+            #[cfg(feature = "deep-plc")]
+            if let Some(p) = neural {
+                self.conceal_neural(n, last_neural, p);
+            }
             self.prefilter_and_fold = true;
         }
 
@@ -8681,6 +8850,131 @@ impl CeltDecoder {
         } else {
             FrameType::PlcPeriodic
         };
+        #[cfg(feature = "deep-plc")]
+        if curr_neural {
+            self.last_frame_type = FrameType::PlcNeural;
+        }
+    }
+
+    /// The deep PLC part of libopus `celt_decode_lost`
+    /// (celt_decoder.c:1020-1075), after the pitch period repetition has
+    /// written the frame: deep PLC conceals 16 kHz audio, which replaces
+    /// the frame and the `overlap` samples after it.
+    ///
+    /// 1. Deep PLC fills `plc_pcm` 10 ms at a time until it holds what the
+    ///    frame, the resampling filter and the overlap need.
+    /// 2. The 16 kHz audio is upsampled to 48 kHz with `SINC_FILTER`
+    ///    (three phases, the samples times 3) into channel 0.
+    /// 3. Pre-emphasis, continued from `plc_preemphasis_mem` for the frame
+    ///    and from the frame's last sample for the overlap.
+    /// 4. The whole history of channel 0 is copied to channel 1: deep PLC
+    ///    is mono.
+    /// 5. On the first frame of deep PLC, its first `overlap` samples are
+    ///    cross-faded with those of the pitch period repetition, per
+    ///    channel.
+    ///
+    /// The roundings are those of libopus built without loop
+    /// vectorization: each tap of the filter is a fused multiply-add, the
+    /// pre-emphasis is one fused multiply-add, and the cross-fade fuses the
+    /// product of the pitch-based sample (`(1 - w) * old + (w * new)`).
+    #[cfg(feature = "deep-plc")]
+    fn conceal_neural(&mut self, n: usize, last_neural: bool, p: &mut DeepPlcArgs) {
+        use crate::dnn::freq::fmaf;
+        use crate::dnn::plc::LPCNET_FRAME_SIZE;
+        use crate::dnn::plc::lpcnet_plc::{SINC_FILTER, SINC_ORDER};
+        // libopus `PREEMPHASIS` of `dnn/freq.h`.
+        const PREEMPHASIS: f32 = 0.85;
+        let Some(models) = p.models else {
+            unreachable!("deep PLC runs only with its models");
+        };
+        let channels = self.channels;
+        let overlap = CELT_OVERLAP;
+        let chan_mem = DECODE_BUFFER_SIZE + overlap;
+        let at = DECODE_BUFFER_SIZE - n;
+        let window = self.mode.window;
+
+        // The pitch-based start of each channel, for the cross-fade.
+        let mut buf_copy = [0.0f32; CELT_MAX_CHANNELS * CELT_OVERLAP];
+        for ch in 0..channels {
+            let h = self.hist_start(ch);
+            buf_copy[ch * overlap..(ch + 1) * overlap]
+                .copy_from_slice(&self.decode_mem[h + at..h + at + overlap]);
+        }
+
+        // Enough 16 kHz samples for the frame, the delay of the filter and
+        // the overlap.
+        let needed = (n + SINC_ORDER + overlap) / 3;
+        if !last_neural {
+            self.plc_fill = 0;
+        }
+        while self.plc_fill < needed {
+            let fill = self.plc_fill;
+            let chunk: &mut [i16; LPCNET_FRAME_SIZE] = (&mut self.plc_pcm
+                [fill..fill + LPCNET_FRAME_SIZE])
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("a slice of LPCNET_FRAME_SIZE samples"));
+            p.state.conceal(models, p.arch, chunk);
+            self.plc_fill += LPCNET_FRAME_SIZE;
+        }
+
+        // Upsample to 48 kHz. C: `sum += 3*plc_pcm[k]*sinc_filter[m]`, the
+        // integer product converted to float.
+        let h0 = self.hist_start(0);
+        let pcm = &self.plc_pcm;
+        let buf = &mut self.decode_mem[h0..h0 + chan_mem];
+        let x = |k: usize| (3 * pcm[k] as i32) as f32;
+        for i in 0..(n + overlap) / 3 {
+            let mut sum = 0.0f32;
+            for j in 0..17 {
+                sum = fmaf(x(i + j), SINC_FILTER[3 * j], sum);
+            }
+            buf[at + 3 * i] = sum;
+            let mut sum = 0.0f32;
+            for j in 0..16 {
+                sum = fmaf(x(i + j + 1), SINC_FILTER[3 * j + 2], sum);
+            }
+            buf[at + 3 * i + 1] = sum;
+            let mut sum = 0.0f32;
+            for j in 0..16 {
+                sum = fmaf(x(i + j + 1), SINC_FILTER[3 * j + 1], sum);
+            }
+            buf[at + 3 * i + 2] = sum;
+        }
+        self.plc_pcm.copy_within(n / 3..self.plc_fill, 0);
+        self.plc_fill -= n / 3;
+
+        // Pre-emphasis of the frame, then of the overlap. The overlap
+        // continues from the frame without changing the memory, which the
+        // next frame continues from.
+        let mut mem = self.plc_preemphasis_mem;
+        for v in buf[at..DECODE_BUFFER_SIZE].iter_mut() {
+            let tmp = *v;
+            *v = fmaf(mem, -PREEMPHASIS, tmp);
+            mem = tmp;
+        }
+        self.plc_preemphasis_mem = mem;
+        for v in buf[DECODE_BUFFER_SIZE..chan_mem].iter_mut() {
+            let tmp = *v;
+            *v = fmaf(mem, -PREEMPHASIS, tmp);
+            mem = tmp;
+        }
+
+        // Deep PLC is mono: channel 1 gets channel 0's whole history.
+        if channels == 2 {
+            let h1 = self.hist_start(1);
+            self.decode_mem.copy_within(h0..h0 + chan_mem, h1);
+        }
+        // Cross-fade from the pitch period repetition on the first frame.
+        if !last_neural {
+            for ch in 0..channels {
+                let h = self.hist_start(ch);
+                let start = &mut self.decode_mem[h + at..h + at + overlap];
+                let old = &buf_copy[ch * overlap..(ch + 1) * overlap];
+                for ((v, &o), &w) in start.iter_mut().zip(old).zip(window) {
+                    *v = fmaf(1.0 - w, o, w * *v);
+                }
+            }
+        }
     }
 }
 

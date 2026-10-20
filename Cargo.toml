@@ -53,15 +53,20 @@ analysis = []
 # it on.
 dnn = []
 # `deep-plc`: deep packet loss concealment (PitchDNN, the PLC model and
-# FARGAN), like libopus's `--enable-deep-plc`. It runs at decoder
-# complexity 5 and above.
+# FARGAN), like libopus's `--enable-deep-plc`. It conceals lost SILK
+# wideband and CELT-only frames at decoder complexity 5 and above. As in
+# libopus, compiling it also changes SILK at every complexity: the fade-in
+# of the first 16 kHz frame after a loss is skipped.
 deep-plc = ["dnn"]
 # `osce`: the LACE and NoLACE speech enhancers of SILK, which run at
-# decoder complexity 6 and at 7 and above. It turns on `deep-plc`, as
-# libopus's `--enable-osce` does.
+# decoder complexity 6 and at 7 and above on 20 ms SILK frames at 16 kHz.
+# It turns on `deep-plc`, as libopus's `--enable-osce` does. As in
+# libopus, compiling it also changes SILK at every complexity: -32768
+# becomes -32767 in those frames.
 osce = ["deep-plc"]
-# `osce-bwe`: the bandwidth extension of SILK wideband to 48 kHz (BBWENet).
-# It turns on `osce`.
+# `osce-bwe`: the bandwidth extension of SILK wideband to 48 kHz
+# (BBWENet), at decoder complexity 4 and above when it is switched on
+# with `OpusDecoder::set_osce_bwe`. It turns on `osce`.
 osce-bwe = ["osce"]
 # A later `dred` feature (deep redundancy) is planned; it is not part of
 # this release.
@@ -96,3 +101,7 @@ harness = false
 name = "dnn_bench"
 harness = false
 required-features = ["dnn"]
+[[bench]]
+name = "deep_plc_bench"
+harness = false
+required-features = ["deep-plc"]

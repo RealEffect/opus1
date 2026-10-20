@@ -175,6 +175,11 @@ pub mod silk {
     pub mod dec_api {
         pub use crate::silk::dec_api::SilkDecoder;
     }
+    /// `silk_decode_core`: the OSCE tests decode SILK frames step by step
+    /// to read the parameters that OSCE takes.
+    pub mod decode_core {
+        pub use crate::silk::decode_core::silk_decode_core;
+    }
     pub mod decode_frame {
         pub use crate::silk::decode_frame::{
             FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST,
@@ -185,11 +190,18 @@ pub mod silk {
             silk_decode_indices, silk_stereo_decode_mid_only, silk_stereo_decode_pred,
         };
     }
+    /// `silk_decode_parameters`, for the OSCE tests (see `decode_core`).
+    pub mod decode_parameters {
+        pub use crate::silk::decode_parameters::silk_decode_parameters;
+    }
     pub mod decode_pulses {
         pub use crate::silk::decode_pulses::silk_decode_pulses;
     }
     pub mod decoder_structs {
         pub use crate::silk::decoder_structs::SilkDecControl;
+        /// The decoder state and control of one SILK channel, for the OSCE
+        /// tests (see `decode_core`).
+        pub use crate::silk::decoder_structs::{SilkDecoderControl, SilkDecoderState};
     }
     pub mod define {
         pub use crate::silk::define::*;

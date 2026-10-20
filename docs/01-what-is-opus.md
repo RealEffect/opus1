@@ -307,7 +307,7 @@ Notes on these tools:
 - FEC costs bits. libopus and opus1 add it only when the packet loss and the bitrate make it worthwhile.
 - With FEC on and enough packet loss, the encoder prefers SILK, even at bitrates where it would otherwise choose CELT.
 - `OpusEncoder::set_prediction_disabled` makes every frame decodable on its own, at a cost in quality.
-- libopus 1.5 added further tools based on machine learning: deep PLC and Deep REDundancy (DRED). opus1 has neither.
+- libopus 1.5 added further tools based on machine learning: deep PLC and Deep REDundancy (DRED). opus1 has deep PLC, behind the cargo feature `deep-plc` (see [Using the library](06-using-the-library.md#deep-packet-loss-concealment)), but not DRED.
 
 [The decoder](04-decoder.md) explains how concealment and FEC work inside. The example below loses two packets. It rebuilds the first one from the FEC data of the next packet, and it conceals the second.
 
@@ -394,12 +394,12 @@ opus1 is a port of libopus 1.6 to Rust. It has no C code and no C dependency. Bu
 ### What follows libopus bit for bit
 
 - **The bitstream.** opus1 reads and writes the Opus format of RFC 6716. libopus decodes the packets of opus1, and opus1 decodes the packets of libopus.
-- **SILK decoding.** libopus decodes SILK with integer arithmetic in every build, so an exact port is possible. In the project's comparison over 49 SILK scenarios, 48 decode to the same samples as libopus. In the remaining one, which uses FEC, the difference lies 186 decibels (dB) below the signal. `tests/k24_silk_bitexact.rs` checks SILK-only streams sample by sample.
+- **SILK decoding.** libopus decodes SILK with integer arithmetic in every build, so an exact port is possible. In the project's comparison over 49 SILK scenarios, all 49 decode to the same samples as libopus. `tests/k24_silk_bitexact.rs` checks SILK-only streams sample by sample.
+- **CELT and Hybrid decoding on 64-bit ARM.** CELT uses floating point, like the default build of libopus. On 64-bit ARM, opus1 rounds as clang compiles libopus, and the decoded samples, float and 16-bit, are libopus's in every stream compared (see [Differences from libopus](10-differences-from-libopus.md#decoder)). Other targets were not compared.
 - **The fast Fourier transform and the MDCT on arm64.** On aarch64 the fast Fourier transform (FFT) and the MDCT give the same bits as the arm64 build of libopus.
 
 ### What is a port with small numeric differences
 
-- **The CELT decoder.** It uses floating point, like the default build of libopus. On most CELT streams its output is not bit-exact. The difference from libopus lies 136 to 146 dB below the signal.
 - **The CELT encoder.** Over 960 CELT test streams, the mean quality gap to libopus is 0.02 dB.
 - **The SILK encoder.** opus1 ports the fixed-point SILK encoder of libopus. The usual floating-point build of libopus uses a floating-point SILK encoder instead. Its packets therefore differ from those of opus1. The quality is about the same. Against the fixed-point build of libopus, a voiced stream of 300 SILK packets is byte-identical.
 
@@ -409,7 +409,7 @@ The main gaps:
 
 - the integer version of the speech/music analysis that the fixed-point build of libopus runs (opus1 ports the floating-point version);
 - some controls, for example phase inversion and a decoder output gain;
-- the machine-learning tools (deep PLC, DRED, OSCE), the quality extension, and packet extensions;
+- the machine-learning tool DRED (deep PLC and OSCE are there, behind the cargo features `deep-plc`, `osce` and `osce-bwe`), the quality extension, and packet extensions;
 - ambisonics with a demixing matrix (mapping family 3);
 - on x86-64, the code compiles but has not been run.
 

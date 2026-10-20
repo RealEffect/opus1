@@ -260,11 +260,13 @@ A lost SILK frame goes through `silk_decode_frame` with `FLAG_PACKET_LOST`, whic
 
 A SILK frame is 10 ms at least. A shorter piece is taken from the start of 10 ms of concealment.
 
+With the cargo feature `deep-plc`, a lost frame at the 16 kHz SILK rate is first concealed as above, which updates the state of this concealment. Then, at decoder complexity 5 and above, deep PLC replaces it 10 ms at a time, and the predictor state is computed back from its output. Every good 16 kHz frame goes into deep PLC's history, at every complexity, and step 5 is skipped for 16 kHz frames, as in libopus built with deep PLC. [Using the library](06-using-the-library.md#deep-packet-loss-concealment) describes deep PLC.
+
 After a lost SILK frame the decoder sets its last gain index back to the start value 10. Otherwise the first gain of the next good frame could not fall more than 16 steps below the gain before the loss. The level could then jump back up (dec_API.c: "remove the gain clamping").
 
 ### 8.2 CELT concealment
 
-A lost CELT frame goes through `CeltDecoder::decode_lost` (`conceal` in `src/celt.rs`, the port of `celt_decode_lost` without the neural concealment of libopus). It uses one of two methods:
+A lost CELT frame goes through `CeltDecoder::decode_lost` (`conceal` in `src/celt.rs`, the port of `celt_decode_lost`). It uses one of two methods, and a third one with deep PLC:
 
 - **Pitch repetition** (CELT-only, for the first 100 ms of a loss):
   1. On the first lost frame, it searches the pitch period of the last output (`plc_pitch_search`, 100 to 720 samples at 48 kHz). It also fits a linear predictor of order 24 to the last 1024 output samples. The search and the fit use the functions of the encoder's pre-filter in `src/pitch.rs` and `src/celt_lpc.rs`, which round as libopus does on 64-bit ARM.
@@ -276,6 +278,8 @@ A lost CELT frame goes through `CeltDecoder::decode_lost` (`conceal` in `src/cel
   - after 100 ms of loss;
   - for the CELT layer of a Hybrid stream;
   - after a noise-concealed loss, until two frames in a row have been decoded.
+
+- **Deep PLC** (cargo feature `deep-plc`, decoder complexity 5 and above, CELT-only): for the first 200 ms of a loss, deep PLC makes 16 kHz audio, which is upsampled to 48 kHz and replaces the pitch repetition. On its first frame the two are cross-faded over 2.5 ms. Deep PLC is mono; a stereo decoder gets the same signal on both channels. After 200 ms the shaped noise follows.
 
 The first frame decoded after a loss predicts its band energies from the frames before the loss. The decoder lowers those energies first, so that a wrong prediction cannot cause a loud click.
 
@@ -404,7 +408,14 @@ assert_eq!(output.len(), packets.len() * frame);
    - The value `a` is chosen so that the peak lands on ±1.
    - When such a stretch reaches the end of the packet, a value per channel (`softclip_mem`) keeps its `a`. The next packet applies the same curve to its first samples, up to the first zero crossing. So packets join without a step.
    - Concealed and FEC output is not soft-clipped, as in libopus.
-3. Each sample is scaled by 32768, limited to the 16-bit range, and rounded to the nearest integer, halves to even (`float2int16`, libopus `FLOAT2INT16`).
+3. The samples of the call are converted together (`celt_float2int16`, the libopus function of the same name). Each sample is scaled by 32768, limited to the 16-bit range, and rounded to the nearest integer. A value exactly halfway between two integers is rounded as libopus rounds it on the same processor:
+   - On 64-bit ARM, libopus calls `celt_float2int16_neon`. It converts whole blocks of 16 values with vector instructions that round halfway values away from zero. The values after the last whole block go through `FLOAT2INT16`, which rounds them to the even integer.
+   - On 32-bit ARM, opus1 assumes a processor with NEON and does the same. Its vector rounding adds 0.5 with the sign of the value and truncates, as libopus does on ARMv7.
+   - On x86 and every other target, every sample goes through `FLOAT2INT16` (`float2int16`), which rounds halfway values to the even integer.
+
+   A long loss is converted 60 ms at a time (step 1). 60 ms at any of the five rates is a whole number of blocks of 16 samples, so the blocks fall where they fall in libopus's single conversion of the call.
+
+   The multistream decoder converts each sample with `FLOAT2INT16` on every target, as libopus `opus_multistream_decode` does.
 
 `pcm_soft_clip` is public and can be used on float output directly:
 
@@ -456,5 +467,5 @@ These figures come from the project's comparison of both decoders on packets fro
 - Hybrid: 29 of 29 test streams decode to the same samples.
 - CELT: 51 of 51 test streams decode to the same samples.
 - Mode switches: the 8 switching test streams decode to the same samples.
-- The neural concealment of libopus is not ported.
+- The neural concealment of libopus (deep PLC) is ported, behind the cargo feature `deep-plc`, and gives the bits of libopus 1.6.1 built with it (see [Differences from libopus](10-differences-from-libopus.md#neural-network-code)).
 - Packet extensions that libopus 1.5 and later store in the padding are not read (`src/packet.rs`).

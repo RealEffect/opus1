@@ -27,7 +27,7 @@ mod multistream_dec_common;
 
 use ms_support::*;
 use multistream_dec_common::*;
-use opus1::OpusDecoder;
+use opus1::{OpusDecoder, pcm_soft_clip};
 
 /// Which packets of a stream of `count` packets are lost: every 10th, a
 /// burst of 3 and a burst of 6. Nothing is lost in the last `tail` packets.
@@ -665,6 +665,13 @@ enum Step {
 /// The multistream decoder adds nothing of its own: its output is the
 /// output of one `OpusDecoder` per stream, copied to the right channels,
 /// bit for bit, and its final range is the XOR of theirs.
+///
+/// For 16-bit output the reference is built from the float output of the
+/// stream decoders, as libopus `opus_multistream_decode` builds it: each
+/// decoded packet of a stream is soft-clipped with the memory of that
+/// stream, and each sample is rounded with `FLOAT2INT16`. One
+/// `OpusDecoder::decode_i16` per stream is not the reference: like
+/// `opus_decode`, it rounds halfway values in blocks of 16 on ARM.
 #[test]
 fn multistream_output_is_one_decoder_per_stream() {
     let cases = [
@@ -689,9 +696,10 @@ fn multistream_output_is_one_decoder_per_stream() {
             // Float output.
             let (_, mut ms) = e.decoders(fs);
             let mut singles = new_stream_decoders();
-            // 16-bit output.
+            // 16-bit output, and the soft clipper's memory of each stream.
             let (_, mut ms16) = e.decoders(fs);
             let mut singles16 = new_stream_decoders();
+            let mut clip_memory = vec![[0f32; 2]; e.streams];
             let mut out = vec![0f32; max_frame * e.channels];
             let mut out16 = vec![0i16; max_frame * e.channels];
             let (mut clipped, mut concealed, mut rebuilt) = (0usize, 0usize, 0usize);
@@ -745,13 +753,19 @@ fn multistream_output_is_one_decoder_per_stream() {
                     let decoded: Vec<Vec<i16>> = singles16
                         .iter_mut()
                         .zip(&parts)
-                        .map(|(dec, (stream_packet, stream_channels))| {
+                        .zip(clip_memory.iter_mut())
+                        .map(|((dec, (stream_packet, stream_channels)), memory)| {
                             let stream_packet: &[u8] = if with_packet { stream_packet } else { &[] };
-                            let mut buf = vec![0i16; size * stream_channels];
-                            let got = if fec { dec.decode_fec_i16(stream_packet, size, &mut buf) } else { dec.decode_i16(stream_packet, size, &mut buf) }
+                            let mut buf = vec![0f32; size * stream_channels];
+                            let got = if fec { dec.decode_fec(stream_packet, size, &mut buf) } else { dec.decode(stream_packet, size, &mut buf) }
                                 .unwrap_or_else(|err| panic!("{what}: stream decoder, 16 bits: {err}"));
                             assert_eq!(got, n, "{what}: samples of a stream");
-                            buf
+                            // Concealed and rebuilt frames are not
+                            // soft-clipped, and keep the memory.
+                            if with_packet && !fec {
+                                pcm_soft_clip(&mut buf, n, *stream_channels, memory);
+                            }
+                            to_i16(&buf[..n * stream_channels])
                         })
                         .collect();
                     let want16 = route(&e, &decoded, n);

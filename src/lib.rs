@@ -28,6 +28,7 @@ mod analysis;
 mod bands;
 mod celt;
 mod celt_lpc;
+mod deep_plc;
 #[cfg(feature = "dnn")]
 mod dnn;
 #[cfg(feature = "dnn")]
@@ -38,6 +39,7 @@ pub mod internals;
 mod kiss_fft;
 mod mdct;
 mod modes;
+mod osce_args;
 /// Multichannel encoding and decoding (several Opus streams in one packet).
 /// It allocates in its constructors, so it needs the `std` feature (on by
 /// default). The single-stream codec stays `no_std` without `alloc`.
@@ -1191,6 +1193,26 @@ fn state_mut<T: core::ops::DerefMut>(b: &mut T) -> &mut T::Target {
 #[inline(always)]
 fn state_mut<T: ?Sized>(b: &mut T) -> &mut T {
     b
+}
+
+/// Runs `$body` with `$p` bound to the deep PLC argument of the SILK and
+/// CELT decoders: `Some(&mut DeepPlcArgs)` with this `OpusDecoder`'s deep
+/// PLC state, models and kernel variant, or `None` in a build without the
+/// feature `deep-plc`. `$body` may borrow other fields of `$self`.
+macro_rules! with_deep_plc {
+    ($self:ident, |$p:ident| $body:expr) => {{
+        #[cfg(feature = "deep-plc")]
+        let mut args = crate::deep_plc::DeepPlcArgs {
+            state: state_mut(&mut $self.deep_plc),
+            models: $self.dnn.deep_plc(),
+            arch: $self.dnn.arch(),
+        };
+        #[cfg(feature = "deep-plc")]
+        let $p = Some(&mut args);
+        #[cfg(not(feature = "deep-plc"))]
+        let $p: Option<&mut crate::deep_plc::DeepPlcArgs> = None;
+        $body
+    }};
 }
 
 impl OpusEncoder {
@@ -3700,6 +3722,8 @@ impl OpusEncoder {
 }
 
 use celt::PcmLayout;
+#[cfg(feature = "osce-bwe")]
+use dnn::osce::OsceExtMode;
 
 pub struct OpusDecoder {
     #[cfg(not(feature = "heap"))]
@@ -3780,6 +3804,15 @@ pub struct OpusDecoder {
     dnn: Box<dnn::DecoderDnn>,
     #[cfg(all(feature = "dnn", not(feature = "heap")))]
     dnn: dnn::DecoderDnn,
+    /// C `st->lpcnet`: the state of deep packet loss concealment, 42 KB.
+    /// SILK appends every decoded 16 kHz frame to its history, at every
+    /// complexity. From complexity 5 it conceals lost SILK wideband and
+    /// CELT-only frames. `reset_state` clears it, except the state of the
+    /// FARGAN vocoder, as libopus does.
+    #[cfg(all(feature = "deep-plc", feature = "heap"))]
+    deep_plc: Box<dnn::plc::DeepPlc>,
+    #[cfg(all(feature = "deep-plc", not(feature = "heap")))]
+    deep_plc: dnn::plc::DeepPlc,
 }
 
 /// The error of a request that this build does not implement, like
@@ -3846,6 +3879,11 @@ impl OpusDecoder {
             dnn: Box::new(dnn::DecoderDnn::new()),
             #[cfg(all(feature = "dnn", not(feature = "heap")))]
             dnn: dnn::DecoderDnn::new(),
+            // C `lpcnet_plc_init`.
+            #[cfg(all(feature = "deep-plc", feature = "heap"))]
+            deep_plc: Box::new(dnn::plc::DeepPlc::new()),
+            #[cfg(all(feature = "deep-plc", not(feature = "heap")))]
+            deep_plc: dnn::plc::DeepPlc::new(),
         })
     }
 
@@ -3918,8 +3956,12 @@ impl OpusDecoder {
     ///
     /// The packet is decoded to floating point and soft-clipped, so that
     /// peaks beyond full scale are rounded off instead of cut
-    /// ([`pcm_soft_clip`]). The result is rounded to 16 bits. A lost packet
-    /// is given as in [`decode`](Self::decode).
+    /// ([`pcm_soft_clip`]). The result is rounded to 16 bits, to the
+    /// nearest integer. A value halfway between two integers is rounded as
+    /// libopus rounds it on the same processor: on ARM away from zero in
+    /// blocks of 16 values and to the even integer for the values after the
+    /// last whole block, elsewhere to the even integer. A lost packet is
+    /// given as in [`decode`](Self::decode).
     pub fn decode_i16(
         &mut self,
         input: &[u8],
@@ -4011,9 +4053,10 @@ impl OpusDecoder {
             }
             match self.decode_native(data, piece, &mut pcm[..len], decode_fec, false, true) {
                 Ok((samples, _)) => {
-                    for (o, &x) in output.iter_mut().zip(&pcm[..samples * channels]) {
-                        *o = float2int16(x);
-                    }
+                    // A piece of a long loss is 60 ms, a whole number of
+                    // blocks of `celt_float2int16`, so the blocks fall where
+                    // they fall in libopus's single conversion of the call.
+                    celt_float2int16(&pcm[..samples * channels], output);
                     done += samples;
                 }
                 Err(e) => break Err(e),
@@ -4048,7 +4091,9 @@ impl OpusDecoder {
     /// - `soft_clip`: a decoded packet is soft-clipped with this decoder's
     ///   memory ([`pcm_soft_clip`]), as libopus does for 16-bit output.
     ///   Concealed and FEC output is left as it is, as in libopus. The
-    ///   caller converts to 16 bits with [`float2int16`].
+    ///   caller converts to 16 bits: [`celt_float2int16`] for one stream
+    ///   (`opus_decode`), [`float2int16`] for each sample of a multistream
+    ///   stream (`opus_multistream_decode`).
     ///
     /// Returns the samples per channel written to `output`, and the number
     /// of bytes of `data` the packet takes (0 for a lost packet).
@@ -4219,15 +4264,30 @@ impl OpusDecoder {
     /// decoder then behaves like a new one with the same sampling rate and
     /// channel count. The settings stay: the complexity, the bandwidth
     /// extension switch and the loaded neural network weights.
+    ///
+    /// With the neural network features there are exceptions, as in
+    /// libopus:
+    ///
+    /// - With `deep-plc`, the state of FARGAN, the vocoder of deep packet
+    ///   loss concealment, survives the reset. Concealment after a reset
+    ///   can then differ from that of a new decoder, when deep PLC
+    ///   concealed a loss before the reset.
+    /// - With `osce-bwe`, the state of the bandwidth extension survives,
+    ///   and so does the mode of the last SILK frame. After a reset in the
+    ///   middle of a stream with the extension on, the next frame continues
+    ///   from the old state of the extension, without starting it afresh.
     pub fn reset_state(&mut self) {
         // C opus_decoder_ctl, OPUS_RESET_STATE: clear the stream state,
         // reset both layers, and put back the two values that do not start
         // at zero. `st->DecControl` is not part of what libopus clears, so
         // the SILK channel count and rate of the last frame stay. They are
-        // not used before the next SILK frame sets them again. The
-        // complexity and the BWE switch lie outside what libopus clears
-        // too. The neural network models stay as well; libopus reloads
-        // PitchDNN here (`dnn/lpcnet_enc.c:53-57`).
+        // not used before the next SILK frame sets them again. The previous
+        // OSCE extended mode of `DecControl` stays too; `SilkDecoder::reset`
+        // keeps it, and it keeps the BWE state of each channel, which lies
+        // before the part `silk_reset_decoder` clears. The complexity and
+        // the BWE switch lie outside what libopus clears too. The neural
+        // network models stay as well; libopus reloads PitchDNN here
+        // (`dnn/lpcnet_enc.c:53-57`).
         self.celt_dec.reset_state();
         self.silk_dec.reset();
         self.mode = None;
@@ -4238,6 +4298,9 @@ impl OpusDecoder {
         self.range_final = 0;
         self.last_packet_duration = 0;
         self.softclip_mem = [0.0; OPUS_MAX_CHANNELS];
+        // C `lpcnet_plc_reset`.
+        #[cfg(feature = "deep-plc")]
+        self.deep_plc.reset();
     }
 
     /// The sampling rate of the output in Hz (`OPUS_GET_SAMPLE_RATE`).
@@ -4257,9 +4320,11 @@ impl OpusDecoder {
     /// `osce-bwe`). Without these features the value is only stored, as in
     /// a libopus built without them.
     ///
-    /// In this version of opus1 the features are not connected to the
-    /// decoder yet: the value is stored and reported, and the decoded
-    /// output does not depend on it.
+    /// LACE and NoLACE enhance SILK frames of 20 ms at the 16 kHz SILK
+    /// rate: wideband SILK-only frames and the SILK layer of Hybrid frames.
+    /// A change of complexity that changes the method starts the
+    /// enhancement afresh: the next such frame comes out unenhanced, and
+    /// the one after it fades in over 10 ms, as in libopus.
     ///
     /// [`reset_state`](Self::reset_state) keeps the value.
     pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
@@ -4267,6 +4332,9 @@ impl OpusDecoder {
             return Err("Invalid complexity");
         }
         self.complexity = complexity;
+        // C: the request is passed on to the CELT decoder, whose deep PLC
+        // reads it.
+        self.celt_dec.set_complexity(complexity)?;
         Ok(())
     }
 
@@ -4276,17 +4344,27 @@ impl OpusDecoder {
         self.complexity
     }
 
-    /// libopus `OPUS_SET_OSCE_BWE`: switches the bandwidth extension of
-    /// SILK wideband speech to 48 kHz on or off. The default is off. It
-    /// works at a complexity of 4 and above, when the output is 48 kHz.
+    /// libopus `OPUS_SET_OSCE_BWE`: switches the bandwidth extension (BWE)
+    /// of SILK wideband speech to 48 kHz on or off. The default is off.
+    ///
+    /// When it is on, the complexity is 4 or more and the output is
+    /// 48 kHz, the network BBWENet makes the 48 kHz output of SILK frames
+    /// at the 16 kHz SILK rate in place of the resampler, with the band
+    /// above 8 kHz. It runs on SILK-only frames that arrive and on lost
+    /// frames (also of Hybrid streams, whose CELT layer is then not
+    /// concealed), as in libopus. Switching between it and the resampler
+    /// fades over 10 ms. Its output is delayed by 21 samples (0.44 ms)
+    /// against the resampler's.
+    ///
+    /// libopus 1.6.1 does not decode CELT-only frames that follow frames
+    /// with BWE (it outputs silence until the next SILK frame). opus1
+    /// decodes them, as libopus main does.
     ///
     /// Without the cargo feature `osce-bwe` this returns
     /// `"Request not implemented"`, as libopus returns `OPUS_UNIMPLEMENTED`
     /// when it was built without the extension.
-    ///
-    /// In this version of opus1 the extension is not connected to the
-    /// decoder yet: the switch is stored and reported only.
-    /// [`reset_state`](Self::reset_state) keeps it.
+    /// [`reset_state`](Self::reset_state) keeps the switch, and so does the
+    /// state of the extension, as in libopus.
     pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), &'static str> {
         #[cfg(feature = "osce-bwe")]
         {
@@ -4428,7 +4506,7 @@ impl OpusDecoder {
             } else {
                 silk::decode_frame::FLAG_DECODE_NORMAL
             };
-            self.decode_silk(&mut rc, lost_flag, frame_size, Some(&mut *out))?;
+            self.decode_silk(&mut rc, lost_flag, frame_size, mode, Some(&mut *out))?;
         }
 
         // Redundancy frame: present if enough bits are left after SILK.
@@ -4526,10 +4604,16 @@ impl OpusDecoder {
                 // the last CELT frame decoded. The two differ when the
                 // bandwidth changes across the loss, or when SILK-only
                 // packets came before it.
-                self.celt_dec.decode_lost(frame_size, out, layout)?;
+                with_deep_plc!(self, |p| {
+                    self.celt_dec.decode_lost_with_deep_plc(frame_size, out, layout, p)
+                })?;
             } else {
                 let bits = (len * 8) as i32;
-                let decoded = self.celt_dec.decode(&mut rc, bits, frame_size, out, layout);
+                // C: the main CELT call gets the deep PLC state; the
+                // redundancy and fade-out frames do not.
+                let decoded = with_deep_plc!(self, |p| {
+                    self.celt_dec.decode_with_deep_plc(&mut rc, bits, frame_size, out, layout, p)
+                });
                 // C: `return celt_ret < 0 ? celt_ret : audiosize`. The CELT
                 // decoder refuses a frame it cannot decode at all (a frame
                 // size or band range that is not valid), which the packet
@@ -4676,9 +4760,21 @@ impl OpusDecoder {
                     // count and rate of the last frame that carried data. A
                     // shorter piece is the head of 10 ms.
                     let mut rc = RangeCoder::new_decoder(&[]);
-                    self.decode_silk(&mut rc, silk::decode_frame::FLAG_PACKET_LOST, piece, None)?;
+                    let lost = silk::decode_frame::FLAG_PACKET_LOST;
+                    self.decode_silk(&mut rc, lost, piece, plc_mode, None)?;
                     dst.copy_from_slice(&self.w_silk_out[..piece * channels]);
-                    if plc_mode == OpusMode::Hybrid {
+                    if plc_mode == OpusMode::Hybrid && self.silk_bwe_replaces_celt() {
+                        // C 595-627: when the bandwidth extension makes the
+                        // whole band, CELT does not conceal. As after any
+                        // Hybrid frame without a CELT layer, 2.5 ms of CELT
+                        // silence are decoded on top of SILK's output, so
+                        // that the CELT layer fades out.
+                        self.celt_dec.set_stream_channels(self.stream_channels)?;
+                        self.celt_dec.set_start_band(0)?;
+                        let mut rc_silence = RangeCoder::new_decoder(&[0xFF, 0xFF]);
+                        let fade = &mut dst[..f2_5 * channels];
+                        self.celt_dec.decode(&mut rc_silence, 16, f2_5, fade, PcmLayout::InterleavedAdd);
+                    } else if plc_mode == OpusMode::Hybrid {
                         // C 610: CELT conceals the piece itself
                         // (`celt_frame_size = IMIN(F20, frame_size)`), also
                         // when SILK had to produce 10 ms for a shorter one.
@@ -4720,7 +4816,7 @@ impl OpusDecoder {
     ) -> Result<(), &'static str> {
         self.celt_dec.set_stream_channels(self.stream_channels)?;
         self.celt_dec.set_start_band(start_band)?;
-        self.celt_dec.decode_lost(n, out, layout)?;
+        with_deep_plc!(self, |p| self.celt_dec.decode_lost_with_deep_plc(n, out, layout, p))?;
         Ok(())
     }
 }
@@ -4745,13 +4841,43 @@ impl OpusDecoder {
     /// `lost_flag` is one of `FLAG_DECODE_NORMAL`, `FLAG_PACKET_LOST`
     /// (conceal) and `FLAG_DECODE_LBRR` (the redundant copy of the frame
     /// before, for FEC).
+    ///
+    /// `mode` is the mode of the frame, SILK-only or Hybrid; for a lost
+    /// frame the mode it is concealed in. With the features `osce` and
+    /// `osce-bwe` it selects, with the complexity and the BWE switch, the
+    /// OSCE method and whether the bandwidth extension replaces the
+    /// resampler (opus_decoder.c:444-466).
     fn decode_silk(
         &mut self,
         rc: &mut RangeCoder,
         lost_flag: i32,
         frame_size: usize,
+        mode: OpusMode,
         out: Option<&mut [f32]>,
     ) -> Result<(), &'static str> {
+        // C 444-466: the OSCE method follows the complexity. The extended
+        // mode says whether the bandwidth extension makes the output.
+        // After CELT-only frames there is no fade between it and the
+        // resampler, and its state starts afresh.
+        #[cfg(feature = "osce-bwe")]
+        let extended_mode = self.osce_extended_mode(mode, lost_flag != silk::decode_frame::FLAG_PACKET_LOST);
+        #[cfg(feature = "osce-bwe")]
+        if self.prev_mode == Some(OpusMode::CeltOnly) {
+            self.silk_dec.prev_osce_extended_mode = OsceExtMode::CeltOnly;
+        }
+        #[cfg(feature = "osce")]
+        let osce_args = osce_args::OsceArgs {
+            models: dnn::osce::OsceModels::from_decoder(&self.dnn),
+            method: dnn::osce::OsceMethod::for_complexity(self.complexity),
+            #[cfg(feature = "osce-bwe")]
+            extended_mode,
+        };
+        #[cfg(feature = "osce")]
+        let osce = Some(&osce_args);
+        #[cfg(not(feature = "osce"))]
+        let osce: Option<&osce_args::OsceArgs> = None;
+        #[cfg(not(feature = "osce-bwe"))]
+        let _ = mode;
         let channels = self.channels;
         let f10 = self.sampling_rate as usize / 100;
         let out = match out {
@@ -4767,19 +4893,31 @@ impl OpusDecoder {
             // 10 ms".
             payload_size_ms: (1000 * frame_size as i32 / self.sampling_rate).max(10),
         };
+        // C 443: `DecControl.enable_deep_plc = complexity >= 5`, for every
+        // SILK call.
+        let enable_deep_plc = self.complexity >= 5;
         // C 409-416: a piece shorter than 10 ms is the head of a 10 ms
         // frame. Only concealment asks for such a piece, and `w_silk_out`
         // has room for 10 ms. A frame with data lasts 10 ms or more.
         let room = frame_size.max(f10);
         let mut done = 0usize;
         while done < frame_size {
-            let decoded = {
+            let decoded = with_deep_plc!(self, |p| {
                 let (silk_dec, pcm) = (
                     state_mut(&mut self.silk_dec),
                     state_mut(&mut self.w_pcm_i16),
                 );
-                silk_dec.decode_with_control(&control, rc, pcm, lost_flag, done == 0)
-            };
+                silk_dec.decode_with_dnn(
+                    &control,
+                    rc,
+                    pcm,
+                    lost_flag,
+                    done == 0,
+                    p,
+                    enable_deep_plc,
+                    osce,
+                )
+            });
             match decoded {
                 Ok(n) if n > 0 && done + n <= room => {
                     // C `INT16TORES`: SILK's 16-bit samples as floats.
@@ -4799,6 +4937,56 @@ impl OpusDecoder {
             }
         }
         Ok(())
+    }
+}
+
+impl OpusDecoder {
+    /// libopus `DecControl.osce_extended_mode` of a SILK frame
+    /// (opus_decoder.c:452-461): `SilkBbwe` when the bandwidth extension
+    /// makes the output, that is at complexity 4 or more with the switch
+    /// on, 48 kHz output and SILK at 16 kHz, for a SILK-only frame or a
+    /// frame without data (lost, or a DTX frame). Otherwise the mode of the
+    /// frame.
+    ///
+    /// A decoder whose BBWENet layers are not loaded uses the resampler.
+    /// That does not happen with the built-in weights: `set_dnn_blob`
+    /// replaces a model only with a complete one.
+    #[cfg(feature = "osce-bwe")]
+    fn osce_extended_mode(&self, mode: OpusMode, has_data: bool) -> OsceExtMode {
+        let bbwe = self.complexity >= 4
+            && self.osce_bwe
+            && self.sampling_rate == 48000
+            && self.silk_internal_rate == 16000
+            && (mode == OpusMode::SilkOnly || !has_data)
+            && self.dnn.bbwenet().is_some();
+        if bbwe {
+            OsceExtMode::SilkBbwe
+        } else if mode == OpusMode::SilkOnly {
+            OsceExtMode::SilkOnly
+        } else {
+            OsceExtMode::Hybrid
+        }
+    }
+
+    /// Whether the concealment of a Hybrid frame runs in BBWE mode, where
+    /// the bandwidth extension makes the whole band and CELT does not
+    /// conceal (opus_decoder.c:595-627).
+    ///
+    /// libopus 1.6.1 also skips the CELT layer of CELT-only frames after
+    /// BBWE frames, because the extended mode of the last SILK frame stays
+    /// set. opus1 decodes them, as libopus main does since commit
+    /// 228a0f85, which sets the extended mode to CELT-only for those
+    /// frames. With that fix, a frame with data is never in BBWE mode
+    /// unless it is SILK-only, so only this concealment checks it.
+    fn silk_bwe_replaces_celt(&self) -> bool {
+        #[cfg(feature = "osce-bwe")]
+        {
+            self.osce_extended_mode(OpusMode::Hybrid, false) == OsceExtMode::SilkBbwe
+        }
+        #[cfg(not(feature = "osce-bwe"))]
+        {
+            false
+        }
     }
 }
 
@@ -4825,6 +5013,84 @@ pub(crate) fn float2int16(x: f32) -> i16 {
     rounded as i16
 }
 
+/// libopus `celt_float2int16` (celt/mathops.h), as the float build of
+/// libopus 1.6.1 compiles it for the target of this crate: the conversion
+/// from float to 16 bits at the end of `opus_decode`.
+///
+/// The conversions differ only for a value halfway between two integers
+/// after the scaling by 32768 (and for NaN).
+///
+/// - **64-bit ARM:** `celt_float2int16_neon` (celt/arm/celt_neon_intr.c).
+///   libopus's build system enables the NEON (ARM vector instructions)
+///   intrinsics by default, and every 64-bit ARM processor has them, so
+///   this version is called directly, with or without run-time CPU
+///   detection. It converts whole blocks of 16 values with vector
+///   instructions: scale by 32768, round to nearest with halfway values
+///   away from zero (`vcvtaq_s32_f32`), then limit to 16 bits
+///   (`vqmovn_s32`). A NaN becomes 0. The values after the last whole block
+///   go through [`float2int16`], which rounds halfway values to the even
+///   integer (`vcvtns_s32_f32`).
+/// - **32-bit ARM:** the same NEON function, with the rounding of ARMv7
+///   in the blocks (see `float2int16_neon_arm32`). libopus calls it when
+///   the processor has NEON: always when it is built for NEON (as the
+///   Android NDK builds `armeabi-v7a` by default), and after a run-time
+///   check otherwise. This crate assumes a processor with NEON.
+/// - **x86 and every other target:** [`float2int16`] for each value. On
+///   x86 it is `_mm_cvt_ss2si`, elsewhere `lrintf`; both round halfway
+///   values to the even integer.
+///
+/// `input` and `output` should have the same length; the shorter one sets
+/// how many values are converted. libopus converts all the samples of one
+/// `opus_decode` call at once, so the blocks start at the first sample of
+/// the call.
+pub(crate) fn celt_float2int16(input: &[f32], output: &mut [i16]) {
+    let n = input.len().min(output.len());
+    let (input, output) = (&input[..n], &mut output[..n]);
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+    let blocks = n / 16 * 16;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+    let blocks = 0;
+    #[cfg(target_arch = "aarch64")]
+    for (src, dst) in input[..blocks].as_chunks::<4>().0.iter().zip(output[..blocks].as_chunks_mut::<4>().0) {
+        use core::arch::aarch64::{vcvtaq_s32_f32, vld1q_f32, vmulq_n_f32, vqmovn_s32, vst1_s16};
+        // SAFETY: `src` and `dst` hold exactly 4 values each, the width of
+        // one load and one store. NEON is part of every 64-bit ARM
+        // processor.
+        unsafe {
+            let x = vmulq_n_f32(vld1q_f32(src.as_ptr()), 32768.0);
+            vst1_s16(dst.as_mut_ptr(), vqmovn_s32(vcvtaq_s32_f32(x)));
+        }
+    }
+    #[cfg(target_arch = "arm")]
+    for (dst, &src) in output[..blocks].iter_mut().zip(&input[..blocks]) {
+        *dst = float2int16_neon_arm32(src);
+    }
+    for (dst, &src) in output[blocks..].iter_mut().zip(&input[blocks..]) {
+        *dst = float2int16(src);
+    }
+}
+
+/// One value of a block of `celt_float2int16_neon` on 32-bit ARM: scale,
+/// `vroundf` of celt/arm/mathops_arm.h for ARMv7, then `vqmovn_s32`.
+///
+/// ARMv7 has no instruction that rounds halfway values away from zero.
+/// `vroundf` adds 0.5 with the sign of the value, in float arithmetic, and
+/// truncates toward zero. Rust's `as` conversion truncates, saturates and
+/// turns NaN into 0, as `vcvtq_s32_f32` does.
+///
+/// libopus built for ARMv8 in 32-bit mode uses `vcvtaq_s32_f32` instead,
+/// as on 64-bit ARM. The two differ for one scaled value only, ±0.49999997
+/// (0.5 - 2^-25): the addition rounds it up to 1. Rust offers no stable way
+/// to tell the two architectures apart at compile time (the 32-bit ARM
+/// target features are unstable), so this follows ARMv7.
+#[cfg(any(target_arch = "arm", test))]
+#[inline]
+fn float2int16_neon_arm32(x: f32) -> i16 {
+    let x = x * 32768.0;
+    let half = f32::from_bits(0x3F00_0000 | (x.to_bits() & 0x8000_0000));
+    ((x + half) as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
 /// libopus `opus_pcm_soft_clip` (opus.c): bring a float signal into
 /// [-1, 1] without hard clipping.
 ///
@@ -4839,6 +5105,10 @@ pub(crate) fn float2int16(x: f32) -> i16 {
 ///
 /// Arguments that do not fit (no samples, a slice too short) leave `pcm`
 /// unchanged.
+///
+/// On 64-bit ARM the result has the bits of libopus 1.6.1 built by clang:
+/// `x + a*x*x` rounds `a*x` and then adds `(a*x)*x` to `x` in one fused
+/// multiply-add, and so does the small boost of `a` (`a + a*2.4e-7`).
 pub fn pcm_soft_clip(pcm: &mut [f32], frame_size: usize, channels: usize, declip_mem: &mut [f32]) {
     let (n, nc) = (frame_size, channels);
     // A sample count that overflows cannot fit `pcm` either.
@@ -4862,10 +5132,11 @@ pub fn pcm_soft_clip(pcm: &mut [f32], frame_size: usize, channels: usize, declip
         // fuses the second product into the sum (`mac`).
         for i in 0..n {
             let v = x[i * nc];
-            if v * a >= 0.0 {
+            let av = a * v;
+            if av >= 0.0 {
                 break;
             }
-            x[i * nc] = mac(v, a * v, v);
+            x[i * nc] = mac(v, av, v);
         }
 
         let mut curr = 0usize;
@@ -5147,6 +5418,11 @@ fn channels_from_toc(toc: u8) -> usize {
 ///
 /// With `out_fades_in`, `other` fades out and `out` fades in. Otherwise
 /// `out` fades out and `other` fades in.
+///
+/// libopus computes `w*in2 + (1-w)*in1`. On 64-bit ARM, clang rounds
+/// `(1-w)*in1` first and adds `w*in2` to it in one fused multiply-add
+/// (`fmul`, then `fmadd`, in the Homebrew build of 1.6.1). [`mac`] does the
+/// same.
 fn smooth_fade(
     other: &[f32],
     out: &mut [f32],
@@ -5331,6 +5607,65 @@ mod tests {
         assert_eq!(float2int16(f32::NAN), -32768);
     }
 
+    /// libopus `celt_float2int16`: on ARM, halfway values in whole blocks of
+    /// 16 go away from zero, the values after the last block to the even
+    /// integer. Elsewhere every halfway value goes to the even integer.
+    #[test]
+    fn celt_float2int16_rounds_blocks_as_libopus() {
+        let lsb = 1.0 / 32768.0;
+        // 35 values: two blocks of 16, then 3 more. Every value is halfway
+        // between two integers.
+        let input: Vec<f32> = (0..35).map(|i| (i as f32 - 17.0 + 0.5) * lsb).collect();
+        let mut output = vec![0i16; 35];
+        celt_float2int16(&input, &mut output);
+        let arm = cfg!(any(target_arch = "aarch64", target_arch = "arm"));
+        for (i, (&x, &y)) in input.iter().zip(&output).enumerate() {
+            let v = x * 32768.0;
+            let expected = if arm && i < 32 { v.round() } else { v.round_ties_even() };
+            assert_eq!(y, expected as i16, "value {i}: {v}");
+        }
+        // The limits, infinities and NaN, in a block and after it.
+        let mut input = vec![0f32; 17];
+        input[..5].copy_from_slice(&[1.0, -1.0, 7.0, f32::NEG_INFINITY, f32::NAN]);
+        input[12..].copy_from_slice(&[32767.5 * lsb, -32768.5 * lsb, f32::INFINITY, -7.0, f32::NAN]);
+        let mut output = vec![1i16; 17];
+        celt_float2int16(&input, &mut output);
+        assert_eq!(output[..5], [32767, -32768, 32767, -32768, if arm { 0 } else { -32768 }]);
+        assert_eq!(output[12..], [32767, -32768, 32767, -32768, -32768]);
+        // Only the shorter of the two slices is converted.
+        let mut output = [5i16; 3];
+        celt_float2int16(&[0.5 * lsb, 1.5 * lsb], &mut output);
+        assert_eq!(output, [0, 2, 5]);
+    }
+
+    /// The ARMv7 rounding of `celt_float2int16_neon`: add 0.5 with the sign
+    /// of the value, then truncate.
+    #[test]
+    fn float2int16_neon_arm32_adds_half_and_truncates() {
+        let lsb = 1.0 / 32768.0;
+        for (v, expected) in [
+            (0.5f32, 1i16),
+            (1.5, 2),
+            (2.5, 3),
+            (-0.5, -1),
+            (-2.5, -3),
+            (2.4999998, 2),
+            (100.49, 100),
+            (-100.51, -101),
+            // 0.5 - 2^-25: the addition rounds up to 1. `vcvtaq_s32_f32`
+            // would give 0.
+            (0.49999997, 1),
+            (-0.49999997, -1),
+            (32767.5, 32767),
+            (-32768.5, -32768),
+            (1e9, 32767),
+            (f32::NEG_INFINITY, -32768),
+            (f32::NAN, 0),
+        ] {
+            assert_eq!(float2int16_neon_arm32(v * lsb), expected, "{v}");
+        }
+    }
+
     /// Encode a tone with `enc`, `frames` frames of `frame_size` samples.
     fn encode_tone(enc: &mut OpusEncoder, frame_size: usize, frames: usize) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
@@ -5449,7 +5784,8 @@ mod tests {
                     delimited.decode_native(&stream, frame_size, &mut b, false, true, true),
                     Ok((frame_size, len))
                 );
-                let converted: Vec<i16> = b[..frame_size].iter().map(|&v| float2int16(v)).collect();
+                let mut converted = vec![0i16; frame_size];
+                celt_float2int16(&b[..frame_size], &mut converted);
                 assert_eq!(a16, converted, "packet {i}: 16-bit decode");
             } else {
                 assert_eq!(plain.decode(p, frame_size, &mut a), Ok(frame_size));

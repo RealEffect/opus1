@@ -17,6 +17,16 @@
 //! previous packet that a packet can carry (in-band forward error
 //! correction). libopus calls that copy LBRR, "low bit rate redundancy".
 
+use crate::deep_plc::DeepPlcArgs;
+#[cfg(feature = "osce-bwe")]
+use crate::dnn::DnnArch;
+#[cfg(feature = "osce-bwe")]
+use crate::dnn::models::bbwenet::BbwenetLayers;
+#[cfg(feature = "osce-bwe")]
+use crate::dnn::osce::{OsceExtMode, osce_bwe, osce_bwe_cross_fade_10ms, osce_bwe_reset};
+#[cfg(feature = "osce")]
+use crate::dnn::osce::{OsceMethod, osce_reset};
+use crate::osce_args::OsceArgs;
 use crate::range_coder::RangeCoder;
 use crate::silk::decode_frame::{
     FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST, silk_decode_frame,
@@ -57,6 +67,15 @@ pub struct SilkDecoder {
     /// One channel of one frame at the output rate, before it is written
     /// into the interleaved stereo output.
     w_resample_buf: [i16; MAX_API_FRAME_LENGTH],
+
+    /// libopus `DecControl.prev_osce_extended_mode`: the extended mode of
+    /// the previous frame, which decides whether the bandwidth extension
+    /// starts afresh and whether the output is cross-faded between it and
+    /// the resampler. `OpusDecoder` sets it to `CeltOnly` for the first
+    /// SILK frame after CELT-only frames. `reset` keeps it, as libopus
+    /// keeps `DecControl` on `OPUS_RESET_STATE`.
+    #[cfg(feature = "osce-bwe")]
+    pub(crate) prev_osce_extended_mode: OsceExtMode,
 }
 
 impl Default for SilkDecoder {
@@ -85,6 +104,8 @@ impl SilkDecoder {
             s_stereo: StereoDecState::default(),
             w_silk_buf: [[0; MAX_FRAME_LENGTH + 2]; 2],
             w_resample_buf: [0; MAX_API_FRAME_LENGTH],
+            #[cfg(feature = "osce-bwe")]
+            prev_osce_extended_mode: OsceExtMode::Unset,
         };
         silk_init_decoder(&mut dec.channel_state[0]);
         silk_init_decoder(&mut dec.channel_state[1]);
@@ -123,6 +144,10 @@ impl SilkDecoder {
     ///
     /// The output rate that `silk_decoder_set_fs` needs is read from
     /// `channel_state[0].fs_api_hz`.
+    ///
+    /// With the feature `osce`, the frames are decoded with OSCE method
+    /// NONE, as by a libopus built with OSCE below complexity 6: a 20 ms
+    /// frame at 16 kHz has -32768 clipped to -32767.
     pub fn decode(
         &mut self,
         range_dec: &mut RangeCoder,
@@ -146,7 +171,7 @@ impl SilkDecoder {
             payload_size_ms,
         };
         let decoded = check_control(&control, lost_flag).and_then(|fs_khz_dec| {
-            self.decode_to_silk_rate(&control, fs_khz_dec, range_dec, lost_flag, new_packet)
+            self.decode_to_silk_rate(&control, fs_khz_dec, range_dec, lost_flag, new_packet, None, false, None)
         });
         let frame = match decoded {
             Ok(frame) => frame,
@@ -190,6 +215,12 @@ impl SilkDecoder {
     /// With `FLAG_DECODE_LBRR` the range decoder must be at the start of the
     /// packet that followed the lost one. A SILK frame for which that packet
     /// carries no copy is concealed instead.
+    ///
+    /// The frame is decoded as by a libopus `silk_Decode` whose control
+    /// has no neural network settings: no deep PLC, OSCE method NONE and
+    /// no bandwidth extension. With the feature `osce` method NONE clips
+    /// -32768 to -32767 in 20 ms frames at 16 kHz, as libopus built with
+    /// OSCE does.
     pub fn decode_with_control(
         &mut self,
         control: &SilkDecControl,
@@ -197,6 +228,34 @@ impl SilkDecoder {
         output: &mut [i16],
         lost_flag: i32,
         new_packet: bool,
+    ) -> Result<usize, &'static str> {
+        self.decode_with_dnn(control, range_dec, output, lost_flag, new_packet, None, false, None)
+    }
+
+    /// `decode_with_control` with the neural network parts of the decoder,
+    /// as `OpusDecoder` calls it (libopus `silk_Decode` with `lpcnet` and
+    /// the OSCE settings of `decControl`).
+    ///
+    /// The mid channel appends each decoded 16 kHz frame to the history of
+    /// `deep_plc`. `enable_deep_plc` is libopus
+    /// `decControl->enable_deep_plc` (decoder complexity 5 or more): with
+    /// it, a lost 16 kHz frame is concealed with deep PLC when the models
+    /// are loaded.
+    ///
+    /// `osce` holds the OSCE method of the frame and, with the feature
+    /// `osce-bwe`, its extended mode; `None` stands for method NONE and no
+    /// bandwidth extension.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_with_dnn(
+        &mut self,
+        control: &SilkDecControl,
+        range_dec: &mut RangeCoder,
+        output: &mut [i16],
+        lost_flag: i32,
+        new_packet: bool,
+        deep_plc: Option<&mut DeepPlcArgs>,
+        enable_deep_plc: bool,
+        osce: Option<&OsceArgs>,
     ) -> Result<usize, &'static str> {
         if !matches!(control.api_sample_rate, 8000 | 12000 | 16000 | 24000 | 48000) {
             return Err("SILK decoder: invalid output sampling rate");
@@ -218,28 +277,41 @@ impl SilkDecoder {
             return Err("SILK decoder: output buffer too small");
         }
 
-        let frame =
-            self.decode_to_silk_rate(control, fs_khz_dec, range_dec, lost_flag, new_packet)?;
+        let frame = self.decode_to_silk_rate(
+            control,
+            fs_khz_dec,
+            range_dec,
+            lost_flag,
+            new_packet,
+            deep_plc,
+            enable_deep_plc,
+            osce,
+        )?;
         let n_dec = frame.n_samples;
         if n_dec * control.api_sample_rate as usize != n_out * fs_khz as usize * 1000 {
             return Err("SILK decoder: unexpected frame length");
         }
 
-        // Resample to the output rate. The input starts at index 1 of the
-        // frame buffer: the buffer begins with the last two samples of the
-        // previous frame, and libopus reads from the second of them.
+        // Resample to the output rate, or extend the bandwidth. The input
+        // starts at index 1 of the frame buffer: the buffer begins with the
+        // last two samples of the previous frame, and libopus reads from
+        // the second of them.
+        #[cfg(feature = "osce-bwe")]
+        let stage = OutputStage::new(osce, self.prev_osce_extended_mode, control.internal_sample_rate);
+        #[cfg(not(feature = "osce-bwe"))]
+        let stage = OutputStage::new(osce, control.internal_sample_rate);
         if n_api == 1 {
-            self.channel_state[0].resampler_state.process(
+            stage.run(
+                &mut self.channel_state[0],
                 &mut output[..n_out],
                 &self.w_silk_buf[0][1..1 + n_dec],
-                n_dec as i32,
             );
         } else {
             for n in 0..n_int {
-                self.channel_state[n].resampler_state.process(
+                stage.run(
+                    &mut self.channel_state[n],
                     &mut self.w_resample_buf[..n_out],
                     &self.w_silk_buf[n][1..1 + n_dec],
-                    n_dec as i32,
                 );
                 let channel = output.iter_mut().skip(n).step_by(2);
                 for (dst, &v) in channel.zip(&self.w_resample_buf[..n_out]) {
@@ -252,7 +324,9 @@ impl SilkDecoder {
                     // The first mono frame after stereo: the right channel
                     // goes through its own resampler once more. That
                     // resampler still holds the last samples of the stereo
-                    // right channel, and this lets them out.
+                    // right channel, and this lets them out. libopus does
+                    // this also when the left channel went through the
+                    // bandwidth extension.
                     self.channel_state[1].resampler_state.process(
                         &mut self.w_resample_buf[..n_out],
                         &self.w_silk_buf[0][1..1 + n_dec],
@@ -268,6 +342,11 @@ impl SilkDecoder {
                     }
                 }
             }
+        }
+        // libopus dec_API.c:436-438.
+        #[cfg(feature = "osce-bwe")]
+        {
+            self.prev_osce_extended_mode = stage.ext;
         }
         Ok(n_out)
     }
@@ -292,7 +371,8 @@ impl SilkDecoder {
     /// one frame per coded channel and turn mid/side into left/right.
     ///
     /// `control` and `lost_flag` have passed `check_control`, which gave
-    /// `fs_khz_dec`.
+    /// `fs_khz_dec`. `deep_plc` goes to the mid channel only.
+    #[allow(clippy::too_many_arguments)]
     fn decode_to_silk_rate(
         &mut self,
         control: &SilkDecControl,
@@ -300,6 +380,9 @@ impl SilkDecoder {
         range_dec: &mut RangeCoder,
         lost_flag: i32,
         new_packet: bool,
+        mut deep_plc: Option<&mut DeepPlcArgs>,
+        enable_deep_plc: bool,
+        osce: Option<&OsceArgs>,
     ) -> Result<DecodedFrame, &'static str> {
         let n_api = control.n_channels_api as usize;
         let n_int = control.n_channels_internal as usize;
@@ -496,6 +579,19 @@ impl SilkDecoder {
                         == 1)
         };
 
+        // libopus dec_API.c:330: the mid channel's PLC learns whether deep
+        // PLC is switched on.
+        self.channel_state[0].s_plc.enable_deep_plc = enable_deep_plc as i32;
+
+        // The OSCE method of the frame, and the layers it enhances with.
+        #[cfg(feature = "osce")]
+        let (osce_method, osce_models) = match osce {
+            Some(args) => (args.method, Some(&args.models)),
+            None => (OsceMethod::None, None),
+        };
+        #[cfg(not(feature = "osce"))]
+        let osce_models = osce;
+
         // Decode one frame per channel into w_silk_buf[n][2..2 + n_samples].
         let mut n_samples: i32 = 0;
         for n in 0..n_int {
@@ -519,6 +615,13 @@ impl SilkDecoder {
                 } else {
                     CODE_CONDITIONALLY
                 };
+                // libopus dec_API.c:350-354: a channel whose OSCE method is
+                // not the method of this frame starts again with it. A side
+                // channel that is not coded keeps its state as it is.
+                #[cfg(feature = "osce")]
+                if self.channel_state[n].osce.method() != osce_method {
+                    osce_reset(&mut self.channel_state[n].osce, osce_method);
+                }
                 let ret = silk_decode_frame(
                     &mut self.channel_state[n],
                     range_dec,
@@ -526,6 +629,8 @@ impl SilkDecoder {
                     &mut n_samples,
                     lost_flag,
                     cond_coding,
+                    if n == 0 { deep_plc.as_deref_mut() } else { None },
+                    osce_models,
                 );
                 if ret < 0 {
                     return Err("SILK decoder: frame decoding failed");
@@ -600,7 +705,10 @@ impl SilkDecoder {
 
     /// Put the decoder back into its start state (libopus
     /// `silk_ResetDecoder`). The channel counts of the previous call stay,
-    /// as in libopus.
+    /// as in libopus. With the feature `osce`, each channel's OSCE state
+    /// goes back to its default method; with `osce-bwe`, the bandwidth
+    /// extension state of each channel and the previous extended mode
+    /// stay, as in libopus.
     pub fn reset(&mut self) {
         // `decode()` reads the output rate from this field, so it survives.
         let fs_api_hz = self.channel_state[0].fs_api_hz;
@@ -617,6 +725,94 @@ impl SilkDecoder {
 
     pub fn sample_rate(&self) -> i32 {
         self.channel_state[0].fs_khz * 1000
+    }
+}
+
+/// The output stage of `silk_Decode` for one frame (libopus
+/// dec_API.c:389-435): each channel is resampled from the SILK rate to the
+/// output rate, or, with the feature `osce-bwe` in BBWE mode, extended
+/// from 16 to 48 kHz by the bandwidth extension (BWE).
+///
+/// The rules of libopus for a channel:
+///
+/// - BBWE mode: the BWE state starts afresh (`osce_bwe_reset`) unless the
+///   previous frame was in BBWE mode too, and BWE makes the output. After a
+///   SILK-only or Hybrid frame the resampler also runs, and the first
+///   10 ms fade from its output to the BWE output. The resampler state does
+///   not change otherwise.
+/// - Other modes: the resampler makes the output. After a BBWE frame, at
+///   a SILK rate of still 16 kHz, BWE runs once more and the first 10 ms
+///   fade from its output to the resampler's. When the rate changed, there
+///   is no fade.
+#[derive(Clone, Copy)]
+struct OutputStage<'a> {
+    /// The extended mode of this frame (`decControl->osce_extended_mode`).
+    #[cfg(feature = "osce-bwe")]
+    ext: OsceExtMode,
+    /// The extended mode of the previous frame.
+    #[cfg(feature = "osce-bwe")]
+    prev: OsceExtMode,
+    /// `decControl->internalSampleRate == 16000`.
+    #[cfg(feature = "osce-bwe")]
+    internal_16k: bool,
+    /// The layers of BBWENet. Without them the resampler always runs.
+    #[cfg(feature = "osce-bwe")]
+    layers: Option<&'a BbwenetLayers<'a>>,
+    /// The kernel variant of the layers.
+    #[cfg(feature = "osce-bwe")]
+    arch: DnnArch,
+    #[cfg(not(feature = "osce-bwe"))]
+    _models: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> OutputStage<'a> {
+    #[cfg(feature = "osce-bwe")]
+    fn new(osce: Option<&'a OsceArgs<'a>>, prev: OsceExtMode, internal_sample_rate: i32) -> Self {
+        OutputStage {
+            ext: osce.map_or(OsceExtMode::Unset, |o| o.extended_mode),
+            prev,
+            internal_16k: internal_sample_rate == 16000,
+            layers: osce.and_then(|o| o.models.bbwenet),
+            arch: osce.map_or(DnnArch::Portable, |o| o.models.arch),
+        }
+    }
+
+    #[cfg(not(feature = "osce-bwe"))]
+    fn new(_osce: Option<&'a OsceArgs<'a>>, _internal_sample_rate: i32) -> Self {
+        OutputStage { _models: core::marker::PhantomData }
+    }
+
+    /// One channel: `input` is the decoded frame at the SILK rate, `out`
+    /// receives it at the output rate.
+    fn run(&self, state: &mut SilkDecoderState, out: &mut [i16], input: &[i16]) {
+        #[cfg(feature = "osce-bwe")]
+        if let Some(layers) = self.layers {
+            // BWE takes 10 or 20 ms at 16 kHz and makes 48 kHz. The
+            // decoder selects BBWE only then; the check keeps a
+            // `SilkDecoder` that is used otherwise from panicking.
+            if matches!(input.len(), 160 | 320) && out.len() == 3 * input.len() {
+                // libopus `resamp_buffer`: the signal faded out.
+                let mut fade = [0i16; 3 * MAX_FRAME_LENGTH];
+                if self.ext == OsceExtMode::SilkBbwe {
+                    if self.prev != OsceExtMode::SilkBbwe {
+                        osce_bwe_reset(&mut state.osce_bwe);
+                    }
+                    osce_bwe(&mut state.osce_bwe, layers, self.arch, out, input);
+                    if matches!(self.prev, OsceExtMode::SilkOnly | OsceExtMode::Hybrid) {
+                        state.resampler_state.process(&mut fade[..out.len()], input, input.len() as i32);
+                        osce_bwe_cross_fade_10ms(out, &fade);
+                    }
+                    return;
+                }
+                state.resampler_state.process(out, input, input.len() as i32);
+                if self.prev == OsceExtMode::SilkBbwe && self.internal_16k {
+                    osce_bwe(&mut state.osce_bwe, layers, self.arch, &mut fade[..out.len()], input);
+                    osce_bwe_cross_fade_10ms(out, &fade);
+                }
+                return;
+            }
+        }
+        state.resampler_state.process(out, input, input.len() as i32);
     }
 }
 

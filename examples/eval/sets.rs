@@ -156,37 +156,24 @@ pub fn default_gates(group: &str) -> Vec<Gate> {
 /// rule, bitrate (for `GeomeanErr`), limit.
 pub const CALIBRATED: &[(&str, GateKind, Option<i32>, f64)] = {
     use GateKind::*;
+    // Measured at c7744f6 (speech and music analysis, no low-frequency
+    // burst at 48 kHz VoIP). Only gates whose measured value does not pass
+    // the default are listed; each limit leaves about 10 % of room.
     &[
         // The quick and selftest sets.
-        ("celt_high", GeomeanErr, Some(128000), 1.45), // measured 1.3472
-        ("celt_high", MaxErr, None, 3.8),               // measured 3.4327
-        ("celt_mid", BytesMax, None, 1.34),             // measured 1.3254 (quiet speech, 48 kb/s mono, c9)
-        ("celt_mid", MaxErr, None, 3.0),                // measured 2.6557
-        ("silk_low", BytesMin, None, 0.88),             // measured 0.8941
-        ("silk_low", MaxErr, None, 2.3),                // measured 2.0777
-        ("silk_low", MocClip, None, -0.29),             // measured -0.2317 (SILK wideband at 48 kHz)
-        ("speech_mid", GeomeanErr, Some(20000), 1.55),  // measured 1.4482
-        ("speech_mid", GeomeanErr, Some(24000), 1.45),  // measured 1.3612
-        ("speech_mid", GeomeanErr, Some(32000), 2.15),  // measured 2.0285
-        ("speech_mid", GeomeanErr, Some(40000), 3.15),  // measured 2.9934
-        ("speech_mid", MaxErr, None, 9.0),              // measured 8.1458
-        ("speech_mid", MocClip, None, -0.34),           // measured -0.2801
-        ("speech_mid", MocMean, None, -0.068),          // measured -0.0582
+        ("celt_mid", BytesMax, None, 1.10),             // measured 1.0451 (quiet speech, 48 kb/s mono, c9)
+        ("silk_low", BytesMin, None, 0.86),             // measured 0.8874
+        ("silk_low", MaxErr, None, 2.4),                // measured 2.1498
+        ("silk_low", MocClip, None, -0.15),             // measured -0.1063 (SILK wideband at 48 kHz)
+        ("speech_mid", MocClip, None, -0.16),           // measured -0.1208
         // The tsp set.
-        ("tsp_low", BytesMaxLong, None, 1.15),          // measured 1.1353
-        ("tsp_low", MaxErr, None, 5.3),                 // measured 4.7587
-        ("tsp_low", MocClip, None, -0.25),              // measured -0.1939
-        ("tsp_mid", BytesMaxLong, None, 1.13),          // measured 1.1199
-        ("tsp_mid", GeomeanErr, Some(24000), 1.7),      // measured 1.5977
-        ("tsp_mid", GeomeanErr, Some(32000), 2.05),     // measured 1.9266
-        ("tsp_mid", GeomeanErr, Some(48000), 2.75),     // measured 2.6089
-        ("tsp_mid", MaxErr, None, 6.3),                 // measured 5.6937
-        ("tsp_mid", MocClip, None, -0.23),              // measured -0.1797
-        ("tsp_high", BytesMax, None, 1.15),             // measured 1.1335
-        ("tsp_high", BytesMaxLong, None, 1.15),         // measured 1.1395
-        ("tsp_high", GeomeanErr, Some(64000), 1.9),     // measured 1.8023
-        ("tsp_high", MaxErr, None, 7.0),                // measured 6.3110
-        ("tsp_high", MocClip, None, -0.37),             // measured -0.3185
+        ("tsp_low", BytesMaxLong, None, 1.15),          // measured 1.1307 (60 ms, no per-frame limit)
+        ("tsp_low", MaxErr, None, 5.2),                 // measured 4.6538
+        ("tsp_low", MocClip, None, -0.32),              // measured -0.2914 (FD22_04, 6 kb/s, c5, 60 ms)
+        ("tsp_mid", BytesMaxLong, None, 1.15),          // measured 1.1252 (60 ms, no per-frame limit)
+        ("tsp_mid", MaxErr, None, 3.6),                 // measured 3.2147
+        ("tsp_high", MaxErr, None, 5.5),                // measured 4.9346
+        ("tsp_high", MocClip, None, -0.28),             // measured -0.2436
     ]
 };
 

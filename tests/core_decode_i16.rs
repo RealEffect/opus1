@@ -94,7 +94,13 @@ const STREAMS: [(&str, usize, usize, i32, i32, i32, usize); 9] = [
     ("CELT-WB 16k mono 40ms", 16000, 1, MODE_CELT, BW_WB, 64000, 16),
 ];
 
-/// Ordinary speech: every sample is libopus's, or one step away.
+/// Whether the 16-bit output must be libopus's in every sample: on 64-bit
+/// ARM, where the float output and the rounding are libopus's. Elsewhere a
+/// sample may be one step away.
+const EXACT: bool = cfg!(target_arch = "aarch64");
+
+/// Ordinary speech: every sample is libopus's (on other targets than
+/// 64-bit ARM, or one step away).
 #[test]
 fn speech_decodes_to_the_samples_of_opus_decode() {
     for (name, rate, channels, mode, bandwidth, bitrate, frame_2_5) in STREAMS {
@@ -103,14 +109,14 @@ fn speech_decodes_to_the_samples_of_opus_decode() {
         let (c, rs) = decode_both(rate, channels, mode, bandwidth, bitrate, rate / 400 * frame_2_5, &pcm);
         let d = diff(&c, &rs);
         println!("{name}: {} samples, {} differ by 1, largest difference {}", d.samples, d.off_by_one, d.max);
-        assert!(d.max <= 1, "{name}: largest difference {}", d.max);
+        assert!(d.max <= if EXACT { 0 } else { 1 }, "{name}: largest difference {}", d.max);
         assert!(d.off_by_one * 1000 < d.samples, "{name}: {} of {} samples differ", d.off_by_one, d.samples);
     }
 }
 
 /// Input that overshoots: the decoded signal goes beyond full scale and the
-/// soft clipper bends it back. The result is still libopus's, within one
-/// step.
+/// soft clipper bends it back. The result is still libopus's (on other
+/// targets than 64-bit ARM, within one step).
 #[test]
 fn overdriven_input_is_soft_clipped_like_opus_decode() {
     for (name, rate, channels, mode, bandwidth, bitrate, frame_2_5) in STREAMS {
@@ -125,7 +131,7 @@ fn overdriven_input_is_soft_clipped_like_opus_decode() {
             let (c, rs) = decode_both(rate, channels, mode, bandwidth, bitrate, rate / 400 * frame_2_5, &pcm);
             let d = diff(&c, &rs);
             println!("{name}, {signal}: {} samples, {} at full scale, {} differ by 1, largest difference {}", d.samples, d.at_full_scale, d.off_by_one, d.max);
-            assert!(d.max <= 1, "{name}, {signal}: largest difference {}", d.max);
+            assert!(d.max <= if EXACT { 0 } else { 1 }, "{name}, {signal}: largest difference {}", d.max);
             assert!(d.off_by_one * 100 < d.samples, "{name}, {signal}: {} of {} samples differ", d.off_by_one, d.samples);
             if signal == "overdriven" && mode == MODE_CELT {
                 assert!(d.at_full_scale > 0, "{name}: the signal was meant to reach full scale");
@@ -230,10 +236,10 @@ fn c_soft_clip(pcm: &[f32], frame_size: usize, channels: usize, mem: &mut [f32])
     out
 }
 
-/// `pcm_soft_clip` gives the output of `opus_pcm_soft_clip` bit for bit,
-/// buffer after buffer with the memory carried along, for buffers of many
-/// lengths. libopus rounds as clang does on 64-bit ARM; elsewhere the
-/// output must agree within 2e-6.
+/// `pcm_soft_clip` gives the output of `opus_pcm_soft_clip`, buffer after
+/// buffer with the memory carried along, for buffers of many lengths. On
+/// 64-bit ARM, where opus1 fuses the multiply-adds as clang does, the bits
+/// are equal.
 #[test]
 fn pcm_soft_clip_matches_libopus() {
     let mut seed = 12345u32;
@@ -264,13 +270,13 @@ fn pcm_soft_clip_matches_libopus() {
                 let exact = cfg!(target_arch = "aarch64");
                 for (i, (a, b)) in expected.iter().zip(&ours).enumerate() {
                     worst = worst.max((a - b).abs());
-                    let limit = if exact { 0.0 } else { 2e-6 };
-                    assert!((a - b).abs() <= limit, "gain {gain}, offset {offset}, {channels} ch, round {round}, sample {i}: libopus {a}, opus1 {b}");
+                    let ok = if exact { a.to_bits() == b.to_bits() } else { (a - b).abs() <= 2e-6 };
+                    assert!(ok, "gain {gain}, offset {offset}, {channels} ch, round {round}, sample {i}: libopus {a}, opus1 {b}");
                     assert!(b.abs() <= 1.0, "sample {i} is {b}");
                 }
                 for (a, b) in c_mem.iter().zip(&rs_mem) {
-                    let limit = if exact { 0.0 } else { 1e-6 * a.abs().max(1.0) };
-                    assert!((a - b).abs() <= limit, "memory: libopus {a}, opus1 {b}");
+                    let ok = if exact { a.to_bits() == b.to_bits() } else { (a - b).abs() <= 1e-6 * a.abs().max(1.0) };
+                    assert!(ok, "memory: libopus {a}, opus1 {b}");
                 }
                 clipped_buffers += (expected != pcm) as usize;
             }
