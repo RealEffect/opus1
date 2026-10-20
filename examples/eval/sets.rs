@@ -8,6 +8,9 @@
 //!   128 kb/s, 20 and 60 ms frames, complexity 5 and 10.
 //! - `tsp_rates`: the items of `tsp`, VoIP mono at 16 and 24 kHz, 6 to
 //!   64 kb/s, 20 and 60 ms frames, complexity 5 and 10.
+//! - `tsp_stereo`: pairs of the `tsp` items as stereo (one talker on each
+//!   channel), VoIP at 16, 24 and 48 kHz, with a bitrate that changes every
+//!   200 ms and at constant bitrates.
 //! - `music`: synthetic music-like items in stereo at 64 to 160 kb/s.
 //! - `baseline`: `tsp` and `music` together.
 
@@ -66,7 +69,7 @@ impl EvalSet {
     }
 }
 
-pub const SET_NAMES: [&str; 6] = ["quick", "selftest", "tsp", "tsp_rates", "music", "baseline"];
+pub const SET_NAMES: [&str; 7] = ["quick", "selftest", "tsp", "tsp_rates", "tsp_stereo", "music", "baseline"];
 
 /// A built-in set by name.
 pub fn builtin(name: &str, corpus_root: &Path) -> Result<EvalSet, String> {
@@ -75,6 +78,7 @@ pub fn builtin(name: &str, corpus_root: &Path) -> Result<EvalSet, String> {
         "selftest" => Ok(selftest()),
         "tsp" => tsp(corpus_root),
         "tsp_rates" => tsp_rates(corpus_root),
+        "tsp_stereo" => tsp_stereo(corpus_root),
         "music" => Ok(music()),
         "baseline" => Ok(tsp(corpus_root)?.merge(music(), "baseline")),
         _ => Err(format!("unknown set {name}; the sets are {}", SET_NAMES.join(", "))),
@@ -377,6 +381,53 @@ fn tsp_at(name: &str, rates: &[u32], bitrates: &[i32], corpus_root: &Path) -> Re
         conditions,
         items,
     })
+}
+
+/// The bitrates of the mode-switching streams of `perf_harness`, in kb/s,
+/// one step every 200 ms.
+const SWITCH_BITRATES: [i32; 10] = [8, 16, 24, 40, 96, 12, 64, 20, 128, 32];
+
+/// TSP speech in stereo: the items of `tsp_speech.txt` in pairs, the first
+/// on the left channel and the second on the right, cut to the shorter one.
+/// VoIP at 16, 24 and 48 kHz, 20 ms frames: complexity 5 and 9 with the
+/// bitrate schedule of `perf_harness`'s mode-switching streams (8 to
+/// 128 kb/s, so the stream changes between mono and stereo coding and
+/// between modes), and complexity 5 at a constant 24 and 32 kb/s.
+pub fn tsp_stereo(corpus_root: &Path) -> Result<EvalSet, String> {
+    let mono = corpus::read_set_file(&tsp_set_file(), corpus_root)?;
+    let mut specs = mono.into_iter();
+    let mut items = Vec::new();
+    while let (Some(left), Some(right)) = (specs.next(), specs.next()) {
+        let name = format!("{}+{}", left.name, right.name);
+        items.push(ItemSpec::generated(
+            &name,
+            Class::Speech,
+            Box::new(move || {
+                let (l, r) = (corpus::load(&left)?, corpus::load(&right)?);
+                let n = l.frames().min(r.frames());
+                let mut v = Vec::with_capacity(2 * n);
+                for i in 0..n {
+                    v.push(l.reference[i * l.channels]);
+                    v.push(r.reference[i * r.channels]);
+                }
+                Ok((2, v))
+            }),
+        ));
+    }
+    let schedule: Vec<(f64, i32)> =
+        (0..300).map(|k| (0.2 * k as f64, SWITCH_BITRATES[k % SWITCH_BITRATES.len()] * 1000)).collect();
+    let mut conditions = Vec::new();
+    for &rate in &[16_000, 24_000, 48_000] {
+        for &complexity in &[5, 9] {
+            conditions.push(
+                Condition::new("tsp_stereo", App::Voip, rate, 2, 8_000, complexity, 20_000).schedule(schedule.clone()),
+            );
+        }
+        for &bitrate in &[24_000, 32_000] {
+            conditions.push(Condition::new("tsp_stereo", App::Voip, rate, 2, bitrate, 5, 20_000));
+        }
+    }
+    Ok(EvalSet { name: "tsp_stereo".into(), groups: vec![group("tsp_stereo", SPEECH)], conditions, items })
 }
 
 /// The bitrates of the music baseline, in kb/s.

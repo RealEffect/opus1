@@ -294,8 +294,9 @@ pub mod silk {
     }
 }
 
-/// A test control of `OpusEncoder`, not part of the API: which high-pass
-/// filter feeds SILK with the `Voip` application at 48 kHz.
+/// Test controls of `OpusEncoder`, not part of the API: which high-pass
+/// filter feeds SILK with the `Voip` application at 48 kHz, and which
+/// residual energies set SILK's quantization gains.
 pub mod silk_input {
     /// With `true`, SILK reads the output of the integer high-pass filter
     /// `hp_cutoff` of libopus's fixed-point build at 48 kHz too, as it does
@@ -306,5 +307,18 @@ pub mod silk_input {
     /// fixed-point build. The setting survives `reset_state`.
     pub fn set_integer_hp_at_48k(enc: &mut crate::OpusEncoder, on: bool) {
         enc.set_integer_hp_at_48k(on);
+    }
+
+    /// With `true`, SILK takes its quantization gains from libopus's
+    /// residual energies alone, as libopus's fixed-point build does. These
+    /// energies come from the signal scaled by the inverse subframe gains
+    /// and rounded to 16 bits. The default, `false`, also computes them
+    /// from the unscaled signal and takes the gain they give when it is
+    /// less than half of libopus's: in a frame with a subframe near digital
+    /// silence the rounding error inflates libopus's energies. For tests
+    /// that compare packets with the fixed-point build. The setting
+    /// survives `reset_state`.
+    pub fn set_fixed_point_res_nrg(enc: &mut crate::OpusEncoder, on: bool) {
+        enc.set_fixed_point_res_nrg(on);
     }
 }

@@ -312,7 +312,13 @@ pub struct SilkEncoderState {
     /// Bits by which the coded packets have overshot the target rate, which
     /// the next frames pay back (libopus `nBitsExceeded`, 0..=10000).
     pub n_bits_exceeded: i32,
-
+    /// Test control, not part of libopus: with `true` the quantization gains
+    /// come from libopus's residual energies alone (`res_nrg` of
+    /// [`SilkEncoderControl`]), as in libopus's fixed-point build. With
+    /// `false`, the default, `silk_process_gains_fix` also reads
+    /// `res_nrg_unscaled`. [`SilkEncoder`](crate::silk::enc_api::SilkEncoder)
+    /// sets it before each packet.
+    pub fixed_point_res_nrg: bool,
 }
 
 impl Default for SilkEncoderState {
@@ -328,6 +334,7 @@ impl Default for SilkEncoderState {
             stereo: SilkStereoState::default(),
             n_bits_used_lbrr: 0,
             n_bits_exceeded: 0,
+            fixed_point_res_nrg: false,
         }
     }
 }
@@ -388,6 +395,13 @@ pub struct SilkEncoderControl {
     pub ltp_red_cod_gain_q7: i32,
     pub res_nrg: [i32; MAX_NB_SUBFR],
     pub res_nrg_q: [i32; MAX_NB_SUBFR],
+    /// Not part of libopus: the residual energy of each subframe computed
+    /// from the signal before its scaling by the inverse gains, and its Q
+    /// format. See `silk_res_nrg_unscaled_fix`.
+    pub res_nrg_unscaled: [i32; MAX_NB_SUBFR],
+    pub res_nrg_unscaled_q: [i32; MAX_NB_SUBFR],
+    /// `res_nrg_unscaled` holds this frame's energies.
+    pub has_res_nrg_unscaled: bool,
     pub last_gain_index_prev: i8,
 }
 
@@ -411,6 +425,9 @@ impl Default for SilkEncoderControl {
             ltp_red_cod_gain_q7: 0,
             res_nrg: [0; MAX_NB_SUBFR],
             res_nrg_q: [0; MAX_NB_SUBFR],
+            res_nrg_unscaled: [0; MAX_NB_SUBFR],
+            res_nrg_unscaled_q: [0; MAX_NB_SUBFR],
+            has_res_nrg_unscaled: false,
             last_gain_index_prev: 0,
         }
     }

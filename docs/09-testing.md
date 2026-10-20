@@ -21,14 +21,14 @@ Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-appl
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 273 | 1248 |
+| Integration tests in `tests/*.rs` | 274 | 1250 |
 | Unit tests inside `src/` | - | 374 |
 | Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (49) | - | 51 |
-| **Total** | | **1673** |
+| **Total** | | **1675** |
 
 30 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 16 directories of shared helper code (for example `tests/k24_common/` and `tests/analysis_common/`) and 6 files of recorded reference values (`*.expected`).
 
-A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1643 tests that are not ignored on Apple M4 Pro. It took 319 seconds, including the build of the test files that had changed.
+A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1645 tests that are not ignored on Apple M4 Pro (commit `5e899cd`).
 
 The 18 files of the neural network code (`tests/dnn_*.rs`) have no tests in the default build: they need a model feature, and 9 of them also need `test-libopus-dnn` (see [Tests of the neural network code](#tests-of-the-neural-network-code)).
 
@@ -117,7 +117,7 @@ A test file's name starts with a prefix that says what it covers. The counts are
 | Prefix | Files | Tests | What the files cover |
 |---|---:|---:|---|
 | `multistream_` | 35 | 288 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`), the surround analysis (`_surround_*`), and the speech and music analysis and DTX of each stream (`_analysis_libopus`, `_analysis_walk_libopus`, `_dtx_libopus`). |
-| `core_` | 34 | 221 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the stereo width estimate (`core_stereo_width_libopus`, bit for bit against libopus's `compute_stereo_width`), the speech and music analysis (`core_analysis_libopus`, and with settings that change during a stream `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`) and the decoder controls of the neural network features. |
+| `core_` | 35 | 223 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the stereo width estimate (`core_stereo_width_libopus`, bit for bit against libopus's `compute_stereo_width`), the speech and music analysis (`core_analysis_libopus`, and with settings that change during a stream `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`) and the decoder controls of the neural network features. |
 | `dnn_` | 18 | 0 | The neural network code: kernels, the layers of every network, weights, signal analysis, the models of deep PLC and of OSCE. Their tests compile only with a model feature (see [Tests of the neural network code](#tests-of-the-neural-network-code)). |
 | `perfk_` | 33 | 114 | Guards for the speed work. Each rewritten kernel is compared with the libopus function, with reference values recorded from libopus, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
 | `celtenc_` | 19 | 93 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching, the rate rules (`celtenc_rate_rules.rs`), the results of the speech and music analysis (`celtenc_analysis_info_libopus.rs`). |
@@ -202,7 +202,7 @@ Do not build this reference from the libopus source that the crate `opus-head-sy
 
 The fixed-point build and its driver programs are kept outside git, in the git-ignored folder `target/perf/fixed-1.6.1/`: `build.py SRC OUT [driver.c ...]` builds the library `OUT/libopus_fixed.a` and links each driver program in `drivers/`. Only the recorded values are in the repository, so the tests run without the C build.
 
-These tests require identical results: the same packets, or the same integers. In the recorded streams, the SILK-only packets of opus1 with the `Voip` application and 16-bit input (`OpusEncoder::encode_i16`) are byte for byte those of the fixed-point build. The same holds for 47 of the 49 SILK streams of the golden file. At 48 kHz opus1's SILK reads the float high-pass filter, not the fixed-point build's integer one (see [Differences from libopus](10-differences-from-libopus.md#deliberate-differences)). A test that compares packets at 48 kHz first calls the test control `internals::silk_input::set_integer_hp_at_48k`, which brings back the integer filter.
+These tests require identical results: the same packets, or the same integers. In the recorded streams, the SILK-only packets of opus1 with the `Voip` application and 16-bit input (`OpusEncoder::encode_i16`) are byte for byte those of the fixed-point build. The same holds for 47 of the 49 SILK streams of the golden file. At 48 kHz opus1's SILK reads the float high-pass filter, not the fixed-point build's integer one (see [Differences from libopus](10-differences-from-libopus.md#deliberate-differences)). A test that compares packets at 48 kHz first calls the test control `internals::silk_input::set_integer_hp_at_48k`, which brings back the integer filter. In rare frames opus1's SILK also takes a quantization gain from the residual energy of the unscaled signal, where the fixed-point build reads a residual energy with a large rounding error (see [Differences from libopus](10-differences-from-libopus.md#silk)). None of the recorded streams has such a frame. A test that needs the fixed-point build's gains in such frames calls the test control `internals::silk_input::set_fixed_point_res_nrg`.
 
 The fixed-point build runs libopus's speech and music analysis only at complexity 10, for input at 16 to 48 kHz (the float build runs it from complexity 7). opus1 has no such analysis. In the recorded streams at complexity 10 with 16 kHz input, and in `silk_wb_16k_mono_20k_vbr_c10_20ms` of the golden file, the packets are equal all the same. [Differences from libopus](10-differences-from-libopus.md#silk) lists the cases where the packets of longer streams start to differ.
 
@@ -338,6 +338,7 @@ The built-in sets (`examples/eval/sets.rs`):
 | `selftest` | 4 | 6 | 18 | 1.3 s |
 | `tsp` | 222 TSP files, 9 per talker (`examples/eval/sets/tsp_speech.txt`) | 40: `Voip`, mono, 48 kHz, 6 to 128 kb/s, 20 and 60 ms, complexity 5 and 10, in the groups `tsp_low`, `tsp_mid` and `tsp_high` | 8,880 | 169 to 212 s |
 | `tsp_rates` | the items of `tsp` | 64: `Voip`, mono, 16 and 24 kHz, 6 to 64 kb/s, 20 and 60 ms, complexity 5 and 10, in the same three groups. A control for changes meant for 48 kHz only. | 14,208 | 227 to 240 s |
+| `tsp_stereo` | 111 stereo items: the items of `tsp` in pairs, one on each channel, cut to the shorter one | 12 in the group `tsp_stereo`: `Voip`, stereo, 16, 24 and 48 kHz, 20 ms. Complexity 5 and 9 with the bitrate schedule of the mode-switching streams of `perf_harness` (8 to 128 kb/s, one step every 200 ms), and complexity 5 at 24 and 32 kb/s | 1,332 | 9.2 s |
 | `music` | 11 synthetic stereo items of 6 s | 16: `Audio`, stereo, 48 kHz, 64 to 160 kb/s, 20 and 60 ms, complexity 5 and 10, in the group `music_high` | 176 | |
 | `baseline` | `tsp` and `music` | 56 | 9,056 | 171.8 s |
 

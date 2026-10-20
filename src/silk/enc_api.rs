@@ -281,6 +281,7 @@ pub fn silk_encode_frame(
         &x_buf_copy,
         cond_coding,
     );
+    silk_res_nrg_unscaled_fix(ps_enc, &mut s_enc_ctrl, x_tmp_frame, &x_buf_copy);
 
     silk_process_gains_fix(ps_enc, &mut s_enc_ctrl, cond_coding);
 
@@ -1411,6 +1412,10 @@ pub struct SilkControl {
     /// The caller can change the internal rate on this packet
     /// (`opusCanSwitch`).
     pub opus_can_switch: bool,
+    /// Test control, not part of libopus: the quantization gains come from
+    /// libopus's residual energies alone, as in libopus's fixed-point build
+    /// (see `SilkEncoderState::fixed_point_res_nrg`).
+    pub fixed_point_res_nrg: bool,
     /// In and out: SILK's speech activity is low enough for a bandwidth
     /// switch to go unheard (`allowBandwidthSwitch`). The rate switch reads
     /// the value of the packet before.
@@ -1636,6 +1641,9 @@ impl SilkEncoder {
             for ch in self.coded_channels(2) {
                 ch.state.s_cmn.first_frame_after_reset = 1;
             }
+        }
+        for ch in core::iter::once(&mut *self.mid).chain(self.side.as_deref_mut()) {
+            ch.state.fixed_point_res_nrg = ctl.fixed_point_res_nrg;
         }
         let (mid, side, x) = self.coded_packet(sch, n);
         let ret = silk_encode_packet(

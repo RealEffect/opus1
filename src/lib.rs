@@ -673,6 +673,14 @@ pub struct OpusEncoder {
     /// and SILK codes it. Only tests that compare packets with the
     /// fixed-point build turn it on (`internals::silk_input`).
     integer_hp_at_48k: bool,
+    /// Test control: SILK's quantization gains come from libopus's residual
+    /// energies alone, as in the fixed-point build of libopus. Off by
+    /// default: in a frame whose subframe gains differ a lot, those
+    /// energies hold a large rounding error, and opus1 then takes the gain
+    /// from the energies of the unscaled signal (see
+    /// `silk_process_gains_fix`). Only tests that compare packets with the
+    /// fixed-point build turn it on (`internals::silk_input`).
+    fixed_point_res_nrg: bool,
 
     #[cfg(not(feature = "heap"))]
     buf_filtered: FixedVec<i16, OPUS_MAX_FRAME>,
@@ -1295,6 +1303,7 @@ impl OpusEncoder {
             variable_hp_smth2_q15,
             hp_mem: FixedVec::from_value(0, channels * 2),
             integer_hp_at_48k: false,
+            fixed_point_res_nrg: false,
 
             #[cfg(not(feature = "heap"))]
             buf_filtered: FixedVec::new(),
@@ -2038,6 +2047,12 @@ impl OpusEncoder {
         self.integer_hp_at_48k = on;
     }
 
+    /// The test control of `internals::silk_input`: with `true`, SILK's
+    /// quantization gains come from libopus's residual energies alone.
+    pub(crate) fn set_fixed_point_res_nrg(&mut self, on: bool) {
+        self.fixed_point_res_nrg = on;
+    }
+
     /// libopus `OPUS_SET_EXPERT_FRAME_DURATION`: the duration of the frames
     /// the encoder codes.
     ///
@@ -2204,8 +2219,9 @@ impl OpusEncoder {
         fresh.silk_lbrr_coded = self.silk_lbrr_coded;
         fresh.silk_allow_bandwidth_switch = self.silk_allow_bandwidth_switch;
         fresh.silk_in_wb_mode_without_variable_lp = self.silk_in_wb_mode_without_variable_lp;
-        // A test control, not codec state.
+        // Test controls, not codec state.
         fresh.integer_hp_at_48k = self.integer_hp_at_48k;
+        fresh.fixed_point_res_nrg = self.fixed_point_res_nrg;
         // C `signal_type`, `voice_ratio` and `lsb_depth` lie before
         // `OPUS_ENCODER_RESET_START` too. The analysis state lies before it
         // as well, but `tonality_analysis_reset` clears it, which `new`
@@ -3012,6 +3028,7 @@ impl OpusEncoder {
                 reduced_dependency: self.prediction_disabled,
                 opus_can_switch: self.silk_opus_can_switch,
                 allow_bandwidth_switch: self.silk_allow_bandwidth_switch,
+                fixed_point_res_nrg: self.fixed_point_res_nrg,
                 ..SilkControl::default()
             };
             let result = self.silk.encode(&mut silk_ctl, silk_input, silk_prefill, &mut self.rc);

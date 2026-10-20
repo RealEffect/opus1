@@ -147,61 +147,166 @@ pub fn silk_find_pred_coefs_fix(
     );
 }
 
+/// The noise shaping gains after the reduction for voiced frames that
+/// `silk_process_gains_fix` applies first (libopus lines 51-57), and the
+/// inverse squared maximum of the target SNR (lines 59-61).
+fn gains_before_res_nrg(ps_enc: &SilkEncoderState, ps_enc_ctrl: &SilkEncoderControl) -> ([i32; MAX_NB_SUBFR], i32) {
+    let mut gains_q16 = ps_enc_ctrl.gains_q16;
+    if ps_enc.s_cmn.indices.signal_type == TYPE_VOICED as i8 {
+        let s_q15 = -silk_sigm_q15(silk_rshift_round(
+            ps_enc_ctrl.ltp_red_cod_gain_q7 - (12.0 * 128.0) as i32,
+            4,
+        ));
+        for g in gains_q16.iter_mut().take(ps_enc.s_cmn.nb_subfr as usize) {
+            *g = silk_smlawb(*g, *g, s_q15);
+        }
+    }
+    let log2lin_arg = silk_smulwb(
+        ((21.0 + 16.0 / 0.33) * 128.0) as i32 - ps_enc.s_cmn.snr_db_q7,
+        21627_i32,
+    );
+    let inv_max_sqr_val_q16 = silk_div32_16(silk_log2lin(log2lin_arg), ps_enc.s_cmn.subfr_length);
+    (gains_q16, inv_max_sqr_val_q16)
+}
+
+/// Not part of libopus: the residual energy of each subframe computed from
+/// the signal before its scaling, into `res_nrg_unscaled`. Runs between
+/// `silk_find_pred_coefs_fix` and `silk_process_gains_fix`, with the same
+/// `x` and `x_buf_full`.
+///
+/// `silk_find_pred_coefs_fix` computes `res_nrg` from each subframe times
+/// `inv_gains_q16`, which is the smallest gain of the frame over the
+/// subframe's gain, times 1/4, rounded to 16 bits. When one subframe is near
+/// digital silence and another is not, the louder one can be scaled down by
+/// a factor of 50 or more. The rounding error is then about as large as the
+/// scaled signal, and `res_nrg` comes out several times too large. libopus's
+/// float build computes its energies without that rounding. `silk_process_gains_fix`
+/// uses the energies of this function when `res_nrg` gives a subframe more
+/// than twice the gain that they give.
+///
+/// The work is skipped, and `has_res_nrg_unscaled` stays false, when no
+/// subframe can be affected: when `res_nrg` gives every subframe at most 1.5
+/// times its noise shaping gain. The gain from any residual energy is at
+/// least the noise shaping gain, less the error of `silk_sqrt_approx`, so
+/// it cannot then be more than twice the gain from `res_nrg_unscaled`. The
+/// work is also skipped with the test control `fixed_point_res_nrg`.
+pub fn silk_res_nrg_unscaled_fix(
+    ps_enc: &SilkEncoderState,
+    ps_enc_ctrl: &mut SilkEncoderControl,
+    x: &[i16],
+    x_buf_full: &[i16],
+) {
+    ps_enc_ctrl.has_res_nrg_unscaled = false;
+    if ps_enc.fixed_point_res_nrg {
+        return;
+    }
+    let nb_subfr = ps_enc.s_cmn.nb_subfr as usize;
+    let (gains_q16, inv_max_sqr_val_q16) = gains_before_res_nrg(ps_enc, ps_enc_ctrl);
+    let may_halve = (0..nb_subfr).any(|k| {
+        let gain = gain_with_res_nrg(gains_q16[k], ps_enc_ctrl.res_nrg[k], ps_enc_ctrl.res_nrg_q[k], inv_max_sqr_val_q16);
+        2 * gain as i64 > 3 * gains_q16[k] as i64
+    });
+    if !may_halve {
+        return;
+    }
+    let subfr_length = ps_enc.s_cmn.subfr_length as usize;
+    let predict_lpc_order = ps_enc.s_cmn.predict_lpc_order as usize;
+    let mut x_pre = [0i16; MAX_NB_SUBFR * MAX_LPC_ORDER + MAX_FRAME_LENGTH];
+    if ps_enc.s_cmn.indices.signal_type == TYPE_VOICED as i8 {
+        // An inverse gain of 1.0 in Q16 leaves the LTP residual as it is.
+        silk_ltp_analysis_filter_fix(
+            &mut x_pre,
+            x_buf_full,
+            ps_enc.s_cmn.ltp_mem_length as usize - predict_lpc_order,
+            &ps_enc_ctrl.ltp_coef_q14,
+            &ps_enc_ctrl.pitch_l,
+            &[1 << 16; MAX_NB_SUBFR],
+            subfr_length,
+            nb_subfr,
+            predict_lpc_order,
+        );
+    } else {
+        let n = subfr_length + predict_lpc_order;
+        for i in 0..nb_subfr {
+            let start = i * subfr_length;
+            x_pre[i * n..(i + 1) * n].copy_from_slice(&x[start..start + n]);
+        }
+    }
+    // The gains of `silk_residual_energy_fix` are in Q0: 1 leaves the
+    // energies unscaled.
+    silk_residual_energy_fix(
+        &mut ps_enc_ctrl.res_nrg_unscaled,
+        &mut ps_enc_ctrl.res_nrg_unscaled_q,
+        &x_pre,
+        &ps_enc_ctrl.pred_coef_q12,
+        &[1; MAX_NB_SUBFR],
+        ps_enc.s_cmn.subfr_length,
+        ps_enc.s_cmn.nb_subfr,
+        ps_enc.s_cmn.predict_lpc_order,
+    );
+    ps_enc_ctrl.has_res_nrg_unscaled = true;
+}
+
+/// libopus `silk_process_gains_FIX`, lines 64-84: the gain of a subframe
+/// from its gain `gain_q16` of the noise shaping analysis and its residual
+/// energy `res_nrg` in Q`res_nrg_q`, at the inverse squared maximum
+/// `inv_max_sqr_val_q16` that the target SNR gives.
+fn gain_with_res_nrg(gain_q16: i32, res_nrg: i32, res_nrg_q: i32, inv_max_sqr_val_q16: i32) -> i32 {
+    let mut res_nrg_part = silk_smulww(res_nrg, inv_max_sqr_val_q16);
+    if res_nrg_q > 0 {
+        res_nrg_part = silk_rshift_round(res_nrg_part, res_nrg_q);
+    } else {
+        let neg_q = (-res_nrg_q).min(30);
+        if neg_q == 0 || res_nrg_part >= (i32::MAX >> neg_q) {
+            res_nrg_part = if neg_q == 0 { res_nrg_part } else { i32::MAX };
+        } else {
+            res_nrg_part <<= neg_q;
+        }
+    }
+    let mut gain_squared_q16 = silk_add_sat32(res_nrg_part, silk_smmul(gain_q16, gain_q16));
+    if gain_squared_q16 < i16::MAX as i32 {
+        gain_squared_q16 = silk_smlaww(res_nrg_part << 16, gain_q16, gain_q16);
+        let gain = silk_min_32(silk_sqrt_approx(gain_squared_q16), i32::MAX >> 8);
+        silk_lshift_sat32(gain, 8)
+    } else {
+        let gain = silk_min_32(silk_sqrt_approx(gain_squared_q16), i32::MAX >> 16);
+        silk_lshift_sat32(gain, 16)
+    }
+}
+
 pub fn silk_process_gains_fix(
     ps_enc: &mut SilkEncoderState,
     ps_enc_ctrl: &mut SilkEncoderControl,
     cond_coding: i32,
 ) {
+    let (gains_q16, inv_max_sqr_val_q16) = gains_before_res_nrg(ps_enc, ps_enc_ctrl);
     let ps_shape_st = &mut ps_enc.s_shape;
-    let s_q15: i32;
-    let mut gain_q16: i32;
-    let mut gain_squared_q16: i32;
-    let mut res_nrg_part: i32;
-
-    if ps_enc.s_cmn.indices.signal_type == TYPE_VOICED as i8 {
-        s_q15 = -silk_sigm_q15(silk_rshift_round(
-            ps_enc_ctrl.ltp_red_cod_gain_q7 - (12.0 * 128.0) as i32,
-            4,
-        ));
-        for k in 0..ps_enc.s_cmn.nb_subfr as usize {
-            ps_enc_ctrl.gains_q16[k] =
-                silk_smlawb(ps_enc_ctrl.gains_q16[k], ps_enc_ctrl.gains_q16[k], s_q15);
-        }
-    }
-
-    let log2lin_arg = silk_smulwb(
-        ((21.0 + 16.0 / 0.33) * 128.0) as i32 - ps_enc.s_cmn.snr_db_q7,
-        21627_i32,
-    );
-    let log2lin_val = silk_log2lin(log2lin_arg);
-    let inv_max_sqr_val_q16 = silk_div32_16(log2lin_val, ps_enc.s_cmn.subfr_length);
 
     for k in 0..ps_enc.s_cmn.nb_subfr as usize {
-        let res_nrg = ps_enc_ctrl.res_nrg[k];
-        res_nrg_part = silk_smulww(res_nrg, inv_max_sqr_val_q16);
-        if ps_enc_ctrl.res_nrg_q[k] > 0 {
-            res_nrg_part = silk_rshift_round(res_nrg_part, ps_enc_ctrl.res_nrg_q[k]);
-        } else {
-            let neg_q = (-ps_enc_ctrl.res_nrg_q[k]).min(30);
-            if neg_q == 0 || res_nrg_part >= (i32::MAX >> neg_q) {
-                res_nrg_part = if neg_q == 0 { res_nrg_part } else { i32::MAX };
-            } else {
-                res_nrg_part <<= neg_q;
+        let gain_q16 = gains_q16[k];
+        let mut gain =
+            gain_with_res_nrg(gain_q16, ps_enc_ctrl.res_nrg[k], ps_enc_ctrl.res_nrg_q[k], inv_max_sqr_val_q16);
+        // Not part of libopus: when the residual energy of the unscaled
+        // signal gives less than half the gain, the energy above is mostly
+        // the rounding error of the scaled signal (see
+        // `silk_res_nrg_unscaled_fix`), and the subframe takes the smaller
+        // gain. At a low SNR the residual energy decides the gain. A gain
+        // that is too large plays the quantizer's offset and the subframe's
+        // few pulses too loudly. This made bursts of energy below 200 Hz
+        // where a stereo stream stops coding its side channel, or where a
+        // signal ends in digital silence.
+        if ps_enc_ctrl.has_res_nrg_unscaled {
+            let unscaled = gain_with_res_nrg(
+                gain_q16,
+                ps_enc_ctrl.res_nrg_unscaled[k],
+                ps_enc_ctrl.res_nrg_unscaled_q[k],
+                inv_max_sqr_val_q16,
+            );
+            if gain as i64 > 2 * unscaled as i64 {
+                gain = unscaled;
             }
         }
-        gain_q16 = ps_enc_ctrl.gains_q16[k];
-        gain_squared_q16 = silk_add_sat32(res_nrg_part, silk_smmul(gain_q16, gain_q16));
-        if gain_squared_q16 < i16::MAX as i32 {
-            gain_squared_q16 = silk_smlaww(res_nrg_part << 16, gain_q16, gain_q16);
-
-            gain_q16 = silk_sqrt_approx(gain_squared_q16);
-            gain_q16 = silk_min_32(gain_q16, i32::MAX >> 8);
-            ps_enc_ctrl.gains_q16[k] = silk_lshift_sat32(gain_q16, 8);
-        } else {
-            gain_q16 = silk_sqrt_approx(gain_squared_q16);
-            gain_q16 = silk_min_32(gain_q16, i32::MAX >> 16);
-            ps_enc_ctrl.gains_q16[k] = silk_lshift_sat32(gain_q16, 16);
-        }
+        ps_enc_ctrl.gains_q16[k] = gain;
     }
 
     for k in 0..ps_enc.s_cmn.nb_subfr as usize {
