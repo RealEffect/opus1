@@ -32,7 +32,8 @@ Every other module is private. The tests, benchmarks, examples and fuzz targets 
 |---|---|---|
 | `src/lib.rs` | `OpusEncoder` and `OpusDecoder`: mode and bandwidth decisions, in-band forward error correction (FEC) decisions, mode switches with redundant CELT frames, packets of 40 to 120 milliseconds (ms), discontinuous transmission (DTX), packet loss, `pcm_soft_clip`. The encoder runs the speech and music analysis of `src/analysis/` and hands its result to these decisions and to the CELT encoder. | `src/opus_encoder.c`, `src/opus_decoder.c`, `opus_pcm_soft_clip` in `src/opus.c` |
 | `src/internals.rs` | The internal items that the tests, benchmarks, examples and fuzz targets use (see above). | none |
-| `src/packet.rs` | Reading, writing and padding packets; self-delimited framing; checks of multistream packets. | `opus_packet_parse_impl` in `src/opus.c`, `src/repacketizer.c`, `opus_multistream_packet_validate` in `src/opus_multistream_decoder.c` |
+| `src/packet.rs` | Reading, writing and padding packets; the repacketizer, which carries packet extensions; self-delimited framing; checks of multistream packets. | `opus_packet_parse_impl` in `src/opus.c`, `src/repacketizer.c`, `opus_multistream_packet_validate` in `src/opus_multistream_decoder.c` |
+| `src/extensions.rs` | Packet extensions in the padding of a packet: reading them (`ExtensionIterator`, `count`, `parse`) and writing them (`generate`). | `src/extensions.c` |
 | `src/hp_cutoff.rs` | The encoder's input filters: the high-pass filter for speech (`hp_cutoff`, `hp_cutoff_float`) and, for other audio, the filter that removes the constant (DC, direct current) part of the signal (`dc_reject_float`). The integer filters use the second-order filter of `src/silk/sigproc_fix.rs`. | `hp_cutoff` and `dc_reject` in `src/opus_encoder.c` |
 | `src/range_coder.rs` | `RangeCoder`: the range encoder and decoder, bit counting (`tell`, `tell_frac`), Laplace-distributed symbols. | `celt/entenc.c`, `celt/entdec.c`, `celt/entcode.c`, `celt/laplace.c` |
 | `src/fixedvec.rs` | `FixedVec<T, N>`: a growable buffer with a fixed capacity, stored inline. See [Feature flags and where state is stored](#feature-flags-and-where-state-is-stored). | none |
@@ -197,10 +198,24 @@ libopus 1.5 and later run small neural networks in the decoder: deep packet loss
 
 The weights are files of the repository, not Rust code:
 
-- `dnn-weights/` holds one blob per network in libopus's blob format (`pitchdnn.bin`, `plc.bin`, `fargan.bin`, `lace.bin`, `nolace.bin`, `bbwenet.bin`), their SHA-256 sums (Secure Hash Algorithm, 256 bits; file `SHA256SUMS`), the libopus version and the sums of the C files they come from (`VERSION`), and libopus's licence (`COPYING`).
+- `dnn-weights/` holds one blob per network in libopus's blob format (`pitchdnn.bin`, `plc.bin`, `fargan.bin`, `dred_rdovae_enc.bin`, `dred_rdovae_dec.bin`, `lace.bin`, `nolace.bin`, `bbwenet.bin`), their SHA-256 sums (Secure Hash Algorithm, 256 bits; file `SHA256SUMS`), the libopus version and the sums of the C files they come from (`VERSION`), and libopus's licence (`COPYING`).
 - `tools/dnn-gen/` is a separate Cargo package, not published. It reads `dnn/*_data.c` and `dnn/*_data.h` of a libopus release and writes `dnn-weights/`, `src/dnn/models/<network>.rs` and `tests/dnn_gen/mod.rs` (the C structs and symbols that the tests against libopus use). Run again on the same release, it writes the same files. Its `README.md` explains how to update the weights to a later release.
 
-The DRED networks (deep redundancy) are not included. The generator can write them, for a later `dred` feature.
+The feature `dred` (deep redundancy) adds the two DRED networks, the RDOVAE encoder and decoder (`models/dred_rdovae_enc.rs`, `models/dred_rdovae_dec.rs`), the constants of the RDOVAE and the tables of DRED's quantizer (`models/dred_rdovae_stats.rs`, also generated), and the encoder and decoder sides of DRED in `dred/`. `ModelSet` does not load the DRED networks: in libopus the encoder and the DRED decoder hold them, not the Opus decoder.
+
+- `builtin::rdovae_dec()` builds the built-in RDOVAE decoder once per process. `holder::DredDecoderDnn` holds it, or one loaded from a blob, for an `OpusDredDecoder`.
+- `builtin::dred_enc()` builds the models of the DRED encoder once per process: the RDOVAE encoder and PitchDNN (`models::DredEncModels`), which load together as in libopus. `holder::DredEncoderDnn` holds them, or those loaded from a blob, for an `OpusEncoder`.
+
+| File | What it does | libopus counterpart |
+|---|---|---|
+| `dred/mod.rs` | The constants of `dnn/dred_config.h`. | `dnn/dred_config.h` |
+| `dred/decoder.rs` | `OpusDredDecoder` (the weights and the kernel variant), `OpusDred` (the DRED data of one packet: initial state, latent vectors, features), `DredParse`, the search for the DRED extension, and the reading of the range-coded payload. | `OpusDREDDecoder`, `opus_dred_parse`, `opus_dred_process`, `dred_find_payload` of `src/opus_decoder.c`; `dnn/dred_decoder.c` |
+| `dred/rdovae_dec.rs` | The RDOVAE decoder network: the GRU states from the initial state, then four frames of features per latent vector. | `dnn/dred_rdovae_dec.c` |
+| `dred/coding.rs` | `compute_quantizer`, the quantizer level of each latent vector. | `dnn/dred_coding.c` |
+| `dred/encoder.rs` | `DredEncoder`, the DRED part of an `OpusEncoder`: the share of the bitrate, the conversion to 16 kHz, the feature analysis and the RDOVAE encoder every 20 ms, the latent vectors and the voice activity of the last second, and the quantized DRED data of a packet. | `dnn/dred_encoder.c`; `compute_dred_bitrate`, `estimate_dred_bitrate` and the DRED fields of `src/opus_encoder.c` |
+| `dred/rdovae_enc.rs` | The RDOVAE encoder network: one latent vector and one initial state from the features of two 10 ms frames. | `dnn/dred_rdovae_enc.c` |
+
+The range coder has four functions for DRED: `RangeCoder::decode_icdf16` and `laplace_decode_p0` for the decoder, `encode_icdf16` and `laplace_encode_p0` for the encoder (libopus `ec_dec_icdf16`, `ec_laplace_decode_p0`, `ec_enc_icdf16`, `ec_laplace_encode_p0`). The Opus encoder calls the DRED encoder from `encode_impl`, `encode_frame`, `finish_frame` and `encode_multiframe` in `src/lib.rs` ([The encoder](03-encoder.md#18-deep-redundancy-dred)).
 
 ### What is not ported
 
@@ -208,8 +223,9 @@ The DRED networks (deep redundancy) are not included. The generator can write th
 
 - The projection encoder and decoder (`src/opus_projection_*.c`, `src/mapping_matrix.c`), which code ambisonics through a mixing matrix (mapping family 3). Mapping family 2, ambisonics without a matrix, is supported by the multistream code.
 - The floating-point SILK encoder (`silk/float/`). `opus1` ports the fixed-point one.
-- Deep REDundancy (DRED), which libopus builds only with `--enable-dred`. Deep packet loss concealment, LACE, NoLACE and the bandwidth extension are ported and run in the decoder (see [Neural network code](#neural-network-code-srcdnn)); libopus builds them only with `--enable-deep-plc` and `--enable-osce`.
 - The scalable quality extension (QEXT), which libopus 1.6 builds only with `--enable-qext`.
+
+The other optional parts of libopus are ported: deep packet loss concealment, LACE, NoLACE and the bandwidth extension, which run in the decoder, and Deep REDundancy (DRED) in the encoder and the decoder (see [Neural network code](#neural-network-code-srcdnn)). libopus builds them only with `--enable-deep-plc`, `--enable-osce` and `--enable-dred`.
 
 ## Main types and what they own
 
@@ -306,6 +322,8 @@ With the feature `deep-plc`, `OpusDecoder` holds one `DeepPlc`. libopus passes i
 | `silk_plc_glue_frames` (`src/silk/plc.rs`) | The fade-in of the first good frame after a loss is skipped at 16 kHz, in every build with the feature and at every complexity. | `silk/PLC.c:477-480` |
 | `CeltDecoder::decode_with_deep_plc` (`src/celt.rs`) | A frame with data ends the loss of deep PLC (`DeepPlc::clear_blend`). | `celt/celt_decoder.c:1288-1293` |
 | `CeltDecoder::conceal` (`src/celt.rs`) | Deep PLC takes over when the start band is 0, the models are loaded, the complexity is 5 or more, the loss is shorter than 200 ms and noise is not forced (`skip_plc`). On the first such frame the last 2048 samples of the history go to `DeepPlc::update_from_celt` before the history moves. On later frames the pitch period repetition is skipped, because deep PLC overwrites all it would write. `conceal_neural` then fills `plc_pcm` with deep PLC output, upsamples it from 16 to 48 kHz, applies the pre-emphasis, copies channel 0 to channel 1, and on the first frame cross-fades from the pitch period repetition. | `celt/celt_decoder.c:726-736`, `820-831`, `1020-1075` |
+| `OpusDecoder::queue_dred_features` (`src/lib.rs`, feature `dred`) | Before the concealment of `dred_decode`, the DRED features of the lost time go into the queue of `DeepPlc` (`fec_clear`, `fec_add`). Deep PLC takes them instead of its predictions. | `src/opus_decoder.c:735-758` |
+| `CeltDecoder::conceal` with queued DRED features (feature `dred`) | Deep PLC conceals whatever the complexity and the length of the loss (`FrameType::Dred`, libopus `FRAME_DRED`). Such a frame sets `plc_duration` to 0 and clears `skip_plc`. | `celt/celt_decoder.c:731-734`, `1082-1087` |
 | `OpusDecoder::reset_state` | `DeepPlc::reset` clears everything but FARGAN. `CeltDecoder::reset_state` clears `plc_pcm` and its fill level and memory; `set_complexity` passes the complexity to the CELT decoder, and a reset keeps it. | `src/opus_decoder.c:1064`, `1120`; `celt/celt_decoder.c:1729-1738` |
 
 The CELT decoder gets the deep PLC state in the main call of a frame: for a frame with data, a lost frame, the concealment of the CELT layer in an FEC decode, and the 5 ms of concealment that bridge a mode switch without a redundancy frame. The redundancy frames and the 2.5 ms fade-out frame get `None`, as libopus passes `NULL` there.
@@ -338,7 +356,7 @@ libopus 1.6.1 sets the extended mode only in its SILK section, so after BBWE fra
 
 ## Feature flags and where state is stored
 
-The crate has four features that decide how it is built: `std`, `heap` and `analysis` (all on by default) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
+The crate has four features that decide how it is built: `std`, `heap` and `analysis` (all on by default) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`, `dred`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
 
 - **`std`** selects `#![no_std]` when it is off (`#![cfg_attr(not(feature = "std"), no_std)]` in `src/lib.rs`). It also enables the run-time processor checks in `src/compat.rs` and `src/kiss_fft.rs`, and the `multistream` module, which uses `Vec`.
 - **`libm`** is required when `std` is off. `src/compat.rs` stops the build with `compile_error!` if both are missing. Its `Math` trait gives `f32` and `f64` the methods `sqrt`, `sin`, `exp2` and so on through the `libm` crate. Each module that needs them imports the trait under `#[cfg(not(feature = "std"))]`; with `std` the inherent methods of `f32` are used instead.
@@ -362,7 +380,7 @@ Below the Opus layer nothing allocates. The CELT, SILK and range coder states st
 
 The neural network features follow the same rules:
 
-- `dnn` compiles `src/dnn/`. `deep-plc`, `osce` and `osce-bwe` each turn on the one before and `dnn`. Each embeds the weights of its networks and adds its groups to `ModelSet` and `DecoderDnn`. `#[cfg(feature = "...")]` on the fields and match arms keeps a build without a feature free of its code and its weights.
+- `dnn` compiles `src/dnn/`. `deep-plc`, `osce` and `osce-bwe` each turn on the one before and `dnn`. Each embeds the weights of its networks and adds its groups to `ModelSet` and `DecoderDnn`. `dred` turns on `deep-plc` and embeds the two RDOVAE networks; an `OpusDredDecoder` holds the RDOVAE decoder, not `ModelSet`. `#[cfg(feature = "...")]` on the fields and match arms keeps a build without a feature free of its code and its weights.
 - With `heap`, `OpusDecoder` holds `DecoderDnn` in a `Box`, and the layers of a group loaded from a blob are in a `Box` too. Without `heap`, `DecoderDnn` is inline and has room for the layers of every group. Blobs then must be `'static`, because there is no heap to copy them to.
 - `test-libopus-dnn` adds nothing to the library. Test files that call a libopus built with its neural network code start with `#![cfg(feature = "test-libopus-dnn")]` (see [Testing](09-testing.md#tests-of-the-neural-network-code)).
 
@@ -438,14 +456,14 @@ FEAT_FCMA is an ARMv8.3 extension with two instructions for complex numbers: `fc
 
 ### `tests/`
 
-The repository holds 274 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
+The repository holds 280 test files in `tests/`, plus helper modules in subdirectories. More than half of them run the same input through `opus1` and through C libopus. They compare packets, decoded samples or internal values. libopus is linked through the `opus` crate and `audiopus_sys` (see [building without cmake](06-using-the-library.md#building-and-testing-on-a-machine-without-cmake)). [Testing](09-testing.md) explains what the tests check and how to run each part. The file name prefix says what a test covers:
 
 | Prefix | Files | What the tests cover |
 |---|---:|---|
 | `perfk_` | 33 | Single kernels after performance work, against the same function inside libopus or a reference version: FFT, PVQ, range coder, pitch, SILK analysis and quantizer. Four `.expected` files hold reference output. |
 | `multistream_` | 35 | The multistream encoder and decoder: `multistream_c_*` against libopus's own functions, `multistream_enc_*` and `multistream_dec_*` for each side, `multistream_e2e_*` end to end, `multistream_surround_*` for the surround masking analysis, `multistream_analysis_libopus`, `multistream_analysis_walk_libopus` and `multistream_dtx_libopus` for the analysis and DTX of each stream. |
-| `core_` | 35 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits, the speech and music analysis (`core_analysis_libopus`, `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`), the high-pass filter in front of SILK (`core_voip_input_filter`), the decoder controls of the neural network features. |
-| `dnn_` | 18 | The neural network code: kernels and their edge cases, layers of every network, weights, signal analysis, the models of deep PLC and OSCE, and both inside the decoder. The 8 files that end in `_libopus` and `dnn_freq_burg.rs` need a libopus built with its neural network code (see [Testing](09-testing.md#tests-of-the-neural-network-code)). |
+| `core_` | 36 | `OpusEncoder` and `OpusDecoder` entry points and controls against libopus: loss, FEC, mode switches, channel changes, limits, the speech and music analysis (`core_analysis_libopus`, `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`), the high-pass filter in front of SILK (`core_voip_input_filter`), the decoder controls of the neural network features. `core_packet` and `core_packet_extensions_libopus` test the packet functions, the repacketizer and the packet extensions against libopus's own functions. |
+| `dnn_` | 23 | The neural network code: kernels and their edge cases, layers of every network, weights, signal analysis, the models of deep PLC and OSCE, both inside the decoder, and the DRED decoder. The 10 files that end in `_libopus` and `dnn_freq_burg.rs` need a libopus built with its neural network code (`dnn_dred_libopus.rs` and `dnn_dred_decode_libopus.rs` one built with DRED) (see [Testing](09-testing.md#tests-of-the-neural-network-code)). |
 | `analysis_` | 3 | The speech and music analysis alone against libopus's `run_analysis` and network, and its properties. |
 | `k24_` | 21 | The 24 kHz path: encoder modes, Hybrid super-wideband, SILK internals and loss, and the decoder matrix of every mode and bandwidth at every output rate. |
 | `celtenc_`, `celtdec_`, `celt_` | 19, 4, 8 | The CELT encoder and decoder. |

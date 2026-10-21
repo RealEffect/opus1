@@ -79,6 +79,8 @@ The packet is coded at the bitrate of the setting (`set_bitrate`), or at the bit
 
 With a constant bitrate (`set_vbr(false)`) the packet size is fixed: the number of whole bytes that the bitrate gives the frame, rounded to the nearest byte and capped by the buffer. The bitrate becomes the rate of those bytes.
 
+With deep redundancy on (feature `dred`, see [1.8](#18-deep-redundancy-dred)), DRED then takes its share of this bitrate. Every later decision of the packet, from the test below to the bitrates of SILK and CELT, uses what is left.
+
 When the packet has no room to code anything, the encoder writes a TOC-only packet instead (`write_placeholder`). That happens in these cases:
 
 - the packet has fewer than 3 bytes;
@@ -362,7 +364,7 @@ Longer frames are split into parts, as libopus splits them (opus_encoder.c lines
 | SILK-only | one frame | one frame | 2 × 40 ms | 5 × 20 ms | 2 × 60 ms |
 | CELT-only, Hybrid | 2 × 20 ms | 3 × 20 ms | 4 × 20 ms | 5 × 20 ms | 6 × 20 ms |
 
-`encode_multiframe` codes each part through `encode_frame` with the decisions of the whole packet. `packet::write` then joins them into one packet with frame count code 1, 2 or 3 (libopus does this with its repacketizer). Each part gets its share of the packet, after the bytes the header of the packet can need. A switch to CELT-only is announced in the last part only.
+`encode_multiframe` codes each part through `encode_frame` with the decisions of the whole packet. The repacketizer (`packet::Repacketizer`, as in libopus) then joins them into one packet with frame count code 1, 2 or 3, with the extensions of their padding. Each part gets its share of the packet, after the bytes the header of the packet can need. With DRED, each part gives up its share of the DRED bytes of the packet, and the first part that is coded gets them all: its padding carries the DRED data. A switch to CELT-only is announced in the last part only.
 
 libopus 1.6 also limits each part of a VBR packet to what the bitrate gives one part (opus_encoder.c line 1785). That limit is left out on purpose. In libopus it costs up to 23 decibels (dB) of signal-to-noise ratio with in-band FEC on.
 
@@ -390,6 +392,55 @@ With `set_dtx(true)` (`OPUS_SET_DTX`) the encoder leaves out frames while the in
 The activity of a frame also reaches SILK without DTX: a frame that the analysis or the silence test finds inactive makes SILK mark it as without voice activity (C 1909-1925).
 
 `in_dtx()` (`OPUS_GET_IN_DTX`) says whether the encoder is in a DTX pause. A packet of several frames counts its frames of one byte. With CBR such a packet is padded only when not all of its frames were left out. `MultistreamEncoder::set_dtx` sets every stream.
+
+### 1.8 Deep redundancy (DRED)
+
+With the cargo feature `dred`, `set_dred_duration(n)` (libopus `OPUS_SET_DRED_DURATION`) makes each packet carry a compressed description of up to `n` frames of 10 ms of the speech before its end. `n` goes from 0 to 104; 0, the default, turns DRED off. A decoder rebuilds lost packets from this data with deep packet loss concealment (see [The decoder](04-decoder.md#10-deep-redundancy-dred-dred_decode)). The code is a port of libopus 1.6.1:
+
+| opus1 | libopus |
+|---|---|
+| `src/dnn/dred/encoder.rs`: `DredEncoder` | `dnn/dred_encoder.c`, and the DRED fields and steps of `src/opus_encoder.c` |
+| `src/dnn/dred/rdovae_enc.rs`: the RDOVAE encoder network | `dnn/dred_rdovae_enc.c` |
+| `RangeCoder::encode_icdf16`, `laplace_encode_p0` | `ec_enc_icdf16`, `ec_laplace_encode_p0` |
+| `encode_impl`, `encode_frame`, `finish_frame`, `encode_multiframe` in `src/lib.rs` | `opus_encode_native`, `opus_encode_frame_native` |
+
+**1. The share of the bitrate** (`compute_bitrate`, C `compute_dred_bitrate`, opus_encoder.c lines 687-730). It is computed once per packet, after the size of a constant-bitrate packet is fixed:
+
+- The fraction of the bitrate starts from the expected loss (`set_packet_loss_perc`). With in-band FEC it is min(0.7, 3 × loss / 100), over the bitrate above 20 kb/s. Without FEC it is min(0.8, 0.55 + loss / 100) above 5 % loss and 12 × loss / 100 otherwise, over the bitrate above 12 kb/s.
+- Longer packets need less: with `d` the packet duration divided by 20 ms, the fraction becomes f / (f + (1 - f) × d).
+- The quantizer of the newest data is q0 = 51 - 3 × (the number of bits of the bitrate above the offset), limited to 4 to 15. The quantizer grows with the age of the data. dQ, an index into a table of steps (`compute_quantizer`), sets how fast: 3 when the bitrate above the offset is more than 36 kb/s, else 5.
+- A table of the approximate size of each quantized vector (`DRED_BITS_TABLE`) gives how many latent vectors fit in the target (C `dred_target_chunks`). With fewer than 2, DRED takes nothing. Otherwise it takes the target, or the estimated size of all vectors when that is smaller.
+
+So with no expected loss DRED takes nothing, and with a variable bitrate it then writes nothing.
+
+**2. The analysis of each frame** (`analyze_frame`, C lines 2027-2040). It runs before SILK, on the filtered frame of `pcm_buf` (after the high-pass or DC filter):
+
+- `convert_to_16k` brings the frame to 16 kHz mono. It scales the samples to 16 bits and rounds them, averages stereo, and low-pass filters and decimates the other rates.
+- For every 20 ms of 16 kHz audio, the feature analysis of deep PLC (`LpcnetEncState`) gives the features of two 10 ms frames. The RDOVAE encoder turns them into one latent vector of 25 values and one initial state of 50 values.
+- The encoder keeps the last 104 of both; at most 52 are used. It also keeps the voice activity of the frame, one value per 2.5 ms, for 1.04 s. The activity comes from the speech and music analysis, from the digital silence test, from the energy for CELT-only frames, or else from SILK's voice activity detector.
+
+**3. Room in the frame for DRED.** With a share for DRED:
+
+- SILK codes a constant-bitrate packet at a variable bitrate with a cap, as in Hybrid packets.
+- The range coder of a CELT-only or Hybrid frame gets the frame's bytes minus 3/4 of the DRED bytes of the frame, but at least 5 bytes more than SILK has used so far, and never more than the frame's bytes (C lines 2399-2411).
+- With a constant bitrate, CELT codes at an unconstrained variable bitrate, at the bitrate left after DRED (and SILK), and DRED fills the rest (C lines 2465-2476).
+
+**4. The DRED data** (`write_extension` and `encode_silk_frame`, C lines 2603-2640 and `dred_encode_silk_frame`). It goes with the first frame of the packet that is coded (not left out by DTX):
+
+- The number of latent vectors to code is (n + 5) / 4, at most 26. Each covers 40 ms. With a variable bitrate it is at most the number that the share pays for.
+- The room is the space left in the packet less 3 bytes (the frame count byte, the padding length and the extension ID), at most 1,000 bytes, less one byte for every 255. Below 10 bytes nothing is written.
+- Latent vectors of inactive audio at the newest end are skipped. After a pause, new data waits one packet, because the packet itself carries that audio.
+- The range coder writes q0, dQ, the time offset of the data and the largest quantizer, then the initial state at quantizer q0, then every second latent vector, newest first, at a quantizer that grows with its age. Each value is quantized with a dead zone and coded with a Laplace code.
+- Coding stops when the bytes run out. The data ends after the last vector near voice activity. When not one vector fits, or there is no activity near, nothing is written.
+- The bytes follow `'D'` and the experimental version 12, in the packet extension with ID 126 for frame 0 (`packet::pad_with_extensions`). With a constant bitrate the padding then fills the packet.
+
+**Reset and models.** `reset_state` turns DRED off, as libopus's `OPUS_RESET_STATE` does: the duration lies in the part of libopus's encoder that a reset clears. The latent vectors and the activity are cleared too. The models stay: the built-in ones, or those loaded with `set_dnn_blob` (the RDOVAE encoder and PitchDNN, which load together).
+
+**Multistream.** libopus's multistream encoder answers `OPUS_SET_DRED_DURATION` with `OPUS_UNIMPLEMENTED`, and opus1's has no such setting. Set it on each stream encoder (`stream_encoder_mut`, libopus `OPUS_MULTISTREAM_GET_ENCODER_STATE`). Each stream then carries its DRED data in its own padding.
+
+**Exactness.** Against libopus 1.6.1 built with DRED without loop vectorization, CELT-only packets with DRED are libopus's byte for byte, DRED data included. In SILK-only and Hybrid packets the DRED data is libopus's when its inputs are: with the `Audio` application and a variable bitrate. [Differences from libopus](10-differences-from-libopus.md#dred-encoding) gives the figures and the cases where it differs.
+
+**Cost.** DRED adds the feature analysis and one step of the RDOVAE encoder per 20 ms, and the quantization of the data in each packet. On the Mac (Apple M4 Pro) this added about 54 µs per 20 ms frame at 48 kHz (libopus: about 90 µs). [Differences from libopus](10-differences-from-libopus.md#dred-encoding) gives the measurement.
 
 ## 2. The SILK encoder
 
@@ -635,7 +686,7 @@ All settings take effect with the next call of `encode`. Each one is a method of
 | `set_vbr(bool)` | `OPUS_SET_VBR` | `true` | CBR (`false`): every packet has the same size and is padded to it. In Hybrid, SILK still runs VBR with a cap and CELT fills the rest. VBR (`true`): see the next row. |
 | `set_vbr_constraint(bool)` | `OPUS_SET_VBR_CONSTRAINT` | `true` | With VBR, CELT-only packets use constrained VBR, which stays close to the bitrate; `false` makes it unconstrained. Hybrid packets always use unconstrained VBR, as in libopus. |
 | `set_complexity(i32)` | `OPUS_SET_COMPLEXITY` | 9 | 0..=10; other values are an error. More analysis for better quality at the same bitrate (tables 2.12 and 3.11). It also raises the equivalent rate. From 7 on, the speech and music analysis runs for input at 16 to 48 kHz (1.3). |
-| `Application` (argument of `OpusEncoder::new`) | `application` of `opus_encoder_create`, `OPUS_SET_APPLICATION` | none | `Voip`: voice estimate 115 without the analysis, CELT threshold +8000 b/s, high-pass filter with a moving cutoff, SILK input from the integer filter at 8 to 24 kHz and from the float filter at 48 kHz. `Audio`: voice estimate 48 without the analysis and at most 115 with it, a 3 Hz filter that removes the constant (direct current, DC) offset. `RestrictedLowDelay`: always CELT-only, no 4 ms look-ahead. It cannot change after construction. |
+| `Application` (argument of `OpusEncoder::new`) | `application` of `opus_encoder_create`, `OPUS_SET_APPLICATION` | none | `Voip`: voice estimate 115 without the analysis, CELT threshold +8000 b/s, high-pass filter with a moving cutoff, SILK input from the integer filter at 8 to 24 kHz and from the float filter at 48 kHz. `Audio`: voice estimate 48 without the analysis and at most 115 with it, a 3 Hz filter that removes the constant (direct current, DC) offset. `RestrictedLowDelay`: always CELT-only, no 4 ms look-ahead. `set_application` changes it before the first frame, as `OPUS_SET_APPLICATION` does; after the first frame only the current application is accepted, until `reset_state`. `application()` reads it. |
 | `set_force_mode(Option<ForcedMode>)` | `OPUS_SET_FORCE_MODE` (in libopus's private header `opus_private.h`) | `None` | Asks for SILK-only, Hybrid or CELT-only. The rules that keep a packet valid still apply (1.4): frames under 10 ms are CELT-only, SILK above wideband becomes Hybrid, Hybrid at wideband or below becomes SILK-only. |
 | `set_bandwidth(Bandwidth)` | `OPUS_SET_BANDWIDTH` | `Bandwidth::Auto` | Codes this bandwidth instead of the automatic one. It never exceeds half the API rate. CELT codes mediumband as wideband. A running SILK encoder moves to it one step at a time. |
 | `set_max_bandwidth(Bandwidth)` | `OPUS_SET_MAX_BANDWIDTH` | `Bandwidth::Fullband` | The widest bandwidth the automatic choice may take. `Bandwidth::Auto` is an error. |
@@ -648,8 +699,11 @@ All settings take effect with the next call of `encode`. Each one is a method of
 | `set_packet_loss_perc(i32)` | `OPUS_SET_PACKET_LOSS_PERC` | 0 | The expected packet loss, 0..=100; other values are an error. FEC needs it above 0. It lowers the equivalent rate, raises the LTP scaling, sets the LBRR gain step, and makes CELT code intra energy more often. |
 | `set_lfe(bool)` | `OPUS_SET_LFE` (in libopus's `celt/celt.h`) | `false` | The encoder codes a low-frequency-effects channel of a surround stream: CELT-only, narrowband, only bands 0 and 1 matter. |
 | `encode_i16` (method) | `opus_encode` (16-bit input) | | Encodes 16-bit samples with an input precision of at most 16 bits. The packets are the same bytes as `encode` with `s as f32 / 32768.0` and `set_lsb_depth(16)`. |
+| `encode24` (method) | `opus_encode24` (24-bit input in 32-bit integers) | | Encodes 24-bit samples, full scale 2^23. Each sample is divided by 2^23 to a float (`INT24TORES`) and the frame is coded as float input with 24 bits of precision; values beyond 24 bits are not limited. The speech and music analysis reads the integers (`downmix_int24`). |
 | `set_expert_frame_duration(FrameDuration)` | `OPUS_SET_EXPERT_FRAME_DURATION` | `FrameDuration::Argument` | Each call codes one frame of the duration that is set; the `frame_size` of the call must be at least that long (libopus `frame_size_select`). The setting stays across a reset. |
 | `set_prediction_disabled(bool)` | `OPUS_SET_PREDICTION_DISABLED` | `false` | Every frame can be decoded on its own: SILK codes each packet as the first after a reset, CELT turns off the pre-filter and inter-frame energy prediction. Costs quality. |
+| `set_phase_inversion_disabled(bool)` | `OPUS_SET_PHASE_INVERSION_DISABLED` | `false` | With `true`, CELT's intensity stereo never inverts the sign of the second channel. libopus documents that this makes a mono downmix of the decoded stereo sound better and lowers stereo quality a little. It changes stereo CELT-only and Hybrid packets at bitrates that use intensity stereo. `reset_state` keeps it. |
+| `set_voice_ratio(i32)` | `OPUS_SET_VOICE_RATIO` (in `opus_private.h`) | -1 | The speech probability in percent, 0..=100, or -1 for none; other values are an error. The encoder replaces it with -1 on every frame that is not digital silence, and with the analysis's estimate when there is one and the signal type is automatic. `voice_ratio()` is `OPUS_GET_VOICE_RATIO`. |
 | `set_energy_mask(Option<&[f32]>)` | `OPUS_SET_ENERGY_MASK` (in `celt/celt.h`) | `None` | Used by the multistream encoder for surround ([05-multichannel.md](05-multichannel.md)): how much each band is masked by other channels. Lowers the bits of masked bands. |
 | `reset_state()` | `OPUS_RESET_STATE` | | Forgets the signal coded so far, also the state of the analysis. The settings stay, and so do the speech estimate of the last packet and the DTX setting of SILK, as in libopus. |
 | `final_range()` | `OPUS_GET_FINAL_RANGE` | | The range coder state after the last packet, for checking a decoder (see [04-decoder.md](04-decoder.md)). |
@@ -707,5 +761,6 @@ The encoder follows libopus 1.6 with these differences. The doc comment of `enco
 4. No control for phase inversion.
 5. A frame that announces the switch to CELT-only without room for the redundant frame still resets the CELT encoder.
 6. The energy mask is copied, not kept as a pointer.
+7. With DRED, in packets of several frames with VBR, the first frame has more room for the DRED data than in libopus (this follows from 2). libopus can then cut its DRED data shorter.
 
 The SILK encoder is a port of the fixed-point one of libopus, so SILK and Hybrid packets differ from those of the float build of libopus. Its feedback (its voice activity, its signal type, the bits it used) reaches later decisions, so a stream with SILK packets can take other decisions than libopus after its first SILK packet. CELT-only packets, and the analysis itself, are libopus's (1.3).

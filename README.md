@@ -21,6 +21,7 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 - **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels, signal type, input bit depth, DTX)
 - **The speech and music analysis of libopus:** from complexity 7 on, the encoder estimates whether the input is speech or music and which bandwidth it uses, as libopus does, with the same results to the last bit on 64-bit ARM. CELT-only packets at complexity 7 to 10 are libopus's byte for byte
 - **The neural decoder features of libopus 1.5 and 1.6 (optional):** deep packet loss concealment, the LACE and NoLACE speech enhancement of SILK, and the bandwidth extension of SILK wideband to fullband. Each is compiled only with its cargo feature and runs only when the decoder complexity is raised, as in libopus: `set_complexity(5)` for deep PLC (packet loss concealment), 6 for LACE, 7 for NoLACE, and 4 with `set_osce_bwe(true)` for the bandwidth extension. On 64-bit ARM the output is that of libopus 1.6.1 built with these features (without loop vectorization) to the last bit.
+- **Deep redundancy (DRED, optional):** with the cargo feature `dred`, the encoder adds a compressed description of up to about one second of earlier speech to each packet (`set_dred_duration`, libopus `OPUS_SET_DRED_DURATION`), and the decoder rebuilds a burst of lost packets from the next packet that arrives (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`). CELT-only packets with DRED, and the DRED data in SILK and Hybrid packets with the `Audio` application and VBR, are those of libopus 1.6.1 built with DRED, byte for byte. Decoding gives libopus's output to the last bit.
 - **`#![no_std]` + no `alloc`:** fully heap-free — runs on bare metal, RTOS, and WebAssembly with **no global allocator**
 
 ## Quick Start
@@ -158,6 +159,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 | `deep-plc` | no    | Deep packet loss concealment (PitchDNN, the PLC network, FARGAN) with its built-in weights (1,432,768 bytes). Runs at decoder complexity 5 and above. |
 | `osce`   | no      | LACE and NoLACE, the speech enhancement of SILK (decoder complexity 6 and 7; weights 1,573,440 bytes). Turns on `deep-plc`, as libopus's `--enable-osce` does. |
 | `osce-bwe` | no    | The bandwidth extension of SILK wideband to 48 kHz fullband output, switched on with `set_osce_bwe` (weights 685,888 bytes). Turns on `osce`. |
+| `dred`   | no      | Deep redundancy (DRED): the encoder writes DRED data (`OpusEncoder::set_dred_duration`), the decoder rebuilds lost packets from it (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`). Embeds the RDOVAE encoder and decoder (weights 565,440 bytes). Turns on `deep-plc`, as libopus's `--enable-dred` does. |
 | `test-libopus-dnn` | no | Test only: compiles the tests that compare with a libopus built with its neural network code (see [docs/09](docs/09-testing.md#tests-of-the-neural-network-code)). |
 | `libm`   | no      | Required for `#![no_std]` builds — provides float math via a pure-Rust port of musl `libm`. Not needed when `std` is on. |
 
@@ -423,11 +425,34 @@ test that compares opus1 with the C library under the same settings.
   them to every stream.
 - The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity`, `set_osce_bwe` and `set_dnn_blob` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/10](docs/10-differences-from-libopus.md)).
 - `OpusDecoder::last_packet_duration()` and `packet::has_lbrr()`, as libopus has them.
+- Phase inversion disabling: `set_phase_inversion_disabled` and
+  `phase_inversion_disabled` on `OpusEncoder`, `OpusDecoder`,
+  `MultistreamEncoder` and `MultistreamDecoder`
+  (`OPUS_SET_PHASE_INVERSION_DISABLED`). CELT's intensity stereo then never
+  inverts the second channel, which makes a mono downmix sound better.
+- Decoder output gain and pitch: `OpusDecoder::set_gain` and `gain`
+  (`OPUS_SET_GAIN`, in 1/256 dB, also on `MultistreamDecoder`) and
+  `OpusDecoder::pitch` (`OPUS_GET_PITCH`).
+- The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,
+  `OpusDecoder::decode24` and `decode_fec24`, and the multistream versions
+  (`opus_encode24`, `opus_decode24`, `opus_multistream_encode24`,
+  `opus_multistream_decode24`).
+- `OpusEncoder::set_application` and `application` (`OPUS_SET_APPLICATION`,
+  before the first frame), and `set_voice_ratio` and `voice_ratio`
+  (`OPUS_SET_VOICE_RATIO`).
+- `MultistreamEncoder` forwards the forced channel count, the prediction and
+  phase inversion switches, the application and the voice ratio as libopus
+  does (difference D5 closed).
+- Deep redundancy (DRED, cargo feature `dred`, off by default), as in libopus 1.5 and later: `OpusEncoder::set_dred_duration` and `dred_duration` (`OPUS_SET_DRED_DURATION`, `OPUS_GET_DRED_DURATION`), `OpusEncoder::set_dnn_blob`, and on the decoder side `OpusDredDecoder` (`opus_dred_decoder_*`, `opus_dred_parse`, `opus_dred_process`), `OpusDred` (`opus_dred_alloc`) and `OpusDecoder::dred_decode`, `dred_decode_float` and `dred_decode24` (`opus_decoder_dred_decode*`). Without the feature, or with a duration of 0, the packets do not change.
+- Packet extensions of libopus 1.5 and later: the module `extensions` (libopus `src/extensions.c`), `packet::Repacketizer` (libopus `OpusRepacketizer`), which carries extensions, and `packet::pad_with_extensions`, `packet::unpad` and `packet::multistream_unpad`.
 - Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/09](docs/09-testing.md#evaluation-tools)).
 
 **Behaviour changes**
 - Float output is no longer clamped to [-1, 1] (libopus does not clip float output).
   Use `decode_i16` for 16-bit output.
+- `packet::pad` and `packet::multistream_pad` keep the extensions in the padding
+  of a packet, and fail with "Internal error" when the padding is not valid
+  extension data, as libopus does. Before, they wrote zeros.
 - The automatic mode choice follows libopus. At 64 kb/s a 16 kHz VoIP encoder
   now codes CELT, as libopus does at that bitrate. At speech rates (for example
   16-24 kb/s, or the automatic 19 kb/s of 20 ms frames) it codes SILK.

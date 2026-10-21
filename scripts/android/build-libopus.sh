@@ -71,7 +71,8 @@
 #                and meson builds of 1.6.1 define only ENABLE_OSCE, so they
 #                have no BWE). Implies --deep-plc, as in configure.
 #   --dred       -DENABLE_DRED=1 and DRED_SOURCES. Implies --deep-plc. This
-#                changes the encoder, so the reference builds leave it out.
+#                changes the encoder, so only the DRED reference builds
+#                below use it.
 #   --rdovae-weights
 #                Compiles only the two weight files of DRED's networks (the
 #                RDOVAE, rate-distortion-optimized variational autoencoder):
@@ -141,6 +142,15 @@
 #     scripts/android/build-libopus.sh --dnn --src $S
 #   LIBOPUS_PREFIX=target/android/libopus-1.6.1-dnn \
 #     scripts/android/build-libopus.sh --dnn --src $S
+#
+# The references of DRED add --dred to the same options, in their own
+# folders: target/android/libopus-host-1.6.1-dred-novec (Mac, without
+# vector loops, the bit-exact reference), libopus-host-1.6.1-dred (Mac,
+# -O2) and libopus-1.6.1-dred-novec (Android, without vector loops):
+#
+#   OPUS_EXTRA_CFLAGS="-fno-vectorize -fno-slp-vectorize" \
+#     LIBOPUS_PREFIX=target/android/libopus-host-1.6.1-dred-novec \
+#     scripts/android/build-libopus.sh --host --rtcd --dnn --dred --src $S
 #
 # The vector loops that clang makes at -O2 round some products before they
 # are added, so the -O2 builds of the Mac and of the phone conceal and

@@ -9,6 +9,7 @@
 //! | Feature | Blobs | Bytes |
 //! |---|---|---:|
 //! | `deep-plc` | `pitchdnn.bin`, `plc.bin`, `fargan.bin` | 1,432,768 |
+//! | `dred` | `dred_rdovae_enc.bin`, `dred_rdovae_dec.bin` | 565,440 |
 //! | `osce` | `lace.bin`, `nolace.bin` | 1,573,440 |
 //! | `osce-bwe` | `bbwenet.bin` | 685,888 |
 //!
@@ -48,6 +49,10 @@ blob!(PITCHDNN, "pitchdnn.bin");
 blob!(PLC, "plc.bin");
 #[cfg(feature = "deep-plc")]
 blob!(FARGAN, "fargan.bin");
+#[cfg(feature = "dred")]
+blob!(DRED_RDOVAE_ENC, "dred_rdovae_enc.bin");
+#[cfg(feature = "dred")]
+blob!(DRED_RDOVAE_DEC, "dred_rdovae_dec.bin");
 #[cfg(feature = "osce")]
 blob!(LACE, "lace.bin");
 #[cfg(feature = "osce")]
@@ -73,6 +78,18 @@ pub fn fargan() -> &'static [u8] {
     &FARGAN.0
 }
 
+/// The blob of DRED's RDOVAE encoder (`dred_rdovae_enc.bin`).
+#[cfg(feature = "dred")]
+pub fn dred_rdovae_enc() -> &'static [u8] {
+    &DRED_RDOVAE_ENC.0
+}
+
+/// The blob of DRED's RDOVAE decoder (`dred_rdovae_dec.bin`).
+#[cfg(feature = "dred")]
+pub fn dred_rdovae_dec() -> &'static [u8] {
+    &DRED_RDOVAE_DEC.0
+}
+
 /// The LACE blob (`lace.bin`).
 #[cfg(feature = "osce")]
 pub fn lace() -> &'static [u8] {
@@ -92,8 +109,8 @@ pub fn bbwenet() -> &'static [u8] {
 }
 
 /// Every built-in blob of this build, with its file name, in the order of
-/// libopus's blob writer (PitchDNN, FARGAN, the PLC model, LACE, NoLACE),
-/// then BBWENet. Empty in a build with only `dnn`.
+/// libopus's blob writer (PitchDNN, FARGAN, the PLC model, the RDOVAE
+/// encoder and decoder, LACE, NoLACE), then BBWENet. Empty in a build with only `dnn`.
 pub fn blobs() -> &'static [(&'static str, &'static [u8])] {
     static BLOBS: &[(&str, &[u8])] = &[
         #[cfg(feature = "deep-plc")]
@@ -102,6 +119,10 @@ pub fn blobs() -> &'static [(&'static str, &'static [u8])] {
         ("fargan.bin", &FARGAN.0),
         #[cfg(feature = "deep-plc")]
         ("plc.bin", &PLC.0),
+        #[cfg(feature = "dred")]
+        ("dred_rdovae_enc.bin", &DRED_RDOVAE_ENC.0),
+        #[cfg(feature = "dred")]
+        ("dred_rdovae_dec.bin", &DRED_RDOVAE_DEC.0),
         #[cfg(feature = "osce")]
         ("lace.bin", &LACE.0),
         #[cfg(feature = "osce")]
@@ -147,4 +168,42 @@ pub fn models() -> &'static ModelSet<'static> {
         }
         set
     })
+}
+
+/// The layers of the built-in RDOVAE decoder of DRED, built on the first
+/// call from `weights()` and shared by every `OpusDredDecoder`. `None` if
+/// they fail to load (the tests check that they load).
+///
+/// The first call also reads one byte of every 4 KiB page of its blob, as
+/// `models()` does for the decoder's models.
+#[cfg(feature = "dred")]
+pub fn rdovae_dec() -> Option<&'static super::models::dred_rdovae_dec::RdovaeDec<'static>> {
+    static MODEL: OnceCell<Option<super::models::dred_rdovae_dec::RdovaeDec<'static>>> = OnceCell::new();
+    MODEL
+        .get(|| {
+            let model = super::models::dred_rdovae_dec::RdovaeDec::init(weights()).ok();
+            super::holder::prefault(dred_rdovae_dec());
+            model
+        })
+        .as_ref()
+}
+
+/// The models of the DRED encoder (the RDOVAE encoder and PitchDNN), built
+/// on the first call from `weights()` and shared by every Opus encoder.
+/// `None` if they fail to load (the tests check that they load).
+///
+/// The first call also reads one byte of every 4 KiB page of the RDOVAE
+/// encoder's blob and of PitchDNN's, as `models()` does for the decoder's
+/// models.
+#[cfg(feature = "dred")]
+pub fn dred_enc() -> Option<&'static super::models::DredEncModels<'static>> {
+    static MODEL: OnceCell<Option<super::models::DredEncModels<'static>>> = OnceCell::new();
+    MODEL
+        .get(|| {
+            let model = super::models::DredEncModels::init(weights()).ok();
+            super::holder::prefault(dred_rdovae_enc());
+            super::holder::prefault(pitchdnn());
+            model
+        })
+        .as_ref()
 }

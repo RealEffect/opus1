@@ -1317,6 +1317,29 @@ pub(super) fn downmix_scalar(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize
                 SecondChannel::None => {}
             }
         }
+        PcmRef::I32(x) => {
+            // C `INT24TOSIG(a)`: `(float)(a)*(1.f/256.f)`.
+            let sig = |a: i32| a as f32 * (1.0 / 256.0);
+            let x = &x[offset * ch..];
+            for (j, v) in y.iter_mut().enumerate() {
+                *v = sig(x[j * ch + c1]);
+            }
+            match pcm.c2 {
+                SecondChannel::Channel(c2) => {
+                    for (j, v) in y.iter_mut().enumerate() {
+                        *v += sig(x[j * ch + c2]);
+                    }
+                }
+                SecondChannel::AllOthers => {
+                    for c in 1..ch {
+                        for (j, v) in y.iter_mut().enumerate() {
+                            *v += sig(x[j * ch + c]);
+                        }
+                    }
+                }
+                SecondChannel::None => {}
+            }
+        }
     }
 }
 

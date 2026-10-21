@@ -12,8 +12,12 @@
 //!   which builds every layer from a `WeightList` (libopus `init_*`);
 //! - `layers()`, every layer of a built model in the order of `LAYERS`.
 //!
-//! The DRED models (RDOVAE encoder and decoder) are left for a later
-//! `dred` feature; the generator can write them (`--models`).
+//! With the feature `dred`, the two models of deep redundancy (DRED) are
+//! here too: the RDOVAE (rate-distortion-optimized variational autoencoder)
+//! encoder and decoder. `dred_rdovae_stats.rs`, also generated, holds the
+//! constants of `dnn/dred_rdovae_constants.h` and the tables of DRED's
+//! quantizer. `ModelSet` does not load the DRED models: in libopus the
+//! encoder and the DRED decoder hold them, not the Opus decoder.
 
 use super::holder::DnnModels;
 use super::nnet::{Conv2dLayer, LinearLayer};
@@ -28,6 +32,15 @@ pub mod plc;
 // FARGAN, the vocoder of deep PLC.
 #[cfg(feature = "deep-plc")]
 pub mod fargan;
+// The RDOVAE encoder of DRED, which the Opus encoder runs.
+#[cfg(feature = "dred")]
+pub mod dred_rdovae_enc;
+// The RDOVAE decoder of DRED, which the DRED decoder runs.
+#[cfg(feature = "dred")]
+pub mod dred_rdovae_dec;
+// The constants of the RDOVAE and the tables of DRED's quantizer.
+#[cfg(feature = "dred")]
+pub mod dred_rdovae_stats;
 // LACE, the speech enhancer of decoder complexity 6.
 #[cfg(feature = "osce")]
 pub mod lace;
@@ -171,6 +184,30 @@ impl<'w> DeepPlcModels<'w> {
             plc: plc::PlcModel::init(list)?,
             pitchdnn: pitchdnn::PitchDnn::init(list)?,
             fargan: fargan::Fargan::init(list)?,
+        })
+    }
+}
+
+/// The two models of the DRED encoder, which load together, as in libopus's
+/// `dred_encoder_load_model` (`dnn/dred_encoder.c:46-57`): the RDOVAE
+/// encoder, and PitchDNN for the feature analysis.
+#[cfg(feature = "dred")]
+#[derive(Clone, Copy, Default)]
+pub struct DredEncModels<'w> {
+    /// The RDOVAE encoder.
+    pub rdovae: dred_rdovae_enc::RdovaeEnc<'w>,
+    /// PitchDNN.
+    pub pitchdnn: pitchdnn::PitchDnn<'w>,
+}
+
+#[cfg(feature = "dred")]
+impl<'w> DredEncModels<'w> {
+    /// Builds both models, the RDOVAE encoder first. Fails when one of them
+    /// fails.
+    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+        Ok(DredEncModels {
+            rdovae: dred_rdovae_enc::RdovaeEnc::init(list)?,
+            pitchdnn: pitchdnn::PitchDnn::init(list)?,
         })
     }
 }

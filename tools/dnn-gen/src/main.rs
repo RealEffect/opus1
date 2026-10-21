@@ -11,6 +11,9 @@
 //!   libopus's `COPYING` as `dnn-weights/COPYING`;
 //! - `src/dnn/models/<model>.rs`: the layer struct, the header constants,
 //!   the layer descriptors and `init`, translated from the C init function;
+//! - `src/dnn/models/dred_rdovae_stats.rs`, with the DRED models: the
+//!   constants of `dnn/dred_rdovae_constants.h` and the quantizer tables of
+//!   `dnn/dred_rdovae_stats_data.c`;
 //! - `tests/dnn_gen/mod.rs`: `#[repr(C)]` copies of the C model structs and
 //!   the C symbols, for the tests against a DNN-enabled libopus.
 //!
@@ -43,9 +46,6 @@ pub struct ModelDef {
     pub feature: &'static str,
     /// The first line of the module documentation.
     pub summary: &'static str,
-    /// Whether opus1 includes the model; the others are written only when
-    /// `--models` names them.
-    pub included: bool,
 }
 
 /// Every model with a `WeightArray` list in libopus 1.6.1, in the order of
@@ -61,7 +61,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "PitchDnn",
         feature: "deep-plc",
         summary: "PitchDNN, the pitch estimator of deep packet loss concealment (deep PLC)",
-        included: true,
     },
     ModelDef {
         key: "fargan",
@@ -71,7 +70,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "Fargan",
         feature: "deep-plc",
         summary: "FARGAN, the vocoder of deep packet loss concealment (deep PLC)",
-        included: true,
     },
     ModelDef {
         key: "plc",
@@ -81,7 +79,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "PlcModel",
         feature: "deep-plc",
         summary: "The PLC model, which predicts the features of lost frames in deep packet loss concealment (deep PLC)",
-        included: true,
     },
     ModelDef {
         key: "dred_rdovae_enc",
@@ -91,7 +88,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "RdovaeEnc",
         feature: "dred",
         summary: "The RDOVAE encoder of deep redundancy (DRED)",
-        included: false,
     },
     ModelDef {
         key: "dred_rdovae_dec",
@@ -101,7 +97,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "RdovaeDec",
         feature: "dred",
         summary: "The RDOVAE decoder of deep redundancy (DRED)",
-        included: false,
     },
     ModelDef {
         key: "lace",
@@ -111,7 +106,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "LaceLayers",
         feature: "osce",
         summary: "LACE, the speech enhancer of SILK at decoder complexity 6",
-        included: true,
     },
     ModelDef {
         key: "nolace",
@@ -121,7 +115,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "NolaceLayers",
         feature: "osce",
         summary: "NoLACE, the speech enhancer of SILK at decoder complexity 7 and above",
-        included: true,
     },
     ModelDef {
         key: "bbwenet",
@@ -131,7 +124,6 @@ pub const MODELS: [ModelDef; 8] = [
         rust_struct: "BbwenetLayers",
         feature: "osce-bwe",
         summary: "BBWENet, the network of the bandwidth extension (BWE) of SILK wideband to 48 kHz",
-        included: true,
     },
 ];
 
@@ -178,6 +170,60 @@ impl Model {
         }
         t
     }
+}
+
+/// The constants and quantizer tables of DRED's RDOVAE, which are not part
+/// of a model's data files.
+pub struct DredStats {
+    pub consts: Vec<cparse::HeaderConst>,
+    pub tables: Vec<cparse::U8Table>,
+    /// SHA-256 of the two source files, for `VERSION`.
+    pub source_sums: [(String, String); 2],
+}
+
+/// The tables of `dnn/dred_rdovae_stats_data.h`, with their sizes:
+/// `DRED_NUM_QUANTIZATION_LEVELS` times `DRED_LATENT_DIM` or `DRED_STATE_DIM`.
+const DRED_STATS_TABLES: [(&str, usize); 8] = [
+    ("dred_latent_quant_scales_q8", 400),
+    ("dred_latent_dead_zone_q8", 400),
+    ("dred_latent_r_q8", 400),
+    ("dred_latent_p0_q8", 400),
+    ("dred_state_quant_scales_q8", 800),
+    ("dred_state_dead_zone_q8", 800),
+    ("dred_state_r_q8", 800),
+    ("dred_state_p0_q8", 800),
+];
+
+fn read_dred_stats(src: &Path) -> Result<DredStats, String> {
+    let read = |name: &str| {
+        let path = src.join(name);
+        fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let h_name = "dnn/dred_rdovae_constants.h";
+    let c_name = "dnn/dred_rdovae_stats_data.c";
+    let h_text = read(h_name)?;
+    let c_text = read(c_name)?;
+    let consts = cparse::parse_defines(h_name, &h_text)?;
+    let tables = cparse::parse_u8_tables(c_name, &c_text)?;
+    let names: Vec<(&str, usize)> = tables.iter().map(|t| (t.name.as_str(), t.data.len())).collect();
+    if names != DRED_STATS_TABLES {
+        return Err(format!("{c_name}: the tables {names:?} are not those of libopus 1.6.1 {DRED_STATS_TABLES:?}"));
+    }
+    let int = |name: &str| {
+        consts.iter().find(|c| c.name == name).and_then(|c| match c.value {
+            cparse::ConstValue::Int { value, .. } => Some(value as usize),
+            _ => None,
+        })
+    };
+    let (levels, latent, state) = (int("DRED_NUM_QUANTIZATION_LEVELS"), int("DRED_LATENT_DIM"), int("DRED_STATE_DIM"));
+    if levels.zip(latent).map(|(l, d)| l * d) != Some(400) || levels.zip(state).map(|(l, d)| l * d) != Some(800) {
+        return Err(format!("{h_name}: the dimensions do not match the sizes of the tables of {c_name}"));
+    }
+    let source_sums = [
+        (sha256::hex(h_text.as_bytes()), h_name.to_string()),
+        (sha256::hex(c_text.as_bytes()), c_name.to_string()),
+    ];
+    Ok(DredStats { consts, tables, source_sums })
 }
 
 fn read_model(src: &Path, def: &'static ModelDef) -> Result<Model, String> {
@@ -354,9 +400,9 @@ options:
   --src DIR               the libopus source tree (the folder with dnn/)
   --repo DIR              the opus1 repository (default: two levels above
                           this tool's Cargo.toml)
-  --models a,b,...        the models to write (default: those opus1 includes:
-                          pitchdnn,fargan,plc,lace,nolace,bbwenet); the
-                          others are dred_rdovae_enc,dred_rdovae_dec
+  --models a,b,...        the models to write (default: all eight,
+                          pitchdnn,fargan,plc,dred_rdovae_enc,
+                          dred_rdovae_dec,lace,nolace,bbwenet)
   --blobs-only DIR        write only the blobs of --models into DIR
   --check-official FILE   compare FILE with the blobs of the 7 models that
                           dump_weights_blob writes, concatenated in its order
@@ -369,7 +415,7 @@ options:
 fn parse_args() -> Result<Args, String> {
     let mut src = None;
     let mut repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut models: Vec<&'static ModelDef> = MODELS.iter().filter(|m| m.included).collect();
+    let mut models: Vec<&'static ModelDef> = MODELS.iter().collect();
     let mut blobs_only = None;
     let mut check_official = None;
     let mut check_all = None;
@@ -446,6 +492,8 @@ fn run() -> Result<(), String> {
     for def in &MODELS {
         all.push(read_model(&args.src, def)?);
     }
+    // The constants and tables of DRED, written with the DRED models.
+    let dred_stats = if args.models.iter().any(|m| m.feature == "dred") { Some(read_dred_stats(&args.src)?) } else { None };
     let selected: Vec<&Model> = args.models.iter().map(|d| all.iter().find(|m| m.def.key == d.key).unwrap()).collect();
 
     if let Some(f) = &args.check_official {
@@ -474,6 +522,11 @@ fn run() -> Result<(), String> {
                 version.push_str(&format!("{sum}  {file}\n"));
             }
         }
+        if let Some(st) = &dred_stats {
+            for (sum, file) in &st.source_sums {
+                version.push_str(&format!("{sum}  {file}\n"));
+            }
+        }
         write(&weights.join("SHA256SUMS"), sums.as_bytes())?;
         write(&weights.join("VERSION"), version.as_bytes())?;
         let copying = fs::read(args.src.join("COPYING")).map_err(|e| format!("COPYING: {e}"))?;
@@ -481,6 +534,10 @@ fn run() -> Result<(), String> {
         for m in &selected {
             let path = args.repo.join("src/dnn/models").join(format!("{}.rs", m.def.key));
             write(&path, codegen::model_file(m, &args.version).as_bytes())?;
+        }
+        if let Some(st) = &dred_stats {
+            let path = args.repo.join("src/dnn/models/dred_rdovae_stats.rs");
+            write(&path, codegen::dred_stats_file(&st.consts, &st.tables, &args.version).as_bytes())?;
         }
         write(&args.repo.join("tests/dnn_gen/mod.rs"), codegen::ffi_file(&all, &args.version).as_bytes())?;
     }

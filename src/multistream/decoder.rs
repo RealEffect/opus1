@@ -208,6 +208,34 @@ impl MultistreamDecoder {
     /// range values of all stream decoders combined with XOR. After a packet
     /// was decoded it equals the value the multistream encoder reports for
     /// that packet.
+    /// Decodes one multistream packet into interleaved 24-bit samples held
+    /// in 32-bit integers: libopus `opus_multistream_decode24`. Each sample
+    /// is scaled by 2^23 and rounded, without soft clipping and without a
+    /// limit to 24 bits; see [`OpusDecoder::decode24`].
+    pub fn decode24(
+        &mut self,
+        packet: &[u8],
+        frame_size: usize,
+        out: &mut [i32],
+    ) -> Result<usize, &'static str> {
+        let frame_size = self.usable_frame_size(frame_size, out.len())?;
+        let channels = self.layout.channels();
+        self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, false, false)
+    }
+
+    /// [`decode_fec`](Self::decode_fec) with 24-bit output: libopus
+    /// `opus_multistream_decode24` with `decode_fec = 1`.
+    pub fn decode_fec24(
+        &mut self,
+        packet: &[u8],
+        frame_size: usize,
+        out: &mut [i32],
+    ) -> Result<usize, &'static str> {
+        let frame_size = self.usable_frame_size(frame_size, out.len())?;
+        let channels = self.layout.channels();
+        self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, true, false)
+    }
+
     pub fn final_range(&self) -> u32 {
         self.decoders.iter().fold(0, |acc, dec| acc ^ dec.final_range())
     }
@@ -238,6 +266,38 @@ impl MultistreamDecoder {
     /// complexity of the first stream decoder.
     pub fn complexity(&self) -> i32 {
         self.decoders.first().map_or(0, OpusDecoder::complexity)
+    }
+
+    /// Sets the output gain of every stream, in 1/256 dB, -32768 to 32767.
+    /// libopus `OPUS_SET_GAIN`. See [`OpusDecoder::set_gain`]. Any other
+    /// value is an error and changes nothing.
+    pub fn set_gain(&mut self, gain: i32) -> Result<(), &'static str> {
+        for dec in &mut self.decoders {
+            dec.set_gain(gain)?;
+        }
+        Ok(())
+    }
+
+    /// The output gain of the first stream. libopus `OPUS_GET_GAIN`.
+    pub fn gain(&self) -> i32 {
+        self.decoders.first().map_or(0, OpusDecoder::gain)
+    }
+
+    /// Disables phase inversion in the intensity stereo of every stream.
+    /// libopus `OPUS_SET_PHASE_INVERSION_DISABLED`. See
+    /// [`OpusDecoder::set_phase_inversion_disabled`].
+    pub fn set_phase_inversion_disabled(&mut self, disabled: bool) {
+        for dec in &mut self.decoders {
+            dec.set_phase_inversion_disabled(disabled);
+        }
+    }
+
+    /// Whether phase inversion is disabled in the first stream. libopus
+    /// `OPUS_GET_PHASE_INVERSION_DISABLED`. At the start it is `false` when
+    /// the first stream is coupled (stereo) and `true` when it is mono, as
+    /// in libopus.
+    pub fn phase_inversion_disabled(&self) -> bool {
+        self.decoders.first().is_some_and(OpusDecoder::phase_inversion_disabled)
     }
 
     /// [`OpusDecoder::set_osce_bwe`] for every stream decoder. libopus's

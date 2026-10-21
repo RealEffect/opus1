@@ -732,6 +732,105 @@ impl RangeCoder {
         val
     }
 
+    /// libopus `ec_dec_icdf16` (celt/entdec.c): `decode_icdf` with a table
+    /// of 16-bit values. The table must end with 0.
+    #[cfg(feature = "dred")]
+    pub fn decode_icdf16(&mut self, icdf: &[u16], ftb: u32) -> i32 {
+        let mut s = self.rng;
+        let d = self.val;
+        let r = s >> ftb;
+        let mut ret = 0;
+        let mut t;
+        loop {
+            t = s;
+            s = r.wrapping_mul(icdf[ret] as u32);
+            ret += 1;
+            if d >= s {
+                break;
+            }
+        }
+        self.val = d.wrapping_sub(s);
+        self.rng = t.wrapping_sub(s);
+        self.normalize_decoder();
+        (ret - 1) as i32
+    }
+
+    /// libopus `ec_laplace_decode_p0` (celt/laplace.c), the Laplace code of
+    /// DRED: the probability `p0` of zero and the `decay` of the larger
+    /// magnitudes, both in Q15. The magnitude is coded in steps of up to 7.
+    #[cfg(feature = "dred")]
+    pub fn laplace_decode_p0(&mut self, p0: u16, decay: u16) -> i32 {
+        let first = 32768 - p0;
+        let sign_icdf = [first, first / 2, 0];
+        let mut s = self.decode_icdf16(&sign_icdf, 15);
+        if s == 2 {
+            s = -1;
+        }
+        if s == 0 {
+            return 0;
+        }
+        let decay = decay as i32;
+        let mut icdf = [0u16; 8];
+        icdf[0] = 7.max(decay) as u16;
+        for i in 1..7 {
+            icdf[i] = (7 - i as i32).max((icdf[i - 1] as i32 * decay) >> 15) as u16;
+        }
+        let mut value = 1i32;
+        loop {
+            let v = self.decode_icdf16(&icdf, 15);
+            value = value.wrapping_add(v);
+            if v != 7 {
+                break;
+            }
+        }
+        s * value
+    }
+
+    /// libopus `ec_enc_icdf16` (celt/entenc.c): `encode_icdf` with a table
+    /// of 16-bit values. The table must end with 0.
+    #[cfg(feature = "dred")]
+    pub fn encode_icdf16(&mut self, s: usize, icdf: &[u16], ftb: u32) {
+        let lower = icdf[s] as u32;
+        let r = self.rng >> ftb;
+        if s > 0 {
+            let val = icdf[s - 1] as u32;
+            self.val = self.val.wrapping_add(self.rng.wrapping_sub(r.wrapping_mul(val)));
+            self.rng = r.wrapping_mul(val.wrapping_sub(lower));
+        } else {
+            self.rng = self.rng.wrapping_sub(r.wrapping_mul(lower));
+        }
+        self.normalize_encoder();
+    }
+
+    /// libopus `ec_laplace_encode_p0` (celt/laplace.c): writes `value` with
+    /// the Laplace code that `laplace_decode_p0` reads. First the sign
+    /// (zero, positive or negative), then the magnitude less one in steps
+    /// of up to 7.
+    #[cfg(feature = "dred")]
+    pub fn laplace_encode_p0(&mut self, value: i32, p0: u16, decay: u16) {
+        let first = 32768 - p0;
+        let sign_icdf = [first, first / 2, 0];
+        let s = if value == 0 { 0 } else if value > 0 { 1 } else { 2 };
+        self.encode_icdf16(s, &sign_icdf, 15);
+        let mut value = value.unsigned_abs() as i32;
+        if value != 0 {
+            let decay = decay as i32;
+            let mut icdf = [0u16; 8];
+            icdf[0] = 7.max(decay) as u16;
+            for i in 1..7 {
+                icdf[i] = (7 - i as i32).max((icdf[i - 1] as i32 * decay) >> 15) as u16;
+            }
+            value -= 1;
+            loop {
+                self.encode_icdf16(value.min(7) as usize, &icdf, 15);
+                value -= 7;
+                if value < 0 {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Writes the next byte of raw bits, from the end of the buffer
     /// downwards, or sets the error flag when the buffer is full (libopus:
     /// `ec_write_byte_at_end`). As in `write_byte`, the second condition
@@ -1029,5 +1128,39 @@ mod tests {
         assert!((10..20).contains(&d1), "d1={} expected in [10, 20)", d1);
         assert_eq!(b2, 5);
         assert!((50..60).contains(&d2), "d2={} expected in [50, 60)", d2);
+    }
+
+    /// Values written with `laplace_encode_p0` read back with
+    /// `laplace_decode_p0`, for every table that DRED codes with: `p0` and
+    /// `decay` are 8-bit values shifted left by 7, and `p0` is 1 to 254.
+    /// (With `p0` 0 a zero has no probability: the coder could stop
+    /// moving, in libopus too. DRED's tables have no such entry for a
+    /// value it codes.)
+    #[cfg(feature = "dred")]
+    #[test]
+    fn laplace_p0_values_read_back() {
+        let mut rng = Lcg(7);
+        for _ in 0..200 {
+            let p0 = ((1 + rng.next() % 254) as u16) << 7;
+            let decay = ((rng.next() % 256) as u16) << 7;
+            let values: Vec<i32> = (0..50)
+                .map(|_| match rng.next() % 4 {
+                    0 => 0,
+                    1 => (rng.next() % 5) as i32 - 2,
+                    2 => (rng.next() % 41) as i32 - 20,
+                    _ => (rng.next() % 401) as i32 - 200,
+                })
+                .collect();
+            let mut enc = RangeCoder::new_encoder(1000);
+            for &v in &values {
+                enc.laplace_encode_p0(v, p0, decay);
+            }
+            enc.done();
+            assert_eq!(enc.error, 0);
+            let mut dec = RangeCoder::new_decoder(&enc.buf[..enc.storage as usize]);
+            for &v in &values {
+                assert_eq!(dec.laplace_decode_p0(p0, decay), v, "p0 {p0} decay {decay}");
+            }
+        }
     }
 }

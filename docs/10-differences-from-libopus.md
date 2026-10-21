@@ -40,30 +40,24 @@ opus1 follows libopus 1.6, the reference implementation of Opus in C. This docum
 
 ### Encoder features and controls
 
-- **Phase inversion cannot be disabled.** CELT's intensity stereo codes one band for both channels and may invert the sign of one of them. libopus documents that disabling this improves a mono downmix of the stream and slightly lowers normal stereo quality. libopus has `OPUS_SET_PHASE_INVERSION_DISABLED` for it. opus1's CELT encoder always allows phase inversion: it calls `quant_all_bands_enc` with `disable_inv` set to `false`.
 - The fixed-point build of libopus runs its own integer version of the speech and music analysis, at complexity 10 only. opus1 ports the float version, which the float build runs from complexity 7 on. Tests that compare with the fixed-point build run opus1's analysis at complexity 10 only, through the internal setting `opus1::internals::analysis::set_analysis_gate`.
 
 ### Decoder controls
 
-The decoder decodes every valid packet, up to 120 ms. The decoder complexity (`OPUS_SET_COMPLEXITY`), the BWE switch (`OPUS_SET_OSCE_BWE`) and weight blobs (`OPUS_SET_DNN_BLOB`) exist, and act as in libopus when the matching feature is compiled: deep PLC from complexity 5, LACE at 6, NoLACE from 7, and the BWE from 4 (see [Optional libopus features](#optional-libopus-features)). These libopus decoder controls have no equivalent in `OpusDecoder`:
-
-- the output gain (`OPUS_SET_GAIN`),
-- phase inversion disabling (`OPUS_SET_PHASE_INVERSION_DISABLED`). The decoder does what libopus does by default: it disables phase inversion only when it mixes a stereo stream down to mono output,
-- the pitch of the last frame (`OPUS_GET_PITCH`).
+The decoder decodes every valid packet, up to 120 ms. The decoder requests of libopus 1.6.1 have equivalents in `OpusDecoder` (phase inversion disabling, the output gain and the pitch since opus1 0.2), with two exceptions: `OPUS_GET_BANDWIDTH`, the bandwidth of the last packet, which `packet` functions read from the packet's first byte instead, and `OPUS_SET_IGNORE_EXTENSIONS` (see [Packet padding extensions](#packet-padding-extensions)). The decoder complexity (`OPUS_SET_COMPLEXITY`), the BWE switch (`OPUS_SET_OSCE_BWE`) and weight blobs (`OPUS_SET_DNN_BLOB`) act as in libopus when the matching feature is compiled: deep PLC from complexity 5, LACE at 6, NoLACE from 7, and the BWE from 4 (see [Optional libopus features](#optional-libopus-features)).
 
 ### Multichannel
 
 - **Mapping family 3** (ambisonics mixed through a matrix, libopus's `opus_projection_*` functions) is not implemented. Families 0, 1, 2 and 255 are.
-- The multistream encoder does not forward these controls: forced channel count, prediction and phase inversion. It forwards the input bit depth, the signal type, DTX and the in-band FEC mode to every stream. `MultistreamEncoder::dtx` reads the setting of the first stream; libopus has no multistream request for `OPUS_GET_IN_DTX`. The module documentation in `src/multistream/encoder.rs` names this difference D5. It names the surround bandwidth choice in [Deliberate differences](#deliberate-differences) D1. The forced channel count and the prediction switch can be set on each stream's encoder through `MultistreamEncoder::stream_encoder_mut`.
+- The multistream encoder forwards every request of libopus's multistream encoder ctl as libopus does (since opus1 0.2 also the forced channel count, prediction, phase inversion, the application and `OPUS_GET_VOICE_RATIO`), except the quality extension (`OPUS_SET_QEXT`), which is not ported. libopus has no multistream request for `OPUS_GET_IN_DTX`; `OpusEncoder::in_dtx` of each stream encoder (`MultistreamEncoder::stream_encoder`) tells whether that stream is in DTX. The module documentation in `src/multistream/encoder.rs` names this former difference D5, and the surround bandwidth choice D1 (see [Deliberate differences](#deliberate-differences)).
+- The multistream decoder forwards the complexity, the gain and phase inversion disabling, as libopus does, but has no getter for `OPUS_GET_BANDWIDTH` and `OPUS_GET_LAST_PACKET_DURATION`, which libopus answers from the first stream. `MultistreamDecoder::stream_decoder(0)` gives the first stream's `last_packet_duration`.
 
 ### Packet padding extensions
 
-libopus 1.5 and later can store extensions in the padding of a packet. The `packet` module does not read them. When a packet already has padding whose bytes are not all zero:
+libopus 1.5 and later can store extensions in the padding of a packet. opus1 reads and writes them as libopus 1.6.1 does (`src/extensions.rs`), and its repacketizer, `pad`, `unpad` and their multistream versions carry or drop them as libopus's do (see [Packets](02-packets.md#packet-extensions)). The remaining differences:
 
-- libopus reads those bytes as extensions and copies them into the new padding. opus1's `pad` and `multistream_pad` write zeros.
-- libopus rejects the packet when the bytes are not valid extensions. opus1 pads it.
-
-For a packet without padding, or with zero padding, the result is libopus's byte for byte.
+- Without the feature `std`, a call that has to keep more than 32 extensions, or to copy more than 1275 bytes of old padding in `pad`, returns "Internal error". libopus allocates room for any number on its stack.
+- The decoder control `OPUS_SET_IGNORE_EXTENSIONS` is not offered. In libopus 1.6.1 only the quality extension (QEXT), which is not ported, reads extensions in the decoder, so the control changes nothing there.
 
 ### Optional libopus features
 
@@ -81,7 +75,7 @@ A libopus built with the features also changes two things at every decoder compl
 - With deep PLC compiled, `silk_PLC_glue_frames` skips its fade-in for 16 kHz SILK frames (`silk/PLC.c` lines 477-480).
 - With OSCE compiled, a sample of -32768 in a 20 ms SILK frame at 16 kHz becomes -32767 (`dnn/osce.c` lines 1672-1679).
 
-opus1 implements neither DRED nor the scalable quality extension.
+With the feature `dred`, opus1 decodes DRED as libopus 1.6.1 built with `--enable-dred` does, bit for bit (see [DRED decoding](#dred-decoding)). Its encoder writes DRED data (`set_dred_duration`, libopus `OPUS_SET_DRED_DURATION`) as libopus does where the inputs of DRED are the same (see [DRED encoding](#dred-encoding)). opus1 does not implement the scalable quality extension.
 
 ## Deliberate differences
 
@@ -112,6 +106,66 @@ These differences are intended. Most are listed in the comment above `OpusEncode
 | A malformed blob | Refused by `DnnBlob::from_bytes` or `from_static`, without reading out of bounds. | `parse_weights` fails, but every caller ignores that: the decoder request then crashes in `lpcnet_plc_load_model`. A blob without the index table of a sparse layer makes libopus read uninitialized memory. | Safety. |
 | What the layer loader also refuses | Arrays that do not start on a 4-byte boundary; int8 weights equal to -128; a layer with neither int8 nor float weights; int8 layers whose output count is not a multiple of 8 or whose input count is not a multiple of 4 or above 2048; a diagonal array whose size is not 3 times the input count; negative counts or positions in a sparse index table; sizes whose byte count overflows. | Accepts all of these. Some of them make its kernels read or write out of bounds later; with -128 its kernel variants give different results. | Safety. The 1.6.1 weights have none of these. |
 | `reset_state` | Keeps every loaded network. | `OPUS_RESET_STATE` reinitializes PitchDNN from the built-in arrays. In a build with `USE_WEIGHTS_FILE`, PitchDNN is then empty while the decoder counts deep PLC as loaded. | A reset should not lose weights. |
+
+### DRED decoding
+
+The DRED decoder (feature `dred`) gives libopus's results for every valid call. It differs where libopus has no rule or would crash:
+
+| What | opus1 | libopus 1.6.1 | Why |
+|---|---|---|---|
+| `sampling_rate` of `parse` not positive | `"Invalid argument"`. | `opus_dred_parse` divides by it: 0 stops the program, a negative rate gives meaningless numbers. | No crash. |
+| A DRED payload longer than 2,048 bytes | The range decoder reads the bytes after the first 2,048 as zeros. | Reads them. | opus1's range decoder holds at most 2,048 bytes. libopus's encoder writes at most 1,000 bytes of DRED, so only crafted packets reach this. |
+| Output too short for `frame_size` in `dred_decode` | `"Output buffer too small for packet"`, before any change of the decoder. | Takes no buffer length: the caller must give room for `frame_size` samples per channel. | Memory safety. |
+| A new `OpusDred` | Holds nothing: it is neither parsed nor processed, so `process` refuses it and decoding with it conceals as an empty packet. | `opus_dred_alloc` leaves the memory uninitialized. | Defined behavior. |
+| Processing into another state | `process(&src, &mut dst)`; `process_in_place(&mut dred)` for `src == dst`. | One function, `opus_dred_process(dec, src, dst)`, with `src` and `dst` the same or not. | Rust's borrow rules. |
+| Loading weights | `OpusDredDecoder::set_dnn_blob` in every build; a blob without the RDOVAE decoder gives an error and keeps the weights. | `OPUS_SET_DNN_BLOB` only with `USE_WEIGHTS_FILE`; a failure returns `OPUS_BAD_ARG` and can leave the model half replaced. | As for the other networks ([Neural network weights](#neural-network-weights)). |
+| 24-bit output out of range | `dred_decode24` gives the nearest 32-bit value, and 0 for NaN, as libopus does on 64-bit ARM (`vcvtns_s32_f32`). | On x86 (`_mm_cvt_ss2si`) both give -2^31. | Concealed audio stays far inside the range, so this is not reached. |
+
+### DRED encoding
+
+The DRED encoder (feature `dred`) was compared with libopus 1.6.1 built with `--dred` without loop vectorization (`libopus-host-1.6.1-dred-novec`, a float build), on the speech fixture with pauses of digital silence and quiet noise (`tests/dnn_dred_encode_libopus.rs`). The same input and settings give:
+
+| Packets | Equal to libopus | With DRED data |
+|---|---|---|
+| CELT-only, 48 kHz, mono and stereo, 2.5 to 20 ms, VBR and CBR, 24 to 128 kb/s, 5 to 50 % loss, with and without FEC, DRED of 10 to 104 frames, complexity 0 to 6 (80 streams) | 60,000 of 60,000 packets, byte for byte | 21,848 (packets of 2.5 and 5 ms at low bitrates have no room) |
+| The same at complexity 7 to 10, with the speech and music analysis (5 streams) | 3,000 of 3,000 packets | 1,618 |
+| CELT-only packets of 40 and 60 ms with CBR (4 streams) | 500 of 500 packets | 291 |
+| CELT-only at 8, 12, 16 and 24 kHz (8 streams) | 2,400 of 2,400 packets | 2,010 |
+| Hybrid, 48 kHz, `Audio`, VBR, complexity 0 to 6 (5 streams) | the DRED data of 2,100 of 2,100 packets | 1,875 |
+| SILK-only, 8 to 48 kHz, 10 to 60 ms, `Audio`, VBR (6 streams) | the DRED data of 1,400 of 1,400 packets | 1,166 |
+| Hybrid, `Voip` with VBR at complexity 5, and `Audio` with VBR at complexity 9 (one stream each) | the DRED data of 500 of 500 packets in each | 487 in each |
+| Hybrid with CBR: `Audio` at complexity 5, `Voip` at complexity 9 | the DRED data of 208 and 207 of 500 packets | libopus 466 and 468, opus1 466 and 471 |
+| 40 and 60 ms with VBR: Hybrid | the DRED data of 120 of 250 and 78 of 166 packets | libopus 198 and 137, opus1 243 and 161 |
+| 40 and 60 ms with VBR: CELT-only | the DRED data of 146 of 250 and 97 of 166 packets | libopus 208 and 154, opus1 243 and 161 |
+| Multistream (a stereo and a mono stream, CELT-only, 96 kb/s), DRED set on each stream | 200 of 200 packets | 198 in each stream |
+
+The SILK layer of opus1 is the fixed-point one, so SILK-only and Hybrid packets differ from those of the float build in their main frames. The DRED data reads only the filtered input, the voice activity and the bitrate, so it can still be libopus's. It differs in these cases:
+
+- **A constant bitrate with SILK.** The room for DRED data is what the main frame leaves of the packet. opus1's SILK codes other bytes, so the room differs, and the DRED data stops after another latent vector or is not written at all.
+- **Packets of several frames with VBR.** opus1 leaves out libopus's limit of each frame to its share of the bitrate on purpose (see [Deliberate differences](#deliberate-differences)). The first frame then has more room for DRED data, and libopus cuts its data shorter or leaves it out more often.
+- **`Voip` with SILK.** The high-pass filter before DRED follows the pitch analysis of SILK, and at 8 to 24 kHz SILK's voice activity detector reads the output of opus1's integer filter (see [Deliberate differences](#deliberate-differences)). Both can change the DRED data. In the stream above, at 48 kHz, nothing changed.
+- **The speech and music analysis.** opus1's analysis follows the Homebrew build of libopus, which rounds some sums otherwise than the build without vector loops (see [What the figures were measured against](#what-the-figures-were-measured-against)). The activity it gives DRED could then differ. No packet of the tests changed.
+
+The recovered audio was measured too. With bursts of 1 to 49 lost packets, each rebuilt from the DRED data of the packet after the burst, libopus's decoder and opus1's give the same samples, from opus1's packets and from libopus's. The energy of the rebuilt audio in each 10 ms is closer to that of a decode without loss than plain concealment: 5.57 against 7.40 dB on average (opus1's Hybrid packets, 32 kb/s), 6.29 against 26.64 dB (opus1's CELT-only stereo packets, 64 kb/s CBR), and 6.18 against 7.29 dB (libopus's Hybrid packets, 24 kb/s).
+
+The time DRED takes was measured on the Mac (Apple M4 Pro) with the ignored test `encoder_cost_of_dred`: `Voip`, 32 kb/s, 20 % expected loss, complexity 9, the mode chosen by the encoder, 20 s of the speech above, the best of 5 runs. Per 20 ms frame:
+
+| Input | opus1, DRED off | opus1, DRED of 100 frames | libopus `-O2`, off | libopus `-O2`, 100 frames | libopus novec, off | libopus novec, 100 frames |
+|---|---|---|---|---|---|---|
+| 48 kHz mono | 25.6 µs | 79.8 µs | 46.3 µs | 136.0 µs | 49.8 µs | 142.8 µs |
+| 16 kHz mono | 18.3 µs | 64.8 µs | 36.9 µs | 114.8 µs | 39.2 µs | 122.1 µs |
+
+So DRED adds about 54 µs per 20 ms frame to opus1's encoder at 48 kHz and 47 µs at 16 kHz, and about 90 µs and 78 µs to libopus's (`libopus-host-1.6.1-dred`, `-O2`). The opus1 and `-O2` columns come from one run; the novec columns from a run against `libopus-host-1.6.1-dred-novec`, in which opus1 measured 25.6, 79.6, 18.2 and 64.7 µs.
+
+Where the DRED encoder itself differs from libopus:
+
+| What | opus1 | libopus 1.6.1 | Why |
+|---|---|---|---|
+| The voice activity of latent vector 51 | Counts the 8 bytes after the activity memory as inactive. | `dred_voice_active` reads 8 bytes past `activity_mem` when it skips silence with a full buffer of latent vectors: the encoder fields `nonfinal_frame` and `rangeFinal`. | Memory safety. With latent vector 51 or 52 there is nothing left to code either way, so no packet changes. |
+| A reset in a build with `USE_WEIGHTS_FILE` | `reset_state` keeps the loaded models. | `dred_encoder_reset` calls `lpcnet_encoder_init`, which clears PitchDNN and loads it again only from built-in weights. With a weights file PitchDNN is then empty while the encoder counts DRED as loaded. | A reset should not lose weights. Both turn DRED off. |
+| Loading weights | `OpusEncoder::set_dnn_blob` in every build. The RDOVAE encoder and PitchDNN load together; a blob without one of them gives an error and keeps the old models. | `OPUS_SET_DNN_BLOB` only with `USE_WEIGHTS_FILE`. When PitchDNN fails, the RDOVAE encoder stays replaced and `OPUS_BAD_ARG` is returned. | As for the other networks ([Neural network weights](#neural-network-weights)). |
+| One frame of a packet of several frames | At most 1,275 bytes, DRED data included. | The first frame may take more when the DRED bytes are added to its share. | Only at bitrates near the largest a frame holds. |
+| The multistream encoder | Has no DRED setting; set it on each stream encoder (`stream_encoder_mut`). | Answers `OPUS_SET_DRED_DURATION` with `OPUS_UNIMPLEMENTED`; set it on each stream (`OPUS_MULTISTREAM_GET_ENCODER_STATE`). | The same. |
 
 ## Where the numbers differ
 
@@ -326,8 +380,8 @@ The crate `opus-head-sys` 0.3.3, a dependency of the tests, vendors the C source
 | celt/bands.c, celt/celt_encoder.c, celt/celt_decoder.c, celt/rate.c, celt/vq.c, celt/modes.c | bands.c 847, 1091, 1675-1676; celt_encoder.c 2557, after 2590, 2659, 2688; celt_decoder.c 1474, 1507; rate.c 752-851; vq.c 526; modes.c 487 | The scalable quality extension (QEXT, `ENABLE_QEXT`): more extra bits per band (12 to 14), a new depth allocation, a cap of 1275 bytes without the extension, bits counted on the extension's range coder, `extra_quant[nbEBands+1]` corrected to `[nbEBands+i]`, `ec_enc_refine`, a comment. | Not ported: opus1 has no QEXT. |
 | celt/celt_decoder.c | 644-645, after 671 | Deep PLC (`update_plc_state`): two buffers move from the C stack to `ALLOC`. Same output. | No change needed: `DeepPlc::update_from_celt` keeps them on the stack (8 KB and 1.3 KB), with the same output. |
 | src/opus_decoder.c | after 496, after 497 | With the OSCE bandwidth extension, a CELT-only frame resets `osce_extended_mode`. In 1.6.1 a CELT-only frame after bandwidth-extended SILK frames skips its CELT decode, and the range decoder loses its place. | main (see [Deliberate differences](#deliberate-differences)). |
-| src/opus_decoder.c | after 735, 1442, after 1530, 1562-1566, after 1597, 1615 | DRED (deep redundancy): rejects a DRED state that was not processed, returns the result of loading a model through `ret`, clears a new DRED decoder, changes how many features are decoded, adds an assertion on `nb_latents`, removes a blank line. | Not ported: opus1 has no DRED. |
-| src/repacketizer.c | 169 | A packet whose extensions cannot be parsed gives `OPUS_INVALID_PACKET` instead of `OPUS_INTERNAL_ERROR`. | Not ported: opus1 does not read extensions (see [Packet padding extensions](#packet-padding-extensions)). |
+| src/opus_decoder.c | after 735, 1442, after 1530, 1562-1566, after 1597, 1615 | DRED (deep redundancy): rejects a DRED state that was not processed, returns the result of loading a model through `ret`, clears a new DRED decoder, changes how many features are decoded, adds an assertion on `nb_latents`, removes a blank line. | 1.6.1, with the checks listed in [DRED decoding](#dred-decoding). |
+| src/repacketizer.c | 169 | A packet whose extensions cannot be parsed gives `OPUS_INVALID_PACKET` instead of `OPUS_INTERNAL_ERROR`. | 1.6.1: opus1's repacketizer and `pad` give "Internal error" (`OPUS_INTERNAL_ERROR`), as 1.6.1 does (see [Packet padding extensions](#packet-padding-extensions)). |
 | src/repacketizer.c | 265, after 352, after 353 | `RESTORE_STACK` on two error paths. It matters only for builds with libopus's own stack (neither `VAR_ARRAYS` nor `alloca`). | Not applicable. |
 | silk/x86/NSQ_del_dec_avx2.c | 100-106, 138, 518, 567, 901, 959, 1069 | The AVX2 quantizer rounds with `silk_RSHIFT_ROUND` instead of `(a + 2^(b-1)) >> b`. The two differ only when that addition overflows. | opus1 has no AVX2 quantizer. Its quantizer uses `silk_RSHIFT_ROUND`, as the C quantizer of both versions does. |
 | silk/float/burg_modified_FLP.c | 69-70 | The float Burg analysis adds 0.1 instead of 1e-9 to the energy. | Not ported: opus1 has no float SILK encoder. The linked Homebrew libopus is 1.6.1 and adds 1e-9. |
@@ -389,7 +443,7 @@ Against the `-O2` build of the Mac, the differences above grow, because the netw
 - The concealed frames differ at 15.7 dB SNR (scripted losses on the fixture) and 13.2 dB (random losses on all 1,445 signals, 56,800 concealed frames). Builds of libopus differ from each other by about as much: 10.0 to 15.4 dB between the Mac `-O2`, the Mac `-Os` and the Android `-O2` builds.
 - In the decoder (`OpusDecoder` at complexity 5, mono 48 kHz output, 62 streams of every mode, with single losses, bursts and long losses; `distance_to_an_o2_build` in `tests/dnn_plc_decoder_libopus.rs`), the concealed audio differs at 13.5 dB SNR (12.1 dB with speech of the TSP corpus, 20,370 concealed calls), and the audio decoded after the losses, which continues from the concealed state, at 26.9 dB (27.3 dB). The `-O2` build also rounds the filters of the CELT part of deep PLC (`update_plc_state` and the upsampler) and the pitch-based CELT concealment differently.
 
-Two places of the deep PLC models are written for memory safety. Only DRED features (deep redundancy, not ported yet) reach them:
+Two places of the deep PLC models are written for memory safety. Only DRED features (deep redundancy, feature `dred`) reach them:
 
 - A DRED feature vector beyond the 104 places of the queue is dropped. libopus stops with an assertion, or, built without assertions, writes past the queue.
 - A DRED pitch above 7.5 gives FARGAN the period 0. libopus then reads past the end of its pitch buffer, into the next field of `FARGANState`. opus1 reads the same values from that field, so the output is the same, without reading out of bounds.

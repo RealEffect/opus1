@@ -173,6 +173,20 @@ fn init_all<'w>(list: &WeightList<'w>) -> Vec<ModelCheck<'w>> {
         out.push(("fargan", &fargan::LAYERS, fargan::Fargan::init(list).map(|m| owned(&m.layers()))));
         out.push(("plc", &plc::LAYERS, plc::PlcModel::init(list).map(|m| owned(&m.layers()))));
     }
+    #[cfg(feature = "dred")]
+    {
+        use opus1::internals::dnn::models::{dred_rdovae_dec, dred_rdovae_enc};
+        out.push((
+            "dred_rdovae_enc",
+            &dred_rdovae_enc::LAYERS,
+            dred_rdovae_enc::RdovaeEnc::init(list).map(|m| owned(&m.layers())),
+        ));
+        out.push((
+            "dred_rdovae_dec",
+            &dred_rdovae_dec::LAYERS,
+            dred_rdovae_dec::RdovaeDec::init(list).map(|m| owned(&m.layers())),
+        ));
+    }
     #[cfg(feature = "osce")]
     {
         use opus1::internals::dnn::models::{lace, nolace};
@@ -257,6 +271,10 @@ fn builtin_blobs_match_sha256sums_and_version() {
         "fargan.bin",
         #[cfg(feature = "deep-plc")]
         "plc.bin",
+        #[cfg(feature = "dred")]
+        "dred_rdovae_enc.bin",
+        #[cfg(feature = "dred")]
+        "dred_rdovae_dec.bin",
         #[cfg(feature = "osce")]
         "lace.bin",
         #[cfg(feature = "osce")]
@@ -330,6 +348,10 @@ fn every_model_loads_with_the_shapes_of_its_descriptors() {
         ("fargan", 20),
         #[cfg(feature = "deep-plc")]
         ("plc", 6),
+        #[cfg(feature = "dred")]
+        ("dred_rdovae_enc", 24),
+        #[cfg(feature = "dred")]
+        ("dred_rdovae_dec", 29),
         #[cfg(feature = "osce")]
         ("lace", 14),
         #[cfg(feature = "osce")]

@@ -728,15 +728,7 @@ pub struct HeaderFile {
 /// Reads a `*_data.h` file and the struct named `struct_name`.
 pub fn parse_header(file: &str, text: &str, struct_name: &str) -> Result<HeaderFile, Error> {
     let pp = preprocess(file, text, &[])?;
-    let mut consts = Vec::new();
-    for d in &pp.defines {
-        if d.value.is_empty() {
-            // The include guard.
-            continue;
-        }
-        let value = parse_const(&d.value).ok_or_else(|| err(file, 0, format!("unsupported value `{}` of `{}`", d.value, d.name)))?;
-        consts.push(HeaderConst { name: d.name.clone(), value });
-    }
+    let consts = header_consts(file, &pp)?;
     let toks = tokenize(file, &pp.lines)?;
     let mut c = Cursor { file, toks: &toks, pos: 0 };
     let mut fields = None;
@@ -769,6 +761,80 @@ pub fn parse_header(file: &str, text: &str, struct_name: &str) -> Result<HeaderF
     }
     let fields = fields.ok_or_else(|| err(file, 0, format!("no struct `{struct_name}`")))?;
     Ok(HeaderFile { consts, fields })
+}
+
+/// The constants of a header's `#define` lines, without the include guard.
+fn header_consts(file: &str, pp: &Preprocessed) -> Result<Vec<HeaderConst>, Error> {
+    let mut consts = Vec::new();
+    for d in &pp.defines {
+        if d.value.is_empty() {
+            // The include guard.
+            continue;
+        }
+        let value = parse_const(&d.value).ok_or_else(|| err(file, 0, format!("unsupported value `{}` of `{}`", d.value, d.name)))?;
+        consts.push(HeaderConst { name: d.name.clone(), value });
+    }
+    Ok(consts)
+}
+
+/// Reads a header that holds only `#define` constants, such as
+/// `dnn/dred_rdovae_constants.h`, and returns them in file order. Any C
+/// code outside the preprocessor lines is an error.
+pub fn parse_defines(file: &str, text: &str) -> Result<Vec<HeaderConst>, Error> {
+    let pp = preprocess(file, text, &[])?;
+    if let Some((line, l)) = pp.lines.iter().find(|(_, l)| !l.trim().is_empty()) {
+        return Err(err(file, *line, format!("unexpected code `{}` in a header of constants", l.trim())));
+    }
+    header_consts(file, &pp)
+}
+
+/// One table of `dnn/dred_rdovae_stats_data.c`.
+#[derive(Clone, Debug)]
+pub struct U8Table {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// Reads a file of byte tables, `dnn/dred_rdovae_stats_data.c`: only
+/// `const opus_uint8 <name>[<count>] = { <values> };`, in file order. Each
+/// table must have all its values, each from 0 to 255.
+pub fn parse_u8_tables(file: &str, text: &str) -> Result<Vec<U8Table>, Error> {
+    let pp = preprocess(file, text, BUILD_DEFINES)?;
+    let toks = tokenize(file, &pp.lines)?;
+    let mut c = Cursor { file, toks: &toks, pos: 0 };
+    let mut out: Vec<U8Table> = Vec::new();
+    while !c.at_end() {
+        let line = c.line();
+        c.keyword("const")?;
+        c.keyword("opus_uint8")?;
+        let name = c.ident()?.to_string();
+        c.punct('[')?;
+        let count = c.usize()?;
+        c.punct(']')?;
+        c.punct('=')?;
+        c.punct('{')?;
+        let mut data = Vec::with_capacity(count);
+        while !c.is_punct('}') {
+            let s = c.number()?;
+            let v: u8 = s.parse().map_err(|_| c.error(format!("`{s}` is not a value of opus_uint8")))?;
+            data.push(v);
+            if c.is_punct(',') {
+                c.punct(',')?;
+            } else {
+                break;
+            }
+        }
+        c.punct('}')?;
+        c.punct(';')?;
+        if data.len() != count {
+            return Err(err(file, line, format!("table `{name}` has {} values for {count} elements", data.len())));
+        }
+        if out.iter().any(|t| t.name == name) {
+            return Err(err(file, line, format!("table `{name}` defined twice")));
+        }
+        out.push(U8Table { name, data });
+    }
+    Ok(out)
 }
 
 fn parse_fields(c: &mut Cursor) -> Result<Vec<(String, FieldKind)>, Error> {

@@ -7,6 +7,8 @@ These files hold the weights of the neural network models of libopus, in libopus
 | `pitchdnn.bin` | PitchDNN, the pitch estimator of deep packet loss concealment (deep PLC) | `deep-plc` |
 | `fargan.bin` | FARGAN, the vocoder of deep PLC | `deep-plc` |
 | `plc.bin` | the PLC model, which predicts the features of lost frames | `deep-plc` |
+| `dred_rdovae_enc.bin` | the RDOVAE encoder of deep redundancy (DRED) | `dred` |
+| `dred_rdovae_dec.bin` | the RDOVAE decoder of DRED | `dred` |
 | `lace.bin` | LACE, the speech enhancer of SILK at decoder complexity 6 | `osce` |
 | `nolace.bin` | NoLACE, the speech enhancer of SILK at decoder complexity 7 and above | `osce` |
 | `bbwenet.bin` | BBWENet, the network of the bandwidth extension | `osce-bwe` |

@@ -58,6 +58,8 @@ pub mod weights;
 
 #[cfg(feature = "deep-plc")]
 pub mod plc;
+#[cfg(feature = "dred")]
+pub mod dred;
 #[cfg(feature = "osce")]
 pub mod osce;
 

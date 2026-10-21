@@ -282,23 +282,20 @@ fn large_celt_narrowband_stereo_packets_have_the_decoders_final_range() {
     }
 }
 
-/// `opus_packet_pad` on a copy of `data`: the padded packet, or `None` when
-/// libopus rejects it.
-fn c_pad(data: &[u8], new_len: usize) -> Option<Vec<u8>> {
+/// `opus_packet_pad` on a copy of `data`: the padded packet, or the error
+/// code when libopus rejects it.
+fn c_pad(data: &[u8], new_len: usize) -> Result<Vec<u8>, i32> {
     let mut out = data.to_vec();
     out.resize(new_len, 0xEE);
     let ret = unsafe { audiopus_sys::opus_packet_pad(out.as_mut_ptr(), data.len() as i32, new_len as i32) };
-    (ret == 0).then_some(out)
+    if ret == 0 { Ok(out) } else { Err(ret) }
 }
 
 /// Padding a packet that is padded already, with random bytes in the old
-/// padding. This measures the one known difference from `opus_packet_pad`
-/// (packet extensions are not ported) and holds it to its limits:
-///
-/// - old padding of zeros: the bytes are libopus's;
-/// - any old padding: `pad` succeeds, the frames are unchanged, and the new
-///   padding is zeros. libopus keeps old padding it can read as extensions
-///   and rejects the packet otherwise.
+/// padding. libopus reads the old padding as packet extensions: it keeps
+/// the extensions it finds and rejects the packet ("Internal error") when
+/// the bytes are not valid extensions. `pad` must do the same, byte for
+/// byte.
 #[test]
 fn pad_of_a_packet_with_padding_content() {
     let mut seed = 77u64;
@@ -306,7 +303,7 @@ fn pad_of_a_packet_with_padding_content() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (seed >> 33) as u32
     };
-    let (mut same, mut c_keeps_content, mut c_rejects) = (0, 0, 0);
+    let (mut zeros_out, mut kept, mut rejected) = (0, 0, 0);
     for round in 0..3000 {
         let frame_len = 1 + next() as usize % 20;
         let pad_len = 1 + next() as usize % 12;
@@ -319,27 +316,28 @@ fn pad_of_a_packet_with_padding_content() {
 
         let mut ours = data.clone();
         ours.resize(new_len, 0xEE);
-        packet::pad(&mut ours, data.len(), new_len).unwrap_or_else(|e| panic!("round {round}: {e}"));
-        let parsed = packet::parse(&ours, false).unwrap();
-        assert_eq!(parsed.frame(&ours, 0), &data[3..3 + frame_len], "round {round}: the frame");
-        assert_eq!(parsed.padding_len + parsed.payload_offset + frame_len, new_len, "round {round}");
-        assert!(ours[new_len - parsed.padding_len..].iter().all(|&b| b == 0), "round {round}: new padding");
-
-        let all_zero = data[3 + frame_len..].iter().all(|&b| b == 0);
+        let result = packet::pad(&mut ours, data.len(), new_len);
         match c_pad(&data, new_len) {
-            Some(expected) if expected == ours => same += 1,
-            Some(_) => {
-                assert!(!all_zero, "round {round}: bytes differ from libopus without padding content");
-                c_keeps_content += 1;
+            Ok(expected) => {
+                assert_eq!(result, Ok(()), "round {round}");
+                assert_eq!(ours, expected, "round {round}: the bytes of libopus");
+                let parsed = packet::parse(&ours, false).unwrap();
+                assert_eq!(parsed.frame(&ours, 0), &data[3..3 + frame_len], "round {round}: the frame");
+                if ours[new_len - parsed.padding_len..].iter().all(|&b| b == 0) {
+                    zeros_out += 1;
+                } else {
+                    kept += 1;
+                }
             }
-            None => {
-                assert!(!all_zero, "round {round}: libopus rejects a packet with zero padding");
-                c_rejects += 1;
+            Err(code) => {
+                assert_eq!(code, -3, "round {round}");
+                assert_eq!(result, Err("Internal error"), "round {round}");
+                rejected += 1;
             }
         }
     }
-    println!("{same} identical to libopus; libopus keeps the old padding in {c_keeps_content} and rejects {c_rejects}");
-    assert!(same >= 1000, "{same} identical");
+    println!("new padding of zeros {zeros_out}, extensions kept {kept}, rejected {rejected}");
+    assert!(zeros_out >= 1000 && kept >= 100 && rejected >= 100, "{zeros_out} {kept} {rejected}");
 }
 
 /// The level of a signal in dB, 0 dB for a full-scale square wave.

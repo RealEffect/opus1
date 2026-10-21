@@ -10,8 +10,9 @@
 //!   functions build: the same shapes, the same arrays present or absent,
 //!   and the same array contents. The C init functions also accept opus1's
 //!   blobs, read with libopus's own `parse_weights`.
-//! - The sparse layers of the two DRED models, which opus1 does not include
-//!   yet, load like `linear_init` loads them.
+//! - The layers of the two DRED models, also in a build without the
+//!   feature `dred`, load from their descriptors like `linear_init` loads
+//!   them, sparse layers included.
 //! - `WeightList::parse` accepts and refuses changed blobs as
 //!   `parse_weights` does, and `linear_init` refuses bad index tables that
 //!   libopus refuses.
@@ -23,6 +24,9 @@
 //!   LIBOPUS_STATIC=1 CARGO_TARGET_DIR=target/dnn-ref cargo test --release \
 //!   --features test-libopus-dnn,osce-bwe --test dnn_weights_libopus
 //! ```
+//!
+//! With `dred,osce-bwe` it runs the same way, against either the build
+//! above or the one with DRED (`libopus-host-1.6.1-dred-novec`).
 //!
 //! The comparison with the blob files of the reference build looks in
 //! `OPUS1_DNN_BLOB_DIR`, then in `target/android/dnn-blob-1.6.1` of the
@@ -171,6 +175,15 @@ fn rust_model<'w>(key: &str, list: &WeightList<'w>) -> Option<Built<'w>> {
             "pitchdnn" => return Some((&pitchdnn::LAYERS, pitchdnn::PitchDnn::init(list).map(|m| owned(&m.layers())))),
             "fargan" => return Some((&fargan::LAYERS, fargan::Fargan::init(list).map(|m| owned(&m.layers())))),
             "plc" => return Some((&plc::LAYERS, plc::PlcModel::init(list).map(|m| owned(&m.layers())))),
+            _ => {}
+        }
+    }
+    #[cfg(feature = "dred")]
+    {
+        use opus1::internals::dnn::models::{dred_rdovae_dec as dec, dred_rdovae_enc as enc};
+        match key {
+            "dred_rdovae_enc" => return Some((&enc::LAYERS, enc::RdovaeEnc::init(list).map(|m| owned(&m.layers())))),
+            "dred_rdovae_dec" => return Some((&dec::LAYERS, dec::RdovaeDec::init(list).map(|m| owned(&m.layers())))),
             _ => {}
         }
     }
@@ -365,6 +378,9 @@ fn concatenated_blobs_equal_the_blob_of_libopus() {
     };
     if let Some(plc) = cat(&["pitchdnn", "fargan", "plc"]) {
         assert!(official[..plc.len()] == plc[..], "deep PLC blobs");
+        if let Some(dred) = cat(&["dred_rdovae_enc", "dred_rdovae_dec"]) {
+            assert!(official[plc.len()..plc.len() + dred.len()] == dred[..], "DRED blobs");
+        }
     }
     if let Some(osce) = cat(&["lace", "nolace"]) {
         assert!(official[official.len() - osce.len()..] == osce[..], "LACE and NoLACE blobs");

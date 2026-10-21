@@ -131,7 +131,7 @@ pub use decoder::MultistreamDecoder;
 pub use encoder::MultistreamEncoder;
 pub use layout::{ChannelLayout, MappingType, SILENT_CHANNEL, validate_ambisonics};
 
-use crate::{float2int16, int16_to_res, packet};
+use crate::{float2int16, float2int24, int16_to_res, int24_to_res, packet};
 
 /// Source of the input samples of one frame, by input channel.
 /// libopus calls this `opus_copy_channel_in_func`.
@@ -142,15 +142,19 @@ pub(crate) trait ChannelSource {
 }
 
 /// A sample type of the encoder input and the decoder output: `f32` with
-/// full scale 1.0, or `i16`.
+/// full scale 1.0, `i16`, or `i32` holding 24-bit samples.
 pub(crate) trait Sample: Copy {
     /// Silence.
     const ZERO: Self;
-    /// The precision libopus gives this input type: 24 bits for `f32`
-    /// (`MAX_ENCODING_DEPTH`) and 16 for `i16`.
+    /// The precision libopus gives this input type: 24 bits for `f32` and
+    /// `i32` (`MAX_ENCODING_DEPTH`) and 16 for `i16`.
     const LSB_DEPTH: i32;
+    /// The `float_api` argument libopus's multistream encoder passes for
+    /// this input type: 1 for `f32`, 0 for `i16` and `i32`.
+    const FLOAT_API: bool;
     /// The samples as the speech and music analysis reads them: libopus
-    /// `downmix_float` for `f32` and `downmix_int` for `i16`.
+    /// `downmix_float` for `f32`, `downmix_int` for `i16` and
+    /// `downmix_int24` for `i32`.
     fn analysis_pcm(pcm: &[Self]) -> crate::analysis::PcmRef<'_>;
     /// The sample as `f32` with full scale 1.0.
     fn to_f32(self) -> f32;
@@ -161,6 +165,7 @@ pub(crate) trait Sample: Copy {
 impl Sample for f32 {
     const ZERO: f32 = 0.0;
     const LSB_DEPTH: i32 = 24;
+    const FLOAT_API: bool = true;
 
     #[inline(always)]
     fn analysis_pcm(pcm: &[f32]) -> crate::analysis::PcmRef<'_> {
@@ -181,6 +186,7 @@ impl Sample for f32 {
 impl Sample for i16 {
     const ZERO: i16 = 0;
     const LSB_DEPTH: i32 = 16;
+    const FLOAT_API: bool = false;
 
     #[inline(always)]
     fn analysis_pcm(pcm: &[i16]) -> crate::analysis::PcmRef<'_> {
@@ -198,6 +204,30 @@ impl Sample for i16 {
     #[inline(always)]
     fn from_f32(v: f32) -> i16 {
         float2int16(v)
+    }
+}
+
+impl Sample for i32 {
+    const ZERO: i32 = 0;
+    const LSB_DEPTH: i32 = 24;
+    const FLOAT_API: bool = false;
+
+    #[inline(always)]
+    fn analysis_pcm(pcm: &[i32]) -> crate::analysis::PcmRef<'_> {
+        crate::analysis::PcmRef::I32(pcm)
+    }
+
+    /// libopus `INT24TORES` in the float build.
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        int24_to_res(self)
+    }
+
+    /// libopus `RES2INT24`: scaled by 2^23 and rounded to the nearest
+    /// integer, without a limit to 24 bits.
+    #[inline(always)]
+    fn from_f32(v: f32) -> i32 {
+        float2int24(v)
     }
 }
 

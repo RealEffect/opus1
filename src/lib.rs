@@ -33,6 +33,8 @@ mod deep_plc;
 mod dnn;
 #[cfg(feature = "dnn")]
 pub use dnn::{DnnBlob, DnnModels};
+#[cfg(feature = "dred")]
+pub use dnn::dred::decoder::{DredParse, OpusDred, OpusDredDecoder};
 mod hp_cutoff;
 #[doc(hidden)]
 pub mod internals;
@@ -45,6 +47,7 @@ mod osce_args;
 /// default). The single-stream codec stays `no_std` without `alloc`.
 #[cfg(feature = "std")]
 pub mod multistream;
+pub mod extensions;
 pub mod packet;
 mod pitch;
 mod pvq;
@@ -719,6 +722,11 @@ pub struct OpusEncoder {
     analysis: analysis::TonalityAnalysisState,
     /// When the analysis runs (an internal control, see `AnalysisGate`).
     analysis_gate: AnalysisGate,
+    /// C argument `float_api` of `opus_encode_native`, for the frame being
+    /// coded: the input sum test of `encode_frame` runs only with it. It is
+    /// true for every `OpusEncoder` call, and for multistream float input;
+    /// libopus's multistream 16-bit and 24-bit calls pass 0.
+    float_api: bool,
     /// The analysis the last frame went by, for the tests.
     last_analysis: AnalysisInfo,
     /// C `st->voice_ratio`: the speech probability of the last packet that
@@ -749,6 +757,15 @@ pub struct OpusEncoder {
     nb_no_activity_ms_q1: i32,
 
     rc: RangeCoder,
+
+    /// Deep redundancy (DRED, cargo feature `dred`): the feature analysis,
+    /// the RDOVAE encoder, the latent vectors of the last second and the
+    /// DRED settings of libopus's `OpusEncoder`. Boxed with `heap`: it
+    /// holds about 40 KB.
+    #[cfg(all(feature = "dred", feature = "heap"))]
+    dred: Box<dnn::dred::encoder::DredEncoder>,
+    #[cfg(all(feature = "dred", not(feature = "heap")))]
+    dred: dnn::dred::encoder::DredEncoder,
 }
 
 /// libopus `gain_fade` (opus_encoder.c:581): scale an interleaved frame by a
@@ -1334,6 +1351,7 @@ impl OpusEncoder {
             #[cfg(all(feature = "analysis", not(feature = "heap")))]
             analysis: analysis::TonalityAnalysisState::new(sampling_rate),
             analysis_gate: AnalysisGate::FloatBuild,
+            float_api: true,
             last_analysis: AnalysisInfo::default(),
             // C `opus_encoder_init`: `voice_ratio = -1`, `signal_type =
             // OPUS_AUTO`, `lsb_depth = 24`.
@@ -1346,6 +1364,10 @@ impl OpusEncoder {
             silk_channels_internal: channels,
             nb_no_activity_ms_q1: 0,
             rc: RangeCoder::new_encoder(1),
+            #[cfg(all(feature = "dred", feature = "heap"))]
+            dred: Box::new(dnn::dred::encoder::DredEncoder::new(sampling_rate, channels)),
+            #[cfg(all(feature = "dred", not(feature = "heap")))]
+            dred: dnn::dred::encoder::DredEncoder::new(sampling_rate, channels),
         })
     }
 
@@ -1961,6 +1983,48 @@ impl OpusEncoder {
         self.packet_loss_perc
     }
 
+    /// libopus `OPUS_SET_DRED_DURATION` (feature `dred`): how much audio
+    /// before each packet the packet carries again as deep redundancy
+    /// (DRED), in frames of 10 ms, 0 to 104. 0, the default, turns DRED
+    /// off.
+    ///
+    /// DRED takes part of the bitrate, and only with an expected packet
+    /// loss ([`set_packet_loss_perc`](Self::set_packet_loss_perc)) above
+    /// 0. How much depends on the loss, on in-band FEC and on the
+    /// bitrate; at too low a bitrate it takes nothing. The data goes into
+    /// the padding of the packet, as the packet extension with ID 126, in
+    /// the first frame that is coded. A decoder that knows nothing of DRED
+    /// skips it. Decode it with [`OpusDredDecoder`] and
+    /// [`OpusDecoder::dred_decode_float`].
+    ///
+    /// [`reset_state`](Self::reset_state) sets the duration back to 0, as
+    /// libopus does.
+    #[cfg(feature = "dred")]
+    pub fn set_dred_duration(&mut self, frames: i32) -> Result<(), &'static str> {
+        self.dred.set_duration(frames)
+    }
+
+    /// libopus `OPUS_GET_DRED_DURATION` (feature `dred`): the DRED duration
+    /// in frames of 10 ms ([`set_dred_duration`](Self::set_dred_duration)).
+    #[cfg(feature = "dred")]
+    pub fn dred_duration(&self) -> i32 {
+        self.dred.duration()
+    }
+
+    /// libopus `OPUS_SET_DNN_BLOB` on an encoder (feature `dred`): loads the
+    /// models of the DRED encoder (the RDOVAE encoder and PitchDNN) from a
+    /// blob in the libopus format. When the blob does not hold all of their
+    /// arrays, returns `"DNN blob holds no model of this build"` and keeps
+    /// the models it had. [`DnnBlob::builtin`] brings back the built-in
+    /// weights. Without the models the encoder writes no DRED data.
+    ///
+    /// libopus offers the request only when built with `USE_WEIGHTS_FILE`
+    /// and returns `OPUS_BAD_ARG` on a failure.
+    #[cfg(feature = "dred")]
+    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+        self.dred.load(blob)
+    }
+
     /// libopus `OPUS_SET_FORCE_MODE`: ask for a coding mode instead of the
     /// automatic choice. `None` gives the choice back to the encoder.
     ///
@@ -2041,6 +2105,26 @@ impl OpusEncoder {
         self.prediction_disabled
     }
 
+    /// libopus `OPUS_SET_PHASE_INVERSION_DISABLED`: with `true`, CELT's
+    /// intensity stereo never inverts the sign of the second channel. The
+    /// default is `false`.
+    ///
+    /// libopus documents the trade: disabling phase inversion makes a mono
+    /// downmix of the decoded stereo sound better, and lowers stereo
+    /// quality a little. It changes CELT-only and Hybrid packets of stereo
+    /// streams, at bitrates where CELT codes high bands as intensity
+    /// stereo. [`reset_state`](Self::reset_state) keeps the value.
+    pub fn set_phase_inversion_disabled(&mut self, disabled: bool) {
+        self.celt_enc.set_phase_inversion_disabled(disabled);
+    }
+
+    /// The value set with
+    /// [`set_phase_inversion_disabled`](Self::set_phase_inversion_disabled)
+    /// (`OPUS_GET_PHASE_INVERSION_DISABLED`).
+    pub fn phase_inversion_disabled(&self) -> bool {
+        self.celt_enc.phase_inversion_disabled()
+    }
+
     /// The test control of `internals::silk_input`: with `true`, SILK reads
     /// the output of the integer `hp_cutoff` with `Voip` at 48 kHz too.
     pub(crate) fn set_integer_hp_at_48k(&mut self, on: bool) {
@@ -2112,6 +2196,58 @@ impl OpusEncoder {
     /// The count set with [`set_force_channels`](Self::set_force_channels).
     pub fn force_channels(&self) -> Option<usize> {
         self.force_channels
+    }
+
+    /// libopus `OPUS_SET_APPLICATION`: changes the application given to
+    /// [`new`](Self::new), before the first frame is coded.
+    ///
+    /// Once a frame is coded, only the current application is accepted;
+    /// another one is an error and changes nothing, as in libopus.
+    /// [`reset_state`](Self::reset_state) allows a change again. An
+    /// encoder whose application is changed before the first frame codes
+    /// as one created with the new application.
+    pub fn set_application(&mut self, application: Application) -> Result<(), &'static str> {
+        if !self.first && application != self.application {
+            return Err("Application cannot change after the first frame");
+        }
+        self.application = application;
+        // What `new` derives from the application. Before the first frame
+        // the delay buffer holds only zeros, so its length can change.
+        let restricted = application == Application::RestrictedLowDelay;
+        let fs = self.sampling_rate as usize;
+        self.encoder_buffer = if restricted { 0 } else { fs / 100 };
+        self.delay_compensation = if restricted { 0 } else { fs / 250 };
+        Ok(())
+    }
+
+    /// The application (`OPUS_GET_APPLICATION`).
+    pub fn application(&self) -> Application {
+        self.application
+    }
+
+    /// libopus `OPUS_SET_VOICE_RATIO`: the probability that the input is
+    /// speech, in percent (0 to 100), or -1 for none. Any other value is an
+    /// error and changes nothing.
+    ///
+    /// The encoder replaces the value itself: with every frame that is not
+    /// digital silence it goes back to -1, and when the speech and music
+    /// analysis gives a result and the signal type is automatic, it becomes
+    /// the analysis's estimate. While it is not -1 and the signal type is
+    /// automatic, it steers the choice between SILK and CELT. The start
+    /// value is -1.
+    pub fn set_voice_ratio(&mut self, ratio: i32) -> Result<(), &'static str> {
+        if !(-1..=100).contains(&ratio) {
+            return Err("Invalid voice ratio");
+        }
+        self.voice_ratio = ratio;
+        Ok(())
+    }
+
+    /// libopus `OPUS_GET_VOICE_RATIO`: the value of
+    /// [`set_voice_ratio`](Self::set_voice_ratio), or the encoder's own
+    /// estimate from the last frame, in percent, or -1.
+    pub fn voice_ratio(&self) -> i32 {
+        self.voice_ratio
     }
 
     /// libopus `OPUS_SET_ENERGY_MASK`: how far each band of each channel
@@ -2189,6 +2325,11 @@ impl OpusEncoder {
     /// bandwidth switch, and whether it ran at wideband. With FEC on and
     /// more than 5 % loss, the first packets after a reset can therefore
     /// have another bandwidth than those of a new encoder.
+    ///
+    /// With the feature `dred`, a reset also turns DRED off, as in libopus:
+    /// [`dred_duration`](Self::dred_duration) is 0 afterwards. The DRED
+    /// models stay, also those loaded with
+    /// [`set_dnn_blob`](Self::set_dnn_blob).
     pub fn reset_state(&mut self) {
         // `new` accepted this sampling rate, channel count and application
         // before, so it does again.
@@ -2236,6 +2377,14 @@ impl OpusEncoder {
         fresh.use_dtx = self.use_dtx;
         fresh.silk_use_dtx = self.silk_use_dtx;
         fresh.silk_channels_internal = self.silk_channels_internal;
+        // C: `disable_inv` lies before the part of the CELT encoder that a
+        // reset clears.
+        fresh.celt_enc.set_phase_inversion_disabled(self.celt_enc.phase_inversion_disabled());
+        // The DRED fields of libopus's encoder lie after
+        // `OPUS_ENCODER_RESET_START`, `dred_duration` included, so a reset
+        // turns DRED off. `dred_encoder_reset` keeps the models.
+        #[cfg(feature = "dred")]
+        fresh.dred.swap_models(&mut self.dred);
         *self = fresh;
     }
 
@@ -2293,7 +2442,7 @@ impl OpusEncoder {
             c2: SecondChannel::AllOthers,
             frame_size: analysis_frame_size,
         };
-        self.encode_impl(input, frame_size, output, analysis_pcm, 24)
+        self.encode_impl(input, frame_size, output, analysis_pcm, 24, true)
     }
 
     /// Encode a frame of interleaved 16-bit PCM (libopus `opus_encode`).
@@ -2330,7 +2479,40 @@ impl OpusEncoder {
             c2: SecondChannel::AllOthers,
             frame_size: analysis_frame_size,
         };
-        self.encode_impl(&pcm, frame_size, output, analysis_pcm, 16)
+        self.encode_impl(&pcm, frame_size, output, analysis_pcm, 16, true)
+    }
+
+    /// Encode one frame of interleaved 24-bit samples held in 32-bit
+    /// integers: libopus `opus_encode24` in the float build.
+    ///
+    /// Full scale is 2^23 (±8388608). Each sample is divided by 2^23 to a
+    /// float (libopus `INT24TORES`), and the frame is then coded as
+    /// [`encode`](Self::encode) codes float input, with 24 bits of
+    /// precision. Values beyond 24 bits are accepted and are not limited,
+    /// as in libopus. The speech and music analysis reads the integers
+    /// (libopus `downmix_int24`). `frame_size` and the errors are those of
+    /// [`encode`](Self::encode).
+    pub fn encode24(
+        &mut self,
+        input: &[i32],
+        frame_size: usize,
+        output: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        let analysis_frame_size = frame_size;
+        let frame_size = self.select_frame_size(input.len(), frame_size)?;
+        let n = frame_size * self.channels;
+        let mut pcm: FixedVec<f32, OPUS_PCM_PACKET> = FixedVec::from_value(0.0, n);
+        for (dst, &src) in pcm.iter_mut().zip(&input[..n]) {
+            *dst = int24_to_res(src);
+        }
+        let analysis_pcm = AnalysisPcm {
+            pcm: PcmRef::I32(input),
+            channels: self.channels,
+            c1: 0,
+            c2: SecondChannel::AllOthers,
+            frame_size: analysis_frame_size,
+        };
+        self.encode_impl(&pcm, frame_size, output, analysis_pcm, 24, true)
     }
 
     /// The frame an encode call codes: libopus `frame_size_select`, which
@@ -2392,7 +2574,9 @@ impl OpusEncoder {
         output: &mut [u8],
         analysis_pcm: AnalysisPcm<'_>,
         lsb_depth: i32,
+        float_api: bool,
     ) -> Result<usize, &'static str> {
+        self.float_api = float_api;
         // C 1223: no final range until a frame is coded.
         self.range_final = 0;
         let out_data_bytes = output.len();
@@ -2489,6 +2673,14 @@ impl OpusEncoder {
             // "Make sure we provide at least one byte to avoid failing."
             max_data_bytes = cbr_bytes.max(1);
         }
+        // C 1335-1339: "Allocate some of the bits to DRED if needed." The
+        // rest of the packet goes by the bitrate that DRED leaves. With DRED
+        // off the share is 0.
+        #[cfg(feature = "dred")]
+        {
+            let fec = self.fec_config != InbandFec::Off;
+            bitrate -= self.dred.compute_bitrate(bitrate, frame_size, fec, self.packet_loss_perc);
+        }
         self.packet_bitrate_bps = bitrate;
 
         // C 1340-1406: "If the space is too low to do something useful,
@@ -2536,7 +2728,7 @@ impl OpusEncoder {
             info: analysis_info,
             is_silence,
         };
-        self.encode_frame(input, frame_size, &mut output[..max_data_bytes], decisions, frame_analysis)
+        self.encode_frame(input, frame_size, &mut output[..max_data_bytes], decisions, frame_analysis, true)
     }
 
     /// C 1247-1263: the speech and music analysis of the packet, when the
@@ -2590,7 +2782,9 @@ impl OpusEncoder {
     ///
     /// `output.len()` is the largest size the frame's packet may have (C
     /// `orig_max_data_bytes`). With a constant bitrate the packet is padded
-    /// to exactly that size.
+    /// to exactly that size. `first_frame` is true for the first frame of a
+    /// packet that is coded (not left out by DTX): its packet carries the
+    /// DRED data.
     fn encode_frame(
         &mut self,
         input: &[f32],
@@ -2598,6 +2792,7 @@ impl OpusEncoder {
         output: &mut [u8],
         d: FrameDecisions,
         analysis: FrameAnalysis,
+        first_frame: bool,
     ) -> Result<usize, &'static str> {
         let orig_max_data_bytes = output.len();
         // C `max_data_bytes`: one frame takes 1275 bytes at most.
@@ -2629,10 +2824,9 @@ impl OpusEncoder {
         // - A CELT-only frame without the analysis: active when its energy
         //   is within 25 dB of the peak energy, with the frame's energy
         //   halved ("Boosting peak energy a bit because we didn't just
-        //   average the active frames"). Only the DTX of the Opus layer
-        //   reads this value (libopus also gives it to its deep redundancy,
-        //   DRED, which opus1 does not have), so it is computed only when
-        //   that DTX is in use.
+        //   average the active frames"). Only the DTX of the Opus layer and
+        //   the deep redundancy (DRED) read this value, so it is computed
+        //   only when one of them is in use.
         // - Otherwise `VAD_NO_DECISION` (-1): SILK decides by itself, and
         //   its decision becomes the frame's activity below.
         //
@@ -2646,7 +2840,7 @@ impl OpusEncoder {
                 || self.peak_signal_energy
                     < PSEUDO_SNR_THRESHOLD * frame_energy(&input[..frame_size * ch]);
             active as i32
-        } else if d.mode == OpusMode::CeltOnly && self.use_dtx && !self.silk_use_dtx {
+        } else if d.mode == OpusMode::CeltOnly && ((self.use_dtx && !self.silk_use_dtx) || self.dred_on()) {
             let noise_energy = frame_energy(&input[..frame_size * ch]);
             (self.peak_signal_energy < PSEUDO_SNR_THRESHOLD * (0.5 * noise_energy)) as i32
         } else {
@@ -2759,13 +2953,19 @@ impl OpusEncoder {
             } else {
                 dc_reject_float(input, 3, out, &mut self.hp_mem_float, frame_size, ch, fs);
             }
-            // 3. float NaN guard (C: 2016-2028)
-            if !input_is_sane(&self.buf_celt_pcm[prefix..]) {
+            // 3. float NaN guard (C: 2016-2028), for the float API only.
+            if self.float_api && !input_is_sane(&self.buf_celt_pcm[prefix..]) {
                 self.buf_celt_pcm[prefix..].fill(0.0);
                 self.hp_mem_float = [0.0; 4];
                 frame_cleared = true;
             }
         }
+
+        // C 2027-2040: "Compute the DRED features. Needs to be before SILK
+        // because of DTX." DRED reads the filtered frame, and records the
+        // frame's activity.
+        #[cfg(feature = "dred")]
+        self.dred.analyze_frame(&self.buf_celt_pcm[prefix..], frame_size, delay, activity);
 
         // SILK's 16-bit input with `Voip` at 8 to 24 kHz, and at 48 kHz with
         // the test control `integer_hp_at_48k`: the integer `hp_cutoff` of
@@ -2901,26 +3101,30 @@ impl OpusEncoder {
                     silk_max_bits -= 20;
                 }
             }
-            if mode == OpusMode::Hybrid {
-                if self.use_cbr {
+            // "When we're in CBR mode, but we have non-SILK data to encode,
+            // switch SILK to VBR with cap to save on complexity": a Hybrid
+            // frame, and a frame with DRED data.
+            let silk_vbr_with_cap = mode == OpusMode::Hybrid || self.dred_bitrate_bps() > 0;
+            if self.use_cbr {
+                if silk_vbr_with_cap {
                     // "Allow SILK to steal up to 25% of the remaining bits".
                     let silk_bits =
                         (silk_bitrate as i64 * frame_size as i64 / fs as i64) as i32;
                     let other_bits = 0i32.max(silk_max_bits - silk_bits);
                     silk_max_bits = 0i32.max(silk_max_bits - other_bits * 3 / 4);
-                } else {
-                    // C opus_encoder.c:2176-2181: the SILK rate that goes
-                    // with the largest packet allowed.
-                    let max_bit_rate = compute_silk_rate_for_hybrid(
-                        silk_max_bits * fs / frame_size as i32,
-                        frame_bandwidth,
-                        frame_ms == 20,
-                        true,
-                        lbrr_coded != 0,
-                        self.stream_channels,
-                    );
-                    silk_max_bits = bitrate_to_bits(max_bit_rate, fs, frame_size);
                 }
+            } else if mode == OpusMode::Hybrid {
+                // C opus_encoder.c:2176-2181: the SILK rate that goes with
+                // the largest packet allowed.
+                let max_bit_rate = compute_silk_rate_for_hybrid(
+                    silk_max_bits * fs / frame_size as i32,
+                    frame_bandwidth,
+                    frame_ms == 20,
+                    true,
+                    lbrr_coded != 0,
+                    self.stream_channels,
+                );
+                silk_max_bits = bitrate_to_bits(max_bit_rate, fs, frame_size);
             }
             // C 2112-2147: the internal rates SILK may choose from. Hybrid's
             // CELT layer starts at 8 kHz, so its SILK layer is wideband. A
@@ -3014,11 +3218,11 @@ impl OpusEncoder {
                 bit_rate: silk_bitrate,
                 max_bits: silk_max_bits,
                 // C opus_encoder.c:2133-2177: SILK runs at a constant
-                // bitrate only in SILK-only packets. A Hybrid packet with a
-                // constant bitrate codes SILK at a variable one, with a cap,
-                // and CELT takes up the rest ("switch SILK to VBR with
-                // cap").
-                use_cbr: self.use_cbr && mode != OpusMode::Hybrid,
+                // bitrate only in SILK-only packets without DRED data. A
+                // Hybrid packet with a constant bitrate codes SILK at a
+                // variable one, with a cap, and CELT takes up the rest
+                // ("switch SILK to VBR with cap"); with DRED, DRED does.
+                use_cbr: self.use_cbr && !silk_vbr_with_cap,
                 complexity: self.complexity,
                 packet_loss_perc: self.packet_loss_perc,
                 lbrr_coded: lbrr_coded != 0,
@@ -3058,6 +3262,8 @@ impl OpusEncoder {
             // packet of 40 or 60 ms).
             if activity == VAD_NO_DECISION {
                 activity = (self.silk.mid().s_cmn.indices.signal_type != TYPE_NO_VOICE_ACTIVITY as i8) as i32;
+                #[cfg(feature = "dred")]
+                self.dred.set_activity(frame_size, activity);
             }
             // C 2242-2249: SILK's DTX left the packet out. Only the TOC byte
             // is sent, without padding. The rest of the frame is skipped:
@@ -3234,7 +3440,20 @@ impl OpusEncoder {
         let mut nb_compr_bytes = if mode == OpusMode::SilkOnly {
             (((self.rc.tell() + 7) >> 3).max(0) as usize).min(n_bytes - 1 - redundancy_bytes)
         } else {
-            let nb = n_bytes - 1 - redundancy_bytes;
+            #[allow(unused_mut)]
+            let mut nb = n_bytes - 1 - redundancy_bytes;
+            // C 2399-2411: the CELT part leaves room for the DRED data.
+            #[cfg(feature = "dred")]
+            if self.dred.duration() > 0 {
+                let dred_bytes = bitrate_to_bits(self.dred.bitrate_bps(), fs, frame_size) / 8;
+                // "Allow CELT to steal up to 25% of the remaining bits."
+                let max_celt_bytes = nb as i32 - dred_bytes * 3 / 4;
+                // "But try to give CELT at least 5 bytes to prevent a
+                // mismatch with the redundancy signaling."
+                let max_celt_bytes = max_celt_bytes.max((self.rc.tell() + 7) / 8 + 5);
+                // "Subject to the original max."
+                nb = nb.min(max_celt_bytes as usize);
+            }
             self.rc.shrink(nb as u32);
             nb
         };
@@ -3315,6 +3534,20 @@ impl OpusEncoder {
             // SILK left), CELT-only VBR follows the setting.
             self.celt_enc
                 .set_constrained_vbr(mode == OpusMode::CeltOnly && self.vbr_constraint);
+            // C 2465-2476: "When Using DRED CBR, we can actually make the
+            // CELT part VBR and have DRED pick up the slack." CELT gets what
+            // the bitrate leaves after DRED (and SILK). A rate under 501 b/s
+            // is refused, as in libopus, and CELT keeps `OPUS_BITRATE_MAX`.
+            #[cfg(feature = "dred")]
+            if self.use_cbr && self.dred.duration() > 0 {
+                let mut celt_bitrate = self.packet_bitrate_bps;
+                if mode == OpusMode::Hybrid {
+                    celt_bitrate -= hybrid_silk_rate;
+                }
+                self.celt_enc.set_vbr(true);
+                self.celt_enc.set_constrained_vbr(false);
+                let _ = self.celt_enc.set_bitrate(celt_bitrate);
+            }
             // C `CELT_SET_START_BAND`; 0 and 17 are both valid.
             let _ = self.celt_enc.set_start_band(start_band);
 
@@ -3391,12 +3624,8 @@ impl OpusEncoder {
             if d.to_celt {
                 self.celt_enc.reset_state();
             }
-            let mut ret = 2usize;
-            if self.use_cbr {
-                packet::pad(output, ret, orig_max_data_bytes)?;
-                ret = orig_max_data_bytes;
-            }
-            return Ok(ret);
+            // libopus goes on to the DRED data and the padding.
+            return self.finish_frame(output, 2, first_frame);
         }
 
         // C 2509-2511: the state of the range coder once the frame is
@@ -3442,13 +3671,63 @@ impl OpusEncoder {
         output[ret..ret + redundancy_bytes].copy_from_slice(&redundant[..redundancy_bytes]);
         ret += redundancy_bytes;
         self.range_final ^= redundant_rng;
+        self.finish_frame(output, ret, first_frame)
+    }
 
+    /// The end of a frame's packet (C 2602-2652). `output[..ret]` holds the
+    /// packet; `output.len()` is the size it may take.
+    ///
+    /// - With DRED (feature `dred`), the DRED data of the first coded frame
+    ///   of a packet goes into the padding, as the extension with ID 126
+    ///   for frame 0. With a constant bitrate the padding fills the packet.
+    /// - Otherwise a constant bitrate pads the packet to its full size.
+    fn finish_frame(&mut self, output: &mut [u8], ret: usize, first_frame: bool) -> Result<usize, &'static str> {
+        let orig_max_data_bytes = output.len();
+        #[cfg(feature = "dred")]
+        if first_frame {
+            use crate::dnn::dred::{DRED_EXTENSION_ID, DRED_MAX_DATA_SIZE};
+            let mut buf = [0u8; DRED_MAX_DATA_SIZE];
+            // "Remaining space for DRED, accounting for cost the 3 extra
+            // bytes for code 3, padding length, and extension number."
+            let room = orig_max_data_bytes as i32 - ret as i32 - 3;
+            let n = self.dred.write_extension(&mut self.rc, &mut buf, room, !self.use_cbr);
+            if n > 0 {
+                let ext = [extensions::Extension { id: DRED_EXTENSION_ID, frame: 0, data: &buf[..n] }];
+                // C returns `OPUS_INTERNAL_ERROR` when this fails.
+                return packet::pad_with_extensions(output, ret, orig_max_data_bytes, self.use_cbr, &ext)
+                    .map_err(|_| "Internal error");
+            }
+        }
+        #[cfg(not(feature = "dred"))]
+        let _ = first_frame;
         // C 2643-2651: a constant bitrate pads the packet to its full size.
         if self.use_cbr {
             packet::pad(output, ret, orig_max_data_bytes)?;
-            ret = orig_max_data_bytes;
+            return Ok(orig_max_data_bytes);
         }
         Ok(ret)
+    }
+
+    /// Whether DRED is on (feature `dred` and a duration above 0).
+    #[inline]
+    fn dred_on(&self) -> bool {
+        #[cfg(feature = "dred")]
+        {
+            self.dred.duration() > 0
+        }
+        #[cfg(not(feature = "dred"))]
+        false
+    }
+
+    /// The bitrate DRED takes from the current packet, 0 without DRED.
+    #[inline]
+    fn dred_bitrate_bps(&self) -> i32 {
+        #[cfg(feature = "dred")]
+        {
+            self.dred.bitrate_bps()
+        }
+        #[cfg(not(feature = "dred"))]
+        0
     }
 
     /// The 5 ms redundant CELT frame at the end of a frame that announces
@@ -3688,17 +3967,34 @@ impl OpusEncoder {
                     && (frame_to_celt || (!decisions.to_celt && i == 0)),
                 ..decisions
             };
-            let mut curr_max = (max_len_sum / nb).min(max_len_sum.saturating_sub(tot_size));
+            // C 1774-1776: "Attempt DRED encoding until we have a non-DTX
+            // frame. In case of DTX refresh, that allows for DRED not to be
+            // in the first frame."
+            let first_frame = i == 0 || i == dtx_count;
+            #[allow(unused_mut)]
+            let mut curr_max = max_len_sum / nb;
             if self.use_cbr {
                 curr_max = curr_max.min(nominal_part);
             }
-            let curr_max = curr_max.min(OPUS_MAX_PACKET_BYTES);
+            // C 1786-1789: the DRED bytes of the whole packet are taken from
+            // every frame's share and given to the first coded frame, whose
+            // packet carries the DRED data.
+            #[cfg(feature = "dred")]
+            {
+                let dred_bytes = (bitrate_to_bits(self.dred.bitrate_bps(), fs, frame_size) / 8).max(0) as usize;
+                curr_max = curr_max.min(max_len_sum.saturating_sub(dred_bytes) / nb);
+                if first_frame {
+                    curr_max += dred_bytes;
+                }
+            }
+            let curr_max = curr_max.min(max_len_sum.saturating_sub(tot_size)).min(OPUS_MAX_PACKET_BYTES);
             match self.encode_frame(
                 sub_input,
                 enc_frame,
                 &mut sub[i][..curr_max],
                 frame_decisions,
                 frame_analysis,
+                first_frame,
             ) {
                 Ok(n) => {
                     lens[i] = n;
@@ -3717,23 +4013,23 @@ impl OpusEncoder {
         self.silk_to_mono = bak_to_mono;
         result?;
 
-        // C 1826-1831: the frames go into one packet (libopus's
-        // repacketizer). A constant bitrate pads it to its full size,
-        // unless DTX left out every frame.
-        let mut frames: [&[u8]; MAX_SUB] = [&[]; MAX_SUB];
-        for ((frame, part), &len) in frames.iter_mut().zip(&sub).zip(&lens).take(nb) {
-            let parsed = packet::parse(&part[..len], false)?;
-            if parsed.count != 1 {
+        // C 1821-1831: the frames go into one packet (libopus's
+        // repacketizer), with the extensions of their padding. A constant
+        // bitrate pads it to its full size, unless DTX left out every frame.
+        let mut rp = packet::Repacketizer::new();
+        for (part, &len) in sub.iter().zip(&lens).take(nb) {
+            if packet::nb_frames(&part[..len])? != 1 {
                 return Err("Unexpected frame count in a part of a packet");
             }
-            *frame = parsed.frame(&part[..len], 0);
+            rp.cat(&part[..len])?;
         }
-        packet::write(
-            sub[0][0],
-            &frames[..nb],
+        rp.out_range_ext(
+            0,
+            nb,
             &mut output[..repacketize_len],
             false,
             self.use_cbr && dtx_count != nb,
+            &[],
         )
     }
 }
@@ -3811,6 +4107,14 @@ pub struct OpusDecoder {
     /// C `st->complexity`: the decoder complexity, 0 to 10, set with
     /// `OPUS_SET_COMPLEXITY`. A reset keeps it, as in libopus.
     complexity: i32,
+    /// C `st->decode_gain`: the output gain in 1/256 dB, set with
+    /// `OPUS_SET_GAIN`. A reset keeps it, as in libopus.
+    decode_gain: i32,
+    /// C `st->DecControl.prevPitchLag`: the pitch lag of the last SILK
+    /// frame, in samples at 48 kHz, or 0 when that frame was not voiced.
+    /// `silk_Decode` sets it after each frame. A reset keeps it, as in
+    /// libopus.
+    silk_prev_pitch_lag: i32,
     /// C `st->DecControl.enable_osce_bwe`, set with `OPUS_SET_OSCE_BWE`. A
     /// reset keeps it, as in libopus.
     #[cfg(feature = "osce-bwe")]
@@ -3890,6 +4194,8 @@ impl OpusDecoder {
 
             // C `opus_decoder_init`: `st->complexity = 0`.
             complexity: 0,
+            decode_gain: 0,
+            silk_prev_pitch_lag: 0,
             #[cfg(feature = "osce-bwe")]
             osce_bwe: false,
             #[cfg(all(feature = "dnn", feature = "heap"))]
@@ -3999,6 +4305,211 @@ impl OpusDecoder {
         self.decode_i16_native(data, frame_size, output, true)
     }
 
+    /// Decode one Opus packet into interleaved 24-bit samples held in
+    /// 32-bit integers: libopus `opus_decode24` in the float build.
+    ///
+    /// Full scale is 2^23: each float sample is multiplied by 8388608 and
+    /// rounded to the nearest integer, halfway values to the even one
+    /// (libopus `RES2INT24`). Unlike [`decode_i16`](Self::decode_i16),
+    /// there is no soft clipping and no limit to 24 bits, as in libopus:
+    /// a loud signal comes back with values beyond ±8388607. A value beyond
+    /// the 32-bit range gives the nearest 32-bit value. A lost packet is
+    /// given as in [`decode`](Self::decode).
+    pub fn decode24(
+        &mut self,
+        input: &[u8],
+        frame_size: usize,
+        output: &mut [i32],
+    ) -> Result<usize, &'static str> {
+        self.decode_int_native(input, frame_size, output, false, false, res_to_int24)
+    }
+
+    /// [`decode_fec`](Self::decode_fec) with 24-bit output: libopus
+    /// `opus_decode24` with `decode_fec = 1`.
+    pub fn decode_fec24(
+        &mut self,
+        data: &[u8],
+        frame_size: usize,
+        output: &mut [i32],
+    ) -> Result<usize, &'static str> {
+        self.decode_int_native(data, frame_size, output, true, false, res_to_int24)
+    }
+
+    /// Conceal lost audio with deep redundancy (DRED) data: libopus
+    /// `opus_decoder_dred_decode_float`.
+    ///
+    /// `dred` holds the processed DRED data of a packet received after the
+    /// loss ([`OpusDredDecoder::parse`]). `dred_offset` is the position of
+    /// the lost audio: the number of samples (at this decoder's rate)
+    /// between the start of the lost audio and the start of that packet.
+    /// `frame_size` samples per channel are concealed, a multiple of
+    /// 2.5 ms, as for a lost packet. Returns `frame_size`.
+    ///
+    /// The DRED features that cover the lost audio go to deep PLC, which
+    /// synthesizes the audio from them instead of predicting features.
+    /// Where `dred` has no features for that time, or when it is not
+    /// processed, the loss is concealed as without DRED.
+    ///
+    /// Errors: `"Invalid argument"` when `frame_size` is 0, and those of a
+    /// lost packet in [`decode`](Self::decode). These checks come before
+    /// any change of the decoder.
+    #[cfg(feature = "dred")]
+    pub fn dred_decode_float(
+        &mut self,
+        dred: &OpusDred,
+        dred_offset: i32,
+        frame_size: usize,
+        output: &mut [f32],
+    ) -> Result<usize, &'static str> {
+        self.check_dred_decode(frame_size, output.len())?;
+        self.queue_dred_features(dred, dred_offset, frame_size);
+        self.decode_native(&[], frame_size, output, false, false, false)
+            .map(|(samples, _)| samples)
+    }
+
+    /// [`dred_decode_float`](Self::dred_decode_float) with 16-bit output:
+    /// libopus `opus_decoder_dred_decode`. Each sample is rounded to the
+    /// nearest integer, halfway values to the even one, and limited to the
+    /// 16-bit range, as libopus's `FLOAT2INT16` does.
+    #[cfg(feature = "dred")]
+    pub fn dred_decode(
+        &mut self,
+        dred: &OpusDred,
+        dred_offset: i32,
+        frame_size: usize,
+        output: &mut [i16],
+    ) -> Result<usize, &'static str> {
+        self.dred_decode_int(dred, dred_offset, frame_size, output, float2int16)
+    }
+
+    /// [`dred_decode_float`](Self::dred_decode_float) with 24-bit output in
+    /// 32-bit integers: libopus `opus_decoder_dred_decode24`. Each sample
+    /// is scaled by 2^23 and rounded to the nearest integer, halfway values
+    /// to the even one. There is no limit to 24 bits, as in libopus.
+    #[cfg(feature = "dred")]
+    pub fn dred_decode24(
+        &mut self,
+        dred: &OpusDred,
+        dred_offset: i32,
+        frame_size: usize,
+        output: &mut [i32],
+    ) -> Result<usize, &'static str> {
+        self.dred_decode_int(dred, dred_offset, frame_size, output, float2int24)
+    }
+
+    /// The checks of a DRED decode that come before any change of state:
+    /// libopus's `frame_size <= 0` and 2.5 ms checks, and the room in the
+    /// output.
+    #[cfg(feature = "dred")]
+    fn check_dred_decode(&self, frame_size: usize, output_len: usize) -> Result<(), &'static str> {
+        if frame_size == 0 {
+            return Err("Invalid argument");
+        }
+        if !is_whole_2_5ms(frame_size, self.sampling_rate) {
+            return Err("Lost frame: frame_size must be a multiple of 2.5 ms");
+        }
+        if frame_size.checked_mul(self.channels).is_none_or(|len| len > output_len) {
+            return Err("Output buffer too small for packet");
+        }
+        Ok(())
+    }
+
+    /// The DRED step at the start of libopus `opus_decode_native`
+    /// (`src/opus_decoder.c:735-758`): replaces the queue of deep PLC with
+    /// the DRED features of the `frame_size` samples that start
+    /// `dred_offset` samples before the DRED packet.
+    ///
+    /// One feature frame is queued per 10 ms of `frame_size` (at least
+    /// one). When the last call of deep PLC was not a concealment (it
+    /// appended decoded audio), two more frames come first, because deep PLC
+    /// then needs two frames of history before it conceals. A frame that
+    /// `dred` does not hold goes in as a gap, except before the newest
+    /// DRED frame (a negative position), where nothing goes in.
+    #[cfg(feature = "dred")]
+    fn queue_dred_features(&mut self, dred: &OpusDred, dred_offset: i32, frame_size: usize) {
+        use dnn::models::dred_rdovae_stats::DRED_NUM_FEATURES;
+        if !dred.is_processed() {
+            return;
+        }
+        let plc = &mut self.deep_plc;
+        plc.fec_clear();
+        let f10 = self.sampling_rate / 100;
+        let init_frames: i32 = if plc.blend() { 0 } else { 2 };
+        let features_per_frame = (frame_size / f10 as usize).max(1) as i32;
+        let needed_feature_frames = init_frames + features_per_frame;
+        // libopus: "We floor instead of rounding because 5-ms overlap
+        // compensates for the missing 0.5 rounding offset."
+        let newest = (dred_offset as f32 + (dred.dred_offset * f10 / 4) as f32) / f10 as f32;
+        let newest = newest.floor() as i32;
+        for i in 0..needed_feature_frames {
+            let feature_offset = (init_frames - i - 2).wrapping_add(newest);
+            if feature_offset >= 0 && feature_offset < 4 * dred.nb_latents {
+                let start = feature_offset as usize * DRED_NUM_FEATURES;
+                let features = dred.fec_features[start..start + DRED_NUM_FEATURES].try_into().ok();
+                plc.fec_add(features);
+            } else if feature_offset >= 0 {
+                plc.fec_add(None);
+            }
+        }
+    }
+
+    /// `dred_decode` and `dred_decode24`: conceal into a float buffer, then
+    /// convert each sample. The buffer holds 120 ms, as in
+    /// `decode_i16_native`. A longer loss is concealed 60 ms at a time,
+    /// which gives the same samples as one call; the DRED features are
+    /// queued once, before the first piece, as libopus does for the whole
+    /// call.
+    #[cfg(feature = "dred")]
+    fn dred_decode_int<T>(
+        &mut self,
+        dred: &OpusDred,
+        dred_offset: i32,
+        frame_size: usize,
+        output: &mut [T],
+        convert: fn(f32) -> T,
+    ) -> Result<usize, &'static str> {
+        self.check_dred_decode(frame_size, output.len())?;
+        self.queue_dred_features(dred, dred_offset, frame_size);
+        let saved_duration = self.last_packet_duration;
+        let channels = self.channels;
+        let max_samples = packet::max_packet_samples(self.sampling_rate);
+        let step = max_samples / 2;
+        #[cfg(feature = "heap")]
+        let mut pcm = self.w_pcm_float.take().unwrap_or_default();
+        #[cfg(not(feature = "heap"))]
+        let mut pcm: FixedVec<f32, OPUS_PCM_PACKET> = FixedVec::new();
+        let mut done = 0;
+        let result = loop {
+            let left = frame_size - done;
+            let piece = if left > max_samples { step } else { left };
+            let len = piece * channels;
+            if pcm.len() < len {
+                pcm.resize(len, 0.0);
+            }
+            match self.decode_native(&[], piece, &mut pcm[..len], false, false, true) {
+                Ok((samples, _)) => {
+                    let out = &mut output[done * channels..(done + samples) * channels];
+                    for (o, &x) in out.iter_mut().zip(&pcm[..samples * channels]) {
+                        *o = convert(x);
+                    }
+                    done += samples;
+                }
+                Err(e) => break Err(e),
+            }
+            if piece == left {
+                break Ok(done);
+            }
+        };
+        #[cfg(feature = "heap")]
+        {
+            self.w_pcm_float = Some(pcm);
+        }
+        // libopus conceals the whole loss in one call, which sets the
+        // duration once: to the whole loss, or not at all when it fails.
+        self.last_packet_duration = if result.is_ok() { frame_size } else { saved_duration };
+        result
+    }
+
     /// libopus `opus_decode` (opus_decoder.c, float build): decode into a
     /// float buffer with the soft clipper on, then round to 16 bits.
     ///
@@ -4012,6 +4523,23 @@ impl OpusDecoder {
         frame_size: usize,
         output: &mut [i16],
         decode_fec: bool,
+    ) -> Result<usize, &'static str> {
+        // C `opus_decode`: soft clipping (`OPTIONAL_CLIP`), then
+        // `celt_float2int16`.
+        self.decode_int_native(data, frame_size, output, decode_fec, true, celt_float2int16)
+    }
+
+    /// Integer output through a float buffer: libopus `opus_decode` and
+    /// `opus_decode24` of the float build. `soft_clip` is `opus_decode`'s
+    /// `OPTIONAL_CLIP`; `convert` turns the float samples into `T`.
+    fn decode_int_native<T>(
+        &mut self,
+        data: &[u8],
+        frame_size: usize,
+        output: &mut [T],
+        decode_fec: bool,
+        soft_clip: bool,
+        convert: fn(&[f32], &mut [T]),
     ) -> Result<usize, &'static str> {
         let channels = self.channels;
         let lost = decode_fec || data.is_empty();
@@ -4068,12 +4596,12 @@ impl OpusDecoder {
             if pcm.len() < len {
                 pcm.resize(len, 0.0);
             }
-            match self.decode_native(data, piece, &mut pcm[..len], decode_fec, false, true) {
+            match self.decode_native(data, piece, &mut pcm[..len], decode_fec, false, soft_clip) {
                 Ok((samples, _)) => {
                     // A piece of a long loss is 60 ms, a whole number of
                     // blocks of `celt_float2int16`, so the blocks fall where
                     // they fall in libopus's single conversion of the call.
-                    celt_float2int16(&pcm[..samples * channels], output);
+                    convert(&pcm[..samples * channels], output);
                     done += samples;
                 }
                 Err(e) => break Err(e),
@@ -4359,6 +4887,81 @@ impl OpusDecoder {
     /// (`OPUS_GET_COMPLEXITY`).
     pub fn complexity(&self) -> i32 {
         self.complexity
+    }
+
+    /// libopus `OPUS_SET_PHASE_INVERSION_DISABLED` on the decoder: with
+    /// `true`, CELT decodes intensity stereo bands without inverting the
+    /// sign of the second channel, even where the packet codes the
+    /// inversion.
+    ///
+    /// The default depends on the channel count, as in libopus. A mono
+    /// decoder starts with `true`: it mixes a stereo stream down, and the
+    /// inverted channels would cancel in the mix. A stereo decoder starts
+    /// with `false`. [`reset_state`](Self::reset_state) keeps the value.
+    pub fn set_phase_inversion_disabled(&mut self, disabled: bool) {
+        self.celt_dec.set_phase_inversion_disabled(disabled);
+    }
+
+    /// The value of
+    /// [`set_phase_inversion_disabled`](Self::set_phase_inversion_disabled)
+    /// (`OPUS_GET_PHASE_INVERSION_DISABLED`).
+    pub fn phase_inversion_disabled(&self) -> bool {
+        self.celt_dec.phase_inversion_disabled()
+    }
+
+    /// libopus `OPUS_SET_GAIN`: scales the decoded output by `gain`, in
+    /// units of 1/256 dB (Q8 dB). The range is -32768 to 32767, about
+    /// -128 to +128 dB; any other value is an error and changes nothing.
+    /// The default is 0, no scaling.
+    ///
+    /// The factor is `2^(6.48814081e-4 * gain)`, which is
+    /// `10^(gain / (20 * 256))`, computed as libopus's float build does.
+    /// Every decoded or concealed frame is multiplied by it before the
+    /// 16-bit conversion and its soft clipping. The decoder's own state
+    /// does not see the gain. [`reset_state`](Self::reset_state) keeps the
+    /// value.
+    pub fn set_gain(&mut self, gain: i32) -> Result<(), &'static str> {
+        if !(-32768..=32767).contains(&gain) {
+            return Err("Invalid gain");
+        }
+        self.decode_gain = gain;
+        Ok(())
+    }
+
+    /// The gain set with [`set_gain`](Self::set_gain), in 1/256 dB
+    /// (`OPUS_GET_GAIN`).
+    pub fn gain(&self) -> i32 {
+        self.decode_gain
+    }
+
+    /// libopus `OPUS_GET_PITCH`: the pitch period of the last decoded or
+    /// concealed frame, in samples at 48 kHz, or 0 when it had none.
+    ///
+    /// After a CELT-only frame it is the period of CELT's pitch
+    /// post-filter: 0 when the frame switched the filter off, and at least
+    /// 15 after concealment from noise. Otherwise it is the pitch lag of the
+    /// last SILK frame, scaled to 48 kHz, or 0 when that frame was not
+    /// voiced. [`reset_state`](Self::reset_state) keeps the SILK value, as
+    /// in libopus, and it is what this returns until the next frame.
+    pub fn pitch(&self) -> i32 {
+        if self.prev_mode == Some(OpusMode::CeltOnly) {
+            self.celt_dec.pitch()
+        } else {
+            self.silk_prev_pitch_lag
+        }
+    }
+
+    /// C 681-693: multiply `pcm` by the output gain, when there is one.
+    #[allow(clippy::excessive_precision)]
+    fn apply_gain(&self, pcm: &mut [f32]) {
+        if self.decode_gain != 0 {
+            // C `QCONST16(6.48814081e-4f, 25)`, with libopus's digits. In
+            // the float build the macros are plain float products.
+            let gain = mathops::celt_exp2(6.488_140_81e-4_f32 * self.decode_gain as f32);
+            for x in pcm {
+                *x *= gain;
+            }
+        }
     }
 
     /// libopus `OPUS_SET_OSCE_BWE`: switches the bandwidth extension (BWE)
@@ -4705,6 +5308,9 @@ impl OpusDecoder {
             }
         }
 
+        // C 681-693: the output gain, on this frame's samples.
+        self.apply_gain(&mut out[..frame_len]);
+
         // The output is not clipped: libopus `opus_decode_float` does not
         // clip, and `decode_i16` soft-clips the whole packet.
 
@@ -4804,6 +5410,12 @@ impl OpusDecoder {
                 left -= piece;
             }
         }
+        // C 681-693: each call of `opus_decode_frame` applies the output
+        // gain to what it made. One pass over the whole output does the
+        // same. The transition audio of `decode_frame` comes from here too,
+        // so it gets the gain twice, once here and once with its frame, as
+        // in libopus.
+        self.apply_gain(&mut output[..total * channels]);
         // C 706-712: a concealed frame has no final range and no redundancy
         // frame, and leaves its mode behind.
         self.prev_mode = Some(plc_mode);
@@ -4937,6 +5549,9 @@ impl OpusDecoder {
             });
             match decoded {
                 Ok(n) if n > 0 && done + n <= room => {
+                    // C `silk_Decode` (dec_API.c:457-463) exports the pitch
+                    // lag after each frame.
+                    self.silk_prev_pitch_lag = self.silk_dec.prev_pitch_lag();
                     // C `INT16TORES`: SILK's 16-bit samples as floats.
                     let silk_out = &mut out[done * channels..(done + n) * channels];
                     for (o, &v) in silk_out.iter_mut().zip(self.w_pcm_i16.iter()) {
@@ -5028,6 +5643,41 @@ pub(crate) fn float2int16(x: f32) -> i16 {
     const TWO_23: f32 = 8_388_608.0;
     let rounded = if x >= 0.0 { (x + TWO_23) - TWO_23 } else { (x - TWO_23) + TWO_23 };
     rounded as i16
+}
+
+/// [`float2int24`] over a buffer, for [`OpusDecoder::decode24`].
+fn res_to_int24(input: &[f32], output: &mut [i32]) {
+    for (o, &x) in output.iter_mut().zip(input) {
+        *o = float2int24(x);
+    }
+}
+
+/// libopus `INT24TORES` of the float build (celt/arch.h): a 24-bit sample
+/// in a 32-bit integer as a float with full scale 1.0,
+/// `(1.f/32768.f/256.f)*(a)`. The conversion of `a` to `f32` rounds values
+/// beyond 2^24 to the nearest float, as in C.
+#[inline(always)]
+pub(crate) fn int24_to_res(x: i32) -> f32 {
+    x as f32 * (1.0 / 8_388_608.0)
+}
+
+/// libopus `RES2INT24` of the float build (celt/arch.h):
+/// `float2int(32768.f*256.f*x)`, the sample scaled by 2^23 and rounded to
+/// the nearest integer, halfway values to the even one. A value beyond the
+/// 32-bit range gives the nearest 32-bit value and NaN gives 0, as
+/// `vcvtns_s32_f32` does on 64-bit ARM; libopus on x86 gives -2^31 for
+/// both.
+pub(crate) fn float2int24(x: f32) -> i32 {
+    let x = 32768.0f32 * 256.0 * x;
+    const TWO_23: f32 = 8_388_608.0;
+    let rounded = if (0.0..TWO_23).contains(&x) {
+        (x + TWO_23) - TWO_23
+    } else if x < 0.0 && x > -TWO_23 {
+        (x - TWO_23) + TWO_23
+    } else {
+        x
+    };
+    rounded as i32
 }
 
 /// libopus `celt_float2int16` (celt/mathops.h), as the float build of

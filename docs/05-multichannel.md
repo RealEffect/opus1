@@ -358,6 +358,7 @@ A port of libopus `OpusMSEncoder`.
 | `new_surround(rate, channels, family, application)` | An encoder with the layout of mapping family 0, 1, 2 or 255. libopus `opus_multistream_surround_encoder_create`. |
 | `encode(pcm, frame_size, output)` | Encodes one frame of `f32` samples (full scale ±1.0). Returns the packet length. |
 | `encode_i16(pcm, frame_size, output)` | The same for 16-bit samples. Writes the packet `encode` writes for the samples `s as f32 / 32768.0` after `set_lsb_depth(16)`. |
+| `encode24(pcm, frame_size, output)` | The same for 24-bit samples in `i32`, full scale 2^23 (libopus `opus_multistream_encode24`). Values beyond 24 bits are not limited. |
 | `set_bitrate(Bitrate)`, `bitrate_setting()` | Sets and reads the total bitrate setting. |
 | `bitrate()` | The sum of the stream bitrates that the last frame used. |
 | `set_vbr(bool)`, `vbr()` | Variable bitrate (`true`, the default) or constant bitrate. |
@@ -372,9 +373,14 @@ A port of libopus `OpusMSEncoder`.
 | `set_bandwidth(Bandwidth)`, `bandwidth()` | Fixes the bandwidth of every stream. No effect in surround mode. |
 | `set_max_bandwidth(Bandwidth)`, `max_bandwidth()` | Limits the automatic bandwidth choice. |
 | `set_force_mode(Option<ForcedMode>)` | Asks every stream for SILK-only, Hybrid or CELT-only. In surround mode the coupled streams stay CELT-only, and in ambisonics mode all streams do. |
+| `set_force_channels(Option<usize>)`, `force_channels()` | Forces 1 or 2 coded channels on one stream after the other (libopus `OPUS_SET_FORCE_CHANNELS`). The first stream that refuses the value stops the loop with its error: `Some(2)` is set on the coupled streams and refused by the first mono stream, as in libopus. In surround mode the coupled streams are forced to 2 on every frame. The getter reads the first stream. |
+| `set_prediction_disabled(bool)`, `prediction_disabled()` | Prediction from earlier frames off on every stream (libopus `OPUS_SET_PREDICTION_DISABLED`). |
+| `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off in the intensity stereo of every coupled stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). |
+| `set_application(Application)` | Changes the application of every stream before the first frame (libopus `OPUS_SET_APPLICATION`); afterwards only the current one is accepted. |
+| `voice_ratio()` | The voice ratio of the first stream, in percent, or -1 (libopus `OPUS_GET_VOICE_RATIO`). |
 | `set_expert_frame_duration(FrameDuration)`, `expert_frame_duration()` | The duration of the frame each `encode` call codes (libopus `OPUS_SET_EXPERT_FRAME_DURATION`). `FrameDuration::Argument`, the default, takes the `frame_size` of the call. The multistream encoder keeps this setting for itself, as libopus does; the setting of a stream encoder plays no part. |
 | `layout()`, `mapping_type()`, `lfe_stream()` | The layout, how it was chosen, and the LFE stream. |
-| `application()`, `sampling_rate()` | The settings given at construction. |
+| `application()`, `sampling_rate()` | The application of the first stream, and the sampling rate given at construction. |
 | `lookahead()` | The delay the encoder adds, in samples per channel. An Ogg Opus header stores it, converted to 48 kHz, as the pre-skip. |
 | `final_range()` | The final range coder states of all streams, combined with exclusive or (XOR). A decoder that read the packet correctly reports the same value. |
 | `reset_state()` | Forgets the audio coded so far. The settings stay. |
@@ -399,7 +405,11 @@ A port of libopus `OpusMSDecoder`.
 | `with_layout(rate, channels, streams, coupled_streams, mapping)` | A decoder for a layout given as numbers. libopus `opus_multistream_decoder_create`. |
 | `decode(packet, frame_size, out)` | Decodes one packet into `f32` samples. Returns the samples per channel written. The output is not clipped. |
 | `decode_i16(packet, frame_size, out)` | The same into 16-bit samples. Each stream is soft-clipped before it is rounded, as in libopus. |
-| `decode_fec(packet, frame_size, out)`, `decode_fec_i16(...)` | Rebuilds a lost packet from the packet after it. |
+| `decode24(packet, frame_size, out)` | The same into 24-bit samples in `i32`, full scale 2^23, without soft clipping and without a limit (libopus `opus_multistream_decode24`). |
+| `decode_fec(packet, frame_size, out)`, `decode_fec_i16(...)`, `decode_fec24(...)` | Rebuilds a lost packet from the packet after it. |
+| `set_gain(gain)`, `gain()` | The output gain of every stream in 1/256 dB, -32768 to 32767 (libopus `OPUS_SET_GAIN`). The getter reads the first stream. |
+| `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off on every stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). At the start it is off only for mono streams, so the getter, which reads the first stream, gives `false` when the first stream is coupled and `true` when it is mono. |
+| `set_complexity(0..=10)`, `complexity()` | The decoder complexity of every stream. |
 | `layout()`, `sampling_rate()` | The settings given at construction. |
 | `final_range()` | The final range decoder states of all streams, combined with XOR. |
 | `reset_state()` | Forgets the audio decoded so far. |

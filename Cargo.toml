@@ -68,8 +68,13 @@ osce = ["deep-plc"]
 # (BBWENet), at decoder complexity 4 and above when it is switched on
 # with `OpusDecoder::set_osce_bwe`. It turns on `osce`.
 osce-bwe = ["osce"]
-# A later `dred` feature (deep redundancy) is planned; it is not part of
-# this release.
+# `dred`: deep redundancy (DRED), like libopus's `--enable-dred`. The
+# encoder adds a compressed history of the speech to each packet, in a
+# packet extension, and the decoder rebuilds lost frames from it. It turns
+# on `deep-plc`, as libopus's `--enable-dred` does. For now it adds the two
+# DRED models (the RDOVAE encoder and decoder) and their weights; the
+# encoder and decoder parts are being ported.
+dred = ["deep-plc"]
 #
 # `test-libopus-dnn`: TEST-ONLY. It adds nothing to the library. It only
 # compiles the test files that begin with

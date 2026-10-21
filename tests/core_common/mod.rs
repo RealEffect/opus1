@@ -13,6 +13,27 @@ pub const OPUS_SET_FORCE_MODE_REQUEST: i32 = 11002;
 pub const OPUS_SET_LFE_REQUEST: i32 = 10024;
 pub const OPUS_SET_ENERGY_MASK_REQUEST: i32 = 10026;
 pub const OPUS_GET_FINAL_RANGE_REQUEST: i32 = 4031;
+pub const OPUS_SET_VOICE_RATIO_REQUEST: i32 = 11018;
+pub const OPUS_GET_VOICE_RATIO_REQUEST: i32 = 11019;
+
+// The 24-bit calls of libopus 1.6, which `audiopus_sys` does not declare.
+unsafe extern "C" {
+    pub fn opus_encode24(
+        st: *mut sys::OpusEncoder,
+        pcm: *const i32,
+        frame_size: i32,
+        data: *mut u8,
+        max_data_bytes: i32,
+    ) -> i32;
+    pub fn opus_decode24(
+        st: *mut sys::OpusDecoder,
+        data: *const u8,
+        len: i32,
+        pcm: *mut i32,
+        frame_size: i32,
+        decode_fec: i32,
+    ) -> i32;
+}
 
 pub const MODE_SILK: i32 = 1000;
 pub const MODE_HYBRID: i32 = 1001;
@@ -172,6 +193,19 @@ impl CEncoder {
         Ok(out)
     }
 
+    /// `opus_encode24`: like `try_encode`, for 24-bit input in 32-bit
+    /// integers.
+    pub fn try_encode24(&mut self, pcm: &[i32], frame_size: usize, max_bytes: usize) -> Result<Vec<u8>, i32> {
+        assert!(pcm.len() >= frame_size * self.channels, "pcm is shorter than the frame");
+        let mut out = vec![0u8; max_bytes];
+        let n = unsafe { opus_encode24(self.st, pcm.as_ptr(), frame_size as i32, out.as_mut_ptr(), max_bytes as i32) };
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
     /// `opus_encode`: like `try_encode`, for 16-bit input.
     pub fn try_encode_i16(&mut self, pcm: &[i16], frame_size: usize, max_bytes: usize) -> Result<Vec<u8>, i32> {
         assert!(pcm.len() >= frame_size * self.channels, "pcm is shorter than the frame");
@@ -257,6 +291,35 @@ impl CDecoder {
         }
         pcm.truncate(n as usize * self.channels);
         Ok(pcm)
+    }
+
+    /// `opus_decode24`: 24-bit output in 32-bit integers.
+    pub fn decode24(&mut self, packet: Option<&[u8]>, frame_size: usize, fec: bool) -> Result<Vec<i32>, i32> {
+        let mut pcm = vec![0i32; frame_size * self.channels];
+        let (ptr, len) = match packet {
+            Some(p) => (p.as_ptr(), p.len() as i32),
+            None => (std::ptr::null(), 0),
+        };
+        let n = unsafe { opus_decode24(self.st, ptr, len, pcm.as_mut_ptr(), frame_size as i32, fec as i32) };
+        if n < 0 {
+            return Err(n);
+        }
+        pcm.truncate(n as usize * self.channels);
+        Ok(pcm)
+    }
+
+    /// A "set" control that takes one `opus_int32`, with libopus's return
+    /// code.
+    pub fn try_set(&mut self, request: i32, value: i32) -> i32 {
+        unsafe { sys::opus_decoder_ctl(self.st, request, value) }
+    }
+
+    /// A "get" control that returns one `opus_int32`.
+    pub fn get(&mut self, request: i32) -> i32 {
+        let mut value = 0i32;
+        let ret = unsafe { sys::opus_decoder_ctl(self.st, request, &mut value as *mut i32) };
+        assert_eq!(ret, 0, "opus_decoder_ctl({request}) = {ret}");
+        value
     }
 
     /// `OPUS_GET_FINAL_RANGE` after the last decode call.

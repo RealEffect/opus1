@@ -450,6 +450,90 @@ impl Default for DecoderDnn {
     }
 }
 
+/// What an `OpusDredDecoder` stores: the kernel variant and the layers of
+/// the RDOVAE decoder (libopus: `model`, `loaded` and `arch` of
+/// `OpusDREDDecoder`).
+#[cfg(feature = "dred")]
+pub(crate) struct DredDecoderDnn {
+    arch: DnnArch,
+    model: Slot<models::dred_rdovae_dec::RdovaeDec<'static>>,
+}
+
+#[cfg(feature = "dred")]
+impl DredDecoderDnn {
+    /// The detected kernel variant and the built-in model.
+    pub(crate) fn new() -> Self {
+        DredDecoderDnn { arch: arch::detect(), model: Slot::builtin(builtin::rdovae_dec()) }
+    }
+
+    /// Loads the RDOVAE decoder from `blob`. When the blob lacks it, or one
+    /// of its arrays does not load, returns `"DNN blob holds no model of
+    /// this build"` and keeps the model it had.
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+        if let Inner::Builtin = blob.inner {
+            self.model = Slot::Builtin(builtin::rdovae_dec().ok_or(ERR_NO_MODEL)?);
+        } else {
+            let model = models::dred_rdovae_dec::RdovaeDec::init(blob.list()).map_err(|_| ERR_NO_MODEL)?;
+            self.model = Slot::loaded(model, blob);
+        }
+        blob.prefault();
+        Ok(())
+    }
+
+    /// The model, when loaded.
+    pub(crate) fn model(&self) -> Option<&models::dred_rdovae_dec::RdovaeDec<'_>> {
+        self.model.get()
+    }
+
+    /// The kernel variant.
+    pub(crate) fn arch(&self) -> DnnArch {
+        self.arch
+    }
+}
+
+/// What the DRED part of an Opus encoder stores: the kernel variant and
+/// the models of the DRED encoder (libopus: `model`, `loaded` and the
+/// PitchDNN model of `lpcnet_enc_state` in `DREDEnc`, and the encoder's
+/// `arch`).
+#[cfg(feature = "dred")]
+pub(crate) struct DredEncoderDnn {
+    arch: DnnArch,
+    model: Slot<models::DredEncModels<'static>>,
+}
+
+#[cfg(feature = "dred")]
+impl DredEncoderDnn {
+    /// The detected kernel variant and the built-in models.
+    pub(crate) fn new() -> Self {
+        DredEncoderDnn { arch: arch::detect(), model: Slot::builtin(builtin::dred_enc()) }
+    }
+
+    /// Loads the RDOVAE encoder and PitchDNN from `blob`. When the blob
+    /// lacks one of them, or one of their arrays does not load, returns
+    /// `"DNN blob holds no model of this build"` and keeps the models it
+    /// had.
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+        if let Inner::Builtin = blob.inner {
+            self.model = Slot::Builtin(builtin::dred_enc().ok_or(ERR_NO_MODEL)?);
+        } else {
+            let model = models::DredEncModels::init(blob.list()).map_err(|_| ERR_NO_MODEL)?;
+            self.model = Slot::loaded(model, blob);
+        }
+        blob.prefault();
+        Ok(())
+    }
+
+    /// The models, when loaded.
+    pub(crate) fn model(&self) -> Option<&models::DredEncModels<'_>> {
+        self.model.get()
+    }
+
+    /// The kernel variant.
+    pub(crate) fn arch(&self) -> DnnArch {
+        self.arch
+    }
+}
+
 #[cfg(all(test, feature = "deep-plc"))]
 mod tests {
     use super::*;

@@ -22,6 +22,26 @@ use audiopus_sys as sys;
 use std::f64::consts::PI;
 use std::os::raw::c_int;
 
+// The 24-bit multistream calls of libopus 1.6, which `audiopus_sys` does
+// not declare.
+unsafe extern "C" {
+    fn opus_multistream_encode24(
+        st: *mut sys::OpusMSEncoder,
+        pcm: *const i32,
+        frame_size: c_int,
+        data: *mut u8,
+        max_data_bytes: i32,
+    ) -> c_int;
+    fn opus_multistream_decode24(
+        st: *mut sys::OpusMSDecoder,
+        data: *const u8,
+        len: i32,
+        pcm: *mut i32,
+        frame_size: c_int,
+        decode_fec: c_int,
+    ) -> c_int;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -64,6 +84,8 @@ pub const OPUS_SET_LFE_REQUEST: i32 = 10024;
 pub const OPUS_SET_ENERGY_MASK_REQUEST: i32 = 10026;
 /// Request `OPUS_GET_FINAL_RANGE`. Its argument is a pointer to `u32`.
 pub const OPUS_GET_FINAL_RANGE_REQUEST: i32 = 4031;
+/// `OPUS_GET_VOICE_RATIO` (opus_private.h).
+pub const OPUS_GET_VOICE_RATIO_REQUEST: i32 = 11019;
 /// Request `OPUS_MULTISTREAM_GET_ENCODER_STATE`. Its arguments are the stream
 /// index and a pointer to `*mut OpusEncoder`.
 pub const OPUS_MULTISTREAM_GET_ENCODER_STATE_REQUEST: i32 = 5120;
@@ -319,6 +341,21 @@ impl CMsEncoder {
         Ok(out)
     }
 
+    /// `opus_multistream_encode24`: like `encode_float`, for 24-bit input
+    /// in 32-bit integers.
+    pub fn encode24(&mut self, pcm: &[i32], frame_size: usize, max_bytes: usize) -> Result<Vec<u8>, i32> {
+        assert!(pcm.len() >= frame_size * self.channels, "pcm is shorter than one frame");
+        let mut out = vec![0u8; max_bytes];
+        let n = unsafe {
+            opus_multistream_encode24(self.st, pcm.as_ptr(), frame_size as c_int, out.as_mut_ptr(), max_bytes as i32)
+        };
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
     /// `opus_multistream_encode`: like `encode_float`, for 16-bit input.
     pub fn encode_i16(
         &mut self,
@@ -459,6 +496,38 @@ impl CMsDecoder {
         }
         out.truncate(n as usize * self.channels);
         Ok(out)
+    }
+
+    /// `opus_multistream_decode24`: like `decode_float`, with 24-bit
+    /// output in 32-bit integers.
+    pub fn decode24(&mut self, packet: Option<&[u8]>, frame_size: usize, fec: bool) -> Result<Vec<i32>, i32> {
+        let mut out = vec![0i32; frame_size * self.channels];
+        let (ptr, len) = match packet {
+            Some(p) => (p.as_ptr(), p.len() as i32),
+            None => (std::ptr::null(), 0),
+        };
+        let n = unsafe {
+            opus_multistream_decode24(self.st, ptr, len, out.as_mut_ptr(), frame_size as c_int, fec as c_int)
+        };
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize * self.channels);
+        Ok(out)
+    }
+
+    /// A control of the multistream decoder that takes one `i32`, with
+    /// libopus's return code.
+    pub fn try_ctl(&mut self, request: i32, value: i32) -> i32 {
+        unsafe { sys::opus_multistream_decoder_ctl(self.st, request, value) }
+    }
+
+    /// A control of the multistream decoder that reads one `i32`.
+    pub fn get(&mut self, request: i32) -> i32 {
+        let mut v: i32 = 0;
+        let ret = unsafe { sys::opus_multistream_decoder_ctl(self.st, request, &mut v as *mut i32) };
+        assert_eq!(ret, 0, "opus_multistream_decoder_ctl({request}) = {ret}");
+        v
     }
 
     /// `opus_multistream_decode`: like `decode_float`, with 16-bit output.

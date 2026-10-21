@@ -204,6 +204,8 @@ pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bo
     };
     let ch = pcm.channels;
     match pcm.pcm {
+        // 24-bit input is rare enough for the scalar code.
+        PcmRef::I32(_) => return false,
         PcmRef::F32(x) => {
             let x = &x[offset * ch..offset * ch + n * ch];
             let (blocks, tail) = (n / 4, n % 4);

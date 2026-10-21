@@ -307,7 +307,7 @@ Notes on these tools:
 - FEC costs bits. libopus and opus1 add it only when the packet loss and the bitrate make it worthwhile.
 - With FEC on and enough packet loss, the encoder prefers SILK, even at bitrates where it would otherwise choose CELT.
 - `OpusEncoder::set_prediction_disabled` makes every frame decodable on its own, at a cost in quality.
-- libopus 1.5 added further tools based on machine learning: deep PLC and Deep REDundancy (DRED). opus1 has deep PLC, behind the cargo feature `deep-plc` (see [Using the library](06-using-the-library.md#deep-packet-loss-concealment)), but not DRED.
+- libopus 1.5 added further tools based on machine learning: deep PLC and Deep REDundancy (DRED). opus1 has both, behind the cargo features `deep-plc` and `dred` (see [Using the library](06-using-the-library.md#deep-packet-loss-concealment) and [Deep redundancy (DRED)](06-using-the-library.md#deep-redundancy-dred)).
 
 [The decoder](04-decoder.md) explains how concealment and FEC work inside. The example below loses two packets. It rebuilds the first one from the FEC data of the next packet, and it conceals the second.
 
@@ -409,7 +409,7 @@ The main gaps:
 
 - the integer version of the speech/music analysis that the fixed-point build of libopus runs (opus1 ports the floating-point version);
 - some controls, for example phase inversion and a decoder output gain;
-- the machine-learning tool DRED (deep PLC and OSCE are there, behind the cargo features `deep-plc`, `osce` and `osce-bwe`), the quality extension, and packet extensions;
+- the quality extension (the machine-learning tools deep PLC, OSCE and DRED are there, behind the cargo features `deep-plc`, `osce`, `osce-bwe` and `dred`, and so are packet extensions);
 - ambisonics with a demixing matrix (mapping family 3);
 - on x86-64, the code compiles but has not been run.
 

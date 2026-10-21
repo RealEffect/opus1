@@ -56,7 +56,7 @@ float samples, interleaved (not clipped)
 
 ## 1. Entry points
 
-All decoding goes through `decode_native` in `src/lib.rs`, the port of libopus `opus_decode_native`. The 16-bit methods call it through `decode_i16_native`, which decodes into a float buffer and turns on the soft clipper (section 10).
+All decoding goes through `decode_native` in `src/lib.rs`, the port of libopus `opus_decode_native`. The 16-bit methods call it through `decode_i16_native`, which decodes into a float buffer and turns on the soft clipper (section 11).
 
 | Method | libopus function | What it does |
 |---|---|---|
@@ -64,9 +64,17 @@ All decoding goes through `decode_native` in `src/lib.rs`, the port of libopus `
 | `decode_i16(data, frame_size, out)` | `opus_decode` | As `decode`, then soft clipping and rounding to 16 bits. |
 | `decode_fec(data, frame_size, out)` | `opus_decode_float` with `decode_fec = 1` | Rebuilds the packet before `data` from the FEC copy in `data`. |
 | `decode_fec_i16(data, frame_size, out)` | `opus_decode` with `decode_fec = 1` | As `decode_fec`, with 16-bit output. |
+| `decode24(data, frame_size, out)` | `opus_decode24` | As `decode`, then each sample scaled by 2^23 and rounded into an `i32`, without soft clipping or a limit (section 11). |
+| `decode_fec24(data, frame_size, out)` | `opus_decode24` with `decode_fec = 1` | As `decode_fec`, with 24-bit output. |
+| `set_gain(gain)`, `gain()` | `OPUS_SET_GAIN`, `OPUS_GET_GAIN` | The output gain in 1/256 dB, -32768 to 32767 (section 11). |
+| `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | `OPUS_SET_PHASE_INVERSION_DISABLED`, `OPUS_GET_PHASE_INVERSION_DISABLED` | Decodes intensity stereo bands without the sign inversion of the second channel (section 5). |
+| `pitch()` | `OPUS_GET_PITCH` | The pitch period of the last frame, in samples at 48 kHz (section 5). |
 | `final_range()` | `OPUS_GET_FINAL_RANGE` | The range decoder state after the last frame. |
 | `last_packet_duration()` | `OPUS_GET_LAST_PACKET_DURATION` | The samples per channel of the last successful decode, concealment or FEC call. 0 at the start and after `reset_state`. |
 | `reset_state()` | `OPUS_RESET_STATE` | Forgets the stream decoded so far. |
+| `dred_decode_float(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode_float` | Conceals `frame_size` samples with the deep redundancy (DRED) data of a later packet (feature `dred`, section 10). |
+| `dred_decode(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode` | As `dred_decode_float`, with 16-bit output. |
+| `dred_decode24(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode24` | As `dred_decode_float`, with 24-bit output in `i32`. |
 
 All of them return the number of samples per channel written. The output is interleaved: left, right, left, right for two channels.
 
@@ -185,6 +193,8 @@ Some details:
 - **Output rates below 48 kHz.** `synthesis` sets every MDCT value above the output's Nyquist frequency (half the output rate) to zero before the inverse MDCT. De-emphasis then keeps one sample in 2, 3, 4 or 6 without another filter.
 - **Post-filter.** The filter changes smoothly from frame to frame. In a frame of 5 ms or more, the first 2.5 ms use the last frame's filter, the next 2.5 ms fade to this frame's filter, and the rest uses this frame's filter. A 2.5 ms frame fades between the filters of the two frames before it; its own filter takes effect in the next frame.
 - **No saturation.** libopus saturates CELT samples only in its fixed-point build. The float build, and this crate, keep values beyond ±1.
+- **Phase inversion.** In an intensity stereo band the packet codes one shape for both channels, and a flag can invert the sign of the second channel. With phase inversion disabled (`set_phase_inversion_disabled(true)`, libopus `OPUS_SET_PHASE_INVERSION_DISABLED`) the decoder ignores that flag. As in libopus, a decoder with one output channel starts with it disabled: it mixes the two channels down, and the inverted channels would cancel. A decoder with two channels starts with it enabled. `reset_state` keeps the setting.
+- **Pitch.** `pitch()` (libopus `OPUS_GET_PITCH`) returns, after a CELT-only frame, the post-filter period of that frame in samples at 48 kHz (libopus `postfilter_period`): 0 when the frame has no post-filter, and at least 15 after concealment from noise. After a SILK or Hybrid frame it returns SILK's pitch lag of the last frame, scaled to 48 kHz (`lagPrev` times 6, 4 or 3 at 8, 12 or 16 kHz), or 0 when that frame was not voiced (libopus `DecControl.prevPitchLag`). `reset_state` keeps the SILK value, which lies outside the part of the decoder that libopus clears, so after a reset `pitch()` returns it until the next frame.
 
 ## 6. Mode switches and redundant frames
 
@@ -396,7 +406,35 @@ for i in 0..packets.len() {
 assert_eq!(output.len(), packets.len() * frame);
 ```
 
-## 10. Float and 16-bit output
+## 10. Deep redundancy (DRED): `dred_decode`
+
+With the feature `dred`, the decoder can conceal a loss with deep redundancy (DRED) data, as libopus 1.6.1 built with `--enable-dred` does, bit for bit. The feature turns on `deep-plc`.
+
+An encoder of libopus 1.5 or later with `OPUS_SET_DRED_DURATION(n)` adds DRED data to its packets. It describes up to `n` frames of 10 ms of the speech before the end of the packet, at most 104 frames. The data sits in a packet extension with the ID 126 (see [Packet extensions](02-packets.md#packet-extensions)), so decoders that do not know it skip it. opus1's encoder writes it too, with the feature `dred` and `set_dred_duration` (see [The encoder](03-encoder.md#18-deep-redundancy-dred)).
+
+Decoding DRED takes three steps. The first two belong to an `OpusDredDecoder` and an `OpusDred` (`src/dnn/dred/decoder.rs`), the third to the `OpusDecoder`.
+
+1. **Parse** (`OpusDredDecoder::parse`, libopus `opus_dred_parse`). It finds the first DRED extension whose payload starts with `b'D'` and the version 12, and reads the range-coded payload:
+   - the quantizer level `q0` of the newest data, the step `dq` by which the level rises with age, the largest level `qmax`, and the offset of the newest frame in units of 2.5 ms (`OpusDred::dred_offset`);
+   - an initial state of 50 values;
+   - latent vectors of 25 values, newest first. Each stands for 40 ms (four frames of 10 ms).
+
+   Only the vectors that cover `max_dred_samples` and 20 ms more are read, at most 26. Reading also stops when fewer than 8 bits are left. The result (`DredParse`) holds libopus's return value (`samples`: how far back the data reaches, at the rate of the call) and `dred_end` (`end`: the samples between the start of the packet and the newest data, when the encoder left out the newest frames).
+2. **Process** (`OpusDredDecoder::process` or `process_in_place`, libopus `opus_dred_process`). The RDOVAE decoder (`src/dnn/dred/rdovae_dec.rs`) turns the initial state into the states of its five GRUs, and each latent vector into four frames of 20 features, newest first. `parse` processes at once unless `defer_processing` is set.
+3. **Decode** (`OpusDecoder::dred_decode_float` and the 16-bit and 24-bit variants). `dred_offset` is the distance in samples, at the decoder's rate, from the start of the audio to make up to the start of the DRED packet. The decoder first fills the feature queue of deep PLC, as the DRED step of libopus `opus_decode_native` does (`src/opus_decoder.c:735-758`):
+   - It empties the queue.
+   - It queues one feature frame per 10 ms of `frame_size`, at least one. When the last call of deep PLC added decoded audio to its history instead of concealing, two more frames come first.
+   - Frame `i` of the queue is DRED frame `k = init - i - 2 + floor((dred_offset + dred.dred_offset * F10 / 4) / F10)`, with `init` the number of extra frames (2 or 0) and `F10` the samples of 10 ms. A frame `k` that `dred` holds goes in. A `k` beyond the oldest frame goes in as a gap, which deep PLC fills with its own prediction. A negative `k` (newer than the newest DRED frame) is left out.
+
+   Then it conceals `frame_size` samples as for a lost packet ([section 8](#8-packet-loss-concealment)). Deep PLC takes the queued features instead of predicting them:
+   - SILK at 16 kHz runs deep PLC whenever features are queued, at every complexity.
+   - CELT runs deep PLC whenever features are queued, whatever the complexity and the length of the loss (libopus `FRAME_DRED`). Such a frame also restarts the count of the loss (`plc_duration`) and clears `skip_plc` (`celt/celt_decoder.c:731-734`, `1082-1087`).
+
+A state that is not processed, or that holds no DRED (the packet had none), leaves the queue as it is: the call conceals as an empty packet does. The checks of `frame_size` (not 0, a multiple of 2.5 ms) and of the room in `out` come before any change of the decoder. `last_packet_duration()` becomes `frame_size`. No soft clipping runs, as for any concealment. The 16-bit variant rounds each sample with libopus's `FLOAT2INT16`, not with `celt_float2int16`; the 24-bit variant gives `float2int(32768*256*x)`, without a limit to 24 bits. Both conceal a loss longer than 120 ms in pieces of 60 ms, which gives the samples of one call, after queueing the features once.
+
+An `OpusDred` is 11,236 bytes and decoding does not change it, so one parsed packet serves all the lost frames before it. The `OpusDredDecoder` holds only weights and the kernel variant; one can serve every stream. Parsing, processing and decoding allocate nothing.
+
+## 11. Float, 16-bit and 24-bit output
 
 `decode` and `decode_fec` write `f32` samples. Full scale is ±1.0. The output is **not** clipped, as in libopus `opus_decode_float`: a loud signal comes back with peaks beyond ±1.0. A caller that needs the range must limit the samples itself.
 
@@ -417,6 +455,10 @@ assert_eq!(output.len(), packets.len() * frame);
 
    The multistream decoder converts each sample with `FLOAT2INT16` on every target, as libopus `opus_multistream_decode` does.
 
+`decode24` and `decode_fec24` follow libopus `opus_decode24` in its float build. They decode as `decode_i16` does in step 1, without soft clipping (`soft_clip` is not set, so `softclip_mem` is cleared as in libopus). Each sample then becomes `float2int(32768*256*x)`: scaled by 2^23 and rounded to the nearest integer, halfway values to the even one. Nothing limits the values to 24 bits; a sample beyond the 32-bit range gives the nearest 32-bit value on 64-bit ARM. The multistream decoder's `decode24` and `decode_fec24` (`opus_multistream_decode24`) do the same for every stream.
+
+**Output gain.** `set_gain(gain)` (libopus `OPUS_SET_GAIN`) scales the output by `celt_exp2(6.48814081e-4 * gain)`, that is `10^(gain / (20 * 256))`, with `gain` in 1/256 dB from -32768 to 32767. Any other value is the error "Invalid gain", and the setting stays. The default 0 skips the multiplication. As in libopus, the gain is applied at the end of every frame that is decoded or concealed (`opus_decode_frame`, `src/opus_decoder.c:681-693`): before the soft clipping and the conversion to 16 or 24 bits, and after the mode-switch cross-fades. The 2.5 or 5 ms of concealment that a cross-fade of a mode switch mixes in comes from a nested frame call, so it gets the gain twice, as in libopus. The decoder's state never sees the gain. `reset_state` keeps it. The multistream decoder sets it on every stream.
+
 `pcm_soft_clip` is public and can be used on float output directly:
 
 ```rust
@@ -429,7 +471,7 @@ assert!(pcm.iter().all(|x| (-1.0..=1.0).contains(x)));
 assert!(pcm[2] > 0.99); // the peak lands just below 1
 ```
 
-## 11. The final range
+## 12. The final range
 
 The range coder ends every frame in a state, a 32-bit number. An encoder and a decoder that read the same frame the same way end in the same state. `OpusDecoder::final_range()` (libopus `OPUS_GET_FINAL_RANGE`) returns it for the last frame decoded:
 
@@ -459,7 +501,7 @@ for k in 0..10 {
 }
 ```
 
-## 12. Known differences from libopus
+## 13. Known differences from libopus
 
 These figures come from the project's comparison of both decoders on packets from the libopus encoder (Apple M4 Pro, libopus 1.6.1). [10-differences-from-libopus.md](10-differences-from-libopus.md) collects the differences of the whole library.
 
@@ -468,4 +510,4 @@ These figures come from the project's comparison of both decoders on packets fro
 - CELT: 51 of 51 test streams decode to the same samples.
 - Mode switches: the 8 switching test streams decode to the same samples.
 - The neural concealment of libopus (deep PLC) is ported, behind the cargo feature `deep-plc`, and gives the bits of libopus 1.6.1 built with it (see [Differences from libopus](10-differences-from-libopus.md#neural-network-code)).
-- Packet extensions that libopus 1.5 and later store in the padding are not read (`src/packet.rs`).
+- The decoder does not read the packet extensions that libopus 1.5 and later store in the padding, as libopus 1.6.1 does not without its quality extension (QEXT). `src/extensions.rs` reads and writes them for the repacketizer and the padding functions.

@@ -96,6 +96,9 @@ pub enum PcmRef<'a> {
     /// 16-bit samples (libopus `downmix_int`): converted to `f32` and
     /// summed, without a limit.
     I16(&'a [i16]),
+    /// 24-bit samples in 32-bit integers (libopus `downmix_int24`):
+    /// converted to `f32`, divided by 256 and summed, without a limit.
+    I32(&'a [i32]),
 }
 
 /// Which channels the analysis adds to channel `c1` (libopus `c2`).

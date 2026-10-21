@@ -505,6 +505,112 @@ assert_eq!(decoded, 30 * FRAME);
 
 If packet 11 had not arrived either, the decoder would call `decoder.decode(&[], FRAME, &mut out)` for packet 10 instead.
 
+### Deep redundancy (DRED)
+
+With the feature `dred`, the decoder can rebuild lost speech from deep redundancy (DRED) data. The encoder of opus1 adds this data to its packets after `set_dred_duration`, and so does a libopus encoder of version 1.5 or later after `OPUS_SET_DRED_DURATION`. Each packet with DRED describes up to about one second of the speech before it, in a few kb/s. So one packet that arrives after a burst of losses can rebuild the whole burst, where in-band FEC rebuilds only the last packet. DRED carries speech features, not audio: deep PLC synthesizes the audio from them. The result follows the lost speech closely, but it is not a copy of it.
+
+The sender sets three things on its `OpusEncoder`:
+
+- `set_dred_duration(n)`: how much audio before each packet the packet describes, in frames of 10 ms, from 1 to 104. 0, the default, turns DRED off.
+- `set_packet_loss_perc(p)`: the expected loss in percent. DRED's share of the bitrate grows with it. With no expected loss DRED takes no bits, and with VBR it then writes nothing.
+- A bitrate above 12 kb/s (20 kb/s with in-band FEC): DRED's share is a fraction of the bitrate above that. When the share does not pay for at least two latent vectors (40 ms), DRED takes nothing.
+
+The share is taken from the bitrate of the audio, so the packets stay at about the bitrate that was set. In the tests, Hybrid packets of 20 ms at 24 kb/s with 20 % expected loss carried 26 bytes of DRED data on average, in the 287 of 300 packets that had DRED. `reset_state` turns DRED off, as libopus's `OPUS_RESET_STATE` does, so set the duration again after a reset. A `MultistreamEncoder` has no DRED setting, as in libopus: set it on each stream encoder (`stream_encoder_mut`). [The encoder](03-encoder.md#18-deep-redundancy-dred) explains the steps.
+
+The receiver needs three objects per stream:
+
+- the `OpusDecoder`;
+- an `OpusDredDecoder`, which holds the weights of the RDOVAE decoder (the network that turns DRED data into features). It keeps nothing from one packet to the next, so one can serve every stream;
+- an `OpusDred` (11,236 bytes), which holds the DRED data of one packet.
+
+When the jitter buffer (the queue that holds received packets until it is time to play them) must play lost packets and a later packet has arrived:
+
+1. Call `OpusDredDecoder::parse` on the first packet after the gap. Pass the duration from the start of the first lost packet to the start of that packet as `max_dred_samples` (more than one second does not help), and the decoder's rate as `sampling_rate`. The result's `samples` says how far back the data reaches; 0 means the packet carries no DRED.
+2. For each lost packet, oldest first, call `dred_decode_float` (or `dred_decode` for 16-bit output, `dred_decode24` for 24-bit output). `dred_offset` is the number of samples from the start of that lost packet to the start of the DRED packet, and `frame_size` its duration. Audio older than the DRED data reaches is concealed by deep PLC as without DRED, so the call can be made for every lost packet of the burst.
+3. Decode the DRED packet itself with `decode`, as usual.
+
+```rust
+#[cfg(feature = "dred")]
+{
+    use opus1::{Application, Bitrate, OpusDecoder, OpusDred, OpusDredDecoder, OpusEncoder};
+
+    const RATE: i32 = 16_000;
+    const FRAME: usize = 320; // 20 ms
+
+    /// Plays `lost` lost packets of FRAME samples, then `next`, the packet
+    /// that arrived after them. Returns the samples played.
+    fn play_after_loss(
+        decoder: &mut OpusDecoder,
+        dred_decoder: &OpusDredDecoder,
+        dred: &mut OpusDred,
+        next: &[u8],
+        lost: usize,
+        out: &mut [f32],
+    ) -> usize {
+        let gap = (lost * FRAME) as i32;
+        // Only the DRED data that covers the gap is read.
+        let reach = match dred_decoder.parse(dred, next, gap.min(RATE), RATE, false) {
+            Ok(found) => found.samples,
+            Err(_) => 0, // not a valid packet: conceal
+        };
+        let mut played = 0;
+        for k in 0..lost {
+            // From the start of lost packet k to the start of `next`.
+            let dred_offset = ((lost - k) * FRAME) as i32;
+            played += if reach > 0 {
+                decoder.dred_decode_float(dred, dred_offset, FRAME, out).unwrap()
+            } else {
+                decoder.decode(&[], FRAME, out).unwrap()
+            };
+        }
+        played + decoder.decode(next, FRAME, out).unwrap()
+    }
+
+    // The sender: DRED of 1 s, with 20 % expected loss. Packets of a
+    // libopus encoder with DRED are read the same way.
+    let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
+    encoder.set_packet_loss_perc(20).unwrap();
+    encoder.set_dred_duration(100).unwrap();
+    let signal: Vec<f32> = (0..FRAME * 20)
+        .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 180.0 * i as f32 / RATE as f32).sin())
+        .collect();
+    let packets: Vec<Vec<u8>> = signal
+        .chunks_exact(FRAME)
+        .map(|frame| {
+            let mut packet = vec![0u8; 1276];
+            let len = encoder.encode(frame, FRAME, &mut packet).unwrap();
+            packet.truncate(len);
+            packet
+        })
+        .collect();
+
+    let mut decoder = OpusDecoder::new(RATE, 1).unwrap();
+    let dred_decoder = OpusDredDecoder::new();
+    let mut dred = OpusDred::new();
+    let mut out = vec![0.0f32; FRAME];
+    let mut played = 0;
+    for packet in &packets[..10] {
+        played += decoder.decode(packet, FRAME, &mut out).unwrap();
+    }
+    // Packets 10 to 14 are lost; packet 15 arrived. All its DRED data
+    // (up to 1 s) reaches back over all of them.
+    let found = dred_decoder.parse(&mut dred, &packets[15], RATE, RATE, true).unwrap();
+    assert!(found.samples >= (5 * FRAME) as i32);
+    played += play_after_loss(&mut decoder, &dred_decoder, &mut dred, &packets[15], 5, &mut out);
+    assert_eq!(played, 16 * FRAME);
+}
+```
+
+Points for the jitter buffer:
+
+- DRED helps only when the packet after the gap arrives before the lost audio must be played. A buffer that holds packets for a short delay often has it after a short burst. When it has not arrived, conceal with an empty packet.
+- One parsed `OpusDred` serves every lost packet of the burst, because decoding does not change it. A new packet needs a new parse.
+- `parse` with `defer_processing` set only reads the bits, which is cheap. `process_in_place` then runs the network, the costly step. A receiver can parse each packet as it arrives, to know how far back it reaches, and process only the one it uses.
+- `dred_offset` need not fall on the start of a packet. Only `frame_size` must be a multiple of 2.5 ms.
+- In-band FEC and DRED combine. libopus's test program `opus_demo` uses `decode_fec` for the last lost packet when `packet::has_lbrr` says the next packet carries a copy, and DRED for the others.
+- DRED works at every decoder complexity. It needs the deep PLC models, which are built in. [The decoder](04-decoder.md#10-deep-redundancy-dred-dred_decode) explains what the calls do.
+
 ## Neural network features of the decoder
 
 libopus 1.5 and later can run small neural networks in the decoder. A default build of libopus leaves them out, and so does a default build of opus1. In opus1 they are cargo features, all off by default:
@@ -514,11 +620,12 @@ libopus 1.5 and later can run small neural networks in the decoder. A default bu
 | `deep-plc` | Deep packet loss concealment (deep PLC): the networks PitchDNN, PLC and FARGAN make up lost speech. | `--enable-deep-plc` | 1,432,768 bytes |
 | `osce` | LACE and NoLACE, the two speech enhancers of OSCE (Opus Speech Coding Enhancement), for SILK frames. It turns on `deep-plc`, as `--enable-osce` does. | `--enable-osce` | 1,573,440 bytes more |
 | `osce-bwe` | The bandwidth extension (BWE) of OSCE: the network BBWENet extends 16 kHz SILK speech to 48 kHz output. It turns on `osce`. | `--enable-osce` (only the `configure` build of libopus) | 685,888 bytes more |
+| `dred` | Deep redundancy (DRED): the encoder writes DRED data (`OpusEncoder::set_dred_duration`), and the decoder rebuilds lost packets from it (`OpusDredDecoder`, `OpusDred` and `OpusDecoder::dred_decode`; see [Deep redundancy (DRED)](#deep-redundancy-dred)). It embeds the RDOVAE encoder and decoder of DRED. It turns on `deep-plc`, as `--enable-dred` does. | `--enable-dred` | 565,440 bytes more |
 | `dnn` | The code that the networks share. Each feature above turns it on. It is not meant to be selected alone. | | |
 
 The weights are those of libopus 1.6.1. They are files in the crate (`dnn-weights/`), and each feature embeds the files of its networks in the program. The features work with and without `std` and `heap`.
 
-All of them run in the decoder. The decoded output is that of libopus 1.6.1 built with `--enable-osce` (which includes deep PLC), bit for bit, with one exception: opus1 decodes CELT-only frames that follow frames with the BWE, which libopus 1.6.1 replaces by silence (see [LACE, NoLACE and the bandwidth extension](#lace-nolace-and-the-bandwidth-extension)). [Testing](09-testing.md#tests-of-the-neural-network-code) says how this is checked.
+All of them run in the decoder; `dred` also runs in the encoder. With `dred`, the audio that `dred_decode` makes is that of libopus 1.6.1 built with `--enable-dred`, bit for bit. So are CELT-only packets with DRED data, and the DRED data of SILK and Hybrid packets with the `Audio` application and VBR ([Differences from libopus](10-differences-from-libopus.md#dred-encoding)). The decoded output is that of libopus 1.6.1 built with `--enable-osce` (which includes deep PLC), bit for bit, with one exception: opus1 decodes CELT-only frames that follow frames with the BWE, which libopus 1.6.1 replaces by silence (see [LACE, NoLACE and the bandwidth extension](#lace-nolace-and-the-bandwidth-extension)). [Testing](09-testing.md#tests-of-the-neural-network-code) says how this is checked.
 
 ### Deep packet loss concealment
 
@@ -666,6 +773,53 @@ let mut out = [0i16; 960];
 assert_eq!(decoder.decode_i16(&packet[..len], 960, &mut out).unwrap(), 960);
 ```
 
+## 24-bit input and output
+
+libopus 1.6 added calls for 24-bit samples held in 32-bit integers, with full scale 2^23 (±8388608). opus1 has them with libopus's arithmetic:
+
+- `encode24` divides each sample by 2^23 to a float and encodes as `encode` does, with 24 bits of precision. The speech and music analysis reads the integers. Values beyond 24 bits are accepted and not limited, as in libopus.
+- `decode24` and `decode_fec24` decode as `decode` and `decode_fec` do, then multiply each sample by 2^23 and round it to the nearest integer. There is no soft clipping and no limit to 24 bits, as in libopus: a loud signal gives values beyond ±8388607.
+- `MultistreamEncoder::encode24`, `MultistreamDecoder::decode24` and `decode_fec24` do the same for multistream packets.
+
+```rust
+use opus1::{Application, OpusDecoder, OpusEncoder};
+
+let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+
+// A 24-bit tone, and the same tone as float.
+let pcm: Vec<i32> = (0..960).map(|i| ((i % 96) as i32 - 48) * 100_000).collect();
+let pcm_f32: Vec<f32> = pcm.iter().map(|&s| s as f32 / 8_388_608.0).collect();
+
+let mut packet = [0u8; 1276];
+let len = encoder.encode24(&pcm, 960, &mut packet).unwrap();
+let mut packet_f32 = [0u8; 1276];
+let mut encoder_f32 = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let len_f32 = encoder_f32.encode(&pcm_f32, 960, &mut packet_f32).unwrap();
+assert_eq!(packet[..len], packet_f32[..len_f32]);
+
+let mut out = [0i32; 960];
+assert_eq!(decoder.decode24(&packet[..len], 960, &mut out).unwrap(), 960);
+```
+
+## Decoder output gain, pitch and phase inversion
+
+- `OpusDecoder::set_gain(gain)` scales the decoded audio by `gain` in 1/256 dB, from -32768 to 32767 (about -128 to +128 dB), as libopus `OPUS_SET_GAIN` does. 256 is +1 dB. The scaling comes before the soft clipping of `decode_i16` and the conversion of `decode24`. Other values are an error. `gain()` reads it.
+- `OpusDecoder::pitch()` (libopus `OPUS_GET_PITCH`) is the pitch period of the last frame in samples at 48 kHz, or 0: the post-filter period of CELT after a CELT-only frame, SILK's pitch lag otherwise.
+- `set_phase_inversion_disabled(true)` on `OpusEncoder` or `OpusDecoder` (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`) turns off the sign inversion in CELT's intensity stereo. On the encoder it makes a mono downmix of the decoded stereo sound better, at a small cost in stereo quality. A mono decoder has it on from the start, because it mixes stereo streams down; a stereo decoder has it off. The multistream encoder and decoder forward it to every stream.
+
+```rust
+use opus1::OpusDecoder;
+
+let mut decoder = OpusDecoder::new(48_000, 2).unwrap();
+decoder.set_gain(-6 * 256).unwrap(); // -6 dB
+assert_eq!(decoder.gain(), -1536);
+assert!(decoder.set_gain(40_000).is_err());
+assert!(!decoder.phase_inversion_disabled());
+decoder.set_phase_inversion_disabled(true);
+assert_eq!(decoder.pitch(), 0); // nothing decoded yet
+```
+
 ## More than two channels
 
 `OpusEncoder` and `OpusDecoder` handle 1 or 2 channels. For 3 to 255 channels, such as 5.1 surround, use `opus1::multistream::MultistreamEncoder` and `MultistreamDecoder`. A multistream packet holds one ordinary Opus packet per stream. Each stream has its own `OpusEncoder` or `OpusDecoder`. The module needs the `std` feature. [Multichannel audio](05-multichannel.md) explains the channel layouts and the settings.
@@ -703,7 +857,7 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 | `heap` | on | Keeps the large codec state behind `Box`, so `OpusEncoder` and `OpusDecoder` themselves are small. Requires `std`. |
 | `analysis` | on | The speech and music analysis of the encoder. It adds about 28 KB of machine code and 24 KB of tables, most of them the weights of its network as `f32` (measured in a release build for aarch64-apple-darwin that encodes one frame). Without it the encoder decides at every complexity as at complexity 6, and `OpusEncoder` is 25,968 bytes smaller without `heap` (see below). It works with and without `std`. |
 | `libm` | off | Provides `sin`, `cos`, `sqrt` and the other float functions through the `libm` crate, a pure-Rust port of the musl C library's math functions. A build without `std` needs it. |
-| `deep-plc`, `osce`, `osce-bwe` | off | The neural network features of the decoder, with the weights of libopus 1.6.1 (see [Neural network features of the decoder](#neural-network-features-of-the-decoder)). Each one turns on the one before it, and `dnn`. |
+| `deep-plc`, `osce`, `osce-bwe`, `dred` | off | The neural network features of the decoder (`dred` also of the encoder), with the weights of libopus 1.6.1 (see [Neural network features of the decoder](#neural-network-features-of-the-decoder)). `osce` turns on `deep-plc`, `osce-bwe` turns on `osce`, and `dred` turns on `deep-plc`. Each turns on `dnn`. |
 | `dnn` | off | The code that the neural network features share. The features above turn it on. |
 | `test-libopus-dnn` | off | For the tests of this repository only. It adds nothing to the library. It compiles the tests that call a libopus built with its neural network code. `cargo test --all-features` fails to link against a libopus without that code, such as the Homebrew build. |
 
@@ -736,6 +890,8 @@ The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of
 | `heap` without `analysis` | 2,648 bytes, plus 115,416 bytes in 7 allocations (mono) or 125,352 bytes in 8 allocations (stereo) |
 | Without `heap` (with or without `std`), with `analysis` | 153,904 bytes |
 | Without `heap` and without `analysis` | 127,936 bytes |
+| Default with `dred` (measured on 2026-10-20, branch `next-dred`) | 2,672 bytes, plus 193,816 bytes on the heap in 9 allocations (mono) or 203,760 bytes in 10 allocations (stereo) |
+| Without `heap`, with `analysis` and `dred` (the same day) | 210,176 bytes |
 
 | Build | `OpusDecoder` |
 |---|---|
@@ -747,6 +903,8 @@ The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of
 | Without `heap`, with `deep-plc` | 107,288 bytes |
 | Without `heap`, with `osce` | 142,136 bytes |
 | Without `heap`, with `osce-bwe` | 160,752 bytes |
+
+With `dred`, the encoder holds the state of the DRED encoder. With `heap` it is one allocation of 52,424 bytes. 31,200 bytes of it are the latent vectors and initial states of the last 104 steps of 20 ms; the rest is the 16 kHz input, the feature analysis and the state of the RDOVAE encoder. Without `heap` it takes 56,248 bytes inline, which include room for the layer tables of models loaded from a blob. On the same day the default encoder measured 2,664 bytes plus 141,392 bytes (mono) or 151,336 bytes (stereo), and 153,928 bytes without `heap`.
 
 The state of the speech and music analysis takes 25,968 bytes: 14,004 bytes as in libopus, plus the FFT buffer and the per-bin values that libopus keeps on the stack, and two caches: the square roots of the band energies and the distances between the stored blocks.
 
@@ -817,9 +975,9 @@ What is rejected:
 |---|---|---|
 | `OpusEncoder::new`, `OpusDecoder::new` | a sampling rate other than 8000, 12000, 16000, 24000, 48000 | `"Invalid sampling rate"` |
 | `OpusEncoder::new`, `OpusDecoder::new` | a channel count other than 1 or 2 | `"Invalid number of channels"` |
-| `encode`, `encode_i16` | a frame size that is not 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms; with an expert frame duration, a frame size shorter than that duration | `"Invalid frame size for sampling rate"` |
-| `encode`, `encode_i16` | fewer than `frame_size * channels` input samples | `"Input buffer too small for frame"` |
-| `encode`, `encode_i16` | an empty output buffer, or a 100 ms frame into a 1-byte buffer | `"Output buffer too small"` |
+| `encode`, `encode_i16`, `encode24` | a frame size that is not 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms; with an expert frame duration, a frame size shorter than that duration | `"Invalid frame size for sampling rate"` |
+| `encode`, `encode_i16`, `encode24` | fewer than `frame_size * channels` input samples | `"Input buffer too small for frame"` |
+| `encode`, `encode_i16`, `encode24` | an empty output buffer, or a 100 ms frame into a 1-byte buffer | `"Output buffer too small"` |
 | `decode` and the other decode calls | a packet that breaks the rules of section 3 of RFC 6716 (Request for Comments 6716, the Opus specification) | `"Invalid packet"` |
 | `decode` | a packet longer than `frame_size` | `"frame_size too small for packet"` |
 | `decode` and the other decode calls | an output buffer shorter than the samples to be written | `"Output buffer too small for packet"` |
@@ -833,6 +991,10 @@ What is rejected:
 | `set_packet_loss_perc` | a value outside 0 to 100 | `"Invalid packet loss percentage"` |
 | `set_max_bandwidth` | `Bandwidth::Auto` | `"Invalid maximum bandwidth"` |
 | `set_force_channels` | more channels than the encoder has, or 0 | `"Invalid forced channel count"` |
+| `MultistreamEncoder::set_force_channels` | as above, for the first stream that refuses it (`Some(2)` with a mono stream); the streams before it keep the new value, as in libopus | `"Invalid forced channel count"` |
+| `OpusDecoder::set_gain`, `MultistreamDecoder::set_gain` | a value outside -32768 to 32767 | `"Invalid gain"` |
+| `OpusEncoder::set_voice_ratio` | a value outside -1 to 100 | `"Invalid voice ratio"` |
+| `OpusEncoder::set_application`, `MultistreamEncoder::set_application` | another application after the first frame (before `reset_state`) | `"Application cannot change after the first frame"` |
 
 What is not rejected: a positive bitrate below 500 b/s or above 750,000 b/s per channel. `set_bitrate` moves it to the nearest limit, as libopus's `OPUS_SET_BITRATE` does.
 

@@ -35,9 +35,9 @@ This glossary defines, in alphabetical order, the terms that these documents use
 
 - **Decibel (dB)**: A logarithmic unit for a ratio of two powers or two amplitudes. A factor of two in amplitude is about 6 dB.
 - **De-emphasis**: See pre-emphasis.
-- **Deep PLC**: Packet loss concealment with a neural network, added to libopus 1.5 as a build option. opus1 does not have it.
+- **Deep PLC**: Packet loss concealment with a neural network, added to libopus 1.5 as a build option. opus1 has it with the feature `deep-plc`.
 - **Delayed decision**: A way of quantizing the SILK excitation. It keeps several candidate results and chooses between them only some samples later, which lowers the error. SILK uses 2 candidates from complexity 2, 3 from complexity 6 and 4 from complexity 8.
-- **DRED (Deep REDundancy)**: Redundancy coded with a neural network, added to libopus 1.5 as a build option. opus1 does not have it. It carries a compact description of earlier speech in the padding of later packets.
+- **DRED (Deep REDundancy)**: Redundancy coded with a neural network, added to libopus 1.5 as a build option. It carries a compact description of earlier speech in the padding of later packets. With the feature `dred`, opus1 writes it (`OpusEncoder::set_dred_duration`) and decodes it (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`).
 - **DTX (discontinuous transmission)**: During silence or steady background noise, the encoder sends a packet only now and then. The decoder fills the gaps with comfort noise. The opus1 encoder produces such streams with `OpusEncoder::set_dtx(true)`.
 - **Dual stereo**: A CELT stereo option that codes the left and the right channel of a band separately, instead of as mid and side. It applies to the bands below the intensity band.
 
@@ -112,9 +112,9 @@ This glossary defines, in alphabetical order, the terms that these documents use
 ## P
 
 - **Packet**: What one call of the encoder writes and one call of the decoder reads: a TOC byte and 1 to 48 frames, at most 120 ms in total. The packet does not store its own length. The transport, such as the Real-time Transport Protocol (RTP) or Ogg, carries it.
-- **Packet extension**: Extra data that libopus 1.5 and later can store in the padding of a packet, for example DRED. Decoders that do not know an extension skip it. opus1 neither reads nor writes extensions.
+- **Packet extension**: Extra data that libopus 1.5 and later can store in the padding of a packet, for example DRED. Decoders that do not know an extension skip it. `opus1::extensions` reads and writes them, and the repacketizer and the padding functions of `opus1::packet` carry them as libopus's do. The encoder and the decoder of opus1 do not use them yet.
 - **Padding**: Extra bytes at the end of a packet that carry no audio, for example to bring a CBR packet to its exact size. Only packets with frame count code 3 can have padding.
-- **Phase inversion**: In intensity stereo, CELT can invert the sign of one channel of a band, to code a band whose two channels are close to opposite. Such bands cancel when the decoded stereo is mixed down to mono. So libopus can turn the inversion off (`OPUS_SET_PHASE_INVERSION_DISABLED`). opus1 cannot.
+- **Phase inversion**: In intensity stereo, CELT can invert the sign of one channel of a band, to code a band whose two channels are close to opposite. Such bands cancel when the decoded stereo is mixed down to mono. So libopus can turn the inversion off (`OPUS_SET_PHASE_INVERSION_DISABLED`), and so can opus1 (`set_phase_inversion_disabled` on the encoder and the decoder).
 - **Pitch, pitch period, pitch lag**: The pitch period is the length of one cycle of a periodic sound, such as voiced speech or a musical note. The pitch lag is the same period counted in samples. SILK estimates it for LTP, and the CELT encoder for its comb filter.
 - **PLC (packet loss concealment)**: The decoder fills the gap of a lost packet with plausible audio, made from the audio before it. In opus1, pass an empty packet to `OpusDecoder::decode`.
 - **Pre-emphasis, de-emphasis**: Pre-emphasis is a filter that boosts high frequencies before CELT codes the signal (`y[n] = x[n] - 0.85 * x[n-1]`). De-emphasis is its inverse after decoding. Together they make the coding noise lower at high frequencies relative to low ones.

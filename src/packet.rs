@@ -2,11 +2,12 @@
 //! frames out of a packet, writing frames into a packet, and padding.
 //!
 //! This is a port of the framing code of libopus 1.6: `opus_packet_parse_impl`
-//! (opus.c), `opus_repacketizer_out_range_impl` and `opus_packet_pad`
-//! (repacketizer.c), and `opus_multistream_packet_validate`
-//! (opus_multistream_decoder.c).
+//! (opus.c), the repacketizer with `opus_packet_pad` and
+//! `opus_packet_unpad` (repacketizer.c), and
+//! `opus_multistream_packet_validate` (opus_multistream_decoder.c).
 //!
-//! Nothing here allocates. A packet is described by a small [`ParsedPacket`]
+//! Nothing here allocates, apart from the rare cases that
+//! [`pad_with_extensions`] and [`Repacketizer::out_range_ext`] describe. A packet is described by a small [`ParsedPacket`]
 //! value and the frames stay where they are, in the caller's buffer.
 //!
 //! A packet starts with a table-of-contents (TOC) byte. Its two lowest bits
@@ -22,17 +23,24 @@
 //! frame, so that a decoder knows where the packet ends. A multistream packet
 //! uses it for every stream but the last.
 //!
-//! Not ported: the packet extensions libopus 1.5 and later can store in the
-//! padding. This shows in [`pad`] and [`multistream_pad`] when the packet
-//! already has padding whose bytes are not all zero:
+//! The padding of a code 3 packet can hold packet extensions (libopus 1.5
+//! and later; see [`crate::extensions`]). As in libopus:
 //!
-//! - libopus reads those bytes as extensions and carries them over into the
-//!   new padding. These functions write zeros.
-//! - libopus rejects the packet when the bytes are not valid extensions.
-//!   These functions pad it.
+//! - [`parse`] does not look at the padding; [`ParsedPacket::padding`]
+//!   returns it.
+//! - [`Repacketizer`] carries the extensions of its packets into the
+//!   packets it writes, with frame numbers that count from the first frame
+//!   of the new packet.
+//! - [`pad`] and [`multistream_pad`] keep the extensions of the packet, and
+//!   fail with "Internal error" when its padding holds invalid extension
+//!   data. [`pad_with_extensions`] adds extensions.
+//! - [`unpad`] and [`multistream_unpad`] drop the padding with its
+//!   extensions.
 //!
-//! For a packet without padding, or with zero padding, the result is
-//! libopus's byte for byte.
+//! The decoder ignores extensions, as libopus 1.6.1 without its quality
+//! extension (QEXT) does.
+
+use crate::extensions::{self, Extension, ExtensionIterator, ExtensionList};
 
 /// The most frames a packet can hold: 120 ms of 2.5 ms frames.
 pub const MAX_FRAMES: usize = 48;
@@ -52,6 +60,7 @@ pub(crate) const fn max_packet_samples(fs: i32) -> usize {
 const INVALID_PACKET: &str = "Invalid packet";
 const BUFFER_TOO_SMALL: &str = "Output buffer too small";
 const BAD_ARG: &str = "Invalid argument";
+const INTERNAL_ERROR: &str = "Internal error";
 
 /// Result of parsing one Opus packet. libopus `opus_packet_parse_impl`.
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +95,14 @@ impl ParsedPacket {
     /// index past the last frame gives an empty slice.
     pub fn frame<'a>(&self, data: &'a [u8], index: usize) -> &'a [u8] {
         self.frames(data).nth(index).unwrap_or(&[])
+    }
+
+    /// The padding of the packet `data` this value was parsed from: the
+    /// `padding_len` bytes after the last frame, where packet extensions
+    /// live (see [`crate::extensions`]). libopus returns it from
+    /// `opus_packet_parse_impl`.
+    pub fn padding<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        data.get(self.packet_offset - self.padding_len..self.packet_offset).unwrap_or(&[])
     }
 }
 
@@ -444,17 +461,21 @@ struct Layout {
     pad_amount: usize,
     /// Bytes before the first frame.
     header_len: usize,
+    /// Bytes of the extensions, which end the padding.
+    ext_len: usize,
     /// Length of the whole packet.
     total: usize,
 }
 
-/// Lay out a packet of frames with the given `sizes` in at most `maxlen`
-/// bytes: the first half of `opus_repacketizer_out_range_impl`.
+/// Lay out a packet of frames with the given `sizes` and `extensions` in
+/// at most `maxlen` bytes: the first half of
+/// `opus_repacketizer_out_range_impl`.
 fn layout(
     sizes: &[u16],
     maxlen: usize,
     self_delimited: bool,
     pad: bool,
+    extensions: &[Extension],
 ) -> Result<Layout, &'static str> {
     let count = sizes.len();
     let payload: usize = sizes.iter().map(|&s| s as usize).sum();
@@ -482,33 +503,41 @@ fn layout(
 
     let mut vbr = false;
     let mut pad_amount = 0usize;
-    if count > 2 || (pad && header_len + payload < maxlen) {
-        // Code 3. Padding needs it whatever the number of frames.
+    let mut ext_len = 0usize;
+    if count > 2 || (pad && header_len + payload < maxlen) || !extensions.is_empty() {
+        // Code 3. Padding and extensions need it whatever the number of
+        // frames.
         code = 3;
         vbr = sizes[1..].iter().any(|&s| s != sizes[0]);
         header_len = 2 + last_size_len;
         if vbr {
             header_len += sizes[..count - 1].iter().map(|&s| size_field_len(s)).sum::<usize>();
         }
-        if header_len + payload > maxlen {
+        let tot_size = header_len + payload;
+        if tot_size > maxlen {
             return Err(BUFFER_TOO_SMALL);
         }
         if pad {
-            pad_amount = maxlen - header_len - payload;
+            pad_amount = maxlen - tot_size;
+        }
+        if !extensions.is_empty() {
+            ext_len = extensions::generated_len(maxlen - tot_size, extensions, count)?;
+            if !pad {
+                // Just the room of the extensions and of the length.
+                pad_amount = ext_len + if ext_len > 0 { ext_len.div_ceil(254) } else { 1 };
+            }
         }
         if pad_amount != 0 {
             // The length of the padding takes `nb_255s + 1` bytes of it.
-            header_len += (pad_amount - 1) / 255 + 1;
+            let nb_255s = (pad_amount - 1) / 255;
+            if tot_size + ext_len + nb_255s + 1 > maxlen {
+                return Err(BUFFER_TOO_SMALL);
+            }
+            header_len += nb_255s + 1;
         }
+        return Ok(Layout { code, vbr, pad_amount, header_len, ext_len, total: tot_size + pad_amount });
     }
-    let padding_zeros = if pad_amount != 0 { pad_amount - (pad_amount - 1) / 255 - 1 } else { 0 };
-    Ok(Layout {
-        code,
-        vbr,
-        pad_amount,
-        header_len,
-        total: header_len + payload + padding_zeros,
-    })
+    Ok(Layout { code, vbr, pad_amount, header_len, ext_len, total: header_len + payload })
 }
 
 /// Write the bytes before the first frame into `out[..plan.header_len]`:
@@ -542,6 +571,42 @@ fn write_header(toc: u8, sizes: &[u16], plan: &Layout, self_delimited: bool, out
     debug_assert_eq!(pos, plan.header_len);
 }
 
+/// Write one packet into `out`, whose length is the most the packet may
+/// take: libopus `opus_repacketizer_out_range_impl` once it has collected
+/// the extensions.
+///
+/// `place_frames(out, at)` puts the frames, one after the other, at offset
+/// `at` of `out`. It runs before anything else is written, so that it can
+/// move frames that are already in `out` (in-place padding).
+///
+/// After the frames comes the padding: with extensions, bytes 0x01 and then
+/// the extensions; with `pad` and no extensions, zeros up to the end of
+/// `out`.
+fn emit(
+    toc: u8,
+    sizes: &[u16],
+    out: &mut [u8],
+    self_delimited: bool,
+    pad: bool,
+    extensions: &[Extension],
+    place_frames: impl FnOnce(&mut [u8], usize),
+) -> Result<usize, &'static str> {
+    let plan = layout(sizes, out.len(), self_delimited, pad, extensions)?;
+    place_frames(out, plan.header_len);
+    write_header(toc, sizes, &plan, self_delimited, out);
+    let pos = plan.header_len + sizes.iter().map(|&s| s as usize).sum::<usize>();
+    if !extensions.is_empty() {
+        let ext_begin = plan.total - plan.ext_len;
+        out[pos..ext_begin].fill(0x01);
+        let written = extensions::generate(&mut out[ext_begin..plan.total], extensions, sizes.len(), false);
+        debug_assert_eq!(written, Ok(plan.ext_len));
+    } else if pad {
+        // Fill the padding with zeros.
+        out[pos..].fill(0);
+    }
+    Ok(plan.total)
+}
+
 /// Check the frames a packet is to be made of, and collect their sizes.
 fn frame_sizes(toc: u8, frames: &[&[u8]]) -> Result<[u16; MAX_FRAMES], &'static str> {
     let count = frames.len();
@@ -560,6 +625,15 @@ fn frame_sizes(toc: u8, frames: &[&[u8]]) -> Result<[u16; MAX_FRAMES], &'static 
     Ok(sizes)
 }
 
+/// Copies `frames` one after the other into `out` from offset `at`.
+fn copy_frames(frames: &[&[u8]], out: &mut [u8], at: usize) {
+    let mut pos = at;
+    for frame in frames {
+        out[pos..pos + frame.len()].copy_from_slice(frame);
+        pos += frame.len();
+    }
+}
+
 /// Write one packet made of `frames`: libopus
 /// `opus_repacketizer_out_range_impl` (repacketizer.c) without extensions.
 ///
@@ -569,7 +643,8 @@ fn frame_sizes(toc: u8, frames: &[&[u8]]) -> Result<[u16; MAX_FRAMES], &'static 
 /// - `pad` fills `out` to its full length with padding. The packet then is
 ///   exactly `out.len()` bytes long.
 ///
-/// Returns the number of bytes written.
+/// Returns the number of bytes written. [`Repacketizer`] does the same for
+/// the frames of whole packets, and carries their extensions.
 pub fn write(
     toc: u8,
     frames: &[&[u8]],
@@ -579,55 +654,317 @@ pub fn write(
 ) -> Result<usize, &'static str> {
     let sizes = frame_sizes(toc, frames)?;
     let sizes = &sizes[..frames.len()];
-    let plan = layout(sizes, out.len(), self_delimited, pad)?;
-    write_header(toc, sizes, &plan, self_delimited, out);
-    let mut pos = plan.header_len;
-    for frame in frames {
-        out[pos..pos + frame.len()].copy_from_slice(frame);
-        pos += frame.len();
+    emit(toc, sizes, out, self_delimited, pad, &[], |out, at| copy_frames(frames, out, at))
+}
+
+/// Joins the frames of Opus packets into new packets, and splits packets
+/// into their frames: libopus `OpusRepacketizer` (repacketizer.c).
+///
+/// [`cat`](Self::cat) adds the frames of a packet. All packets must have
+/// the same TOC byte apart from the frame-count code (the same mode,
+/// bandwidth, frame duration and channel count), and together at most
+/// 120 ms. [`out_range`](Self::out_range) writes a packet of some of the
+/// frames, [`out`](Self::out) one of all of them.
+///
+/// The extensions in the padding of the packets go into the new packets,
+/// with their frame numbers adjusted, when the frame they start from is
+/// part of the new packet. Other padding is dropped.
+///
+/// The repacketizer borrows the packets; it copies nothing until a packet
+/// is written. libopus's `opus_repacketizer_init` is [`reset`](Self::reset).
+#[derive(Clone, Copy, Debug)]
+pub struct Repacketizer<'a> {
+    toc: u8,
+    nb_frames: usize,
+    frames: [&'a [u8]; MAX_FRAMES],
+    /// The padding of each packet, at the place of its first frame; empty
+    /// at the other frames.
+    paddings: [&'a [u8]; MAX_FRAMES],
+    /// The number of frames of the packet each padding belongs to.
+    padding_nb_frames: [u8; MAX_FRAMES],
+}
+
+impl Default for Repacketizer<'_> {
+    fn default() -> Self {
+        Self::new()
     }
-    if pad {
-        // Fill the padding with zeros.
-        out[pos..].fill(0);
+}
+
+impl<'a> Repacketizer<'a> {
+    /// An empty repacketizer.
+    pub const fn new() -> Self {
+        Repacketizer {
+            toc: 0,
+            nb_frames: 0,
+            frames: [&[]; MAX_FRAMES],
+            paddings: [&[]; MAX_FRAMES],
+            padding_nb_frames: [0; MAX_FRAMES],
+        }
     }
-    Ok(plan.total)
+
+    /// Removes all frames. libopus `opus_repacketizer_init`.
+    pub fn reset(&mut self) {
+        self.nb_frames = 0;
+    }
+
+    /// The number of frames added so far. libopus
+    /// `opus_repacketizer_get_nb_frames`.
+    pub fn nb_frames(&self) -> usize {
+        self.nb_frames
+    }
+
+    /// Adds the frames of the packet `data`. libopus `opus_repacketizer_cat`.
+    ///
+    /// Fails with "Invalid packet", and adds nothing, when the packet is
+    /// not valid, its TOC byte does not match that of the frames already
+    /// added (apart from the frame-count code), or the frames would last
+    /// more than 120 ms.
+    pub fn cat(&mut self, data: &'a [u8]) -> Result<(), &'static str> {
+        self.cat_impl(data, false)
+    }
+
+    /// libopus `opus_repacketizer_cat_impl`: `cat` for a self-delimited
+    /// packet too.
+    pub(crate) fn cat_impl(&mut self, data: &'a [u8], self_delimited: bool) -> Result<(), &'static str> {
+        let Some(&toc) = data.first() else {
+            return Err(INVALID_PACKET);
+        };
+        if self.nb_frames == 0 {
+            self.toc = toc;
+        } else if (self.toc & 0xFC) != (toc & 0xFC) {
+            return Err(INVALID_PACKET);
+        }
+        let curr_nb_frames = nb_frames(data)?;
+        if curr_nb_frames < 1 {
+            return Err(INVALID_PACKET);
+        }
+        // At most 120 ms: 960 samples at 8 kHz.
+        if (curr_nb_frames + self.nb_frames) * samples_per_frame(self.toc, 8000) > 960 {
+            return Err(INVALID_PACKET);
+        }
+        let packet = parse(data, self_delimited)?;
+        let n = self.nb_frames;
+        for (k, frame) in packet.frames(data).enumerate() {
+            self.frames[n + k] = frame;
+            self.paddings[n + k] = &[];
+            self.padding_nb_frames[n + k] = 0;
+        }
+        self.paddings[n] = packet.padding(data);
+        self.padding_nb_frames[n] = packet.count as u8;
+        self.nb_frames += packet.count;
+        Ok(())
+    }
+
+    /// Writes a packet of frames `begin..end` into `out`, whose length is
+    /// the largest packet allowed. Returns its length. libopus
+    /// `opus_repacketizer_out_range`.
+    ///
+    /// Errors: "Invalid argument" when the range is empty or goes past the
+    /// last frame, "Output buffer too small", and "Internal error" when the
+    /// padding of a packet in the range holds invalid extensions.
+    pub fn out_range(&self, begin: usize, end: usize, out: &mut [u8]) -> Result<usize, &'static str> {
+        self.out_range_ext(begin, end, out, false, false, &[])
+    }
+
+    /// Writes a packet of all frames into `out`. libopus
+    /// `opus_repacketizer_out`.
+    pub fn out(&self, out: &mut [u8]) -> Result<usize, &'static str> {
+        self.out_range_ext(0, self.nb_frames, out, false, false, &[])
+    }
+
+    /// [`out_range`](Self::out_range) with the options of libopus's
+    /// internal `opus_repacketizer_out_range_impl`:
+    ///
+    /// - `self_delimited` adds the size of the last frame (RFC 6716
+    ///   appendix B), as every stream but the last of a multistream packet
+    ///   needs.
+    /// - `pad` makes the packet exactly `out.len()` bytes long.
+    /// - `extensions` are added before those of the packets' padding. Their
+    ///   frame numbers count from frame `begin`.
+    ///
+    /// Besides the errors of `out_range`, the extensions give the errors of
+    /// [`extensions::generate`].
+    ///
+    /// Up to 32 extensions in all, `extensions` and those of the padding,
+    /// need no allocation. More need the feature `std`; without it they
+    /// give "Internal error".
+    pub fn out_range_ext(
+        &self,
+        begin: usize,
+        end: usize,
+        out: &mut [u8],
+        self_delimited: bool,
+        pad: bool,
+        extensions: &[Extension],
+    ) -> Result<usize, &'static str> {
+        if begin >= end || end > self.nb_frames {
+            return Err(BAD_ARG);
+        }
+        let frames = &self.frames[begin..end];
+        let mut sizes = [0u16; MAX_FRAMES];
+        for (size, frame) in sizes.iter_mut().zip(frames) {
+            *size = frame.len() as u16;
+        }
+        let sizes = &sizes[..frames.len()];
+        // The extensions in the padding of the packets.
+        let mut found = 0;
+        for i in begin..end {
+            found += extensions::count_checked(self.paddings[i], self.padding_nb_frames[i] as usize)
+                .map_err(|_| INTERNAL_ERROR)?;
+        }
+        let place = |out: &mut [u8], at: usize| copy_frames(frames, out, at);
+        if found == 0 {
+            return emit(self.toc, sizes, out, self_delimited, pad, extensions, place);
+        }
+        let mut all = ExtensionList::with_capacity(extensions.len() + found)?;
+        for &ext in extensions {
+            all.push(ext);
+        }
+        for i in begin..end {
+            let mut iter = ExtensionIterator::new(self.paddings[i], self.padding_nb_frames[i] as usize);
+            while let Ok(Some(mut ext)) = iter.next() {
+                ext.frame += i - begin;
+                all.push(ext);
+            }
+        }
+        emit(self.toc, sizes, out, self_delimited, pad, all.as_slice(), place)
+    }
 }
 
 /// Pad the packet `data[..len]` in place to `new_len` bytes: libopus
 /// `opus_packet_pad` (repacketizer.c).
 ///
-/// The result is a code 3 packet with zero padding, unless one more byte is
-/// all that is needed. `data` must hold at least `new_len` bytes.
+/// The result is a code 3 packet whose padding holds the extensions the
+/// packet had, then zeros when it had none, unless one more byte is all
+/// that is needed. `data` must hold at least `new_len` bytes.
 ///
-/// Padding the packet already has is replaced by zeros: packet extensions
-/// are not ported (see the module documentation).
+/// Errors: "Invalid argument" when `len` is 0, `new_len` is below `len` or
+/// `data` is shorter than either; "Invalid packet"; "Internal error" when
+/// the padding of the packet holds invalid extensions.
 pub fn pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), &'static str> {
+    pad_with_extensions(data, len, new_len, true, &[]).map(|_| ())
+}
+
+/// libopus's internal `opus_packet_pad_impl`: rewrites the packet
+/// `data[..len]` in place, in at most `new_len` bytes, with `extensions`
+/// added before the extensions it has. With `pad` the packet takes exactly
+/// `new_len` bytes. Returns the new length, or 0 when `len == new_len`:
+/// then, as in libopus, the packet stays as it is and `extensions` are not
+/// added.
+///
+/// The frame numbers of `extensions` count the frames of this packet.
+/// Besides the errors of [`pad`], the extensions give those of
+/// [`extensions::generate`].
+///
+/// Without the feature `std`, a packet whose padding already holds
+/// extensions can only be rewritten when that padding is at most 1275
+/// bytes and the extensions are at most 32 in all; otherwise the result is
+/// "Internal error".
+pub fn pad_with_extensions(
+    data: &mut [u8],
+    len: usize,
+    new_len: usize,
+    pad: bool,
+    extensions: &[Extension],
+) -> Result<usize, &'static str> {
     if len < 1 || len > data.len() {
         return Err(BAD_ARG);
     }
     if len == new_len {
-        return Ok(());
+        return Ok(0);
     }
     if len > new_len || new_len > data.len() {
         return Err(BAD_ARG);
     }
+    // The checks of opus_repacketizer_cat: `parse` makes the same ones.
     let packet = parse(&data[..len], false)?;
+    let found = extensions::count_checked(packet.padding(&data[..len]), packet.count).map_err(|_| INTERNAL_ERROR)?;
+    if found == 0 {
+        return pad_in_place(data, new_len, &packet, pad, extensions);
+    }
+    pad_keeping_extensions(data, new_len, &packet, pad, extensions, found)
+}
+
+/// Rewrites the packet `packet` of `data` into `data[..new_len]` with the
+/// extensions `extensions` only.
+fn pad_in_place(
+    data: &mut [u8],
+    new_len: usize,
+    packet: &ParsedPacket,
+    pad: bool,
+    extensions: &[Extension],
+) -> Result<usize, &'static str> {
     let sizes = &packet.sizes[..packet.count];
-    let plan = layout(sizes, new_len, false, true)?;
+    let start = packet.payload_offset;
+    let payload: usize = sizes.iter().map(|&s| s as usize).sum();
     // libopus copies the packet and writes the new one over the old. Here
     // the frames, which are one block of bytes, move to their new place
     // first. The new header is built from the parsed sizes alone, so it can
     // overwrite what is left of the old one.
-    let payload: usize = sizes.iter().map(|&s| s as usize).sum();
-    data.copy_within(packet.payload_offset..packet.payload_offset + payload, plan.header_len);
-    write_header(packet.toc, sizes, &plan, false, data);
-    data[plan.header_len + payload..new_len].fill(0);
-    Ok(())
+    emit(packet.toc, sizes, &mut data[..new_len], false, pad, extensions, |out, at| {
+        out.copy_within(start..start + payload, at)
+    })
+}
+
+/// The most bytes of padding with extensions that `pad_with_extensions`
+/// copies without the feature `std`.
+#[cfg(not(feature = "std"))]
+const NO_STD_PADDING_COPY: usize = MAX_FRAME_BYTES;
+
+/// `pad_in_place` for a packet whose padding holds `found` extensions:
+/// they go into the new padding after `extensions`. They are read from a
+/// copy of the old padding, which the new packet may overwrite.
+#[inline(never)]
+fn pad_keeping_extensions(
+    data: &mut [u8],
+    new_len: usize,
+    packet: &ParsedPacket,
+    pad: bool,
+    extensions: &[Extension],
+    found: usize,
+) -> Result<usize, &'static str> {
+    let old = packet.padding(data);
+    #[cfg(feature = "std")]
+    let owned = old.to_vec();
+    #[cfg(feature = "std")]
+    let copy: &[u8] = &owned;
+    #[cfg(not(feature = "std"))]
+    let mut buf = [0u8; NO_STD_PADDING_COPY];
+    #[cfg(not(feature = "std"))]
+    let copy = {
+        let n = old.len();
+        buf.get_mut(..n).ok_or(INTERNAL_ERROR)?.copy_from_slice(old);
+        &buf[..n]
+    };
+    let mut all = ExtensionList::with_capacity(extensions.len() + found)?;
+    for &ext in extensions {
+        all.push(ext);
+    }
+    let mut iter = ExtensionIterator::new(copy, packet.count);
+    while let Ok(Some(ext)) = iter.next() {
+        all.push(ext);
+    }
+    pad_in_place(data, new_len, packet, pad, all.as_slice())
+}
+
+/// Remove the padding and the extensions of the packet `data[..len]` in
+/// place, and write it in its shortest form. Returns the new length.
+/// libopus `opus_packet_unpad` (repacketizer.c).
+///
+/// Errors: "Invalid argument" when `len` is 0 or above `data.len()`, and
+/// "Invalid packet".
+pub fn unpad(data: &mut [u8], len: usize) -> Result<usize, &'static str> {
+    if len < 1 || len > data.len() {
+        return Err(BAD_ARG);
+    }
+    let packet = parse(&data[..len], false)?;
+    pad_in_place(data, len, &packet, false, &[])
 }
 
 /// Pad the multistream packet `data[..len]` of `nb_streams` streams in place
 /// to `new_len` bytes: libopus `opus_multistream_packet_pad`
-/// (repacketizer.c). The padding goes into the last stream.
+/// (repacketizer.c). The padding goes into the last stream, which keeps its
+/// extensions as with [`pad`].
 pub fn multistream_pad(
     data: &mut [u8],
     len: usize,
@@ -654,6 +991,39 @@ pub fn multistream_pad(
     }
     let last_len = len.checked_sub(start).ok_or(INVALID_PACKET)?;
     pad(&mut data[start..], last_len, last_len + amount)
+}
+
+/// Remove the padding and the extensions of every stream of the
+/// multistream packet `data[..len]` of `nb_streams` streams, in place.
+/// Returns the new length. libopus `opus_multistream_packet_unpad`
+/// (repacketizer.c).
+pub fn multistream_unpad(data: &mut [u8], len: usize, nb_streams: usize) -> Result<usize, &'static str> {
+    if len < 1 || len > data.len() {
+        return Err(BAD_ARG);
+    }
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    for s in 0..nb_streams {
+        let self_delimited = s != nb_streams - 1;
+        if src >= len {
+            return Err(INVALID_PACKET);
+        }
+        let packet = parse(&data[src..len], self_delimited)?;
+        // The checks of opus_repacketizer_cat_impl on this stream.
+        let mut rp = Repacketizer::new();
+        rp.cat_impl(&data[src..src + packet.packet_offset], self_delimited)?;
+        let sizes = &packet.sizes[..packet.count];
+        let start = src - dst + packet.payload_offset;
+        let payload: usize = sizes.iter().map(|&s| s as usize).sum();
+        // The stream moves to `dst`, which is never after `src`; the output
+        // is never longer than the input, so the room left is enough.
+        let written = emit(packet.toc, sizes, &mut data[dst..len], self_delimited, false, &[], |out, at| {
+            out.copy_within(start..start + payload, at)
+        })?;
+        dst += written;
+        src += packet.packet_offset;
+    }
+    Ok(dst)
 }
 
 #[cfg(all(test, feature = "std"))]

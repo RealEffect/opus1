@@ -2382,6 +2382,10 @@ pub struct CeltEncoder {
     /// libopus `st->disable_pf` (`CELT_SET_PREDICTION` 0 or 1): no pitch
     /// pre-filter.
     disable_pf: bool,
+    /// libopus `st->disable_inv` (`OPUS_SET_PHASE_INVERSION_DISABLED`):
+    /// intensity stereo never inverts the sign of the second channel. A
+    /// reset keeps it.
+    disable_inv: bool,
     /// libopus `st->force_intra` (`CELT_SET_PREDICTION` 0): the coarse
     /// energy of every frame is coded without prediction from the frame
     /// before.
@@ -4280,6 +4284,7 @@ impl CeltEncoder {
             energy_mask: None,
             stream_channels: channels,
             disable_pf: false,
+            disable_inv: false,
             force_intra: false,
             energy_error: FixedVec::from_value(0.0, nb_x_ch),
             rotations: crate::pvq::RotationCache::new(),
@@ -4472,6 +4477,16 @@ impl CeltEncoder {
     /// and it keeps every band from band 2 up at least 80 dB below band 0.
     pub fn set_lfe(&mut self, lfe: bool) {
         self.lfe = lfe;
+    }
+    /// Phase inversion disabling (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`,
+    /// celt_encoder.c). With `true`, intensity stereo codes both channels
+    /// of a band with the same sign. The default is `false`.
+    pub fn set_phase_inversion_disabled(&mut self, disabled: bool) {
+        self.disable_inv = disabled;
+    }
+    /// The value set with `set_phase_inversion_disabled`.
+    pub fn phase_inversion_disabled(&self) -> bool {
+        self.disable_inv
     }
     /// Surround masking input (libopus `OPUS_SET_ENERGY_MASK`).
     ///
@@ -5386,7 +5401,7 @@ impl CeltEncoder {
             coded_bands,
             &mut seed,
             self.complexity,
-            false,
+            self.disable_inv,
             &mut self.rotations,
         );
 
@@ -5562,6 +5577,10 @@ enum FrameType {
     /// A lost frame, concealed with deep PLC (feature `deep-plc`).
     #[cfg(feature = "deep-plc")]
     PlcNeural,
+    /// A lost frame, concealed with deep PLC from DRED features (feature
+    /// `dred`).
+    #[cfg(feature = "dred")]
+    Dred,
 }
 
 /// The samples of `plc_pcm` (libopus `PLC_UPDATE_SAMPLES`): four frames of
@@ -7489,6 +7508,13 @@ pub struct CeltDecoder {
     /// `OPUS_SET_COMPLEXITY`). From 5, a lost CELT-only frame is concealed
     /// with deep PLC when the decoder has it. A reset does not change it.
     complexity: i32,
+    /// libopus `disable_inv` (`OPUS_SET_PHASE_INVERSION_DISABLED`): decode
+    /// intensity stereo bands without the sign inversion of the second
+    /// channel. It starts `true` for a one-channel decoder, which mixes a
+    /// stereo stream down and where the inversion would cancel in the mix,
+    /// and `false` for two channels (celt_decoder.c:261). A reset does not
+    /// change it.
+    disable_inv: bool,
 
     // Everything below is cleared by `reset_state`.
     rng: u32,
@@ -7506,7 +7532,13 @@ pub struct CeltDecoder {
     /// start and after a noise-concealed frame, and cleared once two frames
     /// in a row have been decoded (libopus `skip_plc`).
     skip_plc: bool,
+    /// The post-filter period of the last frame (libopus
+    /// `postfilter_period`): 0 when the frame switched the filter off, as
+    /// in libopus. The comb filter treats any period below 15 as 15
+    /// (`COMBFILTER_MINPERIOD`). `OPUS_GET_PITCH` returns this value.
     prefilter_period: usize,
+    /// The post-filter period of the frame before (libopus
+    /// `postfilter_period_old`).
     prefilter_period_old: usize,
     prefilter_gain: f32,
     prefilter_gain_old: f32,
@@ -7595,6 +7627,7 @@ impl CeltDecoder {
             start_band: 0,
             end_band: mode.eff_ebands,
             complexity: 0,
+            disable_inv: channels == 1,
 
             rng: 0,
             last_pitch_index: 0,
@@ -7602,8 +7635,8 @@ impl CeltDecoder {
             plc_duration: 0,
             last_frame_type: FrameType::None,
             skip_plc: true,
-            prefilter_period: COMBFILTER_MINPERIOD,
-            prefilter_period_old: COMBFILTER_MINPERIOD,
+            prefilter_period: 0,
+            prefilter_period_old: 0,
             prefilter_gain: 0.0,
             prefilter_gain_old: 0.0,
             prefilter_tapset: 0,
@@ -7651,8 +7684,8 @@ impl CeltDecoder {
         self.plc_duration = 0;
         self.last_frame_type = FrameType::None;
         self.skip_plc = true;
-        self.prefilter_period = COMBFILTER_MINPERIOD;
-        self.prefilter_period_old = COMBFILTER_MINPERIOD;
+        self.prefilter_period = 0;
+        self.prefilter_period_old = 0;
         self.prefilter_gain = 0.0;
         self.prefilter_gain_old = 0.0;
         self.prefilter_tapset = 0;
@@ -7690,6 +7723,26 @@ impl CeltDecoder {
     /// The complexity set with `set_complexity` (0 at the start).
     pub fn complexity(&self) -> i32 {
         self.complexity
+    }
+
+    /// libopus `OPUS_GET_PITCH` on the CELT decoder: the post-filter period
+    /// of the last frame (`postfilter_period`), 0 when it had none.
+    pub fn pitch(&self) -> i32 {
+        self.prefilter_period as i32
+    }
+
+    /// Phase inversion disabling (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`
+    /// on the CELT decoder). With `true`, the second channel of an
+    /// intensity stereo band is not inverted, even when the packet codes
+    /// the inversion. A reset keeps the value.
+    pub fn set_phase_inversion_disabled(&mut self, disabled: bool) {
+        self.disable_inv = disabled;
+    }
+
+    /// The value of `set_phase_inversion_disabled`: `true` at the start
+    /// for one output channel, `false` for two.
+    pub fn phase_inversion_disabled(&self) -> bool {
+        self.disable_inv
     }
 
     /// Set how many channels the next packets carry (libopus
@@ -7953,7 +8006,8 @@ impl CeltDecoder {
             rc.nbits_total += tell - rc.tell();
         }
 
-        let mut pitch_index = COMBFILTER_MINPERIOD;
+        // C `postfilter_pitch`: 0 when the frame has no post-filter.
+        let mut pitch_index = 0;
         let mut gain1 = 0.0f32;
         let mut prefilter_tapset = 0;
 
@@ -8167,9 +8221,7 @@ impl CeltDecoder {
             lm as i32,
             coded_bands,
             true,
-            // libopus `disable_inv`: a one-channel decoder mixes a stereo
-            // stream down, and phase inversion would cancel in the mix.
-            channels == 1,
+            self.disable_inv,
             &mut self.rng,
         );
         let mut anti_collapse_on = false;
@@ -8220,6 +8272,10 @@ impl CeltDecoder {
         }
         self.synthesis(c, lm, is_transient, start_band, end_band, silence);
 
+        // C 1538-1539. The comb filter limits the periods itself; these
+        // lines keep the stored values those of libopus.
+        self.prefilter_period = self.prefilter_period.max(COMBFILTER_MINPERIOD);
+        self.prefilter_period_old = self.prefilter_period_old.max(COMBFILTER_MINPERIOD);
         self.postfilter(frame_size, lm, pitch_index, gain1, prefilter_tapset);
         self.prefilter_period_old = self.prefilter_period;
         self.prefilter_gain_old = self.prefilter_gain;
@@ -8580,7 +8636,11 @@ impl CeltDecoder {
     /// Whether the last frame was concealed with deep PLC.
     #[inline]
     fn last_frame_neural(&self) -> bool {
-        #[cfg(feature = "deep-plc")]
+        #[cfg(feature = "dred")]
+        {
+            self.last_frame_type == FrameType::PlcNeural || self.last_frame_type == FrameType::Dred
+        }
+        #[cfg(all(feature = "deep-plc", not(feature = "dred")))]
         {
             self.last_frame_type == FrameType::PlcNeural
         }
@@ -8613,18 +8673,24 @@ impl CeltDecoder {
         // libopus celt_decoder.c:726-731: deep PLC takes over from the
         // other two methods, also from noise between 100 and 200 ms of
         // loss.
+        //
+        // With the feature `dred`, queued DRED features take over whatever
+        // the complexity and the length of the loss (libopus
+        // celt_decoder.c:731-734, `FRAME_DRED`).
         #[cfg(feature = "deep-plc")]
-        let mut neural = match deep_plc {
-            Some(p)
-                if start == 0
-                    && p.models.is_some()
-                    && self.complexity >= 5
-                    && self.plc_duration < 80
-                    && !self.skip_plc =>
-            {
-                Some(p)
+        let (mut neural, dred_frame) = match deep_plc {
+            Some(p) if start == 0 && p.models.is_some() => {
+                #[cfg(feature = "dred")]
+                let dred = p.state.fec_fill_pos() > p.state.fec_cursor().0;
+                #[cfg(not(feature = "dred"))]
+                let dred = false;
+                if dred || (self.complexity >= 5 && self.plc_duration < 80 && !self.skip_plc) {
+                    (Some(p), dred)
+                } else {
+                    (None, false)
+                }
             }
-            _ => None,
+            _ => (None, false),
         };
         #[cfg(feature = "deep-plc")]
         let curr_neural = neural.is_some();
@@ -8670,7 +8736,10 @@ impl CeltDecoder {
 
             self.synthesis(channels, lm, false, start, eff_end, false);
 
-            // Run the post-filter with the last parameters.
+            // Run the post-filter with the last parameters. C 790-791 first
+            // raise the periods to at least 15.
+            self.prefilter_period = self.prefilter_period.max(COMBFILTER_MINPERIOD);
+            self.prefilter_period_old = self.prefilter_period_old.max(COMBFILTER_MINPERIOD);
             self.postfilter(
                 n,
                 lm,
@@ -8853,6 +8922,17 @@ impl CeltDecoder {
         #[cfg(feature = "deep-plc")]
         if curr_neural {
             self.last_frame_type = FrameType::PlcNeural;
+        }
+        // A frame made from DRED features starts the counting of the loss
+        // anew.
+        #[cfg(feature = "deep-plc")]
+        if dred_frame {
+            self.plc_duration = 0;
+            self.skip_plc = false;
+            #[cfg(feature = "dred")]
+            {
+                self.last_frame_type = FrameType::Dred;
+            }
         }
     }
 

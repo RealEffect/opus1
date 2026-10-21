@@ -33,12 +33,13 @@
 //!   later encode call with a number that is no duration fails.
 //!   [`MultistreamEncoder::set_expert_frame_duration`] takes a
 //!   [`FrameDuration`], which holds only the numbers libopus accepts.
-//! - **D5, controls.** Missing at the multistream level are the forced
-//!   channel count and the switches for prediction and phase inversion.
-//!   [`OpusEncoder`] has the forced channel count and the prediction
-//!   switch; they can be set on each stream through
-//!   [`MultistreamEncoder::stream_encoder_mut`]. It has no switch for
-//!   phase inversion.
+//! - **D5, controls (closed).** The forced channel count, the switches for
+//!   prediction and phase inversion, the application and the voice ratio
+//!   were missing at the multistream level. They are now forwarded as
+//!   libopus forwards them: a setter goes to one stream after the other
+//!   and stops at the first stream that refuses the value, and a getter
+//!   reads the first stream. `OPUS_GET_IN_DTX` has no multistream request
+//!   in libopus; [`OpusEncoder::in_dtx`] of each stream tells it.
 //! - **D6, energy mask.** libopus gives each stream encoder a pointer to the
 //!   mask. Here the values are copied into the stream encoder.
 //!
@@ -283,9 +284,22 @@ impl MultistreamEncoder {
         self.lfe_stream
     }
 
-    /// The application the stream encoders were created for.
+    /// The application of the first stream. libopus
+    /// `OPUS_GET_APPLICATION`.
     pub fn application(&self) -> Application {
-        self.application
+        self.encoders.first().map_or(self.application, OpusEncoder::application)
+    }
+
+    /// Changes the application of every stream before the first frame.
+    /// libopus `OPUS_SET_APPLICATION`. See
+    /// [`OpusEncoder::set_application`]: after the first frame only the
+    /// current application is accepted.
+    pub fn set_application(&mut self, application: Application) -> Result<(), &'static str> {
+        for enc in &mut self.encoders {
+            enc.set_application(application)?;
+        }
+        self.application = application;
+        Ok(())
     }
 
     /// The sampling rate of the input in Hz.
@@ -359,6 +373,24 @@ impl MultistreamEncoder {
     /// duration of this encoder. Also checks that the input holds the
     /// `frame_size` samples per channel the caller passed. Returns the
     /// frame size in samples per channel.
+    /// Encodes one frame of interleaved 24-bit samples held in 32-bit
+    /// integers: libopus `opus_multistream_encode24`. Full scale is 2^23;
+    /// see [`OpusEncoder::encode24`]. `frame_size` and the errors are those
+    /// of [`encode`](Self::encode).
+    pub fn encode24(
+        &mut self,
+        pcm: &[i32],
+        frame_size: usize,
+        output: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        let selected = self.check_input(pcm.len(), frame_size)?;
+        let src = Interleaved {
+            pcm,
+            channels: self.layout.channels(),
+        };
+        self.encode_native(&src, selected, frame_size, output)
+    }
+
     fn check_input(&self, pcm_len: usize, frame_size: usize) -> Result<usize, &'static str> {
         let selected =
             crate::frame_size_select(frame_size, self.variable_duration, self.sampling_rate)
@@ -539,31 +571,23 @@ impl MultistreamEncoder {
                 &mut self.tmp[..curr_max],
                 analysis_pcm,
                 T::LSB_DEPTH,
+                T::FLOAT_API,
             )?;
 
             // The stream encoder can return more than one frame (a 60 ms
             // CELT packet is three 20 ms frames, a 120 ms one six) and can
             // pad its packet.
-            // Like the libopus repacketizer, take the frames out and write
-            // them anew: with the size of the last frame for every stream
-            // but the last, and padded to the full size for the last stream
-            // of a constant-bitrate packet.
-            let stream_packet = &self.tmp[..len];
-            let parsed = packet::parse(stream_packet, false)?;
-            let mut frames: [&[u8]; packet::MAX_FRAMES] = [&[]; packet::MAX_FRAMES];
-            for (slot, frame) in frames.iter_mut().zip(parsed.frames(stream_packet)) {
-                *slot = frame;
-            }
+            // As libopus does, pass it through the repacketizer, which
+            // writes the frames anew with the extensions of the padding:
+            // with the size of the last frame for every stream but the
+            // last, and padded to the full size for the last stream of a
+            // constant-bitrate packet.
+            let mut rp = packet::Repacketizer::new();
+            rp.cat(&self.tmp[..len])?;
             let room = output
                 .get_mut(tot_size..max_data_bytes)
                 .ok_or(BUFFER_TOO_SMALL)?;
-            let written = packet::write(
-                parsed.toc,
-                &frames[..parsed.count],
-                room,
-                !last,
-                !vbr && last,
-            )?;
+            let written = rp.out_range_ext(0, rp.nb_frames(), room, !last, !vbr && last, &[])?;
             tot_size += written;
         }
         Ok(tot_size)
@@ -833,6 +857,68 @@ impl MultistreamEncoder {
         for enc in &mut self.encoders {
             enc.set_force_mode(mode);
         }
+    }
+
+    /// Forces the number of coded channels of every stream. libopus
+    /// `OPUS_SET_FORCE_CHANNELS`. See [`OpusEncoder::set_force_channels`].
+    ///
+    /// As in libopus, the value goes to one stream after the other, the
+    /// coupled streams first, and the first stream that refuses it stops
+    /// the loop with its error. `Some(2)` is therefore set on the coupled
+    /// streams and refused by the first mono stream. `None` and `Some(1)`
+    /// suit every stream.
+    ///
+    /// In surround mode the encoder forces two channels on every coupled
+    /// stream on every frame, as libopus does.
+    pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), &'static str> {
+        for enc in &mut self.encoders {
+            enc.set_force_channels(channels)?;
+        }
+        Ok(())
+    }
+
+    /// The forced channel count of the first stream. libopus
+    /// `OPUS_GET_FORCE_CHANNELS`.
+    pub fn force_channels(&self) -> Option<usize> {
+        self.encoders.first().and_then(|enc| enc.force_channels())
+    }
+
+    /// Turns off prediction from earlier frames in every stream. libopus
+    /// `OPUS_SET_PREDICTION_DISABLED`. See
+    /// [`OpusEncoder::set_prediction_disabled`].
+    pub fn set_prediction_disabled(&mut self, disabled: bool) {
+        for enc in &mut self.encoders {
+            enc.set_prediction_disabled(disabled);
+        }
+    }
+
+    /// Whether prediction is disabled in the first stream. libopus
+    /// `OPUS_GET_PREDICTION_DISABLED`.
+    pub fn prediction_disabled(&self) -> bool {
+        self.encoders.first().is_some_and(|enc| enc.prediction_disabled())
+    }
+
+    /// Disables phase inversion in the intensity stereo of every stream.
+    /// libopus `OPUS_SET_PHASE_INVERSION_DISABLED`. See
+    /// [`OpusEncoder::set_phase_inversion_disabled`]. It changes only the
+    /// coupled streams; a mono stream has no intensity stereo.
+    pub fn set_phase_inversion_disabled(&mut self, disabled: bool) {
+        for enc in &mut self.encoders {
+            enc.set_phase_inversion_disabled(disabled);
+        }
+    }
+
+    /// Whether phase inversion is disabled in the first stream. libopus
+    /// `OPUS_GET_PHASE_INVERSION_DISABLED`.
+    pub fn phase_inversion_disabled(&self) -> bool {
+        self.encoders.first().is_some_and(|enc| enc.phase_inversion_disabled())
+    }
+
+    /// The voice ratio of the first stream, in percent, or -1. libopus
+    /// `OPUS_GET_VOICE_RATIO`; see [`OpusEncoder::voice_ratio`]. libopus
+    /// has no multistream `OPUS_SET_VOICE_RATIO`.
+    pub fn voice_ratio(&self) -> i32 {
+        self.encoders.first().map_or(-1, |enc| enc.voice_ratio())
     }
 
     // --- State ---
