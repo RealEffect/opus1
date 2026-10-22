@@ -766,7 +766,7 @@ fn multistream_output_is_one_decoder_per_stream() {
                             // Concealed and rebuilt frames are not
                             // soft-clipped, and keep the memory.
                             if with_packet && !fec {
-                                pcm_soft_clip(&mut buf, n, *stream_channels, memory);
+                                pcm_soft_clip(&mut buf[..n * stream_channels], *stream_channels, memory).unwrap();
                             }
                             to_i16(&buf[..n * stream_channels])
                         })

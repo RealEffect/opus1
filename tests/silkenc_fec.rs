@@ -10,9 +10,10 @@
 //! could not be recovered.
 
 mod silkenc_common;
+use std::num::NonZeroU32;
 use silkenc_common::*;
 
-use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 
 /// A change of settings before packet `at`.
 #[derive(Clone, Copy)]
@@ -58,9 +59,9 @@ impl Stream {
         let mut packets = Vec::new();
         for (i, chunk) in pcm.chunks_exact(self.frame * self.channels).enumerate() {
             for s in self.steps.iter().filter(|s| s.at == i) {
-                enc.set_inband_fec(s.fec);
-                enc.set_packet_loss_perc(s.loss).unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
+                enc.set_inband_fec(if s.fec { InbandFec::On } else { InbandFec::Off });
+                enc.set_packet_loss_perc(s.loss as u8).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(s.bitrate as u32).unwrap()));
             }
             let n = enc.encode(chunk, self.frame, &mut out).unwrap();
             packets.push(out[..n].to_vec());

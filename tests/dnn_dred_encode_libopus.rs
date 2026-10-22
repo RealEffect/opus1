@@ -29,12 +29,13 @@
 #[path = "dnn_plc_common/mod.rs"]
 mod common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use opus1::internals::dnn::dred::DRED_EXTENSION_ID;
 use opus1::multistream::MultistreamEncoder;
 use opus1::{
-    Application, Bandwidth, Bitrate, Channels, DredProcessing, ForcedMode, OpusDecoder, OpusDred,
-    OpusDredDecoder, OpusEncoder, SampleRate, packet,
+    Application, Bandwidth, Bitrate, Channels, DredProcessing, ForcedMode, InbandFec, OpusDecoder,
+    OpusDred, OpusDredDecoder, OpusEncoder, SampleRate, packet,
 };
 use opus1::packet::Framing;
 use std::ffi::CStr;
@@ -87,8 +88,6 @@ const OPUS_GET_DRED_DURATION: c_int = 4051;
 const OPUS_SET_FORCE_MODE: c_int = 11002;
 const OPUS_MULTISTREAM_GET_ENCODER_STATE: c_int = 5120;
 const OPUS_BANDWIDTH_WIDEBAND: c_int = 1103;
-const MODE_SILK_ONLY: c_int = 1000;
-const MODE_HYBRID: c_int = 1001;
 const MODE_CELT_ONLY: c_int = 1002;
 
 fn linked() {
@@ -159,14 +158,10 @@ impl CEnc {
     fn new(cfg: &Cfg) -> Self {
         linked();
         let mut err = 0;
-        let app = cfg.application as c_int;
+        let app = cfg.application.to_raw();
         let enc = unsafe { sys::opus_encoder_create(cfg.fs, cfg.channels as c_int, app, &mut err) };
         assert_eq!(err, 0);
-        let mode = match cfg.mode {
-            ForcedMode::SilkOnly => MODE_SILK_ONLY,
-            ForcedMode::Hybrid => MODE_HYBRID,
-            ForcedMode::CeltOnly => MODE_CELT_ONLY,
-        };
+        let mode = cfg.mode.to_raw();
         unsafe {
             assert_eq!(sys::opus_encoder_ctl(enc, OPUS_SET_BITRATE, cfg.bitrate), 0);
             assert_eq!(sys::opus_encoder_ctl(enc, OPUS_SET_VBR, cfg.vbr as c_int), 0);
@@ -204,17 +199,17 @@ fn opus1_encoder(cfg: &Cfg) -> OpusEncoder {
         cfg.application,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(cfg.bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(cfg.bitrate as u32).unwrap()));
     enc.set_vbr(cfg.vbr);
-    enc.set_complexity(cfg.complexity).unwrap();
-    enc.set_inband_fec(cfg.fec);
-    enc.set_packet_loss_perc(cfg.loss).unwrap();
-    enc.set_dred_duration(cfg.dred).unwrap();
+    enc.set_complexity(cfg.complexity as u8).unwrap();
+    enc.set_inband_fec(if cfg.fec { InbandFec::On } else { InbandFec::Off });
+    enc.set_packet_loss_perc(cfg.loss as u8).unwrap();
+    enc.set_dred_duration(cfg.dred as u8).unwrap();
     enc.set_force_mode(Some(cfg.mode));
     if cfg.mode == ForcedMode::SilkOnly {
         // Above wideband libopus codes Hybrid packets even when SILK-only
         // is forced.
-        enc.set_max_bandwidth(Bandwidth::Wideband).unwrap();
+        enc.set_max_bandwidth(Bandwidth::Wideband);
     }
     enc
 }
@@ -264,7 +259,7 @@ fn compare(cfg: &Cfg, seconds: usize) -> Counts {
         counts.same_dred += (da == db) as usize;
         counts.dred_bytes += db.as_ref().map_or(0, |d| d.1.len());
         if i == 0 {
-            assert_eq!(r.dred_duration(), cfg.dred);
+            assert_eq!(i32::from(r.dred_duration()), cfg.dred);
         }
     }
     counts
@@ -599,16 +594,20 @@ fn dred_duration_control_and_reset_as_libopus() {
     };
     let c = CEnc::new(&cfg);
     let mut r = opus1_encoder(&cfg);
-    for v in [-1, 0, 1, 50, 104, 105, 1000] {
+    for v in [-1, 0, 1, 50, 104, 105, 255, 1000] {
         let cr = unsafe { sys::opus_encoder_ctl(c.0, OPUS_SET_DRED_DURATION, v) };
-        assert_eq!(cr == 0, r.set_dred_duration(v).is_ok(), "{v}");
-        let mut got = -1;
+        // A value that opus1's `u8` cannot hold is refused by libopus.
+        match u8::try_from(v) {
+            Ok(frames) => assert_eq!(cr == 0, r.set_dred_duration(frames).is_ok(), "{v}"),
+            Err(_) => assert_ne!(cr, 0, "{v}"),
+        }
+        let mut got: c_int = -1;
         unsafe { sys::opus_encoder_ctl(c.0, OPUS_GET_DRED_DURATION, &mut got as *mut c_int) };
-        assert_eq!(got, r.dred_duration(), "{v}");
+        assert_eq!(got, i32::from(r.dred_duration()), "{v}");
     }
     unsafe { sys::opus_encoder_ctl(c.0, OPUS_RESET_STATE) };
     r.reset_state();
-    let mut got = -1;
+    let mut got: c_int = -1;
     unsafe { sys::opus_encoder_ctl(c.0, OPUS_GET_DRED_DURATION, &mut got as *mut c_int) };
     assert_eq!((got, r.dred_duration()), (0, 0));
 
@@ -676,7 +675,7 @@ fn multistream_packets_with_dred_on_the_streams_equal_libopus() {
         // setting on the multistream encoder.
         assert_ne!(sys::opus_multistream_encoder_ctl(c, OPUS_SET_DRED_DURATION, 50), 0);
     }
-    r.set_bitrate(Bitrate::BitsPerSecond(96000)).unwrap();
+    r.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(96000).unwrap()));
     r.set_complexity(5).unwrap();
     r.set_packet_loss_perc(20).unwrap();
     for s in 0..streams {

@@ -117,8 +117,8 @@ The encoder hands the result to the CELT encoder once per frame, before any CELT
 **Controls.**
 
 - `set_signal(Signal)` (`OPUS_SET_SIGNAL`): `Signal::Voice` or `Signal::Music` replaces the speech estimate of the analysis. The analysis still runs for the other uses.
-- `set_lsb_depth(i32)` (`OPUS_SET_LSB_DEPTH`): the precision of the input, 8 to 24 bits, default 24. It sets the silence threshold and the noise floor of the bandwidth detection and of CELT. `encode_i16` codes with at most 16.
-- `set_inband_fec_mode(InbandFec::OnUnlessMusic)` (`OPUS_SET_INBAND_FEC` 2): FEC that does not move the encoder to SILK when the analysis is confident the input is music.
+- `set_lsb_depth(u8)` (`OPUS_SET_LSB_DEPTH`): the precision of the input, 8 to 24 bits, default 24. It sets the silence threshold and the noise floor of the bandwidth detection and of CELT. `encode_i16` codes with at most 16.
+- `set_inband_fec(InbandFec::OnUnlessMusic)` (`OPUS_SET_INBAND_FEC` 2): FEC that does not move the encoder to SILK when the analysis is confident the input is music.
 - `opus1::internals::analysis::set_analysis_gate` is not part of the public interface. Tests use it to run the analysis at complexity 10 only, as the fixed-point build of libopus does, or never.
 
 **Exactness and cost.** On 64-bit ARM the analysis gives the results of the Homebrew build of libopus 1.6.1 in every field of every frame. It rounds as clang at `-Os` does: the same products are fused into one rounding, and the same sums run in the same order. So CELT-only packets at complexity 7 to 10 are libopus's byte for byte. Builds of libopus at `-O2` differ from the Homebrew build in the last bits of some results ([Differences from libopus](10-differences-from-libopus.md#what-the-figures-were-measured-against)). The busiest loops have NEON versions (`src/analysis/neon.rs`) that give the same bits as the scalar code. One 20 ms call takes about 2.9 µs at 48 kHz on Apple M4 Pro, 11.6 µs on a Cortex-A76 and 34.7 µs on a Cortex-A55, 0.27 to 0.40 of the time of libopus's analysis ([Performance](08-performance.md#the-speech-and-music-analysis)).
@@ -176,6 +176,7 @@ The bandwidth and FEC decisions use the equivalent rate for the mode just chosen
 The first example below shows the switch for a 16 kHz `Voip` encoder at complexity 6. From complexity 7 on, the speech and music analysis estimates `voice_est` from the input instead, and would take the tone of the example for music. At 64 100 b/s the equivalent rate is 61 536 b/s, below the threshold, and the packet is SILK. At 64 200 b/s it is 61 632 b/s, and the packet is CELT-only.
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 // The top five bits of the TOC byte are the configuration number
@@ -196,7 +197,7 @@ let mut packet = vec![0u8; 1276];
 for (bitrate, expected) in [(64_100, "SILK-only"), (64_200, "CELT-only")] {
     let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     encoder.set_complexity(6).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     let len = encoder.encode(&pcm, 320, &mut packet).unwrap();
     assert!(len > 1);
     assert_eq!(mode_of(packet[0]), expected);
@@ -231,7 +232,7 @@ The search starts at fullband and steps down until the rate reaches the threshol
 6. The bandwidth does not exceed half the API rate: 8 kHz input is narrowband, 12 kHz mediumband, 16 kHz wideband, 24 kHz super-wideband.
 7. Without a bandwidth set with `set_bandwidth`, the bandwidth the analysis detected limits the result. The analysis band 0 to 12 is narrowband, 13 and 14 mediumband, 15 and 16 wideband, 17 and 18 super-wideband, 19 and 20 fullband. The limit is never below a minimum for the equivalent rate per coded channel. For CELT-only packets the minimum is narrowband up to 18 000 b/s and mediumband up to 24 000 b/s. For all packets it is wideband up to 30 000 b/s, super-wideband up to 44 000 b/s and fullband above. So SILK and Hybrid packets do not go below wideband for it.
 
-**In-band FEC** (`decide_fec`). FEC is off when it was not turned on (`set_inband_fec(true)` or `set_inband_fec_mode`), when the packet loss is 0 %, or for CELT-only packets. Otherwise the equivalent rate must exceed a threshold for the bandwidth (`FEC_THRESHOLDS`):
+**In-band FEC** (`decide_fec`). FEC is off when it was not turned on (`set_inband_fec` with `InbandFec::On` or `InbandFec::OnUnlessMusic`), when the packet loss is 0 %, or for CELT-only packets. Otherwise the equivalent rate must exceed a threshold for the bandwidth (`FEC_THRESHOLDS`):
 
 | Bandwidth | NB | MB | WB | SWB | FB |
 |---|---:|---:|---:|---:|---:|
@@ -678,33 +679,32 @@ In a transient frame, a band of a short block can end up with no pulses at all. 
 
 ## 4. Settings and what they change
 
-All settings take effect with the next call of `encode`. Each one is a method of `OpusEncoder`, and most have a getter of the same name without `set_`. A setter checks its value as the libopus control does. One that can refuse a value returns a `Result`, and after an error the setting keeps its old value.
+All settings take effect with the next call of `encode`. Each one is a method of `OpusEncoder`, and most have a getter of the same name without `set_`. The type of a setting holds only values that make sense: for example the complexity is a `u8`, and an automatic choice is `None` or an `Auto` value. A setter checks its value as the libopus control does. One that can still refuse a value returns a `Result`, and after an error the setting keeps its old value.
 
 | Setting | libopus control | Default | What it changes |
 |---|---|---|---|
-| `set_bitrate(Bitrate)` | `OPUS_SET_BITRATE` | `Bitrate::Auto` (60 × rate / frame size + rate × channels b/s) | The target bitrate: `Bitrate::BitsPerSecond(n)`, `Bitrate::Auto` (`OPUS_AUTO`) or `Bitrate::Max` (`OPUS_BITRATE_MAX`). `n` of 0 or less is an error; other values are raised to at least 500 b/s and limited to at most 750 000 b/s per channel. It drives the channel, mode, bandwidth and FEC decisions and the SILK and CELT rates. The output buffer can lower it (1.2). `bitrate_setting()` returns the setting, `bitrate()` the rate in b/s (`OPUS_GET_BITRATE`). |
+| `set_bitrate(Bitrate)` | `OPUS_SET_BITRATE` | `Bitrate::Auto` (60 × rate / frame size + rate × channels b/s) | The target bitrate: `Bitrate::BitsPerSecond(n)` with `n` a `NonZeroU32`, `Bitrate::Auto` (`OPUS_AUTO`) or `Bitrate::Max` (`OPUS_BITRATE_MAX`). `n` is raised to at least 500 b/s and limited to at most 750 000 b/s per channel, so the call never fails. It drives the channel, mode, bandwidth and FEC decisions and the SILK and CELT rates. The output buffer can lower it (1.2). `bitrate_setting()` returns the setting, `bitrate()` the rate in b/s (`OPUS_GET_BITRATE`). |
 | `set_vbr(bool)` | `OPUS_SET_VBR` | `true` | CBR (`false`): every packet has the same size and is padded to it. In Hybrid, SILK still runs VBR with a cap and CELT fills the rest. VBR (`true`): see the next row. |
 | `set_vbr_constraint(bool)` | `OPUS_SET_VBR_CONSTRAINT` | `true` | With VBR, CELT-only packets use constrained VBR, which stays close to the bitrate; `false` makes it unconstrained. Hybrid packets always use unconstrained VBR, as in libopus. |
-| `set_complexity(i32)` | `OPUS_SET_COMPLEXITY` | 9 | 0..=10; other values are an error. More analysis for better quality at the same bitrate (tables 2.12 and 3.11). It also raises the equivalent rate. From 7 on, the speech and music analysis runs for input at 16 to 48 kHz (1.3). |
+| `set_complexity(u8)` | `OPUS_SET_COMPLEXITY` | 9 | 0..=10; a value above 10 is an error. More analysis for better quality at the same bitrate (tables 2.12 and 3.11). It also raises the equivalent rate. From 7 on, the speech and music analysis runs for input at 16 to 48 kHz (1.3). |
 | `Application` (argument of `OpusEncoder::new`) | `application` of `opus_encoder_create`, `OPUS_SET_APPLICATION` | none | `Voip`: voice estimate 115 without the analysis, CELT threshold +8000 b/s, high-pass filter with a moving cutoff, SILK input from the integer filter at 8 to 24 kHz and from the float filter at 48 kHz. `Audio`: voice estimate 48 without the analysis and at most 115 with it, a 3 Hz filter that removes the constant (direct current, DC) offset. `RestrictedLowDelay`: always CELT-only, no 4 ms look-ahead. `set_application` changes it before the first frame, as `OPUS_SET_APPLICATION` does; after the first frame only the current application is accepted, until `reset_state`. `application()` reads it. |
 | `set_force_mode(Option<ForcedMode>)` | `OPUS_SET_FORCE_MODE` (in libopus's private header `opus_private.h`) | `None` | Asks for SILK-only, Hybrid or CELT-only. The rules that keep a packet valid still apply (1.4): frames under 10 ms are CELT-only, SILK above wideband becomes Hybrid, Hybrid at wideband or below becomes SILK-only. |
-| `set_bandwidth(Bandwidth)` | `OPUS_SET_BANDWIDTH` | `Bandwidth::Auto` | Codes this bandwidth instead of the automatic one. It never exceeds half the API rate. CELT codes mediumband as wideband. A running SILK encoder moves to it one step at a time. |
-| `set_max_bandwidth(Bandwidth)` | `OPUS_SET_MAX_BANDWIDTH` | `Bandwidth::Fullband` | The widest bandwidth the automatic choice may take. `Bandwidth::Auto` is an error. |
+| `set_bandwidth(Option<Bandwidth>)` | `OPUS_SET_BANDWIDTH` | `None` (`OPUS_AUTO`) | Codes this bandwidth instead of the automatic one. `bandwidth_setting()` reads it. It never exceeds half the API rate. CELT codes mediumband as wideband. A running SILK encoder moves to it one step at a time. |
+| `set_max_bandwidth(Bandwidth)` | `OPUS_SET_MAX_BANDWIDTH` | `Bandwidth::Fullband` | The widest bandwidth the automatic choice may take. |
 | `set_force_channels(Option<Channels>)` | `OPUS_SET_FORCE_CHANNELS` | `None` | Codes mono or stereo instead of the automatic choice. A mono encoder codes mono whatever is set (libopus refuses stereo there). A packet made of several frames (1.6) that changes to mono sets it to `Some(Channels::Mono)` itself, as libopus does. |
-| `set_inband_fec(bool)` | `OPUS_SET_INBAND_FEC` 0 and 1 | `false` | Allows LBRR copies in SILK and Hybrid packets (1.4, 2.9). With packet loss above the voice-dependent limit it also makes the encoder prefer SILK. |
-| `set_inband_fec_mode(InbandFec)` | `OPUS_SET_INBAND_FEC` 0, 1 and 2 | `InbandFec::Off` | `On` is `set_inband_fec(true)`. `OnUnlessMusic` does not move the encoder to SILK for FEC when the speech estimate is 25 or less (1.4). |
+| `set_inband_fec(InbandFec)` | `OPUS_SET_INBAND_FEC` 0, 1 and 2 | `InbandFec::Off` | `On` allows LBRR copies in SILK and Hybrid packets (1.4, 2.9). With packet loss above the voice-dependent limit it also makes the encoder prefer SILK. `OnUnlessMusic` does the same, but does not move the encoder to SILK for FEC when the speech estimate is 25 or less (1.4). |
 | `set_signal(Signal)` | `OPUS_SET_SIGNAL` | `Signal::Auto` | `Voice` and `Music` replace the speech estimate of the analysis with 127 and 0 (1.3, 1.4). |
-| `set_lsb_depth(i32)` | `OPUS_SET_LSB_DEPTH` | 24 | The input precision, 8..=24 bits; other values are an error. It sets the digital silence threshold and the noise floor of the analysis and of CELT. `encode_i16` uses at most 16 (1.1). |
+| `set_lsb_depth(u8)` | `OPUS_SET_LSB_DEPTH` | 24 | The input precision, 8..=24 bits; other values are an error. It sets the digital silence threshold and the noise floor of the analysis and of CELT. `encode_i16` uses at most 16 (1.1). |
 | `set_dtx(bool)` | `OPUS_SET_DTX` | `false` | Discontinuous transmission (1.7). `in_dtx()` is `OPUS_GET_IN_DTX`. |
-| `set_packet_loss_perc(i32)` | `OPUS_SET_PACKET_LOSS_PERC` | 0 | The expected packet loss, 0..=100; other values are an error. FEC needs it above 0. It lowers the equivalent rate, raises the LTP scaling, sets the LBRR gain step, and makes CELT code intra energy more often. |
+| `set_packet_loss_perc(u8)` | `OPUS_SET_PACKET_LOSS_PERC` | 0 | The expected packet loss, 0..=100; a value above 100 is an error. FEC needs it above 0. It lowers the equivalent rate, raises the LTP scaling, sets the LBRR gain step, and makes CELT code intra energy more often. |
 | `set_lfe(bool)` | `OPUS_SET_LFE` (in libopus's `celt/celt.h`) | `false` | The encoder codes a low-frequency-effects channel of a surround stream: CELT-only, narrowband, only bands 0 and 1 matter. |
 | `encode_i16` (method) | `opus_encode` (16-bit input) | | Encodes 16-bit samples with an input precision of at most 16 bits. The packets are the same bytes as `encode` with `s as f32 / 32768.0` and `set_lsb_depth(16)`. |
 | `encode24` (method) | `opus_encode24` (24-bit input in 32-bit integers) | | Encodes 24-bit samples, full scale 2^23. Each sample is divided by 2^23 to a float (`INT24TORES`) and the frame is coded as float input with 24 bits of precision; values beyond 24 bits are not limited. The speech and music analysis reads the integers (`downmix_int24`). |
 | `set_expert_frame_duration(FrameDuration)` | `OPUS_SET_EXPERT_FRAME_DURATION` | `FrameDuration::Argument` | Each call codes one frame of the duration that is set; the `frame_size` of the call must be at least that long (libopus `frame_size_select`). The setting stays across a reset. |
 | `set_prediction_disabled(bool)` | `OPUS_SET_PREDICTION_DISABLED` | `false` | Every frame can be decoded on its own: SILK codes each packet as the first after a reset, CELT turns off the pre-filter and inter-frame energy prediction. Costs quality. |
 | `set_phase_inversion_disabled(bool)` | `OPUS_SET_PHASE_INVERSION_DISABLED` | `false` | With `true`, CELT's intensity stereo never inverts the sign of the second channel. libopus documents that this makes a mono downmix of the decoded stereo sound better and lowers stereo quality a little. It changes stereo CELT-only and Hybrid packets at bitrates that use intensity stereo. `reset_state` keeps it. |
-| `set_voice_ratio(i32)` | `OPUS_SET_VOICE_RATIO` (in `opus_private.h`) | -1 | The speech probability in percent, 0..=100, or -1 for none; other values are an error. The encoder replaces it with -1 on every frame that is not digital silence, and with the analysis's estimate when there is one and the signal type is automatic. `voice_ratio()` is `OPUS_GET_VOICE_RATIO`. |
-| `set_energy_mask(Option<&[f32]>)` | `OPUS_SET_ENERGY_MASK` (in `celt/celt.h`) | `None` | Used by the multistream encoder for surround ([05-multichannel.md](05-multichannel.md)): how much each band is masked by other channels. Lowers the bits of masked bands. |
+| `set_voice_ratio(Option<u8>)` | `OPUS_SET_VOICE_RATIO` (in `opus_private.h`) | `None` (libopus -1) | The speech probability in percent, 0..=100, or `None` when it is not known; a value above 100 is an error. The encoder replaces it with `None` on every frame that is not digital silence, and with the analysis's estimate when there is one and the signal type is automatic. `voice_ratio()` is `OPUS_GET_VOICE_RATIO`. |
+| `set_energy_mask(Option<&[f32]>)` | `OPUS_SET_ENERGY_MASK` (in `celt/celt.h`) | `None` | Used by the multistream encoder for surround ([05-multichannel.md](05-multichannel.md)): how much each band is masked by other channels, 21 values per channel. A slice of another length is an error. Lowers the bits of masked bands. |
 | `reset_state()` | `OPUS_RESET_STATE` | | Forgets the signal coded so far, also the state of the analysis. The settings stay, and so do the speech estimate of the last packet and the DTX setting of SILK, as in libopus. |
 | `final_range()` | `OPUS_GET_FINAL_RANGE` | | The range coder state after the last packet, for checking a decoder (see [04-decoder.md](04-decoder.md)). |
 | `lookahead()` | `OPUS_GET_LOOKAHEAD` | | The encoder delay in samples at the API rate. |
@@ -712,16 +712,17 @@ All settings take effect with the next call of `encode`. Each one is a method of
 This example sets several controls at once and checks the packet they give. The output is a mono SILK wideband packet of exactly 80 bytes: 32 kilobits per second (kb/s) for 20 ms is 640 bits.
 
 ```rust
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use std::num::NonZeroU32;
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 
 let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(32_000)).unwrap(); // OPUS_SET_BITRATE
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32_000).unwrap())); // OPUS_SET_BITRATE
 encoder.set_vbr(false); // OPUS_SET_VBR(0)
 encoder.set_complexity(5).unwrap(); // OPUS_SET_COMPLEXITY
-encoder.set_inband_fec(true); // OPUS_SET_INBAND_FEC(1)
+encoder.set_inband_fec(InbandFec::On); // OPUS_SET_INBAND_FEC(1)
 encoder.set_packet_loss_perc(10).unwrap(); // OPUS_SET_PACKET_LOSS_PERC
 encoder.set_force_mode(Some(ForcedMode::SilkOnly)); // OPUS_SET_FORCE_MODE
-encoder.set_bandwidth(Bandwidth::Wideband); // OPUS_SET_BANDWIDTH
+encoder.set_bandwidth(Some(Bandwidth::Wideband)); // OPUS_SET_BANDWIDTH
 encoder.set_force_channels(Some(Channels::Mono)); // OPUS_SET_FORCE_CHANNELS
 
 let pcm = vec![0.0f32; 960 * 2]; // 20 ms of stereo silence at 48 kHz
@@ -735,6 +736,7 @@ assert_eq!(packet[0] & 0x04, 0); // the stereo bit is clear: one coded channel
 This example shows that the two entry points give the same packets when the float encoder codes with the precision of 16-bit input:
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 let pcm16: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.07).sin() * 8000.0) as i16).collect();
@@ -742,8 +744,8 @@ let pcm32: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
 
 let mut a = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 let mut b = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-a.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
-b.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+a.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
+b.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
 b.set_lsb_depth(16).unwrap(); // what encode_i16 uses
 let (mut packet_a, mut packet_b) = (vec![0u8; 400], vec![0u8; 400]);
 let len_a = a.encode_i16(&pcm16, 320, &mut packet_a).unwrap();

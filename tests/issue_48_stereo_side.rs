@@ -12,11 +12,12 @@
 //! that loses most: content that isn't amplitude-panned (two independent
 //! voices) and anti-phase content, whose mid is silent.
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, Bandwidth, Bitrate, OpusDecoder, OpusEncoder, SampleRate, Signal};
+use opus1::{Application, Bandwidth, Bitrate, InbandFec, OpusDecoder, OpusEncoder, SampleRate, Signal};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -293,7 +294,7 @@ fn run(case: &Case) -> Measured {
         Application::Voip,
     )
     .unwrap();
-    rs_enc.set_bitrate(Bitrate::BitsPerSecond(case.bitrate)).unwrap();
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(case.bitrate as u32).unwrap()));
     rs_enc.set_vbr(!case.cbr);
     // A stereo stream, as libopus below: both encoders would otherwise code
     // the input as mono below ~18 kb/s.
@@ -304,9 +305,9 @@ fn run(case: &Case) -> Measured {
     // frequencies.
     rs_enc.set_signal(Signal::Voice);
     rs_enc.set_bandwidth(match case.bandwidth {
-        CBw::Wideband => Bandwidth::Wideband,
-        CBw::Superwideband => Bandwidth::Superwideband,
-        CBw::Fullband => Bandwidth::Fullband,
+        CBw::Wideband => Some(Bandwidth::Wideband),
+        CBw::Superwideband => Some(Bandwidth::Superwideband),
+        CBw::Fullband => Some(Bandwidth::Fullband),
         other => panic!("no such bandwidth in this test: {other:?}"),
     });
 
@@ -315,13 +316,13 @@ fn run(case: &Case) -> Measured {
     let mut c_enc = CEnc::new(sr as u32, CCh::Stereo, CApp::Voip).unwrap();
     c_enc.set_bitrate(CBitrate::Bits(case.bitrate)).unwrap();
     c_enc.set_vbr(!case.cbr).unwrap();
-    c_enc.set_complexity(rs_enc.complexity()).unwrap();
+    c_enc.set_complexity(i32::from(rs_enc.complexity())).unwrap();
     c_enc.set_bandwidth(case.bandwidth).unwrap();
     c_enc.set_signal(CSignal::Voice).unwrap();
     c_enc.set_force_channels(Some(CCh::Stereo)).unwrap();
     if let Some(loss) = case.fec_loss {
-        rs_enc.set_inband_fec(true);
-        rs_enc.set_packet_loss_perc(loss).unwrap();
+        rs_enc.set_inband_fec(InbandFec::On);
+        rs_enc.set_packet_loss_perc(loss as u8).unwrap();
         c_enc.set_inband_fec(true).unwrap();
         c_enc.set_packet_loss_perc(loss).unwrap();
     }
@@ -352,7 +353,7 @@ fn run(case: &Case) -> Measured {
             } else {
                 other
             };
-            rs_enc.set_bitrate(Bitrate::BitsPerSecond(rate)).unwrap();
+            rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(rate as u32).unwrap()));
             c_enc.set_bitrate(CBitrate::Bits(rate)).unwrap();
         }
         for (k, (dec, fec_dec, stream)) in streams.iter_mut().enumerate() {

@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 #[test]
@@ -6,7 +7,7 @@ fn test_48k_audio_roundtrip() {
 
     let mut enc =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap()));
     enc.set_complexity(0).unwrap();
     let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 

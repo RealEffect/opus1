@@ -30,7 +30,11 @@ pub const SILENT_CHANNEL: u8 = 255;
 pub const MAX_CHANNELS: usize = 255;
 
 /// How a layout was chosen. libopus `MappingType` (opus_private.h).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// More values may be added in a later release, for example when mapping
+/// family 3 (projection) is added. A `match` on it needs a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MappingType {
     /// No special handling: the generic constructor, and mapping families 0
     /// and 255. Mapping family 1 with 1 or 2 channels is also this type.

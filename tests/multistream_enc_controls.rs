@@ -12,12 +12,13 @@
 mod ms_support;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bitrate, ErrorKind, ForcedMode, SampleRate};
+use opus1::{Application, Bitrate, ErrorKind, ForcedMode, InbandFec, SampleRate};
 
 /// Whether a stream of the packet is stereo and in Hybrid mode. The final
 /// range of such a packet is not compared: see the note on the fault in
@@ -96,11 +97,9 @@ fn settings_change_in_a_running_surround_stream() {
         let name = case.name;
 
         // Bitrate up and down, in 20 ms frames.
-        enc.set_bitrate(Bitrate::BitsPerSecond(64_000 * channels))
-            .unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64_000 * channels as u32).unwrap()));
         let high = encode_checked(&mut enc, &mut dec, &pcm, &mut next, 20, 960, name);
-        enc.set_bitrate(Bitrate::BitsPerSecond(16_000 * channels))
-            .unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(16_000 * channels as u32).unwrap()));
         let low = encode_checked(&mut enc, &mut dec, &pcm, &mut next, 20, 960, name);
         assert!(
             mean_len(&low) < 0.4 * mean_len(&high),
@@ -118,8 +117,7 @@ fn settings_change_in_a_running_surround_stream() {
         for p in encode_checked(&mut enc, &mut dec, &pcm, &mut next, 10, 480, name) {
             assert_eq!(p.len() as i32, 16_000 * channels / 800, "{name}: CBR 10 ms");
         }
-        enc.set_bitrate(Bitrate::BitsPerSecond(40_000 * channels))
-            .unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(40_000 * channels as u32).unwrap()));
         for p in encode_checked(&mut enc, &mut dec, &pcm, &mut next, 4, 2880, name) {
             assert_eq!(
                 p.len() as i32,
@@ -138,32 +136,31 @@ fn settings_change_in_a_running_surround_stream() {
         // Back to variable bitrate, with the automatic and the maximum
         // bitrate.
         enc.set_vbr(true);
-        enc.set_bitrate(Bitrate::Auto).unwrap();
+        enc.set_bitrate(Bitrate::Auto);
         encode_checked(&mut enc, &mut dec, &pcm, &mut next, 10, 960, name);
-        enc.set_bitrate(Bitrate::Max).unwrap();
+        enc.set_bitrate(Bitrate::Max);
         let max = encode_checked(&mut enc, &mut dec, &pcm, &mut next, 5, 960, name);
         assert!(mean_len(&max) > mean_len(&high), "{name}: maximum bitrate");
 
         // Complexity, forward error correction and expected loss.
-        enc.set_bitrate(Bitrate::BitsPerSecond(24_000 * channels))
-            .unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24_000 * channels as u32).unwrap()));
         for complexity in [0, 10, 5] {
             enc.set_complexity(complexity).unwrap();
             assert_eq!(enc.complexity(), complexity);
             encode_checked(&mut enc, &mut dec, &pcm, &mut next, 8, 960, name);
         }
-        enc.set_inband_fec(true);
+        enc.set_inband_fec(InbandFec::On);
         enc.set_packet_loss_perc(20).unwrap();
-        assert!(enc.inband_fec());
+        assert_eq!(enc.inband_fec(), InbandFec::On);
         assert_eq!(enc.packet_loss_perc(), 20);
         encode_checked(&mut enc, &mut dec, &pcm, &mut next, 10, 960, name);
-        enc.set_inband_fec(false);
+        enc.set_inband_fec(InbandFec::Off);
         enc.set_packet_loss_perc(0).unwrap();
 
         // In surround mode the encoder sets the bandwidth of every stream
         // on every frame. A bandwidth the caller asks for does not hold.
-        enc.set_bandwidth(opus1::Bandwidth::Narrowband);
-        assert_eq!(enc.bandwidth(), opus1::Bandwidth::Narrowband);
+        enc.set_bandwidth(Some(opus1::Bandwidth::Narrowband));
+        assert_eq!(enc.bandwidth_setting(), Some(opus1::Bandwidth::Narrowband));
         let streams = enc.layout().streams();
         for p in encode_checked(&mut enc, &mut dec, &pcm, &mut next, 5, 960, name) {
             let parts = split_streams(&p, streams).unwrap();
@@ -176,14 +173,14 @@ fn settings_change_in_a_running_surround_stream() {
                 assert_eq!(toc(part.toc).bandwidth, want, "{name}: stream {s}");
             }
         }
-        enc.set_bandwidth(opus1::Bandwidth::Auto);
+        enc.set_bandwidth(None);
 
         // A reset in the middle of the stream.
         enc.reset_state();
         encode_checked(&mut enc, &mut dec, &pcm, &mut next, 10, 960, name);
         assert_eq!(
             enc.bitrate_setting(),
-            Bitrate::BitsPerSecond(24_000 * channels)
+            Bitrate::BitsPerSecond(NonZeroU32::new(24_000 * channels as u32).unwrap())
         );
     }
 }
@@ -201,13 +198,15 @@ fn bandwidth_settings_reach_the_streams_of_a_plain_layout() {
     let mut next = 0;
 
     // Each step: the opus1 setting, the same setting on the C encoder,
-    // and the bandwidth every stream must signal afterwards.
+    // and the bandwidth every stream must signal afterwards. `Some(None)`
+    // sets the automatic choice.
     use opus1::Bandwidth as Bw;
-    let steps: [(&str, Option<Bw>, Option<Bw>, TocBandwidth); 6] = [
+    type Step = (&'static str, Option<Option<Bw>>, Option<Bw>, TocBandwidth);
+    let steps: [Step; 6] = [
         ("default", None, None, TocBandwidth::Fb),
-        ("wideband", Some(Bw::Wideband), None, TocBandwidth::Wb),
-        ("narrowband", Some(Bw::Narrowband), None, TocBandwidth::Nb),
-        ("automatic again", Some(Bw::Auto), None, TocBandwidth::Fb),
+        ("wideband", Some(Some(Bw::Wideband)), None, TocBandwidth::Wb),
+        ("narrowband", Some(Some(Bw::Narrowband)), None, TocBandwidth::Nb),
+        ("automatic again", Some(None), None, TocBandwidth::Fb),
         (
             "at most super-wideband",
             None,
@@ -224,13 +223,13 @@ fn bandwidth_settings_reach_the_streams_of_a_plain_layout() {
     for (what, bandwidth, max_bandwidth, want) in steps {
         if let Some(bw) = bandwidth {
             rust.set_bandwidth(bw);
-            assert_eq!(rust.bandwidth(), bw);
-            c.ctl(sys::OPUS_SET_BANDWIDTH_REQUEST, bw as i32);
+            assert_eq!(rust.bandwidth_setting(), bw);
+            c.ctl(sys::OPUS_SET_BANDWIDTH_REQUEST, bw.map_or(OPUS_AUTO, Bw::to_raw));
         }
         if let Some(bw) = max_bandwidth {
-            rust.set_max_bandwidth(bw).unwrap();
+            rust.set_max_bandwidth(bw);
             assert_eq!(rust.max_bandwidth(), bw);
-            c.ctl(sys::OPUS_SET_MAX_BANDWIDTH_REQUEST, bw as i32);
+            c.ctl(sys::OPUS_SET_MAX_BANDWIDTH_REQUEST, bw.to_raw());
         }
         let start = next;
         let packets = encode_checked(&mut rust, &mut dec, &pcm, &mut next, 10, frame_size, what);
@@ -248,7 +247,8 @@ fn bandwidth_settings_reach_the_streams_of_a_plain_layout() {
             }
         }
     }
-    assert!(rust.set_max_bandwidth(Bw::Auto).is_err());
+    // libopus refuses `OPUS_AUTO` as a maximum. opus1's `Bandwidth` has
+    // no such value.
     assert_eq!(rust.max_bandwidth(), Bw::Fullband);
     assert_ne!(c.try_ctl(sys::OPUS_SET_MAX_BANDWIDTH_REQUEST, OPUS_AUTO), 0);
 }
@@ -307,14 +307,14 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
         let (mut rust, mut c) = encoders(case, 48_000, Application::Audio);
         let streams = c.streams;
         // The values of a new encoder are those of libopus.
-        assert_eq!(rust.complexity(), c.get(sys::OPUS_GET_COMPLEXITY_REQUEST));
+        assert_eq!(i32::from(rust.complexity()), c.get(sys::OPUS_GET_COMPLEXITY_REQUEST));
         assert_eq!(rust.vbr() as i32, c.get(sys::OPUS_GET_VBR_REQUEST));
         assert_eq!(
-            rust.inband_fec() as i32,
+            rust.inband_fec().to_raw(),
             c.get(sys::OPUS_GET_INBAND_FEC_REQUEST)
         );
         assert_eq!(
-            rust.packet_loss_perc(),
+            i32::from(rust.packet_loss_perc()),
             c.get(sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST)
         );
         assert_eq!(
@@ -323,13 +323,13 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
         );
         assert_eq!(rust.lookahead() as i32, c.lookahead());
         assert_eq!(rust.bitrate_setting(), Bitrate::Auto);
-        assert_eq!(rust.bandwidth(), opus1::Bandwidth::Auto);
+        assert_eq!(rust.bandwidth_setting(), None);
         assert_eq!(rust.max_bandwidth(), opus1::Bandwidth::Fullband);
         assert_eq!(rust.application(), Application::Audio);
 
         rust.set_complexity(3).unwrap();
         rust.set_vbr(false);
-        rust.set_inband_fec(true);
+        rust.set_inband_fec(InbandFec::On);
         rust.set_packet_loss_perc(17).unwrap();
         c.set_complexity(3)
             .set_vbr(false)
@@ -337,12 +337,12 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
             .set_packet_loss_perc(17);
         assert_eq!(rust.complexity(), 3);
         assert!(!rust.vbr());
-        assert!(rust.inband_fec());
+        assert_eq!(rust.inband_fec(), InbandFec::On);
         assert_eq!(rust.packet_loss_perc(), 17);
         for s in 0..streams {
             let enc = rust.stream_encoder(s).unwrap();
             assert_eq!(
-                enc.complexity(),
+                i32::from(enc.complexity()),
                 c.stream_get(s, sys::OPUS_GET_COMPLEXITY_REQUEST)
             );
             assert_eq!(
@@ -350,11 +350,11 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
                 c.stream_get(s, sys::OPUS_GET_VBR_REQUEST)
             );
             assert_eq!(
-                enc.inband_fec() as i32,
+                enc.inband_fec().to_raw(),
                 c.stream_get(s, sys::OPUS_GET_INBAND_FEC_REQUEST)
             );
             assert_eq!(
-                enc.packet_loss_perc(),
+                i32::from(enc.packet_loss_perc()),
                 c.stream_get(s, sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST)
             );
             assert_eq!(enc.channels().count(), if s < c.coupled { 2 } else { 1 });
@@ -378,30 +378,29 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
 fn out_of_range_settings_are_rejected_like_libopus() {
     let case = Case::family("5.1", 6, 1);
     let (mut rust, mut c) = encoders(&case, 48_000, Application::Audio);
-    for complexity in [-1000, -1, 0, 1, 9, 10, 11, 1000] {
+    // Values that opus1's `u8` cannot hold are refused by libopus.
+    for complexity in [-1000, -1, 0, 1, 9, 10, 11, 255, 1000] {
         let ok = c.try_ctl(sys::OPUS_SET_COMPLEXITY_REQUEST, complexity) == 0;
-        assert_eq!(
-            rust.set_complexity(complexity).is_ok(),
-            ok,
-            "complexity {complexity}"
-        );
-        assert_eq!(rust.complexity(), c.get(sys::OPUS_GET_COMPLEXITY_REQUEST));
+        match u8::try_from(complexity) {
+            Ok(v) => assert_eq!(rust.set_complexity(v).is_ok(), ok, "complexity {complexity}"),
+            Err(_) => assert!(!ok, "complexity {complexity}"),
+        }
+        assert_eq!(i32::from(rust.complexity()), c.get(sys::OPUS_GET_COMPLEXITY_REQUEST));
     }
-    for percent in [-1000, -1, 0, 1, 50, 100, 101, 1000] {
+    for percent in [-1000, -1, 0, 1, 50, 100, 101, 255, 1000] {
         let ok = c.try_ctl(sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, percent) == 0;
+        match u8::try_from(percent) {
+            Ok(v) => assert_eq!(rust.set_packet_loss_perc(v).is_ok(), ok, "loss {percent}"),
+            Err(_) => assert!(!ok, "loss {percent}"),
+        }
         assert_eq!(
-            rust.set_packet_loss_perc(percent).is_ok(),
-            ok,
-            "loss {percent}"
-        );
-        assert_eq!(
-            rust.packet_loss_perc(),
+            i32::from(rust.packet_loss_perc()),
             c.get(sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST)
         );
     }
-    // A bitrate must be positive. The automatic and the maximum bitrate
-    // have their own values in opus1, so the numbers libopus uses for
-    // them, -1000 and -1, are not bitrates here.
+    // A bitrate must be positive: libopus refuses 0 and the negative
+    // numbers other than -1000 and -1, which opus1's type cannot hold. The
+    // automatic and the maximum bitrate have their own values in opus1.
     for bitrate in [
         i32::MIN,
         -5000,
@@ -417,19 +416,16 @@ fn out_of_range_settings_are_rejected_like_libopus() {
         i32::MAX,
     ] {
         let ok = c.try_ctl(sys::OPUS_SET_BITRATE_REQUEST, bitrate) == 0;
-        assert_eq!(
-            rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).is_ok(),
-            ok,
-            "bitrate {bitrate}"
-        );
-        if ok {
-            // 500 to 750 000 bits per second per channel.
-            let limited = bitrate.clamp(3000, 4_500_000);
-            assert_eq!(rust.bitrate_setting(), Bitrate::BitsPerSecond(limited));
+        match u32::try_from(bitrate).ok().and_then(NonZeroU32::new) {
+            Some(bps) => {
+                assert!(ok, "bitrate {bitrate}");
+                rust.set_bitrate(Bitrate::BitsPerSecond(bps));
+                // 500 to 750 000 bits per second per channel.
+                let limited = bitrate.clamp(3000, 4_500_000);
+                assert_eq!(rust.bitrate_setting(), Bitrate::BitsPerSecond(NonZeroU32::new(limited as u32).unwrap()));
+            }
+            None => assert!(!ok, "bitrate {bitrate}"),
         }
-    }
-    for bitrate in [-1000, -1] {
-        assert!(rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).is_err());
     }
     // The limits are those of libopus: both encoders give their streams
     // the same bitrates at either end.
@@ -780,8 +776,7 @@ fn reset_state_starts_the_stream_anew() {
         let channels = case.channels as i32;
         let pcm = voiced(fs, case.channels, 12 * frame_size);
         let settings = |enc: &mut MultistreamEncoder| {
-            enc.set_bitrate(Bitrate::BitsPerSecond(20_000 * channels))
-                .unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000 * channels as u32).unwrap()));
             enc.set_complexity(7).unwrap();
             enc.set_vbr(false);
             enc.set_packet_loss_perc(5).unwrap();
@@ -801,7 +796,7 @@ fn reset_state_starts_the_stream_anew() {
         enc.reset_state();
         assert_eq!(
             enc.bitrate_setting(),
-            Bitrate::BitsPerSecond(20_000 * channels)
+            Bitrate::BitsPerSecond(NonZeroU32::new(20_000 * channels as u32).unwrap())
         );
         assert_eq!(enc.complexity(), 7);
         assert!(!enc.vbr());
@@ -832,8 +827,7 @@ fn final_range_is_the_xor_of_the_stream_encoders() {
     let frame_size = 960;
     for case in CASES {
         let mut enc = rust_encoder(case, fs, Application::Audio);
-        enc.set_bitrate(Bitrate::BitsPerSecond(32_000 * case.channels as i32))
-            .unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32_000 * case.channels as u32).unwrap()));
         assert_eq!(
             enc.final_range(),
             0,
@@ -888,8 +882,7 @@ fn surround_mode_sets_the_energy_mask_of_every_stream() {
     let by_hand = [123.0f32; 42];
     for case in CASES {
         let mut enc = rust_encoder(case, fs, Application::Audio);
-        enc.set_bitrate(Bitrate::BitsPerSecond(32_000 * case.channels as i32))
-            .unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32_000 * case.channels as u32).unwrap()));
         let streams = enc.layout().streams();
         let surround = enc.mapping_type() == opus1::multistream::MappingType::Surround;
         let pcm = voiced(fs, case.channels, 3 * frame_size);
@@ -897,7 +890,8 @@ fn surround_mode_sets_the_energy_mask_of_every_stream() {
         for frame in pcm.chunks_exact(frame_size * case.channels) {
             for s in 0..streams {
                 let stream = enc.stream_encoder_mut(s).unwrap();
-                stream.set_energy_mask(Some(&by_hand));
+                let values = 21 * stream.channels().count();
+                stream.set_energy_mask(Some(&by_hand[..values])).unwrap();
                 assert!(stream.energy_mask().is_some());
             }
             enc.encode(frame, frame_size, &mut out).unwrap();

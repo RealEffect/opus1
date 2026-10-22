@@ -10,6 +10,7 @@
 //!   CELT payload's tail bits differ from libopus's (deeper CELT-encoder
 //!   divergence, tracked for follow-up).
 
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 #[test]
@@ -34,7 +35,7 @@ fn issue45_starved_cbr() {
             Application::Voip,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(bps)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bps as u32).unwrap()));
         enc.set_vbr(false);
         let input: Vec<f32> = (0..frame)
             .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / sr as f32).sin())
@@ -66,7 +67,7 @@ fn issue46_low_cbr() {
             Application::Voip,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(bps)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bps as u32).unwrap()));
         enc.set_vbr(false);
         let input: Vec<f32> = (0..frame)
             .map(|i| {
@@ -102,7 +103,7 @@ fn issue46_low_cbr_decodes_as_celt() {
             Application::Voip,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(bps)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bps as u32).unwrap()));
         enc.set_vbr(false);
         let mut rs_dec =
             OpusDecoder::new(SampleRate::try_from(sr as i32).unwrap(), Channels::Mono).unwrap();

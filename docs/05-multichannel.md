@@ -203,7 +203,7 @@ The mapping family in the header says what the output channels mean. The stream 
 |---|---|
 | `Bitrate::Auto` (the default) | The encoder picks the total from the sampling rate, the frame size and the layout. |
 | `Bitrate::Max` | As many bits as the output buffer holds. |
-| `Bitrate::BitsPerSecond(b)` | `b` bits per second for all channels together. It must be positive. It is limited to 500 to 750 000 bits per second per input channel. |
+| `Bitrate::BitsPerSecond(b)` | `b` bits per second for all channels together, a `NonZeroU32`. It is limited to 500 to 750 000 bits per second per input channel. |
 
 Before every frame the encoder splits the total between the streams. Every stream gets at least 500 bits per second.
 
@@ -247,6 +247,7 @@ With constant bitrate the last stream gets the bitrate that fills the bytes that
 The source file `src/multistream/rate_alloc.rs` holds these rules. After a frame, each stream encoder reports the bitrate it was given, and the multistream encoder reports their sum:
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::multistream::{MappingType, MultistreamEncoder};
 use opus1::{Application, Bitrate, SampleRate};
 
@@ -260,13 +261,13 @@ let stream_rates = |encoder: &MultistreamEncoder| -> Vec<i32> {
 };
 
 // 256 kb/s.
-encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(256_000).unwrap()));
 encoder.encode(&pcm, 960, &mut packet).unwrap();
 assert_eq!(stream_rates(&encoder), [95_120, 95_120, 57_560, 8_195]);
 assert_eq!(encoder.bitrate(), 255_995);
 
 // The automatic bitrate.
-encoder.set_bitrate(Bitrate::Auto).unwrap();
+encoder.set_bitrate(Bitrate::Auto);
 encoder.encode(&pcm, 960, &mut packet).unwrap();
 assert_eq!(encoder.bitrate(), 307_998);
 
@@ -282,7 +283,7 @@ let mut plain = MultistreamEncoder::new(
     Application::Audio,
 )
 .unwrap();
-plain.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
+plain.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(256_000).unwrap()));
 plain.encode(&pcm, 960, &mut packet).unwrap();
 assert_eq!(stream_rates(&plain), [78_666, 78_666, 49_333, 49_333]);
 ```
@@ -363,21 +364,20 @@ A port of libopus `OpusMSEncoder`.
 | `bitrate()` | The sum of the stream bitrates that the last frame used. |
 | `set_vbr(bool)`, `vbr()` | Variable bitrate (`true`, the default) or constant bitrate. |
 | `set_vbr_constraint(bool)`, `vbr_constraint()` | With variable bitrate, keeps CELT-only packets close to the bitrate (`true`, the default). |
-| `set_complexity(0..=10)`, `complexity()` | Complexity of every stream. The default is 9. |
-| `set_inband_fec(bool)`, `inband_fec()` | In-band forward error correction (FEC) on every stream. Only SILK frames carry it. |
-| `set_packet_loss_perc(0..=100)`, `packet_loss_perc()` | Expected packet loss in percent. |
-| `set_inband_fec_mode(InbandFec)` | The three FEC settings of libopus on every stream (see [Using the library](06-using-the-library.md#default-settings-and-the-automatic-choice-of-mode)). |
+| `set_complexity(0..=10)`, `complexity()` | Complexity of every stream, a `u8`. The default is 9. |
+| `set_inband_fec(InbandFec)`, `inband_fec()` | In-band forward error correction (FEC) on every stream, with the three settings of libopus (see [Using the library](06-using-the-library.md#default-settings-and-the-automatic-choice-of-mode)). Only SILK frames carry it. |
+| `set_packet_loss_perc(0..=100)`, `packet_loss_perc()` | Expected packet loss in percent, a `u8`. |
 | `set_signal(Signal)`, `signal()` | Tells every stream that the input is voice or music, or leaves it to the speech and music analysis (`Signal::Auto`, the default). |
 | `set_lsb_depth(8..=24)`, `lsb_depth()` | The precision of the input in bits, on every stream. `encode_i16` codes with at most 16. |
 | `set_dtx(bool)`, `dtx()` | Discontinuous transmission on every stream. `dtx()` reads the first stream. |
-| `set_bandwidth(Bandwidth)`, `bandwidth()` | Fixes the bandwidth of every stream. No effect in surround mode. |
+| `set_bandwidth(Option<Bandwidth>)`, `bandwidth_setting()` | Fixes the bandwidth of every stream; `None`, the default, lets each stream choose. No effect in surround mode. |
 | `set_max_bandwidth(Bandwidth)`, `max_bandwidth()` | Limits the automatic bandwidth choice. |
 | `set_force_mode(Option<ForcedMode>)` | Asks every stream for SILK-only, Hybrid or CELT-only. In surround mode the coupled streams stay CELT-only, and in ambisonics mode all streams do. |
 | `set_force_channels(Option<Channels>)`, `force_channels()` | Forces mono or stereo coding on every stream (libopus `OPUS_SET_FORCE_CHANNELS`). A mono stream codes mono whatever is set, so `Some(Channels::Stereo)` acts on the coupled streams only. libopus refuses stereo at the first mono stream, after it has set the coupled streams. In surround mode the coupled streams are forced to stereo on every frame. The getter reads the first stream. |
 | `set_prediction_disabled(bool)`, `prediction_disabled()` | Prediction from earlier frames off on every stream (libopus `OPUS_SET_PREDICTION_DISABLED`). |
 | `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off in the intensity stereo of every coupled stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). |
 | `set_application(Application)` | Changes the application of every stream before the first frame (libopus `OPUS_SET_APPLICATION`); afterwards only the current one is accepted. |
-| `voice_ratio()` | The voice ratio of the first stream, in percent, or -1 (libopus `OPUS_GET_VOICE_RATIO`). |
+| `voice_ratio()` | The voice ratio of the first stream, in percent, or `None` when it is not known (libopus `OPUS_GET_VOICE_RATIO`, -1). |
 | `set_expert_frame_duration(FrameDuration)`, `expert_frame_duration()` | The duration of the frame each `encode` call codes (libopus `OPUS_SET_EXPERT_FRAME_DURATION`). `FrameDuration::Argument`, the default, takes the `frame_size` of the call. The multistream encoder keeps this setting for itself, as libopus does; the setting of a stream encoder plays no part. |
 | `layout()`, `mapping_type()`, `lfe_stream()` | The layout, how it was chosen, and the LFE stream. |
 | `application()`, `sampling_rate()` | The application of the first stream, and the sampling rate given at construction. |
@@ -407,7 +407,7 @@ A port of libopus `OpusMSDecoder`.
 | `decode_i16(packet, frame_size, out)` | The same into 16-bit samples. Each stream is soft-clipped before it is rounded, as in libopus. |
 | `decode24(packet, frame_size, out)` | The same into 24-bit samples in `i32`, full scale 2^23, without soft clipping and without a limit (libopus `opus_multistream_decode24`). |
 | `decode_fec(packet, frame_size, out)`, `decode_fec_i16(...)`, `decode_fec24(...)` | Rebuilds a lost packet from the packet after it. |
-| `set_gain(gain)`, `gain()` | The output gain of every stream in 1/256 dB, -32768 to 32767 (libopus `OPUS_SET_GAIN`). The getter reads the first stream. |
+| `set_gain(gain)`, `gain()` | The output gain of every stream in 1/256 dB, an `i16` (libopus `OPUS_SET_GAIN`). The getter reads the first stream. |
 | `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off on every stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). At the start it is off only for mono streams, so the getter, which reads the first stream, gives `false` when the first stream is coupled and `true` when it is mono. |
 | `set_complexity(0..=10)`, `complexity()` | The decoder complexity of every stream. |
 | `layout()`, `sampling_rate()` | The settings given at construction. |
@@ -474,6 +474,7 @@ assert!(ChannelLayout::surround(4, 3).is_err());
 ### Encoding 5.1
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::multistream::MultistreamEncoder;
 use opus1::packet::{self, Framing};
 use opus1::{Application, Bitrate, SampleRate};
@@ -481,7 +482,7 @@ use opus1::{Application, Bitrate, SampleRate};
 // 5.1 at 48 kHz in the channel order of mapping family 1:
 // front left, centre, front right, rear left, rear right, LFE.
 let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(256_000).unwrap()));
 
 // The layout the encoder chose. An Ogg Opus header stores these numbers.
 let layout = encoder.layout();
@@ -530,11 +531,12 @@ assert_eq!(len, 640);
 ### Decoding 5.1 through an Ogg Opus header
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::multistream::{ChannelMappingTable, MultistreamDecoder, MultistreamEncoder};
 use opus1::{Application, Bitrate, SampleRate};
 
 let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(256_000).unwrap()));
 let layout = encoder.layout().clone();
 
 // The writer builds the OpusHead header (RFC 7845 section 5.1).
@@ -643,6 +645,6 @@ These differences from libopus 1.6.1 are known. The figures come from the projec
 
 - **Bandwidth with an automatic or maximum bitrate in surround mode.** libopus compares the raw setting (−1000 or −1) with the thresholds, so it always chooses narrowband. `opus1` uses the allocated bitrate and codes fullband. This is deliberate.
 - **Expert frame duration.** libopus's multistream encoder stores any number given to `OPUS_SET_EXPERT_FRAME_DURATION`, and then refuses every encode call when the number is no duration. `opus1` takes a `FrameDuration`, which holds only the ten values libopus defines. For those values both encoders take and refuse the same calls (`tests/multistream_long_frames.rs`). Frames of 80, 100 and 120 ms, which earlier versions did not offer (difference D3), are coded as libopus codes them.
-- **Controls.** The multistream encoder has no control for these: the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`. The least significant bit (LSB) depth, the signal type, discontinuous transmission (DTX) and the in-band FEC mode are set on every stream, as in libopus (`set_lsb_depth`, `set_signal`, `set_dtx`, `set_inband_fec_mode`).
+- **Controls.** The multistream encoder has no control for these: the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`. The least significant bit (LSB) depth, the signal type, discontinuous transmission (DTX) and the in-band FEC mode are set on every stream, as in libopus (`set_lsb_depth`, `set_signal`, `set_dtx`, `set_inband_fec`).
 - **Rate use and stereo Hybrid streams.** Each stream runs the speech and music analysis, as in libopus. At 16 kHz and with `Application::Voip`, the `opus1` multistream encoder codes -12.8 % to +4.1 % around the requested rate in the 25 cases of `tests/multistream_enc_signals.rs` (libopus +0.3 % to +8.3 %). In the test matrix of `tests/multistream_enc_validity.rs`, both write the same number of packets with a stereo Hybrid stream: 239, of which libopus writes 128 at 8 kilobits per second (kb/s) per channel and 111 at 24 kb/s per channel. Before the analysis was ported, `opus1` used 65 % to 80 % of the rate in four of the cases and wrote no such packet.
 - **Family 3 (projection)** is not supported.

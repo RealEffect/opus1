@@ -12,7 +12,7 @@
 //!   joined into one multistream packet;
 //! - a lost packet, of a random multiple of 2.5 ms;
 //! - `decode_fec` with a packet of the pool;
-//! - `set_complexity` with -1 to 11, `set_osce_bwe` on or off,
+//! - `set_complexity` with 0 to 11, `set_osce_bwe` on or off,
 //!   `reset_state`;
 //! - (`OpusDecoder` only) DRED: a packet of the pool with DRED data is
 //!   parsed by `OpusDredDecoder`, and `dred_decode_float` conceals a loss at
@@ -82,7 +82,7 @@ impl Dec {
         }
     }
 
-    fn set_complexity(&mut self, c: i32) -> std::result::Result<(), opus1::Error> {
+    fn set_complexity(&mut self, c: u8) -> std::result::Result<(), opus1::Error> {
         match self {
             Dec::One(d) => d.set_complexity(c),
             Dec::Multi(d) => d.set_complexity(c),
@@ -225,8 +225,8 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 }
             }
             10 => {
-                let c = u.int_in_range(-1..=11)?;
-                assert_eq!(dec.set_complexity(c).is_ok(), (0..=10).contains(&c), "complexity {c}");
+                let c = u.int_in_range(0..=11)?;
+                assert_eq!(dec.set_complexity(c).is_ok(), c <= 10, "complexity {c}");
             }
             11 => dec.set_osce_bwe(u.arbitrary()?).unwrap(),
             12 => {

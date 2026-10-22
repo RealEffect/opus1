@@ -105,6 +105,7 @@ use crate::compat::Math;
 use crate::fixedvec::FixedVec;
 use crate::in_place::write_fields;
 use core::mem::MaybeUninit;
+use core::num::NonZeroU32;
 use analysis::{AnalysisGate, AnalysisInfo, AnalysisPcm, PcmRef, SecondChannel, is_digital_silence};
 use celt::{CeltDecoder, CeltEncoder};
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float};
@@ -315,24 +316,97 @@ impl From<Channels> for usize {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What an encoder is tuned for: libopus `OPUS_APPLICATION_*`, the
+/// `application` argument of [`OpusEncoder::new`].
+///
+/// The number of each value is the libopus constant of the same name
+/// ([`to_raw`](Self::to_raw)). More values may be added in a later release,
+/// so a `match` on it needs a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Application {
+    /// libopus `OPUS_APPLICATION_VOIP` (2048): speech, for example in a
+    /// call. The encoder leans towards SILK and keeps speech intelligible.
     Voip = 2048,
+    /// libopus `OPUS_APPLICATION_AUDIO` (2049): music and other audio that
+    /// should sound as close to the input as possible.
     Audio = 2049,
+    /// libopus `OPUS_APPLICATION_RESTRICTED_LOWDELAY` (2051): the lowest
+    /// delay. Every packet is CELT-only, and the encoder has no 4 ms
+    /// look-ahead.
     RestrictedLowDelay = 2051,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Application {
+    /// The libopus number of the value, for example 2048 for
+    /// [`Voip`](Self::Voip).
+    pub const fn to_raw(self) -> i32 {
+        self as i32
+    }
+}
+
+impl TryFrom<i32> for Application {
+    type Error = crate::Error;
+
+    /// The value with the libopus number `value`. Any other number is
+    /// refused with [`BadArg`](crate::ErrorKind::BadArg), as libopus
+    /// `opus_encoder_create` refuses it.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            2048 => Ok(Application::Voip),
+            2049 => Ok(Application::Audio),
+            2051 => Ok(Application::RestrictedLowDelay),
+            _ => Err(Error::bad_arg("invalid application")),
+        }
+    }
+}
+
+/// An audio bandwidth: libopus `OPUS_BANDWIDTH_*`. Each value says up to
+/// which frequency a packet carries audio.
+///
+/// The number of each value is the libopus constant of the same name
+/// ([`to_raw`](Self::to_raw)). The automatic choice of an encoder, libopus
+/// `OPUS_AUTO`, is not a bandwidth: it is `None` in
+/// [`OpusEncoder::set_bandwidth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bandwidth {
-    Auto = OPUS_AUTO as isize,
+    /// 4 kHz (libopus `OPUS_BANDWIDTH_NARROWBAND`, 1101).
     Narrowband = 1101,
+    /// 6 kHz (libopus `OPUS_BANDWIDTH_MEDIUMBAND`, 1102).
     Mediumband = 1102,
+    /// 8 kHz (libopus `OPUS_BANDWIDTH_WIDEBAND`, 1103).
     Wideband = 1103,
+    /// 12 kHz (libopus `OPUS_BANDWIDTH_SUPERWIDEBAND`, 1104).
     Superwideband = 1104,
+    /// 20 kHz (libopus `OPUS_BANDWIDTH_FULLBAND`, 1105).
     Fullband = 1105,
 }
 
+impl TryFrom<i32> for Bandwidth {
+    type Error = crate::Error;
+
+    /// The value with the libopus number `value` (1101 to 1105). Any other
+    /// number, `OPUS_AUTO` too, is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg).
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1101 => Ok(Bandwidth::Narrowband),
+            1102 => Ok(Bandwidth::Mediumband),
+            1103 => Ok(Bandwidth::Wideband),
+            1104 => Ok(Bandwidth::Superwideband),
+            1105 => Ok(Bandwidth::Fullband),
+            _ => Err(Error::bad_arg("invalid bandwidth")),
+        }
+    }
+}
+
 impl Bandwidth {
+    /// The libopus number of the value, for example 1105 for
+    /// [`Fullband`](Self::Fullband).
+    pub const fn to_raw(self) -> i32 {
+        self as i32
+    }
+
     /// The wider of two bandwidths (C `IMAX` of the bandwidth numbers).
     fn max_by_index(self, other: Bandwidth) -> Bandwidth {
         if bandwidth_fec_index(other) > bandwidth_fec_index(self) { other } else { self }
@@ -340,7 +414,7 @@ impl Bandwidth {
 
     /// The number of CELT bands a packet of this bandwidth codes (libopus
     /// `CELT_SET_END_BAND` in `opus_encode_frame_native` and
-    /// `opus_decode_frame`). `Auto` counts as fullband.
+    /// `opus_decode_frame`).
     ///
     /// This holds for Hybrid packets as well as CELT-only ones: a Hybrid
     /// super-wideband packet codes bands 17 and 18 only.
@@ -350,7 +424,7 @@ impl Bandwidth {
             Bandwidth::Narrowband => 13,
             Bandwidth::Mediumband | Bandwidth::Wideband => 17,
             Bandwidth::Superwideband => 19,
-            Bandwidth::Fullband | Bandwidth::Auto => 21,
+            Bandwidth::Fullband => 21,
         }
     }
 
@@ -380,32 +454,92 @@ enum OpusMode {
 /// A coding mode the caller asks the encoder to use: libopus
 /// `MODE_SILK_ONLY`, `MODE_HYBRID` and `MODE_CELT_ONLY` for
 /// `OPUS_SET_FORCE_MODE`. See [`OpusEncoder::set_force_mode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The number of each value is the libopus constant
+/// ([`to_raw`](Self::to_raw)). More values may be added in a later release,
+/// so a `match` on it needs a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ForcedMode {
-    /// SILK alone: speech up to wideband (8 kHz of audio).
-    SilkOnly,
+    /// SILK alone: speech up to wideband (8 kHz of audio). libopus
+    /// `MODE_SILK_ONLY` (1000).
+    SilkOnly = 1000,
     /// SILK below 8 kHz and CELT above: super-wideband and fullband speech.
-    Hybrid,
-    /// CELT alone: music, and frames shorter than 10 ms.
-    CeltOnly,
+    /// libopus `MODE_HYBRID` (1001).
+    Hybrid = 1001,
+    /// CELT alone: music, and frames shorter than 10 ms. libopus
+    /// `MODE_CELT_ONLY` (1002).
+    CeltOnly = 1002,
+}
+
+impl ForcedMode {
+    /// The libopus number of the value, for example 1000 for
+    /// [`SilkOnly`](Self::SilkOnly).
+    pub const fn to_raw(self) -> i32 {
+        self as i32
+    }
+}
+
+impl TryFrom<i32> for ForcedMode {
+    type Error = crate::Error;
+
+    /// The value with the libopus number `value` (1000 to 1002). Any other
+    /// number is refused with [`BadArg`](crate::ErrorKind::BadArg).
+    /// libopus's `OPUS_SET_FORCE_MODE` also takes `OPUS_AUTO`, which is
+    /// `None` in [`OpusEncoder::set_force_mode`].
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1000 => Ok(ForcedMode::SilkOnly),
+            1001 => Ok(ForcedMode::Hybrid),
+            1002 => Ok(ForcedMode::CeltOnly),
+            _ => Err(Error::bad_arg("invalid forced mode")),
+        }
+    }
 }
 
 /// The bitrate setting of an encoder: libopus `OPUS_SET_BITRATE`. See
 /// [`OpusEncoder::set_bitrate`]; `MultistreamEncoder::set_bitrate` takes it
 /// too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ```
+/// use core::num::NonZeroU32;
+/// use opus1::Bitrate;
+///
+/// let bitrate = Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap());
+/// assert_ne!(bitrate, Bitrate::default());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Bitrate {
     /// libopus `OPUS_AUTO`, the default: the encoder picks the bitrate from
     /// the sampling rate, the channel count and the frame duration. An
     /// [`OpusEncoder`] takes `60 * rate / frame_size + rate * channels` bits
     /// per second: 19,000 b/s for 16 kHz mono and 99,000 b/s for 48 kHz
     /// stereo in 20 ms frames.
+    #[default]
     Auto,
     /// libopus `OPUS_BITRATE_MAX`: as many bits as the output buffer holds.
     /// An [`OpusEncoder`] takes at most 1,500,000 b/s.
     Max,
-    /// Bits per second for all channels together.
-    BitsPerSecond(i32),
+    /// Bits per second for all channels together. The encoder limits the
+    /// value as [`OpusEncoder::set_bitrate`] says.
+    BitsPerSecond(NonZeroU32),
+}
+
+impl Bitrate {
+    /// [`BitsPerSecond`](Self::BitsPerSecond) for a bitrate that is already
+    /// within an encoder's limits, so at least 500 b/s. A value below 1
+    /// would become 1 b/s; no caller passes one.
+    pub(crate) fn within_limits(bps: i32) -> Bitrate {
+        let bps = u32::try_from(bps).unwrap_or(0);
+        Bitrate::BitsPerSecond(NonZeroU32::new(bps).unwrap_or(NonZeroU32::MIN))
+    }
+
+    /// The bits per second of [`BitsPerSecond`](Self::BitsPerSecond) as the
+    /// `opus_int32` of libopus: a value above `i32::MAX` becomes
+    /// `i32::MAX`. Every encoder limit is far below it.
+    pub(crate) fn bps_to_i32(bps: NonZeroU32) -> i32 {
+        i32::try_from(bps.get()).unwrap_or(i32::MAX)
+    }
 }
 
 /// The frame duration setting of an encoder: libopus
@@ -417,10 +551,11 @@ pub enum Bitrate {
 /// (`OPUS_FRAMESIZE_ARG` is 5000, `OPUS_FRAMESIZE_2_5_MS` is 5001, and so
 /// on). [`FrameDuration::try_from`] takes those numbers and refuses every
 /// other one, as libopus's encoder control does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum FrameDuration {
     /// libopus `OPUS_FRAMESIZE_ARG`, the default: each frame lasts as long
     /// as the `frame_size` argument of the encode call says.
+    #[default]
     Argument = 5000,
     /// 2.5 ms (`OPUS_FRAMESIZE_2_5_MS`).
     Ms2_5 = 5001,
@@ -459,7 +594,7 @@ impl FrameDuration {
 
     /// The libopus number of the value, for example 5000 for
     /// [`Argument`](Self::Argument).
-    pub fn to_raw(self) -> i32 {
+    pub const fn to_raw(self) -> i32 {
         self as i32
     }
 
@@ -500,36 +635,95 @@ impl TryFrom<i32> for FrameDuration {
 
 /// What the input of an encoder is: libopus `OPUS_SET_SIGNAL`. See
 /// [`OpusEncoder::set_signal`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The number of each value is the libopus constant
+/// ([`to_raw`](Self::to_raw)). More values may be added in a later release,
+/// so a `match` on it needs a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum Signal {
-    /// libopus `OPUS_AUTO`, the default. From complexity 7 on, the
+    /// libopus `OPUS_AUTO` (-1000), the default. From complexity 7 on, the
     /// encoder's speech and music analysis estimates it for every packet.
     /// Below, the application decides: speech for `Voip`, mostly music for
     /// `Audio`.
     #[default]
-    Auto,
-    /// libopus `OPUS_SIGNAL_VOICE`: speech. The encoder leans towards SILK
-    /// and narrower bandwidths.
-    Voice,
-    /// libopus `OPUS_SIGNAL_MUSIC`: music. The encoder leans towards CELT.
-    Music,
+    Auto = -1000,
+    /// libopus `OPUS_SIGNAL_VOICE` (3001): speech. The encoder leans
+    /// towards SILK and narrower bandwidths.
+    Voice = 3001,
+    /// libopus `OPUS_SIGNAL_MUSIC` (3002): music. The encoder leans towards
+    /// CELT.
+    Music = 3002,
+}
+
+impl Signal {
+    /// The libopus number of the value, for example 3001 for
+    /// [`Voice`](Self::Voice).
+    pub const fn to_raw(self) -> i32 {
+        self as i32
+    }
+}
+
+impl TryFrom<i32> for Signal {
+    type Error = crate::Error;
+
+    /// The value with the libopus number `value`: `OPUS_AUTO` (-1000),
+    /// 3001 or 3002. Any other number is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg), as libopus's `OPUS_SET_SIGNAL`
+    /// refuses it.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            OPUS_AUTO => Ok(Signal::Auto),
+            3001 => Ok(Signal::Voice),
+            3002 => Ok(Signal::Music),
+            _ => Err(Error::bad_arg("invalid signal type")),
+        }
+    }
 }
 
 /// In-band forward error correction (FEC): libopus `OPUS_SET_INBAND_FEC`.
-/// See [`OpusEncoder::set_inband_fec_mode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// See [`OpusEncoder::set_inband_fec`].
+///
+/// The number of each value is the libopus value
+/// ([`to_raw`](Self::to_raw)). More values may be added in a later release,
+/// so a `match` on it needs a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum InbandFec {
     /// libopus 0, the default: no FEC.
     #[default]
-    Off,
+    Off = 0,
     /// libopus 1: FEC. With enough packet loss the encoder codes SILK,
     /// because only SILK frames carry it.
-    On,
+    On = 1,
     /// libopus 2: FEC, but the encoder does not move to SILK for it when
     /// it is confident the input is music (an estimated speech
     /// probability of at most 25 in 127). This needs the speech and
     /// music analysis, from complexity 7 on, or [`Signal::Music`].
-    OnUnlessMusic,
+    OnUnlessMusic = 2,
+}
+
+impl InbandFec {
+    /// The libopus value, 0 to 2.
+    pub const fn to_raw(self) -> i32 {
+        self as i32
+    }
+}
+
+impl TryFrom<i32> for InbandFec {
+    type Error = crate::Error;
+
+    /// The value with the libopus value `value` (0 to 2). Any other number
+    /// is refused with [`BadArg`](crate::ErrorKind::BadArg), as libopus's
+    /// `OPUS_SET_INBAND_FEC` refuses it.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(InbandFec::Off),
+            1 => Ok(InbandFec::On),
+            2 => Ok(InbandFec::OnUnlessMusic),
+            _ => Err(Error::bad_arg("invalid in-band FEC setting")),
+        }
+    }
 }
 
 /// The decisions `opus_encode_native` makes once per packet and hands to
@@ -807,7 +1001,7 @@ pub struct OpusEncoder {
     /// ([`set_vbr_constraint`](Self::set_vbr_constraint)).
     vbr_constraint: bool,
     /// C `st->fec_config`, and `st->silk_mode.useInBandFEC` when it is not
-    /// `Off` ([`set_inband_fec_mode`](Self::set_inband_fec_mode)).
+    /// `Off` ([`set_inband_fec`](Self::set_inband_fec)).
     fec_config: InbandFec,
     /// C `st->silk_mode.packetLossPercentage`: 0 to 100
     /// ([`set_packet_loss_perc`](Self::set_packet_loss_perc)).
@@ -1038,7 +1232,7 @@ fn bandwidth_fec_index(bw: Bandwidth) -> usize {
         Bandwidth::Mediumband => 1,
         Bandwidth::Wideband => 2,
         Bandwidth::Superwideband => 3,
-        Bandwidth::Fullband | Bandwidth::Auto => 4,
+        Bandwidth::Fullband => 4,
     }
 }
 
@@ -1891,19 +2085,17 @@ impl OpusEncoder {
     /// `60 * rate / frame_size + rate * channels` b/s, for example
     /// 19,000 b/s for 16 kHz mono in 20 ms frames.
     ///
-    /// As in libopus, an explicit bitrate must be positive. It is raised to
-    /// at least 500 bits per second and limited to at most 750,000 bits per
-    /// second per channel. The length of the output buffer of each
+    /// As in libopus, an explicit bitrate is raised to at least 500 bits
+    /// per second and limited to at most 750,000 bits per second per
+    /// channel. The length of the output buffer of each
     /// [`encode`](Self::encode) call can lower it further.
-    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), Error> {
+    pub fn set_bitrate(&mut self, bitrate: Bitrate) {
         self.user_bitrate = match bitrate {
-            Bitrate::BitsPerSecond(bps) if bps <= 0 => return Err(Error::INVALID_BITRATE),
-            Bitrate::BitsPerSecond(bps) => {
-                Bitrate::BitsPerSecond(bps.clamp(500, 750_000 * self.channels as i32))
-            }
+            Bitrate::BitsPerSecond(bps) => Bitrate::within_limits(
+                Bitrate::bps_to_i32(bps).clamp(500, 750_000 * self.channels as i32),
+            ),
             other => other,
         };
-        Ok(())
     }
 
     /// The bitrate that was set, after its limits were applied.
@@ -1930,24 +2122,26 @@ impl OpusEncoder {
         let user_bitrate = match self.user_bitrate {
             Bitrate::Auto => 60 * fs / frame_size as i32 + fs * self.channels as i32,
             Bitrate::Max => 1_500_000,
-            Bitrate::BitsPerSecond(bps) => bps,
+            Bitrate::BitsPerSecond(bps) => Bitrate::bps_to_i32(bps),
         };
         user_bitrate.min(max_bitrate)
     }
 
     /// libopus `OPUS_SET_COMPLEXITY`: 0 to 10. Higher values spend more
-    /// processor time for better quality. The default is 9.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
-        if !(0..=10).contains(&complexity) {
+    /// processor time for better quality. The default is 9. A value above
+    /// 10 is refused with [`BadArg`](crate::ErrorKind::BadArg), and the
+    /// setting stays.
+    pub fn set_complexity(&mut self, complexity: u8) -> Result<(), Error> {
+        if complexity > 10 {
             return Err(Error::INVALID_COMPLEXITY);
         }
-        self.complexity = complexity;
+        self.complexity = i32::from(complexity);
         Ok(())
     }
 
     /// The complexity set with [`set_complexity`](Self::set_complexity).
-    pub fn complexity(&self) -> i32 {
-        self.complexity
+    pub fn complexity(&self) -> u8 {
+        self.complexity as u8
     }
 
     /// libopus `OPUS_SET_VBR`: a variable bitrate (`true`, the default) or a
@@ -1977,35 +2171,22 @@ impl OpusEncoder {
         self.vbr_constraint
     }
 
-    /// libopus `OPUS_SET_INBAND_FEC` 0 or 1: let SILK and Hybrid packets
-    /// carry a low-bitrate copy of the frame before them (in-band forward
-    /// error correction, FEC), so that a decoder can rebuild a lost packet.
-    /// The copy is coded only when
+    /// libopus `OPUS_SET_INBAND_FEC`: let SILK and Hybrid packets carry a
+    /// low-bitrate copy of the frame before them (in-band forward error
+    /// correction, FEC), so that a decoder can rebuild a lost packet. The
+    /// copy is coded only when
     /// [`set_packet_loss_perc`](Self::set_packet_loss_perc) is above 0 and
-    /// the bitrate leaves room for it. Off by default.
+    /// the bitrate leaves room for it. [`InbandFec::Off`] by default.
     ///
-    /// `true` is [`InbandFec::On`] and `false` [`InbandFec::Off`]; see
-    /// [`set_inband_fec_mode`](Self::set_inband_fec_mode) for the third
-    /// setting of libopus.
-    pub fn set_inband_fec(&mut self, enabled: bool) {
-        self.fec_config = if enabled { InbandFec::On } else { InbandFec::Off };
-    }
-
-    /// Whether in-band FEC is on, in either of its two modes
-    /// ([`set_inband_fec_mode`](Self::set_inband_fec_mode)).
-    pub fn inband_fec(&self) -> bool {
-        self.fec_config != InbandFec::Off
-    }
-
-    /// libopus `OPUS_SET_INBAND_FEC` with its three values (0, 1, 2). With
-    /// [`InbandFec::OnUnlessMusic`] the encoder does not move to SILK for
-    /// the FEC when it is confident that the input is music.
-    pub fn set_inband_fec_mode(&mut self, mode: InbandFec) {
-        self.fec_config = mode;
+    /// With [`InbandFec::On`] the encoder moves to SILK for the FEC when
+    /// the packet loss is high enough. With [`InbandFec::OnUnlessMusic`] it
+    /// does not do so when it is confident that the input is music.
+    pub fn set_inband_fec(&mut self, fec: InbandFec) {
+        self.fec_config = fec;
     }
 
     /// The in-band FEC setting (libopus `OPUS_GET_INBAND_FEC`).
-    pub fn inband_fec_mode(&self) -> InbandFec {
+    pub fn inband_fec(&self) -> InbandFec {
         self.fec_config
     }
 
@@ -2026,24 +2207,24 @@ impl OpusEncoder {
     }
 
     /// libopus `OPUS_SET_LSB_DEPTH`: the precision of the input in bits, 8
-    /// to 24. The default is 24. Any other value is an error, and the
-    /// setting stays.
+    /// to 24. The default is 24. Any other value is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg), and the setting stays.
     ///
     /// Samples below `2^-depth` count as digital silence, and the noise
     /// floor of the analysis and of CELT's allocation follows it.
     /// [`encode_i16`](Self::encode_i16) codes with at most 16 bits, as
     /// libopus `opus_encode` does.
-    pub fn set_lsb_depth(&mut self, depth: i32) -> Result<(), Error> {
+    pub fn set_lsb_depth(&mut self, depth: u8) -> Result<(), Error> {
         if !(8..=24).contains(&depth) {
             return Err(Error::INVALID_LSB_DEPTH);
         }
-        self.lsb_depth = depth;
+        self.lsb_depth = i32::from(depth);
         Ok(())
     }
 
     /// The input precision set with [`set_lsb_depth`](Self::set_lsb_depth).
-    pub fn lsb_depth(&self) -> i32 {
-        self.lsb_depth
+    pub fn lsb_depth(&self) -> u8 {
+        self.lsb_depth as u8
     }
 
     /// libopus `OPUS_SET_DTX`: discontinuous transmission (DTX). Off by
@@ -2135,25 +2316,27 @@ impl OpusEncoder {
     /// libopus `OPUS_SET_PACKET_LOSS_PERC`: the packet loss the network is
     /// expected to have, 0 to 100 percent. The default is 0. Higher values
     /// make the packets more robust against loss, at the cost of quality
-    /// without loss.
-    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), Error> {
-        if !(0..=100).contains(&percent) {
+    /// without loss. A value above 100 is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg), and the setting stays.
+    pub fn set_packet_loss_perc(&mut self, percent: u8) -> Result<(), Error> {
+        if percent > 100 {
             return Err(Error::INVALID_PACKET_LOSS);
         }
-        self.packet_loss_perc = percent;
+        self.packet_loss_perc = i32::from(percent);
         Ok(())
     }
 
     /// The expected packet loss in percent
     /// ([`set_packet_loss_perc`](Self::set_packet_loss_perc)).
-    pub fn packet_loss_perc(&self) -> i32 {
-        self.packet_loss_perc
+    pub fn packet_loss_perc(&self) -> u8 {
+        self.packet_loss_perc as u8
     }
 
     /// libopus `OPUS_SET_DRED_DURATION` (feature `dred`): how much audio
     /// before each packet the packet carries again as deep redundancy
     /// (DRED), in frames of 10 ms, 0 to 104. 0, the default, turns DRED
-    /// off.
+    /// off. A value above 104 is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg), and the setting stays.
     ///
     /// DRED takes part of the bitrate, and only with an expected packet
     /// loss ([`set_packet_loss_perc`](Self::set_packet_loss_perc)) above
@@ -2167,15 +2350,15 @@ impl OpusEncoder {
     /// [`reset_state`](Self::reset_state) sets the duration back to 0, as
     /// libopus does.
     #[cfg(feature = "dred")]
-    pub fn set_dred_duration(&mut self, frames: i32) -> Result<(), Error> {
-        self.dred.set_duration(frames)
+    pub fn set_dred_duration(&mut self, frames: u8) -> Result<(), Error> {
+        self.dred.set_duration(i32::from(frames))
     }
 
     /// libopus `OPUS_GET_DRED_DURATION` (feature `dred`): the DRED duration
     /// in frames of 10 ms ([`set_dred_duration`](Self::set_dred_duration)).
     #[cfg(feature = "dred")]
-    pub fn dred_duration(&self) -> i32 {
-        self.dred.duration()
+    pub fn dred_duration(&self) -> u8 {
+        self.dred.duration() as u8
     }
 
     /// libopus `OPUS_SET_DNN_BLOB` on an encoder (feature `dred`): loads the
@@ -2216,30 +2399,29 @@ impl OpusEncoder {
     }
 
     /// libopus `OPUS_SET_BANDWIDTH`: code this audio bandwidth instead of
-    /// the one the bitrate calls for. `Bandwidth::Auto` gives the choice
-    /// back to the encoder.
+    /// the one the bitrate calls for. `None`, the default, gives the choice
+    /// back to the encoder (libopus `OPUS_AUTO`).
     ///
     /// The bandwidth never exceeds what the input sampling rate can carry.
     /// CELT has no mediumband and codes wideband instead. SILK codes at the
     /// internal rate of the bandwidth (8, 12 or 16 kHz); a running SILK
     /// encoder moves there one step at a time, when the signal lets it.
-    pub fn set_bandwidth(&mut self, bandwidth: Bandwidth) {
-        self.user_bandwidth = match bandwidth {
-            Bandwidth::Auto => None,
-            fixed => Some(fixed),
-        };
+    pub fn set_bandwidth(&mut self, bandwidth: Option<Bandwidth>) {
+        self.user_bandwidth = bandwidth;
+    }
+
+    /// The value set with [`set_bandwidth`](Self::set_bandwidth): `None`
+    /// when the encoder chooses the bandwidth itself.
+    pub fn bandwidth_setting(&self) -> Option<Bandwidth> {
+        self.user_bandwidth
     }
 
     /// libopus `OPUS_SET_MAX_BANDWIDTH`: the widest audio bandwidth the
-    /// automatic choice may take. A bandwidth set with
+    /// automatic choice may take. The default is
+    /// [`Bandwidth::Fullband`]. A bandwidth set with
     /// [`set_bandwidth`](Self::set_bandwidth) is not limited by it.
-    /// `Bandwidth::Auto` is not a bandwidth and is rejected.
-    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) -> Result<(), Error> {
-        if bandwidth == Bandwidth::Auto {
-            return Err(Error::INVALID_MAX_BANDWIDTH);
-        }
+    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) {
         self.max_bandwidth = bandwidth;
-        Ok(())
     }
 
     /// libopus `OPUS_SET_LFE`: this encoder codes the low-frequency-effects
@@ -2392,28 +2574,30 @@ impl OpusEncoder {
     }
 
     /// libopus `OPUS_SET_VOICE_RATIO`: the probability that the input is
-    /// speech, in percent (0 to 100), or -1 for none. Any other value is an
-    /// error and changes nothing.
+    /// speech, in percent (0 to 100), or `None` when it is not known
+    /// (libopus -1). A value above 100 is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg) and changes nothing.
     ///
     /// The encoder replaces the value itself: with every frame that is not
-    /// digital silence it goes back to -1, and when the speech and music
-    /// analysis gives a result and the signal type is automatic, it becomes
-    /// the analysis's estimate. While it is not -1 and the signal type is
-    /// automatic, it steers the choice between SILK and CELT. The start
-    /// value is -1.
-    pub fn set_voice_ratio(&mut self, ratio: i32) -> Result<(), Error> {
-        if !(-1..=100).contains(&ratio) {
-            return Err(Error::bad_arg("invalid voice ratio"));
-        }
-        self.voice_ratio = ratio;
+    /// digital silence it goes back to `None`, and when the speech and
+    /// music analysis gives a result and the signal type is automatic, it
+    /// becomes the analysis's estimate. While it is known and the signal
+    /// type is automatic, it steers the choice between SILK and CELT. The
+    /// start value is `None`.
+    pub fn set_voice_ratio(&mut self, ratio: Option<u8>) -> Result<(), Error> {
+        self.voice_ratio = match ratio {
+            None => -1,
+            Some(percent) if percent <= 100 => i32::from(percent),
+            Some(_) => return Err(Error::bad_arg("invalid voice ratio")),
+        };
         Ok(())
     }
 
     /// libopus `OPUS_GET_VOICE_RATIO`: the value of
     /// [`set_voice_ratio`](Self::set_voice_ratio), or the encoder's own
-    /// estimate from the last frame, in percent, or -1.
-    pub fn voice_ratio(&self) -> i32 {
-        self.voice_ratio
+    /// estimate from the last frame, in percent, or `None` (libopus -1).
+    pub fn voice_ratio(&self) -> Option<u8> {
+        u8::try_from(self.voice_ratio).ok()
     }
 
     /// libopus `OPUS_SET_ENERGY_MASK`: how far each band of each channel
@@ -2422,10 +2606,11 @@ impl OpusEncoder {
     ///
     /// `mask` holds 21 values per channel of this encoder, the first
     /// channel first, in units of 6 dB (log2 of an amplitude ratio). A
-    /// negative value says the band is masked. `None` clears the mask, and
-    /// so does a slice that is too short. libopus keeps a pointer to the
-    /// caller's array; this function copies the values, so call it again
-    /// when they change.
+    /// negative value says the band is masked. `None` clears the mask. A
+    /// slice of another length is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg), and the mask stays. libopus
+    /// keeps a pointer to the caller's array; this function copies the
+    /// values, so call it again when they change.
     ///
     /// What the encoder does with a mask, as libopus does:
     ///
@@ -2446,13 +2631,18 @@ impl OpusEncoder {
     /// fails to set the CELT bitrate and the CELT layer runs at its maximum:
     /// a 10 kb/s stream comes out at about 500 kb/s. This encoder gives the
     /// CELT layer the lowest bitrate it takes instead (501 b/s).
-    pub fn set_energy_mask(&mut self, mask: Option<&[f32]>) {
+    pub fn set_energy_mask(&mut self, mask: Option<&[f32]>) -> Result<(), Error> {
         let n = 21 * self.channels;
-        self.energy_mask = mask.filter(|m| m.len() >= n).map(|m| {
-            let mut values = [0.0; 21 * OPUS_MAX_CHANNELS];
-            values[..n].copy_from_slice(&m[..n]);
-            values
-        });
+        self.energy_mask = match mask {
+            None => None,
+            Some(m) if m.len() == n => {
+                let mut values = [0.0; 21 * OPUS_MAX_CHANNELS];
+                values[..n].copy_from_slice(m);
+                Some(values)
+            }
+            Some(_) => return Err(Error::bad_arg("invalid energy mask length")),
+        };
+        Ok(())
     }
 
     /// The mask set with [`set_energy_mask`](Self::set_energy_mask): 21
@@ -4984,7 +5174,7 @@ impl OpusDecoder {
         // C: the soft clipper runs on a decoded packet only. Concealed and
         // FEC output returns above, without it, and leaves its memory alone.
         if soft_clip {
-            pcm_soft_clip(
+            crate::soft_clip(
                 &mut output[..decoded_total * channels],
                 decoded_total,
                 channels,
@@ -5110,11 +5300,14 @@ impl OpusDecoder {
     /// enhancement afresh: the next such frame comes out unenhanced, and
     /// the one after it fades in over 10 ms, as in libopus.
     ///
-    /// [`reset_state`](Self::reset_state) keeps the value.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
-        if !(0..=10).contains(&complexity) {
+    /// [`reset_state`](Self::reset_state) keeps the value. A value above
+    /// 10 is refused with [`BadArg`](crate::ErrorKind::BadArg), and the
+    /// setting stays.
+    pub fn set_complexity(&mut self, complexity: u8) -> Result<(), Error> {
+        if complexity > 10 {
             return Err(Error::INVALID_COMPLEXITY);
         }
+        let complexity = i32::from(complexity);
         self.complexity = complexity;
         // C: the request is passed on to the CELT decoder, whose deep PLC
         // reads it.
@@ -5124,8 +5317,8 @@ impl OpusDecoder {
 
     /// The complexity set with [`set_complexity`](Self::set_complexity)
     /// (`OPUS_GET_COMPLEXITY`).
-    pub fn complexity(&self) -> i32 {
-        self.complexity
+    pub fn complexity(&self) -> u8 {
+        self.complexity as u8
     }
 
     /// libopus `OPUS_SET_PHASE_INVERSION_DISABLED` on the decoder: with
@@ -5149,9 +5342,9 @@ impl OpusDecoder {
     }
 
     /// libopus `OPUS_SET_GAIN`: scales the decoded output by `gain`, in
-    /// units of 1/256 dB (Q8 dB). The range is -32768 to 32767, about
-    /// -128 to +128 dB; any other value is an error and changes nothing.
-    /// The default is 0, no scaling.
+    /// units of 1/256 dB (Q8 dB). The range of the type, -32768 to 32767,
+    /// is the range of libopus: about -128 to +128 dB. The default is 0, no
+    /// scaling.
     ///
     /// The factor is `2^(6.48814081e-4 * gain)`, which is
     /// `10^(gain / (20 * 256))`, computed as libopus's float build does.
@@ -5159,18 +5352,14 @@ impl OpusDecoder {
     /// 16-bit conversion and its soft clipping. The decoder's own state
     /// does not see the gain. [`reset_state`](Self::reset_state) keeps the
     /// value.
-    pub fn set_gain(&mut self, gain: i32) -> Result<(), Error> {
-        if !(-32768..=32767).contains(&gain) {
-            return Err(Error::bad_arg("invalid gain"));
-        }
-        self.decode_gain = gain;
-        Ok(())
+    pub fn set_gain(&mut self, gain: i16) {
+        self.decode_gain = i32::from(gain);
     }
 
     /// The gain set with [`set_gain`](Self::set_gain), in 1/256 dB
     /// (`OPUS_GET_GAIN`).
-    pub fn gain(&self) -> i32 {
-        self.decode_gain
+    pub fn gain(&self) -> i16 {
+        self.decode_gain as i16
     }
 
     /// libopus `OPUS_GET_PITCH`: the pitch period of the last decoded or
@@ -6004,18 +6193,43 @@ fn float2int16_neon_arm32(x: f32) -> i16 {
 /// around that place is bent by `x + a * x * x`. `a` is chosen so that the
 /// peak of the stretch lands on ±1. Samples beyond ±2 are cut to ±2 first.
 ///
-/// - `pcm`: interleaved samples, `frame_size * channels` of them.
-/// - `declip_mem`: one value per channel, all 0 at the start of a stream.
-///   It carries the bend that is under way from one call to the next, so
-///   that consecutive buffers join without a step.
+/// - `pcm`: interleaved samples of `channels` channels. The number of
+///   samples per channel (libopus `frame_size`) is `pcm.len() / channels`.
+/// - `declip_mem`: at least one value per channel, all 0 at the start of a
+///   stream. It carries the bend that is under way from one call to the
+///   next, so that consecutive buffers join without a step.
 ///
-/// Arguments that do not fit (no samples, a slice too short) leave `pcm`
-/// unchanged.
+/// Returns [`BadArg`](crate::ErrorKind::BadArg), and leaves `pcm` and
+/// `declip_mem` unchanged, when `channels` is 0, when `pcm.len()` is not a
+/// multiple of `channels`, or when `declip_mem` has fewer than `channels`
+/// values. An empty `pcm` changes nothing.
 ///
 /// On 64-bit ARM the result has the bits of libopus 1.6.1 built by clang:
 /// `x + a*x*x` rounds `a*x` and then adds `(a*x)*x` to `x` in one fused
 /// multiply-add, and so does the small boost of `a` (`a + a*2.4e-7`).
-pub fn pcm_soft_clip(pcm: &mut [f32], frame_size: usize, channels: usize, declip_mem: &mut [f32]) {
+///
+/// ```
+/// use opus1::pcm_soft_clip;
+///
+/// // Two channels, three samples each, interleaved.
+/// let mut pcm = [0.5, -0.5, 1.5, -1.5, 0.25, -0.25];
+/// let mut memory = [0.0; 2];
+/// pcm_soft_clip(&mut pcm, 2, &mut memory)?;
+/// assert!(pcm.iter().all(|x| x.abs() <= 1.0));
+/// # Ok::<(), opus1::Error>(())
+/// ```
+pub fn pcm_soft_clip(pcm: &mut [f32], channels: usize, declip_mem: &mut [f32]) -> Result<(), Error> {
+    if channels == 0 || !pcm.len().is_multiple_of(channels) || declip_mem.len() < channels {
+        return Err(Error::BAD_ARG);
+    }
+    soft_clip(pcm, pcm.len() / channels, channels, declip_mem);
+    Ok(())
+}
+
+/// [`pcm_soft_clip`] on `frame_size` samples per channel at the start of
+/// `pcm`, with the argument checks of libopus `opus_pcm_soft_clip`:
+/// arguments that do not fit leave `pcm` unchanged.
+fn soft_clip(pcm: &mut [f32], frame_size: usize, channels: usize, declip_mem: &mut [f32]) {
     let (n, nc) = (frame_size, channels);
     // A sample count that overflows cannot fit `pcm` either.
     let fits = n.checked_mul(nc).is_some_and(|len| len <= pcm.len());
@@ -6508,7 +6722,7 @@ mod tests {
     fn test_invalid_small_frame_size_returns_error_not_panic() {
         let mut enc =
             OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Voip).unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
         enc.set_complexity(5).unwrap();
         enc.set_vbr(false);
 
@@ -6684,8 +6898,8 @@ mod tests {
         let frame_size = 320usize;
         let mut enc =
             OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(28000)).unwrap();
-        enc.set_inband_fec(true);
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(28000).unwrap()));
+        enc.set_inband_fec(InbandFec::On);
         enc.set_packet_loss_perc(25).unwrap();
         let packets = encode_tone(&mut enc, frame_size, 40);
         // SILK-only packets, half of them or more with a copy of the frame
@@ -6763,5 +6977,124 @@ mod tests {
             result.is_err(),
             "Audio/48kHz encoder with frame_size=48 should return Err"
         );
+    }
+
+    /// The enums with a libopus number convert to it and back, and refuse
+    /// every other number, also the numbers next to theirs.
+    #[test]
+    fn settings_enums_convert_to_and_from_libopus_numbers() {
+        fn check<T>(values: &[T], raw: fn(T) -> i32)
+        where
+            T: Copy + PartialEq + core::fmt::Debug + TryFrom<i32, Error = Error>,
+        {
+            for &v in values {
+                assert_eq!(T::try_from(raw(v)), Ok(v));
+            }
+            let numbers: Vec<i32> = values.iter().map(|&v| raw(v)).collect();
+            for &n in &numbers {
+                for other in [n - 1, n + 1] {
+                    if !numbers.contains(&other) {
+                        assert_eq!(T::try_from(other).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+                    }
+                }
+            }
+            for other in [i32::MIN, -1, 0, i32::MAX] {
+                if !numbers.contains(&other) {
+                    assert!(T::try_from(other).is_err(), "{other}");
+                }
+            }
+        }
+        let apps = [Application::Voip, Application::Audio, Application::RestrictedLowDelay];
+        assert_eq!(apps.map(Application::to_raw), [2048, 2049, 2051]);
+        check(&apps, Application::to_raw);
+        let bandwidths = [
+            Bandwidth::Narrowband,
+            Bandwidth::Mediumband,
+            Bandwidth::Wideband,
+            Bandwidth::Superwideband,
+            Bandwidth::Fullband,
+        ];
+        assert_eq!(bandwidths.map(Bandwidth::to_raw), [1101, 1102, 1103, 1104, 1105]);
+        check(&bandwidths, Bandwidth::to_raw);
+        assert!(Bandwidth::try_from(OPUS_AUTO).is_err());
+        let modes = [ForcedMode::SilkOnly, ForcedMode::Hybrid, ForcedMode::CeltOnly];
+        assert_eq!(modes.map(ForcedMode::to_raw), [1000, 1001, 1002]);
+        check(&modes, ForcedMode::to_raw);
+        let signals = [Signal::Auto, Signal::Voice, Signal::Music];
+        assert_eq!(signals.map(Signal::to_raw), [OPUS_AUTO, 3001, 3002]);
+        check(&signals, Signal::to_raw);
+        let fec = [InbandFec::Off, InbandFec::On, InbandFec::OnUnlessMusic];
+        assert_eq!(fec.map(InbandFec::to_raw), [0, 1, 2]);
+        check(&fec, InbandFec::to_raw);
+        check(&FrameDuration::ALL, FrameDuration::to_raw);
+        // The defaults are those of libopus.
+        assert_eq!(Bitrate::default(), Bitrate::Auto);
+        assert_eq!(Signal::default(), Signal::Auto);
+        assert_eq!(InbandFec::default(), InbandFec::Off);
+        assert_eq!(FrameDuration::default(), FrameDuration::Argument);
+    }
+
+    /// The settings with a narrow type refuse only what libopus refuses
+    /// inside that type, and keep their value then.
+    #[test]
+    fn narrow_settings_refuse_what_libopus_refuses() {
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
+        for v in 0..=u8::MAX {
+            assert_eq!(enc.set_complexity(v).is_ok(), v <= 10, "complexity {v}");
+            assert_eq!(enc.complexity(), v.min(10), "complexity {v}");
+            assert_eq!(enc.set_packet_loss_perc(v).is_ok(), v <= 100, "loss {v}");
+            assert_eq!(enc.packet_loss_perc(), v.min(100), "loss {v}");
+            assert_eq!(enc.set_voice_ratio(Some(v)).is_ok(), v <= 100, "voice ratio {v}");
+            assert_eq!(enc.voice_ratio(), Some(v.min(100)), "voice ratio {v}");
+        }
+        for v in [0, 7, 8, 16, 24, 25, u8::MAX] {
+            let ok = (8..=24).contains(&v);
+            assert_eq!(enc.set_lsb_depth(v).is_ok(), ok, "LSB depth {v}");
+            assert_eq!(enc.lsb_depth(), if ok { v } else { 24 }, "LSB depth {v}");
+        }
+        enc.set_voice_ratio(None).unwrap();
+        assert_eq!(enc.voice_ratio(), None);
+        assert_eq!(enc.voice_ratio, -1);
+
+        // A bitrate is limited to 500 b/s and 750,000 b/s per channel, also
+        // beyond the `opus_int32` of libopus.
+        let bps = |v| Bitrate::BitsPerSecond(NonZeroU32::new(v).unwrap());
+        for (set, kept) in [(1, 500), (499, 500), (64_000, 64_000), (1_500_001, 1_500_000), (u32::MAX, 1_500_000)] {
+            enc.set_bitrate(bps(set));
+            assert_eq!(enc.bitrate_setting(), bps(kept), "bitrate {set}");
+        }
+
+        let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+        for v in 0..=u8::MAX {
+            assert_eq!(dec.set_complexity(v).is_ok(), v <= 10, "decoder complexity {v}");
+            assert_eq!(dec.complexity(), v.min(10), "decoder complexity {v}");
+        }
+        for gain in [i16::MIN, -1, 0, 1, i16::MAX] {
+            dec.set_gain(gain);
+            assert_eq!(dec.gain(), gain);
+        }
+    }
+
+    /// `pcm_soft_clip` takes the samples per channel from the length of
+    /// `pcm` and refuses arguments that do not fit.
+    #[test]
+    fn pcm_soft_clip_checks_its_arguments() {
+        let mut pcm = [1.5f32, -1.5, 1.5, -1.5, 0.0, 0.0];
+        let mut memory = [0.0f32; 2];
+        let kind = |r: Result<(), Error>| r.map_err(|e| e.kind());
+        assert_eq!(kind(pcm_soft_clip(&mut pcm, 0, &mut memory)), Err(ErrorKind::BadArg));
+        assert_eq!(kind(pcm_soft_clip(&mut pcm, 4, &mut memory)), Err(ErrorKind::BadArg));
+        assert_eq!(kind(pcm_soft_clip(&mut pcm, 3, &mut memory)), Err(ErrorKind::BadArg));
+        assert_eq!(pcm, [1.5, -1.5, 1.5, -1.5, 0.0, 0.0]);
+        // Three samples of two channels, as `soft_clip` with a frame size of
+        // 3 gives them.
+        let mut expected = pcm;
+        let mut expected_memory = memory;
+        soft_clip(&mut expected, 3, 2, &mut expected_memory);
+        pcm_soft_clip(&mut pcm, 2, &mut memory).unwrap();
+        assert_eq!(pcm, expected);
+        assert_eq!(memory, expected_memory);
+        assert!(pcm.iter().all(|x| x.abs() <= 1.0));
     }
 }

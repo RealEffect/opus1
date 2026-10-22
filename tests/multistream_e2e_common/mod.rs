@@ -95,6 +95,7 @@ pub fn mode_is_fixed(enc: &MultistreamEncoder, s: usize) -> bool {
         MappingType::Surround => stream_kind(enc, s) != StreamKind::Mono,
         MappingType::Ambisonics => true,
         MappingType::None => false,
+        other => panic!("unexpected mapping type {other:?}"),
     }
 }
 
@@ -300,7 +301,7 @@ pub fn measure_signal(setting: Setting, pcm: &[f32]) -> Measured {
     let channels = case.channels;
     let (mut rust, mut c) = encoders(&case, fs, application);
     configure(&mut rust, &mut c, bitrate, vbr);
-    rust.set_complexity(complexity).unwrap();
+    rust.set_complexity(complexity as u8).unwrap();
     c.set_complexity(complexity);
     let streams = c.streams;
 

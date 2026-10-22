@@ -178,7 +178,7 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
     for (k, (per_channel, units, frames, reset)) in steps.into_iter().enumerate() {
         let frame_size = units * unit;
         let bitrate = per_channel * channels as i32;
-        enc.set_bitrate(rust_bitrate(bitrate)).unwrap();
+        enc.set_bitrate(rust_bitrate(bitrate));
         if reset {
             enc.reset_state();
             if let Some(probe) = probe.as_mut() {
@@ -222,14 +222,14 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                 let stream = enc.stream_encoder(s).unwrap();
                 // The bitrate of the allocation, or under constant bitrate
                 // what was left for the last stream.
-                single.set_bitrate(stream.bitrate_setting()).unwrap();
+                single.set_bitrate(stream.bitrate_setting());
                 single.set_vbr(vbr);
                 let (left, right) = inputs[s];
                 // What a surround or ambisonics layout sets on a stream
                 // (opus_multistream_encoder.c:939-962).
                 match enc.mapping_type() {
                     MappingType::Surround => {
-                        single.set_bandwidth(surround_bandwidth(bitrate, channels, frame_size, fs));
+                        single.set_bandwidth(Some(surround_bandwidth(bitrate, channels, frame_size, fs)));
                         if s < enc.layout().coupled_streams() {
                             // CELT-only and two coded channels
                             // (opus_multistream_encoder.c:953-958).
@@ -244,10 +244,11 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                             Some(&mask[..]),
                             "{label}: stream {s}: energy mask"
                         );
-                        single.set_energy_mask(Some(&mask));
+                        single.set_energy_mask(Some(&mask)).unwrap();
                     }
                     MappingType::Ambisonics => single.set_force_mode(Some(ForcedMode::CeltOnly)),
                     MappingType::None => {}
+                    other => panic!("{label}: unexpected mapping type {other:?}"),
                 }
                 if !surround {
                     assert_eq!(

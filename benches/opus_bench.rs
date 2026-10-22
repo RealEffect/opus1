@@ -2,6 +2,7 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
+use std::num::NonZeroU32;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -119,7 +120,7 @@ fn bench_opus_encode_silk(c: &mut Criterion) {
                     Application::Voip,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
                 b.iter(|| {
                     enc.encode(black_box(&input), fs, black_box(&mut output))
                         .unwrap()
@@ -263,7 +264,7 @@ fn bench_opus_encode_celt(c: &mut Criterion) {
                     Application::Audio,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap()));
                 b.iter(|| {
                     enc.encode(black_box(&input), fs, black_box(&mut output))
                         .unwrap()
@@ -295,7 +296,7 @@ fn bench_silk_vs_c(c: &mut Criterion) {
                     Application::Voip,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
                 enc.set_complexity(0).unwrap();
                 let mut output = vec![0u8; 256];
                 b.iter(|| {
@@ -584,7 +585,7 @@ fn bench_opus_real(c: &mut Criterion) {
                     app,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(if sr == 48000 { 64_000 } else { 20_000 })).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(if sr == 48000 { 64_000 } else { 20_000 }).unwrap()));
                 enc.set_complexity(0).unwrap();
                 enc.set_vbr(false);
                 let mut dec = OpusDecoder::new(
@@ -957,7 +958,7 @@ fn bench_opus_encode_i16(c: &mut Criterion) {
                     Application::Voip,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
                 b.iter(|| {
                     enc.encode_i16(black_box(&input_i16), fs, black_box(&mut output))
                         .unwrap()
@@ -974,7 +975,7 @@ fn bench_opus_encode_i16(c: &mut Criterion) {
                     Application::Voip,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
                 b.iter(|| {
                     enc.encode(black_box(&input_f32), fs, black_box(&mut output))
                         .unwrap()

@@ -12,6 +12,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{speech, to_stereo};
 use opus1::internals::range_coder::RangeCoder;
@@ -92,7 +93,7 @@ fn celt_flags(
     )
     .unwrap();
     enc.set_complexity(10).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(48000 * channels as i32)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(48000 * channels as u32).unwrap()));
     enc.set_force_mode(Some(ForcedMode::CeltOnly));
     setup(&mut enc, &mut c_enc);
     let mut buf = vec![0u8; 1500];
@@ -170,7 +171,7 @@ fn celt_after_silk_starts_afresh_without_prediction_like_libopus() {
         )
         .unwrap();
         enc.set_complexity(10).unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
         let mut buf = vec![0u8; 1500];
         let (long, short) = (rate / 50, rate / 200);
         let mut at = 0;
@@ -179,7 +180,7 @@ fn celt_after_silk_starts_afresh_without_prediction_like_libopus() {
             // 300 ms of SILK-only, then 100 ms of 5 ms CELT-only frames.
             c_enc.force_mode(MODE_SILK).bandwidth(BW_WB);
             enc.set_force_mode(Some(ForcedMode::SilkOnly));
-            enc.set_bandwidth(opus1::Bandwidth::Wideband);
+            enc.set_bandwidth(Some(opus1::Bandwidth::Wideband));
             for _ in 0..15 {
                 let input = &pcm[at * channels..(at + long) * channels];
                 at += long;

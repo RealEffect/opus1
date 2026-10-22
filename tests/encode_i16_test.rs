@@ -8,7 +8,8 @@
 //! noise floor of the speech and music analysis and of CELT's bit
 //! allocation, so the float encoder of each pair is set to 16 bits.
 
-use opus1::{Application, Bitrate, Channels, ErrorKind, OpusDecoder, OpusEncoder, SampleRate};
+use std::num::NonZeroU32;
+use opus1::{Application, Bitrate, Channels, ErrorKind, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 
 /// Deterministic test signal: speech-like sine + LCG noise, moderate level.
 struct SignalGen {
@@ -83,11 +84,11 @@ impl EncConfig {
         )
         .unwrap();
         for enc in [&mut a, &mut b] {
-            enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
-            enc.set_complexity(self.complexity).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(self.bitrate as u32).unwrap()));
+            enc.set_complexity(self.complexity as u8).unwrap();
             enc.set_vbr(!self.use_cbr);
-            enc.set_inband_fec(self.fec);
-            enc.set_packet_loss_perc(self.loss).unwrap();
+            enc.set_inband_fec(if self.fec { InbandFec::On } else { InbandFec::Off });
+            enc.set_packet_loss_perc(self.loss as u8).unwrap();
         }
         a.set_lsb_depth(16).unwrap();
         (a, b)
@@ -278,8 +279,8 @@ fn encode_i16_roundtrip_decodes() {
         OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     let mut enc_b =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-    enc_a.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
-    enc_b.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc_a.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
+    enc_b.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 
     let mut signal = SignalGen::new(fs as usize);

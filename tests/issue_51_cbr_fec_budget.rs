@@ -14,11 +14,12 @@
 //! too, busted 15 at 20 and 24 kb/s and 10 at 32 kb/s. Stereo LBRR then
 //! alternated with gaps: 5-20 LBRR packets where libopus codes 29-30.
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 const SR: usize = 16000;
@@ -115,10 +116,10 @@ fn measure(ch: usize, rate: i32) -> (Counts, Counts) {
         Application::Voip,
     )
     .unwrap();
-    rs_enc.set_bitrate(Bitrate::BitsPerSecond(rate)).unwrap();
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(rate as u32).unwrap()));
     rs_enc.set_vbr(false);
-    rs_enc.set_inband_fec(true);
-    rs_enc.set_packet_loss_perc(LOSS_PERC).unwrap();
+    rs_enc.set_inband_fec(InbandFec::On);
+    rs_enc.set_packet_loss_perc(LOSS_PERC as u8).unwrap();
 
     // libopus at opus1's settings, pinned to voice, wideband and (for two
     // channels) a stereo stream, which it would otherwise drop at low rates.
@@ -126,7 +127,7 @@ fn measure(ch: usize, rate: i32) -> (Counts, Counts) {
     let mut c_enc = CEnc::new(SR as u32, c_ch, CApp::Voip).unwrap();
     c_enc.set_bitrate(CBitrate::Bits(rate)).unwrap();
     c_enc.set_vbr(false).unwrap();
-    c_enc.set_complexity(rs_enc.complexity()).unwrap();
+    c_enc.set_complexity(i32::from(rs_enc.complexity())).unwrap();
     c_enc.set_bandwidth(CBw::Wideband).unwrap();
     c_enc.set_signal(CSignal::Voice).unwrap();
     if ch == 2 {

@@ -10,6 +10,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
 use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate, packet};
@@ -82,7 +83,7 @@ fn small_buffers(rate: usize, frame_tenth_ms: &[usize]) -> Counts {
                             Application::Audio,
                         )
                         .unwrap();
-                        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                         enc.set_vbr(!cbr);
                         enc.set_complexity(5).unwrap();
                         if let Some((c_mode, forced)) = mode {
@@ -186,7 +187,7 @@ fn constant_bitrate_above_one_frame_pads_like_libopus() {
             Application::Audio,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         enc.set_vbr(false);
         enc.set_complexity(5).unwrap();
         enc.set_force_mode(Some(ForcedMode::CeltOnly));

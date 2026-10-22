@@ -252,10 +252,10 @@ impl MultistreamDecoder {
 
     /// libopus `OPUS_SET_COMPLEXITY` of a multistream decoder: sets the decoder
     /// complexity of every stream decoder (see
-    /// [`OpusDecoder::set_complexity`]). A value outside 0 to 10 is refused
-    /// with [`BadArg`](crate::ErrorKind::BadArg) and no stream changes.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
-        if !(0..=10).contains(&complexity) {
+    /// [`OpusDecoder::set_complexity`]). A value above 10 is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg) and no stream changes.
+    pub fn set_complexity(&mut self, complexity: u8) -> Result<(), Error> {
+        if complexity > 10 {
             return Err(Error::INVALID_COMPLEXITY);
         }
         for dec in &mut self.decoders {
@@ -266,22 +266,20 @@ impl MultistreamDecoder {
 
     /// libopus `OPUS_GET_COMPLEXITY` of a multistream decoder: the
     /// complexity of the first stream decoder.
-    pub fn complexity(&self) -> i32 {
+    pub fn complexity(&self) -> u8 {
         self.decoders.first().map_or(0, OpusDecoder::complexity)
     }
 
-    /// Sets the output gain of every stream, in 1/256 dB, -32768 to 32767.
-    /// libopus `OPUS_SET_GAIN`. See [`OpusDecoder::set_gain`]. Any other
-    /// value is an error and changes nothing.
-    pub fn set_gain(&mut self, gain: i32) -> Result<(), Error> {
+    /// Sets the output gain of every stream, in 1/256 dB (Q8 dB). libopus
+    /// `OPUS_SET_GAIN`. See [`OpusDecoder::set_gain`].
+    pub fn set_gain(&mut self, gain: i16) {
         for dec in &mut self.decoders {
-            dec.set_gain(gain)?;
+            dec.set_gain(gain);
         }
-        Ok(())
     }
 
     /// The output gain of the first stream. libopus `OPUS_GET_GAIN`.
-    pub fn gain(&self) -> i32 {
+    pub fn gain(&self) -> i16 {
         self.decoders.first().map_or(0, OpusDecoder::gain)
     }
 

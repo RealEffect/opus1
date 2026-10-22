@@ -69,10 +69,10 @@ use crate::{
 /// The bitrate a stream encoder gets for `value` (libopus `opus_encoder_ctl`,
 /// `OPUS_SET_BITRATE_REQUEST`): limited to 500 bits per second at least and
 /// 750 000 bits per second per channel at most. A value of 0 or less, which
-/// [`OpusEncoder::set_bitrate`] refuses, becomes 500.
+/// libopus refuses, becomes 500.
 #[inline]
 fn stream_bitrate(value: i32, stream_channels: usize) -> Bitrate {
-    Bitrate::BitsPerSecond(value.clamp(500, MAX_BITRATE_PER_CHANNEL * stream_channels as i32))
+    Bitrate::within_limits(value.clamp(500, MAX_BITRATE_PER_CHANNEL * stream_channels as i32))
 }
 
 /// The input channels of stream `s` (C `c1` and `c2`): the left and the right
@@ -130,8 +130,9 @@ pub struct MultistreamEncoder {
     /// C `st->bitrate_bps`: `OPUS_AUTO`, `OPUS_BITRATE_MAX` or bits per
     /// second for all channels together.
     bitrate_bps: i32,
-    /// What `set_bandwidth` was given last.
-    user_bandwidth: Bandwidth,
+    /// What `set_bandwidth` was given last: `None` for the automatic
+    /// choice.
+    user_bandwidth: Option<Bandwidth>,
     /// What `set_max_bandwidth` was given last.
     max_bandwidth: Bandwidth,
     /// One encoder per stream. The first `coupled_streams` are stereo.
@@ -258,7 +259,7 @@ impl MultistreamEncoder {
             application,
             sampling_rate,
             bitrate_bps: OPUS_AUTO,
-            user_bandwidth: Bandwidth::Auto,
+            user_bandwidth: None,
             max_bandwidth: Bandwidth::Fullband,
             encoders,
             stream_inputs,
@@ -499,11 +500,9 @@ impl MultistreamEncoder {
 
         // Settings of every stream encoder for this frame.
         for (s, enc) in self.encoders.iter_mut().enumerate() {
-            // The bitrate is positive and within the limits, so it is
-            // accepted.
-            let _ = enc.set_bitrate(stream_bitrate(self.rates[s], enc.channels().count()));
+            enc.set_bitrate(stream_bitrate(self.rates[s], enc.channels().count()));
             if let Some(bandwidth) = surround_bandwidth {
-                enc.set_bandwidth(bandwidth);
+                enc.set_bandwidth(Some(bandwidth));
                 if s < coupled {
                     // "To preserve the spatial image, force stereo CELT on
                     // coupled streams" (opus_multistream_encoder.c:953-958):
@@ -537,7 +536,9 @@ impl MultistreamEncoder {
                 // the right. D6: the values are copied. Without a mask the
                 // stream encoder is told so, which also drops the mask of an
                 // earlier frame.
-                enc.set_energy_mask(if have_mask {
+                // The mask has 21 values per channel of the stream, the
+                // length the stream encoder takes.
+                let _ = enc.set_energy_mask(if have_mask {
                     Some(stream_mask(&mut band_log_e, &self.band_smr, c1, c2))
                 } else {
                     None
@@ -550,7 +551,7 @@ impl MultistreamEncoder {
             let curr_max = stream_max_bytes(max_data_bytes, tot_size, streams, s, frame_size, fs)?;
             if !vbr && last {
                 // Constant bitrate: the last stream fills what is left.
-                let _ = enc.set_bitrate(stream_bitrate(
+                enc.set_bitrate(stream_bitrate(
                     cbr_last_stream_bitrate(curr_max, frame_size, fs)?,
                     stream_channels,
                 ));
@@ -606,20 +607,19 @@ impl MultistreamEncoder {
 
     /// Sets the total bitrate. libopus `OPUS_SET_BITRATE`.
     ///
-    /// An explicit value must be positive. It is limited to 500 to 750 000
-    /// bits per second per input channel. The default is [`Bitrate::Auto`].
-    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), Error> {
+    /// An explicit value is limited to 500 to 750 000 bits per second per
+    /// input channel. The default is [`Bitrate::Auto`].
+    pub fn set_bitrate(&mut self, bitrate: Bitrate) {
         self.bitrate_bps = match bitrate {
             Bitrate::Auto => OPUS_AUTO,
             Bitrate::Max => OPUS_BITRATE_MAX,
+            // A layout has at least one channel and the value is positive,
+            // so the limits apply and the clamp never fails.
             Bitrate::BitsPerSecond(bps) => {
-                if bps <= 0 {
-                    return Err(Error::INVALID_BITRATE);
-                }
-                clamp_user_bitrate(bps, self.layout.channels())?
+                clamp_user_bitrate(Bitrate::bps_to_i32(bps), self.layout.channels())
+                    .unwrap_or(self.bitrate_bps)
             }
         };
-        Ok(())
     }
 
     /// The bitrate that was set, after its limits were applied.
@@ -627,7 +627,7 @@ impl MultistreamEncoder {
         match self.bitrate_bps {
             OPUS_AUTO => Bitrate::Auto,
             OPUS_BITRATE_MAX => Bitrate::Max,
-            bps => Bitrate::BitsPerSecond(bps),
+            bps => Bitrate::within_limits(bps),
         }
     }
 
@@ -648,9 +648,10 @@ impl MultistreamEncoder {
     // --- Settings forwarded to every stream encoder ---
 
     /// Sets the complexity, 0 to 10, on every stream. libopus
-    /// `OPUS_SET_COMPLEXITY`. The default is 9.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
-        if !(0..=10).contains(&complexity) {
+    /// `OPUS_SET_COMPLEXITY`. The default is 9. A value above 10 is refused
+    /// with [`BadArg`](crate::ErrorKind::BadArg) and no stream changes.
+    pub fn set_complexity(&mut self, complexity: u8) -> Result<(), Error> {
+        if complexity > 10 {
             return Err(Error::INVALID_COMPLEXITY);
         }
         for enc in &mut self.encoders {
@@ -660,7 +661,7 @@ impl MultistreamEncoder {
     }
 
     /// The complexity of the first stream. libopus `OPUS_GET_COMPLEXITY`.
-    pub fn complexity(&self) -> i32 {
+    pub fn complexity(&self) -> u8 {
         self.encoders.first().map_or(0, |enc| enc.complexity())
     }
 
@@ -696,33 +697,19 @@ impl MultistreamEncoder {
         self.encoders.first().is_none_or(|enc| enc.vbr_constraint())
     }
 
-    /// Turns in-band forward error correction on or off on every stream.
+    /// Sets in-band forward error correction (FEC) on every stream.
     /// libopus `OPUS_SET_INBAND_FEC`. Only streams coded with SILK carry it.
-    pub fn set_inband_fec(&mut self, enabled: bool) {
+    /// See [`OpusEncoder::set_inband_fec`].
+    pub fn set_inband_fec(&mut self, fec: InbandFec) {
         for enc in &mut self.encoders {
-            enc.set_inband_fec(enabled);
+            enc.set_inband_fec(fec);
         }
     }
 
-    /// Whether in-band forward error correction is on in the first stream.
-    /// libopus `OPUS_GET_INBAND_FEC`.
-    pub fn inband_fec(&self) -> bool {
-        self.encoders.first().is_some_and(|enc| enc.inband_fec())
-    }
-
-    /// Sets one of the three in-band FEC settings of libopus on every
-    /// stream (`OPUS_SET_INBAND_FEC` 0, 1 or 2). See
-    /// [`OpusEncoder::set_inband_fec_mode`].
-    pub fn set_inband_fec_mode(&mut self, mode: InbandFec) {
-        for enc in &mut self.encoders {
-            enc.set_inband_fec_mode(mode);
-        }
-    }
-
-    /// The in-band FEC setting of the first stream (libopus
-    /// `OPUS_GET_INBAND_FEC`).
-    pub fn inband_fec_mode(&self) -> InbandFec {
-        self.encoders.first().map_or(InbandFec::Off, |enc| enc.inband_fec_mode())
+    /// The in-band FEC setting of the first stream. libopus
+    /// `OPUS_GET_INBAND_FEC`.
+    pub fn inband_fec(&self) -> InbandFec {
+        self.encoders.first().map_or(InbandFec::Off, |enc| enc.inband_fec())
     }
 
     /// Says what the input is, on every stream. libopus `OPUS_SET_SIGNAL`.
@@ -740,8 +727,9 @@ impl MultistreamEncoder {
 
     /// Sets the precision of the input in bits, 8 to 24, on every stream.
     /// libopus `OPUS_SET_LSB_DEPTH`. See [`OpusEncoder::set_lsb_depth`]. Any
-    /// other value is an error, and the setting stays.
-    pub fn set_lsb_depth(&mut self, depth: i32) -> Result<(), Error> {
+    /// other value is refused with [`BadArg`](crate::ErrorKind::BadArg),
+    /// and the setting stays.
+    pub fn set_lsb_depth(&mut self, depth: u8) -> Result<(), Error> {
         if !(8..=24).contains(&depth) {
             return Err(Error::INVALID_LSB_DEPTH);
         }
@@ -753,7 +741,7 @@ impl MultistreamEncoder {
 
     /// The input precision of the first stream. libopus
     /// `OPUS_GET_LSB_DEPTH`.
-    pub fn lsb_depth(&self) -> i32 {
+    pub fn lsb_depth(&self) -> u8 {
         self.encoders.first().map_or(24, |enc| enc.lsb_depth())
     }
 
@@ -777,9 +765,10 @@ impl MultistreamEncoder {
     }
 
     /// Sets the expected packet loss, 0 to 100 percent, on every stream.
-    /// libopus `OPUS_SET_PACKET_LOSS_PERC`.
-    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), Error> {
-        if !(0..=100).contains(&percent) {
+    /// libopus `OPUS_SET_PACKET_LOSS_PERC`. A value above 100 is refused
+    /// with [`BadArg`](crate::ErrorKind::BadArg) and no stream changes.
+    pub fn set_packet_loss_perc(&mut self, percent: u8) -> Result<(), Error> {
+        if percent > 100 {
             return Err(Error::INVALID_PACKET_LOSS);
         }
         for enc in &mut self.encoders {
@@ -790,48 +779,45 @@ impl MultistreamEncoder {
 
     /// The expected packet loss of the first stream in percent. libopus
     /// `OPUS_GET_PACKET_LOSS_PERC`.
-    pub fn packet_loss_perc(&self) -> i32 {
+    pub fn packet_loss_perc(&self) -> u8 {
         self.encoders.first().map_or(0, |enc| enc.packet_loss_perc())
     }
 
     /// Sets the audio bandwidth every stream codes. libopus
-    /// `OPUS_SET_BANDWIDTH`. `Bandwidth::Auto`, the default, lets each
-    /// stream decide from its bitrate.
+    /// `OPUS_SET_BANDWIDTH`. `None`, the default, lets each stream decide
+    /// from its bitrate (libopus `OPUS_AUTO`).
     ///
     /// In surround mode the encoder sets the bandwidth of every stream
     /// again on every frame, exactly like libopus, so this has no effect
     /// there. The LFE stream is always narrowband.
-    pub fn set_bandwidth(&mut self, bandwidth: Bandwidth) {
+    pub fn set_bandwidth(&mut self, bandwidth: Option<Bandwidth>) {
         self.user_bandwidth = bandwidth;
         for enc in &mut self.encoders {
             enc.set_bandwidth(bandwidth);
         }
     }
 
-    /// What [`set_bandwidth`](Self::set_bandwidth) was given last.
+    /// What [`set_bandwidth`](Self::set_bandwidth) was given last: `None`
+    /// when each stream chooses the bandwidth itself.
     ///
     /// This is the setting. libopus `OPUS_GET_BANDWIDTH` reports something
     /// else: the bandwidth the first stream coded last. The TOC byte of a
     /// stream of the packet tells that.
-    pub fn bandwidth(&self) -> Bandwidth {
+    pub fn bandwidth_setting(&self) -> Option<Bandwidth> {
         self.user_bandwidth
     }
 
     /// Sets the widest audio bandwidth the automatic choice of a stream may
-    /// take. libopus `OPUS_SET_MAX_BANDWIDTH`. `Bandwidth::Auto` is not a
-    /// bandwidth and is rejected. The default is fullband.
+    /// take. libopus `OPUS_SET_MAX_BANDWIDTH`. The default is
+    /// [`Bandwidth::Fullband`].
     ///
     /// A bandwidth set with [`set_bandwidth`](Self::set_bandwidth), or by
     /// the encoder in surround mode, is not limited by it.
-    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) -> Result<(), Error> {
-        if bandwidth == Bandwidth::Auto {
-            return Err(Error::INVALID_MAX_BANDWIDTH);
-        }
+    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) {
         for enc in &mut self.encoders {
-            enc.set_max_bandwidth(bandwidth)?;
+            enc.set_max_bandwidth(bandwidth);
         }
         self.max_bandwidth = bandwidth;
-        Ok(())
     }
 
     /// What [`set_max_bandwidth`](Self::set_max_bandwidth) was given last.
@@ -922,11 +908,12 @@ impl MultistreamEncoder {
         self.encoders.first().is_some_and(|enc| enc.phase_inversion_disabled())
     }
 
-    /// The voice ratio of the first stream, in percent, or -1. libopus
-    /// `OPUS_GET_VOICE_RATIO`; see [`OpusEncoder::voice_ratio`]. libopus
-    /// has no multistream `OPUS_SET_VOICE_RATIO`.
-    pub fn voice_ratio(&self) -> i32 {
-        self.encoders.first().map_or(-1, |enc| enc.voice_ratio())
+    /// The voice ratio of the first stream, in percent, or `None` when it
+    /// is not known (libopus -1). libopus `OPUS_GET_VOICE_RATIO`; see
+    /// [`OpusEncoder::voice_ratio`]. libopus has no multistream
+    /// `OPUS_SET_VOICE_RATIO`.
+    pub fn voice_ratio(&self) -> Option<u8> {
+        self.encoders.first().and_then(|enc| enc.voice_ratio())
     }
 
     // --- State ---
@@ -1100,7 +1087,7 @@ mod tests {
 
     #[test]
     fn stream_bitrate_follows_the_stream_encoder_control() {
-        let bps = Bitrate::BitsPerSecond;
+        let bps = |value| Bitrate::BitsPerSecond(core::num::NonZeroU32::new(value).unwrap());
         assert_eq!(stream_bitrate(1, 1), bps(500));
         assert_eq!(stream_bitrate(500, 2), bps(500));
         assert_eq!(stream_bitrate(64_000, 1), bps(64_000));
@@ -1111,7 +1098,7 @@ mod tests {
         let mut enc =
             OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         for value in [i32::MIN, 0, 1, 500, 64_000, 2_000_000, i32::MAX] {
-            enc.set_bitrate(stream_bitrate(value, 2)).unwrap();
+            enc.set_bitrate(stream_bitrate(value, 2));
             assert_eq!(enc.bitrate_setting(), stream_bitrate(value, 2), "{value}");
         }
     }
@@ -1125,21 +1112,20 @@ mod tests {
             Application::Audio,
         )
         .unwrap();
+        let bps = |value| Bitrate::BitsPerSecond(core::num::NonZeroU32::new(value).unwrap());
         assert_eq!(enc.bitrate_setting(), Bitrate::Auto);
-        enc.set_bitrate(Bitrate::Max).unwrap();
+        enc.set_bitrate(Bitrate::Max);
         assert_eq!(enc.bitrate_setting(), Bitrate::Max);
-        enc.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
-        assert_eq!(enc.bitrate_setting(), Bitrate::BitsPerSecond(256_000));
+        enc.set_bitrate(bps(256_000));
+        assert_eq!(enc.bitrate_setting(), bps(256_000));
         // Limited to 500 and 750 000 bits per second per channel.
-        enc.set_bitrate(Bitrate::BitsPerSecond(1)).unwrap();
-        assert_eq!(enc.bitrate_setting(), Bitrate::BitsPerSecond(3000));
-        enc.set_bitrate(Bitrate::BitsPerSecond(i32::MAX)).unwrap();
-        assert_eq!(enc.bitrate_setting(), Bitrate::BitsPerSecond(4_500_000));
-        // The two special values of libopus are not bitrates here.
-        for bad in [0, -1, -1000, i32::MIN] {
-            assert!(enc.set_bitrate(Bitrate::BitsPerSecond(bad)).is_err());
-            assert_eq!(enc.bitrate_setting(), Bitrate::BitsPerSecond(4_500_000));
-        }
+        enc.set_bitrate(bps(1));
+        assert_eq!(enc.bitrate_setting(), bps(3000));
+        enc.set_bitrate(bps(i32::MAX as u32));
+        assert_eq!(enc.bitrate_setting(), bps(4_500_000));
+        // Above the `opus_int32` of libopus the same limit applies.
+        enc.set_bitrate(bps(u32::MAX));
+        assert_eq!(enc.bitrate_setting(), bps(4_500_000));
     }
 
     #[test]

@@ -45,10 +45,11 @@ mod dnn_plc_common;
 mod k24_common;
 mod ms_support;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use dnn_dec_common::{CDec, CMsDec, Coding, c_encode, first_difference, rs_encode, splice};
 use opus1::multistream::MultistreamDecoder;
-use opus1::{Application, Bitrate, Channels, OpusDecoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, SampleRate};
 
 fn all() -> bool {
     std::env::var_os("OPUS1_DNN_PLC_ALL").is_some_and(|v| v != "0")
@@ -285,8 +286,8 @@ fn compare(packets: &[Vec<u8>], rate: usize, channels: usize, complexity: i32, l
     let set = |c: &mut CDec, c16: &mut CDec, d: &mut OpusDecoder, d16: &mut OpusDecoder, value| {
         c.set_complexity(value);
         c16.set_complexity(value);
-        d.set_complexity(value).unwrap();
-        d16.set_complexity(value).unwrap();
+        d.set_complexity(value as u8).unwrap();
+        d16.set_complexity(value as u8).unwrap();
     };
     set(&mut c, &mut c16, &mut d, &mut d16, complexity);
     let mut out = vec![0f32; rate * channels];
@@ -501,9 +502,9 @@ fn multistream_matches_libopus() {
         packet_sets.push((format!("libopus {bitrate} b/s"), enc.encode_all(&pcm, 960), layout));
         let mut ours =
             opus1::multistream::MultistreamEncoder::new_surround(SampleRate::Hz48000, channels, 1, Application::Voip).unwrap();
-        ours.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        ours.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         if fec {
-            ours.set_inband_fec(true);
+            ours.set_inband_fec(InbandFec::On);
             ours.set_packet_loss_perc(20).unwrap();
         }
         let layout = ours.layout();
@@ -545,8 +546,8 @@ fn multistream_matches_libopus() {
                     .unwrap();
                     c.set_complexity(complexity);
                     c16.set_complexity(complexity);
-                    d.set_complexity(complexity).unwrap();
-                    d16.set_complexity(complexity).unwrap();
+                    d.set_complexity(complexity as u8).unwrap();
+                    d16.set_complexity(complexity as u8).unwrap();
                     let mut out = vec![0f32; 5760 * channels];
                     let mut out16 = vec![0i16; 5760 * channels];
                     for (index, call) in calls(packets, rate, loss, 3).into_iter().enumerate() {

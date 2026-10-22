@@ -18,6 +18,7 @@
 //! 24 kHz has nothing above 8 kHz, and scored 96 dB even with the fault.
 
 mod k24_common;
+use std::num::NonZeroU32;
 use k24_common::*;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
@@ -70,7 +71,7 @@ fn own_encoder_24k_voip_packets_decode_like_libopus() {
     // speech and would leave the CELT layer of the Hybrid packets empty.
     let pcm = speech_fullband(24000, 3.0);
     let mut enc = OpusEncoder::new(SampleRate::Hz24000, Channels::Mono, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     let mut buf = [0u8; 1500];
     let packets: Vec<Vec<u8>> = pcm
         .as_chunks::<480>().0.iter()

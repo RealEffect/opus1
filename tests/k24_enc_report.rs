@@ -9,6 +9,7 @@
 //! ```
 
 mod k24_enc_common;
+use std::num::NonZeroU32;
 use k24_enc_common::*;
 use opus1::Bitrate;
 
@@ -422,7 +423,7 @@ fn bitrate_switch() {
                 let mut enc = rs_encoder(&cfg);
                 let mut all = Vec::new();
                 for (k, &b) in schedule.iter().enumerate() {
-                    enc.set_bitrate(Bitrate::BitsPerSecond(b)).unwrap();
+                    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(b as u32).unwrap()));
                     all.extend(enc_rs_with(&mut enc, &cfg, &speech[k * FS..(k + 1) * FS])?);
                 }
                 Ok(all)

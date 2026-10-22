@@ -47,13 +47,14 @@
 //! own.
 //!
 //! ```
+//! use core::num::NonZeroU32;
 //! use opus1::multistream::MultistreamEncoder;
 //! use opus1::{Application, Bitrate, SampleRate};
 //!
 //! // 5.1 at 48 kHz: front left, centre, front right, rear left, rear
 //! // right, LFE.
 //! let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio)?;
-//! encoder.set_bitrate(Bitrate::BitsPerSecond(256_000))?;
+//! encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(256_000).unwrap()));
 //!
 //! // Two stereo streams (front and rear), then the centre and the LFE
 //! // channel as mono streams. An Ogg Opus header stores these numbers and

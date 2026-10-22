@@ -21,6 +21,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{multitone, speech};
 use opus1::{Application, Bandwidth, Bitrate, Channels, OpusEncoder, SampleRate};
@@ -51,10 +52,10 @@ fn level_distance_after_a_narrow_packet(small: usize) -> f64 {
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(56_000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(56_000).unwrap()));
     enc.set_vbr(false);
     enc.set_complexity(0).unwrap();
-    enc.set_max_bandwidth(Bandwidth::Superwideband).unwrap();
+    enc.set_max_bandwidth(Bandwidth::Superwideband);
     let (mut dec, mut c_dec) = (CDecoder::new(rate, 1), CDecoder::new(rate, 1));
 
     let mut worst = 0f64;

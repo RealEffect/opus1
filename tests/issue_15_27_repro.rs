@@ -10,9 +10,10 @@
 //!   2. The encoder omitted per-frame / LBRR stereo headers -> bitstream desync.
 //!   3. Multi-frame (40/60 ms) SILK packets decoded only their first frame.
 
+use std::num::NonZeroU32;
 use opus1::internals::silk::SilkResampler;
 use opus1::internals::silk::dec_api::SilkDecoder;
-use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 /// Delay-compensated SNR: SILK decode introduces an algorithmic delay, so
@@ -155,7 +156,7 @@ fn issue_15_resampler_short_output_no_panic() {
 fn issue_27_1_stereo_silk_40ms_encode_no_panic() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     enc.set_vbr(false);
     let frame = 640; // 40 ms @ 16 kHz
     let input = sine_input(frame, 16000, 2);
@@ -178,7 +179,7 @@ fn issue_27_1_stereo_silk_40ms_encode_no_panic() {
 fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     enc.set_vbr(false);
     let frame = 640;
 
@@ -219,8 +220,8 @@ fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
 fn issue_27_2b_stereo_fec_roundtrip_consistent() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
-    enc.set_inband_fec(true);
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
+    enc.set_inband_fec(InbandFec::On);
     enc.set_packet_loss_perc(40).unwrap();
     let frame = 320; // 20 ms
 
@@ -254,9 +255,9 @@ fn issue_27_2b_stereo_fec_roundtrip_consistent() {
 fn issue_27_2b_stereo_fec_cbr_roundtrip_consistent() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
     enc.set_vbr(false);
-    enc.set_inband_fec(true);
+    enc.set_inband_fec(InbandFec::On);
     enc.set_packet_loss_perc(40).unwrap();
     let frame = 320; // 20 ms
 
@@ -297,7 +298,7 @@ fn issue_27_2b_stereo_fec_cbr_roundtrip_consistent() {
 #[test]
 fn issue_27_3_silk_40ms_mono_full_decode() {
     let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     enc.set_vbr(false);
     let frame = 640;
 
@@ -325,7 +326,7 @@ fn issue_27_3_silk_40ms_mono_full_decode() {
 #[test]
 fn issue_27_3_silk_40ms_resampled_full_decode() {
     let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     enc.set_vbr(false);
     let enc_frame = 640; // 40 ms @ 16 kHz
 

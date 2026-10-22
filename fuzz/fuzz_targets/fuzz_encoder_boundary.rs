@@ -1,7 +1,8 @@
 #![no_main]
 
+use std::num::NonZeroU32;
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusEncoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
@@ -24,20 +25,21 @@ fuzz_target!(|data: &[u8]| {
                 };
 
                 // Test extreme bitrate values
-                let bitrates = [
+                let bitrates: [u32; 8] = [
                     500,  // Very low
                     6000, // Minimum recommended
                     16000, 32000, 64000, 128000, 256000, 510000, // Maximum
                 ];
-                let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(bitrates[data[0] as usize % bitrates.len()]));
+                let bitrate = bitrates[data[0] as usize % bitrates.len()];
+                encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate).unwrap()));
 
                 // Test complexity values (0-10, with edge cases)
                 let _ = encoder.set_complexity(match data[1] % 5 {
                     0 => 0,
                     1 => 5,
                     2 => 10,
-                    3 => -1, // Invalid, should be handled
-                    _ => (data[1] % 11) as i32,
+                    3 => 11, // Invalid, should be handled
+                    _ => data[1] % 11,
                 });
 
                 // Test packet loss percentage
@@ -45,12 +47,12 @@ fuzz_target!(|data: &[u8]| {
                     0 => 0,
                     1 => 50,
                     2 => 100,
-                    3 => -1,  // Invalid
-                    _ => 101, // Invalid
+                    3 => u8::MAX, // Invalid
+                    _ => 101,     // Invalid
                 });
 
                 // Test FEC settings
-                encoder.set_inband_fec(data[3] % 2 == 0);
+                encoder.set_inband_fec(if data[3] % 2 == 0 { InbandFec::On } else { InbandFec::Off });
                 encoder.set_vbr(data[4] % 2 != 0);
 
                 // Test frame sizes based on sample rate

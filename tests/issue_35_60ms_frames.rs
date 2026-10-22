@@ -10,6 +10,7 @@
 //! libopus with the full duration and track the input, and libopus's own
 //! 40/60 ms packet must decode in opus1.
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Channels as CCh, Decoder as CDec, Encoder as CEnc,
 };
@@ -115,7 +116,7 @@ fn rust_enc_c_dec(
         app,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     enc.set_vbr(!cbr);
     let mut dec = CDec::new(rate as u32, c_channels(ch)).unwrap();
     let (mut ref_pcm, mut out_pcm) = (Vec::new(), Vec::new());
@@ -256,7 +257,7 @@ fn issue_repro_exact_config() {
     assert!(n > 1);
     assert_eq!(enc.bitrate(), 33_000);
     let mut c_enc = CEnc::new(16000, CCh::Stereo, CApp::Voip).unwrap();
-    c_enc.set_complexity(enc.complexity()).unwrap();
+    c_enc.set_complexity(i32::from(enc.complexity())).unwrap();
     c_enc.encode_float(&pcm, &mut c_out).unwrap();
     assert_eq!(out[0], c_out[0], "the TOC byte differs from libopus's");
     assert_eq!(out[0], 0x5c, "expected one SILK WB 60 ms stereo frame, got {:#04x}", out[0]);
@@ -268,12 +269,12 @@ fn issue_repro_exact_config() {
     // code 3).
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
     let mut c_enc = CEnc::new(16000, CCh::Stereo, CApp::Voip).unwrap();
     c_enc.set_bitrate(opus::Bitrate::Bits(64000)).unwrap();
-    c_enc.set_complexity(enc.complexity()).unwrap();
+    c_enc.set_complexity(i32::from(enc.complexity())).unwrap();
     c_enc.encode_float(&pcm, &mut c_out).unwrap();
     assert_eq!(out[0], c_out[0], "the TOC byte differs from libopus's");
     assert_eq!(out[0], 0xbf, "expected three CELT WB 20 ms frames, got {:#04x}", out[0]);
@@ -284,7 +285,7 @@ fn issue_repro_exact_config() {
     // SILK frame: TOC config 11 = SILK wideband 60 ms.
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
     assert_eq!(out[0] >> 3, 11, "expected SILK WB 60 ms TOC, got {:#04x}", out[0]);

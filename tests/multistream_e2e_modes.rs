@@ -69,7 +69,7 @@ fn run(
     let bitrate = per_channel * case.channels as i32;
     let (mut rust, mut c) = encoders(case, fs, application);
     configure(&mut rust, &mut c, bitrate, true);
-    rust.set_complexity(complexity).unwrap();
+    rust.set_complexity(complexity as u8).unwrap();
     c.set_complexity(complexity);
     let streams = c.streams;
     // The signal without noise: libopus takes it for music, and it has

@@ -4,6 +4,8 @@
 //!
 //! Run it with `cargo run --release --example multistream`.
 
+use std::num::NonZeroU32;
+
 /// The multistream module needs the `std` feature, which is on by default.
 #[cfg(not(feature = "std"))]
 fn main() {
@@ -36,7 +38,7 @@ fn main() -> Result<(), opus1::Error> {
     // 6 channels the encoder knows that the last one is the LFE channel.
     let mut encoder =
         MultistreamEncoder::new_surround(SAMPLE_RATE, CHANNELS, 1, Application::Audio)?;
-    encoder.set_bitrate(Bitrate::BitsPerSecond(BITRATE))?;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(BITRATE as u32).unwrap()));
 
     // The layout the encoder chose. A file format stores these numbers in
     // its header; here they go straight to the decoder.

@@ -24,9 +24,10 @@ mod k24_common;
 mod ms_support;
 mod multistream_dec_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::resample;
-use opus1::{Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, ForcedMode, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 
@@ -177,7 +178,7 @@ fn rs_encode(coding: &Coding, pcm: &[f32]) -> Vec<Vec<u8>> {
     )
     .unwrap();
     if coding.fec {
-        enc.set_inband_fec(true);
+        enc.set_inband_fec(InbandFec::On);
         enc.set_packet_loss_perc(20).unwrap();
     }
     if coding.force_hybrid {
@@ -186,7 +187,7 @@ fn rs_encode(coding: &Coding, pcm: &[f32]) -> Vec<Vec<u8>> {
     let mut buf = vec![0u8; 4000];
     let channels = coding.channels;
     encode_frames(coding, pcm, |frame, bitrate| {
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         let len = enc.encode(frame, frame.len() / channels, &mut buf).unwrap();
         buf[..len].to_vec()
     })

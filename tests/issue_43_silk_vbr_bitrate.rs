@@ -14,6 +14,7 @@
 //! yet subtract the LBRR bits from the frame target, so neither regime is
 //! comparable on size.
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Encoder as CEnc,
     Signal as CSignal,
@@ -111,7 +112,7 @@ fn rs_packets(setup: Setup, cbr: bool, buf_len: usize) -> Vec<Vec<u8>> {
     // detector to say otherwise (opus_encoder.c: `equiv_rate >= threshold`).
     // The libopus side below is kept in SILK with the voice signal hint.
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
-    enc.set_bitrate(Bitrate::BitsPerSecond(setup.bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(setup.bitrate as u32).unwrap()));
     enc.set_vbr(!cbr);
     let mut out = vec![0u8; buf_len];
     (0..PACKETS)

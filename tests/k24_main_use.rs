@@ -20,6 +20,7 @@
 //! delay. Each check requires 100 dB.
 
 mod k24_common;
+use std::num::NonZeroU32;
 use k24_common::*;
 use opus1::{Bitrate, Channels, SampleRate};
 
@@ -112,8 +113,8 @@ fn own_encoder_stream_decodes_like_libopus() {
                 opus1::Application::Voip,
             )
             .unwrap();
-            enc_f.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
-            enc_i.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc_f.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+            enc_i.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             // `encode_i16` codes at a depth of 16 bits, as libopus
             // `opus_encode` does; the float input says so to give the
             // same packets.

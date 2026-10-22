@@ -83,10 +83,11 @@ Most tests drive opus1 and libopus with the same input and settings, then compar
 The final-range check, written as a test of the kind the suite contains:
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
 let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 
 let frame = 320; // 20 ms at 16 kHz

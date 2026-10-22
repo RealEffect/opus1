@@ -429,7 +429,7 @@ impl Pair {
             Channels::try_from(channels).unwrap(),
         )
         .unwrap();
-        r.set_complexity(complexity).unwrap();
+        r.set_complexity(complexity as u8).unwrap();
         Pair { c, r, channels }
     }
 

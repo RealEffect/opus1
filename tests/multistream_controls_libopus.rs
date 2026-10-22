@@ -10,6 +10,7 @@
 
 mod ms_support;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use ms_support::*;
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
@@ -161,7 +162,7 @@ fn prediction_and_phase_inversion_are_forwarded_as_libopus_does() {
             let label = format!("layout {layout:?}, prediction off {prediction_disabled}, inversion off {inversion_disabled}");
             let (mut rust, mut c) = pair(layout, APP_AUDIO);
             let bitrate = 28_000 * streams as i32;
-            rust.set_bitrate(opus1::Bitrate::BitsPerSecond(bitrate)).unwrap();
+            rust.set_bitrate(opus1::Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             c.set_bitrate(bitrate);
             rust.set_force_mode(Some(ForcedMode::CeltOnly));
             c.ctl(OPUS_SET_FORCE_MODE_REQUEST, MODE_CELT_ONLY);
@@ -225,7 +226,7 @@ fn application_and_voice_ratio_follow_libopus() {
                 let n = rust.encode(f, FRAME, &mut out).unwrap();
                 same_bytes(&out[..n], &expected, &format!("{label}: packet {i}"));
                 let get = OPUS_GET_VOICE_RATIO_REQUEST;
-                assert_eq!(rust.voice_ratio(), c.get(get), "{label}: voice ratio after {i}");
+                assert_eq!(rust.voice_ratio().map_or(-1, i32::from), c.get(get), "{label}: voice ratio after {i}");
             }
             for (c_other, other) in apps {
                 let c_ok = c.try_ctl(sys::OPUS_SET_APPLICATION_REQUEST, c_other) == 0;
@@ -254,7 +255,7 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
             c_enc.ctl(OPUS_SET_FORCE_MODE_REQUEST, mode);
             packets.push(c_enc.encode_float(f, FRAME, max_packet_bytes(streams)).unwrap());
         }
-        for (gain, inversion) in [(None, None), (Some(-3000), Some(true)), (Some(32767), Some(false)), (Some(-32768), None), (Some(700), Some(true))] {
+        for (gain, inversion) in [(None, None), (Some(-3000i16), Some(true)), (Some(32767), Some(false)), (Some(-32768), None), (Some(700), Some(true))] {
             let label = format!("layout {layout:?}, gain {gain:?}, inversion off {inversion:?}");
             let mut rust = MultistreamDecoder::with_layout(
                 SampleRate::try_from(FS).unwrap(),
@@ -269,14 +270,14 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
             assert_eq!(rust.phase_inversion_disabled() as i32, c.get(get_inv), "{label}: default");
             assert_eq!(rust.phase_inversion_disabled(), coupled == 0, "{label}: default");
             if let Some(g) = gain {
-                assert_eq!(c.try_ctl(sys::OPUS_SET_GAIN_REQUEST, g), 0);
-                rust.set_gain(g).unwrap();
+                assert_eq!(c.try_ctl(sys::OPUS_SET_GAIN_REQUEST, i32::from(g)), 0);
+                rust.set_gain(g);
             }
             if let Some(off) = inversion {
                 assert_eq!(c.try_ctl(sys::OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST, off as i32), 0);
                 rust.set_phase_inversion_disabled(off);
             }
-            assert_eq!(rust.gain(), c.get(sys::OPUS_GET_GAIN_REQUEST), "{label}");
+            assert_eq!(i32::from(rust.gain()), c.get(sys::OPUS_GET_GAIN_REQUEST), "{label}");
             assert_eq!(rust.phase_inversion_disabled() as i32, c.get(get_inv), "{label}");
             let mut out = vec![0f32; MAX_FRAME * channels];
             let mut out24 = vec![0i32; MAX_FRAME * channels];
@@ -290,8 +291,8 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
             .unwrap();
             let mut c24 = CMsDecoder::new(FS, channels, streams, coupled, mapping).unwrap();
             if let Some(g) = gain {
-                assert_eq!(c24.try_ctl(sys::OPUS_SET_GAIN_REQUEST, g), 0);
-                rust24.set_gain(g).unwrap();
+                assert_eq!(c24.try_ctl(sys::OPUS_SET_GAIN_REQUEST, i32::from(g)), 0);
+                rust24.set_gain(g);
             }
             if let Some(off) = inversion {
                 assert_eq!(c24.try_ctl(sys::OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST, off as i32), 0);
@@ -309,7 +310,8 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
                 assert!(out24[..n * channels] == expected[..], "{label}: 24-bit");
             }
         }
-        // Out-of-range gains: refused by both, the setting stays.
+        // Gains outside the range of an `i16`, which opus1's `set_gain`
+        // cannot be given: libopus refuses them, and the setting stays.
         let mut rust = MultistreamDecoder::with_layout(
             SampleRate::try_from(FS).unwrap(),
             channels,
@@ -319,12 +321,11 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
         )
         .unwrap();
         let mut c = CMsDecoder::new(FS, channels, streams, coupled, mapping).unwrap();
-        rust.set_gain(-100).unwrap();
+        rust.set_gain(-100);
         assert_eq!(c.try_ctl(sys::OPUS_SET_GAIN_REQUEST, -100), 0);
         for v in [i32::MIN, -32769, 32768, i32::MAX] {
             assert_eq!(c.try_ctl(sys::OPUS_SET_GAIN_REQUEST, v), OPUS_BAD_ARG, "gain {v}");
-            assert!(rust.set_gain(v).is_err(), "gain {v}");
-            assert_eq!(rust.gain(), c.get(sys::OPUS_GET_GAIN_REQUEST), "gain {v}");
+            assert_eq!(i32::from(rust.gain()), c.get(sys::OPUS_GET_GAIN_REQUEST), "gain {v}");
         }
     }
 }

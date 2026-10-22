@@ -93,10 +93,53 @@ test that compares opus1 with the C library under the same settings.
   max_dred_samples, SampleRate, defer_processing: bool)` takes a
   `DredProcessing` (`Now`, `Deferred`, exported at the crate root) instead of
   the bool. `DredParse` is `#[non_exhaustive]`.
+- Settings types and enums. The same changes apply to `OpusEncoder`,
+  `OpusDecoder`, `MultistreamEncoder` and `MultistreamDecoder`:
+  - `Application`, `ForcedMode`, `Signal`, `InbandFec` and
+    `multistream::MappingType` are `#[non_exhaustive]`, like `ErrorKind` and
+    `SampleRate`. A `match` on them needs a `_` arm.
+  - Every small enum derives `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq` and
+    `Hash`. `Application`, `Bandwidth`, `Signal`, `ForcedMode`, `InbandFec`
+    and `FrameDuration` have `const fn to_raw(self) -> i32` (the libopus
+    number) and `TryFrom<i32>` (`BadArg` for other numbers). `ForcedMode`
+    has the numbers of libopus's `MODE_*` (1000 to 1002), `Signal::Auto` is
+    `OPUS_AUTO` (-1000). `Bitrate`, `Signal`, `InbandFec` and
+    `FrameDuration` implement `Default` (`Auto`, `Auto`, `Off`, `Argument`).
+  - `Bandwidth::Auto` is removed: `Bandwidth` has the five real bandwidths.
+    `set_bandwidth(Bandwidth)` -> `set_bandwidth(Option<Bandwidth>)`, where
+    `None` is the automatic choice. New `bandwidth_setting() ->
+    Option<Bandwidth>` on `OpusEncoder`; `MultistreamEncoder::bandwidth()`,
+    which returned the setting, is renamed `bandwidth_setting()`.
+    `set_max_bandwidth(Bandwidth)` no longer fails and returns `()`.
+  - `Bitrate::BitsPerSecond(i32)` -> `Bitrate::BitsPerSecond(NonZeroU32)`.
+    `set_bitrate` no longer fails and returns `()`: every value is limited to
+    500 to 750,000 b/s per channel, as before.
+  - Small integers: `set_complexity(u8)` and `complexity() -> u8` on all four
+    codecs; `set_packet_loss_perc(u8)`, `packet_loss_perc() -> u8`,
+    `set_lsb_depth(u8)` and `lsb_depth() -> u8` on both encoders;
+    `OpusEncoder::set_voice_ratio(Option<u8>)` (`None` is libopus -1) and
+    `voice_ratio() -> Option<u8>` (also on `MultistreamEncoder`);
+    `OpusEncoder::set_dred_duration(u8)` and `dred_duration() -> u8`. They
+    still refuse a complexity above 10, a loss or voice ratio above 100, a
+    depth outside 8 to 24 and a DRED duration above 104. The decoders'
+    `set_gain(i16)` no longer fails and returns `()`; `gain() -> i16`.
+  - In-band FEC has one interface: `set_inband_fec(InbandFec)` and
+    `inband_fec() -> InbandFec` on both encoders. `set_inband_fec(bool)`,
+    `inband_fec() -> bool`, `set_inband_fec_mode` and `inband_fec_mode` are
+    removed.
+  - `OpusEncoder::set_energy_mask(Option<&[f32]>)` returns `Result<(),
+    Error>`: a slice of another length than 21 values per channel is
+    `BadArg` and keeps the mask. It used to clear the mask.
+  - `pcm_soft_clip(pcm, frame_size, channels, declip_mem)` ->
+    `pcm_soft_clip(pcm, channels, declip_mem) -> Result<(), Error>`. The
+    number of samples per channel is `pcm.len() / channels`. No channels, a
+    length that is not a multiple of `channels` and fewer memory values than
+    channels are `BadArg`; they used to leave `pcm` unchanged silently.
 - `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
   so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
   call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
-  `set_bandwidth(Bandwidth::Superwideband)` or `set_bandwidth(Bandwidth::Fullband)`,
+  `set_bandwidth(Some(Bandwidth::Superwideband))` or
+  `set_bandwidth(Some(Bandwidth::Fullband))`,
   so that low bitrates do not fall back to wideband SILK.
 - The public field `OpusDecoder::hybrid_skip_celt` is removed. The decoder never
   read it.
@@ -105,10 +148,9 @@ test that compares opus1 with the C library under the same settings.
   `complexity`, `set_vbr` and `vbr` (instead of `use_cbr`, with the opposite
   meaning), `set_inband_fec` and `inband_fec`, `set_packet_loss_perc` and
   `packet_loss_perc`. Each setter checks its value as libopus's `OPUS_SET_*`
-  request does. A bitrate of 0 or less, a complexity outside 0-10 and a packet
-  loss outside 0-100 % are errors, and the setting keeps its old value. A
-  bitrate is raised to at least 500 b/s and limited to at most 750,000 b/s per
-  channel. The encoder no longer
+  request does. A complexity above 10 and a packet loss above 100 % are
+  errors, and the setting keeps its old value. A bitrate is raised to at
+  least 500 b/s and limited to at most 750,000 b/s per channel. The encoder no longer
   clamps the settings on every `encode` call.
 - The default bitrate of `OpusEncoder` is libopus's automatic one,
   `Bitrate::Auto`: 60 × rate / frame size + rate × channels b/s, for example
@@ -193,9 +235,9 @@ test that compares opus1 with the C library under the same settings.
   `OPUS_SET_DTX`, `OPUS_GET_IN_DTX`), with both kinds of DTX of libopus: that
   of the Opus layer, which uses the analysis, and SILK's.
 - New encoder controls of libopus: `set_signal` with the type `Signal`
-  (`OPUS_SET_SIGNAL`), `set_lsb_depth` (`OPUS_SET_LSB_DEPTH`) and
-  `set_inband_fec_mode` with the type `InbandFec` (`OPUS_SET_INBAND_FEC` 2,
-  FEC that does not move music to SILK). The multistream encoder forwards
+  (`OPUS_SET_SIGNAL`), `set_lsb_depth` (`OPUS_SET_LSB_DEPTH`) and the type
+  `InbandFec` for `set_inband_fec` (`OPUS_SET_INBAND_FEC` 2, FEC that does
+  not move music to SILK). The multistream encoder forwards
   them to every stream.
 - The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity`, `set_osce_bwe` and `set_dnn_blob` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/10](10-differences-from-libopus.md)).
 - `OpusDecoder::last_packet_duration()` and `packet::has_lbrr()`, as libopus has them.

@@ -11,6 +11,7 @@
 //! opus1's with both decoders, and require agreement at lag 0. Before the
 //! fix every window after the first packet sat near 0 dB.
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
@@ -100,7 +101,7 @@ fn opus1_packets(ch: usize) -> Vec<Vec<u8>> {
         Application::Voip,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     let mut pkt = vec![0u8; 1500];
     input
         .chunks_exact(frame * ch)

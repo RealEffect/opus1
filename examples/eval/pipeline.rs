@@ -25,6 +25,7 @@
 //!    its reference is the 48 kHz reference resampled to 16 kHz, and a
 //!    decoded signal at another rate is resampled to 16 kHz first.
 
+use std::num::NonZeroU32;
 use crate::corpus::{Class, Item};
 use crate::degrade::Degrade;
 use crate::libopus::{self, CDecoder, CEncoder};
@@ -34,7 +35,7 @@ use opus1::internals::eval::compare::{Reference, opus_compare};
 use opus1::internals::eval::demo::{BitPacket, decode_bitstream};
 use opus1::internals::eval::moc::{moc, moc_relative};
 use opus1::{
-    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusDecoder, OpusEncoder, SampleRate,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -74,7 +75,6 @@ pub enum Mode {
 /// The short name of a forced bandwidth in a condition's name.
 fn bandwidth_name(bw: Bandwidth) -> &'static str {
     match bw {
-        Bandwidth::Auto => "auto",
         Bandwidth::Narrowband => "nb",
         Bandwidth::Mediumband => "mb",
         Bandwidth::Wideband => "wb",
@@ -377,10 +377,12 @@ impl Encoder {
                 };
                 let (rate, channels) = cond.opus1_format()?;
                 let mut e = OpusEncoder::new(rate, channels, application).map_err(|e| format!("OpusEncoder::new: {e}"))?;
-                e.set_complexity(cond.complexity).map_err(|e| format!("set_complexity: {e}"))?;
+                let complexity = u8::try_from(cond.complexity).map_err(|_| "set_complexity: invalid complexity")?;
+                e.set_complexity(complexity).map_err(|e| format!("set_complexity: {e}"))?;
                 e.set_vbr(!cond.cbr);
-                e.set_inband_fec(cond.fec);
-                e.set_packet_loss_perc(cond.loss_perc).map_err(|e| format!("set_packet_loss_perc: {e}"))?;
+                e.set_inband_fec(if cond.fec { InbandFec::On } else { InbandFec::Off });
+                let loss_perc = u8::try_from(cond.loss_perc).map_err(|_| "set_packet_loss_perc: invalid packet loss percentage")?;
+                e.set_packet_loss_perc(loss_perc).map_err(|e| format!("set_packet_loss_perc: {e}"))?;
                 if let Some(mode) = cond.mode {
                     e.set_force_mode(Some(match mode {
                         Mode::Silk => ForcedMode::SilkOnly,
@@ -389,10 +391,10 @@ impl Encoder {
                     }));
                 }
                 if let Some(bw) = cond.bandwidth {
-                    e.set_bandwidth(bw);
+                    e.set_bandwidth(Some(bw));
                 }
                 if let Some(mask) = degrade.and_then(|d| d.energy_mask(cond)) {
-                    e.set_energy_mask(Some(&mask));
+                    e.set_energy_mask(Some(&mask)).map_err(|e| format!("set_energy_mask: {e}"))?;
                 }
                 Ok(Encoder::Opus1(Box::new(e)))
             }
@@ -414,7 +416,7 @@ impl Encoder {
                 }
                 if let Some(bw) = cond.bandwidth {
                     // opus1's values are libopus's `OPUS_BANDWIDTH_*`.
-                    e.ctl(ffi::OPUS_SET_BANDWIDTH_REQUEST, bw as i32)?;
+                    e.ctl(ffi::OPUS_SET_BANDWIDTH_REQUEST, bw.to_raw())?;
                 }
                 Ok(Encoder::Libopus(e))
             }
@@ -423,7 +425,11 @@ impl Encoder {
 
     fn set_bitrate(&mut self, bitrate: i32) -> Result<(), String> {
         match self {
-            Encoder::Opus1(e) => e.set_bitrate(Bitrate::BitsPerSecond(bitrate)).map_err(|e| format!("set_bitrate: {e}")),
+            Encoder::Opus1(e) => {
+                let bitrate = u32::try_from(bitrate).ok().and_then(NonZeroU32::new).ok_or("set_bitrate: invalid bitrate")?;
+                e.set_bitrate(Bitrate::BitsPerSecond(bitrate));
+                Ok(())
+            }
             Encoder::Libopus(e) => e.ctl(ffi::OPUS_SET_BITRATE_REQUEST, bitrate),
         }
     }
@@ -461,9 +467,9 @@ impl Encoder {
                 bitrate: e.bitrate(),
                 vbr: e.vbr(),
                 vbr_constraint: e.vbr_constraint(),
-                complexity: e.complexity(),
-                inband_fec: i32::from(e.inband_fec()),
-                packet_loss_perc: e.packet_loss_perc(),
+                complexity: i32::from(e.complexity()),
+                inband_fec: e.inband_fec().to_raw(),
+                packet_loss_perc: i32::from(e.packet_loss_perc()),
                 force_channels: e.force_channels().map_or(OPUS_AUTO, |c| c.count() as i32),
                 expert_frame_duration: e.expert_frame_duration() as i32,
                 prediction_disabled: e.prediction_disabled(),

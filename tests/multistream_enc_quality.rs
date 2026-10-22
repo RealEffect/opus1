@@ -223,7 +223,7 @@ enum MaskGiven {
 fn coupled_streams_equal_to_a_stereo_encoder(vbr: bool, given: MaskGiven) -> (usize, usize) {
     let case = Case::family("7.1", 8, 1);
     let mut enc = rust_encoder(&case, FS, Application::Audio);
-    enc.set_bitrate(rust_bitrate(320_000)).unwrap();
+    enc.set_bitrate(rust_bitrate(320_000));
     enc.set_vbr(vbr);
     let pcm = voiced(FS, 8, FS as usize);
     let packets = rust_encode_all(&mut enc, &pcm, FRAME);
@@ -252,10 +252,10 @@ fn coupled_streams_equal_to_a_stereo_encoder(vbr: bool, given: MaskGiven) -> (us
             Application::Audio,
         )
         .unwrap();
-        single.set_bitrate(enc.stream_encoder(stream).unwrap().bitrate_setting()).unwrap();
+        single.set_bitrate(enc.stream_encoder(stream).unwrap().bitrate_setting());
         single.set_vbr(vbr);
         single.set_force_mode(Some(ForcedMode::CeltOnly));
-        single.set_bandwidth(Bandwidth::Fullband);
+        single.set_bandwidth(Some(Bandwidth::Fullband));
         let mut out = vec![0u8; 1500];
         for (f, frame) in pcm.as_chunks::<{ FRAME * 8 }>().0.iter().enumerate() {
             let stereo: Vec<f32> = frame
@@ -277,7 +277,7 @@ fn coupled_streams_equal_to_a_stereo_encoder(vbr: bool, given: MaskGiven) -> (us
                 }
                 MaskGiven::Nothing => Vec::new(),
             };
-            single.set_energy_mask((given != MaskGiven::Nothing).then_some(&mask[..]));
+            single.set_energy_mask((given != MaskGiven::Nothing).then_some(&mask[..])).unwrap();
             let n = single.encode(&stereo, FRAME, &mut out).unwrap();
             let parts = split_streams(&packets[f], layout.streams()).unwrap();
             equal += usize::from(parts[stream].packet == out[..n]);

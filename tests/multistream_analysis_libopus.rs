@@ -15,7 +15,7 @@
 //!    float and 16-bit input, VBR and CBR.
 //! 2. The analysis each stream coded its last frame with is what libopus's
 //!    `run_analysis` gives for that stream's channels, in every mode.
-//! 3. The controls `set_signal`, `set_lsb_depth` and `set_inband_fec_mode`
+//! 3. The controls `set_signal`, `set_lsb_depth` and `set_inband_fec`
 //!    reach every stream, as libopus forwards them.
 //! 4. With an expert frame duration the analysis reads the caller's whole
 //!    buffer, as libopus's does.
@@ -146,7 +146,7 @@ fn celt_only_packets_are_libopus() {
                 let i16_input = rng.below(2) == 0;
                 let (mut rust, mut c) = encoders(case, fs, Application::Audio);
                 configure(&mut rust, &mut c, per_channel * case.channels as i32, vbr);
-                rust.set_complexity(complexity).unwrap();
+                rust.set_complexity(complexity as u8).unwrap();
                 c.set_complexity(complexity);
                 rust.set_force_mode(Some(ForcedMode::CeltOnly));
                 c.ctl(OPUS_SET_FORCE_MODE_REQUEST, MODE_CELT_ONLY);
@@ -186,8 +186,8 @@ fn the_analysis_of_each_stream_is_libopus() {
                 let per_channel = [12_000, 24_000, 64_000][rng.below(3)];
                 let i16_input = rng.below(2) == 0;
                 let (mut rust, _) = encoders(case, fs, application);
-                rust.set_bitrate(rust_bitrate(per_channel * case.channels as i32)).unwrap();
-                rust.set_complexity(7 + rng.below(4) as i32).unwrap();
+                rust.set_bitrate(rust_bitrate(per_channel * case.channels as i32));
+                rust.set_complexity((7 + rng.below(4) as i32) as u8).unwrap();
                 let layouts = stream_channels(&rust);
                 let mut c: Vec<CAnalysis> = layouts.iter().map(|_| CAnalysis::new(fs)).collect();
                 let frame_size = fs as usize * frame_ms / 1000;
@@ -264,21 +264,21 @@ fn controls_reach_every_stream() {
     let mut rust = rust_encoder(&case, 48_000, Application::Audio);
     assert_eq!(rust.signal(), Signal::Auto);
     assert_eq!(rust.lsb_depth(), 24);
-    assert_eq!(rust.inband_fec_mode(), InbandFec::Off);
+    assert_eq!(rust.inband_fec(), InbandFec::Off);
     rust.set_signal(Signal::Voice);
     rust.set_lsb_depth(12).unwrap();
     assert!(rust.set_lsb_depth(25).is_err());
     assert!(rust.set_lsb_depth(7).is_err());
-    rust.set_inband_fec_mode(InbandFec::OnUnlessMusic);
+    rust.set_inband_fec(InbandFec::OnUnlessMusic);
     for s in 0..rust.layout().streams() {
         let enc = rust.stream_encoder(s).unwrap();
         assert_eq!(enc.signal(), Signal::Voice);
         assert_eq!(enc.lsb_depth(), 12);
-        assert_eq!(enc.inband_fec_mode(), InbandFec::OnUnlessMusic);
+        assert_eq!(enc.inband_fec(), InbandFec::OnUnlessMusic);
     }
     assert_eq!(rust.signal(), Signal::Voice);
     assert_eq!(rust.lsb_depth(), 12);
-    assert!(rust.inband_fec());
+    assert_eq!(rust.inband_fec(), InbandFec::OnUnlessMusic);
 
     let mut failures = Vec::new();
     for case in [Case::family("family 255, 3 channels", 3, 255), Case::family("5.1", 6, 1)] {
@@ -290,19 +290,12 @@ fn controls_reach_every_stream() {
                 rust.set_force_mode(Some(ForcedMode::CeltOnly));
                 c.ctl(OPUS_SET_FORCE_MODE_REQUEST, MODE_CELT_ONLY);
                 rust.set_signal(signal_type);
-                c.ctl(
-                    audiopus_sys::OPUS_SET_SIGNAL_REQUEST,
-                    match signal_type {
-                        Signal::Auto => OPUS_AUTO,
-                        Signal::Voice => audiopus_sys::OPUS_SIGNAL_VOICE,
-                        Signal::Music => audiopus_sys::OPUS_SIGNAL_MUSIC,
-                    },
-                );
+                c.ctl(audiopus_sys::OPUS_SET_SIGNAL_REQUEST, signal_type.to_raw());
                 rust.set_lsb_depth(lsb).unwrap();
-                c.ctl(audiopus_sys::OPUS_SET_LSB_DEPTH_REQUEST, lsb);
-                rust.set_inband_fec_mode(fec);
+                c.ctl(audiopus_sys::OPUS_SET_LSB_DEPTH_REQUEST, i32::from(lsb));
+                rust.set_inband_fec(fec);
                 rust.set_packet_loss_perc(10).unwrap();
-                c.ctl(audiopus_sys::OPUS_SET_INBAND_FEC_REQUEST, fec as i32);
+                c.ctl(audiopus_sys::OPUS_SET_INBAND_FEC_REQUEST, fec.to_raw());
                 c.set_packet_loss_perc(10);
                 let (rs, cp) = encode_both(&mut rust, &mut c, &pcm, 960, false);
                 if let Some(k) = rs.iter().zip(&cp).position(|(a, b)| a != b) {

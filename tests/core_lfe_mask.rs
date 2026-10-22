@@ -9,9 +9,10 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo, toc};
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 use opus1::packet::Framing;
 
 /// What an LFE channel carries: tones at 38 and 71 Hz that swell twice a
@@ -128,7 +129,7 @@ fn lfe_streams_have_libopus_first_bytes_sizes_and_quality() {
                     )
                     .unwrap();
                     enc.set_lfe(true);
-                    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                     enc.set_vbr(!cbr);
                     let packets = encode_all(&mut enc, &pcm, frame);
 
@@ -211,7 +212,7 @@ fn lfe_tones_come_back_like_from_libopus() {
             )
             .unwrap();
             enc.set_lfe(true);
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             let packets = encode_all(&mut enc, &pcm, frame);
             let rs_snr = c_decoded_snr(&packets, &pcm, rate, frame);
             // Without the flag the same bitrate gives far less: the bits go
@@ -222,9 +223,9 @@ fn lfe_tones_come_back_like_from_libopus() {
                 Application::Audio,
             )
             .unwrap();
-            plain.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            plain.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             plain.set_force_mode(Some(ForcedMode::CeltOnly));
-            plain.set_bandwidth(Bandwidth::Narrowband);
+            plain.set_bandwidth(Some(Bandwidth::Narrowband));
             let plain_snr = c_decoded_snr(&encode_all(&mut plain, &pcm, frame), &pcm, rate, frame);
             println!("{rate} Hz, {bitrate} b/s: opus1 {rs_snr:.1} dB, libopus {c_snr:.1} dB; opus1 without the LFE flag {plain_snr:.1} dB");
             assert!(rs_snr > 12.0 && rs_snr > c_snr - 2.0, "{rate} Hz, {bitrate} b/s: opus1 {rs_snr:.1} dB, libopus {c_snr:.1} dB");
@@ -279,10 +280,12 @@ impl Stream {
         )
         .unwrap();
         enc.set_force_mode(Some(self.mode.0));
-        enc.set_bandwidth(self.bandwidth.0);
-        enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
+        enc.set_bandwidth(Some(self.bandwidth.0));
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(self.bitrate as u32).unwrap()));
         enc.set_vbr(!cbr);
-        enc.set_energy_mask(mask);
+        // opus1 takes exactly 21 values per channel; libopus reads that
+        // many from the start of the array.
+        enc.set_energy_mask(mask.map(|m| &m[..21 * self.channels])).unwrap();
         (c_enc.encode_all(pcm, frame), encode_all(&mut enc, pcm, frame))
     }
 
@@ -395,14 +398,14 @@ fn a_changing_energy_mask_moves_celt_packet_sizes_like_libopus() {
             )
             .unwrap();
             enc.set_force_mode(Some(stream.mode.0));
-            enc.set_bandwidth(stream.bandwidth.0);
-            enc.set_bitrate(Bitrate::BitsPerSecond(stream.bitrate)).unwrap();
+            enc.set_bandwidth(Some(stream.bandwidth.0));
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(stream.bitrate as u32).unwrap()));
             let mut buf = vec![0u8; 4000];
             let (mut c_sizes, mut rs_sizes) = (Vec::new(), Vec::new());
             for (i, f) in pcm.chunks_exact(frame * stream.channels).enumerate() {
                 let mask = [if is_deep(i) { deep } else { shallow }; 42];
                 c_enc.energy_mask(Some(&mask));
-                enc.set_energy_mask(Some(&mask));
+                enc.set_energy_mask(Some(&mask[..21 * stream.channels])).unwrap();
                 c_sizes.push(c_enc.encode(f).len());
                 rs_sizes.push(enc.encode(f, frame, &mut buf).unwrap());
             }
@@ -492,9 +495,9 @@ fn a_mask_cannot_make_a_hybrid_stream_run_away() {
         let mut enc =
             OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
         enc.set_force_mode(Some(ForcedMode::Hybrid));
-        enc.set_bandwidth(Bandwidth::Fullband);
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
-        enc.set_energy_mask(Some(&[mask_value; 21]));
+        enc.set_bandwidth(Some(Bandwidth::Fullband));
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+        enc.set_energy_mask(Some(&[mask_value; 21])).unwrap();
         let mut dec = CDecoder::new(48000, 1);
         let mut buf = vec![0u8; 4000];
         for (i, f) in pcm.as_chunks::<960>().0.iter().enumerate() {
@@ -515,8 +518,8 @@ fn an_lfe_encoder_ignores_the_mask() {
         let mut enc =
             OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
         enc.set_lfe(true);
-        enc.set_bitrate(Bitrate::BitsPerSecond(6000)).unwrap();
-        enc.set_energy_mask(mask);
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(6000).unwrap()));
+        enc.set_energy_mask(mask).unwrap();
         encode_all(&mut enc, &pcm, 960)
     };
     let plain = encode(None);
@@ -626,7 +629,7 @@ fn a_mask_of_any_values_gives_packets_libopus_decodes() {
                             )
                             .unwrap();
                             enc.set_force_mode(mode);
-                            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                             enc.set_vbr(!cbr);
                             enc.set_lfe(lfe);
                             let mut dec = CDecoder::new(rate, channels);
@@ -644,7 +647,7 @@ fn a_mask_of_any_values_gives_packets_libopus_decodes() {
                                         _ => (random() % 8001) as f32 / 1000.0 - 4.0,
                                     })
                                     .collect();
-                                enc.set_energy_mask(Some(&mask));
+                                enc.set_energy_mask(Some(&mask)).unwrap();
                                 let n = enc.encode(f, frame, &mut buf).unwrap_or_else(|e| panic!("{what}, packet {i}: {e}"));
                                 assert!(n <= 3 * nominal + 20, "{what}, packet {i}: {n} bytes");
                                 let out = dec
@@ -724,12 +727,12 @@ fn lfe_wins_over_application_mode_bandwidth_and_fec_like_libopus() {
                             )
                             .unwrap();
                             enc.set_lfe(true);
-                            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                             enc.set_vbr(!cbr);
-                            enc.set_complexity(complexity).unwrap();
-                            enc.set_inband_fec(fec);
+                            enc.set_complexity(complexity as u8).unwrap();
+                            enc.set_inband_fec(if fec { InbandFec::On } else { InbandFec::Off });
                             enc.set_packet_loss_perc(10).unwrap();
-                            enc.set_bandwidth(Bandwidth::Fullband);
+                            enc.set_bandwidth(Some(Bandwidth::Fullband));
                             if let Some((mode, c_mode)) = forced {
                                 c_enc.force_mode(c_mode);
                                 enc.set_force_mode(Some(mode));

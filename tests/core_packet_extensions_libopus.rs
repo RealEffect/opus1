@@ -16,6 +16,7 @@
 //! encoder and by `packet::write`, and padded with extensions or with
 //! random bytes.
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use opus1::SampleRate;
 use opus1::extensions::{self, Extension, ExtensionIterator};
@@ -887,7 +888,7 @@ fn malformed_packets_give_the_errors_of_libopus() {
 fn encoded_packets_with_extensions_decode_as_without() {
     use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
     let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     enc.set_vbr(false);
     let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut dec_plain = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();

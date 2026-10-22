@@ -51,6 +51,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
@@ -144,8 +145,8 @@ impl Setup {
             self.app.rs,
         )
         .unwrap();
-        enc.set_complexity(self.complexity).unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
+        enc.set_complexity(self.complexity as u8).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(self.bitrate as u32).unwrap()));
         enc.set_vbr(self.rc != Rc::Cbr);
         enc.set_vbr_constraint(self.rc == Rc::Cvbr);
         enc.set_force_mode(self.force);
@@ -158,18 +159,10 @@ impl Setup {
         enc.complexity(self.complexity).bitrate(self.bitrate).vbr(self.rc != Rc::Cbr);
         enc.set(sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, (self.rc == Rc::Cvbr) as i32);
         if let Some(mode) = self.force {
-            enc.force_mode(c_mode(mode));
+            enc.force_mode(mode.to_raw());
         }
         enc.set(sys::OPUS_SET_DTX_REQUEST, 1);
         enc
-    }
-}
-
-fn c_mode(mode: ForcedMode) -> i32 {
-    match mode {
-        ForcedMode::SilkOnly => MODE_SILK,
-        ForcedMode::Hybrid => MODE_HYBRID,
-        ForcedMode::CeltOnly => MODE_CELT,
     }
 }
 
@@ -687,7 +680,7 @@ fn settings_change_and_reset_in_a_running_stream() {
                         match STEPS[(k / 23) % STEPS.len()] {
                             Step::Complexity(complexity) => {
                                 c.complexity(complexity);
-                                rs.set_complexity(complexity).unwrap();
+                                rs.set_complexity(complexity as u8).unwrap();
                             }
                             Step::Dtx(on) => {
                                 c.set(sys::OPUS_SET_DTX_REQUEST, on as i32);
@@ -877,7 +870,7 @@ fn a_switch_to_celt_only_inside_a_dtx_pause_is_libopus() {
                 let mut c = s.c_encoder();
                 let mut rs = s.rs_encoder();
                 c.bandwidth(BW_WB);
-                rs.set_bandwidth(opus1::Bandwidth::Wideband);
+                rs.set_bandwidth(Some(opus1::Bandwidth::Wideband));
                 let mut run = Run::default();
                 let mut out = vec![0u8; MAX_PACKET];
                 for k in 0..input.f32.len() / s.frame {

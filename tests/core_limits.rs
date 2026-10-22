@@ -5,6 +5,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{chirp, to_stereo};
 use opus1::{
@@ -95,15 +96,16 @@ fn encoder_frame_sizes_beyond_any_buffer_are_errors() {
 }
 
 /// `pcm_soft_clip` and the packet functions with counts and lengths that do
-/// not fit: nothing is changed, nothing panics.
+/// not fit: they are refused, nothing is changed, nothing panics.
 #[test]
 fn helper_functions_take_counts_that_do_not_fit() {
     let original = [1.5f32, -1.5, 1.5, -1.5];
-    for (frame_size, channels) in [(1usize << 63, 2usize), (usize::MAX, 2), (usize::MAX / 2 + 1, 2), (2, usize::MAX), (usize::MAX, usize::MAX), (3, 2)] {
+    for channels in [0usize, 3, 5, 1 << 63, usize::MAX / 2 + 1, usize::MAX] {
         let mut pcm = original;
         let mut mem = [0f32; 2];
-        pcm_soft_clip(&mut pcm, frame_size, channels, &mut mem);
-        assert_eq!(pcm, original, "frame_size {frame_size:#x}, channels {channels:#x}");
+        assert!(pcm_soft_clip(&mut pcm, channels, &mut mem).is_err(), "channels {channels:#x}");
+        assert_eq!(pcm, original, "channels {channels:#x}");
+        assert_eq!(mem, [0.0; 2], "channels {channels:#x}");
     }
 
     let mut data = [0x4Cu8, 1, 2, 3, 0, 0, 0, 0];
@@ -207,7 +209,7 @@ fn frames_longer_than_1275_bytes_are_rejected_like_libopus() {
 #[test]
 fn encoder_at_extreme_settings_writes_packets_libopus_decodes() {
     let modes = [None, Some(ForcedMode::SilkOnly), Some(ForcedMode::Hybrid), Some(ForcedMode::CeltOnly)];
-    let bandwidths = [Bandwidth::Auto, Bandwidth::Narrowband, Bandwidth::Mediumband, Bandwidth::Superwideband, Bandwidth::Fullband];
+    let bandwidths = [None, Some(Bandwidth::Narrowband), Some(Bandwidth::Mediumband), Some(Bandwidth::Superwideband), Some(Bandwidth::Fullband)];
     let (mut packets, mut errors) = (0usize, 0usize);
     for (rate, channels) in [(8000usize, 2usize), (12000, 1), (24000, 1), (48000, 2)] {
         let mono = chirp(rate, rate / 4);
@@ -229,7 +231,7 @@ fn encoder_at_extreme_settings_writes_packets_libopus_decodes() {
                             .unwrap();
                             enc.set_force_mode(mode);
                             enc.set_bandwidth(bandwidth);
-                            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                             enc.set_vbr(!cbr);
                             let mut c_dec = CDecoder::new(rate, channels);
                             let mut buf = vec![0u8; room];
@@ -278,7 +280,7 @@ fn large_celt_narrowband_stereo_packets_have_the_decoders_final_range() {
             )
             .unwrap();
             enc.set_force_mode(Some(ForcedMode::CeltOnly));
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             enc.set_vbr(!cbr);
             let mut c_dec = CDecoder::new(rate, 2);
             let mut dec = OpusDecoder::new(
@@ -404,7 +406,7 @@ fn insane_frames(application: (i32, Application), mode: Option<(i32, ForcedMode)
         application.1,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
     enc.set_complexity(5).unwrap();
     if let Some((c_mode, forced)) = mode {
         c_enc.force_mode(c_mode);

@@ -11,6 +11,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
 use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
@@ -55,7 +56,7 @@ fn celt_streams(rate: usize, bitrate: i32, cbr: bool, input: &[f32]) -> (Decoded
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     enc.set_complexity(5).unwrap();
     enc.set_vbr(!cbr);
     enc.set_force_mode(Some(ForcedMode::CeltOnly));
@@ -149,7 +150,7 @@ fn stereo_input_at_low_bitrates_has_the_channel_count_of_libopus() {
             let step = (i / 4) % 64;
             let bitrate = 8000 + 1000 * step.abs_diff(32) as i32;
             c_enc.bitrate(bitrate);
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             let n = enc.encode(pcm, frame, &mut buf).unwrap();
             let c_packet = c_enc.encode(pcm);
             c_dec.decode(Some(&buf[..n]), frame, false).unwrap();

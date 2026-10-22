@@ -58,18 +58,20 @@ fn complexity_matches_a_libopus_with_the_features() {
     let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut c = CDec::new(48000, 1);
     assert_eq!((d.complexity(), c.get(OPUS_GET_COMPLEXITY_REQUEST)), (0, (sys::OPUS_OK, 0)));
-    for value in [-1, 0, 4, 5, 6, 7, 10, 11, i32::MIN, i32::MAX] {
+    for value in [-1, 0, 4, 5, 6, 7, 10, 11, 255, i32::MIN, i32::MAX] {
         let want = c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, value);
-        let got = match d.set_complexity(value) {
-            Ok(()) => sys::OPUS_OK,
-            Err(e) => e.to_raw(),
+        // A value that opus1's `u8` cannot hold is refused by libopus.
+        let got = match u8::try_from(value).map(|v| d.set_complexity(v)) {
+            Ok(Ok(())) => sys::OPUS_OK,
+            Ok(Err(e)) => e.to_raw(),
+            Err(_) => sys::OPUS_BAD_ARG,
         };
         assert_eq!(got, want, "complexity {value}");
-        assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, d.complexity()));
+        assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, i32::from(d.complexity())));
     }
     d.reset_state();
     c.reset();
-    assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, d.complexity()));
+    assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, i32::from(d.complexity())));
 }
 
 /// libopus takes 0 and 1 and refuses other values with `OPUS_BAD_ARG`;

@@ -34,9 +34,10 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 
 const LONG_MS: [usize; 3] = [80, 100, 120];
 /// The durations of the parts: libopus codes no frame longer than 60 ms.
@@ -121,21 +122,21 @@ impl Setting {
             self.app.rs,
         )
         .unwrap();
-        rs.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
+        rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(self.bitrate as u32).unwrap()));
         rs.set_vbr(vbr);
         rs.set_vbr_constraint(constrained);
-        rs.set_complexity(self.complexity).unwrap();
-        rs.set_inband_fec(self.fec);
+        rs.set_complexity(self.complexity as u8).unwrap();
+        rs.set_inband_fec(if self.fec { InbandFec::On } else { InbandFec::Off });
         rs.set_packet_loss_perc(loss).unwrap();
         let mut c = CEncoder::new(self.fs, self.channels, self.app.c);
-        c.bitrate(self.bitrate).vbr(vbr).complexity(self.complexity).fec(self.fec, loss);
+        c.bitrate(self.bitrate).vbr(vbr).complexity(self.complexity).fec(self.fec, i32::from(loss));
         c.set(audiopus_sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, constrained as i32);
         if let Some((c_mode, mode)) = self.force {
             rs.set_force_mode(Some(mode));
             c.force_mode(c_mode);
         }
         if let Some((c_bw, bw)) = self.bandwidth {
-            rs.set_bandwidth(bw);
+            rs.set_bandwidth(Some(bw));
             c.bandwidth(c_bw);
         }
         (rs, c)
@@ -476,7 +477,7 @@ fn check_celt_cbr_bytes(fs: usize, channels: usize, bitrate: i32, out_len: usize
         Application::RestrictedLowDelay,
     )
     .unwrap();
-    rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     rs.set_vbr(false);
     rs.set_complexity(5).unwrap();
     let mut c = CEncoder::new(fs, channels, APP_LOWDELAY);
@@ -538,11 +539,11 @@ fn celt_only_cbr_with_settings_changed_between_packets_is_libopus() {
     const TENTHS_MS: [usize; 9] = [25, 50, 100, 200, 400, 600, 800, 1000, 1200];
     const BITRATES: [i32; 10] = [2_000, 6_000, 9_000, 16_000, 32_000, 47_000, 64_000, 128_000, 256_000, 510_000];
     const OUT_LENS: [usize; 13] = [1, 2, 3, 7, 20, 39, 75, 120, 700, 1276, 4000, 7657, 12_000];
-    const BANDWIDTHS: [(i32, Bandwidth); 4] = [
-        (audiopus_sys::OPUS_AUTO, Bandwidth::Auto),
-        (BW_NB, Bandwidth::Narrowband),
-        (BW_WB, Bandwidth::Wideband),
-        (BW_FB, Bandwidth::Fullband),
+    const BANDWIDTHS: [(i32, Option<Bandwidth>); 4] = [
+        (audiopus_sys::OPUS_AUTO, None),
+        (BW_NB, Some(Bandwidth::Narrowband)),
+        (BW_WB, Some(Bandwidth::Wideband)),
+        (BW_FB, Some(Bandwidth::Fullband)),
     ];
     let seconds = if cfg!(debug_assertions) { 1.0 } else { 4.0 };
     let mut packets = 0;
@@ -566,12 +567,12 @@ fn celt_only_cbr_with_settings_changed_between_packets_is_libopus() {
                 while pos < total {
                     if pick(3) == 0 {
                         let bitrate = BITRATES[pick(BITRATES.len())];
-                        rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                        rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                         c.bitrate(bitrate);
                     }
                     if pick(4) == 0 {
                         let complexity = pick(7) as i32;
-                        rs.set_complexity(complexity).unwrap();
+                        rs.set_complexity(complexity as u8).unwrap();
                         c.complexity(complexity);
                     }
                     if pick(6) == 0 {
@@ -632,7 +633,7 @@ fn packets_without_audio_and_buffer_errors_are_libopus() {
                                     app.rs,
                                 )
                                 .unwrap();
-                                rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                                rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                                 rs.set_vbr(vbr);
                                 let mut c = CEncoder::new(fs, channels, app.c);
                                 c.bitrate(bitrate).vbr(vbr);
@@ -673,7 +674,7 @@ fn maximum_bitrate_with_cbr_fills_the_buffer_as_libopus_does() {
                         app.rs,
                     )
                     .unwrap();
-                    rs.set_bitrate(Bitrate::Max).unwrap();
+                    rs.set_bitrate(Bitrate::Max);
                     rs.set_vbr(false);
                     let mut c = CEncoder::new(fs, 1, app.c);
                     c.bitrate(audiopus_sys::OPUS_BITRATE_MAX).vbr(false);
@@ -734,7 +735,7 @@ fn silence_flag_of_stereo_input_coded_as_mono_is_libopus() {
                 Application::RestrictedLowDelay,
             )
             .unwrap();
-            rs.set_bitrate(Bitrate::BitsPerSecond(510_000)).unwrap();
+            rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(510_000).unwrap()));
             rs.set_complexity(9).unwrap();
             let mut c = CEncoder::new(fs, 2, APP_LOWDELAY);
             c.bitrate(510_000).vbr(true).complexity(9);

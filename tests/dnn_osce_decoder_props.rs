@@ -20,6 +20,7 @@
 
 mod dnn_plc_common;
 
+use std::num::NonZeroU32;
 use opus1::multistream::MultistreamDecoder;
 use opus1::{
     Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
@@ -124,14 +125,14 @@ fn packets(kind: Kind, channels: usize) -> Vec<Vec<u8>> {
         Kind::Hybrid => (ForcedMode::Hybrid, Bandwidth::Fullband, 32000 * ch, 960),
         Kind::Celt => (ForcedMode::CeltOnly, Bandwidth::Fullband, 48000 * ch, 960),
     };
-    enc.set_bandwidth(bandwidth);
+    enc.set_bandwidth(Some(bandwidth));
     let mut buf = vec![0u8; 1500];
     pcm.chunks_exact(frame * channels)
         .enumerate()
         .map(|(k, f)| {
             let celt = kind == Kind::SilkCelt && (k / 15) % 2 == 1;
             enc.set_force_mode(Some(if celt { ForcedMode::CeltOnly } else { mode }));
-            enc.set_bitrate(Bitrate::BitsPerSecond(if celt { 48000 * ch } else { bitrate })).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new((if celt { 48000 * ch } else { bitrate }) as u32).unwrap()));
             let n = enc.encode(f, frame, &mut buf).unwrap();
             buf[..n].to_vec()
         })
@@ -150,7 +151,7 @@ fn decoder(rate: i32, channels: usize, complexity: i32, bwe: bool) -> OpusDecode
         Channels::try_from(channels).unwrap(),
     )
     .unwrap();
-    d.set_complexity(complexity).unwrap();
+    d.set_complexity(complexity as u8).unwrap();
     d.set_osce_bwe(bwe).unwrap();
     d
 }
@@ -381,7 +382,7 @@ fn the_multistream_decoder_forwards_bwe_to_every_stream() {
         let want = signal(&decode(&mut decoder(48000, 1, complexity, bwe), &packets, |k| k % 9 == 4));
         let mut ms =
             MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
-        ms.set_complexity(complexity).unwrap();
+        ms.set_complexity(complexity as u8).unwrap();
         ms.set_osce_bwe(bwe).unwrap();
         let mut buf = vec![0f32; 960 * 2];
         let mut got = [Vec::new(), Vec::new()];

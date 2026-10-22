@@ -49,6 +49,7 @@
 //! Timings also depend on where the linker places the code; see "Code
 //! placement" below.
 
+use std::num::NonZeroU32;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fmt::Write as _;
@@ -62,7 +63,7 @@ use audiopus_sys as ffi;
 use opus1::internals::range_coder::RangeCoder;
 use opus1::internals::silk::dec_api::SilkDecoder;
 use opus1::internals::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus1::{Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, ForcedMode, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 
 /// Output buffer handed to both encoders. It is larger than any packet, so
 /// it never limits the bit rate.
@@ -1261,6 +1262,16 @@ impl Fnv {
 /// `forced` pins the coding mode, the bandwidth and the channel count to
 /// what the scenario names, as `CEncoder::new` does for libopus. Without it
 /// opus1 decides by itself.
+/// The opus1 setting for a bitrate in bits per second, which must be
+/// positive.
+fn rust_bitrate(bps: i32) -> Result<Bitrate, String> {
+    u32::try_from(bps)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .map(Bitrate::BitsPerSecond)
+        .ok_or_else(|| format!("bitrate {bps}"))
+}
+
 fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
     let application = match sc.app {
         App::Voip => Application::Voip,
@@ -1272,16 +1283,18 @@ fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
         Channels::try_from(sc.channels).map_err(|e| format!("{} channels: {e}", sc.channels))?;
     let mut encoder =
         OpusEncoder::new(rate, channels, application).map_err(|e| format!("OpusEncoder::new: {e}"))?;
+    encoder.set_bitrate(rust_bitrate(sc.bitrate)?);
+    let complexity =
+        u8::try_from(sc.complexity).map_err(|_| format!("complexity {}", sc.complexity))?;
     encoder
-        .set_bitrate(Bitrate::BitsPerSecond(sc.bitrate))
-        .map_err(|e| format!("set_bitrate: {e}"))?;
-    encoder
-        .set_complexity(sc.complexity)
+        .set_complexity(complexity)
         .map_err(|e| format!("set_complexity: {e}"))?;
     encoder.set_vbr(!sc.cbr);
-    encoder.set_inband_fec(sc.fec);
+    encoder.set_inband_fec(if sc.fec { InbandFec::On } else { InbandFec::Off });
+    let loss_perc =
+        u8::try_from(sc.loss_perc).map_err(|_| format!("packet loss {}", sc.loss_perc))?;
     encoder
-        .set_packet_loss_perc(sc.loss_perc)
+        .set_packet_loss_perc(loss_perc)
         .map_err(|e| format!("set_packet_loss_perc: {e}"))?;
     if forced {
         encoder.set_force_mode(Some(match sc.mode {
@@ -1289,7 +1302,7 @@ fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
             Mode::Hybrid => ForcedMode::Hybrid,
             Mode::Celt => ForcedMode::CeltOnly,
         }));
-        encoder.set_bandwidth(sc.bandwidth().rust_value());
+        encoder.set_bandwidth(Some(sc.bandwidth().rust_value()));
         if sc.channels == 2 {
             encoder.set_force_channels(Some(Channels::Stereo));
         }
@@ -1392,10 +1405,10 @@ impl RustSettings {
     fn of(encoder: &OpusEncoder) -> Self {
         Self {
             bitrate: encoder.bitrate(),
-            complexity: encoder.complexity(),
+            complexity: i32::from(encoder.complexity()),
             cbr: !encoder.vbr(),
-            fec: encoder.inband_fec(),
-            loss_perc: encoder.packet_loss_perc(),
+            fec: encoder.inband_fec() != InbandFec::Off,
+            loss_perc: i32::from(encoder.packet_loss_perc()),
         }
     }
 
@@ -3329,9 +3342,7 @@ fn rust_encode_switching(case: &SwitchCase, clip: &Clip) -> Result<Packets, Stri
     let mut out = [0u8; MAX_PACKET];
     let mut packets = Packets::default();
     for (index, frame) in clip.pcm.chunks_exact(clip.step).enumerate() {
-        encoder
-            .set_bitrate(Bitrate::BitsPerSecond(switch_bitrate(sc, index)))
-            .map_err(|e| format!("set_bitrate at frame {index}: {e}"))?;
+        encoder.set_bitrate(rust_bitrate(switch_bitrate(sc, index))?);
         let len = encoder
             .encode(frame, clip.frame, &mut out)
             .map_err(|e| format!("Rust encode failed at frame {index}: {e}"))?;

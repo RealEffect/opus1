@@ -18,6 +18,7 @@
 //! libopus does, so the margins are tight; `issue_48_stereo_side.rs` covers
 //! the content that needs the side most.
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
@@ -189,7 +190,7 @@ fn run(cfg: &Config) -> Measured {
         Application::Voip,
     )
     .unwrap();
-    rs_enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
     rs_enc.set_vbr(!cfg.cbr);
     // opus1 runs the speech and music analysis as libopus does. It reads
     // the tone as music, and finds no audio above 2 kHz, which lowers the
@@ -197,9 +198,9 @@ fn run(cfg: &Config) -> Measured {
     // libopus below.
     rs_enc.set_signal(Signal::Voice);
     rs_enc.set_bandwidth(match cfg.bandwidth {
-        CBw::Wideband => Bandwidth::Wideband,
-        CBw::Superwideband => Bandwidth::Superwideband,
-        CBw::Fullband => Bandwidth::Fullband,
+        CBw::Wideband => Some(Bandwidth::Wideband),
+        CBw::Superwideband => Some(Bandwidth::Superwideband),
+        CBw::Fullband => Some(Bandwidth::Fullband),
         other => panic!("no such bandwidth in this test: {other:?}"),
     });
 
@@ -209,7 +210,7 @@ fn run(cfg: &Config) -> Measured {
     let mut c_enc = CEnc::new(sr as u32, CCh::Stereo, CApp::Voip).unwrap();
     c_enc.set_bitrate(CBitrate::Bits(32000)).unwrap();
     c_enc.set_vbr(!cfg.cbr).unwrap();
-    c_enc.set_complexity(rs_enc.complexity()).unwrap();
+    c_enc.set_complexity(i32::from(rs_enc.complexity())).unwrap();
     c_enc.set_bandwidth(cfg.bandwidth).unwrap();
     c_enc.set_signal(CSignal::Voice).unwrap();
     c_enc.set_force_channels(Some(CCh::Stereo)).unwrap();

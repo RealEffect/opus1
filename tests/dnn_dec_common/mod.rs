@@ -10,10 +10,11 @@
 // Each test file uses a part of this module.
 #![allow(dead_code)]
 
+use std::num::NonZeroU32;
 use crate::core_common::*;
 use crate::{dnn_plc_common, k24_common};
 use audiopus_sys as sys;
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 use std::os::raw::c_int;
 use std::path::Path;
 
@@ -356,22 +357,22 @@ pub fn rs_encode(coding: &Coding, pcm: &[f32]) -> Vec<Vec<u8>> {
         _ => ForcedMode::CeltOnly,
     }));
     if let Some(bw) = coding.bandwidth {
-        enc.set_bandwidth(match bw {
+        enc.set_bandwidth(Some(match bw {
             BW_NB => Bandwidth::Narrowband,
             BW_MB => Bandwidth::Mediumband,
             BW_WB => Bandwidth::Wideband,
             BW_SWB => Bandwidth::Superwideband,
             _ => Bandwidth::Fullband,
-        });
+        }));
     }
     if coding.fec {
-        enc.set_inband_fec(true);
+        enc.set_inband_fec(InbandFec::On);
         enc.set_packet_loss_perc(20).unwrap();
     }
     let mut buf = vec![0u8; 4000];
     let channels = coding.channels;
     encode_frames(coding, pcm, |frame, bitrate| {
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         let len = enc.encode(frame, frame.len() / channels, &mut buf).unwrap();
         buf[..len].to_vec()
     })

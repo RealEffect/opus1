@@ -32,6 +32,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech_fullband, to_stereo};
@@ -203,26 +204,26 @@ impl Pair {
         let note = match what {
             0 => {
                 let (rs, c) = rng.pick(&[
-                    (Bitrate::BitsPerSecond(6_000), 6_000),
-                    (Bitrate::BitsPerSecond(9_000), 9_000),
-                    (Bitrate::BitsPerSecond(16_000), 16_000),
-                    (Bitrate::BitsPerSecond(24_000), 24_000),
-                    (Bitrate::BitsPerSecond(32_000), 32_000),
-                    (Bitrate::BitsPerSecond(48_000), 48_000),
-                    (Bitrate::BitsPerSecond(64_000), 64_000),
-                    (Bitrate::BitsPerSecond(96_000), 96_000),
-                    (Bitrate::BitsPerSecond(160_000), 160_000),
-                    (Bitrate::BitsPerSecond(320_000), 320_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(6_000).unwrap()), 6_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(9_000).unwrap()), 9_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(16_000).unwrap()), 16_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(24_000).unwrap()), 24_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(32_000).unwrap()), 32_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(48_000).unwrap()), 48_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap()), 64_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(96_000).unwrap()), 96_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(160_000).unwrap()), 160_000),
+                    (Bitrate::BitsPerSecond(NonZeroU32::new(320_000).unwrap()), 320_000),
                     (Bitrate::Auto, sys::OPUS_AUTO),
                     (Bitrate::Max, sys::OPUS_BITRATE_MAX),
                 ]);
-                self.rs.set_bitrate(rs).unwrap();
+                self.rs.set_bitrate(rs);
                 self.c.bitrate(c);
                 format!("bitrate {rs:?}")
             }
             1 | 2 => {
                 let complexity = rng.below(11) as i32;
-                self.rs.set_complexity(complexity).unwrap();
+                self.rs.set_complexity(complexity as u8).unwrap();
                 self.c.complexity(complexity);
                 format!("complexity {complexity}")
             }
@@ -238,9 +239,10 @@ impl Pair {
             }
             4 => {
                 let (rs, c) = if rng.below(3) == 0 {
-                    (Bandwidth::Auto, sys::OPUS_AUTO)
+                    (None, sys::OPUS_AUTO)
                 } else {
-                    rng.pick(&BANDWIDTHS)
+                    let (rs, c) = rng.pick(&BANDWIDTHS);
+                    (Some(rs), c)
                 };
                 self.rs.set_bandwidth(rs);
                 self.c.bandwidth(c);
@@ -248,7 +250,7 @@ impl Pair {
             }
             5 => {
                 let (rs, c) = rng.pick(&BANDWIDTHS);
-                self.rs.set_max_bandwidth(rs).unwrap();
+                self.rs.set_max_bandwidth(rs);
                 self.c.max_bandwidth(c);
                 format!("max bandwidth {rs:?}")
             }
@@ -259,7 +261,7 @@ impl Pair {
             }
             7 => {
                 let depth = 8 + rng.below(17) as i32;
-                self.rs.set_lsb_depth(depth).unwrap();
+                self.rs.set_lsb_depth(depth as u8).unwrap();
                 self.c.set(sys::OPUS_SET_LSB_DEPTH_REQUEST, depth);
                 format!("lsb depth {depth}")
             }
@@ -267,8 +269,8 @@ impl Pair {
                 let loss = rng.pick(&[0, 1, 3, 5, 9, 20]);
                 let (rs, c) = rng.pick(&[(InbandFec::Off, 0), (InbandFec::On, 1), (InbandFec::OnUnlessMusic, 2)]);
                 self.rs.set_packet_loss_perc(loss).unwrap();
-                self.rs.set_inband_fec_mode(rs);
-                self.c.set(sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, loss);
+                self.rs.set_inband_fec(rs);
+                self.c.set(sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, i32::from(loss));
                 self.c.set(sys::OPUS_SET_INBAND_FEC_REQUEST, c);
                 format!("loss {loss} fec {rs:?}")
             }
@@ -489,7 +491,7 @@ fn celt_only_streams_with_changing_settings_are_libopus() {
                 for change_every in [2, 6, 20] {
                     let mut pair = Pair::new(fs, channels, app, c_app, true);
                     let start = 7 + rng.below(4) as i32;
-                    pair.rs.set_complexity(start).unwrap();
+                    pair.rs.set_complexity(start as u8).unwrap();
                     pair.c.complexity(start);
                     streams += 1;
                     if let Some(d) = walk(&mut pair, input, 600, &mut rng, change_every, &mut seen) {
@@ -562,9 +564,9 @@ fn forced_mode_switches_keep_the_celt_frames_of_libopus() {
             )
             .unwrap();
             let mut c = CEncoder::new(fs, 1, APP_AUDIO);
-            rs.set_complexity(complexity).unwrap();
+            rs.set_complexity(complexity as u8).unwrap();
             c.complexity(complexity);
-            rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             c.bitrate(bitrate);
             rs.set_vbr_constraint(cvbr);
             c.set(sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, cvbr as i32);
@@ -583,17 +585,17 @@ fn forced_mode_switches_keep_the_celt_frames_of_libopus() {
                     match rng.pick(modes) {
                         0 => {
                             rs.set_force_mode(Some(ForcedMode::CeltOnly));
-                            rs.set_bandwidth(Bandwidth::Auto);
+                            rs.set_bandwidth(None);
                             c.force_mode(MODE_CELT).bandwidth(sys::OPUS_AUTO);
                         }
                         1 => {
                             rs.set_force_mode(Some(ForcedMode::SilkOnly));
-                            rs.set_bandwidth(Bandwidth::Wideband);
+                            rs.set_bandwidth(Some(Bandwidth::Wideband));
                             c.force_mode(MODE_SILK).bandwidth(BW_WB);
                         }
                         _ => {
                             rs.set_force_mode(Some(ForcedMode::Hybrid));
-                            rs.set_bandwidth(Bandwidth::Fullband);
+                            rs.set_bandwidth(Some(Bandwidth::Fullband));
                             c.force_mode(MODE_HYBRID).bandwidth(BW_FB);
                         }
                     }
@@ -679,9 +681,9 @@ fn automatic_mode_switches_keep_the_celt_frames_of_libopus() {
             )
             .unwrap();
             let mut c = CEncoder::new(fs, 1, APP_AUDIO);
-            rs.set_complexity(complexity).unwrap();
+            rs.set_complexity(complexity as u8).unwrap();
             c.complexity(complexity);
-            rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             c.bitrate(bitrate);
             rs.set_vbr_constraint(cvbr);
             c.set(sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, cvbr as i32);

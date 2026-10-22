@@ -27,7 +27,9 @@ const OPUS_SET_OSCE_BWE_REQUEST: c_int = 4054;
 const OPUS_GET_OSCE_BWE_REQUEST: c_int = 4055;
 
 /// Values that libopus refuses, and the edges of the range it takes.
-const BAD_COMPLEXITIES: [i32; 6] = [-1, 11, 12, 100, i32::MIN, i32::MAX];
+/// Complexities above 10, which both refuse. libopus also refuses negative
+/// values, which opus1's `u8` cannot hold.
+const BAD_COMPLEXITIES: [u8; 4] = [11, 12, 100, u8::MAX];
 
 struct CDec(*mut sys::OpusDecoder);
 
@@ -82,16 +84,16 @@ fn complexity_starts_at_0_and_takes_0_to_10_like_libopus() {
             assert_eq!(d.complexity(), 0);
             assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, 0));
             for value in 0..=10 {
-                assert_eq!(code(&d.set_complexity(value)), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, value));
+                assert_eq!(code(&d.set_complexity(value)), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(value)));
                 assert_eq!(d.complexity(), value);
-                assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, value));
+                assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, i32::from(value)));
             }
             d.set_complexity(6).unwrap();
             c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, 6);
             for value in BAD_COMPLEXITIES {
                 let r = d.set_complexity(value);
                 assert_eq!(r.unwrap_err().kind(), ErrorKind::BadArg);
-                assert_eq!(code(&r), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, value), "complexity {value}");
+                assert_eq!(code(&r), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(value)), "complexity {value}");
                 // A refused value leaves the setting as it was.
                 assert_eq!(d.complexity(), 6);
                 assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, 6));
@@ -275,9 +277,9 @@ fn the_multistream_decoder_sets_the_complexity_of_every_stream_like_libopus() {
     assert_eq!(d.complexity(), 0);
     assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, 0));
     for value in 0..=10 {
-        assert_eq!(code(&d.set_complexity(value)), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, value));
+        assert_eq!(code(&d.set_complexity(value)), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(value)));
         assert_eq!(d.complexity(), value);
-        assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, value));
+        assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, i32::from(value)));
         for s in 0..4 {
             assert_eq!(d.stream_decoder(s).unwrap().complexity(), value);
         }
@@ -286,7 +288,7 @@ fn the_multistream_decoder_sets_the_complexity_of_every_stream_like_libopus() {
     c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, 5);
     for value in BAD_COMPLEXITIES {
         let r = d.set_complexity(value);
-        assert_eq!(code(&r), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, value), "complexity {value}");
+        assert_eq!(code(&r), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(value)), "complexity {value}");
         assert_eq!(d.complexity(), 5);
         assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, 5));
         for s in 0..4 {

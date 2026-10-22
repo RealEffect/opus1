@@ -5,6 +5,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
@@ -35,7 +36,7 @@ fn low_delay_input_is_dc_rejected_like_libopus() {
             Application::RestrictedLowDelay,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         enc.set_complexity(5).unwrap();
         let (mut dec, mut c_dec) = (CDecoder::new(rate, channels), CDecoder::new(rate, channels));
         let mut buf = vec![0u8; 4000];
@@ -118,7 +119,7 @@ fn the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it() {
                         Application::RestrictedLowDelay,
                     )
                     .unwrap();
-                    enc.set_bitrate(Bitrate::BitsPerSecond(510_000)).unwrap();
+                    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(510_000).unwrap()));
                     enc.set_complexity(5).unwrap();
                     enc.set_vbr(vbr);
                     let mut c_enc = CEncoder::new(rate, 2, APP_LOWDELAY);

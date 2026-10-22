@@ -2,6 +2,7 @@
 //! against libopus.
 
 mod silkenc_common;
+use std::num::NonZeroU32;
 use silkenc_common::*;
 
 use opus1::internals::range_coder::RangeCoder;
@@ -17,7 +18,7 @@ use opus1::internals::silk::stereo_lr_to_ms::silk_stereo_lr_to_ms;
 use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
 use opus1::internals::silk::init_encoder::silk_init_encoder;
 use opus1::internals::silk::structs::SilkEncoderState;
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 
 const FS: usize = 16_000;
 const FRAME: usize = 320;
@@ -97,10 +98,10 @@ fn fec_copies_are_coded_with_libopus_gain_increase() {
         )
         .unwrap();
         rs.set_force_mode(Some(ForcedMode::SilkOnly));
-        rs.set_bandwidth(Bandwidth::Wideband);
-        rs.set_bitrate(Bitrate::BitsPerSecond(32_000)).unwrap();
-        rs.set_inband_fec(true);
-        rs.set_packet_loss_perc(loss).unwrap();
+        rs.set_bandwidth(Some(Bandwidth::Wideband));
+        rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32_000).unwrap()));
+        rs.set_inband_fec(InbandFec::On);
+        rs.set_packet_loss_perc(loss as u8).unwrap();
         let mut c = CEncoder::new(FS, 1, APP_AUDIO);
         c.silk_only().bandwidth(BW_WB).bitrate(32_000).fec(true, loss);
         let mut out = vec![0u8; 1500];

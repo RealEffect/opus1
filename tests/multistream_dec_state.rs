@@ -557,7 +557,7 @@ fn run_steps_against_stream_decoders(e: &Encoded, fs: i32, steps: &[Step]) -> us
                 // Concealed and rebuilt frames are not soft-clipped, and
                 // keep the memory.
                 if !spec.fec && !stream_packet.is_empty() {
-                    pcm_soft_clip(&mut buf, n, stream_channels, &mut clip_memory[s]);
+                    pcm_soft_clip(&mut buf[..n * stream_channels], stream_channels, &mut clip_memory[s]).unwrap();
                 }
                 want16.push(to_i16(&buf[..n * stream_channels]));
             } else {

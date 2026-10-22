@@ -16,6 +16,7 @@
 
 mod core_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use core_common::*;
 use opus1::{Application, Bitrate, Channels, FrameDuration, OpusEncoder, SampleRate, packet};
@@ -107,7 +108,7 @@ fn check_calls(fs: usize, channels: usize, app: (i32, Application), cbr: bool, s
             app.1,
         )
         .unwrap();
-        rs.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+        rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap()));
         rs.set_vbr(!cbr);
         rs.set_complexity(5).unwrap();
         rs.set_expert_frame_duration(d);

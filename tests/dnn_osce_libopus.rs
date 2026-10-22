@@ -60,6 +60,7 @@
 //! - `OPUS1_OSCE_TIME=1`: also print the time per 20 ms frame of opus1 and
 //!   of the shim's libopus for LACE, NoLACE and the bandwidth extension.
 
+use std::num::NonZeroU32;
 use opus1::internals::dnn::arch::{self, DnnArch};
 use opus1::internals::dnn::builtin;
 #[cfg(feature = "osce-bwe")]
@@ -478,8 +479,8 @@ fn encode(pcm: &[i16], rate: u32, rng: &mut Rng, with_narrowband: bool) -> Vec<V
         } else {
             Bandwidth::Wideband
         };
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
-        enc.set_bandwidth(bw);
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+        enc.set_bandwidth(Some(bw));
         let frame = ms * samples_per_ms;
         for _ in 0..2000 / ms {
             if pos + frame > pcm.len() {

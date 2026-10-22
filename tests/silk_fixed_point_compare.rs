@@ -9,6 +9,8 @@
 // Burg analysis (line 72 of silk/fixed/burg_modified_FIX.c). With that line,
 // packets 4 to 19 of test_wb_c10 differ, and no packet of the other streams.
 
+use std::num::NonZeroU32;
+
 fn gen_pcm(fs: i32, num_samples: usize) -> Vec<f32> {
     // Use integer phase reduction to keep the sin() argument in [0, 2π],
     // avoiding precision loss at large arguments that causes platform-specific
@@ -36,8 +38,8 @@ fn run_config(fs: i32, bitrate: i32, complexity: i32, c_ref_hex: &[&str], label:
         Application::Voip,
     )
     .expect("encoder");
-    encoder.set_complexity(complexity).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    encoder.set_complexity(complexity as u8).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     encoder.set_vbr(false);
 
     let mut mismatches = 0;
@@ -606,7 +608,7 @@ fn long_voiced_stream_is_the_stream_of_fixed_point_libopus() {
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).expect("encoder");
     encoder.set_complexity(5).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20000).unwrap()));
     encoder.set_vbr(true);
 
     let mut out = vec![0u8; 1275];
