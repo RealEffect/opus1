@@ -340,6 +340,8 @@ A packet that is only the TOC byte is called a TOC-only packet. Encoders write o
   - the packet is longer than 20 ms, and the bitrate is below 2400 bits per second or the output buffer holds fewer than 300 bytes per second of audio.
 
   For a 60 ms CELT-only or Hybrid packet the encoder adds a frame count byte (code 3, three frames of 0 bytes) when the output buffer has room for it. That packet then has 2 bytes. With CBR the encoder pads the packet to its constant size. `OpusEncoder::final_range` is 0 after such a packet.
+
+  The TOC byte names the mode of the last frame the encoder coded, and its bandwidth where that mode allows it, as in libopus. Frames shorter than 10 ms are marked CELT-only, and frames of 60 ms or more in a 1-byte buffer SILK-only. Before the first coded frame, and after `reset_state`, the encoder has libopus's initial mode, Hybrid at fullband. So the TOC byte can name Hybrid even for an encoder with `Application::RestrictedSilk`, `RestrictedCelt` or `RestrictedLowDelay`, whose packets with audio are all SILK-only or all CELT-only.
 - The encoder also writes TOC-only packets during discontinuous transmission (DTX). With DTX on (`set_dtx(true)`), it writes TOC-only packets while the input is inactive, as libopus does, and the application need not send them. With CBR they are not padded.
 - A multistream encoder writes a TOC-only stream when the packet leaves that stream only 1 byte (see [Multichannel audio](05-multichannel.md)).
 

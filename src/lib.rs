@@ -370,6 +370,27 @@ impl From<Channels> for usize {
 /// What an encoder is tuned for: libopus `OPUS_APPLICATION_*`, the
 /// `application` argument of [`OpusEncoder::new`].
 ///
+/// [`Voip`](Self::Voip) and [`Audio`](Self::Audio) only steer the
+/// encoder's choices. The three restricted applications also limit them:
+/// to CELT-only packets, or to SILK-only packets.
+///
+/// That limit holds for every packet that carries audio. A packet without
+/// audio can name another mode in its TOC byte, as in libopus. The encoder
+/// writes such a packet when there is no room to code the frame: the
+/// output buffer has fewer than 3 bytes, or the bitrate gives fewer than 3
+/// bytes per frame, or, for a frame of 40 ms or more, the bitrate is below
+/// 2400 b/s or the output buffer holds fewer than 300 bytes per second.
+/// The packet is the TOC byte, with a frame count byte for some frames of
+/// 60 ms or more, padded when the bitrate is constant (libopus's "PLC"
+/// packet). libopus takes its mode from the last frame the encoder coded,
+/// except that a frame shorter than 10 ms is marked CELT-only and a frame
+/// of 60 ms or more in a 1-byte buffer SILK-only. Before the first coded
+/// frame, and after [`reset_state`](OpusEncoder::reset_state), the last
+/// mode is libopus's initial one, Hybrid at fullband. So a restricted
+/// encoder whose bitrate is too low to code any frame can write a TOC byte
+/// that names Hybrid in every packet. A decoder conceals a packet without
+/// audio like a lost one.
+///
 /// The number of each value is the libopus constant of the same name
 /// ([`to_raw`](Self::to_raw)). More values may be added in a later release,
 /// so a `match` on it needs a `_` arm.
@@ -383,9 +404,33 @@ pub enum Application {
     /// should sound as close to the input as possible.
     Audio = 2049,
     /// libopus `OPUS_APPLICATION_RESTRICTED_LOWDELAY` (2051): the lowest
-    /// delay. Every packet is CELT-only, and the encoder has no 4 ms
-    /// look-ahead.
+    /// delay. Every packet that carries audio is CELT-only (see above for
+    /// packets without audio), and the encoder has no 4 ms look-ahead.
     RestrictedLowDelay = 2051,
+    /// libopus `OPUS_APPLICATION_RESTRICTED_SILK` (2052, new in libopus
+    /// 1.6): every packet that carries audio is SILK-only, for a decoder
+    /// that only has SILK (see above for packets without audio).
+    ///
+    /// - The bandwidth is at most wideband (8 kHz of audio), whatever is
+    ///   set.
+    /// - Frames are 10 ms or longer. An encode call with 2.5 or 5 ms is
+    ///   refused with [`BadArg`](crate::ErrorKind::BadArg).
+    /// - The speech and music analysis does not run.
+    /// - The look-ahead ([`OpusEncoder::lookahead`]) is 6.5 ms, as with
+    ///   [`Voip`](Self::Voip) and [`Audio`](Self::Audio).
+    ///
+    /// It can only be chosen when the encoder is created:
+    /// [`OpusEncoder::set_application`] refuses to change to it or from it.
+    RestrictedSilk = 2052,
+    /// libopus `OPUS_APPLICATION_RESTRICTED_CELT` (2053, new in libopus
+    /// 1.6): every packet that carries audio is CELT-only, for a decoder
+    /// that only has CELT (see above for packets without audio).
+    /// The encoder codes as with [`RestrictedLowDelay`](Self::RestrictedLowDelay):
+    /// the same packets, and no 4 ms look-ahead.
+    ///
+    /// It can only be chosen when the encoder is created:
+    /// [`OpusEncoder::set_application`] refuses to change to it or from it.
+    RestrictedCelt = 2053,
 }
 
 impl Application {
@@ -393,6 +438,22 @@ impl Application {
     /// [`Voip`](Self::Voip).
     pub const fn to_raw(self) -> i32 {
         self as i32
+    }
+
+    /// The applications that can only be chosen when an encoder is created
+    /// (libopus 1.6 `OPUS_SET_APPLICATION`, opus_encoder.c:2789-2798).
+    const fn only_at_creation(self) -> bool {
+        matches!(self, Application::RestrictedSilk | Application::RestrictedCelt)
+    }
+
+    /// The applications whose frames are coded without the 4 ms delay that
+    /// lines CELT up with SILK (C `delay_compensation`,
+    /// opus_encoder.c:1903-1906). Their encoder keeps no delay buffer.
+    const fn without_delay_buffer(self) -> bool {
+        matches!(
+            self,
+            Application::RestrictedLowDelay | Application::RestrictedSilk | Application::RestrictedCelt
+        )
     }
 }
 
@@ -407,6 +468,8 @@ impl TryFrom<i32> for Application {
             2048 => Ok(Application::Voip),
             2049 => Ok(Application::Audio),
             2051 => Ok(Application::RestrictedLowDelay),
+            2052 => Ok(Application::RestrictedSilk),
+            2053 => Ok(Application::RestrictedCelt),
             _ => Err(Error::bad_arg("invalid application")),
         }
     }
@@ -1142,10 +1205,12 @@ pub struct OpusEncoder {
     #[cfg(feature = "heap")]
     buf_celt_pcm: Box<FixedVec<f32, OPUS_PCM_BUF>>,
     /// C `encoder_buffer` (= Fs/100): samples of ring history kept between
-    /// frames (0 for restricted-latency applications).
+    /// frames (0 for the restricted applications,
+    /// `Application::without_delay_buffer`).
     encoder_buffer: usize,
-    /// C `delay_compensation` (= Fs/250): 4 ms lookahead prefix prepended to
-    /// each CELT frame (0 for restricted-latency applications).
+    /// The 4 ms lookahead prefix prepended to each CELT frame (= Fs/250):
+    /// C `delay_compensation` as `opus_encode_frame_native` uses it, 0 for
+    /// the restricted applications.
     delay_compensation: usize,
     /// Float filter state for `dc_reject_float` / `hp_cutoff_float`
     /// (C `st->hp_mem[4]`, opus_val32 in the float build).
@@ -1891,9 +1956,9 @@ impl OpusEncoder {
         // and the sampling rate. Both are decided again for the first packet
         // that is coded.
         let (opus_mode, bw) = (OpusMode::Hybrid, Bandwidth::Fullband);
-        // `RestrictedLowDelay` codes CELT alone, without the lookahead that
-        // aligns CELT with SILK.
-        let low_delay = matches!(application, Application::RestrictedLowDelay);
+        // The restricted applications code without the lookahead that
+        // aligns CELT with SILK, and keep no delay buffer.
+        let low_delay = application.without_delay_buffer();
 
         // SAFETY: the caller guarantees that `this` is valid for writes.
         // Each closure below writes the whole field it is given.
@@ -2055,7 +2120,9 @@ impl OpusEncoder {
         self.decide_stream_channels(bitrate, frame_rate, voice_est);
 
         // --- Mode: SILK or CELT (C 1466-1539) ---
-        let mut mode = if self.application == Application::RestrictedLowDelay {
+        let mut mode = if self.application == Application::RestrictedSilk {
+            OpusMode::SilkOnly
+        } else if matches!(self.application, Application::RestrictedLowDelay | Application::RestrictedCelt) {
             OpusMode::CeltOnly
         } else if let Some(forced) = self.user_forced_mode {
             // C 1528-1530: the mode the caller asked for. The rules below
@@ -2112,12 +2179,14 @@ impl OpusEncoder {
             mode
         };
         // C 1532-1537: SILK frames are 10 ms or longer; 2.5 and 5 ms frames
-        // are CELT-only.
+        // are CELT-only. `RestrictedSilk` never gets here with such a
+        // frame: `frame_size_select` refuses it.
         if mode != OpusMode::CeltOnly && frame_size < self.sampling_rate as usize / 100 {
             mode = OpusMode::CeltOnly;
         }
-        // C 1538-1539: a low-frequency-effects channel is coded by CELT.
-        if self.lfe {
+        // C 1538-1539: a low-frequency-effects channel is coded by CELT,
+        // except by an encoder that has only SILK.
+        if self.lfe && self.application != Application::RestrictedSilk {
             mode = OpusMode::CeltOnly;
         }
 
@@ -2300,6 +2369,10 @@ impl OpusEncoder {
         // whatever was asked for.
         if self.lfe {
             self.bandwidth = Bandwidth::Narrowband;
+        }
+        // C 1688-1689: SILK alone codes at most wideband.
+        if self.application == Application::RestrictedSilk && bandwidth_fec_index(self.bandwidth) > 2 {
+            self.bandwidth = Bandwidth::Wideband;
         }
         let above_wideband = bandwidth_fec_index(self.bandwidth) > 2;
         if mode == OpusMode::SilkOnly && above_wideband {
@@ -2588,11 +2661,13 @@ impl OpusEncoder {
     }
 
     /// Whether the analysis runs for the next packet (C 1249-1253): the
-    /// complexity reaches the gate and the input rate is 16 to 48 kHz.
+    /// complexity reaches the gate, the input rate is 16 to 48 kHz, and the
+    /// application is not `RestrictedSilk`.
     #[cfg(feature = "analysis")]
     fn analysis_runs(&self) -> bool {
         self.analysis_gate.min_complexity().is_some_and(|c| self.complexity >= c)
             && (16000..=48000).contains(&self.sampling_rate)
+            && self.application != Application::RestrictedSilk
     }
 
     /// libopus `OPUS_SET_PACKET_LOSS_PERC`: the packet loss the network is
@@ -2664,10 +2739,11 @@ impl OpusEncoder {
     /// The mode is a request, as in libopus. The rules that keep a packet
     /// valid still apply, in this order:
     ///
-    /// - A `RestrictedLowDelay` encoder codes CELT-only whatever is asked.
+    /// - A `RestrictedLowDelay` or `RestrictedCelt` encoder codes CELT-only
+    ///   whatever is asked, and a `RestrictedSilk` encoder SILK-only.
     /// - Frames shorter than 10 ms are CELT-only.
     /// - A low-frequency-effects encoder ([`set_lfe`](Self::set_lfe)) codes
-    ///   CELT-only.
+    ///   CELT-only, unless it is a `RestrictedSilk` encoder.
     /// - SILK-only above wideband becomes Hybrid, and Hybrid at wideband or
     ///   below becomes SILK-only. To get SILK-only from 24 or 48 kHz input,
     ///   also limit the bandwidth with
@@ -2699,7 +2775,9 @@ impl OpusEncoder {
     /// The bandwidth never exceeds what the input sampling rate can carry.
     /// CELT has no mediumband and codes wideband instead. SILK codes at the
     /// internal rate of the bandwidth (8, 12 or 16 kHz); a running SILK
-    /// encoder moves there one step at a time, when the signal lets it.
+    /// encoder moves there one step at a time, when the signal lets it. A
+    /// [`RestrictedSilk`](Application::RestrictedSilk) encoder codes at most
+    /// wideband.
     pub fn set_bandwidth(&mut self, bandwidth: Option<Bandwidth>) {
         self.user_bandwidth = bandwidth;
     }
@@ -2741,7 +2819,9 @@ impl OpusEncoder {
 
     /// libopus `OPUS_SET_LFE`: this encoder codes the low-frequency-effects
     /// channel of a surround stream. Its packets are CELT-only and
-    /// narrowband, whatever mode and bandwidth are set.
+    /// narrowband, whatever mode and bandwidth are set. A
+    /// [`RestrictedSilk`](Application::RestrictedSilk) encoder codes them
+    /// SILK-only and narrowband.
     pub fn set_lfe(&mut self, lfe: bool) {
         self.lfe = lfe;
     }
@@ -2778,15 +2858,26 @@ impl OpusEncoder {
     /// quality a little. It changes CELT-only and Hybrid packets of stereo
     /// streams, at bitrates where CELT codes high bands as intensity
     /// stereo. [`reset_state`](Self::reset_state) keeps the value.
+    ///
+    /// A [`RestrictedSilk`](Application::RestrictedSilk) encoder codes no
+    /// CELT. As in libopus, it accepts the call and ignores it, and
+    /// [`phase_inversion_disabled`](Self::phase_inversion_disabled) stays
+    /// `false`.
     pub fn set_phase_inversion_disabled(&mut self, disabled: bool) {
-        self.celt_enc.set_phase_inversion_disabled(disabled);
+        // C opus_encoder.c:3181-3182.
+        if self.application != Application::RestrictedSilk {
+            self.celt_enc.set_phase_inversion_disabled(disabled);
+        }
     }
 
     /// The value set with
     /// [`set_phase_inversion_disabled`](Self::set_phase_inversion_disabled)
-    /// (`OPUS_GET_PHASE_INVERSION_DISABLED`).
+    /// (`OPUS_GET_PHASE_INVERSION_DISABLED`). Always `false` for a
+    /// [`RestrictedSilk`](Application::RestrictedSilk) encoder, as in
+    /// libopus.
     pub fn phase_inversion_disabled(&self) -> bool {
-        self.celt_enc.phase_inversion_disabled()
+        // C opus_encoder.c:3192-3195.
+        self.application != Application::RestrictedSilk && self.celt_enc.phase_inversion_disabled()
     }
 
     /// The test control of `internals::silk_input`: with `true`, SILK reads
@@ -2810,6 +2901,10 @@ impl OpusEncoder {
     ///   `frame_size` must be at least that long, and `input` must still
     ///   hold `frame_size * channels` samples. Only the first frame of
     ///   them is coded. A shorter `frame_size` is refused.
+    ///
+    /// The setting itself is always accepted, as in libopus. On a
+    /// [`RestrictedSilk`](Application::RestrictedSilk) encoder, 2.5 and 5 ms
+    /// make every encode call fail.
     ///
     /// libopus calls this "variable duration": the encoder may code less
     /// audio than the call passes. The caller learns how much from the
@@ -2869,14 +2964,25 @@ impl OpusEncoder {
     /// [`reset_state`](Self::reset_state) allows a change again. An
     /// encoder whose application is changed before the first frame codes
     /// as one created with the new application.
+    ///
+    /// [`RestrictedSilk`](Application::RestrictedSilk) and
+    /// [`RestrictedCelt`](Application::RestrictedCelt) can only be chosen
+    /// when the encoder is created, as in libopus 1.6. A change to one of
+    /// them is refused with [`BadArg`](crate::ErrorKind::BadArg), and so is
+    /// any call on an encoder created with one of them, even with the same
+    /// application.
     pub fn set_application(&mut self, application: Application) -> Result<(), Error> {
+        // C opus_encoder.c:2789-2798.
+        if self.application.only_at_creation() || application.only_at_creation() {
+            return Err(Error::bad_arg("application can only be chosen when the encoder is created"));
+        }
         if !self.first && application != self.application {
             return Err(Error::bad_arg("application cannot change after the first frame"));
         }
         self.application = application;
         // What `new` derives from the application. Before the first frame
         // the delay buffer holds only zeros, so its length can change.
-        let restricted = application == Application::RestrictedLowDelay;
+        let restricted = application.without_delay_buffer();
         let fs = self.sampling_rate as usize;
         self.encoder_buffer = if restricted { 0 } else { fs / 100 };
         self.delay_compensation = if restricted { 0 } else { fs / 250 };
@@ -3048,10 +3154,20 @@ impl OpusEncoder {
     /// per channel at the input sampling rate. A decoder's output lags the
     /// encoder's input by this much. An Ogg Opus file stores it, scaled to
     /// 48 kHz, as the pre-skip.
+    ///
+    /// It is 2.5 ms for [`RestrictedLowDelay`](Application::RestrictedLowDelay)
+    /// and [`RestrictedCelt`](Application::RestrictedCelt), and 6.5 ms for
+    /// the other applications.
     pub fn lookahead(&self) -> usize {
-        // 2.5 ms of CELT overlap, and the 4 ms that align CELT with SILK
-        // unless the application is `RestrictedLowDelay`.
-        self.sampling_rate as usize / 400 + self.delay_compensation
+        // C opus_encoder.c:3082-3092: 2.5 ms of CELT overlap, and the 4 ms
+        // that align CELT with SILK. `RestrictedSilk` codes no CELT and
+        // keeps no `delay_compensation`, but libopus counts the 4 ms for it
+        // as for `Voip` and `Audio`.
+        let fs = self.sampling_rate as usize;
+        match self.application {
+            Application::RestrictedLowDelay | Application::RestrictedCelt => fs / 400,
+            _ => fs / 400 + fs / 250,
+        }
     }
 
     /// Encode a frame of interleaved f32 PCM (scale ±1.0; C `opus_encode_float`
@@ -3059,7 +3175,8 @@ impl OpusEncoder {
     /// `frame_size * channels` samples.
     ///
     /// `frame_size` is in samples per channel: 2.5, 5, 10, 20, 40, 60, 80,
-    /// 100 or 120 ms. With an expert frame duration set
+    /// 100 or 120 ms. A [`RestrictedSilk`](Application::RestrictedSilk)
+    /// encoder refuses 2.5 and 5 ms. With an expert frame duration set
     /// ([`set_expert_frame_duration`](Self::set_expert_frame_duration)),
     /// only the first frame of that duration is coded, and `frame_size`
     /// must be at least that long. The speech and music analysis still
@@ -3167,8 +3284,9 @@ impl OpusEncoder {
     /// of samples the caller passed. Returns the frame size in samples per
     /// channel.
     fn select_frame_size(&self, input_len: usize, frame_size: usize) -> Result<usize, Error> {
-        let selected = frame_size_select(frame_size, self.variable_duration, self.sampling_rate)
-            .ok_or(Error::INVALID_FRAME_SIZE)?;
+        let selected =
+            frame_size_select(self.application, frame_size, self.variable_duration, self.sampling_rate)
+                .ok_or(Error::INVALID_FRAME_SIZE)?;
         // The caller passes `frame_size` samples per channel, as libopus
         // reads them. Short input is rejected here, so that it cannot
         // panic inside the high-pass filter or the conversion loops.
@@ -3353,7 +3471,10 @@ impl OpusEncoder {
         );
         let mode = decisions.mode;
         // C 1677: the CELT encoder codes with the precision of the input.
-        self.celt_enc.set_lsb_depth(lsb_depth);
+        // An encoder with only SILK has no CELT encoder in libopus.
+        if self.application != Application::RestrictedSilk {
+            self.celt_enc.set_lsb_depth(lsb_depth);
+        }
 
         // C 1697-1838: "Can't support higher than >60 ms frames, and
         // >20 ms when in Hybrid or CELT-only modes". Longer packets are
@@ -3544,6 +3665,13 @@ impl OpusEncoder {
             if redundancy_bytes == 0 {
                 redundancy = false;
             }
+        }
+        // C 1953-1957: an encoder with only SILK codes no redundant CELT
+        // frame.
+        let silk_only_app = self.application == Application::RestrictedSilk;
+        if silk_only_app {
+            redundancy = false;
+            redundancy_bytes = 0;
         }
 
         self.rc.reset_for_encode((n_bytes - 1) as u32);
@@ -3841,11 +3969,14 @@ impl OpusEncoder {
             // buffer itself. A Hybrid frame after CELT-only frames reads
             // the faded 2.5 ms again: its CELT encoder starts from them
             // (`tmp_prefill`, C 2297-2302).
+            //
+            // An encoder with only SILK has no prefill (C 2191). It never
+            // follows CELT-only packets or a redundant frame anyway.
             let mut silk_prefill = None;
-            if prefill != 0 {
-                if prefill == 1 && self.prev_enc_mode == Some(OpusMode::CeltOnly) {
-                    self.silk.reset();
-                }
+            if prefill == 1 && self.prev_enc_mode == Some(OpusMode::CeltOnly) {
+                self.silk.reset();
+            }
+            if prefill != 0 && !silk_only_app {
                 let mut prefill_input = None;
                 if ebuf > 0 && delay > 0 && ebuf >= delay + f2_5 {
                     let offset = ebuf - delay - f2_5;
@@ -3887,10 +4018,11 @@ impl OpusEncoder {
                 fixed_point_res_nrg: self.fixed_point_res_nrg,
                 ..SilkControl::default()
             };
+            let prefilled = silk_prefill.is_some();
             let result = self.silk.encode(&mut silk_ctl, silk_input, silk_prefill, &mut self.rc);
             // C 2207: "Prevent a second switch in the real encode call."
             // A restart for a rate switch has made that switch.
-            if prefill != 0 {
+            if prefilled {
                 self.silk_opus_can_switch = false;
             }
             result?;
@@ -3935,14 +4067,18 @@ impl OpusEncoder {
             // C 2250-2259: that packet starts with a redundant CELT frame
             // (`silk_bw_switch`), and this one ends with one, when it has
             // room for it.
+            // An encoder with only SILK codes no such frame (C 2253), and
+            // `silk_bw_switch` is cleared again below.
             if self.silk_opus_can_switch {
-                redundancy_bytes = compute_redundancy_bytes(
-                    n_bytes,
-                    self.packet_bitrate_bps,
-                    frame_rate,
-                    self.stream_channels,
-                );
-                redundancy = redundancy_bytes != 0;
+                if !silk_only_app {
+                    redundancy_bytes = compute_redundancy_bytes(
+                        n_bytes,
+                        self.packet_bitrate_bps,
+                        frame_rate,
+                        self.stream_channels,
+                    );
+                    redundancy = redundancy_bytes != 0;
+                }
                 celt_to_silk = false;
                 self.silk_bw_switch = true;
             }
@@ -3953,40 +4089,47 @@ impl OpusEncoder {
         let toc = gen_toc(mode, frame_rate, toc_bandwidth, self.stream_channels);
 
         // C 2262-2283: settings the CELT encoder gets in every mode. A
-        // SILK-only packet needs them for its redundant frame.
-        self.celt_enc.complexity = self.complexity;
-        // libopus `CELT_SET_END_BAND`: match the TOC bandwidth so the
-        // decoder reads the same number of coded bands.
-        self.celt_enc.set_end_band(toc_bandwidth.celt_end_band());
-        // C 2285: the channels the packet codes. The value is 1 or the
-        // input's channel count, which the CELT encoder accepts.
-        let _ = self.celt_enc.set_stream_channels(self.stream_channels);
-        // C 2288-2294: "We may still decide to disable prediction later".
-        if mode != OpusMode::SilkOnly {
-            let _ = self
-                .celt_enc
-                .set_prediction(if self.prediction_disabled { 0 } else { 2 });
+        // SILK-only packet needs them for its redundant frame. An encoder
+        // with only SILK sets none of them (C 2264): libopus has no CELT
+        // encoder there, and the one here is never used.
+        if !silk_only_app {
+            self.celt_enc.complexity = self.complexity;
+            // libopus `CELT_SET_END_BAND`: match the TOC bandwidth so the
+            // decoder reads the same number of coded bands.
+            self.celt_enc.set_end_band(toc_bandwidth.celt_end_band());
+            // C 2285: the channels the packet codes. The value is 1 or the
+            // input's channel count, which the CELT encoder accepts.
+            let _ = self.celt_enc.set_stream_channels(self.stream_channels);
+            // C 2288-2294: "We may still decide to disable prediction later".
+            if mode != OpusMode::SilkOnly {
+                let _ = self
+                    .celt_enc
+                    .set_prediction(if self.prediction_disabled { 0 } else { 2 });
+            }
+            // C 2979-2989: OPUS_SET_PACKET_LOSS_PERC goes to the CELT encoder
+            // too. The value was clamped to 0..=100 above.
+            let _ = self.celt_enc.set_packet_loss_perc(self.packet_loss_perc);
+            // C opus_encoder.c:3283-3297: OPUS_SET_LFE and OPUS_SET_ENERGY_MASK
+            // go to the CELT encoder as well. libopus hands the mask over as a
+            // pointer; here the values are copied before every frame.
+            self.celt_enc.set_lfe(self.lfe);
+            let mask = self.energy_mask.as_ref().map(|m| &m[..21 * ch]);
+            self.celt_enc.set_energy_mask(mask);
         }
-        // C 2979-2989: OPUS_SET_PACKET_LOSS_PERC goes to the CELT encoder
-        // too. The value was clamped to 0..=100 above.
-        let _ = self.celt_enc.set_packet_loss_perc(self.packet_loss_perc);
-        // C opus_encoder.c:3283-3297: OPUS_SET_LFE and OPUS_SET_ENERGY_MASK
-        // go to the CELT encoder as well. libopus hands the mask over as a
-        // pointer; here the values are copied before every frame.
-        self.celt_enc.set_lfe(self.lfe);
-        let mask = self.energy_mask.as_ref().map(|m| &m[..21 * ch]);
-        self.celt_enc.set_energy_mask(mask);
 
         // C 2297-2302: a CELT or Hybrid frame in another mode than the
         // frame before restarts its CELT encoder, which first codes the
         // 2.5 ms before the frame's look-ahead (below). They are taken from
-        // the delay buffer before it moves on.
+        // the delay buffer before it moves on. libopus leaves this out for
+        // `RestrictedCelt` (C 2299 and 2478), whose frames are all
+        // CELT-only, so the mode never changes.
         let celt_restart = mode != OpusMode::SilkOnly
             && self.prev_enc_mode.is_some()
-            && self.prev_enc_mode != Some(mode);
+            && self.prev_enc_mode != Some(mode)
+            && self.application != Application::RestrictedCelt;
         if celt_restart {
-            // `RestrictedLowDelay` keeps no delay buffer, and is always
-            // CELT-only: the start never comes before the buffer.
+            // The restricted applications, which keep no delay buffer,
+            // never get here: their mode never changes.
             let start = ebuf.saturating_sub(delay + f2_5) * ch;
             self.celt_prefill[..f2_5 * ch]
                 .copy_from_slice(&self.delay_buffer[start..start + f2_5 * ch]);
@@ -4010,8 +4153,10 @@ impl OpusEncoder {
             // C 2313-2320: Hybrid attenuates the high band when it gets
             // few bits. The gain fades in over CELT's overlap. "gain_fade()
             // and stereo_fade() need to be after the buffer copying because
-            // we don't want any of this to affect the SILK part".
-            if self.prev_hb_gain < 1.0 || hb_gain < 1.0 {
+            // we don't want any of this to affect the SILK part". Not for
+            // an encoder with only SILK, which has no CELT mode for the
+            // window (C `celt_mode != NULL`).
+            if (self.prev_hb_gain < 1.0 || hb_gain < 1.0) && !silk_only_app {
                 gain_fade(
                     &mut self.buf_celt_pcm[..frame_size * ch],
                     self.prev_hb_gain,
@@ -4044,7 +4189,10 @@ impl OpusEncoder {
         {
             let g1 = self.hybrid_stereo_width_q14 as f32 * (1.0 / 16384.0);
             let g2 = self.silk_stereo_width_q14 as f32 * (1.0 / 16384.0);
-            stereo_fade(&mut self.buf_celt_pcm, g1, g2, frame_size, fs);
+            // C `celt_mode != NULL`: not for an encoder with only SILK.
+            if !silk_only_app {
+                stereo_fade(&mut self.buf_celt_pcm, g1, g2, frame_size, fs);
+            }
             self.hybrid_stereo_width_q14 = self.silk_stereo_width_q14;
         }
 
@@ -6752,9 +6900,10 @@ pub(crate) fn frame_rate_from_params(sampling_rate: i32, frame_size: usize) -> O
 ///   pass at least that much.
 ///
 /// The frame must then be one of the durations Opus has (see
-/// [`frame_rate_from_params`]). libopus also refuses frames under 10 ms
-/// for its `RESTRICTED_SILK` application, which opus1 does not have.
+/// [`frame_rate_from_params`]). The `RestrictedSilk` application also
+/// refuses frames under 10 ms: SILK frames are 10 ms or longer.
 pub(crate) fn frame_size_select(
+    application: Application,
     frame_size: usize,
     duration: FrameDuration,
     sampling_rate: i32,
@@ -6767,6 +6916,9 @@ pub(crate) fn frame_size_select(
         return None;
     }
     frame_rate_from_params(sampling_rate, new_size)?;
+    if application == Application::RestrictedSilk && new_size < sampling_rate as usize / 100 {
+        return None;
+    }
     Some(new_size)
 }
 
@@ -7452,8 +7604,14 @@ mod tests {
                 }
             }
         }
-        let apps = [Application::Voip, Application::Audio, Application::RestrictedLowDelay];
-        assert_eq!(apps.map(Application::to_raw), [2048, 2049, 2051]);
+        let apps = [
+            Application::Voip,
+            Application::Audio,
+            Application::RestrictedLowDelay,
+            Application::RestrictedSilk,
+            Application::RestrictedCelt,
+        ];
+        assert_eq!(apps.map(Application::to_raw), [2048, 2049, 2051, 2052, 2053]);
         check(&apps, Application::to_raw);
         let bandwidths = [
             Bandwidth::Narrowband,

@@ -394,10 +394,6 @@ impl MultistreamEncoder {
         self.encode_native(&src, selected, frame_size, output)
     }
 
-    /// The frame to code: libopus `frame_size_select` with the expert frame
-    /// duration of this encoder. Also checks that the input holds the
-    /// `frame_size` samples per channel the caller passed. Returns the
-    /// frame size in samples per channel.
     /// Encodes one frame of interleaved 24-bit samples held in 32-bit
     /// integers: libopus `opus_multistream_encode24`. Full scale is 2^23;
     /// see [`OpusEncoder::encode24`]. `frame_size` and the errors are those
@@ -416,10 +412,18 @@ impl MultistreamEncoder {
         self.encode_native(&src, selected, frame_size, output)
     }
 
+    /// The frame to code: libopus `frame_size_select` with the application
+    /// and the expert frame duration of this encoder. Also checks that the
+    /// input holds the `frame_size` samples per channel the caller passed.
+    /// Returns the frame size in samples per channel.
     fn check_input(&self, pcm_len: usize, frame_size: usize) -> Result<usize, Error> {
-        let selected =
-            crate::frame_size_select(frame_size, self.variable_duration, self.sampling_rate)
-                .ok_or(Error::INVALID_FRAME_SIZE)?;
+        let selected = crate::frame_size_select(
+            self.application,
+            frame_size,
+            self.variable_duration,
+            self.sampling_rate,
+        )
+        .ok_or(Error::INVALID_FRAME_SIZE)?;
         if pcm_len < frame_size.saturating_mul(self.layout.channels()) {
             return Err(Error::INPUT_TOO_SHORT);
         }
@@ -441,6 +445,9 @@ impl MultistreamEncoder {
         let streams = self.layout.streams();
         let coupled = self.layout.coupled_streams();
         let surround_mode = self.mapping_type == MappingType::Surround;
+        // C 910, 989, 1005, 1013: surround masking needs CELT, so an encoder
+        // with only SILK leaves it out.
+        let masking = surround_mode && self.application != Application::RestrictedSilk;
         // libopus reads the VBR switch from the first stream.
         let vbr = self.vbr();
 
@@ -457,8 +464,8 @@ impl MultistreamEncoder {
         // through `src`. It gives a mask for every frame size and sampling
         // rate this function is reached with, so `have_mask` is then true.
         let have_mask = match self.surround.as_mut() {
-            Some(analysis) => analysis.run(src, frame_size, &mut self.band_smr),
-            None => false,
+            Some(analysis) if masking => analysis.run(src, frame_size, &mut self.band_smr),
+            _ => false,
         };
 
         // Compute bitrate allocation between streams.
@@ -549,7 +556,7 @@ impl MultistreamEncoder {
                 Some(c2) => src.copy_pair(&mut self.buf, c1, c2, frame_size),
                 None => src.copy(&mut self.buf, c1, frame_size),
             }
-            if surround_mode {
+            if masking {
                 // libopus sets the mask of every stream on every frame in
                 // surround mode: the mask of the left channel, then that of
                 // the right. D6: the values are copied. Without a mask the

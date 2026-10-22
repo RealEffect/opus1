@@ -89,11 +89,17 @@ These settings of `OpusEncoder` can be changed at any time. The next `encode` ca
 | `set_packet_loss_perc(u8)` | `packet_loss_perc()` | 0 | The packet loss the network is expected to have, 0 to 100 percent. A value above 100 is refused. |
 | `set_expert_frame_duration(FrameDuration)` | `expert_frame_duration()` | `FrameDuration::Argument` | The duration of the frame each `encode` call codes. `Argument` takes the `frame_size` of the call. See [Frame duration](#frame-duration). |
 
-The three `Application` values give the encoder a hint about the signal. They match libopus's `OPUS_APPLICATION_*` values.
+The five `Application` values give the encoder a hint about the signal, or restrict its choices. They match libopus's `OPUS_APPLICATION_*` values.
 
 - `Application::Voip`: speech. The encoder prefers SILK and Hybrid.
 - `Application::Audio`: music and other sound. The encoder prefers CELT.
-- `Application::RestrictedLowDelay`: every packet is CELT-only, and the encoder leaves out the 4 ms that align CELT with SILK. Its delay (`lookahead()`) is 2.5 ms instead of 6.5 ms.
+- `Application::RestrictedLowDelay`: every packet with audio is CELT-only, and the encoder leaves out the 4 ms that align CELT with SILK. Its delay (`lookahead()`) is 2.5 ms instead of 6.5 ms.
+- `Application::RestrictedCelt` (libopus 1.6): the packets of `RestrictedLowDelay`, for a decoder that only has CELT.
+- `Application::RestrictedSilk` (libopus 1.6): every packet with audio is SILK-only and at most wideband, for a decoder that only has SILK. Frames are 10 ms or longer; `encode` refuses 2.5 and 5 ms.
+
+A packet without audio is the exception. When the bitrate or the output buffer is too small to code a frame, the encoder writes a TOC-only packet, as libopus does. Its TOC byte names the mode of the last coded frame. Before the first coded frame, and after `reset_state`, that is Hybrid, libopus's initial mode, also for the restricted applications ([Opus packets](02-packets.md#packets-without-audio) has the details). A decoder conceals such a packet like a lost one.
+
+`RestrictedSilk` and `RestrictedCelt` can only be chosen when the encoder is built (`OpusEncoder::new` or `init`, or a multistream constructor): `set_application` refuses to change to them or from them.
 
 For every packet the encoder chooses the mode, the audio bandwidth and the number of coded channels. It decides from the bitrate, the application, the sampling rate, the frame duration and the FEC settings. It uses the thresholds of libopus 1.6.
 
@@ -270,7 +276,7 @@ let pre_skip = encoder.lookahead() * 48_000 / RATE.hz() as usize;
 assert_eq!(pre_skip, 312);
 ```
 
-`lookahead()` is the delay the encoder adds, in samples per channel at the input rate. A decoder's output lags the encoder's input by this much: 6.5 ms for `Voip` and `Audio`, 2.5 ms for `RestrictedLowDelay`.
+`lookahead()` is the delay the encoder adds, in samples per channel at the input rate. A decoder's output lags the encoder's input by this much: 6.5 ms for `Voip`, `Audio` and `RestrictedSilk`, 2.5 ms for `RestrictedLowDelay` and `RestrictedCelt`.
 
 ## Recipe: music at 48 kHz stereo
 

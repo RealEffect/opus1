@@ -309,6 +309,8 @@ In surround mode the encoder sets the bandwidth of every stream, and the mode of
 
 In ambisonics mode (family 2) every stream is coded CELT-only. Outside these two modes the stream encoders choose mode and bandwidth by themselves, as a single `OpusEncoder` does.
 
+With the application `Application::RestrictedSilk` every stream is SILK-only and at most wideband, in every mode, as in libopus 1.6: the coupled streams of surround mode and the ambisonics streams stay SILK-only, and the LFE stream is SILK-only and narrowband. The encoder then runs no surround masking analysis and sets no energy mask. With `Application::RestrictedCelt` every stream is CELT-only.
+
 ### The LFE mode
 
 The stream of the LFE channel runs its encoder with `OpusEncoder::set_lfe(true)` (libopus `OPUS_SET_LFE`). In this mode:
@@ -376,7 +378,7 @@ A port of libopus `OpusMSEncoder`.
 | `set_force_channels(Option<Channels>)`, `force_channels()` | Forces mono or stereo coding on every stream (libopus `OPUS_SET_FORCE_CHANNELS`). A mono stream codes mono whatever is set, so `Some(Channels::Stereo)` acts on the coupled streams only. libopus refuses stereo at the first mono stream, after it has set the coupled streams. In surround mode the coupled streams are forced to stereo on every frame. The getter reads the first stream. |
 | `set_prediction_disabled(bool)`, `prediction_disabled()` | Prediction from earlier frames off on every stream (libopus `OPUS_SET_PREDICTION_DISABLED`). |
 | `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off in the intensity stereo of every coupled stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). |
-| `set_application(Application)` | Changes the application of every stream before the first frame (libopus `OPUS_SET_APPLICATION`); afterwards only the current one is accepted. |
+| `set_application(Application)` | Changes the application of every stream before the first frame (libopus `OPUS_SET_APPLICATION`); afterwards only the current one is accepted. `RestrictedSilk` and `RestrictedCelt` can only be chosen in the constructor: a change to them or from them is refused. |
 | `voice_ratio()` | The voice ratio of the first stream, in percent, or `None` when it is not known (libopus `OPUS_GET_VOICE_RATIO`, -1). |
 | `set_expert_frame_duration(FrameDuration)`, `expert_frame_duration()` | The duration of the frame each `encode` call codes (libopus `OPUS_SET_EXPERT_FRAME_DURATION`). `FrameDuration::Argument`, the default, takes the `frame_size` of the call. The multistream encoder keeps this setting for itself, as libopus does; the setting of a stream encoder plays no part. |
 | `layout()`, `mapping_type()`, `lfe_stream()` | The layout, how it was chosen, and the LFE stream. |

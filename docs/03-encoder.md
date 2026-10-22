@@ -87,7 +87,7 @@ When the packet has no room to code anything, the encoder writes a TOC-only pack
 - the bitrate is below 3 bytes per frame;
 - the frame is 40 ms or longer, and the packet allows fewer than 300 bytes per second or the bitrate is below 2400 bits per second (b/s).
 
-A decoder conceals such a packet as if it were lost. Under CBR the packet is padded to its size. A packet of 60 ms or more says its duration as libopus says it: one SILK frame of 60 ms, two SILK frames of 40 or 60 ms (for 80 and 120 ms), or three to six 20 ms frames with a frame count byte.
+A decoder conceals such a packet as if it were lost. Under CBR the packet is padded to its size. These checks come before the mode is chosen, so the TOC byte names the mode of the last frame the encoder coded, as in libopus (frames shorter than 10 ms are marked CELT-only). Before the first coded frame, and after `reset_state`, that is libopus's initial mode, Hybrid at fullband, also for the restricted applications of rule 1 below. A packet of 60 ms or more says its duration as libopus says it: one SILK frame of 60 ms, two SILK frames of 40 or 60 ms (for 80 and 120 ms), or three to six 20 ms frames with a frame count byte.
 
 ### 1.3 The speech and music analysis
 
@@ -143,7 +143,7 @@ threshold = music + voice_est * voice_est * (voice - music) / 2^14
 
 **Mode.** The rules apply in this order:
 
-1. `RestrictedLowDelay` is always CELT-only.
+1. `RestrictedLowDelay` and `RestrictedCelt` are always CELT-only. `RestrictedSilk` is always SILK-only, and the other rules do not apply to it: it never gets a frame shorter than 10 ms, and an LFE encoder stays SILK-only.
 2. A mode set with `set_force_mode` is taken as it is, and rules 3 to 6 are skipped. Rules 7 and 8, and the last corrections at the end of this section, can still change it.
 3. Otherwise the equivalent rate is compared with a threshold. At or above it the packet is CELT-only; below it, SILK.
 4. With in-band FEC on and a packet loss above `(128 - voice_est) / 16` percent (above 0 % for `Voip` without the analysis, above 5 % for `Audio`), the packet is SILK: only SILK carries FEC. With `InbandFec::OnUnlessMusic` this rule does not apply when `voice_est` is 25 or less.
@@ -240,7 +240,7 @@ The search starts at fullband and steps down until the rate reaches the threshol
 
 The threshold is 1000 b/s lower when the last packet had FEC and 1000 b/s higher when it had none. It is then scaled by about `(125 - min(loss, 25)) / 100`. When the rate is too low and the loss is above 5 %, the bandwidth goes down one step at a time until FEC fits. If no bandwidth fits, FEC stays off and the bandwidth stays as it was.
 
-**Last corrections.** A CELT-only packet has no mediumband and codes wideband instead. An LFE packet is narrowband. SILK above wideband becomes Hybrid. Hybrid at wideband or below becomes SILK-only.
+**Last corrections.** A CELT-only packet has no mediumband and codes wideband instead. An LFE packet is narrowband. A `RestrictedSilk` packet is at most wideband. SILK above wideband becomes Hybrid. Hybrid at wideband or below becomes SILK-only.
 
 ### 1.5 One frame: `encode_frame`
 
@@ -257,11 +257,11 @@ The threshold is 1000 b/s lower when the last packet had FEC and 1000 b/s higher
 The input goes through a high-pass filter first:
 
 - `Voip`: `hp_cutoff_float` (`src/hp_cutoff.rs`), a second-order high-pass filter. Its cutoff starts at 60 hertz (Hz) and follows the pitch that SILK finds (`silk_hp_variable_cutoff` updates it, and `encode_frame` smooths it).
-- `Audio` and `RestrictedLowDelay`: `dc_reject_float`, a first-order filter with a 3 Hz cutoff that removes a constant offset.
+- `Audio` and the three restricted applications: `dc_reject_float`, a first-order filter with a 3 Hz cutoff that removes a constant offset.
 
 A frame whose filtered samples have a sum of squares of 1e9 or more, or that holds a value that is not a number, is coded as silence.
 
-The CELT layer codes the signal 4 ms late. This lines it up with SILK, whose resampler and analysis add their own delay. The encoder keeps 10 ms of filtered input in `delay_buffer`. It builds `pcm_buf` (the field `buf_celt_pcm`) from the last 4 ms of that buffer followed by the filtered frame. CELT codes the first `frame_size` samples of `pcm_buf`. `RestrictedLowDelay` has no 4 ms delay and no delay buffer. The total delay is `lookahead()`: 2.5 ms of CELT window overlap plus the 4 ms.
+The CELT layer codes the signal 4 ms late. This lines it up with SILK, whose resampler and analysis add their own delay. The encoder keeps 10 ms of filtered input in `delay_buffer`. It builds `pcm_buf` (the field `buf_celt_pcm`) from the last 4 ms of that buffer followed by the filtered frame. CELT codes the first `frame_size` samples of `pcm_buf`. The restricted applications (`RestrictedLowDelay`, `RestrictedSilk` and `RestrictedCelt`) have no 4 ms delay and no delay buffer. The total delay is `lookahead()`: 2.5 ms of CELT window overlap plus the 4 ms. As in libopus, `lookahead()` leaves the 4 ms out for `RestrictedLowDelay` and `RestrictedCelt` only. `RestrictedSilk` codes no CELT, and its delay counts the 4 ms as for `Voip` and `Audio`.
 
 ```rust
 use opus1::{Application, Channels, OpusEncoder, SampleRate};
@@ -270,6 +270,10 @@ let encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application:
 assert_eq!(encoder.lookahead(), 312); // 2.5 ms + 4 ms at 48 kHz
 let low_delay = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::RestrictedLowDelay).unwrap();
 assert_eq!(low_delay.lookahead(), 120); // 2.5 ms
+let celt = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::RestrictedCelt).unwrap();
+assert_eq!(celt.lookahead(), 120); // 2.5 ms
+let silk = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::RestrictedSilk).unwrap();
+assert_eq!(silk.lookahead(), 312); // 2.5 ms + 4 ms, as libopus counts it
 ```
 
 #### The SILK part (SILK-only and Hybrid)
@@ -293,7 +297,7 @@ The settings go to SILK in a `SilkControl`. `SilkEncoder::encode` (`src/silk/enc
 6. **SILK encoding** of the packet with `silk_encode_packet`, for one or two coded channels. Section 2 describes it.
 7. **Report.** SILK reports its internal rate and its stereo width. It also reports whether it allows a bandwidth switch and whether it is ready to change its internal rate.
 
-Then `encode_frame` uses the report. A SILK-only TOC names the bandwidth of the rate SILK really coded at. SILK allows a bandwidth switch while its speech activity is below a threshold. When SILK is ready to change its internal rate, this packet ends with a redundant frame and the next one switches.
+Then `encode_frame` uses the report. A SILK-only TOC names the bandwidth of the rate SILK really coded at. SILK allows a bandwidth switch while its speech activity is below a threshold. When SILK is ready to change its internal rate, this packet ends with a redundant frame and the next one switches. A `RestrictedSilk` encoder switches without the redundant frame and without the restart of step 6, as libopus does.
 
 SILK's share of a Hybrid packet, per channel (`compute_silk_rate_for_hybrid`; the 10 ms columns of the code have the same values as the 20 ms ones):
 
@@ -687,8 +691,8 @@ All settings take effect with the next call of `encode`. Each one is a method of
 | `set_vbr(bool)` | `OPUS_SET_VBR` | `true` | CBR (`false`): every packet has the same size and is padded to it. In Hybrid, SILK still runs VBR with a cap and CELT fills the rest. VBR (`true`): see the next row. |
 | `set_vbr_constraint(bool)` | `OPUS_SET_VBR_CONSTRAINT` | `true` | With VBR, CELT-only packets use constrained VBR, which stays close to the bitrate; `false` makes it unconstrained. Hybrid packets always use unconstrained VBR, as in libopus. |
 | `set_complexity(u8)` | `OPUS_SET_COMPLEXITY` | 9 | 0..=10; a value above 10 is an error. More analysis for better quality at the same bitrate (tables 2.12 and 3.11). It also raises the equivalent rate. From 7 on, the speech and music analysis runs for input at 16 to 48 kHz (1.3). |
-| `Application` (argument of `OpusEncoder::new`) | `application` of `opus_encoder_create`, `OPUS_SET_APPLICATION` | none | `Voip`: voice estimate 115 without the analysis, CELT threshold +8000 b/s, high-pass filter with a moving cutoff, SILK input from the integer filter at 8 to 24 kHz and from the float filter at 48 kHz. `Audio`: voice estimate 48 without the analysis and at most 115 with it, a 3 Hz filter that removes the constant (direct current, DC) offset. `RestrictedLowDelay`: always CELT-only, no 4 ms look-ahead. `set_application` changes it before the first frame, as `OPUS_SET_APPLICATION` does; after the first frame only the current application is accepted, until `reset_state`. `application()` reads it. |
-| `set_force_mode(Option<ForcedMode>)` | `OPUS_SET_FORCE_MODE` (in libopus's private header `opus_private.h`) | `None` | Asks for SILK-only, Hybrid or CELT-only. The rules that keep a packet valid still apply (1.4): frames under 10 ms are CELT-only, SILK above wideband becomes Hybrid, Hybrid at wideband or below becomes SILK-only. `force_mode()` reads it (libopus has no request for that). |
+| `Application` (argument of `OpusEncoder::new`) | `application` of `opus_encoder_create`, `OPUS_SET_APPLICATION` | none | `Voip`: voice estimate 115 without the analysis, CELT threshold +8000 b/s, high-pass filter with a moving cutoff, SILK input from the integer filter at 8 to 24 kHz and from the float filter at 48 kHz. `Audio`: voice estimate 48 without the analysis and at most 115 with it, a 3 Hz filter that removes the constant (direct current, DC) offset. `RestrictedLowDelay`: always CELT-only, no 4 ms look-ahead. `RestrictedSilk` (libopus 1.6): always SILK-only, at most wideband, frames of 10 ms or more, no speech and music analysis, no redundant CELT frames, and phase inversion disabling is ignored. `RestrictedCelt` (libopus 1.6): the packets of `RestrictedLowDelay`. `set_application` changes it before the first frame, as `OPUS_SET_APPLICATION` does; after the first frame only the current application is accepted, until `reset_state`. `RestrictedSilk` and `RestrictedCelt` can only be chosen when the encoder is built (`new` or `init`): `set_application` refuses to change to them or from them, as libopus 1.6 does. The restricted applications limit the packets that carry audio; a TOC-only packet can name another mode (1.2). `application()` reads it. |
+| `set_force_mode(Option<ForcedMode>)` | `OPUS_SET_FORCE_MODE` (in libopus's private header `opus_private.h`) | `None` | Asks for SILK-only, Hybrid or CELT-only. The rules that keep a packet valid still apply (1.4): the restricted applications keep their mode, frames under 10 ms are CELT-only, SILK above wideband becomes Hybrid, Hybrid at wideband or below becomes SILK-only. `force_mode()` reads it (libopus has no request for that). |
 | `set_bandwidth(Option<Bandwidth>)` | `OPUS_SET_BANDWIDTH` | `None` (`OPUS_AUTO`) | Codes this bandwidth instead of the automatic one. `bandwidth_setting()` reads it. It never exceeds half the API rate. CELT codes mediumband as wideband. A running SILK encoder moves to it one step at a time. |
 | `bandwidth()` | `OPUS_GET_BANDWIDTH` | `Bandwidth::Fullband` | The bandwidth of the last packet, whether chosen or set (section 1.4). It is fullband before the first packet and after `reset_state`, as in libopus. A packet too small to code audio does not change it. |
 | `set_max_bandwidth(Bandwidth)` | `OPUS_SET_MAX_BANDWIDTH` | `Bandwidth::Fullband` | The widest bandwidth the automatic choice may take. `max_bandwidth()` (`OPUS_GET_MAX_BANDWIDTH`) reads it. |
@@ -698,12 +702,12 @@ All settings take effect with the next call of `encode`. Each one is a method of
 | `set_lsb_depth(u8)` | `OPUS_SET_LSB_DEPTH` | 24 | The input precision, 8..=24 bits; other values are an error. It sets the digital silence threshold and the noise floor of the analysis and of CELT. `encode_i16` uses at most 16 (1.1). |
 | `set_dtx(bool)` | `OPUS_SET_DTX` | `false` | Discontinuous transmission (1.7). `in_dtx()` is `OPUS_GET_IN_DTX`. |
 | `set_packet_loss_perc(u8)` | `OPUS_SET_PACKET_LOSS_PERC` | 0 | The expected packet loss, 0..=100; a value above 100 is an error. FEC needs it above 0. It lowers the equivalent rate, raises the LTP scaling, sets the LBRR gain step, and makes CELT code intra energy more often. |
-| `set_lfe(bool)` | `OPUS_SET_LFE` (in libopus's `celt/celt.h`) | `false` | The encoder codes a low-frequency-effects channel of a surround stream: CELT-only, narrowband, only bands 0 and 1 matter. |
+| `set_lfe(bool)` | `OPUS_SET_LFE` (in libopus's `celt/celt.h`) | `false` | The encoder codes a low-frequency-effects channel of a surround stream: CELT-only, narrowband, only bands 0 and 1 matter. A `RestrictedSilk` encoder codes it SILK-only and narrowband. |
 | `encode_i16` (method) | `opus_encode` (16-bit input) | | Encodes 16-bit samples with an input precision of at most 16 bits. The packets are the same bytes as `encode` with `s as f32 / 32768.0` and `set_lsb_depth(16)`. |
 | `encode24` (method) | `opus_encode24` (24-bit input in 32-bit integers) | | Encodes 24-bit samples, full scale 2^23. Each sample is divided by 2^23 to a float (`INT24TORES`) and the frame is coded as float input with 24 bits of precision; values beyond 24 bits are not limited. The speech and music analysis reads the integers (`downmix_int24`). |
-| `set_expert_frame_duration(FrameDuration)` | `OPUS_SET_EXPERT_FRAME_DURATION` | `FrameDuration::Argument` | Each call codes one frame of the duration that is set; the `frame_size` of the call must be at least that long (libopus `frame_size_select`). The setting stays across a reset. |
+| `set_expert_frame_duration(FrameDuration)` | `OPUS_SET_EXPERT_FRAME_DURATION` | `FrameDuration::Argument` | Each call codes one frame of the duration that is set; the `frame_size` of the call must be at least that long (libopus `frame_size_select`). With `RestrictedSilk`, 2.5 and 5 ms make every call fail. The setting stays across a reset. |
 | `set_prediction_disabled(bool)` | `OPUS_SET_PREDICTION_DISABLED` | `false` | Every frame can be decoded on its own: SILK codes each packet as the first after a reset, CELT turns off the pre-filter and inter-frame energy prediction. Costs quality. |
-| `set_phase_inversion_disabled(bool)` | `OPUS_SET_PHASE_INVERSION_DISABLED` | `false` | With `true`, CELT's intensity stereo never inverts the sign of the second channel. libopus documents that this makes a mono downmix of the decoded stereo sound better and lowers stereo quality a little. It changes stereo CELT-only and Hybrid packets at bitrates that use intensity stereo. `reset_state` keeps it. |
+| `set_phase_inversion_disabled(bool)` | `OPUS_SET_PHASE_INVERSION_DISABLED` | `false` | With `true`, CELT's intensity stereo never inverts the sign of the second channel. libopus documents that this makes a mono downmix of the decoded stereo sound better and lowers stereo quality a little. It changes stereo CELT-only and Hybrid packets at bitrates that use intensity stereo. `reset_state` keeps it. A `RestrictedSilk` encoder ignores it, and `phase_inversion_disabled()` stays `false`, as in libopus. |
 | `set_voice_ratio(Option<u8>)` | `OPUS_SET_VOICE_RATIO` (in `opus_private.h`) | `None` (libopus -1) | The speech probability in percent, 0..=100, or `None` when it is not known; a value above 100 is an error. The encoder replaces it with `None` on every frame that is not digital silence, and with the analysis's estimate when there is one and the signal type is automatic. `voice_ratio()` is `OPUS_GET_VOICE_RATIO`. |
 | `set_energy_mask(Option<&[f32]>)` | `OPUS_SET_ENERGY_MASK` (in `celt/celt.h`) | `None` | Used by the multistream encoder for surround ([05-multichannel.md](05-multichannel.md)): how much each band is masked by other channels, 21 values per channel. A slice of another length is an error. Lowers the bits of masked bands. |
 | `reset_state()` | `OPUS_RESET_STATE` | | Forgets the signal coded so far, also the state of the analysis. The settings stay, and so do the speech estimate of the last packet and the DTX setting of SILK, as in libopus. |

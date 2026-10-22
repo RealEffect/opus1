@@ -18,9 +18,11 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let channels = if data[1] % 2 == 0 { 1 } else { 2 };
-    let application = match data[2] % 3 {
+    let application = match data[2] % 5 {
         0 => Application::Voip,
         1 => Application::Audio,
+        2 => Application::RestrictedSilk,
+        3 => Application::RestrictedCelt,
         _ => Application::RestrictedLowDelay,
     };
 
@@ -32,6 +34,10 @@ fuzz_target!(|data: &[u8]| {
     };
 
     if frame_size < 40 {
+        return;
+    }
+    // A `RestrictedSilk` encoder refuses frames under 10 ms.
+    if application == Application::RestrictedSilk && frame_size < sampling_rate as usize / 100 {
         return;
     }
 
