@@ -5,6 +5,7 @@
 //! `dnn/fargan_data.c` (`init_fargan`). Do not edit: change the generator and
 //! run it again (`tools/dnn-gen/README.md`).
 
+use crate::Error;
 use super::{Layer, LayerSpec, LinearSpec};
 use crate::dnn::nnet::LinearLayer;
 use crate::dnn::weights::WeightList;
@@ -378,7 +379,7 @@ impl<'w> Fargan<'w> {
     /// libopus `init_fargan`: builds every layer from the arrays of `list`, in
     /// the order of `LAYERS`. Fails at the first layer whose arrays are
     /// missing, have the wrong size or are malformed; then nothing is built.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(Fargan {
             cond_net_pembed: LAYERS[0].linear(list)?,
             cond_net_fdense1: LAYERS[1].linear(list)?,

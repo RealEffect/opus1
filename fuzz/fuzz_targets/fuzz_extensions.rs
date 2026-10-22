@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
 
 /// The extensions of `data` in frame order, from `count_ext` and
 /// `parse_ext`, after checking both against libopus.
-fn parse_in_frame_order<'a>(data: &'a [u8], nb_frames: usize, what: &str) -> Result<Vec<Extension<'a>>, &'static str> {
+fn parse_in_frame_order<'a>(data: &'a [u8], nb_frames: usize, what: &str) -> Result<Vec<Extension<'a>>, opus1::Error> {
     let len = data.len() as i32;
     let nf = nb_frames as c_int;
     let mut c_counts = [0i32; 48];
@@ -64,7 +64,7 @@ fn parse_in_frame_order<'a>(data: &'a [u8], nb_frames: usize, what: &str) -> Res
             Ok(ours)
         }
         Err(e) => {
-            assert_eq!(e, err_str(c_ret), "{what}: parse_ext error");
+            assert_eq!(e.to_raw(), c_ret, "{what}: parse_ext error");
             Err(e)
         }
     }
@@ -103,7 +103,7 @@ fn read_padding(u: &mut Unstructured) -> Result<()> {
             let b: Vec<Plain> = c_exts[..n].iter().map(c_plain).collect();
             assert_eq!(a, b, "{what}: parse");
         }
-        Err(e) => assert_eq!(e, err_str(c_ret), "{what}: parse error"),
+        Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: parse error"),
     }
 
     // parse, into a list that is too short
@@ -112,7 +112,7 @@ fn read_padding(u: &mut Unstructured) -> Result<()> {
         let mut c_n = cap as i32;
         let c_ret = unsafe { opus_packet_extensions_parse(data.as_ptr(), len, c_exts.as_mut_ptr(), &mut c_n, nf) };
         let ret = extensions::parse(data, &mut ours[..cap], nb_frames);
-        assert_eq!(ret, Err(err_str(c_ret)), "{what}: parse into {cap}");
+        assert_eq!(ret.map_err(|e| e.to_raw()), Err(c_ret), "{what}: parse into {cap}");
     }
 
     // count_ext and parse_ext
@@ -146,7 +146,7 @@ fn read_padding(u: &mut Unstructured) -> Result<()> {
                 assert!(e.frame < nb_frames, "{what}: frame {} of {nb_frames}", e.frame);
             }
             Ok(None) => assert_eq!(c_ret, 0, "{what}: iterator step {step}"),
-            Err(e) => assert_eq!(e, err_str(c_ret), "{what}: iterator step {step}"),
+            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: iterator step {step}"),
         }
     }
 
@@ -190,7 +190,7 @@ fn compare_generate(exts: &[Extension], nb_frames: usize, len: usize, pad: bool,
         unsafe { opus_packet_extensions_generate(std::ptr::null_mut(), len as i32, c.as_ptr(), c.len() as i32, nb_frames as c_int, 0) };
     match extensions::generated_len(len, exts, nb_frames) {
         Ok(n) => assert_eq!(n as i32, c_len, "{what}: generated_len"),
-        Err(e) => assert_eq!(e, err_str(c_len), "{what}: generated_len error"),
+        Err(e) => assert_eq!(e.to_raw(), c_len, "{what}: generated_len error"),
     }
     let mut out = vec![0xEEu8; len];
     match extensions::generate(&mut out, exts, nb_frames, pad) {
@@ -208,6 +208,6 @@ fn compare_generate(exts: &[Extension], nb_frames: usize, len: usize, pad: bool,
             want.sort_by_key(|e| e.1);
             assert_eq!(back.iter().map(plain).collect::<Vec<_>>(), want, "{what}: read back");
         }
-        Err(e) => assert_eq!(e, err_str(c_ret), "{what}: generate error"),
+        Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: generate error"),
     }
 }

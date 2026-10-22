@@ -16,7 +16,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech};
-use opus1::{Application, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder};
 
 /// Stereo music whose right channel is mostly the inverted left channel.
 /// CELT codes such bands as intensity stereo with phase inversion, so
@@ -317,7 +317,7 @@ fn gain_matches_libopus() {
     assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, 1000), 0);
     for v in [i32::MIN, -32769, 32768, i32::MAX] {
         assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, v), sys::OPUS_BAD_ARG, "gain {v}");
-        assert_eq!(rust.set_gain(v), Err("Invalid gain"), "gain {v}");
+        assert_eq!(rust.set_gain(v).map_err(|e| e.kind()), Err(ErrorKind::BadArg), "gain {v}");
         assert_eq!(rust.gain(), c.get(sys::OPUS_GET_GAIN_REQUEST), "gain {v}: kept");
     }
 }

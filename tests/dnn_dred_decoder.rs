@@ -11,7 +11,7 @@
 use opus1::extensions::Extension;
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
-use opus1::{Application, Bitrate, DnnBlob, OpusDecoder, OpusDred, OpusDredDecoder, OpusEncoder, packet};
+use opus1::{Application, Bitrate, DnnBlob, ErrorKind, OpusDecoder, OpusDred, OpusDredDecoder, OpusEncoder, packet};
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
 use std::cell::Cell;
 
@@ -206,7 +206,7 @@ fn dred_decode_checks_its_arguments() {
         dec.decode(p, 320, &mut a).unwrap();
         plain.decode(p, 320, &mut b).unwrap();
     }
-    assert_eq!(dec.dred_decode_float(&dred, 320, 0, &mut a), Err("Invalid argument"));
+    assert_eq!(dec.dred_decode_float(&dred, 320, 0, &mut a).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     for frame in [1, 39, 41, 330] {
         assert!(dec.dred_decode_float(&dred, 320, frame, &mut a).is_err(), "{frame}");
     }
@@ -227,8 +227,8 @@ fn dred_decode_checks_its_arguments() {
 
     // Processing.
     let mut dst = OpusDred::new();
-    assert_eq!(r.process(&OpusDred::new(), &mut dst), Err("Invalid argument"));
-    assert_eq!(r.process_in_place(&mut OpusDred::new()), Err("Invalid argument"));
+    assert_eq!(r.process(&OpusDred::new(), &mut dst).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+    assert_eq!(r.process_in_place(&mut OpusDred::new()).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     let mut deferred = OpusDred::new();
     r.parse(&mut deferred, &data, 16000, 16000, true).unwrap();
     assert!(deferred.is_parsed() && !deferred.is_processed());
@@ -237,12 +237,12 @@ fn dred_decode_checks_its_arguments() {
     assert_eq!(dst.features(), dred.features());
 
     // Parsing: an empty packet, a packet without DRED, a bad rate.
-    assert_eq!(r.parse(&mut dred, &[], 16000, 16000, false), Err("Invalid packet"));
+    assert_eq!(r.parse(&mut dred, &[], 16000, 16000, false).map_err(|e| e.kind()), Err(ErrorKind::InvalidPacket));
     assert!(!dred.is_parsed());
     let got = r.parse(&mut dred, &packets[0], 16000, 16000, false).unwrap();
     assert_eq!((got.samples, got.end), (0, 0));
-    assert_eq!(r.parse(&mut dred, &data, 16000, 0, false), Err("Invalid argument"));
-    assert_eq!(r.parse(&mut dred, &data, 16000, -16000, false), Err("Invalid argument"));
+    assert_eq!(r.parse(&mut dred, &data, 16000, 0, false).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+    assert_eq!(r.parse(&mut dred, &data, 16000, -16000, false).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     // A DRED extension with another version is skipped.
     let mut other = data.clone();
     let at = other.windows(2).position(|w| w == [b'D', DRED_EXPERIMENTAL_VERSION]).unwrap();
@@ -256,7 +256,10 @@ fn dred_decoder_loads_weights() {
     assert!(r.is_loaded());
     // A blob without the RDOVAE decoder is refused and changes nothing.
     let pitch = DnnBlob::from_static(builtin::pitchdnn()).unwrap();
-    assert_eq!(r.set_dnn_blob(&pitch), Err("DNN blob holds no model of this build"));
+    assert_eq!(
+        r.set_dnn_blob(&pitch).map_err(|e| (e.kind(), e.message())),
+        Err((ErrorKind::BadArg, "DNN blob holds no model of this build"))
+    );
     assert!(r.is_loaded());
     r.set_dnn_blob(&DnnBlob::builtin()).unwrap();
     let own = DnnBlob::from_bytes(builtin::dred_rdovae_dec()).unwrap();

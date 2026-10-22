@@ -14,6 +14,8 @@
 extern crate std;
 
 mod compat;
+mod error;
+pub use error::{Error, ErrorKind};
 mod fixedvec;
 mod in_place;
 mod mathops;
@@ -317,7 +319,7 @@ impl FrameDuration {
 }
 
 impl TryFrom<i32> for FrameDuration {
-    type Error = &'static str;
+    type Error = crate::Error;
 
     /// The value with the libopus number `value` (5000 to 5009). Any other
     /// number is refused, as libopus's `OPUS_SET_EXPERT_FRAME_DURATION`
@@ -326,7 +328,7 @@ impl TryFrom<i32> for FrameDuration {
         FrameDuration::ALL
             .into_iter()
             .find(|d| d.to_raw() == value)
-            .ok_or("Invalid frame duration")
+            .ok_or(Error::bad_arg("invalid frame duration"))
     }
 }
 
@@ -521,7 +523,7 @@ fn encode_celt_redundancy(
     pcm: &[f32],
     n: usize,
     out: &mut [u8],
-) -> Result<u32, &'static str> {
+) -> Result<u32, Error> {
     let mut rc = RangeCoder::new_encoder(out.len() as u32);
     let _ = celt.set_start_band(0);
     celt.set_vbr(false);
@@ -529,7 +531,7 @@ fn encode_celt_redundancy(
     celt.encode(pcm, n, &mut rc);
     rc.done();
     if rc.error != 0 || rc.buf.len() < out.len() {
-        return Err("CELT redundancy frame does not fit");
+        return Err(Error::internal("CELT redundancy frame does not fit"));
     }
     out.copy_from_slice(&rc.buf[..out.len()]);
     Ok(rc.rng)
@@ -1248,12 +1250,12 @@ impl OpusEncoder {
         sampling_rate: i32,
         channels: usize,
         application: Application,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, Error> {
         if ![8000, 12000, 16000, 24000, 48000].contains(&sampling_rate) {
-            return Err("Invalid sampling rate");
+            return Err(Error::INVALID_SAMPLING_RATE);
         }
         if ![1, 2].contains(&channels) {
-            return Err("Invalid number of channels");
+            return Err(Error::INVALID_CHANNELS);
         }
 
         let mode = modes::default_mode();
@@ -1731,9 +1733,9 @@ impl OpusEncoder {
     /// at least 500 bits per second and limited to at most 750,000 bits per
     /// second per channel. The length of the output buffer of each
     /// [`encode`](Self::encode) call can lower it further.
-    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), &'static str> {
+    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), Error> {
         self.user_bitrate = match bitrate {
-            Bitrate::BitsPerSecond(bps) if bps <= 0 => return Err("Invalid bitrate"),
+            Bitrate::BitsPerSecond(bps) if bps <= 0 => return Err(Error::INVALID_BITRATE),
             Bitrate::BitsPerSecond(bps) => {
                 Bitrate::BitsPerSecond(bps.clamp(500, 750_000 * self.channels as i32))
             }
@@ -1773,9 +1775,9 @@ impl OpusEncoder {
 
     /// libopus `OPUS_SET_COMPLEXITY`: 0 to 10. Higher values spend more
     /// processor time for better quality. The default is 9.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
         if !(0..=10).contains(&complexity) {
-            return Err("Invalid complexity");
+            return Err(Error::INVALID_COMPLEXITY);
         }
         self.complexity = complexity;
         Ok(())
@@ -1869,9 +1871,9 @@ impl OpusEncoder {
     /// floor of the analysis and of CELT's allocation follows it.
     /// [`encode_i16`](Self::encode_i16) codes with at most 16 bits, as
     /// libopus `opus_encode` does.
-    pub fn set_lsb_depth(&mut self, depth: i32) -> Result<(), &'static str> {
+    pub fn set_lsb_depth(&mut self, depth: i32) -> Result<(), Error> {
         if !(8..=24).contains(&depth) {
-            return Err("Invalid LSB depth");
+            return Err(Error::INVALID_LSB_DEPTH);
         }
         self.lsb_depth = depth;
         Ok(())
@@ -1972,9 +1974,9 @@ impl OpusEncoder {
     /// expected to have, 0 to 100 percent. The default is 0. Higher values
     /// make the packets more robust against loss, at the cost of quality
     /// without loss.
-    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), &'static str> {
+    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), Error> {
         if !(0..=100).contains(&percent) {
-            return Err("Invalid packet loss percentage");
+            return Err(Error::INVALID_PACKET_LOSS);
         }
         self.packet_loss_perc = percent;
         Ok(())
@@ -2003,7 +2005,7 @@ impl OpusEncoder {
     /// [`reset_state`](Self::reset_state) sets the duration back to 0, as
     /// libopus does.
     #[cfg(feature = "dred")]
-    pub fn set_dred_duration(&mut self, frames: i32) -> Result<(), &'static str> {
+    pub fn set_dred_duration(&mut self, frames: i32) -> Result<(), Error> {
         self.dred.set_duration(frames)
     }
 
@@ -2015,16 +2017,16 @@ impl OpusEncoder {
     }
 
     /// libopus `OPUS_SET_DNN_BLOB` on an encoder (feature `dred`): loads the
-    /// models of the DRED encoder (the RDOVAE encoder and PitchDNN) from a
-    /// blob in the libopus format. When the blob does not hold all of their
-    /// arrays, returns `"DNN blob holds no model of this build"` and keeps
-    /// the models it had. [`DnnBlob::builtin`] brings back the built-in
-    /// weights. Without the models the encoder writes no DRED data.
+    /// models of the DRED encoder (the RDOVAE encoder and PitchDNN) from a blob
+    /// in the libopus format. When the blob does not hold all of their arrays,
+    /// returns [`BadArg`](crate::ErrorKind::BadArg) and keeps the models it
+    /// had. [`DnnBlob::builtin`] brings back the built-in weights. Without the
+    /// models the encoder writes no DRED data.
     ///
     /// libopus offers the request only when built with `USE_WEIGHTS_FILE`
     /// and returns `OPUS_BAD_ARG` on a failure.
     #[cfg(feature = "dred")]
-    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<(), Error> {
         self.dred.load(blob)
     }
 
@@ -2070,9 +2072,9 @@ impl OpusEncoder {
     /// automatic choice may take. A bandwidth set with
     /// [`set_bandwidth`](Self::set_bandwidth) is not limited by it.
     /// `Bandwidth::Auto` is not a bandwidth and is rejected.
-    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) -> Result<(), &'static str> {
+    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) -> Result<(), Error> {
         if bandwidth == Bandwidth::Auto {
-            return Err("Invalid maximum bandwidth");
+            return Err(Error::INVALID_MAX_BANDWIDTH);
         }
         self.max_bandwidth = bandwidth;
         Ok(())
@@ -2186,9 +2188,11 @@ impl OpusEncoder {
     /// CELT or Hybrid, 80 to 120 ms of SILK) that would lead over to mono
     /// sets this to `Some(1)` itself (opus_encoder.c:1763-1765). The stream
     /// then stays mono until the caller sets the count again.
-    pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), &'static str> {
+    pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), Error> {
         match channels {
-            Some(n) if n < 1 || n > self.channels => Err("Invalid forced channel count"),
+            Some(n) if n < 1 || n > self.channels => {
+                Err(Error::bad_arg("invalid forced channel count"))
+            }
             _ => {
                 self.force_channels = channels;
                 Ok(())
@@ -2209,9 +2213,9 @@ impl OpusEncoder {
     /// [`reset_state`](Self::reset_state) allows a change again. An
     /// encoder whose application is changed before the first frame codes
     /// as one created with the new application.
-    pub fn set_application(&mut self, application: Application) -> Result<(), &'static str> {
+    pub fn set_application(&mut self, application: Application) -> Result<(), Error> {
         if !self.first && application != self.application {
-            return Err("Application cannot change after the first frame");
+            return Err(Error::bad_arg("application cannot change after the first frame"));
         }
         self.application = application;
         // What `new` derives from the application. Before the first frame
@@ -2238,9 +2242,9 @@ impl OpusEncoder {
     /// the analysis's estimate. While it is not -1 and the signal type is
     /// automatic, it steers the choice between SILK and CELT. The start
     /// value is -1.
-    pub fn set_voice_ratio(&mut self, ratio: i32) -> Result<(), &'static str> {
+    pub fn set_voice_ratio(&mut self, ratio: i32) -> Result<(), Error> {
         if !(-1..=100).contains(&ratio) {
-            return Err("Invalid voice ratio");
+            return Err(Error::bad_arg("invalid voice ratio"));
         }
         self.voice_ratio = ratio;
         Ok(())
@@ -2433,7 +2437,7 @@ impl OpusEncoder {
         input: &[f32],
         frame_size: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let analysis_frame_size = frame_size;
         let frame_size = self.select_frame_size(input.len(), frame_size)?;
         // libopus `opus_encode_float`: the analysis reads the caller's
@@ -2462,7 +2466,7 @@ impl OpusEncoder {
         input: &[i16],
         frame_size: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let analysis_frame_size = frame_size;
         let frame_size = self.select_frame_size(input.len(), frame_size)?;
         // libopus `INT16TORES`, over the frame that is coded. The
@@ -2500,7 +2504,7 @@ impl OpusEncoder {
         input: &[i32],
         frame_size: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let analysis_frame_size = frame_size;
         let frame_size = self.select_frame_size(input.len(), frame_size)?;
         let n = frame_size * self.channels;
@@ -2523,14 +2527,14 @@ impl OpusEncoder {
     /// the caller's (C `analysis_frame_size`), and `input_len` the number
     /// of samples the caller passed. Returns the frame size in samples per
     /// channel.
-    fn select_frame_size(&self, input_len: usize, frame_size: usize) -> Result<usize, &'static str> {
+    fn select_frame_size(&self, input_len: usize, frame_size: usize) -> Result<usize, Error> {
         let selected = frame_size_select(frame_size, self.variable_duration, self.sampling_rate)
-            .ok_or("Invalid frame size for sampling rate")?;
+            .ok_or(Error::INVALID_FRAME_SIZE)?;
         // The caller passes `frame_size` samples per channel, as libopus
         // reads them. Short input is rejected here, so that it cannot
         // panic inside the high-pass filter or the conversion loops.
         if input_len < frame_size.saturating_mul(self.channels) {
-            return Err("Input buffer too small for frame");
+            return Err(Error::INPUT_TOO_SHORT);
         }
         Ok(selected)
     }
@@ -2578,7 +2582,7 @@ impl OpusEncoder {
         analysis_pcm: AnalysisPcm<'_>,
         lsb_depth: i32,
         float_api: bool,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.float_api = float_api;
         // C 1223: no final range until a frame is coded.
         self.range_final = 0;
@@ -2587,22 +2591,22 @@ impl OpusEncoder {
         // are applied later on."
         let mut max_data_bytes = out_data_bytes.min(6 * OPUS_MAX_PACKET_BYTES);
         if max_data_bytes == 0 {
-            return Err("Output buffer too small");
+            return Err(Error::bad_arg("output buffer is empty"));
         }
 
         let frame_rate = frame_rate_from_params(self.sampling_rate, frame_size)
-            .ok_or("Invalid frame size for sampling rate")?;
+            .ok_or(Error::INVALID_FRAME_SIZE)?;
         // C 1231-1236: "Cannot encode 100 ms in 1 byte". A 100 ms packet
         // without audio needs a frame count byte: it is five 20 ms frames.
         if max_data_bytes == 1 && frame_size * 10 == self.sampling_rate as usize {
-            return Err("Output buffer too small");
+            return Err(Error::BUFFER_TOO_SMALL);
         }
 
         // The encoder consumes exactly frame_size * channels samples per call.
         // Short input is rejected here, so that it cannot panic inside the
         // high-pass filter or the float-to-integer conversion loops.
         if input.len() < frame_size * self.channels {
-            return Err("Input buffer too small for frame");
+            return Err(Error::INPUT_TOO_SHORT);
         }
 
         // C 1242-1320: the precision of the input, digital silence, the
@@ -2796,7 +2800,7 @@ impl OpusEncoder {
         d: FrameDecisions,
         analysis: FrameAnalysis,
         first_frame: bool,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let orig_max_data_bytes = output.len();
         // C `max_data_bytes`: one frame takes 1275 bytes at most.
         let n_bytes = orig_max_data_bytes.min(OPUS_MAX_PACKET_BYTES);
@@ -2804,7 +2808,7 @@ impl OpusEncoder {
         // The range coder needs room. libopus never gets here with less:
         // `opus_encode_native` writes a packet without audio instead.
         if n_bytes < 3 {
-            return Err("Output buffer too small");
+            return Err(Error::BUFFER_TOO_SMALL);
         }
         let fs = self.sampling_rate;
         // C `st->channels` (the input's, SILK's `nChannelsAPI`) and
@@ -2854,14 +2858,20 @@ impl OpusEncoder {
 
         match (mode, frame_rate) {
             (OpusMode::CeltOnly, 400 | 200 | 100 | 50) => {}
-            (OpusMode::CeltOnly, _) => return Err("Unsupported frame size for CELT-only mode"),
+            (OpusMode::CeltOnly, _) => {
+                return Err(Error::internal("unsupported frame size for CELT-only mode"));
+            }
             (OpusMode::Hybrid, 100 | 50) => {}
-            (OpusMode::Hybrid, _) => return Err("Unsupported frame size for Hybrid mode"),
+            (OpusMode::Hybrid, _) => {
+                return Err(Error::internal("unsupported frame size for Hybrid mode"));
+            }
             // 2.5/5 ms are CELT-only durations: SILK frames are 10 ms or
             // longer (libopus), and sub-10 ms frames break the SILK
             // analysis geometry (e.g. the VAD band split at 12 kHz).
             (OpusMode::SilkOnly, 100 | 50 | 25 | 16) => {}
-            (OpusMode::SilkOnly, _) => return Err("Unsupported frame size for SILK-only mode"),
+            (OpusMode::SilkOnly, _) => {
+                return Err(Error::internal("unsupported frame size for SILK-only mode"));
+            }
         }
 
         // C 1933-1954: what goes with a change of mode or of SILK's rate.
@@ -3684,7 +3694,7 @@ impl OpusEncoder {
     ///   of a packet goes into the padding, as the extension with ID 126
     ///   for frame 0. With a constant bitrate the padding fills the packet.
     /// - Otherwise a constant bitrate pads the packet to its full size.
-    fn finish_frame(&mut self, output: &mut [u8], ret: usize, first_frame: bool) -> Result<usize, &'static str> {
+    fn finish_frame(&mut self, output: &mut [u8], ret: usize, first_frame: bool) -> Result<usize, Error> {
         let orig_max_data_bytes = output.len();
         #[cfg(feature = "dred")]
         if first_frame {
@@ -3698,7 +3708,7 @@ impl OpusEncoder {
                 let ext = [extensions::Extension { id: DRED_EXTENSION_ID, frame: 0, data: &buf[..n] }];
                 // C returns `OPUS_INTERNAL_ERROR` when this fails.
                 return packet::pad_with_extensions(output, ret, orig_max_data_bytes, self.use_cbr, &ext)
-                    .map_err(|_| "Internal error");
+                    .map_err(|_| Error::INTERNAL_ERROR);
             }
         }
         #[cfg(not(feature = "dred"))]
@@ -3748,7 +3758,7 @@ impl OpusEncoder {
         &mut self,
         frame_size: usize,
         out: &mut [u8],
-    ) -> Result<u32, &'static str> {
+    ) -> Result<u32, Error> {
         let ch = self.channels;
         let f2_5 = self.sampling_rate as usize / 400;
         let f5 = 2 * f2_5;
@@ -3789,7 +3799,7 @@ impl OpusEncoder {
         frame_rate: i32,
         max_data_bytes: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let mut toc_mode = self.mode;
         let mut bw = self.bandwidth;
         let mut frame_rate = frame_rate;
@@ -3871,7 +3881,7 @@ impl OpusEncoder {
         output: &mut [u8],
         analysis_cursor: Option<(usize, i32)>,
         lsb_depth: i32,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         // Up to 120 ms of 20 ms frames.
         const MAX_SUB: usize = 6;
         let ch = self.channels;
@@ -3893,11 +3903,11 @@ impl OpusEncoder {
             fs_u / 50
         };
         if enc_frame == 0 || !frame_size.is_multiple_of(enc_frame) {
-            return Err("Invalid multi-frame size");
+            return Err(Error::internal("invalid multi-frame size"));
         }
         let nb = frame_size / enc_frame;
         if !(2..=MAX_SUB).contains(&nb) {
-            return Err("Unsupported multi-frame size");
+            return Err(Error::internal("unsupported multi-frame size"));
         }
 
         // C 1735-1795: how large the packet and each of its frames may be.
@@ -4019,12 +4029,14 @@ impl OpusEncoder {
         // C 1821-1831: the frames go into one packet (libopus's
         // repacketizer), with the extensions of their padding. A constant
         // bitrate pads it to its full size, unless DTX left out every frame.
+        // As in libopus, a frame the repacketizer refuses, or a packet it
+        // cannot write, is an internal error.
         let mut rp = packet::Repacketizer::new();
         for (part, &len) in sub.iter().zip(&lens).take(nb) {
-            if packet::nb_frames(&part[..len])? != 1 {
-                return Err("Unexpected frame count in a part of a packet");
+            if packet::nb_frames(&part[..len]) != Ok(1) {
+                return Err(Error::internal("unexpected frame count in a part of a packet"));
             }
-            rp.cat(&part[..len])?;
+            rp.cat(&part[..len]).map_err(|_| Error::INTERNAL_ERROR)?;
         }
         rp.out_range_ext(
             0,
@@ -4034,6 +4046,7 @@ impl OpusEncoder {
             self.use_cbr && dtx_count != nb,
             &[],
         )
+        .map_err(|_| Error::INTERNAL_ERROR)
     }
 }
 
@@ -4139,13 +4152,8 @@ pub struct OpusDecoder {
     deep_plc: dnn::plc::DeepPlc,
 }
 
-/// The error of a request that this build does not implement, like
-/// libopus's `OPUS_UNIMPLEMENTED` ("request not implemented").
-#[cfg_attr(feature = "osce-bwe", allow(dead_code))]
-const ERR_UNIMPLEMENTED: &str = "Request not implemented";
-
 impl OpusDecoder {
-    pub fn new(sampling_rate: i32, channels: usize) -> Result<Self, &'static str> {
+    pub fn new(sampling_rate: i32, channels: usize) -> Result<Self, Error> {
         let mut dec = MaybeUninit::<Self>::uninit();
         Self::init(&mut dec, sampling_rate, channels)?;
         // SAFETY: `init` succeeded, so it initialized `dec`.
@@ -4177,18 +4185,18 @@ impl OpusDecoder {
     /// let decoder = OpusDecoder::init(&mut slot, 48000, 2)?;
     /// let mut pcm = [0.0f32; 960 * 2];
     /// decoder.decode(&[], 960, &mut pcm)?; // a lost frame
-    /// # Ok::<(), &'static str>(())
+    /// # Ok::<(), opus1::Error>(())
     /// ```
     pub fn init(
         slot: &mut MaybeUninit<Self>,
         sampling_rate: i32,
         channels: usize,
-    ) -> Result<&mut Self, &'static str> {
+    ) -> Result<&mut Self, Error> {
         if ![8000, 12000, 16000, 24000, 48000].contains(&sampling_rate) {
-            return Err("Invalid sampling rate");
+            return Err(Error::INVALID_SAMPLING_RATE);
         }
         if ![1, 2].contains(&channels) {
-            return Err("Invalid number of channels");
+            return Err(Error::INVALID_CHANNELS);
         }
         // SAFETY: `slot` is valid for writes of `Self`, and `write_new`
         // initializes every field, so `slot` holds a decoder afterwards.
@@ -4280,6 +4288,9 @@ impl OpusDecoder {
     /// packet says how many samples it holds. Only the first
     /// `samples * channels` values of `output` are written, where `samples`
     /// is the result; the rest of `output` is left as it was, as in libopus.
+    /// A `frame_size` of 0 is an error of kind
+    /// [`BadArg`](ErrorKind::BadArg), checked before anything else, as in
+    /// libopus. The other decode methods check it in the same way.
     ///
     /// The packet may code another channel count than the decoder has, as
     /// in libopus. A mono packet is written to both channels of a stereo
@@ -4306,7 +4317,7 @@ impl OpusDecoder {
         input: &[u8],
         frame_size: usize,
         output: &mut [f32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let (samples, _) = self.decode_native(input, frame_size, output, false, false, false)?;
         Ok(samples)
     }
@@ -4332,7 +4343,7 @@ impl OpusDecoder {
         data: &[u8],
         frame_size: usize,
         output: &mut [f32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.decode_native(data, frame_size, output, true, false, false)
             .map(|(samples, _)| samples)
     }
@@ -4353,7 +4364,7 @@ impl OpusDecoder {
         input: &[u8],
         frame_size: usize,
         output: &mut [i16],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.decode_i16_native(input, frame_size, output, false)
     }
 
@@ -4364,7 +4375,7 @@ impl OpusDecoder {
         data: &[u8],
         frame_size: usize,
         output: &mut [i16],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.decode_i16_native(data, frame_size, output, true)
     }
 
@@ -4383,7 +4394,7 @@ impl OpusDecoder {
         input: &[u8],
         frame_size: usize,
         output: &mut [i32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.decode_int_native(input, frame_size, output, false, false, res_to_int24)
     }
 
@@ -4394,7 +4405,7 @@ impl OpusDecoder {
         data: &[u8],
         frame_size: usize,
         output: &mut [i32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.decode_int_native(data, frame_size, output, true, false, res_to_int24)
     }
 
@@ -4413,9 +4424,9 @@ impl OpusDecoder {
     /// Where `dred` has no features for that time, or when it is not
     /// processed, the loss is concealed as without DRED.
     ///
-    /// Errors: `"Invalid argument"` when `frame_size` is 0, and those of a
-    /// lost packet in [`decode`](Self::decode). These checks come before
-    /// any change of the decoder.
+    /// Errors: [`BadArg`](crate::ErrorKind::BadArg) when `frame_size` is 0, and
+    /// those of a lost packet in [`decode`](Self::decode). These checks come
+    /// before any change of the decoder.
     #[cfg(feature = "dred")]
     pub fn dred_decode_float(
         &mut self,
@@ -4423,7 +4434,7 @@ impl OpusDecoder {
         dred_offset: i32,
         frame_size: usize,
         output: &mut [f32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.check_dred_decode(frame_size, output.len())?;
         self.queue_dred_features(dred, dred_offset, frame_size);
         self.decode_native(&[], frame_size, output, false, false, false)
@@ -4441,7 +4452,7 @@ impl OpusDecoder {
         dred_offset: i32,
         frame_size: usize,
         output: &mut [i16],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.dred_decode_int(dred, dred_offset, frame_size, output, float2int16)
     }
 
@@ -4456,7 +4467,7 @@ impl OpusDecoder {
         dred_offset: i32,
         frame_size: usize,
         output: &mut [i32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.dred_decode_int(dred, dred_offset, frame_size, output, float2int24)
     }
 
@@ -4464,15 +4475,15 @@ impl OpusDecoder {
     /// libopus's `frame_size <= 0` and 2.5 ms checks, and the room in the
     /// output.
     #[cfg(feature = "dred")]
-    fn check_dred_decode(&self, frame_size: usize, output_len: usize) -> Result<(), &'static str> {
+    fn check_dred_decode(&self, frame_size: usize, output_len: usize) -> Result<(), Error> {
         if frame_size == 0 {
-            return Err("Invalid argument");
+            return Err(Error::INVALID_FRAME_SIZE);
         }
         if !is_whole_2_5ms(frame_size, self.sampling_rate) {
-            return Err("Lost frame: frame_size must be a multiple of 2.5 ms");
+            return Err(Error::LOST_FRAME_SIZE);
         }
         if frame_size.checked_mul(self.channels).is_none_or(|len| len > output_len) {
-            return Err("Output buffer too small for packet");
+            return Err(Error::BUFFER_TOO_SMALL);
         }
         Ok(())
     }
@@ -4530,7 +4541,7 @@ impl OpusDecoder {
         frame_size: usize,
         output: &mut [T],
         convert: fn(f32) -> T,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.check_dred_decode(frame_size, output.len())?;
         self.queue_dred_features(dred, dred_offset, frame_size);
         let saved_duration = self.last_packet_duration;
@@ -4586,7 +4597,7 @@ impl OpusDecoder {
         frame_size: usize,
         output: &mut [i16],
         decode_fec: bool,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         // C `opus_decode`: soft clipping (`OPTIONAL_CLIP`), then
         // `celt_float2int16`.
         self.decode_int_native(data, frame_size, output, decode_fec, true, celt_float2int16)
@@ -4603,7 +4614,12 @@ impl OpusDecoder {
         decode_fec: bool,
         soft_clip: bool,
         convert: fn(&[f32], &mut [T]),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
+        // C `opus_decode` and `opus_decode24`: `frame_size <= 0` is
+        // OPUS_BAD_ARG, before anything else.
+        if frame_size == 0 {
+            return Err(Error::INVALID_FRAME_SIZE);
+        }
         let channels = self.channels;
         let lost = decode_fec || data.is_empty();
         let max_samples = packet::max_packet_samples(self.sampling_rate);
@@ -4614,11 +4630,11 @@ impl OpusDecoder {
             // packet before it conceals anything, so an invalid packet is
             // an error that leaves the decoder as it was.
             if !is_whole_2_5ms(frame_size, self.sampling_rate) {
-                return Err("Lost frame: frame_size must be a multiple of 2.5 ms");
+                return Err(Error::LOST_FRAME_SIZE);
             }
             // A product that overflows cannot fit any buffer.
             if frame_size.checked_mul(channels).is_none_or(|len| len > output.len()) {
-                return Err("Output buffer too small for packet");
+                return Err(Error::BUFFER_TOO_SMALL);
             }
             if !data.is_empty() {
                 packet::parse(data, false)?;
@@ -4713,10 +4729,15 @@ impl OpusDecoder {
         decode_fec: bool,
         self_delimited: bool,
         soft_clip: bool,
-    ) -> Result<(usize, usize), &'static str> {
+    ) -> Result<(usize, usize), Error> {
+        // C `opus_decode_float`: `frame_size <= 0` is OPUS_BAD_ARG, before
+        // anything else.
+        if frame_size == 0 {
+            return Err(Error::INVALID_FRAME_SIZE);
+        }
         let channels = self.channels;
         if (decode_fec || data.is_empty()) && !is_whole_2_5ms(frame_size, self.sampling_rate) {
-            return Err("Lost frame: frame_size must be a multiple of 2.5 ms");
+            return Err(Error::LOST_FRAME_SIZE);
         }
         // A lost duration so long that `frame_size * channels` overflows
         // cannot fit any buffer.
@@ -4724,7 +4745,7 @@ impl OpusDecoder {
         if data.is_empty() {
             let lost_len = lost_len
                 .filter(|&len| len <= output.len())
-                .ok_or("Output buffer too small for packet")?;
+                .ok_or(Error::BUFFER_TOO_SMALL)?;
             self.conceal(frame_size, &mut output[..lost_len])?;
             self.last_packet_duration = frame_size;
             return Ok((frame_size, 0));
@@ -4739,7 +4760,7 @@ impl OpusDecoder {
 
         if decode_fec {
             if lost_len.is_none_or(|len| len > output.len()) {
-                return Err("Output buffer too small for packet");
+                return Err(Error::BUFFER_TOO_SMALL);
             }
             // If no FEC can be present, run the loss concealment.
             if frame_size < packet_frame_size
@@ -4780,10 +4801,10 @@ impl OpusDecoder {
         // `frame_size`, which only says how much room there is.
         let decoded_total = parsed.count * packet_frame_size;
         if decoded_total > frame_size {
-            return Err("frame_size too small for packet");
+            return Err(Error::FRAME_SIZE_TOO_SMALL);
         }
         if output.len() < decoded_total * channels {
-            return Err("Output buffer too small for packet");
+            return Err(Error::BUFFER_TOO_SMALL);
         }
         // Update the state as the last step, so that an invalid packet
         // leaves it alone.
@@ -4831,7 +4852,7 @@ impl OpusDecoder {
         frame_size: usize,
         out: &mut [f32],
         decode_fec: bool,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), Error> {
         if payload.len() <= 1 {
             self.conceal(frame_size, out)
         } else {
@@ -4916,9 +4937,9 @@ impl OpusDecoder {
         self.sampling_rate
     }
 
-    /// libopus `OPUS_SET_COMPLEXITY` of the decoder: 0 to 10. The default
-    /// is 0. A value outside that range is refused with
-    /// `"Invalid complexity"` and the setting stays as it was.
+    /// libopus `OPUS_SET_COMPLEXITY` of the decoder: 0 to 10. The default is 0.
+    /// A value outside that range is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg) and the setting stays as it was.
     ///
     /// Since libopus 1.5 the decoder complexity turns on the neural network
     /// features that were compiled in: deep packet loss concealment from 5
@@ -4935,9 +4956,9 @@ impl OpusDecoder {
     /// the one after it fades in over 10 ms, as in libopus.
     ///
     /// [`reset_state`](Self::reset_state) keeps the value.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
         if !(0..=10).contains(&complexity) {
-            return Err("Invalid complexity");
+            return Err(Error::INVALID_COMPLEXITY);
         }
         self.complexity = complexity;
         // C: the request is passed on to the CELT decoder, whose deep PLC
@@ -4983,9 +5004,9 @@ impl OpusDecoder {
     /// 16-bit conversion and its soft clipping. The decoder's own state
     /// does not see the gain. [`reset_state`](Self::reset_state) keeps the
     /// value.
-    pub fn set_gain(&mut self, gain: i32) -> Result<(), &'static str> {
+    pub fn set_gain(&mut self, gain: i32) -> Result<(), Error> {
         if !(-32768..=32767).contains(&gain) {
-            return Err("Invalid gain");
+            return Err(Error::bad_arg("invalid gain"));
         }
         self.decode_gain = gain;
         Ok(())
@@ -5044,11 +5065,11 @@ impl OpusDecoder {
     /// decodes them, as libopus main does.
     ///
     /// Without the cargo feature `osce-bwe` this returns
-    /// `"Request not implemented"`, as libopus returns `OPUS_UNIMPLEMENTED`
-    /// when it was built without the extension.
+    /// [`Unimplemented`](crate::ErrorKind::Unimplemented), as libopus returns
+    /// `OPUS_UNIMPLEMENTED` when it was built without the extension.
     /// [`reset_state`](Self::reset_state) keeps the switch, and so does the
     /// state of the extension, as in libopus.
-    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), &'static str> {
+    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), Error> {
         #[cfg(feature = "osce-bwe")]
         {
             self.osce_bwe = enabled;
@@ -5057,21 +5078,21 @@ impl OpusDecoder {
         #[cfg(not(feature = "osce-bwe"))]
         {
             let _ = enabled;
-            Err(ERR_UNIMPLEMENTED)
+            Err(Error::UNIMPLEMENTED)
         }
     }
 
     /// The switch set with [`set_osce_bwe`](Self::set_osce_bwe)
-    /// (`OPUS_GET_OSCE_BWE`). Without the cargo feature `osce-bwe` this
-    /// returns `"Request not implemented"`, as libopus does.
-    pub fn osce_bwe(&self) -> Result<bool, &'static str> {
+    /// (`OPUS_GET_OSCE_BWE`). Without the cargo feature `osce-bwe` this returns
+    /// [`Unimplemented`](crate::ErrorKind::Unimplemented), as libopus does.
+    pub fn osce_bwe(&self) -> Result<bool, Error> {
         #[cfg(feature = "osce-bwe")]
         {
             Ok(self.osce_bwe)
         }
         #[cfg(not(feature = "osce-bwe"))]
         {
-            Err(ERR_UNIMPLEMENTED)
+            Err(Error::UNIMPLEMENTED)
         }
     }
 
@@ -5080,12 +5101,12 @@ impl OpusDecoder {
     /// `dump_weights_blob` writes, in place of the weights the decoder has.
     ///
     /// Every model group of this build that the blob holds completely is
-    /// loaded: deep PLC (PitchDNN, the PLC model and FARGAN together),
-    /// LACE, NoLACE and BBWENet. Each group is replaced only when all of
-    /// its arrays load; the groups that the blob lacks keep the weights
-    /// they had. Returns the groups loaded by this call, or
-    /// `"DNN blob holds no model of this build"`, and then nothing changes.
-    /// [`DnnBlob::builtin`] brings back the built-in weights.
+    /// loaded: deep PLC (PitchDNN, the PLC model and FARGAN together), LACE,
+    /// NoLACE and BBWENet. Each group is replaced only when all of its arrays
+    /// load; the groups that the blob lacks keep the weights they had. Returns
+    /// the groups loaded by this call, or [`BadArg`](crate::ErrorKind::BadArg)
+    /// when the blob holds no complete group of this build, and then nothing
+    /// changes. [`DnnBlob::builtin`] brings back the built-in weights.
     ///
     /// The decoder keeps a clone of `blob` (the bytes are not copied) for
     /// as long as it uses the models. A new decoder starts with the
@@ -5096,7 +5117,7 @@ impl OpusDecoder {
     /// `USE_WEIGHTS_FILE` (and so without built-in weights), returns 1 on
     /// any failure, and can leave a model half loaded.
     #[cfg(feature = "dnn")]
-    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<DnnModels, &'static str> {
+    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<DnnModels, Error> {
         self.dnn.load(blob)
     }
 
@@ -5137,7 +5158,7 @@ impl OpusDecoder {
         frame_size: usize,
         out: &mut [f32],
         decode_fec: bool,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), Error> {
         let channels = self.channels;
         let f2_5 = self.sampling_rate as usize / 400;
         let f5 = 2 * f2_5;
@@ -5302,7 +5323,7 @@ impl OpusDecoder {
                 // size or band range that is not valid), which the packet
                 // parser rules out.
                 if decoded != frame_size {
-                    return Err("CELT decoding failed");
+                    return Err(Error::internal("CELT decoding failed"));
                 }
             }
         } else if prev_mode == Some(OpusMode::Hybrid)
@@ -5403,7 +5424,7 @@ impl OpusDecoder {
     ///   shorter piece.
     /// - A piece is 2.5, 5, 10 or 20 ms: the next shorter one when what is
     ///   left lies between two of them. SILK-only also takes 7.5 ms.
-    fn conceal(&mut self, total: usize, output: &mut [f32]) -> Result<(), &'static str> {
+    fn conceal(&mut self, total: usize, output: &mut [f32]) -> Result<(), Error> {
         let f2_5 = self.sampling_rate as usize / 400;
         let (f5, f10, f20) = (2 * f2_5, 4 * f2_5, 8 * f2_5);
         let channels = self.channels;
@@ -5505,7 +5526,7 @@ impl OpusDecoder {
         start_band: usize,
         out: &mut [f32],
         layout: PcmLayout,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), Error> {
         self.celt_dec.set_stream_channels(self.stream_channels)?;
         self.celt_dec.set_start_band(start_band)?;
         with_deep_plc!(self, |p| self.celt_dec.decode_lost_with_deep_plc(n, out, layout, p))?;
@@ -5546,7 +5567,7 @@ impl OpusDecoder {
         frame_size: usize,
         mode: OpusMode,
         out: Option<&mut [f32]>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), Error> {
         // C 444-466: the OSCE method follows the complexity. The extended
         // mode says whether the bandwidth extension makes the output.
         // After CELT-only frames there is no fade between it and the
@@ -5628,7 +5649,7 @@ impl OpusDecoder {
                     out[done * channels..room * channels].fill(0.0);
                     done = frame_size;
                 }
-                _ => return Err("SILK decoding failed"),
+                _ => return Err(Error::internal("SILK decoding failed")),
             }
         }
         Ok(())

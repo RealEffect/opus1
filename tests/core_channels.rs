@@ -62,7 +62,7 @@ impl Pair {
         self.rate * tenth_ms as usize / 10_000
     }
 
-    fn compare(&mut self, what: &str, expected: Result<Vec<f32>, i32>, got: Result<usize, &'static str>, buf: &[f32]) -> Vec<f32> {
+    fn compare(&mut self, what: &str, expected: Result<Vec<f32>, i32>, got: Result<usize, opus1::Error>, buf: &[f32]) -> Vec<f32> {
         let expected = expected.unwrap_or_else(|e| panic!("{what}: libopus error {e}"));
         let n = got.unwrap_or_else(|e| panic!("{what}: opus1 error: {e}"));
         assert_eq!(n * self.channels, expected.len(), "{what}: number of samples");

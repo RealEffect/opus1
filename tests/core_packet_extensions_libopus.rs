@@ -104,18 +104,6 @@ unsafe extern "C" {
     fn opus_packet_pad_impl(data: *mut c_uchar, len: i32, new_len: i32, pad: c_int, exts: *const CExt, nb: c_int) -> i32;
 }
 
-/// The message opus1 gives for a libopus error code.
-fn err_str(code: i32) -> &'static str {
-    match code {
-        -1 => "Invalid argument",
-        -2 => "Output buffer too small",
-        -3 => "Internal error",
-        -4 => "Invalid packet",
-        0.. => "no error",
-        _ => panic!("unexpected libopus error {code}"),
-    }
-}
-
 /// A small deterministic random number generator.
 struct Rng(u64);
 
@@ -292,7 +280,7 @@ fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
             let b: Vec<Plain> = c_exts[..n].iter().map(c_plain).collect();
             assert_eq!(a, b, "{what}: parse");
         }
-        Err(e) => assert_eq!(e, err_str(c_ret), "{what}: parse error"),
+        Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: parse error"),
     }
     // parse into a list that is too short
     if c_count > 0 {
@@ -300,7 +288,7 @@ fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
         let mut c_n = cap as i32;
         let c_ret = unsafe { opus_packet_extensions_parse(data.as_ptr(), len, c_exts.as_mut_ptr(), &mut c_n, nf) };
         let ret = extensions::parse(data, &mut ours[..cap], nb_frames);
-        assert_eq!(ret, Err(err_str(c_ret)), "{what}: parse into {cap}");
+        assert_eq!(ret.map_err(|e| e.to_raw()), Err(c_ret), "{what}: parse into {cap}");
     }
     // count_ext and parse_ext
     let mut c_counts = [0i32; 48];
@@ -350,7 +338,7 @@ fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
                 assert_eq!(plain(&e), c_plain(&c_ext), "{what}: step {step}");
             }
             Ok(None) => assert_eq!(c_ret, 0, "{what}: step {step}"),
-            Err(e) => assert_eq!(e, err_str(c_ret), "{what}: step {step}"),
+            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: step {step}"),
         }
     }
 }
@@ -450,7 +438,7 @@ fn generate_writes_the_bytes_of_libopus() {
         let ret_len = extensions::generated_len(len, &exts, nb_frames);
         match ret_len {
             Ok(n) => assert_eq!(n as i32, c_len, "{what}: length"),
-            Err(e) => assert_eq!(e, err_str(c_len), "{what}: length error"),
+            Err(e) => assert_eq!(e.to_raw(), c_len, "{what}: length error"),
         }
         match ret {
             Ok(n) => {
@@ -466,7 +454,7 @@ fn generate_writes_the_bytes_of_libopus() {
                 assert_eq!(back[..m].iter().map(plain).collect::<Vec<_>>(), want, "{what}: read back");
                 repeats += out[..n].iter().any(|&b| b == 0x04 || b == 0x05) as usize;
             }
-            Err(e) => assert_eq!(e, err_str(c_ret), "{what}: error"),
+            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: error"),
         }
     }
     assert!(repeats > 1000, "{repeats} lists used a repeat");
@@ -608,7 +596,7 @@ fn pad_and_unpad_carry_extensions_like_libopus() {
                     assert_eq!(buf[..n], c_buf[..n], "{w}: bytes");
                     kept += extensions::count(packet::parse(&buf[..n], false).unwrap().padding(&buf[..n]), count);
                 }
-                Err(e) => assert_eq!(e, err_str(c_ret), "{w}: error"),
+                Err(e) => assert_eq!(e.to_raw(), c_ret, "{w}: error"),
             }
         }
 
@@ -665,7 +653,7 @@ fn repacketizer_carries_extensions_like_libopus() {
             let ret = rp.cat(p);
             match ret {
                 Ok(()) => assert_eq!(c_ret, 0, "{what}: cat {k}"),
-                Err(e) => assert_eq!(e, err_str(c_ret), "{what}: cat {k}"),
+                Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: cat {k}"),
             }
         }
         let nb = unsafe { sys::opus_repacketizer_get_nb_frames(c_rp) } as usize;
@@ -702,7 +690,7 @@ fn repacketizer_carries_extensions_like_libopus() {
                     let p = packet::parse(&out[..n], self_delimited).unwrap();
                     carried += extensions::count(p.padding(&out[..n]), p.count);
                 }
-                Err(e) => assert_eq!(e, err_str(c_ret), "{w}: error"),
+                Err(e) => assert_eq!(e.to_raw(), c_ret, "{w}: error"),
             }
         }
         // The public calls without options.
@@ -715,7 +703,7 @@ fn repacketizer_carries_extensions_like_libopus() {
                     assert_eq!(n as i32, c_ret, "{what}: out");
                     assert_eq!(out[..n], c_out[..n], "{what}: out bytes");
                 }
-                Err(e) => assert_eq!(e, err_str(c_ret), "{what}: out error"),
+                Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: out error"),
             }
         }
         unsafe { sys::opus_repacketizer_destroy(c_rp) };
@@ -762,7 +750,7 @@ fn multistream_pad_and_unpad_like_libopus() {
                 assert_eq!(buf, c_buf, "{what}: pad bytes");
                 kept += 1;
             }
-            Err(e) => assert_eq!(e, err_str(c_ret), "{what}: pad error"),
+            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: pad error"),
         }
         let mut c_buf = data.clone();
         let mut buf = data.clone();
@@ -772,7 +760,7 @@ fn multistream_pad_and_unpad_like_libopus() {
                 assert_eq!(n as i32, c_ret, "{what}: unpad");
                 assert_eq!(buf[..n], c_buf[..n], "{what}: unpad bytes");
             }
-            Err(e) => assert_eq!(e, err_str(c_ret), "{what}: unpad error"),
+            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: unpad error"),
         }
     }
     assert!(kept > 1_900, "{kept} packets padded");
@@ -801,7 +789,7 @@ fn malformed_packets_give_the_errors_of_libopus() {
                 assert_eq!(c_ret, 0, "{what}: pad");
                 assert_eq!(buf[..new_len], c_buf[..new_len], "{what}: pad bytes");
             }
-            Err(e) => assert_eq!(e, err_str(c_ret), "{what}: pad error"),
+            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: pad error"),
         }
         // unpad
         if len > 0 {
@@ -813,7 +801,7 @@ fn malformed_packets_give_the_errors_of_libopus() {
                     assert_eq!(n as i32, c_ret, "{what}: unpad");
                     assert_eq!(buf[..n], c_buf[..n], "{what}: unpad bytes");
                 }
-                Err(e) => assert_eq!(e, err_str(c_ret), "{what}: unpad error"),
+                Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: unpad error"),
             }
         }
         // cat and out
@@ -832,10 +820,10 @@ fn malformed_packets_give_the_errors_of_libopus() {
                             assert_eq!(n as i32, c_ret, "{what}: out");
                             assert_eq!(out[..n], c_out[..n], "{what}: out bytes");
                         }
-                        Err(e) => assert_eq!(e, err_str(c_ret), "{what}: out error"),
+                        Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: out error"),
                     }
                 }
-                Err(e) => assert_eq!(e, err_str(c_ret), "{what}: cat error"),
+                Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: cat error"),
             }
             unsafe { sys::opus_repacketizer_destroy(c_rp) };
         }

@@ -5,6 +5,7 @@
 //! `dnn/pitchdnn_data.c` (`init_pitchdnn`). Do not edit: change the generator
 //! and run it again (`tools/dnn-gen/README.md`).
 
+use crate::Error;
 use super::{Conv2dSpec, Layer, LayerSpec, LinearSpec};
 use crate::dnn::nnet::{Conv2dLayer, LinearLayer};
 use crate::dnn::weights::WeightList;
@@ -158,7 +159,7 @@ impl<'w> PitchDnn<'w> {
     /// libopus `init_pitchdnn`: builds every layer from the arrays of `list`,
     /// in the order of `LAYERS`. Fails at the first layer whose arrays are
     /// missing, have the wrong size or are malformed; then nothing is built.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(PitchDnn {
             dense_if_upsampler_1: LAYERS[0].linear(list)?,
             dense_if_upsampler_2: LAYERS[1].linear(list)?,

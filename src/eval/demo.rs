@@ -128,7 +128,9 @@ pub trait DemoDecoder {
     /// integers (full scale is ±2^23). An empty `data` is a lost packet,
     /// concealed for `frame_size` samples. With `decode_fec`, the frame
     /// before `data` is recovered from it. Returns the samples per channel
-    /// written.
+    /// written. The error is a message, not a [`crate::Error`], because
+    /// code outside the crate (a test that wraps libopus) cannot make an
+    /// `Error`.
     fn decode24(
         &mut self,
         data: &[u8],
@@ -157,21 +159,22 @@ impl DemoDecoder for crate::OpusDecoder {
         out: &mut [i32],
     ) -> Result<usize, &'static str> {
         if frame_size == 0 {
-            return Err("Invalid argument");
+            return Err(crate::Error::INVALID_FRAME_SIZE.message());
         }
         // C: a packet that arrived needs no more room than it holds.
         let frame_size = if !data.is_empty() && !decode_fec {
-            frame_size.min(packet::nb_samples(data, self.sampling_rate())?)
+            frame_size.min(packet::nb_samples(data, self.sampling_rate()).map_err(|e| e.message())?)
         } else {
             frame_size
         };
         let channels = crate::OpusDecoder::channels(self);
         let mut pcm = vec![0.0f32; frame_size * channels];
         let n = if decode_fec {
-            self.decode_fec(data, frame_size, &mut pcm)?
+            self.decode_fec(data, frame_size, &mut pcm)
         } else {
-            self.decode(data, frame_size, &mut pcm)?
-        };
+            self.decode(data, frame_size, &mut pcm)
+        }
+        .map_err(|e| e.message())?;
         for (o, &x) in out.iter_mut().zip(&pcm[..n * channels]) {
             *o = res2int24(x);
         }

@@ -15,6 +15,7 @@
 //! its float and 24-bit variants), which queues the features for deep PLC
 //! and conceals the lost audio with them.
 
+use crate::Error;
 use super::coding::compute_quantizer;
 use super::rdovae_dec;
 use super::{DRED_EXPERIMENTAL_BYTES, DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID, DRED_NUM_REDUNDANCY_FRAMES};
@@ -27,9 +28,6 @@ use crate::dnn::models::dred_rdovae_stats::{
 use crate::extensions::ExtensionIterator;
 use crate::packet;
 use crate::range_coder::RangeCoder;
-
-const BAD_ARG: &str = "Invalid argument";
-const UNIMPLEMENTED: &str = "Request not implemented";
 
 /// The number of feature values an `OpusDred` holds: 104 frames of 10 ms.
 const FEC_FEATURES: usize = 2 * DRED_NUM_REDUNDANCY_FRAMES * DRED_NUM_FEATURES;
@@ -149,21 +147,21 @@ impl OpusDredDecoder {
         OpusDredDecoder { dnn: DredDecoderDnn::new() }
     }
 
-    /// libopus `OPUS_SET_DNN_BLOB` on a DRED decoder: loads the RDOVAE
-    /// decoder from a blob in the libopus format. When the blob does not
-    /// hold all of its arrays, returns `"DNN blob holds no model of this
-    /// build"` and keeps the weights it had. [`DnnBlob::builtin`] brings
-    /// back the built-in weights.
+    /// libopus `OPUS_SET_DNN_BLOB` on a DRED decoder: loads the RDOVAE decoder
+    /// from a blob in the libopus format. When the blob does not hold all of
+    /// its arrays, returns [`BadArg`](crate::ErrorKind::BadArg) and keeps the
+    /// weights it had. [`DnnBlob::builtin`] brings back the built-in weights.
     ///
     /// libopus offers the request only when built with `USE_WEIGHTS_FILE`,
     /// returns `OPUS_BAD_ARG` on a failure, and can leave the model half
     /// replaced.
-    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<(), Error> {
         self.dnn.load(blob)
     }
 
-    /// True when the RDOVAE decoder is loaded (libopus `loaded`). Without
-    /// it, `parse` and `process` return `"Request not implemented"`.
+    /// True when the RDOVAE decoder is loaded (libopus `loaded`). Without it,
+    /// `parse` and `process` return
+    /// [`Unimplemented`](crate::ErrorKind::Unimplemented).
     pub fn is_loaded(&self) -> bool {
         self.dnn.model().is_some()
     }
@@ -180,13 +178,15 @@ impl OpusDredDecoder {
     /// - `defer_processing`: when true, the RDOVAE decoder does not run;
     ///   call [`process`](Self::process) before decoding audio.
     ///
-    /// Returns what was found ([`DredParse`]). A packet without DRED data
-    /// gives zeros and leaves `dred` unusable for decoding. Errors:
-    /// `"Request not implemented"` without a loaded model; `"Invalid
-    /// packet"` when the packet or its extensions are malformed;
-    /// `"Invalid argument"` when `sampling_rate` is not positive (libopus
-    /// divides by it). Every call with a loaded model first marks `dred` as
-    /// not parsed, as libopus does, so after an error it cannot be decoded.
+    /// Returns what was found ([`DredParse`]). A packet without DRED data gives
+    /// zeros and leaves `dred` unusable for decoding. Errors:
+    /// [`Unimplemented`](crate::ErrorKind::Unimplemented) without a loaded
+    /// model; [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the
+    /// packet or its extensions are malformed;
+    /// [`BadArg`](crate::ErrorKind::BadArg) when `sampling_rate` is not
+    /// positive (libopus divides by it). Every call with a loaded model first
+    /// marks `dred` as not parsed, as libopus does, so after an error it cannot
+    /// be decoded.
     pub fn parse(
         &self,
         dred: &mut OpusDred,
@@ -194,13 +194,13 @@ impl OpusDredDecoder {
         max_dred_samples: i32,
         sampling_rate: i32,
         defer_processing: bool,
-    ) -> Result<DredParse, &'static str> {
+    ) -> Result<DredParse, Error> {
         if !self.is_loaded() {
-            return Err(UNIMPLEMENTED);
+            return Err(Error::UNIMPLEMENTED);
         }
         dred.process_stage = -1;
         if sampling_rate <= 0 {
-            return Err(BAD_ARG);
+            return Err(Error::BAD_ARG);
         }
         let Some((payload, dred_frame_offset)) = find_payload(data)? else {
             return Ok(DredParse::default());
@@ -217,16 +217,17 @@ impl OpusDredDecoder {
         Ok(DredParse { samples: samples.max(0), end: end.max(0) })
     }
 
-    /// Runs the RDOVAE decoder on a parsed `dred` (libopus
-    /// `opus_dred_process` with `src == dst`). A state already processed
-    /// is left as it is. Errors: `"Invalid argument"` when `dred` holds no
-    /// parsed data; `"Request not implemented"` without a loaded model.
-    pub fn process_in_place(&self, dred: &mut OpusDred) -> Result<(), &'static str> {
+    /// Runs the RDOVAE decoder on a parsed `dred` (libopus `opus_dred_process`
+    /// with `src == dst`). A state already processed is left as it is. Errors:
+    /// [`BadArg`](crate::ErrorKind::BadArg) when `dred` holds no parsed data;
+    /// [`Unimplemented`](crate::ErrorKind::Unimplemented) without a loaded
+    /// model.
+    pub fn process_in_place(&self, dred: &mut OpusDred) -> Result<(), Error> {
         if !dred.is_parsed() {
-            return Err(BAD_ARG);
+            return Err(Error::BAD_ARG);
         }
         let Some(model) = self.dnn.model() else {
-            return Err(UNIMPLEMENTED);
+            return Err(Error::UNIMPLEMENTED);
         };
         if dred.process_stage == 2 {
             return Ok(());
@@ -248,12 +249,12 @@ impl OpusDredDecoder {
     /// be processed later, or more than once. The errors are those of
     /// [`process_in_place`](Self::process_in_place), and then `dst` is
     /// unchanged.
-    pub fn process(&self, src: &OpusDred, dst: &mut OpusDred) -> Result<(), &'static str> {
+    pub fn process(&self, src: &OpusDred, dst: &mut OpusDred) -> Result<(), Error> {
         if !src.is_parsed() {
-            return Err(BAD_ARG);
+            return Err(Error::BAD_ARG);
         }
         if !self.is_loaded() {
-            return Err(UNIMPLEMENTED);
+            return Err(Error::UNIMPLEMENTED);
         }
         dst.clone_from(src);
         self.process_in_place(dst)
@@ -269,7 +270,7 @@ impl Default for OpusDredDecoder {
 /// libopus `dred_find_payload`: the DRED payload of a packet, without its
 /// 2-byte header, and the position of the frame that carries it in units of
 /// 2.5 ms. The first DRED extension with the right header wins.
-fn find_payload(data: &[u8]) -> Result<Option<(&[u8], i32)>, &'static str> {
+fn find_payload(data: &[u8]) -> Result<Option<(&[u8], i32)>, Error> {
     let parsed = packet::parse(data, false)?;
     let frame_size = packet::samples_per_frame(data[0], 48000);
     let mut iter = ExtensionIterator::new(parsed.padding(data), parsed.count);

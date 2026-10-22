@@ -17,7 +17,7 @@ use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bitrate, ForcedMode};
+use opus1::{Application, Bitrate, ErrorKind, ForcedMode};
 
 /// Whether a stream of the packet is stereo and in Hybrid mode. The final
 /// range of such a packet is not compared: see the note on the fault in
@@ -678,7 +678,7 @@ fn tight_buffers(frame_sizes: &[usize]) -> Tight {
                         let n = match rust_result {
                             Ok(n) => n,
                             Err(e) => {
-                                assert_eq!(e, "Output buffer too small", "{label}");
+                                assert_eq!(e.kind(), ErrorKind::BufferTooSmall, "{label}");
                                 tight.only_c.push(label);
                                 // The streams that were coded before the
                                 // error moved on. Start both sides afresh.

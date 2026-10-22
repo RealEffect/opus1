@@ -13,7 +13,7 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, ErrorKind, ForcedMode, OpusEncoder};
 
 /// A small deterministic random number generator.
 struct Lcg(u32);
@@ -175,8 +175,8 @@ fn random_walk(
                 // packet is limited by the buffer, and with constant
                 // bitrate also by the bitrate.
                 assert_eq!(
-                    e,
-                    "Output buffer too small",
+                    e.kind(),
+                    ErrorKind::BufferTooSmall,
                     "{}: {}",
                     case.name,
                     context(&history)

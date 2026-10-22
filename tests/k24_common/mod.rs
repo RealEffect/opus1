@@ -689,7 +689,7 @@ pub fn rs_decode_all(
     packets: &[Vec<u8>],
     rate: usize,
     channels: usize,
-) -> Result<Vec<f32>, (usize, &'static str)> {
+) -> Result<Vec<f32>, (usize, opus1::Error)> {
     let mut dec = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
     let max = rate * 120 / 1000;
     let mut pcm = vec![0f32; max * channels];

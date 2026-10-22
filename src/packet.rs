@@ -32,14 +32,16 @@
 //!   packets it writes, with frame numbers that count from the first frame
 //!   of the new packet.
 //! - [`pad`] and [`multistream_pad`] keep the extensions of the packet, and
-//!   fail with "Internal error" when its padding holds invalid extension
-//!   data. [`pad_with_extensions`] adds extensions.
+//!   fail with [`InternalError`](crate::ErrorKind::InternalError) when its
+//!   padding holds invalid extension data. [`pad_with_extensions`] adds
+//!   extensions.
 //! - [`unpad`] and [`multistream_unpad`] drop the padding with its
 //!   extensions.
 //!
 //! The decoder ignores extensions, as libopus 1.6.1 without its quality
 //! extension (QEXT) does.
 
+use crate::Error;
 use crate::extensions::{self, Extension, ExtensionIterator, ExtensionList};
 
 /// The most frames a packet can hold: 120 ms of 2.5 ms frames.
@@ -56,11 +58,6 @@ pub(crate) const MAX_PACKET_SAMPLES: usize = max_packet_samples(48000);
 pub(crate) const fn max_packet_samples(fs: i32) -> usize {
     fs as usize / 25 * 3
 }
-
-const INVALID_PACKET: &str = "Invalid packet";
-const BUFFER_TOO_SMALL: &str = "Output buffer too small";
-const BAD_ARG: &str = "Invalid argument";
-const INTERNAL_ERROR: &str = "Internal error";
 
 /// Result of parsing one Opus packet. libopus `opus_packet_parse_impl`.
 #[derive(Debug, Clone, Copy)]
@@ -155,26 +152,26 @@ pub fn samples_per_frame(toc: u8, sampling_rate: i32) -> usize {
 /// libopus `opus_packet_get_nb_frames`: the number of frames a packet says
 /// it holds. Only the first two bytes are looked at; [`parse`] checks the
 /// rest.
-pub fn nb_frames(data: &[u8]) -> Result<usize, &'static str> {
+pub fn nb_frames(data: &[u8]) -> Result<usize, Error> {
     let Some(&toc) = data.first() else {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     };
     match toc & 0x3 {
         0 => Ok(1),
         1 | 2 => Ok(2),
         _ => match data.get(1) {
             Some(&count) => Ok((count & 0x3F) as usize),
-            None => Err(INVALID_PACKET),
+            None => Err(Error::INVALID_PACKET),
         },
     }
 }
 
 /// libopus `opus_packet_get_nb_samples`: the duration of a packet in
 /// samples per channel at `sampling_rate`. More than 120 ms is invalid.
-pub fn nb_samples(data: &[u8], sampling_rate: i32) -> Result<usize, &'static str> {
+pub fn nb_samples(data: &[u8], sampling_rate: i32) -> Result<usize, Error> {
     let samples = nb_frames(data)? * samples_per_frame(data[0], sampling_rate);
     if samples as i64 * 25 > sampling_rate as i64 * 3 {
-        return Err(INVALID_PACKET);
+        return Err(Error::INVALID_PACKET);
     }
     Ok(samples)
 }
@@ -191,9 +188,9 @@ pub fn nb_samples(data: &[u8], sampling_rate: i32) -> Result<usize, &'static str
 ///
 /// An empty `data` is an error. (libopus reads the byte before it checks
 /// the length.)
-pub fn has_lbrr(data: &[u8]) -> Result<bool, &'static str> {
+pub fn has_lbrr(data: &[u8]) -> Result<bool, Error> {
     let Some(&toc) = data.first() else {
-        return Err(INVALID_PACKET);
+        return Err(Error::INVALID_PACKET);
     };
     if toc & 0x80 != 0 {
         return Ok(false);
@@ -262,9 +259,9 @@ fn parse_size(data: &[u8], pos: usize, len: i64) -> Option<(i64, i64)> {
 /// packet. [`ParsedPacket::packet_offset`] then says where the packet ends.
 ///
 /// Returns an error wherever libopus returns `OPUS_INVALID_PACKET`.
-pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static str> {
+pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, Error> {
     let Some(&toc) = data.first() else {
-        return Err(INVALID_PACKET);
+        return Err(Error::INVALID_PACKET);
     };
     let framesize = samples_per_frame(toc, 48000);
 
@@ -288,7 +285,7 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
             cbr = true;
             if !self_delimited {
                 if len & 0x1 != 0 {
-                    return Err(INVALID_PACKET);
+                    return Err(Error::INVALID_PACKET);
                 }
                 last_size = len / 2;
             }
@@ -297,11 +294,11 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
         2 => {
             count = 2;
             let Some((bytes, size)) = parse_size(data, pos, len) else {
-                return Err(INVALID_PACKET);
+                return Err(Error::INVALID_PACKET);
             };
             len -= bytes;
             if size > len {
-                return Err(INVALID_PACKET);
+                return Err(Error::INVALID_PACKET);
             }
             pos += bytes as usize;
             sizes[0] = size as u16;
@@ -310,21 +307,21 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
         // Any number of frames, 0 to 120 ms in total.
         _ => {
             if len < 1 {
-                return Err(INVALID_PACKET);
+                return Err(Error::INVALID_PACKET);
             }
             // The number of frames is in bits 0 to 5.
             let ch = data[pos];
             pos += 1;
             count = (ch & 0x3F) as usize;
             if count == 0 || framesize * count > MAX_PACKET_SAMPLES {
-                return Err(INVALID_PACKET);
+                return Err(Error::INVALID_PACKET);
             }
             len -= 1;
             // Bit 6 says that padding follows.
             if ch & 0x40 != 0 {
                 loop {
                     if len <= 0 {
-                        return Err(INVALID_PACKET);
+                        return Err(Error::INVALID_PACKET);
                     }
                     let p = data[pos];
                     pos += 1;
@@ -338,7 +335,7 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
                 }
             }
             if len < 0 {
-                return Err(INVALID_PACKET);
+                return Err(Error::INVALID_PACKET);
             }
             // Bit 7 says that the frames have a size each (VBR).
             cbr = ch & 0x80 == 0;
@@ -346,23 +343,23 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
                 last_size = len;
                 for size_out in sizes.iter_mut().take(count - 1) {
                     let Some((bytes, size)) = parse_size(data, pos, len) else {
-                        return Err(INVALID_PACKET);
+                        return Err(Error::INVALID_PACKET);
                     };
                     len -= bytes;
                     if size > len {
-                        return Err(INVALID_PACKET);
+                        return Err(Error::INVALID_PACKET);
                     }
                     pos += bytes as usize;
                     *size_out = size as u16;
                     last_size -= bytes + size;
                 }
                 if last_size < 0 {
-                    return Err(INVALID_PACKET);
+                    return Err(Error::INVALID_PACKET);
                 }
             } else if !self_delimited {
                 last_size = len / count as i64;
                 if last_size * count as i64 != len {
-                    return Err(INVALID_PACKET);
+                    return Err(Error::INVALID_PACKET);
                 }
             }
         }
@@ -371,22 +368,22 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
     if self_delimited {
         // Self-delimited framing has an extra size for the last frame.
         let Some((bytes, size)) = parse_size(data, pos, len) else {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         };
         len -= bytes;
         if size > len {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         pos += bytes as usize;
         if cbr {
             // For CBR packets the size applies to all the frames.
             if size * count as i64 > len {
-                return Err(INVALID_PACKET);
+                return Err(Error::INVALID_PACKET);
             }
             sizes[..count].fill(size as u16);
         } else {
             if bytes + size > last_size {
-                return Err(INVALID_PACKET);
+                return Err(Error::INVALID_PACKET);
             }
             sizes[count - 1] = size as u16;
         }
@@ -394,7 +391,7 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, &'static
         // The size of the last frame (of all frames for CBR) is not coded,
         // so it can come out larger than a frame may be.
         if last_size > MAX_FRAME_BYTES as i64 {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         if cbr {
             sizes[..count].fill(last_size as u16);
@@ -424,27 +421,27 @@ pub fn multistream_validate(
     data: &[u8],
     nb_streams: usize,
     sampling_rate: i32,
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     if nb_streams == 0 {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     let mut rest = data;
     let mut samples = 0usize;
     for s in 0..nb_streams {
         if rest.is_empty() {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         let packet = parse(rest, s != nb_streams - 1)?;
         // opus_packet_get_nb_samples: no more than 120 ms.
         let tmp_samples = packet.count * samples_per_frame(packet.toc, sampling_rate);
         if tmp_samples as i64 * 25 > sampling_rate as i64 * 3 {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         if s != 0 && samples != tmp_samples {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         samples = tmp_samples;
-        rest = rest.get(packet.packet_offset..).ok_or(INVALID_PACKET)?;
+        rest = rest.get(packet.packet_offset..).ok_or(Error::INVALID_PACKET)?;
     }
     Ok(samples)
 }
@@ -476,7 +473,7 @@ fn layout(
     self_delimited: bool,
     pad: bool,
     extensions: &[Extension],
-) -> Result<Layout, &'static str> {
+) -> Result<Layout, Error> {
     let count = sizes.len();
     let payload: usize = sizes.iter().map(|&s| s as usize).sum();
     // Self-delimited framing codes the size of the last frame as well.
@@ -498,7 +495,7 @@ fn layout(
     }
     header_len += last_size_len;
     if count <= 2 && header_len + payload > maxlen {
-        return Err(BUFFER_TOO_SMALL);
+        return Err(Error::BUFFER_TOO_SMALL);
     }
 
     let mut vbr = false;
@@ -515,7 +512,7 @@ fn layout(
         }
         let tot_size = header_len + payload;
         if tot_size > maxlen {
-            return Err(BUFFER_TOO_SMALL);
+            return Err(Error::BUFFER_TOO_SMALL);
         }
         if pad {
             pad_amount = maxlen - tot_size;
@@ -531,7 +528,7 @@ fn layout(
             // The length of the padding takes `nb_255s + 1` bytes of it.
             let nb_255s = (pad_amount - 1) / 255;
             if tot_size + ext_len + nb_255s + 1 > maxlen {
-                return Err(BUFFER_TOO_SMALL);
+                return Err(Error::BUFFER_TOO_SMALL);
             }
             header_len += nb_255s + 1;
         }
@@ -590,7 +587,7 @@ fn emit(
     pad: bool,
     extensions: &[Extension],
     place_frames: impl FnOnce(&mut [u8], usize),
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     let plan = layout(sizes, out.len(), self_delimited, pad, extensions)?;
     place_frames(out, plan.header_len);
     write_header(toc, sizes, &plan, self_delimited, out);
@@ -608,17 +605,17 @@ fn emit(
 }
 
 /// Check the frames a packet is to be made of, and collect their sizes.
-fn frame_sizes(toc: u8, frames: &[&[u8]]) -> Result<[u16; MAX_FRAMES], &'static str> {
+fn frame_sizes(toc: u8, frames: &[&[u8]]) -> Result<[u16; MAX_FRAMES], Error> {
     let count = frames.len();
     // The repacketizer takes no more than 120 ms of audio
     // (opus_repacketizer_cat_impl).
     if count == 0 || count > MAX_FRAMES || count * samples_per_frame(toc, 48000) > MAX_PACKET_SAMPLES {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     let mut sizes = [0u16; MAX_FRAMES];
     for (size, frame) in sizes.iter_mut().zip(frames) {
         if frame.len() > MAX_FRAME_BYTES {
-            return Err(BAD_ARG);
+            return Err(Error::BAD_ARG);
         }
         *size = frame.len() as u16;
     }
@@ -651,7 +648,7 @@ pub fn write(
     out: &mut [u8],
     self_delimited: bool,
     pad: bool,
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     let sizes = frame_sizes(toc, frames)?;
     let sizes = &sizes[..frames.len()];
     emit(toc, sizes, out, self_delimited, pad, &[], |out, at| copy_frames(frames, out, at))
@@ -715,32 +712,32 @@ impl<'a> Repacketizer<'a> {
 
     /// Adds the frames of the packet `data`. libopus `opus_repacketizer_cat`.
     ///
-    /// Fails with "Invalid packet", and adds nothing, when the packet is
-    /// not valid, its TOC byte does not match that of the frames already
-    /// added (apart from the frame-count code), or the frames would last
-    /// more than 120 ms.
-    pub fn cat(&mut self, data: &'a [u8]) -> Result<(), &'static str> {
+    /// Fails with [`InvalidPacket`](crate::ErrorKind::InvalidPacket), and adds
+    /// nothing, when the packet is not valid, its TOC byte does not match that
+    /// of the frames already added (apart from the frame-count code), or the
+    /// frames would last more than 120 ms.
+    pub fn cat(&mut self, data: &'a [u8]) -> Result<(), Error> {
         self.cat_impl(data, false)
     }
 
     /// libopus `opus_repacketizer_cat_impl`: `cat` for a self-delimited
     /// packet too.
-    pub(crate) fn cat_impl(&mut self, data: &'a [u8], self_delimited: bool) -> Result<(), &'static str> {
+    pub(crate) fn cat_impl(&mut self, data: &'a [u8], self_delimited: bool) -> Result<(), Error> {
         let Some(&toc) = data.first() else {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         };
         if self.nb_frames == 0 {
             self.toc = toc;
         } else if (self.toc & 0xFC) != (toc & 0xFC) {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         let curr_nb_frames = nb_frames(data)?;
         if curr_nb_frames < 1 {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         // At most 120 ms: 960 samples at 8 kHz.
         if (curr_nb_frames + self.nb_frames) * samples_per_frame(self.toc, 8000) > 960 {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         let packet = parse(data, self_delimited)?;
         let n = self.nb_frames;
@@ -759,16 +756,19 @@ impl<'a> Repacketizer<'a> {
     /// the largest packet allowed. Returns its length. libopus
     /// `opus_repacketizer_out_range`.
     ///
-    /// Errors: "Invalid argument" when the range is empty or goes past the
-    /// last frame, "Output buffer too small", and "Internal error" when the
-    /// padding of a packet in the range holds invalid extensions.
-    pub fn out_range(&self, begin: usize, end: usize, out: &mut [u8]) -> Result<usize, &'static str> {
+    /// Errors: [`BadArg`](crate::ErrorKind::BadArg) when the range is empty or
+    /// goes past the last frame,
+    /// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when the packet
+    /// does not fit in `out`, and
+    /// [`InternalError`](crate::ErrorKind::InternalError) when the padding of a
+    /// packet in the range holds invalid extensions.
+    pub fn out_range(&self, begin: usize, end: usize, out: &mut [u8]) -> Result<usize, Error> {
         self.out_range_ext(begin, end, out, false, false, &[])
     }
 
     /// Writes a packet of all frames into `out`. libopus
     /// `opus_repacketizer_out`.
-    pub fn out(&self, out: &mut [u8]) -> Result<usize, &'static str> {
+    pub fn out(&self, out: &mut [u8]) -> Result<usize, Error> {
         self.out_range_ext(0, self.nb_frames, out, false, false, &[])
     }
 
@@ -785,9 +785,9 @@ impl<'a> Repacketizer<'a> {
     /// Besides the errors of `out_range`, the extensions give the errors of
     /// [`extensions::generate`].
     ///
-    /// Up to 32 extensions in all, `extensions` and those of the padding,
-    /// need no allocation. More need the feature `std`; without it they
-    /// give "Internal error".
+    /// Up to 32 extensions in all, `extensions` and those of the padding, need
+    /// no allocation. More need the feature `std`; without it they give
+    /// [`AllocFail`](crate::ErrorKind::AllocFail).
     pub fn out_range_ext(
         &self,
         begin: usize,
@@ -796,9 +796,9 @@ impl<'a> Repacketizer<'a> {
         self_delimited: bool,
         pad: bool,
         extensions: &[Extension],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         if begin >= end || end > self.nb_frames {
-            return Err(BAD_ARG);
+            return Err(Error::BAD_ARG);
         }
         let frames = &self.frames[begin..end];
         let mut sizes = [0u16; MAX_FRAMES];
@@ -810,7 +810,7 @@ impl<'a> Repacketizer<'a> {
         let mut found = 0;
         for i in begin..end {
             found += extensions::count_checked(self.paddings[i], self.padding_nb_frames[i] as usize)
-                .map_err(|_| INTERNAL_ERROR)?;
+                .map_err(|_| Error::INTERNAL_ERROR)?;
         }
         let place = |out: &mut [u8], at: usize| copy_frames(frames, out, at);
         if found == 0 {
@@ -838,10 +838,12 @@ impl<'a> Repacketizer<'a> {
 /// packet had, then zeros when it had none, unless one more byte is all
 /// that is needed. `data` must hold at least `new_len` bytes.
 ///
-/// Errors: "Invalid argument" when `len` is 0, `new_len` is below `len` or
-/// `data` is shorter than either; "Invalid packet"; "Internal error" when
-/// the padding of the packet holds invalid extensions.
-pub fn pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), &'static str> {
+/// Errors: [`BadArg`](crate::ErrorKind::BadArg) when `len` is 0, `new_len` is
+/// below `len` or `data` is shorter than either;
+/// [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the packet is not
+/// valid; [`InternalError`](crate::ErrorKind::InternalError) when the padding
+/// of the packet holds invalid extensions.
+pub fn pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), Error> {
     pad_with_extensions(data, len, new_len, true, &[]).map(|_| ())
 }
 
@@ -856,29 +858,29 @@ pub fn pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), &'static s
 /// Besides the errors of [`pad`], the extensions give those of
 /// [`extensions::generate`].
 ///
-/// Without the feature `std`, a packet whose padding already holds
-/// extensions can only be rewritten when that padding is at most 1275
-/// bytes and the extensions are at most 32 in all; otherwise the result is
-/// "Internal error".
+/// Without the feature `std`, a packet whose padding already holds extensions
+/// can only be rewritten when that padding is at most 1275 bytes and the
+/// extensions are at most 32 in all; otherwise the result is
+/// [`AllocFail`](crate::ErrorKind::AllocFail).
 pub fn pad_with_extensions(
     data: &mut [u8],
     len: usize,
     new_len: usize,
     pad: bool,
     extensions: &[Extension],
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     if len < 1 || len > data.len() {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     if len == new_len {
         return Ok(0);
     }
     if len > new_len || new_len > data.len() {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     // The checks of opus_repacketizer_cat: `parse` makes the same ones.
     let packet = parse(&data[..len], false)?;
-    let found = extensions::count_checked(packet.padding(&data[..len]), packet.count).map_err(|_| INTERNAL_ERROR)?;
+    let found = extensions::count_checked(packet.padding(&data[..len]), packet.count).map_err(|_| Error::INTERNAL_ERROR)?;
     if found == 0 {
         return pad_in_place(data, new_len, &packet, pad, extensions);
     }
@@ -893,7 +895,7 @@ fn pad_in_place(
     packet: &ParsedPacket,
     pad: bool,
     extensions: &[Extension],
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     let sizes = &packet.sizes[..packet.count];
     let start = packet.payload_offset;
     let payload: usize = sizes.iter().map(|&s| s as usize).sum();
@@ -922,7 +924,7 @@ fn pad_keeping_extensions(
     pad: bool,
     extensions: &[Extension],
     found: usize,
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     let old = packet.padding(data);
     #[cfg(feature = "std")]
     let owned = old.to_vec();
@@ -933,7 +935,11 @@ fn pad_keeping_extensions(
     #[cfg(not(feature = "std"))]
     let copy = {
         let n = old.len();
-        buf.get_mut(..n).ok_or(INTERNAL_ERROR)?.copy_from_slice(old);
+        let room = buf.get_mut(..n).ok_or(Error::new(
+            crate::ErrorKind::AllocFail,
+            "more than 1275 bytes of padding need the std feature",
+        ))?;
+        room.copy_from_slice(old);
         &buf[..n]
     };
     let mut all = ExtensionList::with_capacity(extensions.len() + found)?;
@@ -951,11 +957,12 @@ fn pad_keeping_extensions(
 /// place, and write it in its shortest form. Returns the new length.
 /// libopus `opus_packet_unpad` (repacketizer.c).
 ///
-/// Errors: "Invalid argument" when `len` is 0 or above `data.len()`, and
-/// "Invalid packet".
-pub fn unpad(data: &mut [u8], len: usize) -> Result<usize, &'static str> {
+/// Errors: [`BadArg`](crate::ErrorKind::BadArg) when `len` is 0 or above
+/// `data.len()`, and [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when
+/// the packet is not valid.
+pub fn unpad(data: &mut [u8], len: usize) -> Result<usize, Error> {
     if len < 1 || len > data.len() {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     let packet = parse(&data[..len], false)?;
     pad_in_place(data, len, &packet, false, &[])
@@ -970,26 +977,26 @@ pub fn multistream_pad(
     len: usize,
     new_len: usize,
     nb_streams: usize,
-) -> Result<(), &'static str> {
+) -> Result<(), Error> {
     if len < 1 || len > data.len() {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     if len == new_len {
         return Ok(());
     }
     if len > new_len || new_len > data.len() {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     let amount = new_len - len;
     // Seek to the last stream.
     let mut start = 0usize;
     for _ in 1..nb_streams {
         if start >= len {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         start += parse(&data[start..len], true)?.packet_offset;
     }
-    let last_len = len.checked_sub(start).ok_or(INVALID_PACKET)?;
+    let last_len = len.checked_sub(start).ok_or(Error::INVALID_PACKET)?;
     pad(&mut data[start..], last_len, last_len + amount)
 }
 
@@ -997,16 +1004,16 @@ pub fn multistream_pad(
 /// multistream packet `data[..len]` of `nb_streams` streams, in place.
 /// Returns the new length. libopus `opus_multistream_packet_unpad`
 /// (repacketizer.c).
-pub fn multistream_unpad(data: &mut [u8], len: usize, nb_streams: usize) -> Result<usize, &'static str> {
+pub fn multistream_unpad(data: &mut [u8], len: usize, nb_streams: usize) -> Result<usize, Error> {
     if len < 1 || len > data.len() {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     let mut src = 0usize;
     let mut dst = 0usize;
     for s in 0..nb_streams {
         let self_delimited = s != nb_streams - 1;
         if src >= len {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         let packet = parse(&data[src..len], self_delimited)?;
         // The checks of opus_repacketizer_cat_impl on this stream.

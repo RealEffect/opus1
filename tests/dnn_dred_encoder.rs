@@ -11,7 +11,8 @@
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::{
-    Application, Bitrate, DnnBlob, ForcedMode, OpusDred, OpusDredDecoder, OpusEncoder, packet,
+    Application, Bitrate, DnnBlob, ErrorKind, ForcedMode, OpusDred, OpusDredDecoder, OpusEncoder,
+    packet,
 };
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
 use std::cell::Cell;
@@ -115,7 +116,7 @@ fn the_dred_duration_takes_0_to_104_and_a_reset_clears_it() {
         assert_eq!(enc.dred_duration(), v);
     }
     for v in [-1, 105, i32::MIN, i32::MAX] {
-        assert_eq!(enc.set_dred_duration(v), Err("Invalid DRED duration"));
+        assert_eq!(enc.set_dred_duration(v).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
         assert_eq!(enc.dred_duration(), 104);
     }
     enc.reset_state();
@@ -234,7 +235,10 @@ fn set_dnn_blob_loads_both_models_or_keeps_the_old_ones() {
     for only in [builtin::pitchdnn(), builtin::dred_rdovae_enc(), builtin::plc()] {
         let mut enc = encoder(16000, 1, 32000, 30, 100);
         let blob = DnnBlob::from_static(only).unwrap();
-        assert_eq!(enc.set_dnn_blob(&blob), Err("DNN blob holds no model of this build"));
+        assert_eq!(
+            enc.set_dnn_blob(&blob).map_err(|e| (e.kind(), e.message())),
+            Err((ErrorKind::BadArg, "DNN blob holds no model of this build"))
+        );
         assert_eq!(run(&mut enc), reference);
     }
     let mut both = builtin::dred_rdovae_enc().to_vec();

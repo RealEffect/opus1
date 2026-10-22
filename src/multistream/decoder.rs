@@ -7,6 +7,7 @@
 //!
 //! Memory is allocated in the constructor only. Decoding allocates nothing.
 
+use crate::Error;
 use super::layout::{ChannelLayout, ChannelsByEntry, SILENT_CHANNEL};
 use super::{ChannelMappingTable, ChannelSink, Sample};
 use crate::{OpusDecoder, packet};
@@ -64,9 +65,11 @@ impl MultistreamDecoder {
     /// The table is checked like the arguments of
     /// [`with_layout`](Self::with_layout). In addition, `table.mapping` must
     /// hold exactly `table.channels` entries.
-    pub fn new(sampling_rate: i32, table: ChannelMappingTable) -> Result<Self, &'static str> {
+    pub fn new(sampling_rate: i32, table: ChannelMappingTable) -> Result<Self, Error> {
         if table.mapping.len() != table.channels as usize {
-            return Err("channel mapping table length does not match declared channel count");
+            return Err(Error::bad_arg(
+                "multistream layout: the mapping table length does not match the channel count",
+            ));
         }
         Self::with_layout(
             sampling_rate,
@@ -97,7 +100,7 @@ impl MultistreamDecoder {
         streams: usize,
         coupled_streams: usize,
         mapping: &[u8],
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, Error> {
         let layout = ChannelLayout::new(channels, streams, coupled_streams, mapping)?;
         let mut decoders = Vec::with_capacity(layout.streams());
         for s in 0..layout.streams() {
@@ -144,7 +147,7 @@ impl MultistreamDecoder {
         packet: &[u8],
         frame_size: usize,
         out: &mut [f32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
         self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, false, false)
@@ -161,7 +164,7 @@ impl MultistreamDecoder {
         packet: &[u8],
         frame_size: usize,
         out: &mut [i16],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
         self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, false, true)
@@ -185,7 +188,7 @@ impl MultistreamDecoder {
         packet: &[u8],
         frame_size: usize,
         out: &mut [f32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
         self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, true, false)
@@ -198,7 +201,7 @@ impl MultistreamDecoder {
         packet: &[u8],
         frame_size: usize,
         out: &mut [i16],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
         self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, true, true)
@@ -217,7 +220,7 @@ impl MultistreamDecoder {
         packet: &[u8],
         frame_size: usize,
         out: &mut [i32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
         self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, false, false)
@@ -230,7 +233,7 @@ impl MultistreamDecoder {
         packet: &[u8],
         frame_size: usize,
         out: &mut [i32],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let frame_size = self.usable_frame_size(frame_size, out.len())?;
         let channels = self.layout.channels();
         self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, true, false)
@@ -248,13 +251,13 @@ impl MultistreamDecoder {
         }
     }
 
-    /// libopus `OPUS_SET_COMPLEXITY` of a multistream decoder: sets the
-    /// decoder complexity of every stream decoder (see
+    /// libopus `OPUS_SET_COMPLEXITY` of a multistream decoder: sets the decoder
+    /// complexity of every stream decoder (see
     /// [`OpusDecoder::set_complexity`]). A value outside 0 to 10 is refused
-    /// with `"Invalid complexity"` and no stream changes.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+    /// with [`BadArg`](crate::ErrorKind::BadArg) and no stream changes.
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
         if !(0..=10).contains(&complexity) {
-            return Err("Invalid complexity");
+            return Err(Error::INVALID_COMPLEXITY);
         }
         for dec in &mut self.decoders {
             dec.set_complexity(complexity)?;
@@ -271,7 +274,7 @@ impl MultistreamDecoder {
     /// Sets the output gain of every stream, in 1/256 dB, -32768 to 32767.
     /// libopus `OPUS_SET_GAIN`. See [`OpusDecoder::set_gain`]. Any other
     /// value is an error and changes nothing.
-    pub fn set_gain(&mut self, gain: i32) -> Result<(), &'static str> {
+    pub fn set_gain(&mut self, gain: i32) -> Result<(), Error> {
         for dec in &mut self.decoders {
             dec.set_gain(gain)?;
         }
@@ -303,22 +306,23 @@ impl MultistreamDecoder {
     /// [`OpusDecoder::set_osce_bwe`] for every stream decoder. libopus's
     /// multistream decoder does not forward `OPUS_SET_OSCE_BWE`; there each
     /// stream decoder must be set on its own. Without the cargo feature
-    /// `osce-bwe` this returns `"Request not implemented"`.
-    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), &'static str> {
+    /// `osce-bwe` this returns
+    /// [`Unimplemented`](crate::ErrorKind::Unimplemented).
+    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), Error> {
         for dec in &mut self.decoders {
             dec.set_osce_bwe(enabled)?;
         }
         Ok(())
     }
 
-    /// [`OpusDecoder::set_dnn_blob`] for every stream decoder: each one
-    /// loads the model groups of this build that `blob` holds completely.
-    /// Returns those groups, or `"DNN blob holds no model of this build"`,
-    /// and then no stream changes. libopus's multistream decoder does not
-    /// forward `OPUS_SET_DNN_BLOB`; there each stream decoder must load the
-    /// blob on its own.
+    /// [`OpusDecoder::set_dnn_blob`] for every stream decoder: each one loads
+    /// the model groups of this build that `blob` holds completely. Returns
+    /// those groups, or [`BadArg`](crate::ErrorKind::BadArg) when the blob
+    /// holds no complete group of this build, and then no stream changes.
+    /// libopus's multistream decoder does not forward `OPUS_SET_DNN_BLOB`;
+    /// there each stream decoder must load the blob on its own.
     #[cfg(feature = "dnn")]
-    pub fn set_dnn_blob(&mut self, blob: &crate::DnnBlob) -> Result<crate::DnnModels, &'static str> {
+    pub fn set_dnn_blob(&mut self, blob: &crate::DnnBlob) -> Result<crate::DnnModels, Error> {
         // Every stream decoder has the same build, so the first one's
         // result is everyone's: when it fails, none would load.
         let mut loaded = Err(crate::dnn::models::ERR_NO_MODEL);
@@ -345,14 +349,14 @@ impl MultistreamDecoder {
     /// frame size of 0 and limit it to 120 ms. Then check that the output,
     /// which has room for `out_len` samples, holds that many samples per
     /// channel.
-    fn usable_frame_size(&self, frame_size: usize, out_len: usize) -> Result<usize, &'static str> {
+    fn usable_frame_size(&self, frame_size: usize, out_len: usize) -> Result<usize, Error> {
         if frame_size == 0 {
-            return Err("frame_size must not be 0");
+            return Err(Error::INVALID_FRAME_SIZE);
         }
         // C: "Limit frame_size to avoid excessive stack allocations."
         let frame_size = frame_size.min(packet::max_packet_samples(self.sampling_rate));
         if out_len / self.layout.channels() < frame_size {
-            return Err("output buffer too small for frame_size * channels");
+            return Err(Error::BUFFER_TOO_SMALL);
         }
         Ok(frame_size)
     }
@@ -366,7 +370,7 @@ impl MultistreamDecoder {
         sink: &mut K,
         decode_fec: bool,
         soft_clip: bool,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let Self { layout, outputs, sampling_rate, decoders, buf } = self;
         let streams = layout.streams();
         let coupled_streams = layout.coupled_streams();
@@ -376,12 +380,12 @@ impl MultistreamDecoder {
             // Every stream takes at least 1 byte, and every stream but the
             // last at least 2.
             if packet.len() < 2 * streams - 1 {
-                return Err("Invalid packet");
+                return Err(Error::INVALID_PACKET);
             }
             // Nothing is decoded before the whole packet has been checked.
             let samples = packet::multistream_validate(packet, streams, *sampling_rate)?;
             if samples > frame_size {
-                return Err("frame_size too small for packet");
+                return Err(Error::FRAME_SIZE_TOO_SMALL);
             }
         }
 
@@ -389,13 +393,15 @@ impl MultistreamDecoder {
         for (s, dec) in decoders.iter_mut().enumerate() {
             let stream_channels = if s < coupled_streams { 2 } else { 1 };
             if !do_plc && rest.is_empty() {
-                return Err("Internal error: the packet ended before the last stream");
+                return Err(Error::internal(
+                    "internal error: the packet ended before the last stream",
+                ));
             }
             // Every stream but the last says how long it is.
             let self_delimited = s != streams - 1;
             let stream_buf = buf
                 .get_mut(..frame_size * stream_channels)
-                .ok_or("Internal error: stream buffer too small")?;
+                .ok_or(Error::internal("internal error: stream buffer too small"))?;
             let (samples, used) = dec.decode_native(
                 rest,
                 frame_size,

@@ -158,7 +158,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 let p = packet::parse(p, false).expect("a packet that cat takes parses");
                 frames.extend(p.frames(&packets[i]));
             }
-            Err(e) => assert_eq!(e, err_str(c_ret), "cat of packet {i}"),
+            Err(e) => assert_eq!(e.to_raw(), c_ret, "cat of packet {i}"),
         }
         assert_eq!(rp.nb_frames() as i32, c_rp.nb_frames(), "frames after packet {i}");
         assert_eq!(rp.nb_frames(), frames.len());
@@ -212,7 +212,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         let want: Vec<Vec<u8>> = frames[begin..end].iter().map(|f| f.to_vec()).collect();
                         assert_eq!(back, want, "{what}: frames");
                     }
-                    Err(e) => assert_eq!(e, err_str(c_ret), "{what}: error"),
+                    Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: error"),
                 }
             }
             2 => {
@@ -225,7 +225,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         assert_eq!(n as i32, c_ret, "{what}: out into {maxlen}");
                         assert_eq!(out[..n], c_out[..n], "{what}: out bytes");
                     }
-                    Err(e) => assert_eq!(e, err_str(c_ret), "{what}: out into {maxlen}"),
+                    Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: out into {maxlen}"),
                 }
             }
             3 => {
@@ -269,7 +269,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         assert_eq!(buf[..n], c_buf[..n], "{what}: bytes");
                         assert_eq!(frames_of(&buf[..n], false), frames_of(&data[..len], false), "{what}: frames");
                     }
-                    Err(e) => assert_eq!(e, err_str(c_ret), "{what}: error"),
+                    Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: error"),
                 }
             }
             4 => {
@@ -289,7 +289,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         assert_eq!(p.padding_len, 0, "{what}: padding left");
                         assert_eq!(frames_of(&buf[..n], false), frames_of(&data[..len], false), "{what}: frames");
                     }
-                    Err(e) => assert_eq!(e, err_str(c_ret), "{what}: error"),
+                    Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: error"),
                 }
             }
             _ => {
@@ -330,7 +330,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         assert_eq!(c_ret, 0, "{what_pad}");
                         assert_eq!(buf[..new_len], c_buf[..new_len], "{what_pad}: bytes");
                     }
-                    Err(e) => assert_eq!(e, err_str(c_ret), "{what_pad}: error"),
+                    Err(e) => assert_eq!(e.to_raw(), c_ret, "{what_pad}: error"),
                 }
                 let mut c_buf = data.clone();
                 let c_ret = unsafe { sys::opus_multistream_packet_unpad(c_buf.as_mut_ptr(), len as i32, nb_streams as c_int) };
@@ -342,7 +342,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         assert!(n <= len, "{what}: {n} bytes");
                         assert_eq!(buf[..n], c_buf[..n], "{what}: bytes");
                     }
-                    Err(e) => assert_eq!(e, err_str(c_ret), "{what}: error"),
+                    Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: error"),
                 }
             }
         }
@@ -358,7 +358,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         assert_eq!(c_ret, 0, "cat after reset");
                         frames.extend(packet::parse(p, false).unwrap().frames(p));
                     }
-                    Err(e) => assert_eq!(e, err_str(c_ret), "cat after reset"),
+                    Err(e) => assert_eq!(e.to_raw(), c_ret, "cat after reset"),
                 }
             }
             assert_eq!(rp.nb_frames() as i32, c_rp.nb_frames(), "frames after reset");

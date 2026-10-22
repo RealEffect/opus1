@@ -65,7 +65,7 @@ packet = TOC byte | main frame | redundant frame | padding (CBR)
 
 1. It clears the final range (`final_range()` returns 0 until a frame is coded).
 2. It takes the length of the output buffer as the largest packet, but no more than 6 × 1276 bytes. An empty buffer is an error.
-3. It checks the frame size. A frame must last 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms at the API rate (`frame_rate_from_params`). Any other size is the error "Invalid frame size for sampling rate". A 100 ms frame into a buffer of one byte is the error "Output buffer too small", as in libopus.
+3. It checks the frame size. A frame must last 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms at the API rate (`frame_rate_from_params`). Any other size is an error of kind `BadArg` ("invalid frame size"). A 100 ms frame into a buffer of one byte is an error of kind `BufferTooSmall`, as in libopus.
 4. It checks that the input holds `frame_size * channels` samples.
 5. For stereo input it updates the estimate of the stereo width (`compute_stereo_width`), unless the caller forced mono packets. The width is 0 when both channels carry the same signal and 1 when they differ completely. The estimate and its state are libopus's bit for bit: the sums of products and the smoothing steps are fused multiply-adds where clang fuses them on 64-bit ARM (test `core_stereo_width_libopus`).
 

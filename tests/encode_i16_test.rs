@@ -8,7 +8,7 @@
 //! noise floor of the speech and music analysis and of CELT's bit
 //! allocation, so the float encoder of each pair is set to 16 bits.
 
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, ErrorKind, OpusDecoder, OpusEncoder};
 
 /// Deterministic test signal: speech-like sine + LCG noise, moderate level.
 struct SignalGen {
@@ -295,18 +295,19 @@ fn encode_i16_validation_parity() {
     let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
     let mut out = vec![0u8; 4000];
 
-    // Output buffer too small mirrors encode(). One byte is enough for a
-    // packet without audio, as in libopus; no byte is not.
+    // An empty output buffer mirrors encode(). One byte is enough for a
+    // packet without audio, as in libopus; no byte is an invalid argument,
+    // as libopus's `max_data_bytes <= 0` is.
     let tiny = &mut [0u8; 0][..];
     assert_eq!(
-        enc.encode_i16(&[0i16; 320], 320, tiny),
-        Err("Output buffer too small")
+        enc.encode_i16(&[0i16; 320], 320, tiny).map_err(|e| e.kind()),
+        Err(ErrorKind::BadArg)
     );
 
     // Input shorter than frame_size * channels must be rejected, not panic.
     assert_eq!(
-        enc.encode_i16(&[0i16; 319], 320, &mut out),
-        Err("Input buffer too small for frame")
+        enc.encode_i16(&[0i16; 319], 320, &mut out).map_err(|e| e.kind()),
+        Err(ErrorKind::BadArg)
     );
 
     // Invalid frame size mirrors encode().

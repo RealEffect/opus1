@@ -43,6 +43,7 @@
 //! `crate::dnn::models::ModelSet::load` replaces each model group only
 //! when all of its models load.
 
+use crate::Error;
 use super::MAX_INPUTS;
 use super::nnet::{Conv2dLayer, LinearLayer};
 
@@ -69,23 +70,23 @@ pub const SPARSE_BLOCK_SIZE: usize = 32;
 pub const MAX_BLOBS: usize = 8;
 
 /// The error of a blob that `parse_weights` of libopus refuses.
-pub const ERR_INVALID_BLOB: &str = "Invalid DNN blob";
+pub const ERR_INVALID_BLOB: Error = Error::bad_arg("invalid DNN blob");
 /// The error of a blob whose arrays do not start 4-byte aligned.
-pub const ERR_NOT_ALIGNED: &str = "DNN blob is not aligned";
+pub const ERR_NOT_ALIGNED: Error = Error::bad_arg("DNN blob is not aligned");
 /// The error of more than `MAX_BLOBS` blobs in one list.
-pub const ERR_TOO_MANY_BLOBS: &str = "Too many DNN blobs";
+pub const ERR_TOO_MANY_BLOBS: Error = Error::bad_arg("too many DNN blobs");
 /// The error of a layer whose array is not in the list.
-pub const ERR_MISSING_ARRAY: &str = "DNN weight array is missing";
+pub const ERR_MISSING_ARRAY: Error = Error::bad_arg("DNN weight array is missing");
 /// The error of a layer whose array has another size than its shape needs.
-pub const ERR_ARRAY_SIZE: &str = "DNN weight array has the wrong size";
+pub const ERR_ARRAY_SIZE: Error = Error::bad_arg("DNN weight array has the wrong size");
 /// The error of a malformed sparse index table.
-pub const ERR_SPARSE_INDEX: &str = "Invalid DNN sparse index table";
+pub const ERR_SPARSE_INDEX: Error = Error::bad_arg("invalid DNN sparse index table");
 /// The error of a layer without weights.
-pub const ERR_NO_WEIGHTS: &str = "DNN layer has no weights";
+pub const ERR_NO_WEIGHTS: Error = Error::bad_arg("DNN layer has no weights");
 /// The error of int8 weights that hold -128.
-pub const ERR_INT8_MINUS_128: &str = "DNN int8 weight is -128";
+pub const ERR_INT8_MINUS_128: Error = Error::bad_arg("DNN int8 weight is -128");
 /// The error of a shape that the kernels cannot run.
-pub const ERR_LAYER_SHAPE: &str = "Invalid DNN layer shape";
+pub const ERR_LAYER_SHAPE: Error = Error::bad_arg("invalid DNN layer shape");
 
 /// One array of a blob (libopus `WeightArray`, `dnn/nnet.h:44-49`).
 #[derive(Clone, Copy)]
@@ -119,7 +120,7 @@ fn read_i32(b: &[u8], at: usize) -> Option<i32> {
 /// `parse_record` (`dnn/parse_lpcnet_weights.c:38-53`) and of
 /// `parse_weights`, which also refuses `size == 0` (lines 62-75). Returns
 /// the array and the offset of the next record.
-fn read_record(blob: &[u8], off: usize) -> Result<(WeightArray<'_>, usize), &'static str> {
+fn read_record(blob: &[u8], off: usize) -> Result<(WeightArray<'_>, usize), Error> {
     let remaining = blob.len().checked_sub(off).ok_or(ERR_INVALID_BLOB)?;
     if remaining < WEIGHT_BLOCK_SIZE {
         return Err(ERR_INVALID_BLOB);
@@ -153,7 +154,7 @@ fn read_record(blob: &[u8], off: usize) -> Result<(WeightArray<'_>, usize), &'st
 
 /// Checks one blob: every record is well formed and aligned, and the
 /// records fill the blob exactly.
-fn validate(blob: &[u8]) -> Result<(), &'static str> {
+fn validate(blob: &[u8]) -> Result<(), Error> {
     let mut off = 0;
     while off < blob.len() {
         off = read_record(blob, off)?.1;
@@ -220,14 +221,14 @@ impl<'w> WeightList<'w> {
     /// Errors: `ERR_INVALID_BLOB` for a record that libopus refuses (also
     /// when the records do not fill the blob exactly), `ERR_NOT_ALIGNED`
     /// for an array that does not start 4-byte aligned.
-    pub fn parse(blob: &'w [u8]) -> Result<Self, &'static str> {
+    pub fn parse(blob: &'w [u8]) -> Result<Self, Error> {
         Self::parse_all(&[blob])
     }
 
     /// Checks several blobs as `parse` does, and lists them in order.
     /// Fails when one of them fails, or with `ERR_TOO_MANY_BLOBS` for more
     /// than `MAX_BLOBS` blobs.
-    pub fn parse_all(blobs: &[&'w [u8]]) -> Result<Self, &'static str> {
+    pub fn parse_all(blobs: &[&'w [u8]]) -> Result<Self, Error> {
         let mut list = Self::empty();
         for &blob in blobs {
             list.push(blob)?;
@@ -238,7 +239,7 @@ impl<'w> WeightList<'w> {
     /// Checks a blob as `parse` does and appends it to the list. Its
     /// arrays come after those already in the list. On failure the list is
     /// unchanged.
-    pub fn push(&mut self, blob: &'w [u8]) -> Result<(), &'static str> {
+    pub fn push(&mut self, blob: &'w [u8]) -> Result<(), Error> {
         if self.count == MAX_BLOBS {
             return Err(ERR_TOO_MANY_BLOBS);
         }
@@ -296,7 +297,7 @@ impl Pod for i32 {}
 impl Pod for i8 {}
 
 /// libopus `find_array_check`: the array `name` with exactly `size` bytes.
-fn find_sized<'w, T: Pod>(list: &WeightList<'w>, name: &str, size: usize) -> Result<&'w [T], &'static str> {
+fn find_sized<'w, T: Pod>(list: &WeightList<'w>, name: &str, size: usize) -> Result<&'w [T], Error> {
     let a = list.find(name).ok_or(ERR_MISSING_ARRAY)?;
     if a.data.len() != size {
         return Err(ERR_ARRAY_SIZE);
@@ -308,7 +309,7 @@ fn find_sized<'w, T: Pod>(list: &WeightList<'w>, name: &str, size: usize) -> Res
 
 /// libopus `opt_array_check`: like `find_sized`, but a missing array is
 /// not an error. An array with the wrong size still is.
-fn find_optional<'w, T: Pod>(list: &WeightList<'w>, name: &str, size: usize) -> Result<Option<&'w [T]>, &'static str> {
+fn find_optional<'w, T: Pod>(list: &WeightList<'w>, name: &str, size: usize) -> Result<Option<&'w [T]>, Error> {
     match find_sized(list, name, size) {
         Ok(a) => Ok(Some(a)),
         Err(ERR_MISSING_ARRAY) => Ok(None),
@@ -325,7 +326,7 @@ fn find_optional<'w, T: Pod>(list: &WeightList<'w>, name: &str, size: usize) -> 
 /// libopus, a missing table, a negative count and a negative position are
 /// refused (libopus then reads out of bounds). Trailing bytes that do not
 /// make a whole `int` are ignored, as in libopus.
-fn find_idx<'w>(list: &WeightList<'w>, name: &str, nb_inputs: usize, nb_outputs: usize) -> Result<(&'w [i32], usize), &'static str> {
+fn find_idx<'w>(list: &WeightList<'w>, name: &str, nb_inputs: usize, nb_outputs: usize) -> Result<(&'w [i32], usize), Error> {
     let a = list.find(name).ok_or(ERR_MISSING_ARRAY)?;
     let whole = a.data.len() / 4 * 4;
     let idx: &[i32] = cast(&a.data[..whole]).ok_or(ERR_NOT_ALIGNED)?;
@@ -385,7 +386,7 @@ pub fn linear_init<'w>(
     scale: Option<&str>,
     nb_inputs: usize,
     nb_outputs: usize,
-) -> Result<LinearLayer<'w>, &'static str> {
+) -> Result<LinearLayer<'w>, Error> {
     let out_bytes = nb_outputs.checked_mul(4).ok_or(ERR_LAYER_SHAPE)?;
     let mut layer = LinearLayer { nb_inputs, nb_outputs, ..LinearLayer::default() };
     if let Some(name) = bias {
@@ -449,7 +450,7 @@ pub fn conv2d_init<'w>(
     out_channels: usize,
     ktime: usize,
     kheight: usize,
-) -> Result<Conv2dLayer<'w>, &'static str> {
+) -> Result<Conv2dLayer<'w>, Error> {
     let mut layer = Conv2dLayer { in_channels, out_channels, ktime, kheight, ..Conv2dLayer::default() };
     if let Some(name) = bias {
         let bytes = out_channels.checked_mul(4).ok_or(ERR_LAYER_SHAPE)?;

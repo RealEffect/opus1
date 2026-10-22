@@ -19,6 +19,7 @@
 //! quantizer. `ModelSet` does not load the DRED models: in libopus the
 //! encoder and the DRED decoder hold them, not the Opus decoder.
 
+use crate::Error;
 use super::holder::DnnModels;
 use super::nnet::{Conv2dLayer, LinearLayer};
 use super::weights::{WeightList, conv2d_init, linear_init};
@@ -53,9 +54,9 @@ pub mod bbwenet;
 
 /// The error of `LayerSpec::linear` on a conv2d layer and of
 /// `LayerSpec::conv2d` on a linear layer.
-pub const ERR_LAYER_KIND: &str = "DNN layer has another kind";
+pub const ERR_LAYER_KIND: Error = Error::internal("DNN layer has another kind");
 /// The error of `ModelSet::load` when no model group of this build loads.
-pub const ERR_NO_MODEL: &str = "DNN blob holds no model of this build";
+pub const ERR_NO_MODEL: Error = Error::bad_arg("DNN blob holds no model of this build");
 
 /// The arguments of one `linear_init` call of a C init function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +124,7 @@ impl LayerSpec {
 
     /// Builds the layer with `linear_init`. Fails with `ERR_LAYER_KIND`
     /// for a conv2d layer.
-    pub fn linear<'w>(&self, list: &WeightList<'w>) -> Result<LinearLayer<'w>, &'static str> {
+    pub fn linear<'w>(&self, list: &WeightList<'w>) -> Result<LinearLayer<'w>, Error> {
         match self {
             LayerSpec::Linear(s) => linear_init(
                 list,
@@ -143,7 +144,7 @@ impl LayerSpec {
 
     /// Builds the layer with `conv2d_init`. Fails with `ERR_LAYER_KIND`
     /// for a linear layer.
-    pub fn conv2d<'w>(&self, list: &WeightList<'w>) -> Result<Conv2dLayer<'w>, &'static str> {
+    pub fn conv2d<'w>(&self, list: &WeightList<'w>) -> Result<Conv2dLayer<'w>, Error> {
         match self {
             LayerSpec::Conv2d(s) => {
                 conv2d_init(list, s.bias, s.float_weights, s.in_channels, s.out_channels, s.ktime, s.kheight)
@@ -179,7 +180,7 @@ pub struct DeepPlcModels<'w> {
 impl<'w> DeepPlcModels<'w> {
     /// Builds the three models, in the order of `lpcnet_plc_load_model`:
     /// the PLC model, PitchDNN, FARGAN. Fails when one of them fails.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(DeepPlcModels {
             plc: plc::PlcModel::init(list)?,
             pitchdnn: pitchdnn::PitchDnn::init(list)?,
@@ -204,7 +205,7 @@ pub struct DredEncModels<'w> {
 impl<'w> DredEncModels<'w> {
     /// Builds both models, the RDOVAE encoder first. Fails when one of them
     /// fails.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(DredEncModels {
             rdovae: dred_rdovae_enc::RdovaeEnc::init(list)?,
             pitchdnn: pitchdnn::PitchDnn::init(list)?,
@@ -302,7 +303,7 @@ impl<'w> ModelSet<'w> {
     /// Loads every group of this build whose arrays are all in `list`, and
     /// replaces those groups. A group that fails keeps what it had. Returns
     /// the groups loaded by this call, or `ERR_NO_MODEL` when none loads.
-    pub fn load(&mut self, list: &WeightList<'w>) -> Result<DnnModels, &'static str> {
+    pub fn load(&mut self, list: &WeightList<'w>) -> Result<DnnModels, Error> {
         #[allow(unused_mut)]
         let mut loaded = DnnModels::NONE;
         #[cfg(feature = "deep-plc")]

@@ -17,6 +17,7 @@
 //! functions here return the exact value in that case. The stream encoder
 //! limits it to 750 000 bits per second per channel afterwards.
 
+use crate::Error;
 use super::layout::{ChannelLayout, MappingType};
 
 /// libopus `OPUS_AUTO`: the encoder picks the bitrate from the sampling rate
@@ -49,12 +50,12 @@ fn count(v: usize) -> i64 {
 
 /// Checks the two arguments that every function divides by.
 #[inline]
-fn check_frame(frame_size: usize, fs: i32) -> Result<(i64, i64), &'static str> {
+fn check_frame(frame_size: usize, fs: i32) -> Result<(i64, i64), Error> {
     if frame_size == 0 {
-        return Err("multistream rate: the frame size must not be 0");
+        return Err(Error::bad_arg("multistream rate: the frame size must not be 0"));
     }
     if fs <= 0 {
-        return Err("multistream rate: the sampling rate must be positive");
+        return Err(Error::bad_arg("multistream rate: the sampling rate must be positive"));
     }
     Ok((count(frame_size), fs as i64))
 }
@@ -63,22 +64,22 @@ fn check_frame(frame_size: usize, fs: i32) -> Result<(i64, i64), &'static str> {
 /// `check_frame`, the frame must be shorter than 6 seconds, because both
 /// divide by six times the number of frames per second.
 #[inline]
-fn check_conversion(frame_size: usize, fs: i32) -> Result<(), &'static str> {
+fn check_conversion(frame_size: usize, fs: i32) -> Result<(), Error> {
     let (frame_size, fs) = check_frame(frame_size, fs)?;
     if 6 * fs / frame_size == 0 {
-        return Err("multistream rate: the frame is longer than 6 seconds");
+        return Err(Error::bad_arg("multistream rate: the frame is longer than 6 seconds"));
     }
     Ok(())
 }
 
 /// libopus `bitrate_to_bits`: bits per second to bits per frame.
-pub fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: usize) -> Result<i32, &'static str> {
+pub fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: usize) -> Result<i32, Error> {
     check_conversion(frame_size, fs)?;
     Ok(crate::bitrate_to_bits(bitrate, fs, frame_size))
 }
 
 /// libopus `bits_to_bitrate`: bits per frame to bits per second.
-pub fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> Result<i32, &'static str> {
+pub fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> Result<i32, Error> {
     check_conversion(frame_size, fs)?;
     Ok(crate::bits_to_bitrate(bits, fs, frame_size))
 }
@@ -91,15 +92,15 @@ pub fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> Result<i32, &'s
 /// other value must be positive and is clamped to 500 to 750 000 bits per
 /// second per channel. `channels` is the channel count of the layout; 0 is
 /// an error.
-pub fn clamp_user_bitrate(value: i32, channels: usize) -> Result<i32, &'static str> {
+pub fn clamp_user_bitrate(value: i32, channels: usize) -> Result<i32, Error> {
     if channels == 0 {
-        return Err("multistream rate: the channel count must not be 0");
+        return Err(Error::bad_arg("multistream rate: the channel count must not be 0"));
     }
     if value == OPUS_AUTO || value == OPUS_BITRATE_MAX {
         return Ok(value);
     }
     if value <= 0 {
-        return Err("multistream rate: the bitrate must be positive");
+        return Err(Error::bad_arg("multistream rate: the bitrate must be positive"));
     }
     let channels = count(channels);
     Ok(to_i32(
@@ -117,12 +118,14 @@ fn check_allocation_args(
     frame_size: usize,
     fs: i32,
     rate: &[i32],
-) -> Result<(i64, i64), &'static str> {
+) -> Result<(i64, i64), Error> {
     if user_bitrate <= 0 && user_bitrate != OPUS_AUTO && user_bitrate != OPUS_BITRATE_MAX {
-        return Err("multistream rate: the bitrate must be positive");
+        return Err(Error::bad_arg("multistream rate: the bitrate must be positive"));
     }
     if rate.len() < layout.streams() {
-        return Err("multistream rate: the rate buffer has fewer entries than streams");
+        return Err(Error::bad_arg(
+            "multistream rate: the rate buffer has fewer entries than streams",
+        ));
     }
     check_frame(frame_size, fs)
 }
@@ -146,12 +149,14 @@ pub fn surround_rate_allocation(
     frame_size: usize,
     fs: i32,
     rate: &mut [i32],
-) -> Result<(), &'static str> {
+) -> Result<(), Error> {
     let (frame_size, fs) = check_allocation_args(layout, user_bitrate, frame_size, fs, rate)?;
     let streams = layout.streams();
     let coupled = layout.coupled_streams();
     if lfe_stream.is_some_and(|lfe| lfe < coupled || lfe >= streams) {
-        return Err("multistream rate: the LFE stream must be one of the mono streams");
+        return Err(Error::bad_arg(
+            "multistream rate: the LFE stream must be one of the mono streams",
+        ));
     }
 
     let nb_lfe = lfe_stream.is_some() as i64;
@@ -159,7 +164,7 @@ pub fn surround_rate_allocation(
     let nb_uncoupled = streams as i64 - nb_coupled - nb_lfe;
     let nb_normal = 2 * nb_coupled + nb_uncoupled;
     if nb_normal == 0 {
-        return Err("multistream rate: there is no stream besides the LFE stream");
+        return Err(Error::bad_arg("multistream rate: there is no stream besides the LFE stream"));
     }
 
     // Give each non-LFE channel enough bits per channel for coding band energy.
@@ -220,7 +225,7 @@ pub fn ambisonics_rate_allocation(
     frame_size: usize,
     fs: i32,
     rate: &mut [i32],
-) -> Result<(), &'static str> {
+) -> Result<(), Error> {
     let (frame_size, fs) = check_allocation_args(layout, user_bitrate, frame_size, fs, rate)?;
     let nb_streams = layout.streams() as i64;
     let nb_coupled_streams = layout.coupled_streams() as i64;
@@ -267,7 +272,7 @@ pub fn rate_allocation(
     frame_size: usize,
     fs: i32,
     rate: &mut [i32],
-) -> Result<i32, &'static str> {
+) -> Result<i32, Error> {
     if mapping_type == MappingType::Ambisonics {
         ambisonics_rate_allocation(layout, user_bitrate, frame_size, fs, rate)?;
     } else {
@@ -300,10 +305,10 @@ fn is_100_ms(frame_size: i64, fs: i64) -> bool {
 ///
 /// Every stream needs one byte, and every stream but the last needs one more
 /// byte for its length. An output buffer below this size is an error.
-pub fn smallest_packet(streams: usize, frame_size: usize, fs: i32) -> Result<usize, &'static str> {
+pub fn smallest_packet(streams: usize, frame_size: usize, fs: i32) -> Result<usize, Error> {
     let (frame_size, fs) = check_frame(frame_size, fs)?;
     if streams == 0 {
-        return Err("multistream rate: at least one stream is needed");
+        return Err(Error::bad_arg("multistream rate: at least one stream is needed"));
     }
     let streams = count(streams);
     let mut smallest = streams * 2 - 1;
@@ -336,7 +341,7 @@ pub fn cbr_max_data_bytes(
     frame_size: usize,
     fs: i32,
     max_data_bytes: usize,
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     let smallest = smallest_packet(streams, frame_size, fs)? as i64;
     let max_data_bytes = count(max_data_bytes);
     let limit = if user_bitrate == OPUS_AUTO {
@@ -375,10 +380,10 @@ pub fn stream_max_bytes(
     stream: usize,
     frame_size: usize,
     fs: i32,
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     let (frame_size, fs) = check_frame(frame_size, fs)?;
     if stream >= streams {
-        return Err("multistream rate: no such stream");
+        return Err(Error::bad_arg("multistream rate: no such stream"));
     }
     let streams_after = count(streams - stream - 1);
     // Number of bytes left (+Toc).
@@ -395,7 +400,7 @@ pub fn stream_max_bytes(
         curr_max -= if curr_max > 253 { 2 } else { 1 };
     }
     if curr_max < 1 {
-        return Err("Output buffer too small");
+        return Err(Error::BUFFER_TOO_SMALL);
     }
     Ok(curr_max as usize)
 }
@@ -411,7 +416,7 @@ pub fn cbr_last_stream_bitrate(
     curr_max: usize,
     frame_size: usize,
     fs: i32,
-) -> Result<i32, &'static str> {
+) -> Result<i32, Error> {
     bits_to_bitrate(to_i32(count(curr_max) * 8), fs, frame_size)
 }
 

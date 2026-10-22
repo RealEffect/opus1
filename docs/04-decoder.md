@@ -78,7 +78,7 @@ All decoding goes through `decode_native` in `src/lib.rs`, the port of libopus `
 
 All of them return the number of samples per channel written. The output is interleaved: left, right, left, right for two channels.
 
-For a packet that arrived, `frame_size` is the room in `out` in samples per channel, and the packet decides how many samples come out. A packet longer than `frame_size` is the error "frame_size too small for packet". `decode` writes zeros after the decoded samples. To decode any packet, pass room for 120 ms: 5760 samples per channel at 48 kHz.
+For a packet that arrived, `frame_size` is the room in `out` in samples per channel, and the packet decides how many samples come out. A packet longer than `frame_size` is an error of kind `BufferTooSmall`, as libopus returns `OPUS_BUFFER_TOO_SMALL`. A `frame_size` of 0 is an error of kind `BadArg`, as in libopus. Only the samples a call returns are written; the rest of `out` is left as it was, as in libopus. To decode any packet, pass room for 120 ms: 5760 samples per channel at 48 kHz.
 
 For a lost packet and for `decode_fec`, `frame_size` is the duration to produce. It must be a multiple of 2.5 ms.
 
@@ -457,7 +457,7 @@ An `OpusDred` is 11,236 bytes and decoding does not change it, so one parsed pac
 
 `decode24` and `decode_fec24` follow libopus `opus_decode24` in its float build. They decode as `decode_i16` does in step 1, without soft clipping (`soft_clip` is not set, so `softclip_mem` is cleared as in libopus). Each sample then becomes `float2int(32768*256*x)`: scaled by 2^23 and rounded to the nearest integer, halfway values to the even one. Nothing limits the values to 24 bits; a sample beyond the 32-bit range gives the nearest 32-bit value on 64-bit ARM. The multistream decoder's `decode24` and `decode_fec24` (`opus_multistream_decode24`) do the same for every stream.
 
-**Output gain.** `set_gain(gain)` (libopus `OPUS_SET_GAIN`) scales the output by `celt_exp2(6.48814081e-4 * gain)`, that is `10^(gain / (20 * 256))`, with `gain` in 1/256 dB from -32768 to 32767. Any other value is the error "Invalid gain", and the setting stays. The default 0 skips the multiplication. As in libopus, the gain is applied at the end of every frame that is decoded or concealed (`opus_decode_frame`, `src/opus_decoder.c:681-693`): before the soft clipping and the conversion to 16 or 24 bits, and after the mode-switch cross-fades. The 2.5 or 5 ms of concealment that a cross-fade of a mode switch mixes in comes from a nested frame call, so it gets the gain twice, as in libopus. The decoder's state never sees the gain. `reset_state` keeps it. The multistream decoder sets it on every stream.
+**Output gain.** `set_gain(gain)` (libopus `OPUS_SET_GAIN`) scales the output by `celt_exp2(6.48814081e-4 * gain)`, that is `10^(gain / (20 * 256))`, with `gain` in 1/256 dB from -32768 to 32767. Any other value is an error of kind `BadArg`, and the setting stays. The default 0 skips the multiplication. As in libopus, the gain is applied at the end of every frame that is decoded or concealed (`opus_decode_frame`, `src/opus_decoder.c:681-693`): before the soft clipping and the conversion to 16 or 24 bits, and after the mode-switch cross-fades. The 2.5 or 5 ms of concealment that a cross-fade of a mode switch mixes in comes from a nested frame call, so it gets the gain twice, as in libopus. The decoder's state never sees the gain. `reset_state` keeps it. The multistream decoder sets it on every stream.
 
 `pcm_soft_clip` is public and can be used on float output directly:
 

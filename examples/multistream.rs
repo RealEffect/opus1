@@ -11,7 +11,7 @@ fn main() {
 }
 
 #[cfg(feature = "std")]
-fn main() -> Result<(), &'static str> {
+fn main() -> Result<(), opus1::Error> {
     use opus1::{Application, Bitrate};
     use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
 

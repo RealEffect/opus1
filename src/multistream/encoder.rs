@@ -48,6 +48,7 @@
 //! coupled stream on the mean of its two channels, a mono stream on its
 //! one channel.
 
+use crate::Error;
 use super::{ChannelSource, Interleaved, Sample};
 use super::layout::{ChannelLayout, MappingType};
 use super::rate_alloc::{
@@ -60,8 +61,6 @@ use crate::packet;
 use crate::{
     Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, InbandFec, OpusEncoder, Signal,
 };
-
-const BUFFER_TOO_SMALL: &str = "Output buffer too small";
 
 /// The bitrate a stream encoder gets for `value` (libopus `opus_encoder_ctl`,
 /// `OPUS_SET_BITRATE_REQUEST`): limited to 500 bits per second at least and
@@ -79,16 +78,16 @@ fn stream_bitrate(value: i32, stream_channels: usize) -> Bitrate {
 fn stream_input_channels(
     layout: &ChannelLayout,
     s: usize,
-) -> Result<(usize, Option<usize>), &'static str> {
+) -> Result<(usize, Option<usize>), Error> {
     if s < layout.coupled_streams() {
-        let missing = "multistream encoder: a coupled stream has no input channel";
+        let missing = Error::bad_arg("multistream encoder: a coupled stream has no input channel");
         let left = layout.left_channel(s, None).ok_or(missing)?;
         let right = layout.right_channel(s, None).ok_or(missing)?;
         Ok((left, Some(right)))
     } else {
         let chan = layout
             .mono_channel(s, None)
-            .ok_or("multistream encoder: a mono stream has no input channel")?;
+            .ok_or(Error::bad_arg("multistream encoder: a mono stream has no input channel"))?;
         Ok((chan, None))
     }
 }
@@ -173,7 +172,7 @@ impl MultistreamEncoder {
         coupled_streams: usize,
         mapping: &[u8],
         application: Application,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, Error> {
         let layout = ChannelLayout::new(channels, streams, coupled_streams, mapping)?;
         Self::init(sampling_rate, layout, MappingType::None, None, application)
     }
@@ -195,7 +194,7 @@ impl MultistreamEncoder {
         channels: usize,
         mapping_family: u8,
         application: Application,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, Error> {
         let (layout, mapping_type, lfe_stream) = ChannelLayout::surround(channels, mapping_family)?;
         Self::init(sampling_rate, layout, mapping_type, lfe_stream, application)
     }
@@ -207,7 +206,7 @@ impl MultistreamEncoder {
         mapping_type: MappingType,
         lfe_stream: Option<usize>,
         application: Application,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, Error> {
         layout.validate_for_encoder()?;
         // The generic constructor has no LFE stream (C: `lfe_stream = -1`
         // unless the mapping type is surround).
@@ -294,7 +293,7 @@ impl MultistreamEncoder {
     /// libopus `OPUS_SET_APPLICATION`. See
     /// [`OpusEncoder::set_application`]: after the first frame only the
     /// current application is accepted.
-    pub fn set_application(&mut self, application: Application) -> Result<(), &'static str> {
+    pub fn set_application(&mut self, application: Application) -> Result<(), Error> {
         for enc in &mut self.encoders {
             enc.set_application(application)?;
         }
@@ -325,9 +324,10 @@ impl MultistreamEncoder {
     ///   ([`set_expert_frame_duration`](Self::set_expert_frame_duration)),
     ///   only the first frame of that duration is coded, and `frame_size`
     ///   must be at least that long.
-    /// - `output.len()` is the largest packet allowed. The smallest buffer
-    ///   that can work is `2 * streams - 1` bytes. A buffer that leaves a
-    ///   stream too few bytes is an error ("Output buffer too small").
+    /// - `output.len()` is the largest packet allowed. The smallest buffer that
+    ///   can work is `2 * streams - 1` bytes. A buffer that leaves a stream too
+    ///   few bytes is an error
+    ///   ([`BufferTooSmall`](crate::ErrorKind::BufferTooSmall)).
     ///
     /// Returns the length of the packet in bytes. With constant bitrate and
     /// an explicit bitrate the packet has `bitrate * duration / 8` bytes,
@@ -339,7 +339,7 @@ impl MultistreamEncoder {
         pcm: &[f32],
         frame_size: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let selected = self.check_input(pcm.len(), frame_size)?;
         let src = Interleaved {
             pcm,
@@ -360,7 +360,7 @@ impl MultistreamEncoder {
         pcm: &[i16],
         frame_size: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let selected = self.check_input(pcm.len(), frame_size)?;
         let src = Interleaved {
             pcm,
@@ -382,7 +382,7 @@ impl MultistreamEncoder {
         pcm: &[i32],
         frame_size: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let selected = self.check_input(pcm.len(), frame_size)?;
         let src = Interleaved {
             pcm,
@@ -391,12 +391,12 @@ impl MultistreamEncoder {
         self.encode_native(&src, selected, frame_size, output)
     }
 
-    fn check_input(&self, pcm_len: usize, frame_size: usize) -> Result<usize, &'static str> {
+    fn check_input(&self, pcm_len: usize, frame_size: usize) -> Result<usize, Error> {
         let selected =
             crate::frame_size_select(frame_size, self.variable_duration, self.sampling_rate)
-                .ok_or("Invalid frame size")?;
+                .ok_or(Error::INVALID_FRAME_SIZE)?;
         if pcm_len < frame_size.saturating_mul(self.layout.channels()) {
-            return Err("Input buffer too small for frame");
+            return Err(Error::INPUT_TOO_SHORT);
         }
         Ok(selected)
     }
@@ -411,7 +411,7 @@ impl MultistreamEncoder {
         frame_size: usize,
         analysis_frame_size: usize,
         output: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let fs = self.sampling_rate;
         let streams = self.layout.streams();
         let coupled = self.layout.coupled_streams();
@@ -422,7 +422,7 @@ impl MultistreamEncoder {
         // Smallest packet the encoder can produce.
         let smallest = smallest_packet(streams, frame_size, fs)?;
         if output.len() < smallest {
-            return Err(BUFFER_TOO_SMALL);
+            return Err(Error::BUFFER_TOO_SMALL);
         }
 
         // Surround masking: how far each band of each channel lies above
@@ -583,10 +583,12 @@ impl MultistreamEncoder {
             // last, and padded to the full size for the last stream of a
             // constant-bitrate packet.
             let mut rp = packet::Repacketizer::new();
-            rp.cat(&self.tmp[..len])?;
+            // C: a stream packet the repacketizer refuses is an internal
+            // error.
+            rp.cat(&self.tmp[..len]).map_err(|_| Error::INTERNAL_ERROR)?;
             let room = output
                 .get_mut(tot_size..max_data_bytes)
-                .ok_or(BUFFER_TOO_SMALL)?;
+                .ok_or(Error::BUFFER_TOO_SMALL)?;
             let written = rp.out_range_ext(0, rp.nb_frames(), room, !last, !vbr && last, &[])?;
             tot_size += written;
         }
@@ -599,13 +601,13 @@ impl MultistreamEncoder {
     ///
     /// An explicit value must be positive. It is limited to 500 to 750 000
     /// bits per second per input channel. The default is [`Bitrate::Auto`].
-    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), &'static str> {
+    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), Error> {
         self.bitrate_bps = match bitrate {
             Bitrate::Auto => OPUS_AUTO,
             Bitrate::Max => OPUS_BITRATE_MAX,
             Bitrate::BitsPerSecond(bps) => {
                 if bps <= 0 {
-                    return Err("Invalid bitrate");
+                    return Err(Error::INVALID_BITRATE);
                 }
                 clamp_user_bitrate(bps, self.layout.channels())?
             }
@@ -640,9 +642,9 @@ impl MultistreamEncoder {
 
     /// Sets the complexity, 0 to 10, on every stream. libopus
     /// `OPUS_SET_COMPLEXITY`. The default is 9.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
         if !(0..=10).contains(&complexity) {
-            return Err("Invalid complexity");
+            return Err(Error::INVALID_COMPLEXITY);
         }
         for enc in &mut self.encoders {
             enc.set_complexity(complexity)?;
@@ -732,9 +734,9 @@ impl MultistreamEncoder {
     /// Sets the precision of the input in bits, 8 to 24, on every stream.
     /// libopus `OPUS_SET_LSB_DEPTH`. See [`OpusEncoder::set_lsb_depth`]. Any
     /// other value is an error, and the setting stays.
-    pub fn set_lsb_depth(&mut self, depth: i32) -> Result<(), &'static str> {
+    pub fn set_lsb_depth(&mut self, depth: i32) -> Result<(), Error> {
         if !(8..=24).contains(&depth) {
-            return Err("Invalid LSB depth");
+            return Err(Error::INVALID_LSB_DEPTH);
         }
         for enc in &mut self.encoders {
             enc.set_lsb_depth(depth)?;
@@ -769,9 +771,9 @@ impl MultistreamEncoder {
 
     /// Sets the expected packet loss, 0 to 100 percent, on every stream.
     /// libopus `OPUS_SET_PACKET_LOSS_PERC`.
-    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), &'static str> {
+    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), Error> {
         if !(0..=100).contains(&percent) {
-            return Err("Invalid packet loss percentage");
+            return Err(Error::INVALID_PACKET_LOSS);
         }
         for enc in &mut self.encoders {
             enc.set_packet_loss_perc(percent)?;
@@ -814,9 +816,9 @@ impl MultistreamEncoder {
     ///
     /// A bandwidth set with [`set_bandwidth`](Self::set_bandwidth), or by
     /// the encoder in surround mode, is not limited by it.
-    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) -> Result<(), &'static str> {
+    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) -> Result<(), Error> {
         if bandwidth == Bandwidth::Auto {
-            return Err("Invalid maximum bandwidth");
+            return Err(Error::INVALID_MAX_BANDWIDTH);
         }
         for enc in &mut self.encoders {
             enc.set_max_bandwidth(bandwidth)?;
@@ -870,7 +872,7 @@ impl MultistreamEncoder {
     ///
     /// In surround mode the encoder forces two channels on every coupled
     /// stream on every frame, as libopus does.
-    pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), &'static str> {
+    pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), Error> {
         for enc in &mut self.encoders {
             enc.set_force_channels(channels)?;
         }

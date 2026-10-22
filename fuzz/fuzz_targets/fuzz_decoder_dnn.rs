@@ -61,35 +61,35 @@ enum Dec {
 }
 
 impl Dec {
-    fn decode(&mut self, p: &[u8], frame_size: usize, out: &mut [f32]) -> std::result::Result<usize, &'static str> {
+    fn decode(&mut self, p: &[u8], frame_size: usize, out: &mut [f32]) -> std::result::Result<usize, opus1::Error> {
         match self {
             Dec::One(d) => d.decode(p, frame_size, out),
             Dec::Multi(d) => d.decode(p, frame_size, out),
         }
     }
 
-    fn decode_i16(&mut self, p: &[u8], frame_size: usize, out: &mut [i16]) -> std::result::Result<usize, &'static str> {
+    fn decode_i16(&mut self, p: &[u8], frame_size: usize, out: &mut [i16]) -> std::result::Result<usize, opus1::Error> {
         match self {
             Dec::One(d) => d.decode_i16(p, frame_size, out),
             Dec::Multi(d) => d.decode_i16(p, frame_size, out),
         }
     }
 
-    fn decode_fec(&mut self, p: &[u8], frame_size: usize, out: &mut [f32]) -> std::result::Result<usize, &'static str> {
+    fn decode_fec(&mut self, p: &[u8], frame_size: usize, out: &mut [f32]) -> std::result::Result<usize, opus1::Error> {
         match self {
             Dec::One(d) => d.decode_fec(p, frame_size, out),
             Dec::Multi(d) => d.decode_fec(p, frame_size, out),
         }
     }
 
-    fn set_complexity(&mut self, c: i32) -> std::result::Result<(), &'static str> {
+    fn set_complexity(&mut self, c: i32) -> std::result::Result<(), opus1::Error> {
         match self {
             Dec::One(d) => d.set_complexity(c),
             Dec::Multi(d) => d.set_complexity(c),
         }
     }
 
-    fn set_osce_bwe(&mut self, on: bool) -> std::result::Result<(), &'static str> {
+    fn set_osce_bwe(&mut self, on: bool) -> std::result::Result<(), opus1::Error> {
         match self {
             Dec::One(d) => d.set_osce_bwe(on),
             Dec::Multi(d) => d.set_osce_bwe(on),

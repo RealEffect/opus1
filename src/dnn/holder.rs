@@ -19,6 +19,7 @@
 //!   that live for the whole program exist, and the layers are stored in
 //!   the decoder itself.
 
+use crate::Error;
 use super::arch::{self, DnnArch};
 use super::weights::WeightList;
 use crate::in_place::write_fields;
@@ -100,9 +101,10 @@ struct Block([u8; 64]);
 impl DnnBlob {
     /// A blob that lives for the whole program, for example from
     /// `include_bytes!` in a 64-byte aligned wrapper. Fails with
-    /// `"DNN blob is not aligned"` when an array does not start 4-byte
-    /// aligned, and with `"Invalid DNN blob"` when a record is malformed.
-    pub fn from_static(bytes: &'static [u8]) -> Result<DnnBlob, &'static str> {
+    /// [`BadArg`](crate::ErrorKind::BadArg) when an array does not start 4-byte
+    /// aligned (message "DNN blob is not aligned") or a record is malformed
+    /// (message "invalid DNN blob").
+    pub fn from_static(bytes: &'static [u8]) -> Result<DnnBlob, Error> {
         Ok(DnnBlob { inner: Inner::Static(WeightList::parse(bytes)?) })
     }
 
@@ -110,7 +112,7 @@ impl DnnBlob {
     /// `from_static` does. The copy is shared by the clones of the blob and
     /// by every decoder that loads it.
     #[cfg(feature = "heap")]
-    pub fn from_bytes(bytes: &[u8]) -> Result<DnnBlob, &'static str> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<DnnBlob, Error> {
         let blocks = std::vec![Block([0; 64]); bytes.len().div_ceil(64)].into_boxed_slice();
         // From here on the allocation is owned through this raw pointer
         // only. `SharedBlob::drop` frees it, and so does the failure path
@@ -383,7 +385,7 @@ impl DecoderDnn {
     /// libopus differs (`nnet.md` sections 4.3 and 4.4): it returns 1 on
     /// any failure, can leave a model half-replaced, and a blob without
     /// BBWENet also leaves LACE and NoLACE unloaded in a BWE build.
-    pub fn load(&mut self, blob: &DnnBlob) -> Result<DnnModels, &'static str> {
+    pub fn load(&mut self, blob: &DnnBlob) -> Result<DnnModels, Error> {
         #[allow(unused_mut)]
         let mut loaded = DnnModels::NONE;
         #[cfg(feature = "deep-plc")]
@@ -487,9 +489,9 @@ impl DredDecoderDnn {
     }
 
     /// Loads the RDOVAE decoder from `blob`. When the blob lacks it, or one
-    /// of its arrays does not load, returns `"DNN blob holds no model of
-    /// this build"` and keeps the model it had.
-    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+    /// of its arrays does not load, returns [`ERR_NO_MODEL`] and keeps the
+    /// model it had.
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), Error> {
         if let Inner::Builtin = blob.inner {
             self.model = Slot::Builtin(builtin::rdovae_dec().ok_or(ERR_NO_MODEL)?);
         } else {
@@ -530,9 +532,8 @@ impl DredEncoderDnn {
 
     /// Loads the RDOVAE encoder and PitchDNN from `blob`. When the blob
     /// lacks one of them, or one of their arrays does not load, returns
-    /// `"DNN blob holds no model of this build"` and keeps the models it
-    /// had.
-    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+    /// [`ERR_NO_MODEL`] and keeps the models it had.
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), Error> {
         if let Inner::Builtin = blob.inner {
             self.model = Slot::Builtin(builtin::dred_enc().ok_or(ERR_NO_MODEL)?);
         } else {

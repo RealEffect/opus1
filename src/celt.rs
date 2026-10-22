@@ -1,3 +1,4 @@
+use crate::Error;
 use crate::analysis::{AnalysisInfo, LEAK_BANDS};
 use crate::bands::{
     SPREAD_NONE, SPREAD_NORMAL, compute_band_energies, haar1, log2amp,
@@ -4363,9 +4364,9 @@ impl CeltEncoder {
     /// codes all bands. Hybrid frames start at band 17, because SILK codes
     /// the signal below it. A value of 21 or more is an error, and the
     /// setting stays.
-    pub fn set_start_band(&mut self, start: usize) -> Result<(), &'static str> {
+    pub fn set_start_band(&mut self, start: usize) -> Result<(), Error> {
         if start >= self.mode.nb_ebands {
-            return Err("CELT start band must be below the number of bands");
+            return Err(Error::bad_arg("CELT start band out of range"));
         }
         self.start_band = start;
         Ok(())
@@ -4380,9 +4381,9 @@ impl CeltEncoder {
     ///
     /// The Opus encoder sets 0 when `OPUS_SET_PREDICTION_DISABLED` is on,
     /// and 2 otherwise. Any other value is an error, and the setting stays.
-    pub fn set_prediction(&mut self, value: i32) -> Result<(), &'static str> {
+    pub fn set_prediction(&mut self, value: i32) -> Result<(), Error> {
         if !(0..=2).contains(&value) {
-            return Err("CELT prediction must be 0, 1 or 2");
+            return Err(Error::bad_arg("CELT prediction must be 0, 1 or 2"));
         }
         self.disable_pf = value <= 1;
         self.force_intra = value == 0;
@@ -4399,9 +4400,11 @@ impl CeltEncoder {
     /// also becomes the history of the second channel, so that the
     /// stream can switch back to stereo. The Opus encoder sets this before
     /// every frame from its stereo decision.
-    pub fn set_stream_channels(&mut self, channels: usize) -> Result<(), &'static str> {
+    pub fn set_stream_channels(&mut self, channels: usize) -> Result<(), Error> {
         if channels == 0 || channels > self.channels {
-            return Err("CELT stream channels must be 1 or the encoder's channel count");
+            return Err(Error::bad_arg(
+                "CELT stream channels must be 1 or the encoder's channel count",
+            ));
         }
         self.stream_channels = channels;
         Ok(())
@@ -4420,9 +4423,9 @@ impl CeltEncoder {
     /// a quarter from 5 %, off from 9 %), and the coarse energy is coded
     /// without prediction from the frame before more often. Any other
     /// value is an error, and the setting stays.
-    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), &'static str> {
+    pub fn set_packet_loss_perc(&mut self, percent: i32) -> Result<(), Error> {
         if !(0..=100).contains(&percent) {
-            return Err("packet loss must be 0 to 100 percent");
+            return Err(Error::INVALID_PACKET_LOSS);
         }
         self.loss_rate = percent;
         Ok(())
@@ -4437,9 +4440,9 @@ impl CeltEncoder {
     /// default) there is no target, and a frame takes the bytes it is given.
     /// A value of 500 or less is an error, and the setting stays. A value
     /// above 750 kb/s per channel is lowered to that, as libopus does.
-    pub fn set_bitrate(&mut self, bitrate: i32) -> Result<(), &'static str> {
+    pub fn set_bitrate(&mut self, bitrate: i32) -> Result<(), Error> {
         if bitrate <= 500 && bitrate != OPUS_BITRATE_MAX {
-            return Err("CELT bitrate must be above 500 b/s");
+            return Err(Error::bad_arg("CELT bitrate must be above 500 b/s"));
         }
         self.bitrate = bitrate.min(750_000 * self.channels as i32);
         Ok(())
@@ -7738,9 +7741,9 @@ impl CeltDecoder {
     /// are refused and change nothing. From 5, a lost CELT-only frame is
     /// concealed with deep PLC, when the caller passes the deep PLC state
     /// (only `OpusDecoder` does). A reset keeps the value.
-    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), &'static str> {
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), Error> {
         if !(0..=10).contains(&complexity) {
-            return Err("Invalid complexity");
+            return Err(Error::INVALID_COMPLEXITY);
         }
         self.complexity = complexity;
         Ok(())
@@ -7780,9 +7783,9 @@ impl CeltDecoder {
     /// When the two counts differ the decoder converts, as libopus does. A
     /// mono packet is written to both channels of a two-channel decoder. A
     /// stereo packet is mixed down by a one-channel decoder.
-    pub fn set_stream_channels(&mut self, channels: usize) -> Result<(), &'static str> {
+    pub fn set_stream_channels(&mut self, channels: usize) -> Result<(), Error> {
         if !(1..=2).contains(&channels) {
-            return Err("CELT: stream channels must be 1 or 2");
+            return Err(Error::bad_arg("CELT stream channels must be 1 or 2"));
         }
         self.stream_channels = channels;
         Ok(())
@@ -7808,9 +7811,9 @@ impl CeltDecoder {
     /// `CELT_SET_START_BAND`): 0 for a CELT-only stream, 17 for the CELT
     /// layer of a Hybrid stream. It must lie below the number of bands
     /// (21). It starts at 0 and stays until it is set again.
-    pub fn set_start_band(&mut self, start: usize) -> Result<(), &'static str> {
+    pub fn set_start_band(&mut self, start: usize) -> Result<(), Error> {
         if start >= self.mode.nb_ebands {
-            return Err("CELT: start band out of range");
+            return Err(Error::bad_arg("CELT start band out of range"));
         }
         self.start_band = start;
         Ok(())
@@ -7821,9 +7824,9 @@ impl CeltDecoder {
     /// or full band stream. It must lie between 1 and the number of bands
     /// (21). It starts at 21 and stays until it is set again. Lost frames
     /// are concealed within the same range.
-    pub fn set_end_band(&mut self, end: usize) -> Result<(), &'static str> {
+    pub fn set_end_band(&mut self, end: usize) -> Result<(), Error> {
         if !(1..=self.mode.nb_ebands).contains(&end) {
-            return Err("CELT: end band out of range");
+            return Err(Error::bad_arg("CELT end band out of range"));
         }
         self.end_band = end;
         Ok(())
@@ -7843,7 +7846,7 @@ impl CeltDecoder {
         frame_size: usize,
         pcm: &mut [f32],
         layout: PcmLayout,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.decode_lost_with_deep_plc(frame_size, pcm, layout, None)
     }
 
@@ -7857,12 +7860,12 @@ impl CeltDecoder {
         pcm: &mut [f32],
         layout: PcmLayout,
         deep_plc: Option<&mut DeepPlcArgs>,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         let Some((n, lm)) = self.frame_geometry(frame_size) else {
-            return Err("CELT: frame size is not 2.5, 5, 10 or 20 ms");
+            return Err(Error::bad_arg("CELT frame size is not 2.5, 5, 10 or 20 ms"));
         };
         if pcm.len() < frame_size * self.channels {
-            return Err("CELT: output buffer too small");
+            return Err(Error::BUFFER_TOO_SMALL);
         }
         self.conceal(n, lm, deep_plc);
         self.deemphasis(pcm, n, frame_size, layout);
