@@ -17,7 +17,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder, Signal};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate, Signal};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -161,7 +161,11 @@ fn c_enc_rust_dec(ch: usize, ms: usize) -> Vec<f64> {
     // A steady harmonic tone can read as music and pull libopus into CELT.
     enc.set_signal(CSignal::Voice).unwrap();
     let mut c_dec = CDec::new(sr as u32, c_channels(ch)).unwrap();
-    let mut rs_dec = OpusDecoder::new(sr as i32, ch).unwrap();
+    let mut rs_dec = OpusDecoder::new(
+        SampleRate::try_from(sr as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
 
     let (mut c_pcm, mut rs_pcm) = (Vec::new(), Vec::new());
     let mut pkt = vec![0u8; 1500];
@@ -255,7 +259,12 @@ fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
     let packets = 1000 / ms;
     let input = voiced(sr, ch, frame * packets);
 
-    let mut enc = OpusEncoder::new(sr as i32, ch, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(sr as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+        Application::Voip,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_vbr(!cbr);
     // As for libopus above: the speech and music analysis reads the steady
@@ -267,7 +276,11 @@ fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
     }
     let mut c_dec = CDec::new(sr as u32, c_channels(ch)).unwrap();
     let mut c_fec = CDec::new(sr as u32, c_channels(ch)).unwrap();
-    let mut rs_dec = OpusDecoder::new(sr as i32, ch).unwrap();
+    let mut rs_dec = OpusDecoder::new(
+        SampleRate::try_from(sr as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
 
     let (mut pcm, mut fec_pcm, mut rs_pcm) = (Vec::new(), Vec::new(), Vec::new());
     let mut pkt = vec![0u8; 1500];

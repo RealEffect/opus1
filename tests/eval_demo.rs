@@ -22,7 +22,7 @@ mod k24_common;
 use core_common::{APP_AUDIO, APP_VOIP, BW_FB, BW_SWB, BW_WB, CEncoder, MODE_CELT, MODE_HYBRID, MODE_SILK};
 use eval_common::libopus_demo::{LibopusDecoder, libopus_has_lbrr};
 use k24_common::{repacketize, speech_fullband, to_stereo};
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use opus1::internals::eval::demo::{
     BitPacket, DemoDecoder, DemoOutput, decode_bitstream, opus_demo_s16, parse_bitstream, res2int24,
     write_record,
@@ -140,7 +140,11 @@ fn loop_gives_the_same_output_for_opus1_and_libopus() {
         for (rate, channels) in configs {
             for lossy in [false, true] {
                 let bytes = bitstream(&stream, |i| lossy && lost(i));
-                let mut ours = OpusDecoder::new(rate as i32, channels).unwrap();
+                let mut ours = OpusDecoder::new(
+                    SampleRate::try_from(rate as i32).unwrap(),
+                    Channels::try_from(channels).unwrap(),
+                )
+                .unwrap();
                 let mut theirs = LibopusDecoder::new(rate, channels);
                 let a = run(&mut ours, &bytes);
                 let b = run(&mut theirs, &bytes);
@@ -192,7 +196,7 @@ fn a_corrupted_range_stops_the_loop_at_its_packet() {
                 write_record(&mut bytes, p, if i == target { r ^ 0x100 } else { r });
             }
         }
-        for decoder in [&mut OpusDecoder::new(48000, 2).unwrap() as &mut dyn DemoDecoder, &mut LibopusDecoder::new(48000, 2)] {
+        for decoder in [&mut OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap() as &mut dyn DemoDecoder, &mut LibopusDecoder::new(48000, 2)] {
             let out = run_dyn(decoder, &bytes);
             if target == 0 || lose_before {
                 // The first packet and a packet after a loss are not checked.
@@ -241,7 +245,7 @@ fn invalid_packets_and_early_losses() {
         for (data, range) in &records {
             write_record(&mut bytes, data, *range);
         }
-        let a = run(&mut OpusDecoder::new(16000, 1).unwrap(), &bytes);
+        let a = run(&mut OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap(), &bytes);
         let b = run(&mut LibopusDecoder::new(16000, 1), &bytes);
         println!("{name}: errors {}, FEC calls {}, samples {}", a.decode_errors, a.fec_calls, a.pcm.len());
         assert_eq!((a.decode_errors, a.fec_calls, a.lost), (b.decode_errors, b.fec_calls, b.lost), "{name}");
@@ -259,7 +263,7 @@ fn invalid_packets_and_early_losses() {
 fn a_cut_bitstream_decodes_its_prefix() {
     let stream = &streams()[2];
     let bytes = bitstream(stream, lost);
-    let full = run(&mut OpusDecoder::new(16000, 1).unwrap(), &bytes);
+    let full = run(&mut OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap(), &bytes);
     // Cut in the middle of the payload of a later record. Half the length
     // can fall on a record boundary (the packet sizes depend on the
     // target), so move the cut back until it lies inside a record.
@@ -270,7 +274,7 @@ fn a_cut_bitstream_decodes_its_prefix() {
     let cut = &bytes[..end];
     let parsed = parse_bitstream(cut);
     assert!(parsed.error.is_some());
-    let prefix = decode_bitstream(&mut OpusDecoder::new(16000, 1).unwrap(), &parsed.packets);
+    let prefix = decode_bitstream(&mut OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap(), &parsed.packets);
     assert!(!prefix.pcm.is_empty());
     assert_eq!(&full.pcm[..prefix.pcm.len()], &prefix.pcm[..]);
 }
@@ -411,7 +415,11 @@ fn last_packet_duration_matches_libopus() {
     ];
     for (rate, channels) in [(48000u32, 2usize), (16000, 1), (8000, 2)] {
         let scale = |n: usize| n * rate as usize / 48000;
-        let mut ours = OpusDecoder::new(rate as i32, channels).unwrap();
+        let mut ours = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let mut theirs = LibopusDecoder::new(rate, channels);
         assert_eq!(ours.last_packet_duration(), 0);
         let mut f32_buf = vec![0f32; 9600 * channels];
@@ -486,7 +494,7 @@ fn sixteen_bit_output_matches_opus_decode24() {
     assert!(beyond > 100);
     // The loop through opus1 never writes -32768.
     let records: Vec<BitPacket<'_>> = packets.iter().map(|p| BitPacket { data: p, enc_final_range: 0 }).collect();
-    let out = decode_bitstream(&mut OpusDecoder::new(48000, 2).unwrap(), &records);
+    let out = decode_bitstream(&mut OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap(), &records);
     assert!(out.pcm.contains(&32767) && out.pcm.contains(&-32767));
     assert!(!out.pcm.contains(&i16::MIN));
 }

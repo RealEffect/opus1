@@ -13,7 +13,7 @@
 use opus::{
     Application as CApp, Channels as CCh, Decoder as CDec, Encoder as CEnc,
 };
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 const MAX_FRAME: usize = 5760; // 120 ms @ 48 kHz, per channel
@@ -109,7 +109,12 @@ fn rust_enc_c_dec(
     let frame = expected(rate, ms);
     let packets = 1000 / ms;
     let input = voiced(rate, ch, frame * packets);
-    let mut enc = OpusEncoder::new(rate as i32, ch, app).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+        app,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     enc.set_vbr(!cbr);
     let mut dec = CDec::new(rate as u32, c_channels(ch)).unwrap();
@@ -146,7 +151,11 @@ fn c_enc_rust_dec(
     let packets = 1000 / ms;
     let input = voiced(rate, ch, frame * packets);
     let mut enc = CEnc::new(rate as u32, c_channels(ch), capp).unwrap();
-    let mut dec = OpusDecoder::new(rate as i32, ch).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
     let (mut ref_pcm, mut out_pcm) = (Vec::new(), Vec::new());
     let mut pkt = vec![0u8; 8000];
     let mut buf = vec![0f32; MAX_FRAME * ch];
@@ -241,7 +250,8 @@ fn issue_repro_exact_config() {
     // A new encoder has libopus's automatic bitrate: 60 * 16000 / 960 +
     // 16000 * 2 = 33 kb/s. At that rate libopus codes SILK too: the 60 ms go
     // into one SILK wideband frame, TOC config 11, stereo.
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
     assert_eq!(enc.bitrate(), 33_000);
@@ -250,13 +260,14 @@ fn issue_repro_exact_config() {
     c_enc.encode_float(&pcm, &mut c_out).unwrap();
     assert_eq!(out[0], c_out[0], "the TOC byte differs from libopus's");
     assert_eq!(out[0], 0x5c, "expected one SILK WB 60 ms stereo frame, got {:#04x}", out[0]);
-    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     assert_eq!(dec.decode(&out[..n], 960, &mut decoded).unwrap(), 960);
 
     // At 64 kb/s the automatic mode is CELT-only, in libopus too: the packet
     // holds three 20 ms CELT wideband frames (TOC config 23, frame count
     // code 3).
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
@@ -266,17 +277,18 @@ fn issue_repro_exact_config() {
     c_enc.encode_float(&pcm, &mut c_out).unwrap();
     assert_eq!(out[0], c_out[0], "the TOC byte differs from libopus's");
     assert_eq!(out[0], 0xbf, "expected three CELT WB 20 ms frames, got {:#04x}", out[0]);
-    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     assert_eq!(dec.decode(&out[..n], 960, &mut decoded).unwrap(), 960);
 
     // At 32 kb/s the same encoder codes SILK, and the 60 ms go into one
     // SILK frame: TOC config 11 = SILK wideband 60 ms.
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     let n = enc.encode(&pcm, 960, &mut out).expect("60 ms must encode");
     assert!(n > 1);
     assert_eq!(out[0] >> 3, 11, "expected SILK WB 60 ms TOC, got {:#04x}", out[0]);
-    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     let got = dec.decode(&out[..n], 960, &mut decoded).unwrap();
     assert_eq!(got, 960);
 }

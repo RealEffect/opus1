@@ -1,4 +1,4 @@
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 #[test]
 fn test_48k_hybrid_quality() {
@@ -8,11 +8,12 @@ fn test_48k_hybrid_quality() {
     let total_samples = frame_size * num_frames;
 
     // Create encoder/decoder in VoIP mode (uses Hybrid for 48kHz)
-    let mut encoder = OpusEncoder::new(sample_rate, 1, Application::Voip).unwrap();
+    let mut encoder =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     encoder.set_vbr(false);
 
-    let mut decoder = OpusDecoder::new(sample_rate, 1).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 
     // Generate all input samples and collect all output samples
     let input: Vec<f32> = (0..total_samples)

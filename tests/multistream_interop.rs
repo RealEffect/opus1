@@ -14,7 +14,7 @@
 //! Tests are skipped if the reference files are not present.
 
 use opus1::multistream::{split_self_delimited, ChannelMappingTable, MultistreamDecoder};
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use std::fs;
 
 const OPUS_DECODE_RATE: i32 = 48_000;
@@ -82,7 +82,7 @@ fn goertzel_power(samples: &[f32], sample_rate: f64, freq: f64) -> f64 {
 
 fn run_diff(label: &str, data: &RefData) {
     let channels = data.table.channels as usize;
-    let mut dec = MultistreamDecoder::new(OPUS_DECODE_RATE, ChannelMappingTable {
+    let mut dec = MultistreamDecoder::new(SampleRate::try_from(OPUS_DECODE_RATE).unwrap(), ChannelMappingTable {
         channels: data.table.channels,
         stream_count: data.table.stream_count,
         coupled_count: data.table.coupled_count,
@@ -124,7 +124,7 @@ fn run_diff(label: &str, data: &RefData) {
                 label, s, sub.len(), sub.first().copied().unwrap_or(0), stream_ch
             );
 
-            match OpusDecoder::new(OPUS_DECODE_RATE, stream_ch) {
+            match OpusDecoder::new(SampleRate::try_from(OPUS_DECODE_RATE).unwrap(), Channels::try_from(stream_ch).unwrap()) {
                 Ok(mut standalone_dec) => {
                     let mut buf = vec![0.0f32; MAX_FRAME_SIZE * stream_ch];
                     match standalone_dec.decode(&sub, MAX_FRAME_SIZE, &mut buf) {
@@ -322,7 +322,8 @@ fn multistream_silence_mapping_produces_silence() {
         coupled_count: 0,
         mapping: vec![0, 0, 255],
     };
-    let mut dec = MultistreamDecoder::new(OPUS_DECODE_RATE, table).unwrap();
+    let mut dec =
+        MultistreamDecoder::new(SampleRate::try_from(OPUS_DECODE_RATE).unwrap(), table).unwrap();
 
     let packet = [0u8]; // not a real encoded frame; swap for a captured mono packet if rejected
     let frame_size = 960;

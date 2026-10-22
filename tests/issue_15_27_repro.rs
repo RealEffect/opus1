@@ -12,7 +12,7 @@
 
 use opus1::internals::silk::SilkResampler;
 use opus1::internals::silk::dec_api::SilkDecoder;
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 /// Delay-compensated SNR: SILK decode introduces an algorithmic delay, so
@@ -99,7 +99,7 @@ fn half_snrs_delay(
 /// is 64" inside `silk_resampler_private_up2_hq`.
 #[test]
 fn issue_15_plc_bridge_after_loss_no_panic() {
-    let mut dec = OpusDecoder::new(16000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 320];
 
     // 1. A SILK-only NB packet (TOC 0x00: NB SILK, 10 ms, mono): puts the
@@ -153,7 +153,8 @@ fn issue_15_resampler_short_output_no_panic() {
 /// `silk_enc.stereo.side.resize(640)` (`FixedVec<i16, 320>` capacity).
 #[test]
 fn issue_27_1_stereo_silk_40ms_encode_no_panic() {
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_vbr(false);
     let frame = 640; // 40 ms @ 16 kHz
@@ -175,12 +176,13 @@ fn issue_27_1_stereo_silk_40ms_encode_no_panic() {
 /// second half collapsing to ~-8 dB).
 #[test]
 fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_vbr(false);
     let frame = 640;
 
-    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     for pkt_idx in 0..3 {
         let input = sine_input(frame, 16000, 2);
         let mut pkt = vec![0u8; 1500];
@@ -215,13 +217,14 @@ fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
 /// the no-FEC case.
 #[test]
 fn issue_27_2b_stereo_fec_roundtrip_consistent() {
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_inband_fec(true);
     enc.set_packet_loss_perc(40).unwrap();
     let frame = 320; // 20 ms
 
-    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     for pkt_idx in 0..8 {
         let input = sine_input(frame, 16000, 2);
         let mut pkt = vec![0u8; 1500];
@@ -249,14 +252,15 @@ fn issue_27_2b_stereo_fec_roundtrip_consistent() {
 /// the lowest config where both fit, matching the oracle tests' CBR setup.)
 #[test]
 fn issue_27_2b_stereo_fec_cbr_roundtrip_consistent() {
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_vbr(false);
     enc.set_inband_fec(true);
     enc.set_packet_loss_perc(40).unwrap();
     let frame = 320; // 20 ms
 
-    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     for pkt_idx in 0..8 {
         let input = sine_input(frame, 16000, 2);
         let mut pkt = vec![0u8; 1500];
@@ -292,12 +296,12 @@ fn issue_27_2b_stereo_fec_cbr_roundtrip_consistent() {
 /// exact zeros although decode() reported the full length.
 #[test]
 fn issue_27_3_silk_40ms_mono_full_decode() {
-    let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_vbr(false);
     let frame = 640;
 
-    let mut dec = OpusDecoder::new(16000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     for pkt_idx in 0..3 {
         let input = sine_input(frame, 16000, 1);
         let mut pkt = vec![0u8; 1500];
@@ -320,12 +324,12 @@ fn issue_27_3_silk_40ms_mono_full_decode() {
 /// decoder): exercises the multi-frame loop through the resampling path.
 #[test]
 fn issue_27_3_silk_40ms_resampled_full_decode() {
-    let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_vbr(false);
     let enc_frame = 640; // 40 ms @ 16 kHz
 
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut c_dec = opus::Decoder::new(48000, opus::Channels::Mono).unwrap();
     let dec_frame = 1920; // 40 ms @ 48 kHz
     for pkt_idx in 0..3 {
@@ -387,7 +391,8 @@ fn libopus_match_snr(reference: &[f32], test: &[f32], start: usize, len: usize) 
 /// filter / float conversion loops.
 #[test]
 fn deep_scan_encode_short_input_returns_err() {
-    let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     let input = vec![0.0f32; 100]; // < 960
     let mut pkt = vec![0u8; 1500];
     assert!(enc.encode(&input, 960, &mut pkt).is_err());

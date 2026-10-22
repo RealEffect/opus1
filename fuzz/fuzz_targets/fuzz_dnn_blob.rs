@@ -24,7 +24,7 @@ use opus1::internals::dnn::models::{
     Layer, LayerSpec, ModelSet, bbwenet, fargan, lace, nolace, pitchdnn, plc,
 };
 use opus1::internals::dnn::weights::WeightList;
-use opus1::{DnnBlob, OpusDecoder};
+use opus1::{Channels, DnnBlob, OpusDecoder, SampleRate};
 
 /// The descriptors of every model, with the layers that `ModelSet` holds
 /// for it once it is loaded.
@@ -61,7 +61,7 @@ fn inside<T>(blob: &[u8], s: Option<&[T]>) {
 /// The public path: a copy of `blob` loaded into a decoder.
 fn load_into_decoder(blob: &[u8]) {
     let Ok(b) = DnnBlob::from_bytes(blob) else { return };
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let before = dec.dnn_models();
     match dec.set_dnn_blob(&b) {
         Ok(m) => assert!(!m.is_empty() && dec.dnn_models().contains(m)),

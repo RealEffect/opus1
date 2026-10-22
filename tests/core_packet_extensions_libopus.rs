@@ -17,6 +17,7 @@
 //! random bytes.
 
 use audiopus_sys as sys;
+use opus1::SampleRate;
 use opus1::extensions::{self, Extension, ExtensionIterator};
 use opus1::packet::{self, Repacketizer};
 use std::os::raw::{c_int, c_uchar};
@@ -537,7 +538,7 @@ fn pad_and_unpad_carry_extensions_like_libopus() {
     let mut kept = 0;
     for case in 0..6_000 {
         let toc = tocs[rng.below(tocs.len())];
-        let max = 48 / (packet::samples_per_frame(toc, 48000) / 120);
+        let max = 48 / (packet::samples_per_frame(toc, SampleRate::Hz48000) / 120);
         let count = 1 + rng.below(max.min(6));
         let padding = match rng.below(4) {
             0 => Vec::new(),
@@ -621,7 +622,7 @@ fn repacketizer_carries_extensions_like_libopus() {
     let mut carried = 0;
     for case in 0..3_000 {
         let toc = [0xE0u8, 0x4C, 0xC8][rng.below(3)];
-        let per = packet::samples_per_frame(toc, 48000);
+        let per = packet::samples_per_frame(toc, SampleRate::Hz48000);
         let mut packets = Vec::new();
         let mut total = 0;
         while packets.len() < 6 {
@@ -836,12 +837,12 @@ fn malformed_packets_give_the_errors_of_libopus() {
 #[test]
 #[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn encoded_packets_with_extensions_decode_as_without() {
-    use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
-    let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
+    use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
+    let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_vbr(false);
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
-    let mut dec_plain = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+    let mut dec_plain = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut err = 0;
     let c_dec = unsafe { sys::opus_decoder_create(48000, 1, &mut err) };
     assert_eq!(err, 0);

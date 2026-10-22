@@ -15,7 +15,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Channels as CCh, Decoder as CDec, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -69,7 +69,8 @@ fn worst_window_snr(api_rate: u32) -> f64 {
 
     let out_per_pkt = api_rate as usize / 50; // 20 ms at the API rate
     let mut c_dec = CDec::new(api_rate, CCh::Mono).unwrap();
-    let mut rs_dec = OpusDecoder::new(api_rate as i32, 1).unwrap();
+    let mut rs_dec =
+        OpusDecoder::new(SampleRate::try_from(api_rate as i32).unwrap(), Channels::Mono).unwrap();
 
     let (mut c_pcm, mut rs_pcm) = (Vec::new(), Vec::new());
     let mut pkt = vec![0u8; 1500];

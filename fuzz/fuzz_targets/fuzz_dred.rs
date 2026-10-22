@@ -13,8 +13,7 @@
 //!   extension whose payload is input bytes, after the DRED header or not.
 //!
 //! The packet is parsed with a random `max_dred_samples` (sometimes any
-//! `i32`), a random sampling rate (sometimes any `i32`) and deferred
-//! processing or not, then decoded several times with `dred_decode*` at
+//! `i32`), a random sampling rate and deferred processing or not, then decoded several times with `dred_decode*` at
 //! random offsets (sometimes any `i32`) and lengths, into buffers of random
 //! length, by a decoder at a random rate, channel count and complexity 0 to
 //! 10, with the bandwidth extension on or off.
@@ -39,7 +38,7 @@ use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::extensions::{self, Extension};
 use opus1::packet;
-use opus1::{OpusDecoder, OpusDred, OpusDredDecoder};
+use opus1::{Channels, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate};
 use std::sync::OnceLock;
 
 /// The DRED header: "D" and the experimental version.
@@ -112,7 +111,7 @@ fn changed_pool_packet(u: &mut Unstructured) -> Result<Vec<u8>> {
 /// A packet from the input with a DRED extension.
 fn made_packet(u: &mut Unstructured) -> Result<Vec<u8>> {
     let toc: u8 = u.arbitrary()?;
-    let max = 48 / (packet::samples_per_frame(toc, 48000) / 120);
+    let max = 48 / (packet::samples_per_frame(toc, SampleRate::Hz48000) / 120);
     let count = u.int_in_range(1..=max.min(3))?;
     let mut frames = Vec::with_capacity(count);
     for _ in 0..count {
@@ -147,20 +146,17 @@ fn run(mode: u8, u: &mut Unstructured) -> Result<()> {
     };
 
     // Parse.
-    let parse_fs = match u.int_in_range(0..=6)? {
-        0 => u.arbitrary()?,
-        1 => u.int_in_range(1..=192_000)?,
-        i => RATES[i as usize - 2],
-    };
+    let parse_rate = *u.choose(SampleRate::ALL)?;
+    let parse_fs = parse_rate.hz() as i32;
     let max_samples = match u.int_in_range(0..=5)? {
         0 => u.arbitrary()?,
-        _ => u.int_in_range(0..=parse_fs.clamp(1, 48000))?,
+        _ => u.int_in_range(0..=parse_fs)?,
     };
     let defer = u.arbitrary()?;
     let dec = dred_decoder();
     let mut dred = OpusDred::new();
     let what = format!("parse of {} bytes, max {max_samples} at {parse_fs} Hz, defer {defer}", data.len());
-    let found = match dec.parse(&mut dred, &data, max_samples, parse_fs, defer) {
+    let found = match dec.parse(&mut dred, &data, max_samples, parse_rate, defer) {
         Ok(r) => {
             assert!(r.samples >= 0 && r.end >= 0, "{what}: {r:?}");
             if dred.is_parsed() && !defer {
@@ -208,7 +204,11 @@ fn run(mode: u8, u: &mut Unstructured) -> Result<()> {
     // Decode.
     let fs = *u.choose(&RATES)?;
     let channels = u.int_in_range(1..=2)?;
-    let mut decoder = OpusDecoder::new(fs, channels).unwrap();
+    let mut decoder = OpusDecoder::new(
+        SampleRate::try_from(fs).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     decoder.set_complexity(u.int_in_range(0..=10)?).unwrap();
     decoder.set_osce_bwe(u.arbitrary()?).unwrap();
     let max_frame = fs as usize * 120 / 1000;
@@ -229,7 +229,7 @@ fn run(mode: u8, u: &mut Unstructured) -> Result<()> {
         let offset = match u.int_in_range(0..=5)? {
             0 => u.arbitrary()?,
             _ => {
-                let reach = found.samples.saturating_mul(fs) / parse_fs.max(1);
+                let reach = found.samples.saturating_mul(fs) / parse_fs;
                 u.int_in_range(-(fs / 50)..=reach.clamp(0, 10 * fs) + fs / 50)?
             }
         };

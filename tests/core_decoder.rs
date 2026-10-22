@@ -6,7 +6,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech_fullband, to_stereo};
-use opus1::{OpusDecoder, packet};
+use opus1::{Channels, OpusDecoder, SampleRate, packet};
 
 /// A stream from the C encoder with the mode and bandwidth forced.
 fn c_stream(rate: usize, channels: usize, mode: i32, bandwidth: i32, bitrate: i32, frame: usize) -> (Vec<Vec<u8>>, Vec<u32>) {
@@ -35,7 +35,11 @@ fn final_range_equals_the_c_encoders() {
         // 2 stands for 2.5 ms.
         let frame = if frame_ms == 2 { rate / 400 } else { rate * frame_ms / 1000 };
         let (packets, ranges) = c_stream(rate, channels, mode, bandwidth, bitrate, frame);
-        let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+        let mut dec = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         assert_eq!(dec.final_range(), 0, "{name}: before the first packet");
         let mut pcm = vec![0f32; frame * channels];
         let mut mismatches = 0;
@@ -63,7 +67,8 @@ fn final_range_covers_redundancy_frames() {
     let mut enc = CEncoder::new(rate, 1, APP_AUDIO);
     enc.bitrate(32000);
     let mut c_dec = CDecoder::new(rate, 1);
-    let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
     let mut out = vec![0f32; frame];
     let (mut mismatches, mut modes) = (0, std::collections::BTreeSet::new());
     for (i, f) in pcm.chunks_exact(frame).enumerate() {
@@ -87,7 +92,11 @@ fn final_range_covers_redundancy_frames() {
 /// mismatches.
 fn compare_decoders(rate: usize, channels: usize, packets: &[Vec<u8>], max_frame: usize) -> (f64, usize) {
     let mut c_dec = CDecoder::new(rate, channels);
-    let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let mut out = vec![0f32; max_frame * channels];
     let (mut worst, mut mismatches) = (200f64, 0);
     for (i, p) in packets.iter().enumerate() {
@@ -136,7 +145,8 @@ fn one_byte_packets_follow_libopus() {
     let frame = rate / 50;
     let (packets, _) = c_stream(rate, 1, MODE_SILK, BW_WB, 24000, frame);
     let mut c_dec = CDecoder::new(rate, 1);
-    let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
     let mut out = vec![0f32; 6 * frame];
     for (i, p) in packets.iter().enumerate() {
         let toc = p[0] & 0xFC;
@@ -172,8 +182,16 @@ fn reset_state_gives_a_new_decoder() {
         let frame = rate / 50;
         let (packets, ranges) = c_stream(rate, channels, mode, bandwidth, bitrate, frame);
         let (first, second) = packets.split_at(packets.len() / 2);
-        let mut used = OpusDecoder::new(rate as i32, channels).unwrap();
-        let mut fresh = OpusDecoder::new(rate as i32, channels).unwrap();
+        let mut used = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
+        let mut fresh = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let (mut a, mut b) = (vec![0f32; frame * channels], vec![0f32; frame * channels]);
         for p in first {
             used.decode(p, frame, &mut a).unwrap();
@@ -182,7 +200,7 @@ fn reset_state_gives_a_new_decoder() {
         used.decode(&[], frame, &mut a).unwrap();
         used.reset_state();
         assert_eq!(used.final_range(), 0, "{name}");
-        assert_eq!((used.sampling_rate(), used.channels()), (rate as i32, channels), "{name}");
+        assert_eq!((used.sampling_rate().hz(), used.channels().count()), (rate as u32, channels), "{name}");
         for (i, p) in second.iter().enumerate() {
             used.decode(p, frame, &mut a).unwrap();
             fresh.decode(p, frame, &mut b).unwrap();
@@ -200,7 +218,7 @@ fn reset_state_gives_a_new_decoder() {
 #[test]
 fn bad_arguments_are_errors() {
     let (packets, _) = c_stream(16000, 1, MODE_SILK, BW_WB, 24000, 320);
-    let mut dec = OpusDecoder::new(16000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     let mut out = vec![0f32; 320];
     // Room for less than the packet holds.
     assert!(dec.decode(&packets[0], 160, &mut out).is_err());
@@ -269,7 +287,11 @@ fn garbage_packets_decode_like_libopus() {
         for round in 0..3000 {
             let packet = rng.garbage(packet_channels);
             let mut c_dec = CDecoder::new(rate, channels);
-            let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+            let mut dec = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let reference = c_dec.decode(Some(&packet), max, false);
             let ours = dec.decode(&packet, max, &mut out);
             match (reference, ours) {
@@ -316,7 +338,11 @@ fn any_sequence_of_packets_is_handled() {
         let frame = rate / 50;
         let (packets, _) = c_stream(rate, channels, mode, bandwidth, bitrate, frame);
         let max = rate * 120 / 1000;
-        let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+        let mut dec = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let mut out = vec![0f32; max * channels];
         let mut out_i16 = vec![0i16; max * channels];
         let (mut ok, mut errors) = (0, 0);

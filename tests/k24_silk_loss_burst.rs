@@ -12,6 +12,7 @@
 
 mod k24_common;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 
 #[test]
 fn lost_frames_in_a_row_are_bit_exact() {
@@ -25,7 +26,11 @@ fn lost_frames_in_a_row_are_bit_exact() {
         let rate = 24000usize;
         let frame = rate / 50;
         let mut c_dec = CDec::new(rate, 1);
-        let mut rs_dec = opus1::OpusDecoder::new(rate as i32, 1).unwrap();
+        let mut rs_dec = opus1::OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::Mono,
+        )
+        .unwrap();
         let mut buf = vec![0f32; frame];
         for (i, p) in packets.iter().enumerate() {
             let lost = (10..13).contains(&i);

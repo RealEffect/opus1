@@ -8,7 +8,7 @@
 //! noise floor of the speech and music analysis and of CELT's bit
 //! allocation, so the float encoder of each pair is set to 16 bits.
 
-use opus1::{Application, Bitrate, ErrorKind, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ErrorKind, OpusDecoder, OpusEncoder, SampleRate};
 
 /// Deterministic test signal: speech-like sine + LCG noise, moderate level.
 struct SignalGen {
@@ -70,8 +70,18 @@ struct EncConfig {
 
 impl EncConfig {
     fn make_encoders(&self) -> (OpusEncoder, OpusEncoder) {
-        let mut a = OpusEncoder::new(self.fs, self.channels, self.app).unwrap();
-        let mut b = OpusEncoder::new(self.fs, self.channels, self.app).unwrap();
+        let mut a = OpusEncoder::new(
+            SampleRate::try_from(self.fs).unwrap(),
+            Channels::try_from(self.channels).unwrap(),
+            self.app,
+        )
+        .unwrap();
+        let mut b = OpusEncoder::new(
+            SampleRate::try_from(self.fs).unwrap(),
+            Channels::try_from(self.channels).unwrap(),
+            self.app,
+        )
+        .unwrap();
         for enc in [&mut a, &mut b] {
             enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
             enc.set_complexity(self.complexity).unwrap();
@@ -264,11 +274,13 @@ fn encode_i16_roundtrip_decodes() {
     let fs = 16000;
     let channels = 1;
     let frame_size = 320; // 20 ms
-    let mut enc_a = OpusEncoder::new(fs, channels, Application::Voip).unwrap();
-    let mut enc_b = OpusEncoder::new(fs, channels, Application::Voip).unwrap();
+    let mut enc_a =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
+    let mut enc_b =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     enc_a.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc_b.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
-    let mut dec = OpusDecoder::new(fs, channels).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 
     let mut signal = SignalGen::new(fs as usize);
     let mut pkt_a = vec![0u8; 4000];
@@ -292,7 +304,7 @@ fn encode_i16_roundtrip_decodes() {
 
 #[test]
 fn encode_i16_validation_parity() {
-    let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     let mut out = vec![0u8; 4000];
 
     // An empty output buffer mirrors encode(). One byte is enough for a

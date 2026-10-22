@@ -4,7 +4,7 @@
 
 // WAV file encoder/decoder test using OpusEncoder/OpusDecoder
 use opus1::internals::silk::resampler::SilkResampler;
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -211,14 +211,15 @@ fn process_mode(config: ModeConfig, src_samples: &[i16], src_rate: u32) {
     println!("Application mode: {:?}", effective_app_mode);
 
     // Initialize encoder
-    let mut encoder = OpusEncoder::new(target_rate as i32, 1, effective_app_mode)
+    let rate = SampleRate::try_from(target_rate).expect("an Opus sampling rate");
+    let mut encoder = OpusEncoder::new(rate, Channels::Mono, effective_app_mode)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(effective_bitrate)).unwrap();
     encoder.set_vbr(false);
     encoder.set_complexity(5).unwrap();
 
     // Initialize decoder
-    let mut decoder = OpusDecoder::new(target_rate as i32, 1).expect("Failed to create decoder");
+    let mut decoder = OpusDecoder::new(rate, Channels::Mono).expect("Failed to create decoder");
 
     // Encode frame by frame
     let mut all_payload: Vec<u8> = Vec::new();
@@ -438,11 +439,16 @@ fn main() {
     {
         let rate = 16000i32;
         let frame_size = rate as usize * 20 / 1000; // 320
-        let mut enc = OpusEncoder::new(rate, 1, Application::Voip).expect("encoder");
+        let mut enc = OpusEncoder::new(
+            SampleRate::Hz16000,
+            Channels::Mono,
+            Application::Voip,
+        )
+        .expect("encoder");
         enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
         enc.set_vbr(false);
-        let mut dec16 = OpusDecoder::new(rate, 1).expect("dec 16k");
-        let mut dec48 = OpusDecoder::new(48000, 1).expect("dec 48k");
+        let mut dec16 = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).expect("dec 16k");
+        let mut dec48 = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).expect("dec 48k");
 
         let n_frames = (samples.len() / frame_size).min(200);
         let mut fail16 = 0usize;

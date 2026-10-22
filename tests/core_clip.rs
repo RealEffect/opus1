@@ -9,7 +9,7 @@
 mod core_common;
 
 use core_common::*;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use std::f64::consts::PI;
 
 /// A low tone far beyond full scale: every 2.5 ms frame ends inside a
@@ -50,7 +50,11 @@ fn float_decoding_clears_the_soft_clip_memory() {
         // of every three, one of every four.
         for pattern in [[true, false, true, false], [true, true, false, true], [true, false, false, false]] {
             let mut c_dec = CDecoder::new(rate, channels);
-            let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+            let mut dec = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let mut buf16 = vec![0i16; frame * channels];
             let mut buf = vec![0f32; frame * channels];
             let (mut worst16, mut worst_float, mut clipped, mut over) = (0, 0f32, 0, 0);

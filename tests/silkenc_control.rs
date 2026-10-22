@@ -17,7 +17,7 @@ use opus1::internals::silk::stereo_lr_to_ms::silk_stereo_lr_to_ms;
 use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
 use opus1::internals::silk::init_encoder::silk_init_encoder;
 use opus1::internals::silk::structs::SilkEncoderState;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 const FS: usize = 16_000;
 const FRAME: usize = 320;
@@ -90,7 +90,12 @@ fn fec_copies_are_coded_with_libopus_gain_increase() {
     let pcm = speech(FS, 1, 150 * FRAME, 0.5);
     let mut failures = Vec::new();
     for loss in [3, 8, 10, 15, 20, 30, 60] {
-        let mut rs = OpusEncoder::new(FS as i32, 1, Application::Audio).unwrap();
+        let mut rs = OpusEncoder::new(
+            SampleRate::try_from(FS as i32).unwrap(),
+            Channels::Mono,
+            Application::Audio,
+        )
+        .unwrap();
         rs.set_force_mode(Some(ForcedMode::SilkOnly));
         rs.set_bandwidth(Bandwidth::Wideband);
         rs.set_bitrate(Bitrate::BitsPerSecond(32_000)).unwrap();

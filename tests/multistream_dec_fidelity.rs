@@ -23,6 +23,7 @@ mod multistream_dec_common;
 
 use ms_support::*;
 use multistream_dec_common::*;
+use opus1::SampleRate;
 use opus1::multistream::MultistreamDecoder;
 
 /// The limit for "the same samples as the C decoder". Measured: 124 dB or
@@ -285,7 +286,14 @@ fn generic_layout_repeats_one_stream_and_keeps_one_output_silent() {
 fn decode_with_mapping(e: &Encoded, fs: i32, mapping: &[u8]) -> (Vec<f32>, Vec<f32>) {
     let channels = mapping.len();
     let mut c_dec = CMsDecoder::new(fs, channels, e.streams, e.coupled, mapping).unwrap();
-    let mut r_dec = MultistreamDecoder::with_layout(fs, channels, e.streams, e.coupled, mapping).unwrap();
+    let mut r_dec = MultistreamDecoder::with_layout(
+        SampleRate::try_from(fs).unwrap(),
+        channels,
+        e.streams,
+        e.coupled,
+        mapping,
+    )
+    .unwrap();
     let max_frame = fs as usize / 25 * 3;
     let mut out = vec![0f32; max_frame * channels];
     let (mut c_all, mut r_all) = (Vec::new(), Vec::new());
@@ -468,15 +476,15 @@ fn final_range_is_the_xor_of_the_stream_decoders() {
     let e = encode(SURROUND_7_1, AUDIO, 32, 960, Signal::Tones, 200, 1.0);
     let (_, mut dec) = e.decoders(48000);
     assert_eq!(dec.layout().streams(), 5);
-    assert_eq!(dec.sampling_rate(), 48000);
+    assert_eq!(dec.sampling_rate(), SampleRate::Hz48000);
     let mut out = vec![0f32; 960 * 8];
     for (i, packet) in e.packets.iter().enumerate() {
         assert_eq!(dec.decode(packet, 960, &mut out), Ok(960));
         let mut xor = 0;
         for s in 0..5 {
             let stream = dec.stream_decoder(s).unwrap();
-            assert_eq!(stream.channels(), if s < 3 { 2 } else { 1 });
-            assert_eq!(stream.sampling_rate(), 48000);
+            assert_eq!(stream.channels().count(), if s < 3 { 2 } else { 1 });
+            assert_eq!(stream.sampling_rate(), SampleRate::Hz48000);
             assert_ne!(stream.final_range(), 0);
             xor ^= stream.final_range();
         }

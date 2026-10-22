@@ -48,11 +48,11 @@
 //!
 //! ```
 //! use opus1::multistream::MultistreamEncoder;
-//! use opus1::{Application, Bitrate};
+//! use opus1::{Application, Bitrate, SampleRate};
 //!
 //! // 5.1 at 48 kHz: front left, centre, front right, rear left, rear
 //! // right, LFE.
-//! let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio)?;
+//! let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio)?;
 //! encoder.set_bitrate(Bitrate::BitsPerSecond(256_000))?;
 //!
 //! // Two stereo streams (front and rear), then the centre and the LFE
@@ -83,11 +83,11 @@
 //! it wrongly or rejects it.
 //!
 //! ```
-//! use opus1::Application;
 //! use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
+//! use opus1::{Application, SampleRate};
 //!
 //! // A packet to decode: one 20 ms frame of quadraphonic sound.
-//! let mut encoder = MultistreamEncoder::new_surround(48_000, 4, 1, Application::Audio)?;
+//! let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 4, 1, Application::Audio)?;
 //! let pcm = vec![0.1f32; 960 * 4];
 //! let mut packet = vec![0u8; 4000];
 //! let len = encoder.encode(&pcm, 960, &mut packet)?;
@@ -95,7 +95,7 @@
 //! // The decoder for the same layout.
 //! let layout = encoder.layout();
 //! let mut decoder = MultistreamDecoder::with_layout(
-//!     48_000,
+//!     SampleRate::Hz48000,
 //!     layout.channels(),
 //!     layout.streams(),
 //!     layout.coupled_streams(),

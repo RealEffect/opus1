@@ -1,5 +1,7 @@
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
-use opus1::{Application as RsApp, Bitrate, OpusDecoder as RsDec, OpusEncoder as RsEnc};
+use opus1::{
+    Application as RsApp, Bitrate, Channels, OpusDecoder as RsDec, OpusEncoder as RsEnc, SampleRate,
+};
 
 fn make_sine(sr: i32, ch: usize, frame_size: usize, freq: f32) -> Vec<f32> {
     let mut v = vec![0.0f32; frame_size * ch];
@@ -62,7 +64,7 @@ fn impulse_fixture_hex() -> Option<&'static str> {
 /// through opus1 and through the linked libopus: (opus1, libopus).
 #[cfg(target_arch = "aarch64")]
 fn first_packets(pcm: &[f32]) -> (Vec<u8>, Vec<u8>) {
-    let mut rs_enc = RsEnc::new(48000, 1, RsApp::Audio).unwrap();
+    let mut rs_enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     rs_enc.set_vbr(false);
     rs_enc.set_complexity(10).unwrap();
@@ -125,7 +127,7 @@ fn oracle_celt_sine_48k_mono_64k() {
     let br = 64000;
     let fs = 960;
     let pcm = make_sine(sr, ch, fs, 440.0);
-    let mut rs_enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+    let mut rs_enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     rs_enc.set_vbr(false);
     rs_enc.set_complexity(10).unwrap();
@@ -171,7 +173,7 @@ fn oracle_celt_sine_48k_mono_64k() {
         );
     }
     // Determinism: re-encode same input must be byte-identical
-    let mut rs_enc2 = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+    let mut rs_enc2 = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc2.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     rs_enc2.set_vbr(false);
     rs_enc2.set_complexity(10).unwrap();
@@ -193,7 +195,7 @@ fn oracle_impulse_48k_mono_64k() {
     let fs = 960;
     let mut pcm = vec![0.0f32; fs * ch];
     pcm[0] = 1.0;
-    let mut rs_enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+    let mut rs_enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     rs_enc.set_vbr(false);
     rs_enc.set_complexity(10).unwrap();
@@ -218,7 +220,7 @@ fn oracle_impulse_48k_mono_64k() {
         rs_n,
         c_n
     );
-    let mut rs_dec = RsDec::new(sr, ch).unwrap();
+    let mut rs_dec = RsDec::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * ch];
     let got = rs_dec.decode(&rs_buf[..rs_n], fs, &mut out).unwrap();
     let max = out[..got * ch].iter().fold(0.0f32, |a, &x| a.max(x.abs()));
@@ -236,7 +238,7 @@ fn oracle_impulse_48k_mono_64k() {
             "full byte-exact mismatch for impulse"
         );
     }
-    let mut rs_enc2 = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+    let mut rs_enc2 = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc2.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     rs_enc2.set_vbr(false);
     rs_enc2.set_complexity(10).unwrap();
@@ -257,7 +259,12 @@ fn oracle_all_sr_ch_br() {
             for &br in &brs {
                 let fs = sr / 50;
                 let pcm = make_sine(sr, ch, fs as usize, freq);
-                let mut rs_enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+                let mut rs_enc = RsEnc::new(
+                    SampleRate::try_from(sr).unwrap(),
+                    Channels::try_from(ch).unwrap(),
+                    RsApp::Audio,
+                )
+                .unwrap();
                 rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
                 rs_enc.set_vbr(false);
                 rs_enc.set_complexity(10).unwrap();
@@ -316,7 +323,11 @@ fn oracle_all_sr_ch_br() {
                         c_n
                     );
                 }
-                let mut dec = RsDec::new(sr, ch).unwrap();
+                let mut dec = RsDec::new(
+                    SampleRate::try_from(sr).unwrap(),
+                    Channels::try_from(ch).unwrap(),
+                )
+                .unwrap();
                 let mut out = vec![0.0f32; fs as usize * ch];
                 let got = dec.decode(&rs_buf[..rs_n], fs as usize, &mut out).unwrap();
                 let max = out[..got * ch]

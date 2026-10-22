@@ -4,13 +4,13 @@
 //! only a little stack, even without the `heap` feature.
 
 use core::mem::MaybeUninit;
-use opus1::{Application, ErrorKind, OpusDecoder, OpusEncoder};
+use opus1::{Application, Channels, ErrorKind, OpusDecoder, OpusEncoder, SampleRate};
 
 /// 50 packets of 20 ms: a sine per channel, with another pitch on the
 /// second channel.
 fn packets(sampling_rate: i32, channels: usize, application: Application) -> Vec<Vec<u8>> {
     let frame_size = sampling_rate as usize / 50;
-    let mut encoder = Box::new(OpusEncoder::new(sampling_rate, channels, application).unwrap());
+    let mut encoder = Box::new(OpusEncoder::new(SampleRate::try_from(sampling_rate).unwrap(), Channels::try_from(channels).unwrap(), application).unwrap());
     let mut packets = Vec::new();
     for frame in 0..50 {
         let input: Vec<f32> = (0..frame_size * channels)
@@ -58,9 +58,14 @@ fn init_decodes_like_new() {
         let packets = packets(sampling_rate, channels, application);
         // Complexity 10 runs deep PLC and OSCE in the builds that have them.
         for complexity in [0, 10] {
-            let mut expected = Box::new(OpusDecoder::new(sampling_rate, channels).unwrap());
+            let mut expected = Box::new(OpusDecoder::new(SampleRate::try_from(sampling_rate).unwrap(), Channels::try_from(channels).unwrap()).unwrap());
             let mut slot = Box::<OpusDecoder>::new_uninit();
-            let actual = OpusDecoder::init(&mut slot, sampling_rate, channels).unwrap();
+            let actual = OpusDecoder::init(
+                &mut slot,
+                SampleRate::try_from(sampling_rate).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             for decoder in [&mut *expected, &mut *actual] {
                 decoder.set_complexity(complexity).unwrap();
                 #[cfg(feature = "osce-bwe")]
@@ -78,11 +83,13 @@ fn init_decodes_like_new() {
     }
 }
 
+/// `init` takes a `SampleRate` and a `Channels`, so a rate or a channel
+/// count that Opus does not have cannot reach it: the conversions refuse
+/// them, as libopus `opus_decoder_init` does.
 #[test]
-fn init_rejects_invalid_settings() {
-    let mut slot = Box::<OpusDecoder>::new_uninit();
-    assert_eq!(OpusDecoder::init(&mut slot, 44100, 2).err().map(|e| e.kind()), Some(ErrorKind::BadArg));
-    assert_eq!(OpusDecoder::init(&mut slot, 48000, 3).err().map(|e| e.kind()), Some(ErrorKind::BadArg));
+fn invalid_settings_do_not_convert() {
+    assert_eq!(SampleRate::try_from(44100u32).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+    assert_eq!(Channels::try_from(3).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
 }
 
 /// Builds a decoder with `init` and decodes on a thread with a 32 KB stack
@@ -103,12 +110,13 @@ fn init_needs_little_stack() {
         assert!(core::mem::size_of::<OpusDecoder>() > STACK);
     }
     let packets = packets(48000, 2, Application::Audio);
-    let expected = decode_all(&mut Box::new(OpusDecoder::new(48000, 2).unwrap()), &packets, 960, 2);
+    let expected = decode_all(&mut Box::new(OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap()), &packets, 960, 2);
     let actual = std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
             let mut slot = Box::<OpusDecoder>::new_uninit();
-            let decoder = OpusDecoder::init(&mut slot, 48000, 2).unwrap();
+            let decoder =
+                OpusDecoder::init(&mut slot, SampleRate::Hz48000, Channels::Stereo).unwrap();
             let out = decode_all(decoder, &packets, 960, 2);
             // SAFETY: `init` initialized the slot, and `decoder` is not used
             // any more.
@@ -127,8 +135,9 @@ fn init_in_a_static() {
     static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
     let slot = &raw mut DECODER;
     // SAFETY: only this test uses `DECODER`, once.
-    let decoder = OpusDecoder::init(unsafe { &mut *slot }, 16000, 1).unwrap();
+    let decoder =
+        OpusDecoder::init(unsafe { &mut *slot }, SampleRate::Hz16000, Channels::Mono).unwrap();
     let packets = packets(16000, 1, Application::Voip);
-    let expected = decode_all(&mut Box::new(OpusDecoder::new(16000, 1).unwrap()), &packets, 320, 1);
+    let expected = decode_all(&mut Box::new(OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap()), &packets, 320, 1);
     assert_eq!(decode_all(decoder, &packets, 320, 1), expected);
 }

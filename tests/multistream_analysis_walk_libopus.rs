@@ -27,7 +27,7 @@ use audiopus_sys as sys;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bandwidth, ForcedMode, FrameDuration, Signal};
+use opus1::{Application, Bandwidth, ForcedMode, FrameDuration, SampleRate, Signal};
 
 const EXACT: bool = cfg!(target_arch = "aarch64");
 const OPUS_SET_EXPERT_FRAME_DURATION_REQUEST: i32 = 4040;
@@ -107,8 +107,12 @@ struct Walk {
 }
 
 impl Walk {
+    fn rate(&self) -> SampleRate {
+        SampleRate::try_from(self.fs as u32).unwrap()
+    }
+
     fn coded(&self) -> usize {
-        self.expert.samples(self.fs as i32).unwrap_or(self.frame)
+        self.expert.samples(self.rate()).unwrap_or(self.frame)
     }
 
     fn change(&mut self, rust: &mut MultistreamEncoder, c: &mut CMsEncoder, rng: &mut Lcg) {
@@ -181,11 +185,11 @@ impl Walk {
                 format!("loss {loss}")
             }
             10 => {
-                self.frame = rng.pick(&DURATIONS).samples(self.fs as i32).unwrap();
+                self.frame = rng.pick(&DURATIONS).samples(self.rate()).unwrap();
                 let fits: Vec<FrameDuration> = DURATIONS
                     .iter()
                     .copied()
-                    .filter(|d| d.samples(self.fs as i32).unwrap() <= self.frame)
+                    .filter(|d| d.samples(self.rate()).unwrap() <= self.frame)
                     .collect();
                 self.expert = if rng.below(2) == 0 { FrameDuration::Argument } else { rng.pick(&fits) };
                 rust.set_expert_frame_duration(self.expert);

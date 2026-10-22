@@ -54,7 +54,7 @@ use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::multistream::{MappingType, MultistreamEncoder, split_self_delimited};
-use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
@@ -217,7 +217,8 @@ fn run(data: &[u8]) -> Result<()> {
 /// One stereo stream.
 fn stereo(u: &mut Unstructured, s: Settings) -> Result<()> {
     let mode = *u.choose(&[None, Some(ForcedMode::SilkOnly), Some(ForcedMode::Hybrid), Some(ForcedMode::CeltOnly)])?;
-    let mut rust = OpusEncoder::new(s.fs, 2, s.app).unwrap();
+    let mut rust =
+        OpusEncoder::new(SampleRate::try_from(s.fs).unwrap(), Channels::Stereo, s.app).unwrap();
     rust.set_bitrate(s.bitrate_for(2)).unwrap();
     rust.set_vbr(s.vbr);
     rust.set_complexity(s.complexity).unwrap();
@@ -276,7 +277,12 @@ fn multistream(u: &mut Unstructured, s: Settings) -> Result<()> {
             255 => u.int_in_range(1..=TONES.len())?,
             _ => u.int_in_range(1..=8)?,
         };
-        let Ok(rust) = MultistreamEncoder::new_surround(s.fs, channels, family, s.app) else {
+        let Ok(rust) = MultistreamEncoder::new_surround(
+            SampleRate::try_from(s.fs).unwrap(),
+            channels,
+            family,
+            s.app,
+        ) else {
             return Ok(());
         };
         let (c, streams, coupled, mapping) = CMsEncoder::surround(s.fs, channels, family, c_app)
@@ -294,7 +300,14 @@ fn multistream(u: &mut Unstructured, s: Settings) -> Result<()> {
         for m in mapping.iter_mut() {
             *m = if u.ratio(1, 10)? { 255 } else { u.int_in_range(0..=(streams + coupled) as u8 - 1)? };
         }
-        let Ok(rust) = MultistreamEncoder::new(s.fs, channels, streams, coupled, &mapping, s.app) else {
+        let Ok(rust) = MultistreamEncoder::new(
+            SampleRate::try_from(s.fs).unwrap(),
+            channels,
+            streams,
+            coupled,
+            &mapping,
+            s.app,
+        ) else {
             return Ok(());
         };
         let c = CMsEncoder::new(s.fs, channels, streams, coupled, &mapping, c_app)

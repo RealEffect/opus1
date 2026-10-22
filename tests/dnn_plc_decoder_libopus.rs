@@ -48,7 +48,7 @@ mod ms_support;
 use core_common::*;
 use dnn_dec_common::{CDec, CMsDec, Coding, c_encode, first_difference, rs_encode, splice};
 use opus1::multistream::MultistreamDecoder;
-use opus1::{Application, Bitrate, OpusDecoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, SampleRate};
 
 fn all() -> bool {
     std::env::var_os("OPUS1_DNN_PLC_ALL").is_some_and(|v| v != "0")
@@ -210,7 +210,7 @@ const LOSSES: [Loss; 10] = [
 
 /// The calls that decode `packets` at `rate` with `loss`.
 fn calls(packets: &[Vec<u8>], rate: usize, loss: Loss, seed: u32) -> Vec<Call> {
-    let duration = |k: usize| opus1::packet::nb_samples(&packets[k], rate as i32).unwrap();
+    let duration = |k: usize| opus1::packet::nb_samples(&packets[k], SampleRate::try_from(rate as u32).unwrap()).unwrap();
     let mut state = seed.wrapping_mul(2654435761).wrapping_add(17);
     let mut calls = Vec::new();
     for k in 0..packets.len() {
@@ -272,8 +272,16 @@ struct Count {
 fn compare(packets: &[Vec<u8>], rate: usize, channels: usize, complexity: i32, loss: Loss, seed: u32) -> Result<Count, String> {
     let mut c = CDec::new(rate, channels);
     let mut c16 = CDec::new(rate, channels);
-    let mut d = OpusDecoder::new(rate as i32, channels).unwrap();
-    let mut d16 = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut d = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
+    let mut d16 = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let set = |c: &mut CDec, c16: &mut CDec, d: &mut OpusDecoder, d16: &mut OpusDecoder, value| {
         c.set_complexity(value);
         c16.set_complexity(value);
@@ -288,7 +296,7 @@ fn compare(packets: &[Vec<u8>], rate: usize, channels: usize, complexity: i32, l
         let (want, want16, got, got16) = match call {
             Call::Packet(k) => {
                 let p = &packets[k];
-                let n = opus1::packet::nb_samples(p, rate as i32).unwrap();
+                let n = opus1::packet::nb_samples(p, SampleRate::try_from(rate as u32).unwrap()).unwrap();
                 (
                     c.decode(Some(p), n, false),
                     c16.decode_i16(Some(p), n, false),
@@ -492,7 +500,7 @@ fn multistream_matches_libopus() {
         let layout = (enc.streams, enc.coupled, enc.mapping.clone());
         packet_sets.push((format!("libopus {bitrate} b/s"), enc.encode_all(&pcm, 960), layout));
         let mut ours =
-            opus1::multistream::MultistreamEncoder::new_surround(48000, channels, 1, Application::Voip).unwrap();
+            opus1::multistream::MultistreamEncoder::new_surround(SampleRate::Hz48000, channels, 1, Application::Voip).unwrap();
         ours.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
         if fec {
             ours.set_inband_fec(true);
@@ -519,8 +527,22 @@ fn multistream_matches_libopus() {
                     runs += 1;
                     let mut c = CMsDec::new(rate, channels, *streams, *coupled, mapping);
                     let mut c16 = CMsDec::new(rate, channels, *streams, *coupled, mapping);
-                    let mut d = MultistreamDecoder::with_layout(rate as i32, channels, *streams, *coupled, mapping).unwrap();
-                    let mut d16 = MultistreamDecoder::with_layout(rate as i32, channels, *streams, *coupled, mapping).unwrap();
+                    let mut d = MultistreamDecoder::with_layout(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        channels,
+                        *streams,
+                        *coupled,
+                        mapping,
+                    )
+                    .unwrap();
+                    let mut d16 = MultistreamDecoder::with_layout(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        channels,
+                        *streams,
+                        *coupled,
+                        mapping,
+                    )
+                    .unwrap();
                     c.set_complexity(complexity);
                     c16.set_complexity(complexity);
                     d.set_complexity(complexity).unwrap();
@@ -607,7 +629,7 @@ fn timing() {
         let mut ours = [Vec::new(), Vec::new(), Vec::new()];
         let mut theirs = [Vec::new(), Vec::new(), Vec::new()];
         for _ in 0..5 {
-            let mut d = OpusDecoder::new(48000, 1).unwrap();
+            let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             d.set_complexity(5).unwrap();
             let mut c = CDec::new(48000, 1);
             c.set_complexity(5);
@@ -615,7 +637,7 @@ fn timing() {
             let mut t_ours = [Vec::new(), Vec::new(), Vec::new()];
             let mut t_theirs = [Vec::new(), Vec::new(), Vec::new()];
             for (k, p) in packets.iter().enumerate() {
-                let n = opus1::packet::nb_samples(p, 48000).unwrap();
+                let n = opus1::packet::nb_samples(p, SampleRate::Hz48000).unwrap();
                 let kind = if !lost(k) { 2 } else if k % 25 == 22 { 0 } else { 1 };
                 let start = std::time::Instant::now();
                 if kind == 2 {
@@ -669,7 +691,7 @@ fn distance_to_an_o2_build() {
         for loss in [Loss::Single, Loss::Burst, Loss::Long] {
             let mut c = CDec::new(48000, 1);
             c.set_complexity(5);
-            let mut d = OpusDecoder::new(48000, 1).unwrap();
+            let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             d.set_complexity(5).unwrap();
             let mut out = vec![0f32; 48000];
             let (mut run_sig, mut run_err) = (0f64, 0f64);
@@ -678,7 +700,7 @@ fn distance_to_an_o2_build() {
                 let (want, n, lost) = match call {
                     Call::Packet(k) => {
                         let p = &stream.packets[k];
-                        let n = opus1::packet::nb_samples(p, 48000).unwrap();
+                        let n = opus1::packet::nb_samples(p, SampleRate::Hz48000).unwrap();
                         (c.decode(Some(p), n, false).unwrap(), d.decode(p, n, &mut out).unwrap(), false)
                     }
                     Call::Conceal(n) => (c.decode(None, n, false).unwrap(), d.decode(&[], n, &mut out).unwrap(), true),

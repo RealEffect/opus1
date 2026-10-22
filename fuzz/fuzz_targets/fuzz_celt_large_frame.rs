@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {
@@ -9,11 +9,10 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Focus on 48kHz which gives the largest frame sizes
-    let sampling_rate = 48000;
     let channels = if data[0] % 2 == 0 { 1 } else { 2 };
 
     // Create decoder
-    let mut decoder = match OpusDecoder::new(sampling_rate, channels) {
+    let mut decoder = match OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(channels).unwrap()) {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -51,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
             packet.extend_from_slice(&data[2..]);
 
             // Reset decoder for each attempt
-            let mut decoder2 = match OpusDecoder::new(sampling_rate, channels) {
+            let mut decoder2 = match OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(channels).unwrap()) {
                 Ok(d) => d,
                 Err(_) => continue,
             };

@@ -12,7 +12,7 @@
 mod silkenc_common;
 use silkenc_common::*;
 
-use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// A change of settings before packet `at`.
 #[derive(Clone, Copy)]
@@ -44,10 +44,15 @@ impl Stream {
     }
 
     fn encode_rs(&self, pcm: &[f32]) -> Vec<Vec<u8>> {
-        let mut enc = OpusEncoder::new(self.fs as i32, self.channels, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(self.fs as i32).unwrap(),
+            Channels::try_from(self.channels).unwrap(),
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_force_mode(Some(ForcedMode::SilkOnly));
         // The channel count libopus is forced to in `encode_c`.
-        enc.set_force_channels(Some(self.channels)).unwrap();
+        enc.set_force_channels(Some(Channels::try_from(self.channels).unwrap()));
         enc.set_vbr(!self.cbr);
         let mut out = vec![0u8; 1500];
         let mut packets = Vec::new();

@@ -26,7 +26,7 @@ mod multistream_dec_common;
 
 use core_common::*;
 use k24_common::resample;
-use opus1::{Application, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate};
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 
@@ -170,7 +170,12 @@ fn rs_encode(coding: &Coding, pcm: &[f32]) -> Vec<Vec<u8>> {
         APP_AUDIO => Application::Audio,
         _ => Application::RestrictedLowDelay,
     };
-    let mut enc = OpusEncoder::new(coding.rate as i32, coding.channels, application).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(coding.rate as i32).unwrap(),
+        Channels::try_from(coding.channels).unwrap(),
+        application,
+    )
+    .unwrap();
     if coding.fec {
         enc.set_inband_fec(true);
         enc.set_packet_loss_perc(20).unwrap();
@@ -242,7 +247,7 @@ enum Call {
 
 /// The calls that decode `packets` at `rate` with `loss`.
 fn calls(packets: &[Vec<u8>], rate: usize, loss: Loss, seed: u32) -> Vec<Call> {
-    let duration = |k: usize| opus1::packet::nb_samples(&packets[k], rate as i32).unwrap();
+    let duration = |k: usize| opus1::packet::nb_samples(&packets[k], SampleRate::try_from(rate as u32).unwrap()).unwrap();
     let mut state = seed;
     let mut calls = Vec::new();
     let mut k = 0;
@@ -286,8 +291,16 @@ fn calls(packets: &[Vec<u8>], rate: usize, loss: Loss, seed: u32) -> Vec<Call> {
 fn first_difference(packets: &[Vec<u8>], rate: usize, channels: usize, loss: Loss, seed: u32) -> Option<String> {
     let mut c = CDecoder::new(rate, channels);
     let mut c16 = CDecoder::new(rate, channels);
-    let mut ours = OpusDecoder::new(rate as i32, channels).unwrap();
-    let mut ours16 = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut ours = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
+    let mut ours16 = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     // 8 packets of 120 ms.
     let mut out = vec![0f32; rate * channels];
     let mut out16 = vec![0i16; rate * channels];
@@ -295,7 +308,7 @@ fn first_difference(packets: &[Vec<u8>], rate: usize, channels: usize, loss: Los
         let (what, reference, reference16, got, got16) = match call {
             Call::Packet(k) => {
                 let p = &packets[k];
-                let n = opus1::packet::nb_samples(p, rate as i32).unwrap();
+                let n = opus1::packet::nb_samples(p, SampleRate::try_from(rate as u32).unwrap()).unwrap();
                 (
                     format!("packet {k} (TOC {:02x})", p[0]),
                     c.decode(Some(p), n, false),

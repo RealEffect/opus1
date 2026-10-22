@@ -148,7 +148,7 @@ The encoder chooses the bandwidth from the bitrate. It never goes above what the
 
 ## Sampling rates
 
-An application gives the encoder audio at 8, 12, 16, 24 or 48 kHz. It gets audio from the decoder at one of the same five rates. `OpusEncoder::new` and `OpusDecoder::new` reject any other rate. Audio at 44.1 kHz, for example, must be resampled by the application first.
+An application gives the encoder audio at 8, 12, 16, 24 or 48 kHz. It gets audio from the decoder at one of the same five rates. `OpusEncoder::new` and `OpusDecoder::new` take a `SampleRate`, which has these five values and no others. Audio at 44.1 kHz, for example, must be resampled by the application first.
 
 The sampling rate and the audio bandwidth are independent:
 
@@ -188,7 +188,7 @@ In opus1:
 The example encodes 20 ms of a tone and reads the TOC byte, first by hand and then with the `packet` module.
 
 ```rust
-use opus1::packet;
+use opus1::{Channels, SampleRate, packet};
 use opus1::{Application, Bitrate, OpusEncoder};
 
 // 20 ms of a 440 Hz tone at 48 kHz, mono: 960 samples.
@@ -196,7 +196,7 @@ let pcm: Vec<f32> = (0..960)
     .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin())
     .collect();
 
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
 let mut buf = vec![0u8; 1276];
 let len = encoder.encode(&pcm, 960, &mut buf).unwrap();
@@ -213,8 +213,8 @@ assert_eq!(frame_count_code, 0); // one frame
 
 // The same facts from the packet module.
 assert_eq!(packet::nb_frames(pkt).unwrap(), 1);
-assert_eq!(packet::samples_per_frame(toc, 48_000), 960);
-assert_eq!(packet::nb_samples(pkt, 48_000).unwrap(), 960);
+assert_eq!(packet::samples_per_frame(toc, SampleRate::Hz48000), 960);
+assert_eq!(packet::nb_samples(pkt, SampleRate::Hz48000).unwrap(), 960);
 ```
 
 ## Bitrates
@@ -279,15 +279,15 @@ The lookahead has two parts:
 `OpusEncoder::lookahead` returns the lookahead in samples per channel, at the input sampling rate:
 
 ```rust
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Channels, OpusEncoder, SampleRate};
 
-let voip = OpusEncoder::new(48_000, 1, Application::Voip).unwrap();
+let voip = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
 assert_eq!(voip.lookahead(), 312); // 6.5 ms at 48 kHz
 
-let low_delay = OpusEncoder::new(48_000, 1, Application::RestrictedLowDelay).unwrap();
+let low_delay = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::RestrictedLowDelay).unwrap();
 assert_eq!(low_delay.lookahead(), 120); // 2.5 ms at 48 kHz
 
-let wideband = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
+let wideband = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 assert_eq!(wideband.lookahead(), 104); // 6.5 ms at 16 kHz
 ```
 
@@ -312,10 +312,10 @@ Notes on these tools:
 [The decoder](04-decoder.md) explains how concealment and FEC work inside. The example below loses two packets. It rebuilds the first one from the FEC data of the next packet, and it conceals the second.
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 // 16 kHz mono with in-band FEC: 20 ms is 320 samples.
-let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
 encoder.set_inband_fec(true);
 encoder.set_packet_loss_perc(10).unwrap();
@@ -331,7 +331,7 @@ for f in 0..5 {
     packets.push(buf);
 }
 
-let mut decoder = OpusDecoder::new(16_000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 let mut out = vec![0.0f32; 320];
 
 // Packet 0 arrives.

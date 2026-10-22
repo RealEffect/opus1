@@ -13,7 +13,7 @@ mod ms_support;
 use audiopus_sys as sys;
 use ms_support::*;
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
-use opus1::{Application, ForcedMode};
+use opus1::{Application, Channels, ForcedMode, SampleRate};
 
 const FS: i32 = 48_000;
 const FRAME: usize = 960;
@@ -60,7 +60,15 @@ fn pair(layout: Layout, app: i32) -> (MultistreamEncoder, CMsEncoder) {
         APP_LOWDELAY => Application::RestrictedLowDelay,
         _ => Application::Audio,
     };
-    let rust = MultistreamEncoder::new(FS, channels, streams, coupled, mapping, application).unwrap();
+    let rust = MultistreamEncoder::new(
+        SampleRate::try_from(FS).unwrap(),
+        channels,
+        streams,
+        coupled,
+        mapping,
+        application,
+    )
+    .unwrap();
     let c = CMsEncoder::generic(FS, channels, streams, coupled, mapping, app).unwrap();
     (rust, c)
 }
@@ -70,7 +78,7 @@ fn assert_streams(rust: &MultistreamEncoder, c: &mut CMsEncoder, request: i32, l
     for s in 0..c.streams {
         let enc = rust.stream_encoder(s).unwrap();
         let value = match request {
-            sys::OPUS_GET_FORCE_CHANNELS_REQUEST => enc.force_channels().map_or(OPUS_AUTO, |n| n as i32),
+            sys::OPUS_GET_FORCE_CHANNELS_REQUEST => enc.force_channels().map_or(OPUS_AUTO, |n| n.count() as i32),
             sys::OPUS_GET_PREDICTION_DISABLED_REQUEST => enc.prediction_disabled() as i32,
             sys::OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST => enc.phase_inversion_disabled() as i32,
             sys::OPUS_GET_APPLICATION_REQUEST => enc.application() as i32,
@@ -80,10 +88,12 @@ fn assert_streams(rust: &MultistreamEncoder, c: &mut CMsEncoder, request: i32, l
     }
 }
 
-/// `set_force_channels` goes to one stream after the other and stops at
-/// the first that refuses, as in libopus: the coupled streams take 2 and
-/// the first mono stream refuses it. Every stream's value and the
-/// multistream getter agree with libopus after each call.
+/// `set_force_channels` goes to every stream. For `None` and mono libopus
+/// does the same: every stream's value and the multistream getter agree
+/// with libopus after each call. For stereo libopus sets the coupled
+/// streams and then refuses the value at the first mono stream; opus1 sets
+/// every stream, and a mono stream codes mono whatever is set. After stereo
+/// only the coupled streams are compared with libopus.
 #[test]
 fn forced_channels_are_forwarded_as_libopus_does() {
     for layout in LAYOUTS {
@@ -91,27 +101,42 @@ fn forced_channels_are_forwarded_as_libopus_does() {
         let (mut rust, mut c) = pair(layout, APP_AUDIO);
         let get = sys::OPUS_GET_FORCE_CHANNELS_REQUEST;
         for (value, setting) in [
-            (1, Some(1)),
+            (1, Some(Channels::Mono)),
             (OPUS_AUTO, None),
-            (2, Some(2)),
-            (3, Some(3)),
-            (0, Some(0)),
-            (1, Some(1)),
+            (2, Some(Channels::Stereo)),
+            (1, Some(Channels::Mono)),
         ] {
             let label = format!("{label}, force {value}");
             let c_ok = c.try_ctl(sys::OPUS_SET_FORCE_CHANNELS_REQUEST, value) == 0;
-            assert_eq!(rust.set_force_channels(setting).is_ok(), c_ok, "{label}");
+            rust.set_force_channels(setting);
+            for s in 0..c.streams {
+                assert_eq!(rust.stream_encoder(s).unwrap().force_channels(), setting, "{label}: stream {s}");
+            }
+            if setting == Some(Channels::Stereo) && c.coupled < c.streams {
+                assert!(!c_ok, "{label}: libopus refuses stereo on a mono stream");
+                for s in 0..c.coupled {
+                    assert_eq!(c.stream_get(s, get), 2, "{label}: stream {s}");
+                }
+                continue;
+            }
+            assert!(c_ok, "{label}");
             assert_streams(&rust, &mut c, get, &label);
-            assert_eq!(rust.force_channels().map_or(OPUS_AUTO, |n| n as i32), c.get(get), "{label}");
+            assert_eq!(rust.force_channels().map_or(OPUS_AUTO, |n| n.count() as i32), c.get(get), "{label}");
         }
     }
     // In surround mode the coupled streams are forced to two channels on
     // every frame, over the caller's setting, in both. (Surround packets
     // are not compared: opus1 chooses the bandwidth of surround streams
     // differently on purpose, difference D1 of docs/10.)
-    let mut rust = MultistreamEncoder::new_surround(FS, 6, 1, Application::Audio).unwrap();
+    let mut rust = MultistreamEncoder::new_surround(
+        SampleRate::try_from(FS).unwrap(),
+        6,
+        1,
+        Application::Audio,
+    )
+    .unwrap();
     let mut c = CMsEncoder::surround(FS, 6, 1, APP_AUDIO).unwrap();
-    rust.set_force_channels(Some(1)).unwrap();
+    rust.set_force_channels(Some(Channels::Mono));
     c.ctl(sys::OPUS_SET_FORCE_CHANNELS_REQUEST, 1);
     let pcm = tones(FS, 6, 1, FRAME * 4);
     let mut out = vec![0u8; max_packet_bytes(c.streams)];
@@ -231,7 +256,14 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
         }
         for (gain, inversion) in [(None, None), (Some(-3000), Some(true)), (Some(32767), Some(false)), (Some(-32768), None), (Some(700), Some(true))] {
             let label = format!("layout {layout:?}, gain {gain:?}, inversion off {inversion:?}");
-            let mut rust = MultistreamDecoder::with_layout(FS, channels, streams, coupled, mapping).unwrap();
+            let mut rust = MultistreamDecoder::with_layout(
+                SampleRate::try_from(FS).unwrap(),
+                channels,
+                streams,
+                coupled,
+                mapping,
+            )
+            .unwrap();
             let mut c = CMsDecoder::new(FS, channels, streams, coupled, mapping).unwrap();
             let get_inv = sys::OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST;
             assert_eq!(rust.phase_inversion_disabled() as i32, c.get(get_inv), "{label}: default");
@@ -248,7 +280,14 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
             assert_eq!(rust.phase_inversion_disabled() as i32, c.get(get_inv), "{label}");
             let mut out = vec![0f32; MAX_FRAME * channels];
             let mut out24 = vec![0i32; MAX_FRAME * channels];
-            let mut rust24 = MultistreamDecoder::with_layout(FS, channels, streams, coupled, mapping).unwrap();
+            let mut rust24 = MultistreamDecoder::with_layout(
+                SampleRate::try_from(FS).unwrap(),
+                channels,
+                streams,
+                coupled,
+                mapping,
+            )
+            .unwrap();
             let mut c24 = CMsDecoder::new(FS, channels, streams, coupled, mapping).unwrap();
             if let Some(g) = gain {
                 assert_eq!(c24.try_ctl(sys::OPUS_SET_GAIN_REQUEST, g), 0);
@@ -271,7 +310,14 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
             }
         }
         // Out-of-range gains: refused by both, the setting stays.
-        let mut rust = MultistreamDecoder::with_layout(FS, channels, streams, coupled, mapping).unwrap();
+        let mut rust = MultistreamDecoder::with_layout(
+            SampleRate::try_from(FS).unwrap(),
+            channels,
+            streams,
+            coupled,
+            mapping,
+        )
+        .unwrap();
         let mut c = CMsDecoder::new(FS, channels, streams, coupled, mapping).unwrap();
         rust.set_gain(-100).unwrap();
         assert_eq!(c.try_ctl(sys::OPUS_SET_GAIN_REQUEST, -100), 0);
@@ -304,7 +350,14 @@ fn encode24_and_decode24_follow_libopus() {
             })
             .collect();
         let mut out = vec![0u8; max_packet_bytes(streams)];
-        let mut rust_dec = MultistreamDecoder::with_layout(FS, channels, streams, coupled, mapping).unwrap();
+        let mut rust_dec = MultistreamDecoder::with_layout(
+            SampleRate::try_from(FS).unwrap(),
+            channels,
+            streams,
+            coupled,
+            mapping,
+        )
+        .unwrap();
         let mut c_dec = CMsDecoder::for_encoder(&c);
         let mut out24 = vec![0i32; MAX_FRAME * channels];
         for (i, f) in pcm.chunks_exact(channels * FRAME).enumerate() {
@@ -325,8 +378,20 @@ fn encode24_and_decode24_follow_libopus() {
 fn surround_encode24_codes_as_encode_of_the_scaled_samples() {
     for (channels, family) in [(6, 1), (8, 1), (4, 2)] {
         let label = format!("{channels} channels, family {family}");
-        let mut a = MultistreamEncoder::new_surround(FS, channels, family, Application::Audio).unwrap();
-        let mut b = MultistreamEncoder::new_surround(FS, channels, family, Application::Audio).unwrap();
+        let mut a = MultistreamEncoder::new_surround(
+            SampleRate::try_from(FS).unwrap(),
+            channels,
+            family,
+            Application::Audio,
+        )
+        .unwrap();
+        let mut b = MultistreamEncoder::new_surround(
+            SampleRate::try_from(FS).unwrap(),
+            channels,
+            family,
+            Application::Audio,
+        )
+        .unwrap();
         let x = voiced(FS, channels, FRAME * 20);
         let pcm: Vec<i32> = x.iter().map(|&v| ((v * 7_000_000.0) as i32) | 1).collect();
         let scaled: Vec<f32> = pcm.iter().map(|&v| v as f32 * (1.0 / 8_388_608.0)).collect();

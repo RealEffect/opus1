@@ -19,7 +19,7 @@ mod multistream_enc_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::{Application, FrameDuration};
+use opus1::{Application, FrameDuration, SampleRate};
 
 const SET: i32 = sys::OPUS_SET_EXPERT_FRAME_DURATION_REQUEST;
 const GET: i32 = sys::OPUS_GET_EXPERT_FRAME_DURATION_REQUEST;
@@ -145,7 +145,7 @@ fn expert_frame_duration_matches_libopus() {
                     (Ok(n), Ok(c_packet)) => {
                         let samples = |p: &[u8]| split_streams(p, c.streams).unwrap()[0].samples(fs);
                         assert_eq!(samples(&out[..n]), samples(&c_packet), "{label}");
-                        assert_eq!(samples(&c_packet), d.samples(fs).unwrap_or(size), "{label}");
+                        assert_eq!(samples(&c_packet), d.samples(SampleRate::try_from(fs).unwrap()).unwrap_or(size), "{label}");
                         assert_eq!(n, c_packet.len(), "{label}: CBR size");
                     }
                     (Err(_), Err(e)) => assert_eq!(e, OPUS_BAD_ARG, "{label}"),
@@ -176,7 +176,7 @@ fn the_setting_is_kept_by_the_multistream_encoder() {
     let mut out = vec![0u8; max_packet_bytes(c.streams)];
     let n = rust.encode(&pcm, 5760, &mut out).unwrap();
     for stream in split_streams(&out[..n], c.streams).unwrap() {
-        assert_eq!(stream.samples(48_000), 1920);
+        assert_eq!(stream.samples(48000), 1920);
     }
     rust.reset_state();
     c.ctl(sys::OPUS_RESET_STATE, 0);

@@ -11,7 +11,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo, toc};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// What an LFE channel carries: tones at 38 and 71 Hz that swell twice a
 /// second, and a little noise.
@@ -38,7 +38,7 @@ fn speech(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
 
 fn encode_all(enc: &mut OpusEncoder, pcm: &[f32], frame: usize) -> Vec<Vec<u8>> {
     let mut buf = vec![0u8; 4000];
-    pcm.chunks_exact(frame * enc.channels())
+    pcm.chunks_exact(frame * enc.channels().count())
         .enumerate()
         .map(|(i, f)| {
             let n = enc.encode(f, frame, &mut buf).unwrap_or_else(|e| panic!("packet {i}: {e}"));
@@ -120,7 +120,12 @@ fn lfe_streams_have_libopus_first_bytes_sizes_and_quality() {
                     let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
                     c_enc.lfe(true).bitrate(bitrate).vbr(!cbr);
                     let c_packets = c_enc.encode_all(&pcm, frame);
-                    let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+                    let mut enc = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::Mono,
+                        Application::Audio,
+                    )
+                    .unwrap();
                     enc.set_lfe(true);
                     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                     enc.set_vbr(!cbr);
@@ -198,14 +203,24 @@ fn lfe_tones_come_back_like_from_libopus() {
             let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
             c_enc.lfe(true).bitrate(bitrate);
             let c_snr = c_decoded_snr(&c_enc.encode_all(&pcm, frame), &pcm, rate, frame);
-            let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Mono,
+                Application::Audio,
+            )
+            .unwrap();
             enc.set_lfe(true);
             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             let packets = encode_all(&mut enc, &pcm, frame);
             let rs_snr = c_decoded_snr(&packets, &pcm, rate, frame);
             // Without the flag the same bitrate gives far less: the bits go
             // to all bands.
-            let mut plain = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+            let mut plain = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Mono,
+                Application::Audio,
+            )
+            .unwrap();
             plain.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             plain.set_force_mode(Some(ForcedMode::CeltOnly));
             plain.set_bandwidth(Bandwidth::Narrowband);
@@ -256,7 +271,12 @@ impl Stream {
         let frame = self.rate * self.frame_ms / 1000;
         let mut c_enc = CEncoder::new(self.rate, self.channels, APP_AUDIO);
         c_enc.force_mode(self.mode.1).bandwidth(self.bandwidth.1).bitrate(self.bitrate).vbr(!cbr).energy_mask(mask);
-        let mut enc = OpusEncoder::new(self.rate as i32, self.channels, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(self.rate as i32).unwrap(),
+            Channels::try_from(self.channels).unwrap(),
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_force_mode(Some(self.mode.0));
         enc.set_bandwidth(self.bandwidth.0);
         enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
@@ -367,7 +387,12 @@ fn a_changing_energy_mask_moves_celt_packet_sizes_like_libopus() {
             let is_deep = |i: usize| (i / PERIOD).is_multiple_of(2);
             let mut c_enc = CEncoder::new(stream.rate, stream.channels, APP_AUDIO);
             c_enc.force_mode(stream.mode.1).bandwidth(stream.bandwidth.1).bitrate(stream.bitrate);
-            let mut enc = OpusEncoder::new(stream.rate as i32, stream.channels, Application::Audio).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::try_from(stream.rate as i32).unwrap(),
+                Channels::try_from(stream.channels).unwrap(),
+                Application::Audio,
+            )
+            .unwrap();
             enc.set_force_mode(Some(stream.mode.0));
             enc.set_bandwidth(stream.bandwidth.0);
             enc.set_bitrate(Bitrate::BitsPerSecond(stream.bitrate)).unwrap();
@@ -463,7 +488,8 @@ fn a_mask_cannot_make_a_hybrid_stream_run_away() {
         // The SILK layer takes a few kb/s more; nothing else grows.
         assert!((1.0..1.6).contains(&rs_share), "{bitrate} b/s, mask {mask_value}: {rs_share:.2} times the size without a mask");
         // The stream is still one libopus decodes.
-        let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
         enc.set_force_mode(Some(ForcedMode::Hybrid));
         enc.set_bandwidth(Bandwidth::Fullband);
         enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
@@ -485,7 +511,8 @@ fn a_mask_cannot_make_a_hybrid_stream_run_away() {
 fn an_lfe_encoder_ignores_the_mask() {
     let pcm = rumble(48000, 1.0);
     let encode = |mask: Option<&[f32]>| {
-        let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
         enc.set_lfe(true);
         enc.set_bitrate(Bitrate::BitsPerSecond(6000)).unwrap();
         enc.set_energy_mask(mask);
@@ -591,7 +618,12 @@ fn a_mask_of_any_values_gives_packets_libopus_decodes() {
                         for frame_tenth_ms in [25usize, 100, 200, 600] {
                             let frame = rate * frame_tenth_ms / 10_000;
                             let what = format!("{rate} Hz, {channels} ch, {mode:?}, CBR {cbr}, LFE {lfe}, {bitrate} b/s, {} ms", frame_tenth_ms as f64 / 10.0);
-                            let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+                            let mut enc = OpusEncoder::new(
+                                SampleRate::try_from(rate as i32).unwrap(),
+                                Channels::try_from(channels).unwrap(),
+                                Application::Audio,
+                            )
+                            .unwrap();
                             enc.set_force_mode(mode);
                             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                             enc.set_vbr(!cbr);
@@ -684,7 +716,12 @@ fn lfe_wins_over_application_mode_bandwidth_and_fec_like_libopus() {
                             );
                             let mut c_enc = CEncoder::new(rate, channels, c_app);
                             c_enc.lfe(true).bitrate(bitrate).vbr(!cbr).complexity(complexity).fec(fec, 10).bandwidth(BW_FB);
-                            let mut enc = OpusEncoder::new(rate as i32, channels, app).unwrap();
+                            let mut enc = OpusEncoder::new(
+                                SampleRate::try_from(rate as i32).unwrap(),
+                                Channels::try_from(channels).unwrap(),
+                                app,
+                            )
+                            .unwrap();
                             enc.set_lfe(true);
                             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                             enc.set_vbr(!cbr);

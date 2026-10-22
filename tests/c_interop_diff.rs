@@ -19,7 +19,7 @@
 //! size mismatch causes garbage output). This is not caused by the #7/#8/#9
 //! changes.
 
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use std::fs;
 
 struct RefData {
@@ -66,7 +66,11 @@ fn load_ref(path_prefix: &str, sampling_rate: i32, channels: usize) -> Option<Re
 }
 
 fn run_diff(label: &str, data: &RefData) {
-    let mut dec = OpusDecoder::new(data.sampling_rate, data.channels).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(data.sampling_rate).unwrap(),
+        Channels::try_from(data.channels).unwrap(),
+    )
+    .unwrap();
     let fs_ch = data.frame_size * data.channels;
     let mut rust_pcm: Vec<f32> = Vec::new();
 
@@ -174,7 +178,7 @@ fn diff_silk_stereo() {
     if let Some(data) = load_ref("silk_s", 16000, 2) {
         run_diff("SILK stereo 16kHz", &data);
         // Verify L != R (M/S decode working)
-        let mut dec = OpusDecoder::new(16000, 2).unwrap();
+        let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
         if let Some(pkt) = data.packets.first() {
             let mut buf = vec![0.0f32; 320 * 2];
             if let Ok(n) = dec.decode(pkt, 320, &mut buf) {

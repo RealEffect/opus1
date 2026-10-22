@@ -10,7 +10,7 @@
 //!   CELT payload's tail bits differ from libopus's (deeper CELT-encoder
 //!   divergence, tracked for follow-up).
 
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 #[test]
 fn issue45_starved_cbr() {
@@ -28,7 +28,12 @@ fn issue45_starved_cbr() {
         (8000, 20, 1000),
     ] {
         let frame = sr * ms / 1000;
-        let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(sr as i32).unwrap(),
+            Channels::Mono,
+            Application::Voip,
+        )
+        .unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(bps)).unwrap();
         enc.set_vbr(false);
         let input: Vec<f32> = (0..frame)
@@ -55,7 +60,12 @@ fn issue46_low_cbr() {
         (16000, 10, 9000),
     ] {
         let frame = sr * ms / 1000;
-        let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(sr as i32).unwrap(),
+            Channels::Mono,
+            Application::Voip,
+        )
+        .unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(bps)).unwrap();
         enc.set_vbr(false);
         let input: Vec<f32> = (0..frame)
@@ -86,10 +96,16 @@ fn issue46_low_cbr_decodes_as_celt() {
         (8000, 20, 2000, -3.0),
     ] {
         let frame = sr * ms / 1000;
-        let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(sr as i32).unwrap(),
+            Channels::Mono,
+            Application::Voip,
+        )
+        .unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(bps)).unwrap();
         enc.set_vbr(false);
-        let mut rs_dec = OpusDecoder::new(sr as i32, 1).unwrap();
+        let mut rs_dec =
+            OpusDecoder::new(SampleRate::try_from(sr as i32).unwrap(), Channels::Mono).unwrap();
         let mut c_dec = CDec::new(sr as u32, CCh::Mono).unwrap();
         let input: Vec<f32> = (0..frame * 30)
             .map(|i| {

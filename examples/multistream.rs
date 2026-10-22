@@ -12,10 +12,10 @@ fn main() {
 
 #[cfg(feature = "std")]
 fn main() -> Result<(), opus1::Error> {
-    use opus1::{Application, Bitrate};
+    use opus1::{Application, Bitrate, SampleRate};
     use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
 
-    const SAMPLE_RATE: i32 = 48_000;
+    const SAMPLE_RATE: SampleRate = SampleRate::Hz48000;
     const CHANNELS: usize = 6;
     /// Samples per channel in one frame: 20 ms.
     const FRAME: usize = 960;
@@ -65,7 +65,7 @@ fn main() -> Result<(), opus1::Error> {
     // tone.
     let mut pcm = vec![0f32; FRAMES * FRAME * CHANNELS];
     for (i, frame) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-        let t = i as f32 / SAMPLE_RATE as f32;
+        let t = i as f32 / SAMPLE_RATE.hz() as f32;
         let turn = 2.0 * std::f32::consts::PI * t;
         for (c, sample) in frame.iter_mut().enumerate() {
             *sample = if c == CHANNELS - 1 {
@@ -95,7 +95,7 @@ fn main() -> Result<(), opus1::Error> {
     }
 
     let total: usize = sizes.iter().sum();
-    let seconds = (FRAMES * FRAME) as f64 / SAMPLE_RATE as f64;
+    let seconds = (FRAMES * FRAME) as f64 / SAMPLE_RATE.hz() as f64;
     println!(
         "packets: {} of {} to {} bytes, {} bytes on average",
         sizes.len(),
@@ -111,7 +111,7 @@ fn main() -> Result<(), opus1::Error> {
     // The decoded signal is the input, late by the lookahead of the
     // encoder. The first 0.2 s are left out: the codec starts from silence.
     let delay = encoder.lookahead();
-    let skip = SAMPLE_RATE as usize / 5;
+    let skip = SAMPLE_RATE.hz() as usize / 5;
     println!("signal-to-noise ratio at a delay of {delay} samples:");
     for (c, name) in NAMES.iter().enumerate() {
         let (mut signal, mut noise) = (0f64, 0f64);

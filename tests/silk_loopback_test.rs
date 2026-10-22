@@ -5,7 +5,7 @@
 /// SILK encoder-decoder loopback test
 /// Encodes a 440Hz sine wave with SILK and decodes it back,
 /// then verifies the output is valid (non-zero) and has reasonable SNR.
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 /// Generate a 440Hz sine wave at the given sample rate
 fn generate_sine(sample_rate: i32, duration_ms: i32, frequency: f32) -> Vec<f32> {
@@ -42,17 +42,17 @@ fn compute_snr(original: &[f32], decoded: &[f32], skip: usize) -> f64 {
 #[test]
 fn test_silk_encode_decode_loopback() {
     let sample_rate = 8000;
-    let channels = 1;
     let frame_size = 160; // 20ms at 8kHz
     let bitrate = 10000;
 
     // Create encoder
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip).unwrap();
+    let mut encoder =
+        OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     encoder.set_vbr(false);
 
     // Create decoder
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz8000, Channels::Mono).unwrap();
 
     // Generate 440Hz sine wave - 5 frames = 100ms
     let num_frames = 5;
@@ -155,14 +155,14 @@ fn test_silk_encode_decode_loopback() {
 fn test_silk_encode_decode_nonzero_output() {
     // Minimal test: encode one frame and verify decode produces non-zero output
     let sample_rate = 8000;
-    let channels = 1;
     let frame_size = 160;
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip).unwrap();
+    let mut encoder =
+        OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(10000)).unwrap();
     encoder.set_vbr(false);
 
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz8000, Channels::Mono).unwrap();
 
     // Generate a simple tone
     let input = generate_sine(sample_rate, 20, 440.0);
@@ -197,14 +197,14 @@ fn test_silk_encode_decode_nonzero_output() {
 fn test_silk_multi_frame_continuity() {
     // Test that multi-frame encoding/decoding produces continuous output
     let sample_rate = 8000;
-    let channels = 1;
     let frame_size = 160;
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip).unwrap();
+    let mut encoder =
+        OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap(); // Higher bitrate for better quality
     encoder.set_vbr(false);
 
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz8000, Channels::Mono).unwrap();
 
     let input = generate_sine(sample_rate, 200, 440.0); // 200ms = 10 frames
 

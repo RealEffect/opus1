@@ -35,7 +35,10 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech_fullband, to_stereo};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, InbandFec, OpusEncoder, Signal};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, FrameDuration, InbandFec, OpusEncoder,
+    SampleRate, Signal,
+};
 
 const EXACT: bool = cfg!(target_arch = "aarch64");
 /// Room for six 20 ms CELT frames of 1275 bytes.
@@ -142,7 +145,12 @@ struct Pair {
 
 impl Pair {
     fn new(fs: usize, channels: usize, app: Application, c_app: i32, force_celt: bool) -> Self {
-        let mut rs = OpusEncoder::new(fs as i32, channels, app).unwrap();
+        let mut rs = OpusEncoder::new(
+            SampleRate::try_from(fs as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            app,
+        )
+        .unwrap();
         let mut c = CEncoder::new(fs, channels, c_app);
         if force_celt {
             rs.set_force_mode(Some(ForcedMode::CeltOnly));
@@ -165,9 +173,14 @@ impl Pair {
         }
     }
 
+    /// The sampling rate of the pair.
+    fn rate(&self) -> SampleRate {
+        SampleRate::try_from(self.fs as u32).unwrap()
+    }
+
     /// The frame the next call codes, in samples per channel.
     fn coded(&self) -> usize {
-        self.expert.samples(self.fs as i32).unwrap_or(self.frame)
+        self.expert.samples(self.rate()).unwrap_or(self.frame)
     }
 
     /// Whether the coded frame is a packet of several frames with a
@@ -266,8 +279,9 @@ impl Pair {
                 format!("prediction disabled {off}")
             }
             10 if self.channels == 2 => {
-                let (rs, c) = rng.pick(&[(None, sys::OPUS_AUTO), (Some(1), 1), (Some(2), 2)]);
-                self.rs.set_force_channels(rs).unwrap();
+                let (rs, c) =
+                    rng.pick(&[(None, sys::OPUS_AUTO), (Some(Channels::Mono), 1), (Some(Channels::Stereo), 2)]);
+                self.rs.set_force_channels(rs);
                 self.c.force_channels(c);
                 format!("force channels {rs:?}")
             }
@@ -286,7 +300,7 @@ impl Pair {
             13 => {
                 // The caller's frame size.
                 let d = rng.pick(&DURATIONS);
-                self.frame = d.samples(self.fs as i32).unwrap();
+                self.frame = d.samples(self.rate()).unwrap();
                 if self.expert != FrameDuration::Argument && self.coded() > self.frame {
                     self.expert = FrameDuration::Argument;
                     self.rs.set_expert_frame_duration(self.expert);
@@ -299,7 +313,7 @@ impl Pair {
                 let fits: Vec<FrameDuration> = DURATIONS
                     .iter()
                     .copied()
-                    .filter(|d| d.samples(self.fs as i32).unwrap() <= self.frame)
+                    .filter(|d| d.samples(self.rate()).unwrap() <= self.frame)
                     .collect();
                 self.expert = if rng.below(3) == 0 { FrameDuration::Argument } else { rng.pick(&fits) };
                 self.rs.set_expert_frame_duration(self.expert);
@@ -541,7 +555,12 @@ fn forced_mode_switches_keep_the_celt_frames_of_libopus() {
             let cvbr = rng.below(2) == 0;
             let frame = if rng.below(3) == 0 { fs / 100 } else { fs / 50 };
             let frame_rate = (fs / frame) as i32;
-            let mut rs = OpusEncoder::new(fs as i32, 1, Application::Audio).unwrap();
+            let mut rs = OpusEncoder::new(
+                SampleRate::try_from(fs as i32).unwrap(),
+                Channels::Mono,
+                Application::Audio,
+            )
+            .unwrap();
             let mut c = CEncoder::new(fs, 1, APP_AUDIO);
             rs.set_complexity(complexity).unwrap();
             c.complexity(complexity);
@@ -653,7 +672,12 @@ fn automatic_mode_switches_keep_the_celt_frames_of_libopus() {
             let cvbr = rng.below(2) == 0;
             let frame = rng.pick(&[fs / 100, fs / 50]);
             let frame_rate = (fs / frame) as i32;
-            let mut rs = OpusEncoder::new(fs as i32, 1, Application::Audio).unwrap();
+            let mut rs = OpusEncoder::new(
+                SampleRate::try_from(fs as i32).unwrap(),
+                Channels::Mono,
+                Application::Audio,
+            )
+            .unwrap();
             let mut c = CEncoder::new(fs, 1, APP_AUDIO);
             rs.set_complexity(complexity).unwrap();
             c.complexity(complexity);

@@ -1,14 +1,15 @@
-use opus1::{Application as RsApp, Bitrate, OpusDecoder as RsDec, OpusEncoder as RsEnc};
+use opus1::{
+    Application as RsApp, Bitrate, Channels, OpusDecoder as RsDec, OpusEncoder as RsEnc, SampleRate,
+};
 
 #[test]
 fn mono_impulse_48k_64k_finite_small_packet() {
-    let sr = 48000;
     let ch = 1;
     let br = 64000;
     let fs = 960; // 20ms @48k
     let mut pcm = vec![0.0f32; fs * ch];
     pcm[0] = 1.0;
-    let mut enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+    let mut enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
     let mut buf = vec![0u8; 1276];
     let n = enc.encode(&pcm, fs, &mut buf).unwrap();
@@ -20,7 +21,7 @@ fn mono_impulse_48k_64k_finite_small_packet() {
         n,
         &buf[..n.min(8)]
     );
-    let mut dec = RsDec::new(sr, ch).unwrap();
+    let mut dec = RsDec::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * ch];
     let got = dec.decode(&buf[..n], fs, &mut out).unwrap();
     let max = out[..got * ch].iter().fold(0.0f32, |a, &x| a.max(x.abs()));

@@ -1,4 +1,4 @@
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 #[test]
 fn test_48k_hybrid_quality_audio() {
@@ -7,11 +7,12 @@ fn test_48k_hybrid_quality_audio() {
     let num_frames = 10;
     let total_samples = frame_size * num_frames;
 
-    let mut encoder = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
+    let mut encoder =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(18000)).unwrap();
     encoder.set_vbr(false);
 
-    let mut decoder = OpusDecoder::new(sample_rate, 1).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 
     let input: Vec<f32> = (0..total_samples)
         .map(|i| {

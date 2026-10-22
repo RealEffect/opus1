@@ -33,7 +33,9 @@ use audiopus_sys as ffi;
 use opus1::internals::eval::compare::{Reference, opus_compare};
 use opus1::internals::eval::demo::{BitPacket, decode_bitstream};
 use opus1::internals::eval::moc::{moc, moc_relative};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -129,6 +131,14 @@ pub struct Condition {
 }
 
 impl Condition {
+    /// The sampling rate and the channel count as opus1 takes them, or an
+    /// error for numbers that Opus does not have.
+    fn opus1_format(&self) -> Result<(SampleRate, Channels), String> {
+        let rate = SampleRate::try_from(self.rate).map_err(|e| format!("{} Hz: {e}", self.rate))?;
+        let channels = Channels::try_from(self.channels).map_err(|e| format!("{} channels: {e}", self.channels))?;
+        Ok((rate, channels))
+    }
+
     pub fn new(group: &str, app: App, rate: u32, channels: usize, bitrate: i32, complexity: i32, frame_us: u32) -> Self {
         let mut c = Self {
             name: String::new(),
@@ -365,8 +375,8 @@ impl Encoder {
                     App::Audio => Application::Audio,
                     App::LowDelay => Application::RestrictedLowDelay,
                 };
-                let mut e = OpusEncoder::new(cond.rate as i32, cond.channels, application)
-                    .map_err(|e| format!("OpusEncoder::new: {e}"))?;
+                let (rate, channels) = cond.opus1_format()?;
+                let mut e = OpusEncoder::new(rate, channels, application).map_err(|e| format!("OpusEncoder::new: {e}"))?;
                 e.set_complexity(cond.complexity).map_err(|e| format!("set_complexity: {e}"))?;
                 e.set_vbr(!cond.cbr);
                 e.set_inband_fec(cond.fec);
@@ -446,15 +456,15 @@ impl Encoder {
                 // opus1 has no getter for the application; it is the one
                 // `Encoder::new` passed.
                 application: libopus_application(cond.app),
-                sample_rate: e.sampling_rate(),
-                channels: e.channels() as i32,
+                sample_rate: e.sampling_rate().hz() as i32,
+                channels: e.channels().count() as i32,
                 bitrate: e.bitrate(),
                 vbr: e.vbr(),
                 vbr_constraint: e.vbr_constraint(),
                 complexity: e.complexity(),
                 inband_fec: i32::from(e.inband_fec()),
                 packet_loss_perc: e.packet_loss_perc(),
-                force_channels: e.force_channels().map_or(OPUS_AUTO, |c| c as i32),
+                force_channels: e.force_channels().map_or(OPUS_AUTO, |c| c.count() as i32),
                 expert_frame_duration: e.expert_frame_duration() as i32,
                 prediction_disabled: e.prediction_disabled(),
                 lookahead: e.lookahead() as i32,
@@ -624,7 +634,8 @@ pub fn decode(decoder: Codec, cond: &Condition, packets: &Packets, n: usize) -> 
     let output = match decoder {
         Codec::Libopus => decode_bitstream(&mut CDecoder::new(cond.rate, cond.channels)?, &records),
         Codec::Opus1 => {
-            let mut d = OpusDecoder::new(cond.rate as i32, cond.channels).map_err(|e| format!("OpusDecoder::new: {e}"))?;
+            let (rate, channels) = cond.opus1_format()?;
+            let mut d = OpusDecoder::new(rate, channels).map_err(|e| format!("OpusDecoder::new: {e}"))?;
             decode_bitstream(&mut d, &records)
         }
     };

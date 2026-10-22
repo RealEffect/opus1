@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
@@ -25,7 +25,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Create encoder
-    let mut encoder = match OpusEncoder::new(sampling_rate, channels, application) {
+    let mut encoder = match OpusEncoder::new(SampleRate::try_from(sampling_rate).unwrap(), Channels::try_from(channels).unwrap(), application) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -156,7 +156,7 @@ fuzz_target!(|data: &[u8]| {
     // If encoding succeeded, try decoding
     if let Ok(encoded_len) = encode_result {
         if encoded_len > 0 && encoded_len <= output_size {
-            let mut decoder = match OpusDecoder::new(sampling_rate, channels) {
+            let mut decoder = match OpusDecoder::new(SampleRate::try_from(sampling_rate).unwrap(), Channels::try_from(channels).unwrap()) {
                 Ok(d) => d,
                 Err(_) => return,
             };

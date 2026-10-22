@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use crate::ms_support::*;
+use opus1::SampleRate;
 use opus1::multistream::MultistreamDecoder;
 
 /// Sampling rate of every encoder in these tests.
@@ -117,8 +118,14 @@ impl Encoded {
     pub fn decoders(&self, fs: i32) -> (CMsDecoder, MultistreamDecoder) {
         let c = CMsDecoder::new(fs, self.channels, self.streams, self.coupled, &self.mapping)
             .unwrap_or_else(|e| panic!("{}: C decoder: {e}", self.label));
-        let r = MultistreamDecoder::with_layout(fs, self.channels, self.streams, self.coupled, &self.mapping)
-            .unwrap_or_else(|e| panic!("{}: opus1 decoder: {e}", self.label));
+        let r = MultistreamDecoder::with_layout(
+            SampleRate::try_from(fs).unwrap(),
+            self.channels,
+            self.streams,
+            self.coupled,
+            &self.mapping,
+        )
+        .unwrap_or_else(|e| panic!("{}: opus1 decoder: {e}", self.label));
         (c, r)
     }
 }

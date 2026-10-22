@@ -23,7 +23,7 @@ mod k24_common;
 
 use k24_common::{resample, BW_FB, BW_WB, CDec, CEnc, MODE_CELT, MODE_HYBRID, MODE_SILK};
 use opus1::internals::silk_input::set_integer_hp_at_48k;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// A 2.5 s excerpt of the TSP speech database at 48 kHz (`fixtures/tsp/`).
 fn tsp_excerpt(name: &str) -> Vec<i16> {
@@ -63,7 +63,12 @@ fn padded(pcm: &[i16], lookahead: usize) -> Vec<i16> {
 
 fn opus1_packets(pcm: &[i16], rate: i32, s: Stream, integer_hp: bool) -> Vec<Vec<u8>> {
     let frame = rate as usize / 50;
-    let mut enc = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate).unwrap(),
+        Channels::Mono,
+        Application::Voip,
+    )
+    .unwrap();
     set_integer_hp_at_48k(&mut enc, integer_hp);
     enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
     enc.set_complexity(5).unwrap();
@@ -192,7 +197,12 @@ fn switching_bursts(x48: &[i16], rate: i32) -> usize {
     pcm.resize((pcm.len() + lookahead).div_ceil(frame) * frame, 0);
     let turn = |k: usize| if (k / 5).is_multiple_of(2) { (MODE_SILK, 16000) } else { (MODE_CELT, 48000) };
 
-    let mut enc = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate).unwrap(),
+        Channels::Mono,
+        Application::Voip,
+    )
+    .unwrap();
     enc.set_complexity(9).unwrap();
     let mut cenc = CEnc::voip(rate as usize, 1);
     cenc.complexity(9);

@@ -1,4 +1,4 @@
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fn max_abs(v: &[f32]) -> f32 {
     v.iter().map(|x| x.abs()).fold(0.0f32, f32::max)
@@ -21,13 +21,14 @@ fn vbr_near_silence_192k_not_huge() {
             pcm[i * channels + c] = v;
         }
     }
-    let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     enc.set_vbr(true);
     let mut out = vec![0u8; 1276];
     let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
     assert!(n > 0 && n <= 1276);
-    let mut dec = OpusDecoder::new(48000, channels).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut pcm_out = vec![0.0f32; frame_size * channels];
     let decoded = dec.decode(&out[..n], frame_size, &mut pcm_out).unwrap();
     assert!(
@@ -56,12 +57,13 @@ fn high_bitrate_matrix_48k_stereo() {
                 pcm[i * channels + c] = v + (c as f32 * 0.001);
             }
         }
-        let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(kbps * 1000)).unwrap();
         enc.set_vbr(true);
         let mut out = vec![0u8; 1276];
         let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
-        let mut dec = OpusDecoder::new(48000, channels).unwrap();
+        let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
         let mut pcm_out = vec![0.0f32; frame_size * channels];
         let res = dec.decode(&out[..n], frame_size, &mut pcm_out);
         assert!(res.is_ok(), "decode failed at {} kbps: {:?}", kbps, res);
@@ -88,14 +90,15 @@ fn per_packet_fresh_decoder_192k() {
             pcm[i * channels + c] = v;
         }
     }
-    let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     enc.set_vbr(true);
     let mut out = vec![0u8; 1276];
     let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
     let pkt = out[..n].to_vec();
     // Decode with fresh decoder per packet (single packet)
-    let mut dec = OpusDecoder::new(48000, channels).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut pcm_out = vec![0.0f32; frame_size * channels];
     let res = dec.decode(&pkt, frame_size, &mut pcm_out).unwrap();
     assert!(res > 0);

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
     // Test all sample rates
     for &sampling_rate in &[8000, 12000, 16000, 24000, 48000] {
         for &channels in &[1, 2] {
-            let mut decoder = match OpusDecoder::new(sampling_rate, channels) {
+            let mut decoder = match OpusDecoder::new(SampleRate::try_from(sampling_rate).unwrap(), Channels::try_from(channels).unwrap()) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
@@ -99,7 +99,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Test with mismatched channel configurations
     // Create mono decoder, test with stereo-like TOC
-    if let Ok(mut mono_decoder) = OpusDecoder::new(48000, 1) {
+    if let Ok(mut mono_decoder) = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono) {
         let stereo_tocs = [0x04, 0x0C, 0x14, 0x1C, 0x84, 0x8C, 0x94, 0x9C];
         for &toc in &stereo_tocs {
             let packet = vec![toc];
@@ -111,7 +111,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Create stereo decoder, test with mono-like TOC
-    if let Ok(mut stereo_decoder) = OpusDecoder::new(48000, 2) {
+    if let Ok(mut stereo_decoder) = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo) {
         let mono_tocs = [0x00, 0x08, 0x10, 0x18, 0x80, 0x88, 0x90, 0x98];
         for &toc in &mono_tocs {
             let packet = vec![toc];

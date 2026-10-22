@@ -35,7 +35,7 @@ use audiopus_sys as sys;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
@@ -236,7 +236,7 @@ fn run(data: &[u8]) -> Result<()> {
     let fs = *u.choose(&RATES)?;
     let channels = u.int_in_range(1..=2)?;
     let mut pair = Pair {
-        rust: OpusDecoder::new(fs, channels).unwrap(),
+        rust: OpusDecoder::new(SampleRate::try_from(fs).unwrap(), Channels::try_from(channels).unwrap()).unwrap(),
         c: CDecoder::new(fs, channels),
         fs,
         channels,

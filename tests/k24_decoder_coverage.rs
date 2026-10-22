@@ -8,6 +8,7 @@
 
 mod k24_common;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 
 const MODES: [(i32, i32, &str, i32); 9] = [
     (MODE_SILK, BW_NB, "SILK-NB", 16000),
@@ -185,7 +186,7 @@ fn frame_size_argument_matches_libopus() {
     let packets = enc.encode_all(&pcm, 480);
     for frame_size in [120usize, 240, 479, 480, 481, 960, 2880, 5760] {
         let mut c_dec = CDec::new(24000, 1);
-        let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
+        let mut rs_dec = opus1::OpusDecoder::new(SampleRate::Hz24000, Channels::Mono).unwrap();
         let c = c_dec.decode(Some(&packets[3]), frame_size, false).map(|v| v.len()).ok();
         let mut buf = vec![0f32; frame_size];
         let rs = rs_dec.decode(&packets[3], frame_size, &mut buf).ok();
@@ -193,7 +194,7 @@ fn frame_size_argument_matches_libopus() {
     }
     for frame_size in [59usize, 60, 120, 240, 300, 360, 480, 600, 960, 1440, 2880, 5760] {
         let mut c_dec = CDec::new(24000, 1);
-        let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
+        let mut rs_dec = opus1::OpusDecoder::new(SampleRate::Hz24000, Channels::Mono).unwrap();
         c_dec.decode(Some(&packets[3]), 480, false).unwrap();
         let mut buf = vec![0f32; 5760];
         rs_dec.decode(&packets[3], 480, &mut buf).unwrap();

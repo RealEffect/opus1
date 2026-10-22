@@ -25,7 +25,7 @@
 use audiopus_sys as sys;
 use opus1::extensions::Extension;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
-use opus1::{ErrorKind, OpusDecoder, OpusDred, OpusDredDecoder, packet};
+use opus1::{Channels, ErrorKind, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate, packet};
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uchar, c_void};
 
@@ -224,23 +224,31 @@ fn encode(cfg: &EncCfg, packets: usize) -> Vec<Vec<u8>> {
 }
 
 /// The (max_dred_samples, sampling_rate) pairs of the parse tests.
-const PARSE_ARGS: [(i32, i32); 8] = [
-    (0, 16000),
-    (480, 48000),
-    (16000, 16000),
-    (48000, 48000),
-    (2000, 8000),
-    (100000, 48000),
-    (-5000, 16000),
-    (7, 44100),
+const PARSE_ARGS: [(i32, SampleRate); 8] = [
+    (0, SampleRate::Hz16000),
+    (480, SampleRate::Hz48000),
+    (16000, SampleRate::Hz16000),
+    (48000, SampleRate::Hz48000),
+    (2000, SampleRate::Hz8000),
+    (100000, SampleRate::Hz48000),
+    (-5000, SampleRate::Hz16000),
+    (7, SampleRate::Hz24000),
 ];
 
 /// Parses one packet with both libopus and opus1, with and without
 /// deferred processing, and compares everything.
-fn compare_parse(c: &mut CDredDec, r: &OpusDredDecoder, dred: &mut OpusDred, data: &[u8], max: i32, rate: i32, what: &str) -> i32 {
+fn compare_parse(
+    c: &mut CDredDec,
+    r: &OpusDredDecoder,
+    dred: &mut OpusDred,
+    data: &[u8],
+    max: i32,
+    rate: SampleRate,
+    what: &str,
+) -> i32 {
     for defer in [false, true] {
-        let what = format!("{what} max {max} rate {rate} defer {defer}");
-        let (ret, end) = c.parse(data, max, rate, defer);
+        let what = format!("{what} max {max} rate {rate:?} defer {defer}");
+        let (ret, end) = c.parse(data, max, rate.hz() as i32, defer);
         let got = r.parse(dred, data, max, rate, defer);
         match got {
             Ok(p) => {
@@ -289,7 +297,7 @@ fn parse_and_process_equal_libopus() {
             let ret = compare_parse(&mut c, &r, &mut dred, p, max, rate, &format!("config {k} packet {i}"));
             assert!(ret >= 0);
             // The whole DRED of the packet.
-            compare_parse(&mut c, &r, &mut dred, p, 48000, 48000, &format!("config {k} packet {i} all"));
+            compare_parse(&mut c, &r, &mut dred, p, 48000, SampleRate::Hz48000, &format!("config {k} packet {i} all"));
             if c.dred().process_stage > 0 {
                 with_dred += 1;
                 latents = latents.max(c.dred().nb_latents);
@@ -369,7 +377,7 @@ fn damaged_and_random_payloads_parse_as_in_libopus() {
                 let data = with_dred(&plain, &bad, frame);
                 let (max, rate) = PARSE_ARGS[(i + trial) % PARSE_ARGS.len()];
                 compare_parse(&mut c, &r, &mut dred, &data, max, rate, &format!("config {k} packet {i} trial {trial}"));
-                compare_parse(&mut c, &r, &mut dred, &data, 48000, 48000, &format!("config {k} packet {i} trial {trial} all"));
+                compare_parse(&mut c, &r, &mut dred, &data, 48000, SampleRate::Hz48000, &format!("config {k} packet {i} trial {trial} all"));
                 cases += 1;
             }
         }
@@ -385,7 +393,7 @@ fn damaged_and_random_payloads_parse_as_in_libopus() {
             data[0] = (data[0] & 0xFC) | 3;
             data[1] |= 0x40;
         }
-        compare_parse(&mut c, &r, &mut dred, &data, 48000, 48000, &format!("random packet {n}"));
+        compare_parse(&mut c, &r, &mut dred, &data, 48000, SampleRate::Hz48000, &format!("random packet {n}"));
     }
 }
 
@@ -410,7 +418,11 @@ impl Pair {
         let c = unsafe { sys::opus_decoder_create(fs, channels as c_int, &mut err) };
         assert_eq!(err, 0);
         assert_eq!(unsafe { sys::opus_decoder_ctl(c, OPUS_SET_COMPLEXITY_REQUEST, complexity) }, 0);
-        let mut r = OpusDecoder::new(fs, channels).unwrap();
+        let mut r = OpusDecoder::new(
+            SampleRate::try_from(fs).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         r.set_complexity(complexity).unwrap();
         Pair { c, r, channels }
     }
@@ -511,7 +523,7 @@ fn dred_losses(cfg: &EncCfg, fs: i32, channels: usize, complexity: i32, out: Out
             let dred_input = (lost_count * frame) as i32;
             let max = fs.min(dred_input.max(0));
             let (ret, end) = c.parse(p, max, fs, false);
-            let got = r.parse(&mut dred, p, max, fs, false).unwrap();
+            let got = r.parse(&mut dred, p, max, SampleRate::try_from(fs).unwrap(), false).unwrap();
             assert_eq!((got.samples, got.end), (ret, end), "{tag} packet {i}: parse");
             same_parse(c.dred(), &dred, &format!("{tag} packet {i}"));
             for fr in 0..lost_count {
@@ -577,7 +589,7 @@ fn dred_decode_at_other_positions_equals_libopus() {
             }
             let defer = i % 3 == 0;
             let (ret, _) = c.parse(p, fs, fs, defer);
-            r.parse(&mut dred, p, fs, fs, defer).unwrap();
+            r.parse(&mut dred, p, fs, SampleRate::try_from(fs).unwrap(), defer).unwrap();
             assert!(ret > 0);
             for call in 0..4 {
                 // The last call is longer than 120 ms, which the integer
@@ -610,7 +622,7 @@ fn dred_decode_checks_its_arguments_as_libopus() {
     let mut dred = OpusDred::new();
     let p = &packets[15];
     assert!(c.parse(p, 16000, 16000, false).0 > 0);
-    r.parse(&mut dred, p, 16000, 16000, false).unwrap();
+    r.parse(&mut dred, p, 16000, SampleRate::Hz16000, false).unwrap();
     let mut pair = Pair::new(16000, 1, 10);
     for q in &packets[..15] {
         pair.decode(q, 320, Out::I16, "lead");
@@ -635,13 +647,10 @@ fn dred_decode_checks_its_arguments_as_libopus() {
     // A packet without DRED: zeros, and the state is not usable.
     let plain = split_dred(p).unwrap().0;
     let (ret, end) = c.parse(&plain, 16000, 16000, false);
-    let got = r.parse(&mut dred, &plain, 16000, 16000, false).unwrap();
+    let got = r.parse(&mut dred, &plain, 16000, SampleRate::Hz16000, false).unwrap();
     assert_eq!((got.samples, got.end), (ret, end));
     assert_eq!((ret, end), (0, 0));
     assert!(!dred.is_parsed());
-    // Not a positive sampling rate: an error in opus1 (libopus divides by
-    // it).
-    assert_eq!(r.parse(&mut dred, p, 16000, 0, false).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     // A decode with the unusable state conceals as without DRED.
     pair.dred_decode(c.dred(), &dred, 320, 320, Out::F32, "without DRED");
 }

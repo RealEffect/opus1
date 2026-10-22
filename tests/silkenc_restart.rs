@@ -22,7 +22,7 @@ use opus1::internals::silk::decode_indices::{
 use opus1::internals::silk::decode_pulses::silk_decode_pulses;
 use opus1::internals::silk::define::{CODE_CONDITIONALLY, CODE_INDEPENDENTLY};
 use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 const MODE_CELT: i32 = 1002;
 
@@ -94,7 +94,12 @@ struct Case {
 /// the seeds in the packets of both encoders.
 fn seeds_of_both(case: &Case) -> (Vec<Vec<i8>>, Vec<Vec<i8>>) {
     let Case { fs, channels, bandwidth, silk_ms, bitrate } = *case;
-    let mut rs = OpusEncoder::new(fs as i32, channels, Application::Audio).unwrap();
+    let mut rs = OpusEncoder::new(
+        SampleRate::try_from(fs as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        Application::Audio,
+    )
+    .unwrap();
     rs.set_bandwidth(bandwidth.0);
     rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     rs.set_complexity(0).unwrap();

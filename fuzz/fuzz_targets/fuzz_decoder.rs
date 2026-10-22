@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 {
@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let sampling_rate = 48000;
 
     // Create decoder
-    let mut decoder = match OpusDecoder::new(sampling_rate, channels) {
+    let mut decoder = match OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(channels).unwrap()) {
         Ok(d) => d,
         Err(_) => return,
     };

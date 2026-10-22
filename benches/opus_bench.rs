@@ -27,7 +27,7 @@ use opus1::internals::silk::sigproc_fix::{
     silk_autocorr, silk_inner_prod_aligned, silk_lpc_analysis_filter,
 };
 use opus1::internals::silk::structs::*;
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fn sine_i16(samples: usize, sample_rate: u32, freq: u32) -> Vec<i16> {
     (0..samples)
@@ -113,7 +113,12 @@ fn bench_opus_encode_silk(c: &mut Criterion) {
             BenchmarkId::new(format!("{sample_rate}Hz/{frame_ms}ms"), "voip"),
             &(sample_rate, frame_size),
             |b, &(sr, fs)| {
-                let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(sr as i32).unwrap(),
+                    Channels::Mono,
+                    Application::Voip,
+                )
+                .unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
                 b.iter(|| {
                     enc.encode(black_box(&input), fs, black_box(&mut output))
@@ -252,7 +257,12 @@ fn bench_opus_encode_celt(c: &mut Criterion) {
             BenchmarkId::new(format!("{sample_rate}Hz/{frame_ms}ms"), "audio"),
             &(sample_rate, frame_size),
             |b, &(sr, fs)| {
-                let mut enc = OpusEncoder::new(sr as i32, 1, Application::Audio).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(sr as i32).unwrap(),
+                    Channels::Mono,
+                    Application::Audio,
+                )
+                .unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
                 b.iter(|| {
                     enc.encode(black_box(&input), fs, black_box(&mut output))
@@ -279,7 +289,12 @@ fn bench_silk_vs_c(c: &mut Criterion) {
             BenchmarkId::new(format!("rust/{sample_rate}Hz/{frame_ms}ms"), "cx0"),
             &(sample_rate, frame_size),
             |b, &(sr, fs)| {
-                let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(sr as i32).unwrap(),
+                    Channels::Mono,
+                    Application::Voip,
+                )
+                .unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
                 enc.set_complexity(0).unwrap();
                 let mut output = vec![0u8; 256];
@@ -563,11 +578,20 @@ fn bench_opus_real(c: &mut Criterion) {
                 } else {
                     Application::Voip
                 };
-                let mut enc = OpusEncoder::new(sr as i32, 1, app).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(sr as i32).unwrap(),
+                    Channels::Mono,
+                    app,
+                )
+                .unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(if sr == 48000 { 64_000 } else { 20_000 })).unwrap();
                 enc.set_complexity(0).unwrap();
                 enc.set_vbr(false);
-                let mut dec = OpusDecoder::new(sr as i32, 1).unwrap();
+                let mut dec = OpusDecoder::new(
+                    SampleRate::try_from(sr as i32).unwrap(),
+                    Channels::Mono,
+                )
+                .unwrap();
                 let mut output = vec![0u8; 1024];
                 let mut pcm = vec![0.0f32; fs];
                 b.iter(|| {
@@ -927,7 +951,12 @@ fn bench_opus_encode_i16(c: &mut Criterion) {
             BenchmarkId::new(format!("{sample_rate}Hz/{frame_ms}ms"), "i16_voip"),
             &(sample_rate, frame_size),
             |b, &(sr, fs)| {
-                let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(sr as i32).unwrap(),
+                    Channels::Mono,
+                    Application::Voip,
+                )
+                .unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
                 b.iter(|| {
                     enc.encode_i16(black_box(&input_i16), fs, black_box(&mut output))
@@ -939,7 +968,12 @@ fn bench_opus_encode_i16(c: &mut Criterion) {
             BenchmarkId::new(format!("{sample_rate}Hz/{frame_ms}ms"), "f32_voip"),
             &(sample_rate, frame_size),
             |b, &(sr, fs)| {
-                let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(sr as i32).unwrap(),
+                    Channels::Mono,
+                    Application::Voip,
+                )
+                .unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
                 b.iter(|| {
                     enc.encode(black_box(&input_f32), fs, black_box(&mut output))

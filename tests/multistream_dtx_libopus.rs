@@ -26,7 +26,7 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
-use opus1::{Application, ForcedMode};
+use opus1::{Application, ForcedMode, SampleRate};
 
 /// Whether the packets must be libopus's: the analysis rounds as the
 /// libopus the tests link only on 64-bit ARM.
@@ -264,7 +264,14 @@ fn opus1_dtx_packets_decode_like_libopus() {
                     m => Some(m - coupled),
                 })
                 .collect();
-            let mut r_dec = MultistreamDecoder::with_layout(fs, channels, streams, coupled, layout.mapping()).unwrap();
+            let mut r_dec = MultistreamDecoder::with_layout(
+                SampleRate::Hz48000,
+                channels,
+                streams,
+                coupled,
+                layout.mapping(),
+            )
+            .unwrap();
             let mut c_dec = c_decoder(&rust);
             let max = 5760;
             let mut out = vec![0f32; max * channels];

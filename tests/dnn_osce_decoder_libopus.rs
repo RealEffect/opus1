@@ -50,7 +50,7 @@ mod ms_support;
 use core_common::*;
 use dnn_dec_common::{CDec, CMsDec, Coding, c_encode, first_difference, rs_encode, splice, toc_mode};
 use opus1::multistream::MultistreamDecoder;
-use opus1::{Application, Bitrate, OpusDecoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, SampleRate};
 
 fn all() -> bool {
     std::env::var_os("OPUS1_DNN_OSCE_ALL").is_some_and(|v| v != "0")
@@ -202,7 +202,7 @@ const EVENTS: [Events; 8] =
 
 /// The calls that decode `packets` at `rate` with `events`.
 fn calls(packets: &[Vec<u8>], rate: usize, events: Events, seed: u32) -> Vec<Call> {
-    let duration = |k: usize| opus1::packet::nb_samples(&packets[k], rate as i32).unwrap();
+    let duration = |k: usize| opus1::packet::nb_samples(&packets[k], SampleRate::try_from(rate as u32).unwrap()).unwrap();
     let mut state = seed.wrapping_mul(2654435761).wrapping_add(17);
     let mut calls = Vec::new();
     for k in 0..packets.len() {
@@ -284,8 +284,16 @@ fn compare(packets: &[Vec<u8>], s: Setting, seed: u32) -> Result<Count, String> 
     let (rate, channels) = (s.rate, s.channels);
     let mut c = CDec::new(rate, channels);
     let mut c16 = CDec::new(rate, channels);
-    let mut d = OpusDecoder::new(rate as i32, channels).unwrap();
-    let mut d16 = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut d = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
+    let mut d16 = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let complexity = |c: &mut CDec, c16: &mut CDec, d: &mut OpusDecoder, d16: &mut OpusDecoder, value| {
         c.set_complexity(value);
         c16.set_complexity(value);
@@ -312,7 +320,7 @@ fn compare(packets: &[Vec<u8>], s: Setting, seed: u32) -> Result<Count, String> 
         let (want, want16, got, got16) = match call {
             Call::Packet(k) => {
                 let p = &packets[k];
-                let n = opus1::packet::nb_samples(p, rate as i32).unwrap();
+                let n = opus1::packet::nb_samples(p, SampleRate::try_from(rate as u32).unwrap()).unwrap();
                 (
                     c.decode(Some(p), n, false),
                     c16.decode_i16(Some(p), n, false),
@@ -526,7 +534,7 @@ fn osce_changes_the_output_of_libopus() {
     let mut c = CDec::new(48000, 1);
     c.set_complexity(7);
     c.set_osce_bwe(true);
-    let mut d = OpusDecoder::new(48000, 1).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     d.set_complexity(7).unwrap();
     d.set_osce_bwe(true).unwrap();
     let mut out = vec![0f32; 960];
@@ -569,7 +577,7 @@ fn multistream_matches_libopus() {
         let layout = (enc.streams, enc.coupled, enc.mapping.clone());
         packet_sets.push((format!("libopus {bitrate} b/s"), enc.encode_all(&pcm, 960), layout));
         let mut ours =
-            opus1::multistream::MultistreamEncoder::new_surround(48000, channels, 1, Application::Voip).unwrap();
+            opus1::multistream::MultistreamEncoder::new_surround(SampleRate::Hz48000, channels, 1, Application::Voip).unwrap();
         ours.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
         if fec {
             ours.set_inband_fec(true);
@@ -596,8 +604,22 @@ fn multistream_matches_libopus() {
                     runs += 1;
                     let mut c = CMsDec::new(rate, channels, *streams, *coupled, mapping);
                     let mut c16 = CMsDec::new(rate, channels, *streams, *coupled, mapping);
-                    let mut d = MultistreamDecoder::with_layout(rate as i32, channels, *streams, *coupled, mapping).unwrap();
-                    let mut d16 = MultistreamDecoder::with_layout(rate as i32, channels, *streams, *coupled, mapping).unwrap();
+                    let mut d = MultistreamDecoder::with_layout(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        channels,
+                        *streams,
+                        *coupled,
+                        mapping,
+                    )
+                    .unwrap();
+                    let mut d16 = MultistreamDecoder::with_layout(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        channels,
+                        *streams,
+                        *coupled,
+                        mapping,
+                    )
+                    .unwrap();
                     c.set_complexity(complexity);
                     c16.set_complexity(complexity);
                     c.set_osce_bwe(bwe);
@@ -683,7 +705,7 @@ fn timing() {
     {
         let (mut ours, mut theirs) = (Vec::new(), Vec::new());
         for _ in 0..5 {
-            let mut d = OpusDecoder::new(48000, 1).unwrap();
+            let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             d.set_complexity(complexity).unwrap();
             d.set_osce_bwe(bwe).unwrap();
             let mut c = CDec::new(48000, 1);
@@ -729,7 +751,11 @@ fn distance_to_an_o2_build() {
                 let mut c = CDec::new(48000, channels);
                 c.set_complexity(complexity);
                 c.set_osce_bwe(bwe);
-                let mut d = OpusDecoder::new(48000, channels).unwrap();
+                let mut d = OpusDecoder::new(
+                    SampleRate::Hz48000,
+                    Channels::try_from(channels).unwrap(),
+                )
+                .unwrap();
                 d.set_complexity(complexity).unwrap();
                 d.set_osce_bwe(bwe).unwrap();
                 let mut out = vec![0i16; 5760 * channels];

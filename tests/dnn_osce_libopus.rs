@@ -84,7 +84,9 @@ use opus1::internals::silk::decode_pulses::silk_decode_pulses;
 use opus1::internals::silk::decoder_structs::{SilkDecoderControl, SilkDecoderState};
 use opus1::internals::silk::define::{CODE_CONDITIONALLY, CODE_INDEPENDENTLY};
 use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+};
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -456,7 +458,12 @@ fn speech(offset: usize) -> (Vec<i16>, u32) {
 /// SILK-only mono packets of `pcm`, in segments of changing frame
 /// duration, bitrate and bandwidth.
 fn encode(pcm: &[i16], rate: u32, rng: &mut Rng, with_narrowband: bool) -> Vec<Vec<u8>> {
-    let mut enc = OpusEncoder::new(rate as i32, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Mono,
+        Application::Voip,
+    )
+    .unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
     let samples_per_ms = rate as usize / 1000;
     let mut packets = Vec::new();
@@ -602,7 +609,7 @@ fn decode_frames(packets: &[Vec<u8>]) -> Vec<Frame> {
 fn check_against_decoder(packets: &[Vec<u8>], frames: &[Frame]) {
     const DELAY: usize = 13;
     const REDUNDANCY: usize = 40;
-    let mut dec = OpusDecoder::new(16000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     let mut out = vec![0i16; 960];
     let mut decoded = Vec::new();
     for p in packets {

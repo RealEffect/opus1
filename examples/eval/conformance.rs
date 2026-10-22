@@ -9,7 +9,7 @@
 
 use crate::corpus::corpus_root;
 use crate::pipeline::parallel_map;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use opus1::internals::eval::compare::{Reference, TestSignal, opus_compare_many};
 use opus1::internals::eval::demo::{decode_bitstream, parse_bitstream};
 use std::fmt::Write as _;
@@ -62,7 +62,9 @@ fn run_vector(dir: &Path, n: usize, channels: usize) -> Result<Vec<Cell>, String
     }
     let mut outputs = Vec::new();
     for rate in RATES {
-        let mut decoder = OpusDecoder::new(rate as i32, channels).map_err(|e| e.to_string())?;
+        let sampling_rate = SampleRate::try_from(rate).map_err(|e| e.to_string())?;
+        let decoder_channels = Channels::try_from(channels).map_err(|e| e.to_string())?;
+        let mut decoder = OpusDecoder::new(sampling_rate, decoder_channels).map_err(|e| e.to_string())?;
         let out = decode_bitstream(&mut decoder, &stream.packets);
         if let Some(m) = out.range_mismatch {
             return Err(format!("testvector{n:02} at {rate} Hz: range mismatch at packet {}", m.packet));

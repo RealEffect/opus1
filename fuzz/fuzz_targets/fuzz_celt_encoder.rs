@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 {
@@ -20,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
     let channels = if data[1] % 2 == 0 { 1 } else { 2 };
 
     // Use Audio mode for CELT
-    let mut encoder = match OpusEncoder::new(sampling_rate, channels, Application::Audio) {
+    let mut encoder = match OpusEncoder::new(SampleRate::try_from(sampling_rate).unwrap(), Channels::try_from(channels).unwrap(), Application::Audio) {
         Ok(e) => e,
         Err(_) => return,
     };

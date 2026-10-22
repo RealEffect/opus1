@@ -12,7 +12,9 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{aligned_snr, speech_fullband, to_stereo, toc_summary};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+};
 
 const MODES: [(&str, i32, ForcedMode); 3] = [
     ("SILK", MODE_SILK, ForcedMode::SilkOnly),
@@ -43,7 +45,7 @@ fn speech(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
 /// Encode `pcm` in frames of `frame` samples per channel.
 fn encode_all(enc: &mut OpusEncoder, pcm: &[f32], frame: usize) -> Vec<Vec<u8>> {
     let mut buf = vec![0u8; 4000];
-    pcm.chunks_exact(frame * enc.channels())
+    pcm.chunks_exact(frame * enc.channels().count())
         .enumerate()
         .map(|(i, f)| {
             let n = enc.encode(f, frame, &mut buf).unwrap_or_else(|e| panic!("packet {i}: {e}"));
@@ -121,7 +123,12 @@ fn forced_modes_at(rate: usize) {
 
             let mut c_enc = CEncoder::new(rate, channels, APP_AUDIO);
             c_enc.force_mode(c_mode).bitrate(bitrate);
-            let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                Application::Audio,
+            )
+            .unwrap();
             enc.set_force_mode(Some(mode));
             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             if limit_to_wideband {
@@ -181,7 +188,12 @@ fn forced_mode_yields_to_the_frame_size_and_the_application() {
                 let frame = rate / 400 * frame_2_5ms;
                 let mut c_enc = CEncoder::new(rate, 1, c_app);
                 c_enc.force_mode(c_mode).bitrate(32000).complexity(5);
-                let mut enc = OpusEncoder::new(rate as i32, 1, app).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(rate as i32).unwrap(),
+                    Channels::Mono,
+                    app,
+                )
+                .unwrap();
                 enc.set_force_mode(Some(mode));
                 enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
                 enc.set_complexity(5).unwrap();
@@ -196,10 +208,12 @@ fn forced_mode_yields_to_the_frame_size_and_the_application() {
 
     // Clearing the forced mode: the packets are those of an encoder that
     // never had one.
-    let mut cleared = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
+    let mut cleared =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     cleared.set_force_mode(Some(ForcedMode::CeltOnly));
     cleared.set_force_mode(None);
-    let mut plain = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
+    let mut plain =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     assert_eq!(encode_all(&mut cleared, &pcm, 960), encode_all(&mut plain, &pcm, 960));
 }
 
@@ -222,7 +236,12 @@ fn forced_silk_bandwidths_from_24_and_48_khz_input() {
                     let bitrate = 18000 * channels as i32;
                     let mut c_enc = CEncoder::new(rate, channels, APP_VOIP);
                     c_enc.force_mode(MODE_SILK).bitrate(bitrate);
-                    let mut enc = OpusEncoder::new(rate as i32, channels, Application::Voip).unwrap();
+                    let mut enc = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::try_from(channels).unwrap(),
+                        Application::Voip,
+                    )
+                    .unwrap();
                     enc.set_force_mode(Some(ForcedMode::SilkOnly));
                     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                     if use_max {
@@ -278,7 +297,12 @@ fn bandwidth_settings_at(rate: usize, with_automatic_mode: bool) -> usize {
                         for use_max in [false, true] {
                             let mut c_enc = CEncoder::new(rate, channels, *c_app);
                             c_enc.bitrate(bitrate * channels as i32).complexity(5);
-                            let mut enc = OpusEncoder::new(rate as i32, channels, *app).unwrap();
+                            let mut enc = OpusEncoder::new(
+                                SampleRate::try_from(rate as i32).unwrap(),
+                                Channels::try_from(channels).unwrap(),
+                                *app,
+                            )
+                            .unwrap();
                             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate * channels as i32)).unwrap();
                             enc.set_complexity(5).unwrap();
                             enc.set_force_mode(mode);
@@ -349,7 +373,12 @@ fn automatic_mode_below_24_khz_input_follows_libopus() {
                     let frame = rate / 50;
                     let mut c_enc = CEncoder::new(rate, channels, *c_app);
                     c_enc.bitrate(bitrate * channels as i32).complexity(5);
-                    let mut enc = OpusEncoder::new(rate as i32, channels, *app).unwrap();
+                    let mut enc = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::try_from(channels).unwrap(),
+                        *app,
+                    )
+                    .unwrap();
                     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate * channels as i32)).unwrap();
                     enc.set_complexity(5).unwrap();
                     let c_packets = c_enc.encode_all(&pcm, frame);
@@ -393,7 +422,12 @@ fn automatic_mode_follows_the_stereo_width() {
             let frame = rate / 50;
             let mut c_enc = CEncoder::new(rate, 2, APP_VOIP);
             c_enc.bitrate(56000).complexity(5);
-            let mut enc = OpusEncoder::new(rate as i32, 2, Application::Voip).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Stereo,
+                Application::Voip,
+            )
+            .unwrap();
             enc.set_bitrate(Bitrate::BitsPerSecond(56000)).unwrap();
             enc.set_complexity(5).unwrap();
             let c_packets = c_enc.encode_all(pcm, frame);
@@ -446,7 +480,12 @@ fn a_small_output_buffer_lowers_the_bitrate_the_decisions_go_by() {
                             let frame = rate * frame_ms / 1000;
                             let mut c_enc = CEncoder::new(rate, channels, *c_app);
                             c_enc.bitrate(bitrate).complexity(5);
-                            let mut enc = OpusEncoder::new(rate as i32, channels, *app).unwrap();
+                            let mut enc = OpusEncoder::new(
+                                SampleRate::try_from(rate as i32).unwrap(),
+                                Channels::try_from(channels).unwrap(),
+                                *app,
+                            )
+                            .unwrap();
                             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                             enc.set_complexity(5).unwrap();
                             let mut buf = vec![0u8; max_bytes];
@@ -494,7 +533,12 @@ fn bandwidth_changes_in_a_running_stream_follow_libopus() {
         let frame = rate / 50;
         let mut c_enc = CEncoder::new(rate, channels, APP_VOIP);
         c_enc.force_mode(MODE_SILK).bitrate(20000 * channels as i32).complexity(5);
-        let mut enc = OpusEncoder::new(rate as i32, channels, Application::Voip).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            Application::Voip,
+        )
+        .unwrap();
         enc.set_force_mode(Some(ForcedMode::SilkOnly));
         enc.set_bitrate(Bitrate::BitsPerSecond(20000 * channels as i32)).unwrap();
         enc.set_complexity(5).unwrap();
@@ -524,16 +568,19 @@ fn bandwidth_changes_in_a_running_stream_follow_libopus() {
 
 #[test]
 fn the_maximum_bandwidth_must_be_a_bandwidth() {
-    let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     assert!(enc.set_max_bandwidth(Bandwidth::Auto).is_err());
     assert!(enc.set_max_bandwidth(Bandwidth::Wideband).is_ok());
     // `Auto` clears a forced bandwidth: the packets are those of an encoder
     // that never had one.
     let pcm = speech(48000, 1, 0.5);
-    let mut cleared = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut cleared =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     cleared.set_bandwidth(Bandwidth::Narrowband);
     cleared.set_bandwidth(Bandwidth::Auto);
-    let mut plain = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut plain =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     assert_eq!(encode_all(&mut cleared, &pcm, 960), encode_all(&mut plain, &pcm, 960));
 }
 
@@ -561,7 +608,12 @@ fn lfe_is_celt_only_narrowband() {
                         .collect();
                     let mut c_enc = CEncoder::new(rate, 1, c_app);
                     c_enc.lfe(true).force_mode(c_mode).bandwidth(BW_FB).bitrate(16000);
-                    let mut enc = OpusEncoder::new(rate as i32, 1, app).unwrap();
+                    let mut enc = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::Mono,
+                        app,
+                    )
+                    .unwrap();
                     enc.set_lfe(true);
                     assert!(enc.lfe());
                     enc.set_force_mode(Some(mode));
@@ -581,10 +633,12 @@ fn lfe_is_celt_only_narrowband() {
     }
     // Switching the flag off gives the normal choice back.
     let pcm = speech(48000, 1, 0.3);
-    let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     enc.set_lfe(true);
     enc.set_lfe(false);
-    let mut plain = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut plain =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     assert_eq!(encode_all(&mut enc, &pcm, 960), encode_all(&mut plain, &pcm, 960));
 }
 
@@ -593,12 +647,14 @@ fn lfe_is_celt_only_narrowband() {
 #[test]
 fn energy_mask_is_stored() {
     let pcm = speech(48000, 2, 0.3);
-    let mut enc = OpusEncoder::new(48000, 2, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     assert_eq!(enc.energy_mask(), None);
     let mask: Vec<f32> = (0..50).map(|i| -0.1 * i as f32).collect();
     enc.set_energy_mask(Some(&mask));
     assert_eq!(enc.energy_mask(), Some(&mask[..42]));
-    let mut plain = OpusEncoder::new(48000, 2, Application::Audio).unwrap();
+    let mut plain =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     assert_ne!(encode_all(&mut enc, &pcm, 960), encode_all(&mut plain, &pcm, 960));
     // Too short for two channels: the mask is cleared, nothing panics.
     enc.set_energy_mask(Some(&mask[..41]));
@@ -607,7 +663,8 @@ fn energy_mask_is_stored() {
     enc.set_energy_mask(None);
     assert_eq!(enc.energy_mask(), None);
     // A mono encoder keeps 21 values.
-    let mut mono = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut mono =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     mono.set_energy_mask(Some(&mask));
     assert_eq!(mono.energy_mask(), Some(&mask[..21]));
     // A reset clears the mask, as in libopus.
@@ -631,7 +688,12 @@ fn final_range_run(stream: RangeStream) -> (usize, usize, usize) {
     let (rate, channels, mode, bandwidth, bitrate, frame_2_5ms, cbr, fec) = stream;
     let pcm = speech(rate, channels, 1.5);
     let frame = rate / 400 * frame_2_5ms;
-    let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_force_mode(Some(mode));
     enc.set_bandwidth(bandwidth);
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
@@ -640,7 +702,11 @@ fn final_range_run(stream: RangeStream) -> (usize, usize, usize) {
     enc.set_packet_loss_perc(if fec { 15 } else { 0 }).unwrap();
     assert_eq!(enc.final_range(), 0, "before the first packet");
     let mut c_dec = CDecoder::new(rate, channels);
-    let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let mut buf = vec![0u8; 4000];
     let mut out = vec![0f32; frame * channels];
     let (mut packets, mut differs_from_c, mut differs_from_rs) = (0, 0, 0);
@@ -741,7 +807,12 @@ fn stereo_hybrid_keeps_the_band_above_8_khz() {
         .collect();
     let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
     c_enc.force_mode(MODE_HYBRID).bandwidth(BW_FB).bitrate(64000);
-    let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_force_mode(Some(ForcedMode::Hybrid));
     enc.set_bandwidth(Bandwidth::Fullband);
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
@@ -761,7 +832,8 @@ fn stereo_hybrid_keeps_the_band_above_8_khz() {
 #[test]
 fn final_range_is_zero_without_coded_data() {
     for cbr in [false, true] {
-        let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
         enc.set_vbr(!cbr);
         let pcm = speech(16000, 1, 0.4);
         let mut c_dec = CDecoder::new(16000, 1);
@@ -807,13 +879,23 @@ fn reset_state_gives_a_new_encoder_with_the_same_settings() {
             let pcm = speech(rate, channels, 1.0);
             let frame = rate / 50;
             let (first, second) = pcm.split_at(pcm.len() / 2);
-            let mut used = OpusEncoder::new(rate as i32, channels, app).unwrap();
+            let mut used = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                app,
+            )
+            .unwrap();
             setup(&mut used);
             encode_all(&mut used, first, frame);
             used.reset_state();
             assert_eq!(used.final_range(), 0);
-            assert_eq!((used.sampling_rate(), used.channels(), used.lfe()), (rate as i32, channels, lfe));
-            let mut fresh = OpusEncoder::new(rate as i32, channels, app).unwrap();
+            assert_eq!((used.sampling_rate().hz(), used.channels().count(), used.lfe()), (rate as u32, channels, lfe));
+            let mut fresh = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                app,
+            )
+            .unwrap();
             setup(&mut fresh);
             assert_eq!(
                 encode_all(&mut used, second, frame),
@@ -840,7 +922,12 @@ fn fec_decision_after_a_reset_matches_libopus() {
         let pcm = speech(rate, 1, 1.0);
         let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
         c_enc.complexity(5).vbr(false).fec(true, 30).max_bandwidth(BW_WB);
-        let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::Mono,
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_complexity(5).unwrap();
         enc.set_vbr(false);
         enc.set_inband_fec(true);
@@ -884,9 +971,14 @@ fn lookahead_matches_libopus() {
         for channels in [1usize, 2] {
             for (app_name, c_app, app) in APPS {
                 let mut c_enc = CEncoder::new(rate, channels, c_app);
-                let enc = OpusEncoder::new(rate as i32, channels, app).unwrap();
+                let enc = OpusEncoder::new(
+                    SampleRate::try_from(rate as i32).unwrap(),
+                    Channels::try_from(channels).unwrap(),
+                    app,
+                )
+                .unwrap();
                 assert_eq!(enc.lookahead(), c_enc.lookahead() as usize, "{rate} Hz, {app_name}");
-                assert_eq!((enc.sampling_rate(), enc.channels()), (rate as i32, channels));
+                assert_eq!((enc.sampling_rate().hz(), enc.channels().count()), (rate as u32, channels));
             }
         }
     }
@@ -931,7 +1023,12 @@ fn silk_voice_activity_flag_of_digital_silence_is_libopus() {
         }
         for (name, c_app, app) in [("VoIP", APP_VOIP, Application::Voip), ("audio", APP_AUDIO, Application::Audio)] {
             let frame = rate / 50;
-            let mut enc = OpusEncoder::new(rate as i32, 1, app).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Mono,
+                app,
+            )
+            .unwrap();
             enc.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
             enc.set_force_mode(Some(ForcedMode::SilkOnly));
             let mut c_enc = CEncoder::new(rate, 1, c_app);

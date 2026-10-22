@@ -2,10 +2,11 @@
 //!
 //! Each test mirrors the minimal reproducer from the corresponding issue.
 
-use opus1::{Bitrate, OpusDecoder};
+use opus1::{Bitrate, Channels, OpusDecoder, SampleRate};
 
 fn try_decode(label: &str, pkt: &[u8], frame_size: usize, channels: usize) {
-    let mut dec = OpusDecoder::new(48000, channels).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(channels).unwrap()).unwrap();
     let mut pcm = vec![0.0f32; frame_size * channels];
     match dec.decode(pkt, frame_size, &mut pcm) {
         Ok(n) => println!("{label}: Ok({n})"),
@@ -24,7 +25,7 @@ fn issue_10_code2_first_frame_200_bytes() {
     let mut a = vec![0xfa_u8, 0xC8];
     a.extend(std::iter::repeat_n(0xAA, 200)); // frame 1
     a.extend(std::iter::repeat_n(0xBB, 50)); // frame 2
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&a, 1920, &mut pcm);
     assert!(
@@ -40,7 +41,7 @@ fn issue_10_code3_vbr_first_frame_300_bytes() {
     let mut b = vec![0xfb_u8, 0x82, 252, 12];
     b.extend(std::iter::repeat_n(0xAA, 300));
     b.extend(std::iter::repeat_n(0xBB, 50));
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&b, 1920, &mut pcm);
     assert!(
@@ -56,7 +57,7 @@ fn issue_10_control_code2_first_frame_100_bytes() {
     let mut c = vec![0xfa_u8, 100];
     c.extend(std::iter::repeat_n(0xAA, 100));
     c.extend(std::iter::repeat_n(0xBB, 50));
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&c, 1920, &mut pcm);
     assert!(res.is_ok(), "control should decode, got: {res:?}");
@@ -71,7 +72,7 @@ fn issue_6_code3_cbr_vbr0_multi_frame() {
     // TOC 0xbb: CELT, 20 ms frames, code 3. Count byte 0x03: V=0 (CBR), M=3.
     // Remaining 6 bytes = 3 frames x 2 bytes, no length fields.
     let pkt: [u8; 8] = [0xbb, 0x03, 0xff, 0xfe, 0xff, 0xfe, 0xff, 0xfe];
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 2880]; // 3 x 20 ms @ 48 kHz
     match dec.decode(&pkt, 2880, &mut pcm) {
         Ok(n) => println!("decoded {n} samples (expected)"),
@@ -96,7 +97,7 @@ fn issue_5_silk_60ms_no_panic_wb_mono() {
     // internal_frame_size = 60ms * 16kHz = 960 samples (mono).
     // Before fix: w_pcm_i16 has only 640 slots -> slice[..960] panics.
     let pkt = vec![0x58_u8, 0x00];
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 2880]; // 60ms @ 48kHz
     // We expect a decode error (garbage payload) but NOT a panic.
     let _ = dec.decode(&pkt, 2880, &mut pcm);
@@ -114,7 +115,7 @@ fn issue_5_silk_40ms_stereo_no_panic() {
     // So toc = 0x40 | (2<<3) | 0x04 | code0 = 0x40 | 0x10 | 0x04 = 0x54.
     let toc: u8 = 0x54; // SILK WB 40ms stereo code 0
     let pkt = vec![toc, 0x00];
-    let mut dec = OpusDecoder::new(48000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; 2 * 1920]; // 40ms @ 48kHz stereo
     // Before fix: internal 40ms*16k*2ch = 1280 > 640 -> panic.
     let _ = dec.decode(&pkt, 1920, &mut pcm);
@@ -127,7 +128,7 @@ fn issue_5_silk_40ms_stereo_no_panic() {
 fn code1_odd_length_rejected() {
     // TOC 0xE9 = CELT 20ms mono code 1. 5 data bytes = odd -> invalid.
     let pkt = [0xE9_u8, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&pkt, 1920, &mut pcm);
     assert!(
@@ -140,7 +141,7 @@ fn code1_odd_length_rejected() {
 fn code1_even_length_accepted() {
     // Same shape, but 6 data bytes (even) -> two equal 3-byte frames.
     let pkt = [0xE9_u8, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&pkt, 1920, &mut pcm);
     assert!(res.is_ok(), "even-length code 1 should decode, got {res:?}");
@@ -152,7 +153,7 @@ fn code1_even_length_accepted() {
 #[test]
 fn issue_7_frame_size_zero_no_panic() {
     let pkt = [0xF8_u8, 0x00, 0x00, 0x00, 0x00]; // CELT 20ms mono
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![];
     let res = dec.decode(&pkt, 0, &mut pcm);
     assert!(res.is_err(), "frame_size=0 should Err, got {res:?}");
@@ -162,7 +163,7 @@ fn issue_7_frame_size_zero_no_panic() {
 fn issue_7_frame_size_too_small_no_panic() {
     // Correct frame_size for CELT 20ms @ 48kHz mono is 960; pass 120.
     let pkt = [0xF8_u8, 0x00, 0x00, 0x00, 0x00];
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 120];
     let res = dec.decode(&pkt, 120, &mut pcm);
     assert!(res.is_err(), "too-small frame_size should Err, got {res:?}");
@@ -172,7 +173,7 @@ fn issue_7_frame_size_too_small_no_panic() {
 fn issue_7_decode_returns_actual_sample_count() {
     // CELT 20ms @ 48kHz mono → should return 960, not whatever frame_size was passed.
     let pkt = [0xF8_u8, 0x00, 0x00, 0x00, 0x00];
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![7.0f32; 1920]; // pass double the needed size
     let n = dec.decode(&pkt, 1920, &mut pcm).unwrap();
     assert_eq!(
@@ -209,7 +210,8 @@ fn libopus_stereo_silk(l: impl Fn(f64) -> f32, r: impl Fn(f64) -> f32) -> (Vec<f
     enc.set_signal(CSignal::Voice).unwrap();
     enc.set_force_channels(Some(CCh::Stereo)).unwrap();
     let mut c_dec = CDec::new(sr, CCh::Stereo).unwrap();
-    let mut rs_dec = OpusDecoder::new(sr as i32, 2).unwrap();
+    let mut rs_dec =
+        OpusDecoder::new(SampleRate::try_from(sr as i32).unwrap(), Channels::Stereo).unwrap();
 
     let (mut rs_out, mut c_out) = (Vec::new(), Vec::new());
     let (mut pkt, mut buf) = (vec![0u8; 1500], vec![0f32; fs * 2]);
@@ -313,7 +315,7 @@ fn silk_plc_produces_concealment_audio() {
     use opus1::{Application, OpusDecoder, OpusEncoder};
     let sr = 16000;
     let fs = 320;
-    let mut enc = OpusEncoder::new(sr, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
     // Encode several frames of a sine wave.
@@ -330,7 +332,7 @@ fn silk_plc_produces_concealment_audio() {
         packets.push(pkt[..n].to_vec());
     }
 
-    let mut dec = OpusDecoder::new(sr, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     for pkt in &packets {
         let mut buf = vec![0.0f32; 640];
         dec.decode(pkt, fs, &mut buf).unwrap();

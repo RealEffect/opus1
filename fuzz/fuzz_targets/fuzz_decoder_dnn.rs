@@ -39,7 +39,7 @@ use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::multistream::MultistreamDecoder;
 use opus1::packet::{self, Repacketizer};
-use opus1::{OpusDecoder, OpusDred, OpusDredDecoder};
+use opus1::{Channels, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate};
 use std::sync::OnceLock;
 
 /// A NaN with a payload no decoder writes: marks samples not written.
@@ -111,8 +111,8 @@ fn pool_packet(u: &mut Unstructured, streams: Option<usize>) -> Result<Vec<u8>> 
     let packets = &pool().packets;
     let first = &packets[u.choose_index(packets.len())?];
     let Some(streams) = streams else { return Ok(first.clone()) };
-    let duration = packet::nb_samples(first, 48000).unwrap();
-    let same: Vec<&Vec<u8>> = packets.iter().filter(|p| packet::nb_samples(p, 48000) == Ok(duration)).collect();
+    let duration = packet::nb_samples(first, SampleRate::Hz48000).unwrap();
+    let same: Vec<&Vec<u8>> = packets.iter().filter(|p| packet::nb_samples(p, SampleRate::Hz48000) == Ok(duration)).collect();
     let mut out = Vec::new();
     for s in 0..streams {
         let p = if s == 0 { first } else { same[u.choose_index(same.len())?] };
@@ -135,6 +135,7 @@ fn check_f32(out: &[f32], n: usize, channels: usize, what: &str) {
 
 fn run(u: &mut Unstructured) -> Result<()> {
     let fs = *u.choose(&RATES)?;
+    let rate = SampleRate::try_from(fs).unwrap();
     let (mut dec, channels, streams) = if u.ratio(1, 4)? {
         let streams = u.int_in_range(1..=3)?;
         let coupled = u.int_in_range(0..=streams)?;
@@ -143,11 +144,11 @@ fn run(u: &mut Unstructured) -> Result<()> {
         for _ in 0..channels {
             mapping.push(if u.ratio(1, 10)? { 255 } else { u.int_in_range(0..=(streams + coupled - 1) as u8)? });
         }
-        let Ok(d) = MultistreamDecoder::with_layout(fs, channels, streams, coupled, &mapping) else { return Ok(()) };
+        let Ok(d) = MultistreamDecoder::with_layout(rate, channels, streams, coupled, &mapping) else { return Ok(()) };
         (Dec::Multi(d), channels, Some(streams))
     } else {
         let channels = u.int_in_range(1..=2)?;
-        (Dec::One(OpusDecoder::new(fs, channels).unwrap()), channels, None)
+        (Dec::One(OpusDecoder::new(rate, Channels::try_from(channels).unwrap()).unwrap()), channels, None)
     };
     // Mostly the complexities that run the networks.
     dec.set_complexity(if u.ratio(3, 4)? { u.int_in_range(5..=10)? } else { u.int_in_range(0..=4)? }).unwrap();
@@ -212,7 +213,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
             }
             9 => {
                 let p = pool_packet(u, streams)?;
-                let fec = match packet::nb_samples(&p, fs) {
+                let fec = match packet::nb_samples(&p, rate) {
                     Ok(d) if u.ratio(3, 4)? => d,
                     _ => unit * u.int_in_range(1..=48)?,
                 };
@@ -246,7 +247,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 let p = &dred_packets[u.choose_index(dred_packets.len())?];
                 let mut dred = OpusDred::new();
                 let max = u.int_in_range(0..=fs)?;
-                let Ok(found) = dred_decoder().parse(&mut dred, p, max, fs, u.arbitrary()?) else { continue };
+                let Ok(found) = dred_decoder().parse(&mut dred, p, max, rate, u.arbitrary()?) else { continue };
                 if !dred.is_processed() && u.arbitrary()? {
                     let _ = dred_decoder().process_in_place(&mut dred);
                 }

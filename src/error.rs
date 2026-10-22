@@ -60,9 +60,9 @@ impl ErrorKind {
 /// sentence.
 ///
 /// ```
-/// use opus1::{Application, ErrorKind, OpusEncoder};
+/// use opus1::{ErrorKind, SampleRate};
 ///
-/// let err = OpusEncoder::new(44100, 2, Application::Audio).err().unwrap();
+/// let err = SampleRate::try_from(44100u32).unwrap_err();
 /// assert_eq!(err.kind(), ErrorKind::BadArg);
 /// assert_eq!(err.to_raw(), -1);
 /// assert_eq!(err.to_string(), "invalid sampling rate");

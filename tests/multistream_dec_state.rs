@@ -30,7 +30,7 @@ mod multistream_dec_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_dec_common::*;
-use opus1::{OpusDecoder, pcm_soft_clip};
+use opus1::{Channels, OpusDecoder, SampleRate, pcm_soft_clip};
 use std::f64::consts::PI;
 
 const OPUS_SET_FORCE_CHANNELS_REQUEST: i32 = 4022;
@@ -495,7 +495,7 @@ fn route<T: Copy + Default>(e: &Encoded, decoded: &[Vec<T>], samples: usize) -> 
 fn run_steps_against_stream_decoders(e: &Encoded, fs: i32, steps: &[Step]) -> usize {
     let mut c_dec = RawCDecoder::for_packets(e, fs);
     let (_, mut ms) = e.decoders(fs);
-    let mut singles: Vec<OpusDecoder> = (0..e.streams).map(|s| OpusDecoder::new(fs, if s < e.coupled { 2 } else { 1 }).unwrap()).collect();
+    let mut singles: Vec<OpusDecoder> = (0..e.streams).map(|s| OpusDecoder::new(SampleRate::try_from(fs).unwrap(), Channels::try_from(if s < e.coupled { 2 } else { 1 }).unwrap()).unwrap()).collect();
     let mut clip_memory = vec![[0f32; 2]; e.streams];
     let ch = e.channels;
     let unit = fs as usize / 400;

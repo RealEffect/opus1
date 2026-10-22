@@ -14,7 +14,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 /// Packets from the C encoder: speech (the 16 kHz recording, resampled),
 /// with the mode and bandwidth forced.
@@ -58,7 +58,11 @@ fn a_loss_of_any_duration_is_concealed_like_libopus() {
         for lost_2_5ms in [1usize, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 48] {
             let lost = rate / 400 * lost_2_5ms;
             let mut c_dec = CDecoder::new(rate, channels);
-            let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+            let mut dec = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let mut buf = vec![0f32; frame.max(lost) * channels];
             let mut worst = 200f64;
             let mut losses = 0;
@@ -96,7 +100,11 @@ fn a_long_loss_with_16_bit_output_is_concealed_like_libopus() {
         let frame = rate / 400 * frame_2_5ms;
         let packets = c_packets(rate, channels, MODE_SILK, bandwidth, bitrate, frame, true);
         let mut c_dec = CDecoder::new(rate, channels);
-        let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+        let mut dec = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let long = rate / 400 * 136; // 340 ms
         let mut buf = vec![0i16; long.max(frame) * channels];
         for (i, p) in packets.iter().enumerate().take(24) {
@@ -128,7 +136,8 @@ fn a_long_loss_with_a_broken_fec_packet_changes_nothing() {
     let (rate, frame) = (16000usize, 320usize);
     let packets = c_packets(rate, 1, MODE_SILK, BW_WB, 28000, frame, true);
     let mut c_dec = CDecoder::new(rate, 1);
-    let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
     let long = 10 * frame;
     let mut buf = vec![0i16; long];
     for (i, p) in packets.iter().enumerate().take(30) {
@@ -163,7 +172,11 @@ fn fec_decode_as_the_first_call_matches_libopus() {
         for lost_frames in [1usize, 2, 3] {
             let size = frame * lost_frames;
             let mut c_dec = CDecoder::new(rate, 1);
-            let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+            let mut dec = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Mono,
+            )
+            .unwrap();
             let mut buf = vec![0f32; size];
             for round in 0..3 {
                 let first = 10 + 7 * round;
@@ -200,7 +213,8 @@ fn reset_state_between_modes_matches_libopus() {
     let frame = 960;
     let pcm = multitone(rate, rate * 3 / 2);
     let mut c_dec = CDecoder::new(rate, 1);
-    let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
     let mut buf = vec![0f32; frame];
     let mut buf16 = vec![0i16; frame];
     for (name, mode, bandwidth, bitrate) in [
@@ -258,8 +272,10 @@ fn fec_decode_after_celt_only_packets_conceals() {
             packets.push(enc.encode(input));
         }
         let mut c_dec = CDecoder::new(rate, 1);
-        let mut with_fec_call = OpusDecoder::new(rate as i32, 1).unwrap();
-        let mut with_loss_call = OpusDecoder::new(rate as i32, 1).unwrap();
+        let mut with_fec_call =
+            OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
+        let mut with_loss_call =
+            OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
         let (mut a, mut b) = (vec![0f32; frame], vec![0f32; frame]);
         let mut checked = 0;
         let mut i = 0;
@@ -335,7 +351,8 @@ fn hybrid_fec_matches_libopus_below_6_khz() {
         let packets = enc.encode_all(&speech_fullband(rate, 2.0), frame);
         assert!(packets.iter().all(|p| p[0] & 0xE0 == 0x60), "{name}: Hybrid packets");
         let mut c_dec = CDecoder::new(rate, 1);
-        let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+        let mut dec =
+            OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
         let mut buf = vec![0f32; frame];
         let (mut c_out, mut rs_out) = (Vec::new(), Vec::new());
         let mut recovered = Vec::new();

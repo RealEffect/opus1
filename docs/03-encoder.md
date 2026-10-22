@@ -176,7 +176,7 @@ The bandwidth and FEC decisions use the equivalent rate for the mode just chosen
 The first example below shows the switch for a 16 kHz `Voip` encoder at complexity 6. From complexity 7 on, the speech and music analysis estimates `voice_est` from the input instead, and would take the tone of the example for music. At 64 100 b/s the equivalent rate is 61 536 b/s, below the threshold, and the packet is SILK. At 64 200 b/s it is 61 632 b/s, and the packet is CELT-only.
 
 ```rust
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 // The top five bits of the TOC byte are the configuration number
 // (RFC 6716 section 3.1).
@@ -194,7 +194,7 @@ let pcm: Vec<f32> = (0..320)
     .collect();
 let mut packet = vec![0u8; 1276];
 for (bitrate, expected) in [(64_100, "SILK-only"), (64_200, "CELT-only")] {
-    let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
+    let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     encoder.set_complexity(6).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     let len = encoder.encode(&pcm, 320, &mut packet).unwrap();
@@ -263,11 +263,11 @@ A frame whose filtered samples have a sum of squares of 1e9 or more, or that hol
 The CELT layer codes the signal 4 ms late. This lines it up with SILK, whose resampler and analysis add their own delay. The encoder keeps 10 ms of filtered input in `delay_buffer`. It builds `pcm_buf` (the field `buf_celt_pcm`) from the last 4 ms of that buffer followed by the filtered frame. CELT codes the first `frame_size` samples of `pcm_buf`. `RestrictedLowDelay` has no 4 ms delay and no delay buffer. The total delay is `lookahead()`: 2.5 ms of CELT window overlap plus the 4 ms.
 
 ```rust
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Channels, OpusEncoder, SampleRate};
 
-let encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 assert_eq!(encoder.lookahead(), 312); // 2.5 ms + 4 ms at 48 kHz
-let low_delay = OpusEncoder::new(48_000, 1, Application::RestrictedLowDelay).unwrap();
+let low_delay = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::RestrictedLowDelay).unwrap();
 assert_eq!(low_delay.lookahead(), 120); // 2.5 ms
 ```
 
@@ -369,9 +369,9 @@ Longer frames are split into parts, as libopus splits them (opus_encoder.c lines
 libopus 1.6 also limits each part of a VBR packet to what the bitrate gives one part (opus_encoder.c line 1785). That limit is left out on purpose. In libopus it costs up to 23 decibels (dB) of signal-to-noise ratio with in-band FEC on.
 
 ```rust
-use opus1::{Application, OpusEncoder};
+use opus1::{Application, Channels, OpusEncoder, SampleRate};
 
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 let pcm = vec![0.0f32; 2880]; // 60 ms at 48 kHz
 let mut packet = vec![0u8; 1276];
 let len = encoder.encode(&pcm, 2880, &mut packet).unwrap();
@@ -690,7 +690,7 @@ All settings take effect with the next call of `encode`. Each one is a method of
 | `set_force_mode(Option<ForcedMode>)` | `OPUS_SET_FORCE_MODE` (in libopus's private header `opus_private.h`) | `None` | Asks for SILK-only, Hybrid or CELT-only. The rules that keep a packet valid still apply (1.4): frames under 10 ms are CELT-only, SILK above wideband becomes Hybrid, Hybrid at wideband or below becomes SILK-only. |
 | `set_bandwidth(Bandwidth)` | `OPUS_SET_BANDWIDTH` | `Bandwidth::Auto` | Codes this bandwidth instead of the automatic one. It never exceeds half the API rate. CELT codes mediumband as wideband. A running SILK encoder moves to it one step at a time. |
 | `set_max_bandwidth(Bandwidth)` | `OPUS_SET_MAX_BANDWIDTH` | `Bandwidth::Fullband` | The widest bandwidth the automatic choice may take. `Bandwidth::Auto` is an error. |
-| `set_force_channels(Option<usize>)` | `OPUS_SET_FORCE_CHANNELS` | `None` | Codes 1 or 2 channels instead of the automatic choice. More than the input has is an error. A packet made of several frames (1.6) that changes to mono sets it to `Some(1)` itself, as libopus does. |
+| `set_force_channels(Option<Channels>)` | `OPUS_SET_FORCE_CHANNELS` | `None` | Codes mono or stereo instead of the automatic choice. A mono encoder codes mono whatever is set (libopus refuses stereo there). A packet made of several frames (1.6) that changes to mono sets it to `Some(Channels::Mono)` itself, as libopus does. |
 | `set_inband_fec(bool)` | `OPUS_SET_INBAND_FEC` 0 and 1 | `false` | Allows LBRR copies in SILK and Hybrid packets (1.4, 2.9). With packet loss above the voice-dependent limit it also makes the encoder prefer SILK. |
 | `set_inband_fec_mode(InbandFec)` | `OPUS_SET_INBAND_FEC` 0, 1 and 2 | `InbandFec::Off` | `On` is `set_inband_fec(true)`. `OnUnlessMusic` does not move the encoder to SILK for FEC when the speech estimate is 25 or less (1.4). |
 | `set_signal(Signal)` | `OPUS_SET_SIGNAL` | `Signal::Auto` | `Voice` and `Music` replace the speech estimate of the analysis with 127 and 0 (1.3, 1.4). |
@@ -712,9 +712,9 @@ All settings take effect with the next call of `encode`. Each one is a method of
 This example sets several controls at once and checks the packet they give. The output is a mono SILK wideband packet of exactly 80 bytes: 32 kilobits per second (kb/s) for 20 ms is 640 bits.
 
 ```rust
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
-let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(32_000)).unwrap(); // OPUS_SET_BITRATE
 encoder.set_vbr(false); // OPUS_SET_VBR(0)
 encoder.set_complexity(5).unwrap(); // OPUS_SET_COMPLEXITY
@@ -722,7 +722,7 @@ encoder.set_inband_fec(true); // OPUS_SET_INBAND_FEC(1)
 encoder.set_packet_loss_perc(10).unwrap(); // OPUS_SET_PACKET_LOSS_PERC
 encoder.set_force_mode(Some(ForcedMode::SilkOnly)); // OPUS_SET_FORCE_MODE
 encoder.set_bandwidth(Bandwidth::Wideband); // OPUS_SET_BANDWIDTH
-encoder.set_force_channels(Some(1)).unwrap(); // OPUS_SET_FORCE_CHANNELS
+encoder.set_force_channels(Some(Channels::Mono)); // OPUS_SET_FORCE_CHANNELS
 
 let pcm = vec![0.0f32; 960 * 2]; // 20 ms of stereo silence at 48 kHz
 let mut packet = vec![0u8; 1276];
@@ -735,13 +735,13 @@ assert_eq!(packet[0] & 0x04, 0); // the stereo bit is clear: one coded channel
 This example shows that the two entry points give the same packets when the float encoder codes with the precision of 16-bit input:
 
 ```rust
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 let pcm16: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.07).sin() * 8000.0) as i16).collect();
 let pcm32: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
 
-let mut a = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
-let mut b = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
+let mut a = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
+let mut b = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 a.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
 b.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
 b.set_lsb_depth(16).unwrap(); // what encode_i16 uses

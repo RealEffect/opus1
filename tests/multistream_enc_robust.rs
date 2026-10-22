@@ -13,7 +13,9 @@ mod multistream_enc_common;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bandwidth, Bitrate, ErrorKind, ForcedMode, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ErrorKind, ForcedMode, OpusEncoder, SampleRate,
+};
 
 /// A small deterministic random number generator.
 struct Lcg(u32);
@@ -393,7 +395,12 @@ fn silk_mediumband_10_ms_after_a_change_has_the_decoders_final_range() {
     for (fs, celt_frame) in [(12_000, false), (16_000, true)] {
         for application in [Application::Voip, Application::Audio] {
             for bitrate in [12_000, 20_000, 32_000] {
-                let mut enc = OpusEncoder::new(fs, 1, application).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(fs).unwrap(),
+                    Channels::Mono,
+                    application,
+                )
+                .unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                 enc.set_complexity(3).unwrap();
                 let mut dec = CDecoder::new(fs, 1);

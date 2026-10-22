@@ -12,7 +12,9 @@
 mod dnn_plc_common;
 
 use opus1::multistream::MultistreamDecoder;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+};
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
 use std::cell::Cell;
 
@@ -78,7 +80,12 @@ fn speech48(channels: usize) -> Vec<f32> {
 /// 20 ms packets of opus1's encoder at 48 kHz in `mode`.
 fn packets(mode: ForcedMode, channels: usize) -> Vec<Vec<u8>> {
     let pcm = speech48(channels);
-    let mut enc = OpusEncoder::new(48000, channels, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::try_from(channels).unwrap(),
+        Application::Voip,
+    )
+    .unwrap();
     enc.set_force_mode(Some(mode));
     enc.set_bandwidth(if mode == ForcedMode::SilkOnly { Bandwidth::Wideband } else { Bandwidth::Fullband });
     enc.set_bitrate(Bitrate::BitsPerSecond(24000 * channels as i32)).unwrap();
@@ -94,7 +101,7 @@ fn packets(mode: ForcedMode, channels: usize) -> Vec<Vec<u8>> {
 /// Decodes `packets` with `lost(k)` packets concealed, and returns the
 /// output.
 fn decode(d: &mut OpusDecoder, packets: &[Vec<u8>], lost: impl Fn(usize) -> bool) -> Vec<f32> {
-    let channels = d.channels();
+    let channels = d.channels().count();
     let mut out = Vec::new();
     let mut buf = vec![0f32; 960 * channels];
     for (k, p) in packets.iter().enumerate() {
@@ -118,7 +125,11 @@ fn decoding_with_deep_plc_allocates_nothing() {
     for mode in MODES {
         for channels in [1, 2] {
             let packets = packets(mode, channels);
-            let mut d = OpusDecoder::new(48000, channels).unwrap();
+            let mut d = OpusDecoder::new(
+                SampleRate::Hz48000,
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             d.set_complexity(5).unwrap();
             let mut buf = vec![0f32; 960 * channels];
             let mut buf16 = vec![0i16; 960 * channels];
@@ -140,7 +151,7 @@ fn decoding_with_deep_plc_allocates_nothing() {
     }
     // Two mono streams that carry the same packets.
     let ms_packets: Vec<Vec<u8>> = packets(ForcedMode::CeltOnly, 1).iter().map(|p| ms_packet(p)).collect();
-    let mut ms = MultistreamDecoder::with_layout(48000, 2, 2, 0, &[0, 1]).unwrap();
+    let mut ms = MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
     ms.set_complexity(5).unwrap();
     let mut buf = vec![0f32; 960 * 2];
     let n = allocations_of(|| {
@@ -181,7 +192,11 @@ fn decoding_with_deep_plc_fits_a_small_stack() {
     let mut decoders: Vec<OpusDecoder> = cases
         .iter()
         .map(|(_, channels, _)| {
-            let mut d = OpusDecoder::new(48000, *channels).unwrap();
+            let mut d = OpusDecoder::new(
+                SampleRate::Hz48000,
+                Channels::try_from(*channels).unwrap(),
+            )
+            .unwrap();
             d.set_complexity(5).unwrap();
             d
         })
@@ -212,12 +227,20 @@ fn without_loss_the_complexity_changes_nothing() {
     for mode in MODES {
         for channels in [1, 2] {
             let packets = packets(mode, channels);
-            let mut plain = OpusDecoder::new(48000, channels).unwrap();
+            let mut plain = OpusDecoder::new(
+                SampleRate::Hz48000,
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let want = decode(&mut plain, &packets, |_| false);
             let complexities: &[i32] =
                 if cfg!(feature = "osce") && mode != ForcedMode::CeltOnly { &[5] } else { &[5, 10] };
             for &complexity in complexities {
-                let mut d = OpusDecoder::new(48000, channels).unwrap();
+                let mut d = OpusDecoder::new(
+                    SampleRate::Hz48000,
+                    Channels::try_from(channels).unwrap(),
+                )
+                .unwrap();
                 d.set_complexity(complexity).unwrap();
                 assert!(same(&want, &decode(&mut d, &packets, |_| false)), "{mode:?} {channels} ch, complexity {complexity}");
             }
@@ -234,7 +257,7 @@ fn the_complexity_switches_deep_plc() {
     for mode in MODES {
         let packets = packets(mode, 1);
         let run = |complexity| {
-            let mut d = OpusDecoder::new(48000, 1).unwrap();
+            let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             d.set_complexity(complexity).unwrap();
             decode(&mut d, &packets, lost)
         };
@@ -253,19 +276,19 @@ fn a_reset_keeps_only_the_fargan_state() {
     let packets = packets(ForcedMode::SilkOnly, 1);
     let lost = |k: usize| k % 13 == 7;
     let fresh = {
-        let mut d = OpusDecoder::new(48000, 1).unwrap();
+        let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
         d.set_complexity(5).unwrap();
         decode(&mut d, &packets, lost)
     };
     // Packets decoded before the reset, no loss: deep PLC has only
     // appended history, which the reset clears.
-    let mut d = OpusDecoder::new(48000, 1).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     d.set_complexity(5).unwrap();
     decode(&mut d, &packets[..20], |_| false);
     d.reset_state();
     assert!(same(&fresh, &decode(&mut d, &packets, lost)), "a reset before any loss");
     // With losses before the reset.
-    let mut d = OpusDecoder::new(48000, 1).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     d.set_complexity(5).unwrap();
     decode(&mut d, &packets[..20], |k| k % 5 == 3);
     d.reset_state();
@@ -283,7 +306,11 @@ fn a_long_loss_stays_bounded() {
     for mode in MODES {
         for channels in [1, 2] {
             let packets = packets(mode, channels);
-            let mut d = OpusDecoder::new(48000, channels).unwrap();
+            let mut d = OpusDecoder::new(
+                SampleRate::Hz48000,
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             d.set_complexity(5).unwrap();
             let energy = |x: &[f32]| x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
             let mut buf = vec![0f32; 960 * channels];

@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 use audiopus_sys as sys;
+use opus1::{Channels, SampleRate};
 use std::f64::consts::PI;
 
 // ---------------------------------------------------------------------------
@@ -690,7 +691,11 @@ pub fn rs_decode_all(
     rate: usize,
     channels: usize,
 ) -> Result<Vec<f32>, (usize, opus1::Error)> {
-    let mut dec = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut dec = opus1::OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let max = rate * 120 / 1000;
     let mut pcm = vec![0f32; max * channels];
     let mut out = Vec::new();

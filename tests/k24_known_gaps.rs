@@ -7,6 +7,7 @@
 
 mod k24_common;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 
 fn rms_dbfs(x: &[f32]) -> f64 {
     let p: f64 = x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64;
@@ -24,7 +25,7 @@ fn loss_run(mode: i32, bw: i32, bitrate: i32) -> (f64, f64, f64, f64, f64) {
     let packets = enc.encode_all(&pcm, 480);
     let lost: Vec<bool> = (0..packets.len()).map(|i| i % 10 == 7).collect();
     let mut c_dec = CDec::new(24000, 1);
-    let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(SampleRate::Hz24000, Channels::Mono).unwrap();
     let (mut c, mut r) = (Vec::new(), Vec::new());
     let mut buf = vec![0f32; 480];
     for (i, p) in packets.iter().enumerate() {
@@ -137,7 +138,7 @@ fn lost_frames_are_recovered_from_in_band_fec() {
     let clean = c_decode_all(&packets, 24000, 1);
 
     let mut c_dec = CDec::new(24000, 1);
-    let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(SampleRate::Hz24000, Channels::Mono).unwrap();
     let (mut c, mut r) = (Vec::new(), Vec::new());
     let mut buf = vec![0f32; 480];
     for (i, p) in packets.iter().enumerate() {

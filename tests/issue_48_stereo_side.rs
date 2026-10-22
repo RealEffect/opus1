@@ -16,7 +16,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, Bandwidth, Bitrate, OpusDecoder, OpusEncoder, Signal};
+use opus1::{Application, Bandwidth, Bitrate, OpusDecoder, OpusEncoder, SampleRate, Signal};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -287,12 +287,17 @@ fn run(case: &Case) -> Measured {
     let packets = SECONDS * 1000 / case.frame_ms;
     let input = (case.signal)(sr, frame * packets);
 
-    let mut rs_enc = OpusEncoder::new(sr as i32, CH, Application::Voip).unwrap();
+    let mut rs_enc = OpusEncoder::new(
+        SampleRate::try_from(sr as i32).unwrap(),
+        opus1::Channels::Stereo,
+        Application::Voip,
+    )
+    .unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(case.bitrate)).unwrap();
     rs_enc.set_vbr(!case.cbr);
     // A stereo stream, as libopus below: both encoders would otherwise code
     // the input as mono below ~18 kb/s.
-    rs_enc.set_force_channels(Some(CH)).unwrap();
+    rs_enc.set_force_channels(Some(opus1::Channels::Stereo));
     // The signal type and the bandwidth, as for libopus below: opus1 runs
     // the speech and music analysis as libopus does, which would read the
     // tones as music and lower the bandwidth of signals without high
@@ -321,7 +326,11 @@ fn run(case: &Case) -> Measured {
         c_enc.set_packet_loss_perc(loss).unwrap();
     }
 
-    let mut rs_dec = OpusDecoder::new(sr as i32, CH).unwrap();
+    let mut rs_dec = OpusDecoder::new(
+        SampleRate::try_from(sr as i32).unwrap(),
+        opus1::Channels::Stereo,
+    )
+    .unwrap();
     let mut rs_by_rs = Vec::new();
     let mut streams = [(); 2].map(|_| {
         (

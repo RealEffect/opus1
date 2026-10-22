@@ -33,7 +33,7 @@
 #![cfg(feature = "analysis")]
 
 use opus::{Application as CApp, Bitrate, Channels as CCh, Decoder as CDec, Encoder as CEnc};
-use opus1::{Application, ForcedMode, OpusEncoder};
+use opus1::{Application, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 const PRE_SKIP: usize = 312;
 
@@ -60,7 +60,12 @@ fn input(rate: usize, level: f64) -> Vec<f32> {
 
 /// opus1's packets, CELT-only when `force_celt`.
 fn opus1_packets(rate: usize, bitrate: i32, level: f64, force_celt: bool) -> Vec<Vec<u8>> {
-    let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Mono,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(opus1::Bitrate::BitsPerSecond(bitrate)).unwrap();
     if force_celt {
         enc.set_force_mode(Some(ForcedMode::CeltOnly));

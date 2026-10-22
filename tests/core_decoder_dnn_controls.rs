@@ -16,7 +16,7 @@
 //! with a libopus that has it.
 
 use audiopus_sys as sys;
-use opus1::{ErrorKind, OpusDecoder};
+use opus1::{Channels, ErrorKind, OpusDecoder, SampleRate};
 use opus1::multistream::MultistreamDecoder;
 use std::os::raw::c_int;
 
@@ -73,7 +73,11 @@ fn code<T>(r: &Result<T, opus1::Error>) -> c_int {
 fn complexity_starts_at_0_and_takes_0_to_10_like_libopus() {
     for rate in [8000, 12000, 16000, 24000, 48000] {
         for channels in [1, 2] {
-            let mut d = OpusDecoder::new(rate, channels).unwrap();
+            let mut d = OpusDecoder::new(
+                SampleRate::try_from(rate).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let mut c = CDec::new(rate, channels as i32);
             assert_eq!(d.complexity(), 0);
             assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, 0));
@@ -98,7 +102,7 @@ fn complexity_starts_at_0_and_takes_0_to_10_like_libopus() {
 
 #[test]
 fn a_reset_keeps_the_complexity_like_libopus() {
-    let mut d = OpusDecoder::new(48000, 2).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut c = CDec::new(48000, 2);
     d.set_complexity(7).unwrap();
     c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, 7);
@@ -111,7 +115,7 @@ fn a_reset_keeps_the_complexity_like_libopus() {
 #[cfg(not(feature = "osce-bwe"))]
 #[test]
 fn bwe_requests_are_unimplemented_without_the_feature_like_libopus() {
-    let mut d = OpusDecoder::new(48000, 1).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut c = CDec::new(48000, 1);
     for on in [false, true] {
         let r = d.set_osce_bwe(on);
@@ -126,7 +130,7 @@ fn bwe_requests_are_unimplemented_without_the_feature_like_libopus() {
 #[cfg(feature = "osce-bwe")]
 #[test]
 fn the_bwe_switch_starts_off_and_survives_a_reset() {
-    let mut d = OpusDecoder::new(48000, 1).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     assert_eq!(d.osce_bwe(), Ok(false));
     d.set_osce_bwe(true).unwrap();
     assert_eq!(d.osce_bwe(), Ok(true));
@@ -203,10 +207,12 @@ fn the_controls_do_not_change_the_output_yet() {
     for bitrate in [12_000, 24_000] {
         let packets = packets(bitrate);
         for rate in [16000, 48000] {
-            let mut plain = OpusDecoder::new(rate, 1).unwrap();
+            let mut plain =
+                OpusDecoder::new(SampleRate::try_from(rate).unwrap(), Channels::Mono).unwrap();
             let want = decode_all(&mut plain, &packets, rate);
             for complexity in [0, 4, 5, 6, 7, 10] {
-                let mut d = OpusDecoder::new(rate, 1).unwrap();
+                let mut d =
+                    OpusDecoder::new(SampleRate::try_from(rate).unwrap(), Channels::Mono).unwrap();
                 d.set_complexity(complexity).unwrap();
                 let got = decode_all(&mut d, &packets, rate);
                 assert!(
@@ -260,7 +266,7 @@ fn surround() -> (MultistreamDecoder, CMsDec) {
         coupled_count: 2,
         mapping: mapping.to_vec(),
     };
-    (MultistreamDecoder::new(48000, table).unwrap(), CMsDec::new(48000, 6, 4, 2, &mapping))
+    (MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap(), CMsDec::new(48000, 6, 4, 2, &mapping))
 }
 
 #[test]
@@ -322,7 +328,7 @@ fn the_multistream_decoder_forwards_the_bwe_switch() {
 #[cfg(feature = "dnn")]
 mod blobs {
     use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
-    use opus1::{DnnBlob, DnnModels, ErrorKind, OpusDecoder};
+    use opus1::{Channels, DnnBlob, DnnModels, ErrorKind, OpusDecoder, SampleRate};
 
     const NO_MODEL: &str = "DNN blob holds no model of this build";
 
@@ -365,13 +371,13 @@ mod blobs {
 
     #[test]
     fn a_new_decoder_has_the_builtin_models_of_its_build() {
-        let d = OpusDecoder::new(48000, 2).unwrap();
+        let d = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
         assert_eq!(d.dnn_models(), all());
     }
 
     #[test]
     fn a_blob_without_a_model_of_this_build_changes_nothing() {
-        let mut d = OpusDecoder::new(16000, 1).unwrap();
+        let mut d = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
         let empty = DnnBlob::from_static(&EMPTY.0).unwrap();
         assert_eq!(kind_message(d.set_dnn_blob(&empty)), Err((ErrorKind::BadArg, NO_MODEL)));
         assert_eq!(d.dnn_models(), all());
@@ -411,7 +417,7 @@ mod blobs {
     #[cfg(all(feature = "heap", feature = "deep-plc"))]
     #[test]
     fn each_group_loads_on_its_own_and_a_reset_keeps_it() {
-        let mut d = OpusDecoder::new(48000, 1).unwrap();
+        let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
         // libopus's blob writer order: PitchDNN, FARGAN, PLC, (LACE, NoLACE).
         let mut bytes = file("pitchdnn.bin");
         bytes.extend(file("fargan.bin"));
@@ -438,7 +444,7 @@ mod blobs {
             bytes.extend(file(name));
         }
         let blob = DnnBlob::from_bytes(&bytes).unwrap();
-        let mut d = OpusDecoder::new(48000, 1).unwrap();
+        let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
         let want = DnnModels::DEEP_PLC.union(DnnModels::LACE).union(DnnModels::NOLACE);
         assert_eq!(d.set_dnn_blob(&blob), Ok(want));
         assert_eq!(d.dnn_models(), all());
@@ -463,7 +469,7 @@ mod blobs {
             bytes.extend(file("plc.bin"));
             let blob = DnnBlob::from_bytes(&bytes).unwrap();
             drop(bytes);
-            let mut d = OpusDecoder::new(16000, 1).unwrap();
+            let mut d = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
             assert_eq!(d.set_dnn_blob(&blob), Ok(DnnModels::DEEP_PLC));
             let other = blob.clone();
             drop(blob);
@@ -477,7 +483,7 @@ mod blobs {
     #[test]
     fn the_multistream_decoder_loads_a_blob_into_every_stream() {
         let table = ChannelMappingTable { channels: 3, stream_count: 2, coupled_count: 1, mapping: vec![0, 2, 1] };
-        let mut d = MultistreamDecoder::new(48000, table).unwrap();
+        let mut d = MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap();
         let empty = DnnBlob::from_static(&EMPTY.0).unwrap();
         assert_eq!(kind_message(d.set_dnn_blob(&empty)), Err((ErrorKind::BadArg, NO_MODEL)));
         #[cfg(feature = "deep-plc")]

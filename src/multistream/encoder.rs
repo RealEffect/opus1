@@ -38,8 +38,11 @@
 //!   were missing at the multistream level. They are now forwarded as
 //!   libopus forwards them: a setter goes to one stream after the other
 //!   and stops at the first stream that refuses the value, and a getter
-//!   reads the first stream. `OPUS_GET_IN_DTX` has no multistream request
-//!   in libopus; [`OpusEncoder::in_dtx`] of each stream tells it.
+//!   reads the first stream. The forced channel count is the exception: no
+//!   stream refuses a [`Channels`] value, so it is set on every stream,
+//!   where libopus stops with an error at the first mono stream when it is
+//!   stereo. `OPUS_GET_IN_DTX` has no multistream request in libopus;
+//!   [`OpusEncoder::in_dtx`] of each stream tells it.
 //! - **D6, energy mask.** libopus gives each stream encoder a pointer to the
 //!   mask. Here the values are copied into the stream encoder.
 //!
@@ -59,7 +62,8 @@ use super::surround::{MASK_BANDS, SurroundAnalysis};
 use crate::analysis::{AnalysisPcm, SecondChannel};
 use crate::packet;
 use crate::{
-    Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, InbandFec, OpusEncoder, Signal,
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, FrameDuration, InbandFec, OpusEncoder,
+    SampleRate, Signal,
 };
 
 /// The bitrate a stream encoder gets for `value` (libopus `opus_encoder_ctl`,
@@ -153,7 +157,7 @@ impl MultistreamEncoder {
     /// Creates an encoder for a layout the caller chose. libopus
     /// `opus_multistream_encoder_create`.
     ///
-    /// - `sampling_rate` is 8000, 12000, 16000, 24000 or 48000.
+    /// - `sampling_rate` is the rate of the input.
     /// - `channels` is the number of input channels, 1 to 255.
     /// - `streams` is the number of streams in a packet. The first
     ///   `coupled_streams` of them are stereo, the others mono.
@@ -166,7 +170,7 @@ impl MultistreamEncoder {
     /// Every stream needs an input channel, and there cannot be more coded
     /// channels than input channels.
     pub fn new(
-        sampling_rate: i32,
+        sampling_rate: SampleRate,
         channels: usize,
         streams: usize,
         coupled_streams: usize,
@@ -190,7 +194,7 @@ impl MultistreamEncoder {
     /// Read the chosen layout back with [`layout`](Self::layout) to write
     /// the Ogg Opus header.
     pub fn new_surround(
-        sampling_rate: i32,
+        sampling_rate: SampleRate,
         channels: usize,
         mapping_family: u8,
         application: Application,
@@ -201,7 +205,7 @@ impl MultistreamEncoder {
 
     /// libopus `opus_multistream_encoder_init_impl`.
     fn init(
-        sampling_rate: i32,
+        sampling_rate: SampleRate,
         layout: ChannelLayout,
         mapping_type: MappingType,
         lfe_stream: Option<usize>,
@@ -224,7 +228,7 @@ impl MultistreamEncoder {
             .collect::<Result<Vec<_>, _>>()?;
         let mut encoders = Vec::with_capacity(streams);
         for s in 0..streams {
-            let stream_channels = if s < coupled { 2 } else { 1 };
+            let stream_channels = if s < coupled { Channels::Stereo } else { Channels::Mono };
             // A new stream encoder is at `Bitrate::Auto`, as in libopus.
             // `bitrate` reports that until the first frame sets the
             // bitrates of the streams.
@@ -235,6 +239,7 @@ impl MultistreamEncoder {
             encoders.push(enc);
         }
 
+        let sampling_rate = sampling_rate.hz() as i32;
         // The longest frame is 120 ms. A stereo stream has two samples each.
         let max_frame = 6 * sampling_rate as usize / 50;
         let (surround, band_smr) = if mapping_type == MappingType::Surround {
@@ -301,9 +306,9 @@ impl MultistreamEncoder {
         Ok(())
     }
 
-    /// The sampling rate of the input in Hz.
-    pub fn sampling_rate(&self) -> i32 {
-        self.sampling_rate
+    /// The sampling rate of the input.
+    pub fn sampling_rate(&self) -> SampleRate {
+        SampleRate::from_valid_hz(self.sampling_rate)
     }
 
     /// libopus `OPUS_GET_LOOKAHEAD`: the delay the encoder adds, in samples
@@ -496,7 +501,7 @@ impl MultistreamEncoder {
         for (s, enc) in self.encoders.iter_mut().enumerate() {
             // The bitrate is positive and within the limits, so it is
             // accepted.
-            let _ = enc.set_bitrate(stream_bitrate(self.rates[s], enc.channels()));
+            let _ = enc.set_bitrate(stream_bitrate(self.rates[s], enc.channels().count()));
             if let Some(bandwidth) = surround_bandwidth {
                 enc.set_bandwidth(bandwidth);
                 if s < coupled {
@@ -507,7 +512,7 @@ impl MultistreamEncoder {
                     // low bitrate. Ambisonics streams are not forced to two
                     // channels.
                     enc.set_force_mode(Some(ForcedMode::CeltOnly));
-                    let _ = enc.set_force_channels(Some(2));
+                    enc.set_force_channels(Some(Channels::Stereo));
                 }
             } else if self.mapping_type == MappingType::Ambisonics {
                 enc.set_force_mode(Some(ForcedMode::CeltOnly));
@@ -519,7 +524,7 @@ impl MultistreamEncoder {
         let streams_and_inputs = self.encoders.iter_mut().zip(&self.stream_inputs);
         for (s, (enc, &(c1, c2))) in streams_and_inputs.enumerate() {
             let last = s + 1 == streams;
-            let stream_channels = enc.channels();
+            let stream_channels = enc.channels().count();
             // Copy the input of the stream: left and right interleaved for a
             // coupled stream.
             match c2 {
@@ -864,24 +869,23 @@ impl MultistreamEncoder {
     /// Forces the number of coded channels of every stream. libopus
     /// `OPUS_SET_FORCE_CHANNELS`. See [`OpusEncoder::set_force_channels`].
     ///
-    /// As in libopus, the value goes to one stream after the other, the
-    /// coupled streams first, and the first stream that refuses it stops
-    /// the loop with its error. `Some(2)` is therefore set on the coupled
-    /// streams and refused by the first mono stream. `None` and `Some(1)`
-    /// suit every stream.
+    /// The value goes to every stream. A mono stream codes mono whatever
+    /// is set, so `Some(Channels::Stereo)` forces stereo on the coupled
+    /// streams only. libopus sets the coupled streams and then refuses
+    /// `Some(Stereo)` at the first mono stream with `OPUS_BAD_ARG`; opus1
+    /// sets every stream and does not fail.
     ///
     /// In surround mode the encoder forces two channels on every coupled
     /// stream on every frame, as libopus does.
-    pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), Error> {
+    pub fn set_force_channels(&mut self, channels: Option<Channels>) {
         for enc in &mut self.encoders {
-            enc.set_force_channels(channels)?;
+            enc.set_force_channels(channels);
         }
-        Ok(())
     }
 
     /// The forced channel count of the first stream. libopus
     /// `OPUS_GET_FORCE_CHANNELS`.
-    pub fn force_channels(&self) -> Option<usize> {
+    pub fn force_channels(&self) -> Option<Channels> {
         self.encoders.first().and_then(|enc| enc.force_channels())
     }
 
@@ -990,7 +994,13 @@ mod tests {
 
     #[test]
     fn no_mask_is_set_when_the_analysis_gives_none() {
-        let mut enc = MultistreamEncoder::new_surround(48000, 6, 1, Application::Audio).unwrap();
+        let mut enc = MultistreamEncoder::new_surround(
+            SampleRate::Hz48000,
+            6,
+            1,
+            Application::Audio,
+        )
+        .unwrap();
         let pcm: Vec<f32> = (0..960 * 6)
             .map(|k| ((k * 7 % 97) as f32 - 48.0) / 200.0)
             .collect();
@@ -998,7 +1008,7 @@ mod tests {
         enc.encode(&pcm, 960, &mut out).unwrap();
         for stream in &enc.encoders {
             let mask = stream.energy_mask().expect("a surround stream has a mask");
-            assert_eq!(mask.len(), MASK_BANDS * stream.channels());
+            assert_eq!(mask.len(), MASK_BANDS * stream.channels().count());
         }
         // No frame size or sampling rate that `encode` accepts leaves the
         // analysis without a mask. To reach that branch, the encoder gets an
@@ -1018,17 +1028,22 @@ mod tests {
         // (opus_multistream_encoder.c:910): 3 to 8 channels of family 1.
         for channels in 1..=8 {
             let enc =
-                MultistreamEncoder::new_surround(48000, channels, 1, Application::Audio).unwrap();
+                MultistreamEncoder::new_surround(SampleRate::Hz48000, channels, 1, Application::Audio).unwrap();
             assert_eq!(enc.surround.is_some(), channels > 2, "{channels} channels");
             assert_eq!(enc.band_smr.len(), if channels > 2 { MASK_BANDS * channels } else { 0 });
         }
         for (channels, family) in [(3, 255), (6, 255), (4, 2), (6, 2), (9, 2)] {
-            let enc = MultistreamEncoder::new_surround(48000, channels, family, Application::Audio)
-                .unwrap();
+            let enc = MultistreamEncoder::new_surround(
+                SampleRate::Hz48000,
+                channels,
+                family,
+                Application::Audio,
+            )
+            .unwrap();
             assert!(enc.surround.is_none(), "family {family}, {channels} channels");
         }
         let enc =
-            MultistreamEncoder::new(48000, 6, 4, 2, &[0, 4, 1, 2, 3, 5], Application::Audio)
+            MultistreamEncoder::new(SampleRate::Hz48000, 6, 4, 2, &[0, 4, 1, 2, 3, 5], Application::Audio)
                 .unwrap();
         assert!(enc.surround.is_none(), "the generic constructor");
         assert_eq!(enc.lfe_stream(), None);
@@ -1038,7 +1053,13 @@ mod tests {
     fn stream_input_channels_follow_the_layout() {
         // 5.1 in Vorbis order: front left, centre, front right, rear left,
         // rear right, LFE. libopus codes it as mapping [0, 4, 1, 2, 3, 5].
-        let enc = MultistreamEncoder::new_surround(48000, 6, 1, Application::Audio).unwrap();
+        let enc = MultistreamEncoder::new_surround(
+            SampleRate::Hz48000,
+            6,
+            1,
+            Application::Audio,
+        )
+        .unwrap();
         assert_eq!(enc.layout().mapping(), &[0, 4, 1, 2, 3, 5]);
         let channels = |s| stream_input_channels(enc.layout(), s).unwrap();
         assert_eq!(channels(0), (0, Some(2)));
@@ -1046,7 +1067,13 @@ mod tests {
         assert_eq!(channels(2), (1, None));
         assert_eq!(channels(3), (5, None));
         // 7.1: mapping [0, 6, 1, 2, 3, 4, 5, 7].
-        let enc = MultistreamEncoder::new_surround(48000, 8, 1, Application::Audio).unwrap();
+        let enc = MultistreamEncoder::new_surround(
+            SampleRate::Hz48000,
+            8,
+            1,
+            Application::Audio,
+        )
+        .unwrap();
         let channels = |s| stream_input_channels(enc.layout(), s).unwrap();
         assert_eq!(channels(0), (0, Some(2)));
         assert_eq!(channels(1), (3, Some(4)));
@@ -1055,8 +1082,15 @@ mod tests {
         assert_eq!(channels(4), (7, None));
         // A generic layout. Two channels name the mono stream: the first one
         // is read. Channel 2 is not coded.
-        let enc = MultistreamEncoder::new(48000, 5, 2, 1, &[1, 0, 255, 2, 2], Application::Audio)
-            .unwrap();
+        let enc = MultistreamEncoder::new(
+            SampleRate::Hz48000,
+            5,
+            2,
+            1,
+            &[1, 0, 255, 2, 2],
+            Application::Audio,
+        )
+        .unwrap();
         let channels = |s| stream_input_channels(enc.layout(), s).unwrap();
         assert_eq!(channels(0), (1, Some(0)));
         assert_eq!(channels(1), (3, None));
@@ -1072,7 +1106,8 @@ mod tests {
         assert_eq!(stream_bitrate(2_000_000, 2), bps(1_500_000));
         assert_eq!(stream_bitrate(i32::MAX, 2), bps(1_500_000));
         // What the stream encoder keeps of it is the same value.
-        let mut enc = OpusEncoder::new(48000, 2, Application::Audio).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         for value in [i32::MIN, 0, 1, 500, 64_000, 2_000_000, i32::MAX] {
             enc.set_bitrate(stream_bitrate(value, 2)).unwrap();
             assert_eq!(enc.bitrate_setting(), stream_bitrate(value, 2), "{value}");
@@ -1081,7 +1116,13 @@ mod tests {
 
     #[test]
     fn bitrate_setting_round_trips() {
-        let mut enc = MultistreamEncoder::new_surround(48000, 6, 1, Application::Audio).unwrap();
+        let mut enc = MultistreamEncoder::new_surround(
+            SampleRate::Hz48000,
+            6,
+            1,
+            Application::Audio,
+        )
+        .unwrap();
         assert_eq!(enc.bitrate_setting(), Bitrate::Auto);
         enc.set_bitrate(Bitrate::Max).unwrap();
         assert_eq!(enc.bitrate_setting(), Bitrate::Max);
@@ -1101,8 +1142,9 @@ mod tests {
 
     #[test]
     fn frame_sizes_are_those_of_the_stream_encoder() {
-        for fs in [8000, 12000, 16000, 24000, 48000] {
-            let enc = MultistreamEncoder::new_surround(fs, 2, 1, Application::Audio).unwrap();
+        for &rate in SampleRate::ALL {
+            let enc = MultistreamEncoder::new_surround(rate, 2, 1, Application::Audio).unwrap();
+            let fs = rate.hz();
             let ms = |tenths: usize| fs as usize * tenths / 10_000;
             for tenths in [25, 50, 100, 200, 400, 600, 800, 1000, 1200] {
                 assert_eq!(
@@ -1132,8 +1174,8 @@ mod tests {
 
     #[test]
     fn the_expert_frame_duration_picks_the_frame() {
-        let fs = 48000;
-        let mut enc = MultistreamEncoder::new_surround(fs, 2, 1, Application::Audio).unwrap();
+        let mut enc =
+            MultistreamEncoder::new_surround(SampleRate::Hz48000, 2, 1, Application::Audio).unwrap();
         assert_eq!(enc.expert_frame_duration(), FrameDuration::Argument);
         enc.set_expert_frame_duration(FrameDuration::Ms20);
         // The input must hold what the caller passes; the frame is 20 ms.

@@ -1,4 +1,4 @@
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fn make_sine(
     freq: f64,
@@ -75,7 +75,12 @@ fn test_celt_multi_frame_code_0_and_1() {
     let ch = 1;
     let fs = 960;
 
-    let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::Mono,
+        Application::RestrictedLowDelay,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
@@ -90,7 +95,7 @@ fn test_celt_multi_frame_code_0_and_1() {
     assert_eq!(pkt1[0] & 0x03, 0, "expected code 0");
 
     // Baseline: decode sequentially through one decoder
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let (bl_rms0, bl_rms1) = baseline_two(&mut dec, &pkt0, &pkt1, fs, ch);
     assert!(bl_rms0 > 0.01);
     assert!(bl_rms1 > 0.01);
@@ -103,7 +108,7 @@ fn test_celt_multi_frame_code_0_and_1() {
     c1.extend_from_slice(payload0);
     c1.extend_from_slice(payload1);
 
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * 2];
     dec_mf.decode(&c1, fs * 2, &mut out).unwrap();
     let r0 = rms(&out[..fs]);
@@ -128,7 +133,12 @@ fn test_celt_multi_frame_code_2() {
     let ch = 1;
     let fs = 960;
 
-    let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::Mono,
+        Application::RestrictedLowDelay,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
@@ -136,7 +146,7 @@ fn test_celt_multi_frame_code_2() {
     let pkt0 = encode_full(&mut enc, &pcm0, fs, 400);
     let pkt1 = encode_full(&mut enc, &pcm1, fs, 400);
 
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let (bl_rms0, bl_rms1) = baseline_two(&mut dec, &pkt0, &pkt1, fs, ch);
 
     // Code 2: two unequal frames
@@ -149,7 +159,7 @@ fn test_celt_multi_frame_code_2() {
     c2.extend_from_slice(payload0);
     c2.extend_from_slice(payload1);
 
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * 2];
     dec_mf.decode(&c2, fs * 2, &mut out).unwrap();
     let r0 = rms(&out[..fs]);
@@ -174,7 +184,12 @@ fn test_celt_multi_frame_code_3_with_padding() {
     let ch = 1;
     let fs = 960;
 
-    let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::Mono,
+        Application::RestrictedLowDelay,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     // Zero-padding payloads is only neutral when both already share a size;
     // VBR sizes vary legitimately, so pin CBR to keep the resize a no-op.
@@ -184,7 +199,7 @@ fn test_celt_multi_frame_code_3_with_padding() {
     let pkt0 = encode_full(&mut enc, &pcm0, fs, 400);
     let pkt1 = encode_full(&mut enc, &pcm1, fs, 400);
 
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let (bl_rms0, bl_rms1) = baseline_two(&mut dec, &pkt0, &pkt1, fs, ch);
 
     // Code 3 with padding: 2 equal-sized frames
@@ -203,7 +218,7 @@ fn test_celt_multi_frame_code_3_with_padding() {
     c3.extend_from_slice(&p0);
     c3.extend_from_slice(&p1);
 
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * 2];
     dec_mf.decode(&c3, fs * 2, &mut out).unwrap();
     let r0 = rms(&out[..fs]);
@@ -228,7 +243,12 @@ fn test_celt_multi_frame_code_3_self_delimiting() {
     let ch = 1;
     let fs = 960;
 
-    let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::Mono,
+        Application::RestrictedLowDelay,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
@@ -236,7 +256,7 @@ fn test_celt_multi_frame_code_3_self_delimiting() {
     let pkt0 = encode_full(&mut enc, &pcm0, fs, 400);
     let pkt1 = encode_full(&mut enc, &pcm1, fs, 400);
 
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let (bl_rms0, bl_rms1) = baseline_two(&mut dec, &pkt0, &pkt1, fs, ch);
 
     let payload0 = &pkt0[1..];
@@ -249,7 +269,7 @@ fn test_celt_multi_frame_code_3_self_delimiting() {
     c3.extend_from_slice(payload0);
     c3.extend_from_slice(payload1);
 
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * 2];
     dec_mf.decode(&c3, fs * 2, &mut out).unwrap();
     let r0 = rms(&out[..fs]);
@@ -275,11 +295,11 @@ fn test_silk_multi_frame_code_3_padding_roundtrip() {
     let fs = 320;
     let target_size = 100usize;
 
-    let mut enc = OpusEncoder::new(sr, ch, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_vbr(false);
 
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 
     for frame_idx in 0..3 {
         let pcm = make_sine(440.0, sr, fs, ch, frame_idx);
@@ -306,7 +326,8 @@ fn test_hybrid_multi_frame_roundtrip() {
     let sr = 48000;
     let ch = 1;
     let fs = 960;
-    let mut enc = OpusEncoder::new(sr, ch, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
@@ -317,7 +338,7 @@ fn test_hybrid_multi_frame_roundtrip() {
     let pkt0 = encode_full(&mut enc, &pcm0, fs, 1000);
     let pkt1 = encode_full(&mut enc, &pcm1, fs, 1000);
 
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let (bl_rms0, bl_rms1) = baseline_two(&mut dec, &pkt0, &pkt1, fs, ch);
 
     let payload0 = &pkt0[1..];
@@ -327,7 +348,7 @@ fn test_hybrid_multi_frame_roundtrip() {
     c1.extend_from_slice(payload0);
     c1.extend_from_slice(payload1);
 
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * 2];
     dec_mf.decode(&c1, fs * 2, &mut out).unwrap();
 
@@ -353,19 +374,29 @@ fn test_multi_frame_code_2_unequal_payloads() {
     let ch = 1;
     let fs = 960;
 
-    let mut enc = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::Mono,
+        Application::RestrictedLowDelay,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
 
     let pcm_silence = vec![0.0f32; fs];
     let pcm_tone = make_sine(440.0, sr, fs, ch, 0);
     let pkt_sil = encode_full(&mut enc, &pcm_silence, fs, 400);
     // fresh encoder for tone to avoid state interference
-    let mut enc2 = OpusEncoder::new(sr, ch, Application::RestrictedLowDelay).unwrap();
+    let mut enc2 = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::Mono,
+        Application::RestrictedLowDelay,
+    )
+    .unwrap();
     enc2.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     let pkt_tone = encode_full(&mut enc2, &pcm_tone, fs, 400);
 
     // Baseline: both frames through same decoder
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let (_, bl_tone) = baseline_two(&mut dec, &pkt_sil, &pkt_tone, fs, ch);
 
     // Code 2: silence first (smaller), tone second
@@ -378,7 +409,7 @@ fn test_multi_frame_code_2_unequal_payloads() {
     c2.extend_from_slice(payload_sil);
     c2.extend_from_slice(payload_tone);
 
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut out = vec![0.0f32; fs * 2];
     dec_mf.decode(&c2, fs * 2, &mut out).unwrap();
 
@@ -403,7 +434,8 @@ fn test_multi_frame_all_codes_stereo() {
     let ch = 2;
     let fs = 960;
 
-    let mut enc = OpusEncoder::new(sr, ch, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(96000)).unwrap();
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
@@ -414,7 +446,7 @@ fn test_multi_frame_all_codes_stereo() {
     let pkt0 = encode_full(&mut enc, &pcm0, fs, 1000);
     let pkt1 = encode_full(&mut enc, &pcm1, fs, 1000);
 
-    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let (bl_rms0, bl_rms1) = baseline_two(&mut dec, &pkt0, &pkt1, fs, ch);
 
     let payload0 = &pkt0[1..];
@@ -425,7 +457,7 @@ fn test_multi_frame_all_codes_stereo() {
     let mut c1 = vec![base_toc | 0x01];
     c1.extend_from_slice(payload0);
     c1.extend_from_slice(payload1);
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut out = vec![0.0f32; fs * 2 * ch];
     dec_mf.decode(&c1, fs * 2, &mut out).unwrap();
     let r0 = rms(&out[..fs * ch]);
@@ -449,7 +481,7 @@ fn test_multi_frame_all_codes_stereo() {
     push_frame_size(&mut c2, first_len);
     c2.extend_from_slice(payload0);
     c2.extend_from_slice(payload1);
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut out = vec![0.0f32; fs * 2 * ch];
     dec_mf.decode(&c2, fs * 2, &mut out).unwrap();
     assert!(
@@ -472,7 +504,7 @@ fn test_multi_frame_all_codes_stereo() {
     c3.push(0x00);
     c3.extend_from_slice(&p0);
     c3.extend_from_slice(&p1);
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut out = vec![0.0f32; fs * 2 * ch];
     dec_mf.decode(&c3, fs * 2, &mut out).unwrap();
     assert!(
@@ -491,7 +523,7 @@ fn test_multi_frame_all_codes_stereo() {
     push_frame_size(&mut c3s, len0);
     c3s.extend_from_slice(payload0);
     c3s.extend_from_slice(payload1);
-    let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
+    let mut dec_mf = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut out = vec![0.0f32; fs * 2 * ch];
     dec_mf.decode(&c3s, fs * 2, &mut out).unwrap();
     assert!(

@@ -10,7 +10,7 @@
 //!   stream before it decodes anything.
 
 use audiopus_sys as sys;
-use opus1::packet;
+use opus1::{SampleRate, packet};
 
 /// Frame sizes around the points where the size field changes: one byte up
 /// to 251, two bytes from 252, and the largest frame, 1275 bytes.
@@ -533,10 +533,10 @@ fn mutated_multistream_packets_validate_like_libopus() {
         let read_as = if round % 5 == 0 { 1 + rng.below(4) } else { streams };
         if data.is_empty() {
             // An empty packet means "lost" to the C decoder.
-            assert!(packet::multistream_validate(&data, read_as, 48000).is_err());
+            assert!(packet::multistream_validate(&data, read_as, SampleRate::Hz48000).is_err());
             continue;
         }
-        let ours = packet::multistream_validate(&data, read_as, 48000);
+        let ours = packet::multistream_validate(&data, read_as, SampleRate::Hz48000);
         match decoders[read_as - 1].decode(&data) {
             Ok(samples) => {
                 assert_eq!(ours, Ok(samples), "round {round}, {read_as} streams: {data:02x?}");
@@ -561,10 +561,10 @@ fn mutated_multistream_packets_validate_like_libopus() {
 /// byte and sampling rate.
 #[test]
 fn samples_per_frame_matches_libopus() {
-    for fs in [8000, 12000, 16000, 24000, 48000] {
+    for &fs in SampleRate::ALL {
         for toc in 0..=255u8 {
-            let expected = unsafe { sys::opus_packet_get_samples_per_frame(&toc, fs) };
-            assert_eq!(packet::samples_per_frame(toc, fs), expected as usize, "TOC {toc:#04x} at {fs} Hz");
+            let expected = unsafe { sys::opus_packet_get_samples_per_frame(&toc, fs.hz() as i32) };
+            assert_eq!(packet::samples_per_frame(toc, fs), expected as usize, "TOC {toc:#04x} at {fs:?}");
         }
     }
 }
@@ -585,18 +585,18 @@ fn nb_frames_and_nb_samples_match_libopus() {
                 } else {
                     assert_eq!(ours, Ok(c_frames as usize), "{data:02x?}");
                 }
-                for fs in [8000, 48000] {
-                    let c_samples = unsafe { sys::opus_packet_get_nb_samples(data.as_ptr(), len as i32, fs) };
+                for fs in [SampleRate::Hz8000, SampleRate::Hz48000] {
+                    let c_samples = unsafe { sys::opus_packet_get_nb_samples(data.as_ptr(), len as i32, fs.hz() as i32) };
                     let ours = packet::nb_samples(data, fs);
                     if c_samples < 0 {
-                        assert!(ours.is_err(), "{data:02x?} at {fs} Hz: libopus error {c_samples}");
+                        assert!(ours.is_err(), "{data:02x?} at {fs:?}: libopus error {c_samples}");
                     } else {
-                        assert_eq!(ours, Ok(c_samples as usize), "{data:02x?} at {fs} Hz");
+                        assert_eq!(ours, Ok(c_samples as usize), "{data:02x?} at {fs:?}");
                     }
                 }
             }
         }
     }
     assert!(packet::nb_frames(&[]).is_err());
-    assert!(packet::nb_samples(&[], 48000).is_err());
+    assert!(packet::nb_samples(&[], SampleRate::Hz48000).is_err());
 }

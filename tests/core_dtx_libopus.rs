@@ -54,7 +54,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
-use opus1::{Application, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate};
 
 /// Whether the packets must be libopus's. The speech and music analysis
 /// rounds as the libopus the tests link only on 64-bit ARM.
@@ -137,7 +137,12 @@ impl Setup {
     }
 
     fn rs_encoder(&self) -> OpusEncoder {
-        let mut enc = OpusEncoder::new(self.fs as i32, self.channels, self.app.rs).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(self.fs as i32).unwrap(),
+            Channels::try_from(self.channels).unwrap(),
+            self.app.rs,
+        )
+        .unwrap();
         enc.set_complexity(self.complexity).unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
         enc.set_vbr(self.rc != Rc::Cbr);
@@ -724,7 +729,8 @@ fn settings_change_and_reset_in_a_running_stream() {
 /// The controls, and that `reset_state` keeps DTX on.
 #[test]
 fn dtx_controls() {
-    let mut enc = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     assert!(!enc.dtx());
     assert!(!enc.in_dtx());
     enc.set_dtx(true);
@@ -788,7 +794,11 @@ fn opus1_dtx_streams_decode_like_libopus() {
                     })
                     .collect();
                 streams += 1;
-                let mut rs_dec = OpusDecoder::new(fs as i32, channels).unwrap();
+                let mut rs_dec = OpusDecoder::new(
+                    SampleRate::try_from(fs as i32).unwrap(),
+                    Channels::try_from(channels).unwrap(),
+                )
+                .unwrap();
                 let mut c_dec = CDecoder::new(fs, channels);
                 let max = fs * 120 / 1000;
                 let mut pcm = vec![0f32; max * channels];
