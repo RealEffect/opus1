@@ -9,252 +9,137 @@ test that compares opus1 with the C library under the same settings.
 
 ## Breaking changes to the public interface
 
-- Errors: every call that can fail returns `Result<T, opus1::Error>` instead of
-  `Result<T, &'static str>`, and `TryFrom<i32> for FrameDuration` has
-  `type Error = opus1::Error`. `Error::kind()` returns an `ErrorKind` with one
-  value per libopus error code: `BadArg`, `BufferTooSmall`, `InternalError`,
-  `InvalidPacket`, `Unimplemented`, `InvalidState` and `AllocFail`
-  (`#[non_exhaustive]`). Each call returns the kind that libopus returns in the
-  same case. `Error::to_raw()` and `ErrorKind::to_raw()` give the libopus code
-  (-1 to -7). `Error::message()` and `Display` give a short text. The texts
-  start with a lowercase letter, have no final period, and one error has one
-  wording: for example every output buffer that is too small gives "output
-  buffer too small". `Error` is `Copy` and implements `core::error::Error`.
-  Code that compared message strings now compares `err.kind()`. Kinds that
-  differ from what the old messages suggested: an empty output buffer of
-  `encode` is `BadArg` (libopus `max_data_bytes <= 0`); without the `alloc`
-  feature, more than 32 extensions or more than 1275 bytes of old padding in
-  one call are `AllocFail`.
+This list is what code written for opus-rs 0.1.37 must change. The public
+interface of 0.1.37 was small: `OpusEncoder` (`new`, `encode`,
+`encode_i16`, `enable_hybrid_mode` and five public fields of settings),
+`OpusDecoder` (`new`, `decode` and the public field `hybrid_skip_celt`),
+the enums `Application` and `Bandwidth`, the internal modules, and with
+`std` the module `multistream` (`ChannelMappingTable`,
+`split_self_delimited`, and `MultistreamDecoder` with `new` and `decode`).
+Everything else is new in 0.2.0. It is listed under
+[New features](#new-features) in its 0.2.0 form, also where it changed
+while 0.2.0 was developed.
+
+- Errors: every call that can fail returns `Result<T, opus1::Error>` instead
+  of `Result<T, &'static str>`. Of the calls of 0.1.37 these are
+  `OpusEncoder::new`, `encode` and `encode_i16`, `OpusDecoder::new` and
+  `decode`, `MultistreamDecoder::decode` and the constructor that replaces
+  `MultistreamDecoder::new` (see below), and `split_self_delimited`.
+  - `Error::kind()` returns an `ErrorKind` with one value per libopus error
+    code: `BadArg`, `BufferTooSmall`, `InternalError`, `InvalidPacket`,
+    `Unimplemented`, `InvalidState` and `AllocFail` (`#[non_exhaustive]`).
+    Each call returns the kind that libopus returns in the same case.
+  - `Error::to_raw()` and `ErrorKind::to_raw()` give the libopus code (-1
+    to -7). `Error::message()` and `Display` give a short text. The texts
+    start with a lowercase letter, have no final period, and one error has
+    one wording: for example every output buffer that is too small gives
+    "output buffer too small".
+  - `Error` is `Copy` and implements `core::error::Error`.
+  - Code that compared message strings now compares `err.kind()`. One kind
+    differs from what the old message suggested: an empty output buffer of
+    `encode` is `BadArg` (libopus `max_data_bytes <= 0`), where 0.1.37 said
+    "Output buffer too small".
 - Sampling rates and channel counts have their own types at the crate root.
-  `SampleRate` has the values `Hz8000`, `Hz12000`, `Hz16000`, `Hz24000` and
-  `Hz48000` (`#[non_exhaustive]`), `SampleRate::ALL`, `hz()`,
-  `max_frame_size()` (the samples per channel of 120 ms), `TryFrom<u32>`,
-  `TryFrom<i32>` and `From<SampleRate> for u32`. `Channels` has the values
-  `Mono` and `Stereo`, `Channels::ALL`, `count()`, `TryFrom<usize>` and
-  `From<Channels> for usize`. `try_from` refuses other numbers with
-  `BadArg` ("invalid sampling rate", "invalid number of channels"). The
-  calls that change:
-  - `OpusEncoder::new(i32, usize, Application)` -> `new(SampleRate, Channels,
-    Application)`; `OpusDecoder::new(i32, usize)` -> `new(SampleRate,
-    Channels)`; `OpusDecoder::init(slot, i32, usize)` -> `init(slot,
-    SampleRate, Channels)`. They no longer refuse a rate or a channel count.
-  - `sampling_rate() -> i32` -> `sampling_rate() -> SampleRate` on
-    `OpusEncoder`, `OpusDecoder`, `MultistreamEncoder` and
-    `MultistreamDecoder`; `channels() -> usize` -> `channels() -> Channels` on
-    `OpusEncoder` and `OpusDecoder`.
-  - `set_force_channels(Option<usize>) -> Result<(), Error>` ->
-    `set_force_channels(Option<Channels>)` on `OpusEncoder` and
-    `MultistreamEncoder`; `force_channels() -> Option<usize>` ->
-    `force_channels() -> Option<Channels>`. Stereo on a mono encoder, or on
-    the mono streams of a multistream encoder, is kept and has no effect,
-    where libopus refuses it.
-  - The sampling rate of every constructor of `MultistreamEncoder` and
-    `MultistreamDecoder` is a `SampleRate` (the constructors are renamed
-    below). Their channel counts stay `usize` (1 to 255).
-  - `packet::samples_per_frame(toc, i32)`, `packet::nb_samples(data, i32)`,
-    `packet::multistream_validate(data, nb_streams, i32)` and
-    `FrameDuration::samples(self, i32)` take a `SampleRate` instead.
-  - `OpusDredDecoder::parse(dred, data, max_dred_samples, i32, defer)` takes
-    the sampling rate as a `SampleRate`; its `BadArg` for a rate that is not
-    positive is gone.
-- Packets and packet extensions (modules `packet` and `extensions`):
-  - New `packet::bandwidth(toc) -> Bandwidth` and
-    `packet::nb_channels(toc) -> Channels` (libopus
-    `opus_packet_get_bandwidth`, `opus_packet_get_nb_channels`).
-  - The flags `self_delimited: bool` and `pad: bool` are the enums
-    `packet::Framing` (`Normal`, `SelfDelimited`) and `packet::Padding`
-    (`Shortest`, `FillBuffer`): `packet::parse(data, Framing)`,
-    `packet::write(toc, frames, out, Framing, Padding)`,
-    `Repacketizer::out_range_ext(begin, end, out, Framing, Padding,
-    extensions)`, `packet::pad_with_extensions(data, len, new_len, Padding,
-    extensions)` and `extensions::generate(out, extensions, nb_frames,
-    Padding)`.
-  - `ParsedPacket` has private fields and read-only methods: `toc()`,
-    `nb_frames()` (was the field `count`), `frame_sizes()` (was
-    `sizes[..count]`), `payload_offset()`, `packet_offset()` and
-    `padding_len()`. Only `parse` makes one, so `frames()` and `padding()`
-    cannot panic.
-  - `Repacketizer` is `Clone` but no longer `Copy` (it holds about 1.6 KB).
-  - `extensions::Extension` is `#[non_exhaustive]`; `Extension::new(id,
-    frame, data)` makes one. Its fields stay public for reading.
-  - `ExtensionIterator` implements `Iterator<Item = Result<Extension,
-    Error>>`. After an error it returns `None` (libopus returns the error
-    again). The inherent `next() -> Result<Option<Extension>, Error>` is
-    gone, and `find(id)` is renamed `find_id(id)` so that `Iterator::find`
-    stays callable.
-  - No panics on bad arguments: `nb_frames` above 48 is `BadArg` in
-    `ExtensionIterator` (on the first `next`), `extensions::count`,
-    `count_ext`, `parse` and `parse_ext`, and an `nb_frame_exts` slice shorter
-    than `nb_frames` is `BadArg` in `count_ext` and `parse_ext`.
-    `extensions::count` and `count_ext` therefore return `Result<usize,
-    Error>` instead of `usize`. Counts that do not match the padding no
-    longer overflow in `parse_ext`.
-- DRED (feature `dred`): `OpusDredDecoder::parse(dred, data,
-  max_dred_samples, SampleRate, defer_processing: bool)` takes a
-  `DredProcessing` (`Now`, `Deferred`, exported at the crate root) instead of
-  the bool. `DredParse` is `#[non_exhaustive]`.
-- Settings types and enums. The same changes apply to `OpusEncoder`,
-  `OpusDecoder`, `MultistreamEncoder` and `MultistreamDecoder`:
-  - `Application`, `ForcedMode`, `Signal`, `InbandFec` and
-    `multistream::MappingType` are `#[non_exhaustive]`, like `ErrorKind` and
-    `SampleRate`. A `match` on them needs a `_` arm.
-  - New `Application::RestrictedSilk` (2052) and
-    `Application::RestrictedCelt` (2053), the applications
-    `OPUS_APPLICATION_RESTRICTED_SILK` and `OPUS_APPLICATION_RESTRICTED_CELT`
-    of libopus 1.6, with their behaviour, also in `MultistreamEncoder`:
-    SILK-only at most wideband in frames of 10 ms or more, and CELT-only
-    with the packets of `RestrictedLowDelay`. `set_application` refuses to
-    change to them or from them, as libopus does.
-  - Every small enum derives `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq` and
-    `Hash`. `Application`, `Bandwidth`, `Signal`, `ForcedMode`, `InbandFec`
-    and `FrameDuration` have `const fn to_raw(self) -> i32` (the libopus
-    number) and `TryFrom<i32>` (`BadArg` for other numbers). `ForcedMode`
-    has the numbers of libopus's `MODE_*` (1000 to 1002), `Signal::Auto` is
-    `OPUS_AUTO` (-1000). `Bitrate`, `Signal`, `InbandFec` and
-    `FrameDuration` implement `Default` (`Auto`, `Auto`, `Off`, `Argument`).
-  - `Bandwidth::Auto` is removed: `Bandwidth` has the five real bandwidths.
-    `set_bandwidth(Bandwidth)` -> `set_bandwidth(Option<Bandwidth>)`, where
-    `None` is the automatic choice. New `bandwidth_setting() ->
-    Option<Bandwidth>` on `OpusEncoder`; `MultistreamEncoder::bandwidth()`,
-    which returned the setting, is renamed `bandwidth_setting()`.
-    `set_max_bandwidth(Bandwidth)` no longer fails and returns `()`.
-  - `Bitrate::BitsPerSecond(i32)` -> `Bitrate::BitsPerSecond(NonZeroU32)`.
-    `set_bitrate` no longer fails and returns `()`: every value is limited to
-    500 to 750,000 b/s per channel, as before.
-  - Small integers: `set_complexity(u8)` and `complexity() -> u8` on all four
-    codecs; `set_packet_loss_perc(u8)`, `packet_loss_perc() -> u8`,
-    `set_lsb_depth(u8)` and `lsb_depth() -> u8` on both encoders;
-    `OpusEncoder::set_voice_ratio(Option<u8>)` (`None` is libopus -1) and
-    `voice_ratio() -> Option<u8>` (also on `MultistreamEncoder`);
-    `OpusEncoder::set_dred_duration(u8)` and `dred_duration() -> u8`. They
-    still refuse a complexity above 10, a loss or voice ratio above 100, a
-    depth outside 8 to 24 and a DRED duration above 104. The decoders'
-    `set_gain(i16)` no longer fails and returns `()`; `gain() -> i16`.
-  - In-band FEC has one interface: `set_inband_fec(InbandFec)` and
-    `inband_fec() -> InbandFec` on both encoders. `set_inband_fec(bool)`,
-    `inband_fec() -> bool`, `set_inband_fec_mode` and `inband_fec_mode` are
-    removed.
-  - `OpusEncoder::set_energy_mask(Option<&[f32]>)` returns `Result<(),
-    Error>`: a slice of another length than 21 values per channel is
-    `BadArg` and keeps the mask. It used to clear the mask.
-  - `pcm_soft_clip(pcm, frame_size, channels, declip_mem)` ->
-    `pcm_soft_clip(pcm, channels, declip_mem) -> Result<(), Error>`. The
-    number of samples per channel is `pcm.len() / channels`. No channels, a
-    length that is not a multiple of `channels` and fewer memory values than
-    channels are `BadArg`; they used to leave `pcm` unchanged silently.
-- The single-stream encoder and decoder:
-  - The DRED decode calls follow the names of the decode calls:
-    `OpusDecoder::dred_decode_float` -> `dred_decode` (`f32` output, libopus
-    `opus_decoder_dred_decode_float`), `dred_decode` -> `dred_decode_i16`
-    (libopus `opus_decoder_dred_decode`). `dred_decode24` keeps its name.
-  - New `OpusEncoder::init(slot, SampleRate, Channels, Application) ->
-    Result<&mut OpusEncoder, Error>` builds an encoder in memory that the
-    caller provides, as `OpusDecoder::init` builds a decoder. Without `heap`
-    it needs less than 16 KB of stack, where `new` needs more than 256 KB.
-    `OpusEncoder::reset_state` now writes the new state in place too.
-  - New getters: `OpusEncoder::bandwidth() -> Bandwidth` (libopus
-    `OPUS_GET_BANDWIDTH`: the bandwidth of the last packet, fullband before
-    the first), `max_bandwidth() -> Bandwidth` (`OPUS_GET_MAX_BANDWIDTH`) and
-    `force_mode() -> Option<ForcedMode>`; `OpusDecoder::bandwidth() ->
-    Option<Bandwidth>` (`OPUS_GET_BANDWIDTH`, `None` before the first packet)
-    and `nb_samples(packet) -> Result<usize, Error>`
-    (`opus_decoder_get_nb_samples`).
-  - A method that needs a cargo feature exists only with it. `set_osce_bwe`
-    and `osce_bwe` of `OpusDecoder`, and `MultistreamDecoder::set_osce_bwe`,
-    need `osce-bwe`; without it they used to return `Unimplemented`.
-    `set_osce_bwe(bool)` returns `()` instead of `Result<(), Error>`, and
-    `osce_bwe()` returns `bool` instead of `Result<bool, Error>`.
-  - Every `set_dnn_blob` returns `Result<DnnModels, Error>`: those of
-    `OpusEncoder` (feature `dred`) and `OpusDredDecoder` returned `Result<(),
-    Error>`. New `DnnModels::DRED_ENCODER` (the RDOVAE encoder and PitchDNN)
-    and `DnnModels::DRED_DECODER` (the RDOVAE decoder) are what they load.
-  - `Debug` for `OpusEncoder`, `OpusDecoder`, `MultistreamEncoder`,
-    `MultistreamDecoder`, `OpusDred` and `OpusDredDecoder`. It shows the
-    settings, never the buffers. The `Debug` of `Repacketizer` no longer
-    shows the frames it holds.
-  - New constants `opus1::VERSION` (the crate version) and
-    `opus1::LIBOPUS_VERSION` (`"1.6.1"`, the libopus release opus1 follows).
-- Multistream (module `multistream`):
-  - `MultistreamEncoder` and `MultistreamDecoder` have the same constructors:
-    `new(rate, channels, streams, coupled_streams, mapping)`,
-    `from_mapping_table(rate, &ChannelMappingTable)` and `from_layout(rate,
-    &ChannelLayout)`, each with an `Application` last for the encoder. The
-    encoder keeps `new_surround`. `MultistreamDecoder::new(rate,
-    ChannelMappingTable)` -> `from_mapping_table(rate, &ChannelMappingTable)`;
-    `MultistreamDecoder::with_layout(rate, channels, streams,
-    coupled_streams, mapping)` -> `new(...)` with the same arguments.
-    `MultistreamEncoder::from_mapping_table` and both `from_layout` are new;
-    the encoders they build have no surround mode and no LFE stream, like
-    those of `new`.
-  - New getters: `channels() -> usize` on both;
-    `MultistreamEncoder::bandwidth() -> Bandwidth` (libopus
-    `OPUS_GET_BANDWIDTH`, the bandwidth the first stream coded last) and
-    `force_mode() -> Option<ForcedMode>` (the setting);
-    `MultistreamDecoder::bandwidth() -> Option<Bandwidth>` and
-    `last_packet_duration() -> usize` (libopus `OPUS_GET_BANDWIDTH` and
-    `OPUS_GET_LAST_PACKET_DURATION`, answered by the first stream as libopus
-    does), `osce_bwe() -> bool` (feature `osce-bwe`) and `dnn_models() ->
-    DnnModels` (feature `dnn`).
-  - `ChannelMappingTable` is `#[non_exhaustive]`;
-    `ChannelMappingTable::new(channels, stream_count, coupled_count,
-    &mapping)` makes one. Its fields stay public.
-  - New cargo feature `alloc`, which `std` turns on. The module
-    `multistream` needs `alloc` instead of `std`, so it works in a `no_std`
-    build with a global allocator (`default-features = false, features =
-    ["alloc", "libm"]`). With `alloc`, the `packet` functions keep more than
-    32 extensions and copy more than 1275 bytes of old padding, as with
-    `std` before.
-  - The documentation of `MultistreamEncoder::stream_encoder_mut` lists
-    which settings of one stream can be changed, which the next `encode`
-    sets again, and which break the agreement between the streams.
-  - The multistream decoder writes the channels in the order of its mapping
-    table, the Vorbis order for mapping family 1. opus1 does not reorder or
-    downmix channels; [docs/05](05-multichannel.md#the-order-of-the-channels)
-    compares the Vorbis order with the WAV order.
-- `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
-  so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
-  call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
-  `set_bandwidth(Some(Bandwidth::Superwideband))` or
-  `set_bandwidth(Some(Bandwidth::Fullband))`,
-  so that low bitrates do not fall back to wideband SILK.
-- The public field `OpusDecoder::hybrid_skip_celt` is removed. The decoder never
-  read it.
-- The settings of `OpusEncoder` are methods instead of public fields:
-  `set_bitrate` with `bitrate_setting` and `bitrate`, `set_complexity` and
-  `complexity`, `set_vbr` and `vbr` (instead of `use_cbr`, with the opposite
-  meaning), `set_inband_fec` and `inband_fec`, `set_packet_loss_perc` and
-  `packet_loss_perc`. Each setter checks its value as libopus's `OPUS_SET_*`
-  request does. A complexity above 10 and a packet loss above 100 % are
-  errors, and the setting keeps its old value. A bitrate is raised to at
-  least 500 b/s and limited to at most 750,000 b/s per channel. The encoder no longer
-  clamps the settings on every `encode` call.
+  `OpusEncoder::new(i32, usize, Application)` -> `new(SampleRate, Channels,
+  Application)`, and `OpusDecoder::new(i32, usize)` -> `new(SampleRate,
+  Channels)`. They no longer refuse a rate or a channel count, because the
+  types hold only valid ones.
+  - `SampleRate` has the values `Hz8000`, `Hz12000`, `Hz16000`, `Hz24000`
+    and `Hz48000` (`#[non_exhaustive]`), `SampleRate::ALL` (a slice,
+    `&'static [SampleRate]`, so that a later rate does not change its
+    type), `hz()`, `max_frame_size()` (the samples per channel of 120 ms),
+    `TryFrom<u32>`, `TryFrom<i32>` and `From<SampleRate> for u32`.
+  - `Channels` has the values `Mono` and `Stereo`, `Channels::ALL` (an
+    array, `[Channels; 2]`), `count()`, `TryFrom<usize>` and
+    `From<Channels> for usize`.
+  - `try_from` refuses other numbers with `BadArg` ("invalid sampling
+    rate", "invalid number of channels"). Both types derive `Debug`,
+    `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord` and `Hash`.
+  - The multistream decoder takes a `SampleRate` too (see below).
+- The settings of `OpusEncoder` are methods instead of public fields. Each
+  setter checks its value as libopus's `OPUS_SET_*` request does. A value
+  that libopus refuses is an error of kind `BadArg`, and the setting keeps
+  its old value. The encoder no longer clamps the settings on every
+  `encode` call (0.1.37 limited the bitrate to 500 to 3,000,000 b/s there).
+  - `bitrate_bps: i32` -> `set_bitrate(Bitrate)`, with the getters
+    `bitrate_setting() -> Bitrate` (the setting) and `bitrate() -> i32`
+    (libopus `OPUS_GET_BITRATE`: the bits per second the setting gives).
+    `Bitrate` is `Auto` (libopus `OPUS_AUTO`, the default), `Max`
+    (`OPUS_BITRATE_MAX`) or `BitsPerSecond(NonZeroU32)`. `set_bitrate`
+    cannot fail: as in libopus, a bitrate is raised to at least 500 b/s and
+    limited to at most 750,000 b/s per channel.
+  - `complexity: i32` -> `set_complexity(u8) -> Result<(), Error>` and
+    `complexity() -> u8`. A complexity above 10 is refused.
+  - `use_cbr: bool` -> `set_vbr(bool)` and `vbr() -> bool`, with the
+    opposite meaning.
+  - `use_inband_fec: bool` -> `set_inband_fec(InbandFec)` and
+    `inband_fec() -> InbandFec`. `InbandFec` is `Off` (the default), `On`
+    or `OnUnlessMusic` (libopus `OPUS_SET_INBAND_FEC` 0, 1 and 2).
+  - `packet_loss_perc: i32` -> `set_packet_loss_perc(u8) -> Result<(),
+    Error>` and `packet_loss_perc() -> u8`. A loss above 100 % is refused.
 - The default bitrate of `OpusEncoder` is libopus's automatic one,
   `Bitrate::Auto`: 60 × rate / frame size + rate × channels b/s, for example
-  19 kb/s for 16 kHz mono and 99 kb/s for 48 kHz stereo in 20 ms frames. It was
-  a fixed 64 kb/s. An encoder that is given a bitrate writes the same packets as
-  before.
-- `Bitrate` moved from `opus1::multistream` to the crate root.
-  `OpusEncoder::set_bitrate` takes it too, so a single stream now also has
-  `Bitrate::Auto` (libopus `OPUS_AUTO`) and `Bitrate::Max` (`OPUS_BITRATE_MAX`).
-- New: `set_vbr_constraint` on `OpusEncoder` and `MultistreamEncoder` (libopus
-  `OPUS_SET_VBR_CONSTRAINT`). Turning the constraint off gives CELT-only packets
-  an unconstrained variable bitrate.
-- The internal modules are private. The public API is the crate root
-  (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`,
-  `ForcedMode`, `pcm_soft_clip`) and the modules `packet`, `extensions` and
-  `multistream`. The modules `bands`, `celt`, `celt_lpc`, `hp_cutoff`,
-  `kiss_fft`, `mdct`, `modes`,
+  19 kb/s for 16 kHz mono and 99 kb/s for 48 kHz stereo in 20 ms frames. It
+  was a fixed 64 kb/s. To keep 64 kb/s, call
+  `set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap()))`.
+- `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio
+  bandwidth, so at higher bitrates the encoder still chose CELT. To ask for
+  Hybrid packets, call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
+  `set_bandwidth(Some(Bandwidth::Superwideband))` or
+  `set_bandwidth(Some(Bandwidth::Fullband))`, so that low bitrates do not
+  fall back to wideband SILK.
+- The public field `OpusDecoder::hybrid_skip_celt` is removed. The decoder
+  never read it.
+- `OpusDecoder::decode` no longer sets the part of `output` after the
+  decoded samples to zero. As in libopus, it writes only the samples it
+  returns. A program that relied on the zeros must clear the buffer itself.
+- `Application` is `#[non_exhaustive]` and has two more values,
+  `RestrictedSilk` and `RestrictedCelt` (see [New features](#new-features)).
+  A `match` on it needs a `_` arm.
+- `Bandwidth::Auto` is removed: `Bandwidth` has the five real bandwidths.
+  Where the automatic choice is meant, an `Option<Bandwidth>` is `None`, as
+  in `OpusEncoder::set_bandwidth`.
+- Multistream (module `multistream`):
+  - `MultistreamDecoder::new(i32, ChannelMappingTable)` ->
+    `MultistreamDecoder::from_mapping_table(SampleRate,
+    &ChannelMappingTable)`. The table is checked as libopus checks a
+    layout, and an invalid one is `BadArg`. The name `new` now takes the
+    layout as numbers: `new(SampleRate, channels, streams, coupled_streams,
+    &mapping)`.
+  - `ChannelMappingTable` is `#[non_exhaustive]`, so code outside opus1
+    cannot build it with a struct expression.
+    `ChannelMappingTable::new(channels, stream_count, coupled_count,
+    &mapping)` builds one, and `ChannelMappingTable::parse` reads one as
+    before. Its fields stay public.
+- The internal modules are private. The public interface is the crate root
+  and the modules `packet`, `extensions` and `multistream`. The modules
+  `bands`, `celt`, `celt_lpc`, `hp_cutoff`, `kiss_fft`, `mdct`, `modes`,
   `pitch`, `pvq`, `quant_bands`, `range_coder`, `rate` and `silk`, the types
   `CeltEncoder`, `CeltDecoder`, `SilkResampler`, `SilkResamplerDown1_3` and
-  `SilkResamplerDown1_6` at the crate root, and the macro `tell_frac_inline!`
-  are no longer exported. The submodules of
-  `multistream` are private too; their public items, `validate_ambisonics`
-  included, are in `opus1::multistream`. The tests of this repository reach
-  internal items through `opus1::internals`, which is hidden from the
-  documentation and not part of the stable API.
-- `OpusDecoder::decode` no longer sets the part of `output` after the decoded
-  samples to zero. As in libopus, it writes only the samples it returns. A program
-  that relied on the zeros must clear the buffer itself.
+  `SilkResamplerDown1_6` at the crate root, and the macro
+  `tell_frac_inline!` are no longer exported.
+  - The crate root holds `OpusEncoder`, `OpusDecoder`, `SampleRate`,
+    `Channels`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`,
+    `FrameDuration`, `Signal`, `InbandFec`, `Error`, `ErrorKind`,
+    `pcm_soft_clip`, `VERSION` and `LIBOPUS_VERSION`; with `deep-plc` (or a
+    feature that turns it on) also `DnnBlob` and `DnnModels`, and with
+    `dred` also `OpusDred`, `OpusDredDecoder`, `DredParse` and
+    `DredProcessing`.
+  - The tests, benchmarks, examples and fuzz targets of the repository
+    reach internal items through the hidden module `opus1::internals`. It
+    exists only with the cargo feature `__internals`, which is for them
+    only and outside semantic versioning; applications never enable it.
+    The other hidden test hooks need it too: `DnnBlob::weights()` and the
+    implementation of the evaluation trait `DemoDecoder` for `OpusDecoder`.
+- The feature `heap` turns on `alloc` instead of `std`. In 0.1.37 a build
+  with `default-features = false, features = ["heap"]` was a `std` build.
+  Now it is a `no_std` build, which needs `libm` as well (or `std`). The
+  default features (`std`, `heap` and the new `analysis`) still build with
+  `std`.
+- The minimum Rust version is 1.98 (`rust-version` in Cargo.toml): the
+  64-bit ARM dot-product intrinsics of the neural network code are stable
+  from that version on. opus-rs 0.1.37 declared no minimum; its edition
+  2024 needs Rust 1.85 or later.
 
 ## 24 kHz audio
 
@@ -272,16 +157,107 @@ test that compares opus1 with the C library under the same settings.
 
 ## New features
 
-- `multistream::MultistreamEncoder` (surround families 0, 1, 2 and 255, rate
-  allocation, LFE stream, surround masking) and a general `MultistreamDecoder`
-  (any valid layout, 16-bit output, loss concealment, FEC). Packets interoperate
-  with libopus's multistream encoder and decoder in both directions.
+Everything in this section is new since opus-rs 0.1.37, and is described in
+its 0.2.0 form.
+
+- Multichannel audio, module `multistream`: `MultistreamEncoder` (surround
+  families 0, 1, 2 and 255, rate allocation, LFE stream, surround masking)
+  and a general `MultistreamDecoder` (any valid layout, `f32`, 16-bit and
+  24-bit output, loss concealment, FEC). Packets interoperate with libopus's
+  multistream encoder and decoder in both directions.
+  - Both have the same constructors: `new(rate, channels, streams,
+    coupled_streams, &mapping)`, `from_mapping_table(rate,
+    &ChannelMappingTable)` and `from_layout(rate, &ChannelLayout)`, each
+    with an `Application` last for the encoder. The rate is a `SampleRate`,
+    and the channel counts are `usize` (1 to 255). The encoder also has
+    `new_surround(rate, channels, mapping_family, application)`, which
+    chooses the streams of a mapping family as libopus does. The encoders
+    of the other three constructors have no surround mode and no LFE
+    stream.
+  - The module needs the new cargo feature `alloc`, which `std` and `heap`
+    turn on. So it also works in a `no_std` build with a global allocator
+    (`default-features = false, features = ["alloc", "libm"]`).
+  - The constructors build every stream encoder and decoder in place, in
+    the memory of the multistream encoder or decoder (`OpusEncoder::init`,
+    `OpusDecoder::init`). So they need less than 16 KB of stack, also
+    without `heap`, where one stream encoder holds up to 210 KB. Encoding,
+    decoding and `reset_state` allocate nothing.
+  - Getters: `layout()`, `channels() -> usize` and `sampling_rate() ->
+    SampleRate` on both; `MultistreamEncoder::bandwidth() -> Bandwidth`
+    (libopus `OPUS_GET_BANDWIDTH`, the bandwidth the first stream coded
+    last), `bandwidth_setting() -> Option<Bandwidth>` and `force_mode() ->
+    Option<ForcedMode>` (the settings); `MultistreamDecoder::bandwidth() ->
+    Option<Bandwidth>` and `last_packet_duration() -> usize` (libopus
+    `OPUS_GET_BANDWIDTH` and `OPUS_GET_LAST_PACKET_DURATION`, answered by
+    the first stream as libopus does), `osce_bwe() -> bool` (feature
+    `osce-bwe`) and `dnn_models() -> DnnModels` (feature `deep-plc`).
+  - `ChannelMappingTable::new(channels, stream_count, coupled_count,
+    &mapping)` makes a table. `ChannelLayout`, `MappingType`
+    (`#[non_exhaustive]`) and `validate_ambisonics` are in
+    `opus1::multistream` too.
+  - The documentation of `MultistreamEncoder::stream_encoder_mut` lists
+    which settings of one stream can be changed, which the next `encode`
+    sets again, and which break the agreement between the streams.
+  - The multistream decoder writes the channels in the order of its mapping
+    table, the Vorbis order for mapping family 1. opus1 does not reorder or
+    downmix channels; [docs/05](05-multichannel.md#the-order-of-the-channels)
+    compares the Vorbis order with the WAV order.
+- `MultistreamEncoder` forwards the forced channel count, the prediction and
+  phase inversion switches, the application and the voice ratio as libopus
+  does (difference D5 closed).
 - `OpusDecoder`: `decode_i16` (soft clipping as `opus_decode`), `decode_fec`,
   `decode_fec_i16`, `final_range`, `reset_state`; packets whose channel count
   differs from the decoder's; CELT packet loss concealment ported from libopus.
-- `OpusEncoder`: `set_force_mode`, `set_bandwidth`, `set_max_bandwidth`,
-  `set_force_channels`, `set_lfe`, `set_energy_mask`, `final_range`,
-  `reset_state`, `lookahead`.
+  New getters: `sampling_rate() -> SampleRate`, `channels() -> Channels`,
+  `bandwidth() -> Option<Bandwidth>` (libopus `OPUS_GET_BANDWIDTH`, `None`
+  before the first packet) and `nb_samples(packet) -> Result<usize, Error>`
+  (`opus_decoder_get_nb_samples`).
+- `OpusEncoder` controls of libopus, with their getters:
+  - `set_force_mode(Option<ForcedMode>)` and `force_mode()`
+    (`OPUS_SET_FORCE_MODE`). `ForcedMode` is `SilkOnly`, `Hybrid` or
+    `CeltOnly`, with the numbers of libopus's `MODE_*` (1000 to 1002);
+    `None` is the automatic choice.
+  - `set_bandwidth(Option<Bandwidth>)` and `bandwidth_setting() ->
+    Option<Bandwidth>` (`OPUS_SET_BANDWIDTH`; `None` is the automatic
+    choice, the default). `bandwidth() -> Bandwidth` is
+    `OPUS_GET_BANDWIDTH`: the bandwidth of the last packet, fullband before
+    the first. `set_max_bandwidth(Bandwidth)` and `max_bandwidth()`
+    (`OPUS_SET_MAX_BANDWIDTH`).
+  - `set_force_channels(Option<Channels>)` and `force_channels() ->
+    Option<Channels>` (`OPUS_SET_FORCE_CHANNELS`). Stereo on a mono
+    encoder, or on the mono streams of a multistream encoder, is kept and
+    has no effect, where libopus refuses it.
+  - `set_lfe`, `final_range`, `reset_state`, `lookahead`,
+    `sampling_rate() -> SampleRate` and `channels() -> Channels`.
+  - `set_energy_mask(Option<&[f32]>) -> Result<(), Error>` takes 21 values
+    per channel. A slice of another length is `BadArg` and keeps the mask.
+- The settings types are enums with the numbers of libopus.
+  `Application`, `Bandwidth`, `Signal`, `ForcedMode`, `InbandFec` and
+  `FrameDuration` have `const fn to_raw(self) -> i32` (the libopus number)
+  and `TryFrom<i32>` (`BadArg` for other numbers). `Signal::Auto` is
+  `OPUS_AUTO` (-1000). `Bitrate`, `Signal`, `InbandFec` and
+  `FrameDuration` implement `Default` (`Auto`, `Auto`, `Off`, `Argument`).
+  Every small enum derives `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq` and
+  `Hash`. `Application`, `ForcedMode`, `Signal`, `InbandFec`,
+  `multistream::MappingType`, `ErrorKind` and `SampleRate` are
+  `#[non_exhaustive]`, so a `match` on them needs a `_` arm.
+- `Bitrate` is at the crate root, and both encoders take it in
+  `set_bitrate`: `Bitrate::Auto` (libopus `OPUS_AUTO`), `Bitrate::Max`
+  (`OPUS_BITRATE_MAX`) and `Bitrate::BitsPerSecond(NonZeroU32)`.
+- `set_vbr_constraint` on `OpusEncoder` and `MultistreamEncoder` (libopus
+  `OPUS_SET_VBR_CONSTRAINT`). Turning the constraint off gives CELT-only
+  packets an unconstrained variable bitrate.
+- `Application::RestrictedSilk` (2052) and `Application::RestrictedCelt`
+  (2053), the applications `OPUS_APPLICATION_RESTRICTED_SILK` and
+  `OPUS_APPLICATION_RESTRICTED_CELT` of libopus 1.6, with their behaviour,
+  also in `MultistreamEncoder`: SILK-only at most wideband in frames of
+  10 ms or more, and CELT-only with the packets of `RestrictedLowDelay`.
+  This holds for every packet with audio. A packet without audio, which the
+  encoder writes when the bitrate or the output buffer is too small to code
+  a frame, names the mode of the last coded frame in its TOC byte, as in
+  libopus: Hybrid before the first coded frame and after `reset_state`
+  ([docs/02](02-packets.md#packets-without-audio)). `set_application`
+  refuses to change to them or from them, as libopus does.
 - Frames of 80, 100 and 120 ms in `OpusEncoder` and `MultistreamEncoder`,
   coded as libopus 1.6.1 codes them: CELT and Hybrid as four to six 20 ms
   frames, SILK as two 40 ms, five 20 ms or two 60 ms frames, in one packet.
@@ -294,7 +270,58 @@ test that compares opus1 with the C library under the same settings.
   `OPUS_SET_EXPERT_FRAME_DURATION`): each call codes one frame of the duration
   that is set. The multistream encoder no longer differs from libopus in its
   frame sizes (difference D3).
-- `packet` module: parse, write and pad packets, self-delimited framing.
+- The module `packet`: parse, write and pad packets, with self-delimited
+  framing (libopus `opus_packet_*` and the repacketizer).
+  - `packet::parse(data, Framing) -> Result<ParsedPacket, Error>`.
+    `ParsedPacket` has read-only methods: `toc()`, `nb_frames()`,
+    `frame_sizes()`, `payload_offset()`, `packet_offset()`,
+    `padding_len()`, `frames(data)`, `frame(data, i)` and `padding(data)`.
+    Only `parse` makes one.
+  - `packet::write(toc, frames, out, Framing, Padding)`, `pad(data, len,
+    new_len)`, `unpad`, `multistream_pad`, `multistream_unpad` and
+    `multistream_validate(data, nb_streams, SampleRate)`.
+  - The TOC getters `samples_per_frame(toc, SampleRate)`,
+    `bandwidth(toc) -> Bandwidth` and `nb_channels(toc) -> Channels`
+    (libopus `opus_packet_get_samples_per_frame`,
+    `opus_packet_get_bandwidth`, `opus_packet_get_nb_channels`), and
+    `nb_frames(data)` and `nb_samples(data, SampleRate)`.
+  - The enums `Framing` (`Normal`, `SelfDelimited`) and `Padding`
+    (`Shortest`, `FillBuffer`) stand for libopus's flags `self_delimited`
+    and `pad`.
+  - `pad` and `multistream_pad` keep the extensions in the padding of a
+    packet, and fail with `ErrorKind::InternalError` when the padding is not
+    valid extension data, as libopus does.
+- Packet extensions of libopus 1.5 and later: the module `extensions`
+  (libopus `src/extensions.c`), `packet::Repacketizer` (libopus
+  `OpusRepacketizer`), which carries extensions, and
+  `packet::pad_with_extensions`, `packet::unpad` and
+  `packet::multistream_unpad`.
+  - `Extension` (`#[non_exhaustive]`) has the public fields `id`, `frame`
+    and `data`; `Extension::new(id, frame, data)` makes one.
+  - `ExtensionIterator` implements `Iterator<Item = Result<Extension,
+    Error>>`. After an error it returns `None` (libopus returns the error
+    again). `find_id(id)` looks for one ID; it is not called `find`, so
+    that `Iterator::find` stays callable.
+  - `extensions::count` and `count_ext` return `Result<usize, Error>`;
+    `parse`, `parse_ext`, `generate(out, extensions, nb_frames, Padding)`
+    and `generated_len` complete the module.
+  - No call panics on bad arguments: `nb_frames` above 48 is `BadArg` in
+    `ExtensionIterator` (on the first `next`), `count`, `count_ext`,
+    `parse` and `parse_ext`, and an `nb_frame_exts` slice shorter than
+    `nb_frames` is `BadArg` in `count_ext` and `parse_ext`. libopus checks
+    these only with debug assertions, or not at all.
+  - `Repacketizer::out_range_ext(begin, end, out, Framing, Padding,
+    extensions)` has the options of libopus's internal
+    `opus_repacketizer_out_range_impl`. `Repacketizer` is `Clone` but not
+    `Copy` (it holds about 1.6 KB).
+  - `packet::pad_with_extensions(data, len, new_len, Padding, extensions)`
+    returns the length of the packet, also when there is nothing to do.
+    Extensions it is given are always written, or the call fails with
+    `BufferTooSmall` when they do not fit. Here it differs from libopus's
+    internal `opus_packet_pad_impl`, which returns 0 when `len` equals
+    `new_len` and leaves the extensions out.
+  - Without the feature `alloc`, more than 32 extensions or more than 1275
+    bytes of old padding in one call are `AllocFail`.
 - The speech and music analysis of libopus (`analysis.c`, `mlp.c`), in the
   new module `src/analysis/` (cargo feature `analysis`, on by default). From
   complexity 7 on, for input at 16 to 48 kHz, it estimates per packet how
@@ -311,43 +338,54 @@ test that compares opus1 with the C library under the same settings.
   `OPUS_SET_DTX`, `OPUS_GET_IN_DTX`), with both kinds of DTX of libopus: that
   of the Opus layer, which uses the analysis, and SILK's.
 - New encoder controls of libopus: `set_signal` with the type `Signal`
-  (`OPUS_SET_SIGNAL`), `set_lsb_depth` (`OPUS_SET_LSB_DEPTH`) and the type
-  `InbandFec` for `set_inband_fec` (`OPUS_SET_INBAND_FEC` 2, FEC that does
-  not move music to SILK). The multistream encoder forwards
+  (`OPUS_SET_SIGNAL`), `set_lsb_depth(u8)` (8 to 24, `OPUS_SET_LSB_DEPTH`)
+  and `InbandFec::OnUnlessMusic` for `set_inband_fec` (`OPUS_SET_INBAND_FEC`
+  2, FEC that does not move music to SILK). The multistream encoder forwards
   them to every stream.
-- The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity`, `set_osce_bwe` and `set_dnn_blob` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/10](10-differences-from-libopus.md)).
+- The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity(u8)`, `set_osce_bwe(bool)` and `osce_bwe() -> bool` (feature `osce-bwe`; without it the methods do not exist) and `set_dnn_blob(&DnnBlob) -> Result<DnnModels, Error>` with `dnn_models()` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. `DnnBlob` and `DnnModels` need the feature `deep-plc`, which `osce`, `osce-bwe` and `dred` turn on; the feature `dnn` alone adds no public API. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/10](10-differences-from-libopus.md)).
 - `OpusDecoder::last_packet_duration()` and `packet::has_lbrr()`, as libopus has them.
 - Phase inversion disabling: `set_phase_inversion_disabled` and
   `phase_inversion_disabled` on `OpusEncoder`, `OpusDecoder`,
   `MultistreamEncoder` and `MultistreamDecoder`
   (`OPUS_SET_PHASE_INVERSION_DISABLED`). CELT's intensity stereo then never
   inverts the second channel, which makes a mono downmix sound better.
-- Decoder output gain and pitch: `OpusDecoder::set_gain` and `gain`
-  (`OPUS_SET_GAIN`, in 1/256 dB, also on `MultistreamDecoder`) and
-  `OpusDecoder::pitch` (`OPUS_GET_PITCH`).
+- Decoder output gain and pitch: `OpusDecoder::set_gain(i16)` and
+  `gain() -> i16` (`OPUS_SET_GAIN`, in 1/256 dB, also on
+  `MultistreamDecoder`) and `OpusDecoder::pitch` (`OPUS_GET_PITCH`).
 - The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,
   `OpusDecoder::decode24` and `decode_fec24`, and the multistream versions
   (`opus_encode24`, `opus_decode24`, `opus_multistream_encode24`,
   `opus_multistream_decode24`).
 - `OpusEncoder::set_application` and `application` (`OPUS_SET_APPLICATION`,
-  before the first frame), and `set_voice_ratio` and `voice_ratio`
-  (`OPUS_SET_VOICE_RATIO`).
-- `MultistreamEncoder` forwards the forced channel count, the prediction and
-  phase inversion switches, the application and the voice ratio as libopus
-  does (difference D5 closed).
-- Deep redundancy (DRED, cargo feature `dred`, off by default), as in libopus 1.5 and later: `OpusEncoder::set_dred_duration` and `dred_duration` (`OPUS_SET_DRED_DURATION`, `OPUS_GET_DRED_DURATION`), `OpusEncoder::set_dnn_blob`, and on the decoder side `OpusDredDecoder` (`opus_dred_decoder_*`, `opus_dred_parse`, `opus_dred_process`), `OpusDred` (`opus_dred_alloc`) and `OpusDecoder::dred_decode` (`f32` output, `opus_decoder_dred_decode_float`), `dred_decode_i16` (`opus_decoder_dred_decode`) and `dred_decode24` (`opus_decoder_dred_decode24`). Without the feature, or with a duration of 0, the packets do not change.
-- Packet extensions of libopus 1.5 and later: the module `extensions` (libopus `src/extensions.c`), `packet::Repacketizer` (libopus `OpusRepacketizer`), which carries extensions, and `packet::pad_with_extensions`, `packet::unpad` and `packet::multistream_unpad`.
+  before the first frame), and `set_voice_ratio(Option<u8>)` and
+  `voice_ratio() -> Option<u8>` (`OPUS_SET_VOICE_RATIO`, 0 to 100; `None` is
+  libopus -1).
+- `pcm_soft_clip(pcm, channels, declip_mem) -> Result<(), Error>` (libopus
+  `opus_pcm_soft_clip`). The number of samples per channel is
+  `pcm.len() / channels`. No channels, a length that is not a multiple of
+  `channels` and fewer memory values than channels are `BadArg`.
+- Deep redundancy (DRED, cargo feature `dred`, off by default), as in libopus 1.5 and later: `OpusEncoder::set_dred_duration(u8)` and `dred_duration() -> u8` (`OPUS_SET_DRED_DURATION`, `OPUS_GET_DRED_DURATION`, 0 to 104 frames of 10 ms), `OpusEncoder::set_dnn_blob`, and on the decoder side `OpusDredDecoder` (`opus_dred_decoder_*`, `opus_dred_parse`, `opus_dred_process`), `OpusDred` (`opus_dred_alloc`) and `OpusDecoder::dred_decode` (`f32` output, `opus_decoder_dred_decode_float`), `dred_decode_i16` (`opus_decoder_dred_decode`) and `dred_decode24` (`opus_decoder_dred_decode24`). `OpusDredDecoder::parse(dred, data, max_dred_samples, SampleRate, DredProcessing)` returns a `DredParse` (`#[non_exhaustive]`); `DredProcessing::Deferred` is libopus's `defer_processing`. Every `set_dnn_blob` returns `Result<DnnModels, Error>`; `DnnModels::DRED_ENCODER` (the RDOVAE encoder and PitchDNN) and `DnnModels::DRED_DECODER` (the RDOVAE decoder) are what the DRED encoder and decoder load. Without the feature, or with a duration of 0, the packets do not change.
+- `Debug` for `OpusEncoder`, `OpusDecoder`, `MultistreamEncoder`,
+  `MultistreamDecoder`, `OpusDred` and `OpusDredDecoder`. It shows the
+  settings, never the buffers.
+- The constants `opus1::VERSION` (the crate version) and
+  `opus1::LIBOPUS_VERSION` (`"1.6.1"`, the libopus release opus1 follows).
 - Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/09](09-testing.md#evaluation-tools)).
-- `OpusDecoder::init(slot, sampling_rate, channels)` builds a decoder in memory that the caller provides (`&mut MaybeUninit<OpusDecoder>`, for example a `static`) and returns `&mut OpusDecoder`. Upstream opus-rs added the same function in PR #65 (by Alix ANNERAUD); opus1 implements it in its own way, because its decoder also holds the state of the neural network features. Every part of the decoder is written in place, field by field: the CELT and SILK decoders, the OSCE and BWE states, deep PLC and the model holder. A macro, `write_fields!`, checks at compile time that every field of each struct is written. `new` now goes through the same code. The tables that every decoder shares (the CELT mode and the built-in models) are also built in place, on first use. Measured in a release build for aarch64 without `heap`: `init` needs less than 16 KB of stack, also with `osce-bwe` and `dred` and on the first call of a program, where `new` needs about 192 KB (512 KB with those features). With `heap`, `init` writes the boxed parts straight into their heap memory. Tested by `tests/decoder_init.rs`, adapted from upstream: the output of a decoder from `init` equals that of one from `new` (five settings, with lost packets, at complexity 0 and 10), and `init` and decoding run on a thread with a 32 KB stack. `OpusEncoder::init` builds an encoder in the same way: the CELT and SILK encoders, the speech and music analysis and the DRED encoder are written in place, and `tests/encoder_init.rs` checks that its packets equal those of `new` and that `init` and `reset_state` run on a 32 KB stack. The multistream encoder and decoder have no `init` yet.
-- The feature `portable-atomic`: the crate builds for targets without atomic compare-and-swap (CAS), such as `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf` (ESP32-C3), as upstream opus-rs PR #64 (by Alix ANNERAUD) does. The only compare-and-swap of the crate guards the lazily built shared tables (`compat::OnceCell`); with the feature its atomic comes from the `portable-atomic` crate. `Arc` is used only with `heap`, which needs `std`. On such a target the application also sets portable-atomic's `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip. Checked with `cargo build --target thumbv6m-none-eabi --no-default-features --features libm,portable-atomic` (also with `analysis`, and with `osce-bwe,dred`); `scripts/check_no_std.sh` now builds it.
+- `OpusDecoder::init(slot, sampling_rate, channels)` builds a decoder in memory that the caller provides (`&mut MaybeUninit<OpusDecoder>`, for example a `static`) and returns `&mut OpusDecoder`. Upstream opus-rs added the same function in PR #65 (by Alix ANNERAUD); opus1 implements it in its own way, because its decoder also holds the state of the neural network features. Every part of the decoder is written in place, field by field: the CELT and SILK decoders, the OSCE and BWE states, deep PLC and the model holder. A macro, `write_fields!`, checks at compile time that every field of each struct is written. `new` now goes through the same code. The tables that every decoder shares (the CELT mode and the built-in models) are also built in place, on first use. Measured in a release build for aarch64 without `heap`: `init` needs less than 16 KB of stack, also with `osce-bwe` and `dred` and on the first call of a program, where `new` needs about 192 KB (512 KB with those features). With `heap`, `init` writes the boxed parts straight into their heap memory. Tested by `tests/decoder_init.rs`, adapted from upstream: the output of a decoder from `init` equals that of one from `new` (five settings, with lost packets, at complexity 0 and 10), and `init` and decoding run on a thread with a 32 KB stack. `OpusEncoder::init(slot, SampleRate, Channels, Application) -> Result<&mut OpusEncoder, Error>` builds an encoder in the same way: the CELT and SILK encoders, the speech and music analysis and the DRED encoder are written in place, and `tests/encoder_init.rs` checks that its packets equal those of `new` and that `init` and `reset_state` run on a 32 KB stack. Without `heap` it needs less than 16 KB of stack, where `new` needs more than 256 KB. The multistream encoder and decoder have no `init` yet, but their constructors build each stream codec in place with these functions (`tests/multistream_small_stack.rs`).
+- `OpusEncoder::reset_state` writes the new state in place, as libopus `OPUS_RESET_STATE`: with `heap` into the heap memory the encoder has, so a reset allocates nothing.
+- The feature `portable-atomic`: the crate builds for targets without atomic compare-and-swap (CAS), such as `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf` (ESP32-C3), as upstream opus-rs PR #64 (by Alix ANNERAUD) does. The only compare-and-swap of the crate guards the lazily built shared tables (`compat::OnceCell`); with the feature its atomic comes from the `portable-atomic` crate. `Arc` is used only by `DnnBlob::from_bytes` (with `heap`), which such a target does not have. On such a target the application also sets portable-atomic's `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip. Checked with `cargo build --target thumbv6m-none-eabi --no-default-features --features libm,portable-atomic` (also with `analysis`, and with `osce-bwe,dred`); `scripts/check_no_std.sh` now builds it.
+- The feature `heap` also works in a `no_std` build with a global allocator
+  (`default-features = false, features = ["heap", "libm"]`). There
+  `DnnBlob::from_bytes` needs a target with atomic compare-and-swap.
+- The documentation on docs.rs covers the neural network features: it is
+  built with `dred` and `osce-bwe`, which turn on the others
+  (`[package.metadata.docs.rs]` in Cargo.toml). Each item that needs a
+  feature is labelled with it.
 
 ## Behaviour changes
 
 - Float output is no longer clamped to [-1, 1] (libopus does not clip float output).
   Use `decode_i16` for 16-bit output.
-- `packet::pad` and `packet::multistream_pad` keep the extensions in the padding
-  of a packet, and fail with `ErrorKind::InternalError` when the padding is not valid
-  extension data, as libopus does. Before, they wrote zeros.
 - The automatic mode choice follows libopus. At 64 kb/s a 16 kHz VoIP encoder
   now codes CELT, as libopus does at that bitrate. At speech rates (for example
   16-24 kb/s, or the automatic 19 kb/s of 20 ms frames) it codes SILK.
@@ -461,14 +499,17 @@ test that compares opus1 with the C library under the same settings.
 
 ## Fuzzing
 
-- The 19 fuzz targets in `fuzz/` build and run on the stable toolchain
-  (`fuzz/fuzz.sh`), with overflow checks on. Six of them compare with
-  libopus: packet parsing, padding and writing; a decoder fed packet
-  streams with losses and FEC; the multistream decoder and encoder; an
-  encoder whose settings change between frames; and the channel order of
-  both encoders. They also check the packet length of a constant bitrate
-  against libopus's rule, and that the multistream decoder writes only the
-  samples it returns.
+- The 24 fuzz targets in `fuzz/` build and run on the stable toolchain
+  (`fuzz/fuzz.sh`), with overflow checks on. Eight of them compare with
+  libopus: packet parsing, padding and writing; packet extensions; the
+  repacketizer with extensions; a decoder fed packet streams with losses
+  and FEC; the multistream decoder and encoder; an encoder whose settings
+  change between frames; and the channel order of both encoders. They also
+  check the packet length of a constant bitrate against libopus's rule, and
+  that the multistream decoder writes only the samples it returns. Three
+  targets test the neural network code and need a feature of the fuzz
+  package: weight blobs, DRED data, and a decoder with deep PLC, LACE,
+  NoLACE, the bandwidth extension and DRED.
 
 ## x86-64
 

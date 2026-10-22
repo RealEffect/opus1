@@ -18,6 +18,9 @@
 
 use audiopus_sys as sys;
 use opus1::{Channels, ErrorKind, OpusDecoder, SampleRate};
+// The module `multistream` needs `alloc`; the multistream tests run with
+// `std`, as in the other test files.
+#[cfg(feature = "std")]
 use opus1::multistream::MultistreamDecoder;
 use std::os::raw::c_int;
 
@@ -212,8 +215,10 @@ fn the_controls_do_not_change_the_output_yet() {
 // Multistream decoder
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "std")]
 struct CMsDec(*mut sys::OpusMSDecoder);
 
+#[cfg(feature = "std")]
 impl CMsDec {
     fn new(rate: i32, channels: i32, streams: i32, coupled: i32, mapping: &[u8]) -> Self {
         let mut err = 0;
@@ -235,6 +240,7 @@ impl CMsDec {
     }
 }
 
+#[cfg(feature = "std")]
 impl Drop for CMsDec {
     fn drop(&mut self) {
         unsafe { sys::opus_multistream_decoder_destroy(self.0) }
@@ -242,12 +248,14 @@ impl Drop for CMsDec {
 }
 
 /// A 5.1 decoder (4 streams, 2 of them coupled) on both sides.
+#[cfg(feature = "std")]
 fn surround() -> (MultistreamDecoder, CMsDec) {
     let mapping = [0u8, 4, 1, 2, 3, 5];
     let table = opus1::multistream::ChannelMappingTable::new(6, 4, 2, &mapping);
     (MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table).unwrap(), CMsDec::new(48000, 6, 4, 2, &mapping))
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn the_multistream_decoder_sets_the_complexity_of_every_stream_like_libopus() {
     let (mut d, mut c) = surround();
@@ -279,7 +287,7 @@ fn the_multistream_decoder_sets_the_complexity_of_every_stream_like_libopus() {
     assert_eq!(d.complexity(), 9);
 }
 
-#[cfg(feature = "osce-bwe")]
+#[cfg(all(feature = "std", feature = "osce-bwe"))]
 #[test]
 fn the_multistream_decoder_forwards_the_bwe_switch() {
     let (mut d, _) = surround();

@@ -26,7 +26,15 @@ opus1 = "0.2"
 
 The crate was published as `opus-rs` up to version 0.1.37. Code that used `opus_rs::` now uses `opus1::`.
 
-The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`, and with a neural network feature also `DnnBlob` and `DnnModels`) and the modules `packet`, `extensions` and `multistream`. The crate also has a module `internals` for the tests of its repository. That module is hidden from the documentation, and any release may change it.
+The public interface is the crate root and the modules `packet`, `extensions` and `multistream` (feature `alloc`, which `std` turns on). The crate root holds:
+
+- the codecs `OpusEncoder` and `OpusDecoder`;
+- the setting types `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal` and `InbandFec`;
+- the error types `Error` and `ErrorKind`;
+- the function `pcm_soft_clip` and the constants `VERSION` and `LIBOPUS_VERSION`;
+- with a neural network feature, `DnnBlob` and `DnnModels`, and with `dred` also `OpusDred`, `OpusDredDecoder`, `DredParse` and `DredProcessing`.
+
+The tests of the repository use one more module, `internals`. It exists only with the cargo feature `__internals`, which is for those tests only. That feature is outside semantic versioning: any release may change what it holds. Applications do not enable it.
 
 ## One frame through the encoder and the decoder
 
@@ -872,6 +880,7 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 | `deep-plc`, `osce`, `osce-bwe`, `dred` | off | The neural network features of the decoder (`dred` also of the encoder), with the weights of libopus 1.6.1 (see [Neural network features of the decoder](#neural-network-features-of-the-decoder)). `osce` turns on `deep-plc`, `osce-bwe` turns on `osce`, and `dred` turns on `deep-plc`. Each turns on `dnn`. |
 | `dnn` | off | The code that the neural network features share. The features above turn it on. Alone it adds no public API. |
 | `test-libopus-dnn` | off | For the tests of this repository only. It adds nothing to the library. It compiles the tests that call a libopus built with its neural network code. `cargo test --all-features` fails to link against a libopus without that code, such as the Homebrew build. |
+| `__internals` | off | For the tests, benchmarks, examples and fuzz targets of this repository only. It adds the hidden module `opus1::internals`, which exposes internal parts of the codec. It is outside semantic versioning: any release may change what it holds. Applications do not enable it. |
 
 Five builds are possible:
 

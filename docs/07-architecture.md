@@ -20,19 +20,19 @@ This document describes how the source code of `opus1` is organised, for maintai
 
 The public interface is the crate root and three modules:
 
-- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec` and `pcm_soft_clip`. With `deep-plc` (or a feature that turns it on) also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)).
+- At the crate root: `OpusEncoder`, `OpusDecoder`, `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec`, `Error`, `ErrorKind`, `pcm_soft_clip`, `VERSION` and `LIBOPUS_VERSION`. With `deep-plc` (or a feature that turns it on) also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)), and with `dred` also `OpusDred`, `OpusDredDecoder`, `DredParse` and `DredProcessing`.
 - `packet`: reading, writing and padding packets.
 - `extensions`: the packet extensions stored in the padding of a packet.
-- `multistream`: the multistream encoder and decoder and their channel layouts.
+- `multistream`: the multistream encoder and decoder and their channel layouts (feature `alloc`).
 
-Every other module is private. The tests, benchmarks, examples and fuzz targets of the repository reach internal items through the module `opus1::internals` (`src/internals.rs`). That module is hidden from the documentation and is not part of the stable API. Each module inside it has the name and the place of an internal module, and re-exports only the items that code outside the crate uses, for example `opus1::internals::range_coder::RangeCoder`. So the compiler reports an internal item that neither the codec nor a test uses as dead code.
+Every other module is private. The tests, benchmarks, examples and fuzz targets of the repository reach internal items through the module `opus1::internals` (`src/internals.rs`). That module exists only with the cargo feature `__internals`, which is for those tests only and outside semantic versioning. It is also hidden from the documentation. The tests, benchmarks and examples get the feature through a development dependency of opus1 on itself (`Cargo.toml`), and the fuzz targets through `fuzz/Cargo.toml`. Each module inside `internals` has the name and the place of an internal module, and re-exports only the items that code outside the crate uses, for example `opus1::internals::range_coder::RangeCoder`. So in a build with `__internals`, such as `cargo test`, the compiler reports an internal item that neither the codec nor a test uses as dead code. A build without it does not check that: there every item that only `internals` exposes is unused, so `src/lib.rs` allows dead code in that build.
 
 ### The Opus layer and shared code
 
 | File | What it does | libopus counterpart |
 |---|---|---|
 | `src/lib.rs` | `OpusEncoder` and `OpusDecoder`: mode and bandwidth decisions, in-band forward error correction (FEC) decisions, mode switches with redundant CELT frames, packets of 40 to 120 milliseconds (ms), discontinuous transmission (DTX), packet loss, `pcm_soft_clip`. The encoder runs the speech and music analysis of `src/analysis/` and hands its result to these decisions and to the CELT encoder. | `src/opus_encoder.c`, `src/opus_decoder.c`, `opus_pcm_soft_clip` in `src/opus.c` |
-| `src/internals.rs` | The internal items that the tests, benchmarks, examples and fuzz targets use (see above). | none |
+| `src/internals.rs` | The internal items that the tests, benchmarks, examples and fuzz targets use, with the feature `__internals` (see above). | none |
 | `src/packet.rs` | Reading, writing and padding packets; the repacketizer, which carries packet extensions; self-delimited framing; checks of multistream packets. | `opus_packet_parse_impl` in `src/opus.c`, `src/repacketizer.c`, `opus_multistream_packet_validate` in `src/opus_multistream_decoder.c` |
 | `src/extensions.rs` | Packet extensions in the padding of a packet: reading them (`ExtensionIterator`, `count`, `parse`) and writing them (`generate`). | `src/extensions.c` |
 | `src/hp_cutoff.rs` | The encoder's input filters: the high-pass filter for speech (`hp_cutoff`, `hp_cutoff_float`) and, for other audio, the filter that removes the constant (DC, direct current) part of the signal (`dc_reject_float`). The integer filters use the second-order filter of `src/silk/sigproc_fix.rs`. | `hp_cutoff` and `dc_reject` in `src/opus_encoder.c` |
@@ -225,6 +225,7 @@ The range coder has four functions for DRED: `RangeCoder::decode_icdf16` and `la
 - The projection encoder and decoder (`src/opus_projection_*.c`, `src/mapping_matrix.c`), which code ambisonics through a mixing matrix (mapping family 3). Mapping family 2, ambisonics without a matrix, is supported by the multistream code.
 - The floating-point SILK encoder (`silk/float/`). `opus1` ports the fixed-point one.
 - The scalable quality extension (QEXT), which libopus 1.6 builds only with `--enable-qext`.
+- Opus Custom (`include/opus_custom.h`), which codes CELT at rates and frame sizes that standard Opus does not have. libopus builds it only with `--enable-custom-modes` or `--enable-opus-custom-api`.
 
 The other optional parts of libopus are ported: deep packet loss concealment, LACE, NoLACE and the bandwidth extension, which run in the decoder, and Deep REDundancy (DRED) in the encoder and the decoder (see [Neural network code](#neural-network-code-srcdnn)). libopus builds them only with `--enable-deep-plc`, `--enable-osce` and `--enable-dred`.
 
@@ -357,7 +358,7 @@ libopus 1.6.1 sets the extended mode only in its SILK section, so after BBWE fra
 
 ## Feature flags and where state is stored
 
-The crate has five features that decide how it is built: `std`, `heap` and `analysis` (on by default), `alloc` (on with `std` or `heap`) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`, `dred`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
+The crate has five features that decide how it is built: `std`, `heap` and `analysis` (on by default), `alloc` (on with `std` or `heap`) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`, `dred`) add code, `test-libopus-dnn` only compiles tests, and `__internals` adds the module `internals` for the tests (see [The public interface and `internals`](#the-public-interface-and-internals)). [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
 
 - **`std`** selects `#![no_std]` when it is off (`#![cfg_attr(not(feature = "std"), no_std)]` in `src/lib.rs`). It also enables the run-time processor checks in `src/compat.rs` and `src/kiss_fft.rs`, and it turns on `alloc`.
 - **`alloc`** links the `alloc` crate (`extern crate alloc` in `src/lib.rs`), so it needs a global allocator but no operating system. It enables the `multistream` module, which keeps its stream encoders and decoders in a `Vec`. Each of them is built in place in the memory of the `Vec`, with `OpusEncoder::init` or `OpusDecoder::init`, so a large stream codec never passes through the stack. It also lets `ExtensionList` (`src/extensions.rs`) and `pad_keeping_extensions` (`src/packet.rs`) allocate when their fixed room of 32 extensions or 1275 bytes is too small. The files of `src/multistream/` import `Vec` and `vec!` from `alloc` under `#[cfg(not(feature = "std"))]`.
@@ -509,7 +510,7 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
 
 ### `fuzz/`
 
-`fuzz/` is a separate Cargo package of 20 targets for libFuzzer. `fuzz/fuzz.sh` builds them with the stable toolchain and runs them. Six targets compare opus1 with libopus: `fuzz_packet`, `fuzz_decoder_sequence`, `fuzz_multistream_decoder`, `fuzz_multistream_encoder`, `fuzz_encoder_settings` and `fuzz_channel_order`. Their wrappers of the libopus C functions are in `fuzz/fuzz_targets/common/mod.rs`. The other 14 targets run opus1 alone; one of them, `fuzz_dnn_blob`, loads weight blobs and needs the package feature `dnn`. `fuzz/README.md` and [Testing](09-testing.md#fuzzing) describe what each target checks.
+`fuzz/` is a separate Cargo package of 24 targets for libFuzzer. `fuzz/fuzz.sh` builds them with the stable toolchain and runs them. Eight targets compare opus1 with libopus: `fuzz_packet`, `fuzz_decoder_sequence`, `fuzz_multistream_decoder`, `fuzz_multistream_encoder`, `fuzz_encoder_settings`, `fuzz_channel_order`, `fuzz_extensions` and `fuzz_repacketizer`. Their wrappers of the libopus C functions are in `fuzz/fuzz_targets/common/mod.rs`. The other 16 targets run opus1 alone. Three of them test the neural network code and need a feature of the fuzz package: `fuzz_dnn_blob` (feature `dnn`) loads weight blobs, and `fuzz_dred` and `fuzz_decoder_dnn` (feature `dred`) decode DRED data and run the decoder with its networks. `fuzz/README.md` and [Testing](09-testing.md#fuzzing) describe what each target checks.
 
 ### `scripts/`
 

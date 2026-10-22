@@ -28,6 +28,9 @@ mod ms_support;
 
 use core_common::*;
 use opus1::{Channels, OpusDecoder, SampleRate};
+// The module `multistream` needs `alloc`; the multistream test runs with
+// `std`, as in the other test files.
+#[cfg(feature = "std")]
 use opus1::multistream::MultistreamDecoder;
 use std::f64::consts::PI;
 
@@ -273,6 +276,7 @@ fn long_loss_converts_like_one_call() {
 /// `opus_multistream_decode` rounds every tie to the even integer, on
 /// every target. Three channels in two streams (one stereo, one mono), at
 /// every output rate.
+#[cfg(feature = "std")]
 #[test]
 #[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn multistream_ties_round_to_even() {

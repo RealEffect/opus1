@@ -23,6 +23,14 @@ use opus1::extensions::{self, Extension, ExtensionIterator};
 use opus1::packet::{self, Framing, Padding, Repacketizer};
 use std::os::raw::{c_int, c_uchar};
 
+/// Without the feature `alloc`, opus1 refuses with `AllocFail` a call that
+/// has to keep more than 32 extensions or to copy more than 1275 bytes of
+/// old padding, where libopus allocates (docs/10, "Packet padding
+/// extensions"). Such a call is not compared.
+fn allocation_refused(e: opus1::Error) -> bool {
+    cfg!(not(feature = "alloc")) && e.kind() == opus1::ErrorKind::AllocFail
+}
+
 /// libopus `opus_extension_data` (src/opus_private.h).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -321,6 +329,7 @@ fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
             let b: Vec<Plain> = c_exts[..n].iter().map(c_plain).collect();
             assert_eq!(a, b, "{what}: parse");
         }
+        Err(e) if allocation_refused(e) => {}
         Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: parse error"),
     }
     // parse into a list that is too short
@@ -486,6 +495,7 @@ fn generate_writes_the_bytes_of_libopus() {
         let ret_len = extensions::generated_len(len, &exts, nb_frames);
         match ret_len {
             Ok(n) => assert_eq!(n as i32, c_len, "{what}: length"),
+            Err(e) if allocation_refused(e) => {}
             Err(e) => assert_eq!(e.to_raw(), c_len, "{what}: length error"),
         }
         match ret {
@@ -502,6 +512,7 @@ fn generate_writes_the_bytes_of_libopus() {
                 assert_eq!(back[..m].iter().map(plain).collect::<Vec<_>>(), want, "{what}: read back");
                 repeats += out[..n].iter().any(|&b| b == 0x04 || b == 0x05) as usize;
             }
+            Err(e) if allocation_refused(e) => {}
             Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: error"),
         }
     }
@@ -646,6 +657,7 @@ fn pad_and_unpad_carry_extensions_like_libopus() {
                     assert_eq!(buf[..n], c_buf[..n], "{w}: bytes");
                     kept += extensions::count(packet::parse(&buf[..n], Framing::Normal).unwrap().padding(&buf[..n]), count).unwrap();
                 }
+                Err(e) if allocation_refused(e) => {}
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{w}: error"),
             }
         }
@@ -703,6 +715,7 @@ fn repacketizer_carries_extensions_like_libopus() {
             let ret = rp.cat(p);
             match ret {
                 Ok(()) => assert_eq!(c_ret, 0, "{what}: cat {k}"),
+                Err(e) if allocation_refused(e) => {}
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: cat {k}"),
             }
         }
@@ -740,6 +753,7 @@ fn repacketizer_carries_extensions_like_libopus() {
                     let p = packet::parse(&out[..n], framing_of(self_delimited)).unwrap();
                     carried += extensions::count(p.padding(&out[..n]), p.nb_frames()).unwrap();
                 }
+                Err(e) if allocation_refused(e) => {}
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{w}: error"),
             }
         }
@@ -753,6 +767,7 @@ fn repacketizer_carries_extensions_like_libopus() {
                     assert_eq!(n as i32, c_ret, "{what}: out");
                     assert_eq!(out[..n], c_out[..n], "{what}: out bytes");
                 }
+                Err(e) if allocation_refused(e) => {}
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: out error"),
             }
         }
@@ -800,6 +815,7 @@ fn multistream_pad_and_unpad_like_libopus() {
                 assert_eq!(buf, c_buf, "{what}: pad bytes");
                 kept += 1;
             }
+            Err(e) if allocation_refused(e) => {}
             Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: pad error"),
         }
         let mut c_buf = data.clone();
@@ -810,6 +826,7 @@ fn multistream_pad_and_unpad_like_libopus() {
                 assert_eq!(n as i32, c_ret, "{what}: unpad");
                 assert_eq!(buf[..n], c_buf[..n], "{what}: unpad bytes");
             }
+            Err(e) if allocation_refused(e) => {}
             Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: unpad error"),
         }
     }
@@ -839,6 +856,7 @@ fn malformed_packets_give_the_errors_of_libopus() {
                 assert_eq!(c_ret, 0, "{what}: pad");
                 assert_eq!(buf[..new_len], c_buf[..new_len], "{what}: pad bytes");
             }
+            Err(e) if allocation_refused(e) => {}
             Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: pad error"),
         }
         // unpad
@@ -851,6 +869,7 @@ fn malformed_packets_give_the_errors_of_libopus() {
                     assert_eq!(n as i32, c_ret, "{what}: unpad");
                     assert_eq!(buf[..n], c_buf[..n], "{what}: unpad bytes");
                 }
+                Err(e) if allocation_refused(e) => {}
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: unpad error"),
             }
         }
@@ -870,9 +889,11 @@ fn malformed_packets_give_the_errors_of_libopus() {
                             assert_eq!(n as i32, c_ret, "{what}: out");
                             assert_eq!(out[..n], c_out[..n], "{what}: out bytes");
                         }
+                        Err(e) if allocation_refused(e) => {}
                         Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: out error"),
                     }
                 }
+                Err(e) if allocation_refused(e) => {}
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: cat error"),
             }
             unsafe { sys::opus_repacketizer_destroy(c_rp) };

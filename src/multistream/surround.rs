@@ -283,12 +283,15 @@ impl SurroundAnalysis {
 
 /// The surround masking analysis on interleaved samples. It exists for the
 /// tests in `tests/`, which cannot reach the crate-internal
-/// `SurroundAnalysis`. It is not part of the supported API.
+/// `SurroundAnalysis`. It is not part of the supported API: it exists only
+/// with the test-only feature `__internals`.
+#[cfg(feature = "__internals")]
 #[doc(hidden)]
 pub struct SurroundProbe {
     analysis: SurroundAnalysis,
 }
 
+#[cfg(feature = "__internals")]
 impl SurroundProbe {
     /// A new analysis for `channels` input channels at `sampling_rate` Hz.
     pub fn new(channels: usize, sampling_rate: i32) -> Self {

@@ -108,10 +108,11 @@ osce = ["deep-plc"]
 osce-bwe = ["osce"]
 # `dred`: deep redundancy (DRED), like libopus's `--enable-dred`. The
 # encoder adds a compressed history of the speech to each packet, in a
-# packet extension, and the decoder rebuilds lost frames from it. It turns
-# on `deep-plc`, as libopus's `--enable-dred` does. For now it adds the two
-# DRED models (the RDOVAE encoder and decoder) and their weights; the
-# encoder and decoder parts are being ported.
+# packet extension (`OpusEncoder::set_dred_duration`). The decoder rebuilds
+# lost frames from it (`OpusDredDecoder`, `OpusDred`, and
+# `OpusDecoder::dred_decode`, `dred_decode_i16` and `dred_decode24`). It
+# embeds the two DRED models (the RDOVAE encoder and decoder) and their
+# weights. It turns on `deep-plc`, as libopus's `--enable-dred` does.
 dred = ["deep-plc"]
 #
 # `test-libopus-dnn`: TEST-ONLY. It adds nothing to the library. It only
@@ -124,12 +125,36 @@ dred = ["deep-plc"]
 # Homebrew build) they fail to link, so `cargo test --all-features` fails
 # there. Applications never enable it.
 test-libopus-dnn = []
+#
+# `__internals`: TEST-ONLY, not part of the API and outside semantic
+# versioning. It adds the hidden module `opus1::internals`, which exposes
+# internal parts of the codec to the tests, benchmarks, examples and fuzz
+# targets of this repository. They get it through the dev-dependency on
+# opus1 itself below and through `fuzz/Cargo.toml`. Any release may change
+# or remove what it holds. Applications never enable it.
+__internals = []
+
+# docs.rs builds the documentation with the neural network features, so
+# that their types and methods are documented too (`dred` and `osce-bwe`
+# turn on all the others). It does not use `--all-features`, which would add
+# the test-only features. `--cfg docsrs` turns on `doc_cfg` at the crate
+# root, which labels each item that needs a feature with that feature. A
+# normal build does not set `docsrs` and ignores it.
+[package.metadata.docs.rs]
+features = ["dred", "osce-bwe"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 libm = { version = "0.2", optional = true, default-features = false }
 portable-atomic = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
+# opus1 itself with the test-only feature `__internals`, so that the tests,
+# benchmarks and examples reach `opus1::internals`. It adds no other
+# feature (`default-features = false`), so that
+# `cargo test --no-default-features` still tests a `no_std` build. A
+# dev-dependency with only a `path` is removed from the published crate.
+opus1 = { path = ".", default-features = false, features = ["__internals"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1"
 opus = { version = "0.3", default-features = false }
@@ -138,14 +163,31 @@ opus = { version = "0.3", default-features = false }
 # above already links it; examples/perf_harness.rs and the k24_* tests need
 # controls that crate does not expose, such as forcing the coding mode.
 audiopus_sys = "0.2"
+# The benchmarks and these examples use `opus1::internals`, so they need
+# `__internals`. In this repository the dev-dependency on opus1 itself turns
+# it on. In the published crate, which has no such dev-dependency, cargo
+# skips them unless `--features __internals` is given.
 [[bench]]
 name = "opus_bench"
 harness = false
+required-features = ["__internals"]
 [[bench]]
 name = "dnn_bench"
 harness = false
-required-features = ["dnn"]
+required-features = ["dnn", "__internals"]
 [[bench]]
 name = "deep_plc_bench"
 harness = false
-required-features = ["deep-plc"]
+required-features = ["deep-plc", "__internals"]
+[[example]]
+name = "eval"
+required-features = ["__internals"]
+[[example]]
+name = "opus_compare"
+required-features = ["__internals"]
+[[example]]
+name = "perf_harness"
+required-features = ["__internals"]
+[[example]]
+name = "wav_test"
+required-features = ["__internals"]

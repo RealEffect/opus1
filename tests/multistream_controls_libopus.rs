@@ -9,6 +9,7 @@
 //! Packets are compared byte for byte for CELT-only streams, where opus1's
 //! encoder is libopus's byte for byte. Decoded samples are compared bit for
 //! bit. Each stream's setting is read back from both encoders.
+#![cfg(feature = "std")]
 
 mod ms_support;
 

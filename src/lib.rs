@@ -35,6 +35,10 @@
 //! opus1 differs from libopus.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// docs.rs sets `--cfg docsrs` (see `[package.metadata.docs.rs]` in
+// Cargo.toml). The nightly feature `doc_cfg` then labels each item that
+// needs a cargo feature with that feature. Other builds ignore this line.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
@@ -45,6 +49,12 @@
 // float methods are found before `compat::Math`, whose imports then look
 // unused.
 #![cfg_attr(all(test, not(feature = "std")), allow(unused_imports))]
+// The module `internals` exists only with the test-only feature
+// `__internals`. Without it, the items that only `internals` exposes to the
+// tests (reference versions of the vector kernels, test constructors and
+// the like) are unused. They stay in every build, so that every build
+// compiles them; the linker drops them.
+#![cfg_attr(not(feature = "__internals"), allow(dead_code, unused_imports))]
 #[cfg(all(test, not(feature = "std")))]
 #[macro_use]
 extern crate std;
@@ -67,8 +77,8 @@ mod mathops;
 /// Tools that measure decoded audio: a port of libopus `opus_compare`, the
 /// MOC distance of the OSCE draft and the decoding loop of `opus_demo -d`.
 /// Reached as `internals::eval`; not part of the stable API. It needs
-/// `std`.
-#[cfg(feature = "std")]
+/// `std` and the test-only feature `__internals`.
+#[cfg(all(feature = "std", feature = "__internals"))]
 mod eval;
 
 mod analysis;
@@ -85,6 +95,10 @@ pub use dnn::{DnnBlob, DnnModels};
 #[cfg(feature = "dred")]
 pub use dnn::dred::decoder::{DredParse, DredProcessing, OpusDred, OpusDredDecoder};
 mod hp_cutoff;
+/// Internal parts of the codec for the tests, benchmarks, examples and
+/// fuzz targets of this repository. Only with the test-only feature
+/// `__internals`, which is outside semantic versioning.
+#[cfg(feature = "__internals")]
 #[doc(hidden)]
 pub mod internals;
 mod kiss_fft;
@@ -2659,16 +2673,19 @@ impl OpusEncoder {
     }
 
     /// See `internals::analysis::set_analysis_gate`.
+    #[cfg(feature = "__internals")]
     pub(crate) fn set_analysis_gate(&mut self, gate: AnalysisGate) {
         self.analysis_gate = gate;
     }
 
     /// See `internals::analysis::analysis_gate`.
+    #[cfg(feature = "__internals")]
     pub(crate) fn analysis_gate(&self) -> AnalysisGate {
         self.analysis_gate
     }
 
     /// See `internals::analysis::last_analysis_info`.
+    #[cfg(feature = "__internals")]
     pub(crate) fn last_analysis_info(&self) -> AnalysisInfo {
         self.last_analysis
     }
@@ -2895,12 +2912,14 @@ impl OpusEncoder {
 
     /// The test control of `internals::silk_input`: with `true`, SILK reads
     /// the output of the integer `hp_cutoff` with `Voip` at 48 kHz too.
+    #[cfg(feature = "__internals")]
     pub(crate) fn set_integer_hp_at_48k(&mut self, on: bool) {
         self.integer_hp_at_48k = on;
     }
 
     /// The test control of `internals::silk_input`: with `true`, SILK's
     /// quantization gains come from libopus's residual energies alone.
+    #[cfg(feature = "__internals")]
     pub(crate) fn set_fixed_point_res_nrg(&mut self, on: bool) {
         self.fixed_point_res_nrg = on;
     }
@@ -3336,12 +3355,11 @@ impl OpusEncoder {
     ///    each frame to its share of the bitrate (C 1785) is left out on
     ///    purpose, see `encode_multiframe`.
     /// 3. The Hybrid CELT bitrate has a floor of 501 b/s, on purpose.
-    /// 4. The control for phase inversion is not offered.
-    /// 5. On purpose: a frame that announces the switch to CELT-only
+    /// 4. On purpose: a frame that announces the switch to CELT-only
     ///    without room for the redundant frame still resets the CELT
     ///    encoder. The decoder starts the CELT-only packets from the reset
     ///    state then; libopus's encoder goes on from its last CELT frame.
-    /// 6. The energy mask is copied. After a CELT reset libopus has lost
+    /// 5. The energy mask is copied. After a CELT reset libopus has lost
     ///    its pointer to the mask until the caller sets it again; here the
     ///    copy is applied again on the next frame.
     pub(crate) fn encode_impl(

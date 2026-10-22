@@ -298,7 +298,9 @@ pub fn osce_enhance_frame(ch: &mut OsceChannel, models: &OsceModels<'_>, frame: 
 }
 
 /// `osce_enhance_frame` that computes the features also with method NONE,
-/// exactly as libopus does. For tests.
+/// exactly as libopus does. For tests: it exists only in unit tests and
+/// with the test-only feature `__internals`.
+#[cfg(any(test, feature = "__internals"))]
 #[doc(hidden)]
 pub fn osce_enhance_frame_with_features(ch: &mut OsceChannel, models: &OsceModels<'_>, frame: &OsceFrame<'_>, xq: &mut [i16]) {
     enhance_frame(ch, models, frame, xq, true);

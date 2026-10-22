@@ -10,7 +10,9 @@
 //! discontinuous transmission (DTX), the frame size, the size of the output
 //! buffer, the input signal and its format (`f32` or `i16`), or reset the
 //! encoder. A value that libopus refuses, and that opus1's types can
-//! hold, must be refused.
+//! hold, must be refused, with one exception: a forced stereo channel
+//! count on a mono encoder is kept and has no effect (`set_force_channels`
+//! cannot fail), where libopus refuses it.
 //!
 //! What must hold for every frame:
 //!
