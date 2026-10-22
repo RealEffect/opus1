@@ -73,8 +73,9 @@ analysis = []
 # `libm`, as above).
 #
 # `dnn`: the shared inference layer (layer kernels, weight blob parser).
-# Not meant to be selected alone: each feature below that needs it turns
-# it on.
+# It is a building block of the features below, which turn it on. Alone it
+# adds no public API: `DnnBlob`, `DnnModels`, `set_dnn_blob` and
+# `dnn_models` come with `deep-plc`, the smallest feature with a model.
 dnn = []
 # `deep-plc`: deep packet loss concealment (PitchDNN, the PLC model and
 # FARGAN), like libopus's `--enable-deep-plc`. It conceals lost SILK

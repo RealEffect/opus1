@@ -12,8 +12,8 @@ use std::num::NonZeroU32;
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::{
-    Application, Bitrate, Channels, DnnBlob, DredProcessing, ErrorKind, ForcedMode, InbandFec,
-    OpusDred, OpusDredDecoder, OpusEncoder, SampleRate, packet,
+    Application, Bitrate, Channels, DnnBlob, DnnModels, DredProcessing, ErrorKind, ForcedMode,
+    InbandFec, OpusDred, OpusDredDecoder, OpusEncoder, SampleRate, packet,
 };
 use opus1::packet::Framing;
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
@@ -253,12 +253,12 @@ fn set_dnn_blob_loads_both_models_or_keeps_the_old_ones() {
     let mut both = builtin::dred_rdovae_enc().to_vec();
     both.extend_from_slice(builtin::pitchdnn());
     let mut enc = encoder(16000, 1, 32000, 30, 100);
-    enc.set_dnn_blob(&DnnBlob::from_bytes(&both).unwrap()).unwrap();
+    assert_eq!(enc.set_dnn_blob(&DnnBlob::from_bytes(&both).unwrap()), Ok(DnnModels::DRED_ENCODER));
     enc.reset_state();
     enc.set_dred_duration(100).unwrap();
     assert_eq!(run(&mut enc), reference);
     let mut enc = encoder(16000, 1, 32000, 30, 100);
-    enc.set_dnn_blob(&DnnBlob::builtin()).unwrap();
+    assert_eq!(enc.set_dnn_blob(&DnnBlob::builtin()), Ok(DnnModels::DRED_ENCODER));
     assert_eq!(run(&mut enc), reference);
 }
 

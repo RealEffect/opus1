@@ -20,7 +20,7 @@ This document describes how the source code of `opus1` is organised, for maintai
 
 The public interface is the crate root and three modules:
 
-- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec` and `pcm_soft_clip`. With a neural network feature also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)).
+- At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec` and `pcm_soft_clip`. With `deep-plc` (or a feature that turns it on) also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)).
 - `packet`: reading, writing and padding packets.
 - `extensions`: the packet extensions stored in the padding of a packet.
 - `multistream`: the multistream encoder and decoder and their channel layouts.
@@ -373,6 +373,8 @@ The crate has four features that decide how it is built: `std`, `heap` and `anal
 
   The helper `state_mut` borrows such a field as the inner type in both builds, so the code that uses it needs no `#[cfg]`. `SilkEncoder` stores its channels and its input buffer in `Slot<T>`, which is `Box<T>` with `heap` and an inline value without it.
 
+  `OpusEncoder::reset_state` writes the new state over the old one with the same functions that build an encoder in place (`write_new`). With `heap` they get `HeapMemory::Reuse` (`src/in_place.rs`): each box keeps its memory and only its contents are written anew, so a reset allocates nothing, as libopus `OPUS_RESET_STATE`.
+
 Below the Opus layer nothing allocates. The CELT, SILK and range coder states store every buffer inline, with a size fixed at compile time:
 
 - SILK mostly uses plain arrays, sized by the largest frame (for example `x_buf: [i16; 2 * MAX_FRAME_LENGTH + LA_SHAPE_MAX]`).
@@ -381,7 +383,7 @@ Below the Opus layer nothing allocates. The CELT, SILK and range coder states st
 
 The neural network features follow the same rules:
 
-- `dnn` compiles `src/dnn/`. `deep-plc`, `osce` and `osce-bwe` each turn on the one before and `dnn`. Each embeds the weights of its networks and adds its groups to `ModelSet` and `DecoderDnn`. `dred` turns on `deep-plc` and embeds the two RDOVAE networks; an `OpusDredDecoder` holds the RDOVAE decoder, not `ModelSet`. `#[cfg(feature = "...")]` on the fields and match arms keeps a build without a feature free of its code and its weights.
+- `dnn` compiles `src/dnn/`, but adds no public API: `DnnBlob`, `DnnModels`, `set_dnn_blob` and `dnn_models` need `deep-plc`, the smallest feature with a model. `deep-plc`, `osce` and `osce-bwe` each turn on the one before and `dnn`. Each embeds the weights of its networks and adds its groups to `ModelSet` and `DecoderDnn`. `dred` turns on `deep-plc` and embeds the two RDOVAE networks; an `OpusDredDecoder` holds the RDOVAE decoder, not `ModelSet`. `#[cfg(feature = "...")]` on the fields and match arms keeps a build without a feature free of its code and its weights.
 - With `heap`, `OpusDecoder` holds `DecoderDnn` in a `Box`, and the layers of a group loaded from a blob are in a `Box` too. Without `heap`, `DecoderDnn` is inline and has room for the layers of every group. Blobs then must be `'static`, because there is no heap to copy them to.
 - `test-libopus-dnn` adds nothing to the library. Test files that call a libopus built with its neural network code start with `#![cfg(feature = "test-libopus-dnn")]` (see [Testing](09-testing.md#tests-of-the-neural-network-code)).
 

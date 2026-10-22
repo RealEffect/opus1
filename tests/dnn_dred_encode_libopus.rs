@@ -831,7 +831,7 @@ fn recover(cfg: &Cfg, opus1_packets: bool) -> (f64, f64) {
                     let n = unsafe {
                         opus_decoder_dred_decode_float(c.out, c.dred, offset, a.as_mut_ptr(), frame as i32)
                     };
-                    let m = r.dred_decode_float(&dred, offset, frame, &mut b).unwrap();
+                    let m = r.dred_decode(&dred, offset, frame, &mut b).unwrap();
                     assert_eq!(n as usize, m);
                 } else {
                     let null = std::ptr::null();

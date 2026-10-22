@@ -15,7 +15,7 @@
 //! - `set_complexity` with 0 to 11, `set_osce_bwe` on or off,
 //!   `reset_state`;
 //! - (`OpusDecoder` only) DRED: a packet of the pool with DRED data is
-//!   parsed by `OpusDredDecoder`, and `dred_decode_float` conceals a loss at
+//!   parsed by `OpusDredDecoder`, and `dred_decode` conceals a loss at
 //!   a random offset.
 //!
 //! The output buffer is sometimes shorter or longer than the frame.
@@ -89,7 +89,7 @@ impl Dec {
         }
     }
 
-    fn set_osce_bwe(&mut self, on: bool) -> std::result::Result<(), opus1::Error> {
+    fn set_osce_bwe(&mut self, on: bool) {
         match self {
             Dec::One(d) => d.set_osce_bwe(on),
             Dec::Multi(d) => d.set_osce_bwe(on),
@@ -153,7 +153,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
     };
     // Mostly the complexities that run the networks.
     dec.set_complexity(if u.ratio(3, 4)? { u.int_in_range(5..=10)? } else { u.int_in_range(0..=4)? }).unwrap();
-    dec.set_osce_bwe(u.arbitrary()?).unwrap();
+    dec.set_osce_bwe(u.arbitrary()?);
     let max_frame = fs as usize * 120 / 1000;
     let unit = fs as usize / 400;
 
@@ -228,7 +228,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 let c = u.int_in_range(0..=11)?;
                 assert_eq!(dec.set_complexity(c).is_ok(), c <= 10, "complexity {c}");
             }
-            11 => dec.set_osce_bwe(u.arbitrary()?).unwrap(),
+            11 => dec.set_osce_bwe(u.arbitrary()?),
             12 => {
                 let p = pool_packet(u, streams)?;
                 let mut pcm = vec![0i16; len];
@@ -256,7 +256,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 let lost = unit * u.int_in_range(1..=8)?;
                 let offset = u.int_in_range(-(unit as i32)..=found.samples + unit as i32)?;
                 let mut out = vec![f32::from_bits(UNWRITTEN); lost * channels];
-                if let Ok(n) = d.dred_decode_float(&dred, offset, lost, &mut out) {
+                if let Ok(n) = d.dred_decode(&dred, offset, lost, &mut out) {
                     assert_eq!(n, lost, "{what}: DRED decode of {lost} at {offset}");
                     check_f32(&out, n, channels, &format!("{what}: DRED decode of {lost} at {offset}"));
                 }

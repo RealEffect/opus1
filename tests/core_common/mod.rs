@@ -336,6 +336,12 @@ impl CDecoder {
         let ret = unsafe { sys::opus_decoder_ctl(self.st, sys::OPUS_RESET_STATE) };
         assert_eq!(ret, 0, "OPUS_RESET_STATE");
     }
+
+    /// `opus_decoder_get_nb_samples`: the samples per channel of `packet` at
+    /// the decoder's rate, or the libopus error code.
+    pub fn nb_samples(&self, packet: &[u8]) -> i32 {
+        unsafe { sys::opus_decoder_get_nb_samples(self.st, packet.as_ptr(), packet.len() as i32) }
+    }
 }
 
 impl Drop for CDecoder {

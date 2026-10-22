@@ -1,6 +1,7 @@
 //! The encoder and decoder controls that opus1 0.2 added, against libopus
 //! 1.6.1: phase inversion disabling, the decoder's output gain and pitch,
-//! the 24-bit integer calls, the application change and the voice ratio.
+//! the 24-bit integer calls, the application change, the voice ratio, the
+//! bandwidth getters of both and the decoder's `nb_samples`.
 //!
 //! Every test runs the same input through opus1 and through libopus with
 //! the same settings. Decoded samples must be bit-identical, getters must
@@ -18,7 +19,7 @@ use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech};
 use opus1::{
-    Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+    Application, Bandwidth, Bitrate, Channels, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
 };
 
 /// Stereo music whose right channel is mostly the inverted left channel.
@@ -105,7 +106,9 @@ fn steps(packets: &[Vec<u8>]) -> Vec<Step<'_>> {
 }
 
 /// Runs both decoders over `steps` with float output and compares every
-/// call. `check` runs after each call.
+/// call. `check` runs after each call. The samples must be equal only on
+/// 64-bit ARM: elsewhere CELT and Hybrid output is not bit-exact with
+/// libopus (docs/10, Platforms), so only the lengths are compared there.
 fn decode_both(
     rust: &mut OpusDecoder,
     c: &mut CDecoder,
@@ -125,7 +128,11 @@ fn decode_both(
         };
         let expected = expected.unwrap_or_else(|e| panic!("{label}: libopus error {e}"));
         let n = n.unwrap_or_else(|e| panic!("{label}: {e}"));
-        same_f32(&out[..n * channels], &expected, &label);
+        if cfg!(target_arch = "aarch64") {
+            same_f32(&out[..n * channels], &expected, &label);
+        } else {
+            assert_eq!(n * channels, expected.len(), "{label}: length");
+        }
         check(rust, c, &label);
     }
 }
@@ -662,4 +669,136 @@ fn voice_ratio_follows_libopus() {
     rust.reset_state();
     c.reset();
     assert_eq!(c_ratio(rust.voice_ratio()), c.get(get), "after reset");
+}
+
+// --- Bandwidth getters and the packet duration ---
+
+/// The libopus number of the decoder's bandwidth: 0 for `None`.
+fn c_bandwidth(bandwidth: Option<Bandwidth>) -> i32 {
+    bandwidth.map_or(0, Bandwidth::to_raw)
+}
+
+/// `OpusEncoder::bandwidth` (the bandwidth of the last packet) and
+/// `max_bandwidth` equal libopus's `OPUS_GET_BANDWIDTH` and
+/// `OPUS_GET_MAX_BANDWIDTH`: before the first packet, after every packet
+/// while the bitrate, the bandwidth setting and the maximum bandwidth
+/// change, for packets too small to code audio, and after a reset.
+#[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+fn encoder_bandwidth_matches_libopus() {
+    let configs = [
+        (48_000, 1, APP_AUDIO, Application::Audio),
+        (48_000, 2, APP_VOIP, Application::Voip),
+        (24_000, 2, APP_AUDIO, Application::Audio),
+        (16_000, 1, APP_VOIP, Application::Voip),
+        (8_000, 1, APP_VOIP, Application::Voip),
+        (48_000, 1, APP_LOWDELAY, Application::RestrictedLowDelay),
+    ];
+    let bitrates = [6_000, 10_000, 16_000, 24_000, 40_000, 96_000];
+    let settings = [None, Some(Bandwidth::Wideband), None, Some(Bandwidth::Fullband), Some(Bandwidth::Narrowband)];
+    let maxima = [Bandwidth::Fullband, Bandwidth::Superwideband, Bandwidth::Mediumband, Bandwidth::Fullband];
+    for (rate, channels, c_app, app) in configs {
+        let frame = rate / 50;
+        let mono = speech(rate, 4.0);
+        let mut pcm: Vec<f32> = if channels == 2 { k24_common::to_stereo(&mono, rate) } else { mono };
+        pcm.extend(multitone(rate, 2 * rate * channels));
+        let label = format!("{rate} Hz, {channels} ch, {app:?}");
+        let mut c = CEncoder::new(rate, channels, c_app);
+        let mut rust = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            app,
+        )
+        .unwrap();
+        let check = |rust: &OpusEncoder, c: &mut CEncoder, label: &str| {
+            assert_eq!(rust.bandwidth().to_raw(), c.get(sys::OPUS_GET_BANDWIDTH_REQUEST), "{label}: bandwidth");
+            assert_eq!(rust.max_bandwidth().to_raw(), c.get(sys::OPUS_GET_MAX_BANDWIDTH_REQUEST), "{label}: max");
+        };
+        check(&rust, &mut c, &format!("{label}, new"));
+        let mut seen = Vec::new();
+        let mut out = vec![0u8; 1500];
+        for (i, f) in pcm.chunks_exact(frame * channels).enumerate() {
+            if i % 8 == 0 {
+                let step = i / 8;
+                let bitrate = bitrates[step % bitrates.len()];
+                c.bitrate(bitrate);
+                rust.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+                let setting = settings[(step / 2) % settings.len()];
+                c.bandwidth(setting.map_or(sys::OPUS_AUTO, Bandwidth::to_raw));
+                rust.set_bandwidth(setting);
+                let max = maxima[(step / 3) % maxima.len()];
+                c.max_bandwidth(max.to_raw());
+                rust.set_max_bandwidth(max);
+            }
+            // Every 13th packet has room for 2 bytes only: too small to
+            // code audio.
+            let max_bytes = if i % 13 == 12 { 2 } else { 1500 };
+            let expected = c.try_encode(f, frame, max_bytes).unwrap();
+            let n = rust.encode(f, frame, &mut out[..max_bytes]).unwrap();
+            let label = format!("{label}, packet {i}");
+            // SILK packets are not libopus's byte for byte; the mode, the
+            // bandwidth and the frame size in the first byte are.
+            assert!(n > 0, "{label}");
+            assert_eq!(out[0] >> 3, expected[0] >> 3, "{label}: configuration");
+            check(&rust, &mut c, &label);
+            seen.push(rust.bandwidth());
+        }
+        rust.reset_state();
+        c.reset();
+        check(&rust, &mut c, &format!("{label}, reset"));
+        if app != Application::RestrictedLowDelay && rate == 48_000 {
+            for bw in [Bandwidth::Narrowband, Bandwidth::Wideband, Bandwidth::Fullband] {
+                assert!(seen.contains(&bw), "{label}: no packet of {bw:?} in {seen:?}");
+            }
+        }
+    }
+}
+
+/// `OpusDecoder::bandwidth` equals libopus's `OPUS_GET_BANDWIDTH` (0 for
+/// `None`) after every decoder call: packets of every mode and bandwidth,
+/// lost packets and FEC calls, and after a reset. `nb_samples` equals
+/// `opus_decoder_get_nb_samples`, also for packets that libopus refuses.
+#[test]
+fn decoder_bandwidth_and_nb_samples_match_libopus() {
+    for (rate, channels) in [(48_000, 2), (16_000, 1), (8_000, 1)] {
+        let frame = rate / 50;
+        let mono = speech(rate, 3.0);
+        let pcm: Vec<f32> = if channels == 2 { k24_common::to_stereo(&mono, rate) } else { mono };
+        let packets = mixed_stream(rate, channels, &pcm);
+        let label = format!("{rate} Hz, {channels} ch");
+        let mut rust = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
+        let mut c = CDecoder::new(rate, channels);
+        assert_eq!(rust.bandwidth(), None, "{label}: new");
+        assert_eq!(c.get(sys::OPUS_GET_BANDWIDTH_REQUEST), 0, "{label}: new");
+        let mut seen = Vec::new();
+        decode_both(&mut rust, &mut c, &steps(&packets), frame, &label, |r, c, label| {
+            assert_eq!(c_bandwidth(r.bandwidth()), c.get(sys::OPUS_GET_BANDWIDTH_REQUEST), "{label}: bandwidth");
+            seen.push(r.bandwidth());
+        });
+        if rate == 48_000 {
+            assert!(seen.iter().collect::<std::collections::HashSet<_>>().len() >= 3, "{label}: {seen:?}");
+        }
+        rust.reset_state();
+        c.reset();
+        assert_eq!(c_bandwidth(rust.bandwidth()), c.get(sys::OPUS_GET_BANDWIDTH_REQUEST), "{label}: reset");
+        assert_eq!(rust.bandwidth(), None, "{label}: reset");
+
+        // The packet durations, also of packets made up here: a code 3
+        // packet without its count byte, one of 48 frames of 20 ms (more
+        // than 120 ms) and an empty one.
+        let mut made_up: Vec<Vec<u8>> = packets.iter().take(12).cloned().collect();
+        made_up.extend([vec![0x0b], vec![0x0b, 0x02], vec![0x0b, 0x30], vec![0xfb, 0x06], vec![]]);
+        for (i, p) in made_up.iter().enumerate() {
+            let expected = c.nb_samples(p);
+            match rust.nb_samples(p) {
+                Ok(n) => assert_eq!(n as i32, expected, "{label}: packet {i}"),
+                Err(e) => assert_eq!(e.to_raw(), expected, "{label}: packet {i}"),
+            }
+        }
+        assert_eq!(rust.nb_samples(&[]).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+    }
 }

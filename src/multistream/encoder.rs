@@ -154,6 +154,25 @@ pub struct MultistreamEncoder {
     band_smr: Vec<f32>,
 }
 
+impl core::fmt::Debug for MultistreamEncoder {
+    /// The layout and the main settings, as their getters return them. The
+    /// stream encoders and the buffers are left out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MultistreamEncoder")
+            .field("sampling_rate", &self.sampling_rate())
+            .field("layout", &self.layout)
+            .field("mapping_type", &self.mapping_type)
+            .field("application", &self.application)
+            .field("bitrate_setting", &self.bitrate_setting())
+            .field("complexity", &self.complexity())
+            .field("vbr", &self.vbr())
+            .field("bandwidth_setting", &self.user_bandwidth)
+            .field("max_bandwidth", &self.max_bandwidth)
+            .field("expert_frame_duration", &self.variable_duration)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MultistreamEncoder {
     /// Creates an encoder for a layout the caller chose. libopus
     /// `opus_multistream_encoder_create`.

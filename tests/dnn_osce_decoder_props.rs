@@ -152,7 +152,7 @@ fn decoder(rate: i32, channels: usize, complexity: i32, bwe: bool) -> OpusDecode
     )
     .unwrap();
     d.set_complexity(complexity as u8).unwrap();
-    d.set_osce_bwe(bwe).unwrap();
+    d.set_osce_bwe(bwe);
     d
 }
 
@@ -208,8 +208,11 @@ fn decoding_with_osce_allocates_nothing() {
                     match k {
                         40 => d.reset_state(),
                         60 => d.set_complexity(6).unwrap(),
-                        80 => d.set_osce_bwe(false).unwrap(),
-                        100 => d.set_complexity(10).and_then(|_| d.set_osce_bwe(true)).unwrap(),
+                        80 => d.set_osce_bwe(false),
+                        100 => {
+                            d.set_complexity(10).unwrap();
+                            d.set_osce_bwe(true);
+                        }
                         _ => {}
                     }
                 }
@@ -221,7 +224,7 @@ fn decoding_with_osce_allocates_nothing() {
     let ms_packets: Vec<Vec<u8>> = packets(Kind::SilkWb, 1).iter().map(|p| ms_packet(p)).collect();
     let mut ms = MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
     ms.set_complexity(7).unwrap();
-    ms.set_osce_bwe(true).unwrap();
+    ms.set_osce_bwe(true);
     let mut buf = vec![0f32; 960 * 2];
     let n = allocations_of(|| {
         for (k, p) in ms_packets.iter().enumerate() {
@@ -383,7 +386,7 @@ fn the_multistream_decoder_forwards_bwe_to_every_stream() {
         let mut ms =
             MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
         ms.set_complexity(complexity as u8).unwrap();
-        ms.set_osce_bwe(bwe).unwrap();
+        ms.set_osce_bwe(bwe);
         let mut buf = vec![0f32; 960 * 2];
         let mut got = [Vec::new(), Vec::new()];
         for (k, p) in packets.iter().enumerate() {

@@ -6,9 +6,10 @@
 //! The return values are compared with the libopus that the suite links
 //! (Homebrew 1.6.1, built without the neural network features). Its
 //! decoder takes every complexity from 0 to 10 and refuses the others with
-//! `OPUS_BAD_ARG`, and it answers the BWE requests with
-//! `OPUS_UNIMPLEMENTED`. `dnn_decoder_controls_libopus.rs` compares the
-//! same requests with a libopus built with the features.
+//! `OPUS_BAD_ARG`. It answers the BWE requests with `OPUS_UNIMPLEMENTED`;
+//! opus1 has the BWE switch only with the cargo feature `osce-bwe`.
+//! `dnn_decoder_controls_libopus.rs` compares the same requests with a
+//! libopus built with the features.
 //!
 //! In a build without the features `deep-plc` and `osce`, the controls
 //! must not change the decoded output. With deep PLC the complexity
@@ -21,10 +22,6 @@ use opus1::multistream::MultistreamDecoder;
 use std::os::raw::c_int;
 
 const OPUS_GET_COMPLEXITY_REQUEST: c_int = 4011;
-#[cfg(not(feature = "osce-bwe"))]
-const OPUS_SET_OSCE_BWE_REQUEST: c_int = 4054;
-#[cfg(not(feature = "osce-bwe"))]
-const OPUS_GET_OSCE_BWE_REQUEST: c_int = 4055;
 
 /// Values that libopus refuses, and the edges of the range it takes.
 /// Complexities above 10, which both refuse. libopus also refuses negative
@@ -114,32 +111,17 @@ fn a_reset_keeps_the_complexity_like_libopus() {
     assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, 7));
 }
 
-#[cfg(not(feature = "osce-bwe"))]
-#[test]
-fn bwe_requests_are_unimplemented_without_the_feature_like_libopus() {
-    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
-    let mut c = CDec::new(48000, 1);
-    for on in [false, true] {
-        let r = d.set_osce_bwe(on);
-        assert_eq!(r.unwrap_err().kind(), ErrorKind::Unimplemented);
-        assert_eq!(code(&r), c.set(OPUS_SET_OSCE_BWE_REQUEST, on as i32));
-    }
-    let r = d.osce_bwe();
-    assert_eq!(r.unwrap_err().kind(), ErrorKind::Unimplemented);
-    assert_eq!(code(&r), c.get(OPUS_GET_OSCE_BWE_REQUEST).0);
-}
-
 #[cfg(feature = "osce-bwe")]
 #[test]
 fn the_bwe_switch_starts_off_and_survives_a_reset() {
     let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
-    assert_eq!(d.osce_bwe(), Ok(false));
-    d.set_osce_bwe(true).unwrap();
-    assert_eq!(d.osce_bwe(), Ok(true));
+    assert!(!d.osce_bwe());
+    d.set_osce_bwe(true);
+    assert!(d.osce_bwe());
     d.reset_state();
-    assert_eq!(d.osce_bwe(), Ok(true));
-    d.set_osce_bwe(false).unwrap();
-    assert_eq!(d.osce_bwe(), Ok(false));
+    assert!(d.osce_bwe());
+    d.set_osce_bwe(false);
+    assert!(!d.osce_bwe());
 }
 
 /// A mono 16 kHz speech-like signal: a vowel-like pulse train with noise.
@@ -302,32 +284,23 @@ fn the_multistream_decoder_sets_the_complexity_of_every_stream_like_libopus() {
     assert_eq!(d.complexity(), 9);
 }
 
+#[cfg(feature = "osce-bwe")]
 #[test]
 fn the_multistream_decoder_forwards_the_bwe_switch() {
-    let (mut d, mut c) = surround();
-    #[cfg(not(feature = "osce-bwe"))]
-    {
-        assert_eq!(d.set_osce_bwe(true).unwrap_err().kind(), ErrorKind::Unimplemented);
-        // libopus's multistream decoder does not know the request at all.
-        assert_eq!(c.set(OPUS_SET_OSCE_BWE_REQUEST, 1), sys::OPUS_UNIMPLEMENTED);
+    let (mut d, _) = surround();
+    d.set_osce_bwe(true);
+    for s in 0..4 {
+        assert!(d.stream_decoder(s).unwrap().osce_bwe());
     }
-    #[cfg(feature = "osce-bwe")]
-    {
-        let _ = &mut c;
-        d.set_osce_bwe(true).unwrap();
-        for s in 0..4 {
-            assert_eq!(d.stream_decoder(s).unwrap().osce_bwe(), Ok(true));
-        }
-        d.reset_state();
-        assert_eq!(d.stream_decoder(3).unwrap().osce_bwe(), Ok(true));
-    }
+    d.reset_state();
+    assert!(d.stream_decoder(3).unwrap().osce_bwe());
 }
 
 // ---------------------------------------------------------------------------
 // Weight blobs
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "dnn")]
+#[cfg(feature = "deep-plc")]
 mod blobs {
     use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
     use opus1::{Channels, DnnBlob, DnnModels, ErrorKind, OpusDecoder, SampleRate};

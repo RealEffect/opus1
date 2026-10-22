@@ -83,12 +83,12 @@ fn the_bwe_switch_matches_a_libopus_with_the_extension() {
     let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut c = CDec::new(48000, 1);
     assert_eq!(c.get(OPUS_GET_OSCE_BWE_REQUEST), (sys::OPUS_OK, 0));
-    assert_eq!(d.osce_bwe(), Ok(false));
+    assert!(!d.osce_bwe());
     for on in [true, false, true] {
         assert_eq!(c.set(OPUS_SET_OSCE_BWE_REQUEST, on as i32), sys::OPUS_OK);
-        d.set_osce_bwe(on).unwrap();
+        d.set_osce_bwe(on);
         assert_eq!(c.get(OPUS_GET_OSCE_BWE_REQUEST), (sys::OPUS_OK, on as i32));
-        assert_eq!(d.osce_bwe(), Ok(on));
+        assert_eq!(d.osce_bwe(), on);
     }
     for bad in [-1, 2, 100] {
         assert_eq!(c.set(OPUS_SET_OSCE_BWE_REQUEST, bad), sys::OPUS_BAD_ARG);
@@ -97,7 +97,7 @@ fn the_bwe_switch_matches_a_libopus_with_the_extension() {
     d.reset_state();
     c.reset();
     assert_eq!(c.get(OPUS_GET_OSCE_BWE_REQUEST), (sys::OPUS_OK, 1));
-    assert_eq!(d.osce_bwe(), Ok(true));
+    assert!(d.osce_bwe());
 }
 
 /// A libopus with built-in weights has no `OPUS_SET_DNN_BLOB` (it exists
@@ -140,7 +140,7 @@ fn the_multistream_decoder_of_libopus_does_not_forward_the_bwe_switch() {
     assert_eq!(d.stream_decoder(1).unwrap().complexity(), 7);
     #[cfg(feature = "osce-bwe")]
     {
-        d.set_osce_bwe(true).unwrap();
-        assert_eq!(d.stream_decoder(1).unwrap().osce_bwe(), Ok(true));
+        d.set_osce_bwe(true);
+        assert!(d.stream_decoder(1).unwrap().osce_bwe());
     }
 }

@@ -10,9 +10,9 @@
 //! that the streams have a mask after the measured frames, so the analysis
 //! was part of what was measured.
 //!
-//! The setters are covered too. `reset_state` is not: `OpusEncoder`
-//! builds a new encoder in its `reset_state`, which allocates with the
-//! `heap` feature. It is not called per frame.
+//! The setters are covered too, and so is `reset_state`: each stream
+//! encoder writes its new state into the memory it has, as libopus
+//! `OPUS_RESET_STATE` does.
 #![cfg(feature = "std")]
 
 
@@ -156,6 +156,7 @@ fn encode_does_not_allocate() {
                                 enc.encode_i16(frame16, frame_size, &mut out)
                             };
                             if f == 3 {
+                                enc.reset_state();
                                 enc.set_inband_fec(InbandFec::On);
                                 let _ = enc.set_packet_loss_perc(10);
                                 enc.set_bandwidth(Some(Bandwidth::Wideband));

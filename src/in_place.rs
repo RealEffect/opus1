@@ -1,10 +1,11 @@
 //! Building large structs directly in their final memory.
 //!
 //! Without the `heap` feature an `OpusDecoder` holds all of its state
-//! inline: 60 KB, or 160 KB with the neural network features. A
-//! constructor that returns such a struct by value builds it on the stack
-//! and copies it out, often more than once. `OpusDecoder::init` instead
-//! writes every field through a raw pointer into memory the caller
+//! inline: 60 KB, or 160 KB with the neural network features. An
+//! `OpusEncoder` holds 150 KB, or 210 KB with `dred`. A constructor that
+//! returns such a struct by value builds it on the stack and copies it out,
+//! often more than once. `OpusDecoder::init` and `OpusEncoder::init`
+//! instead write every field through a raw pointer into memory the caller
 //! provides. The large fields are filled by functions that take a pointer
 //! to the field, so no large value is ever built on the stack.
 //!
@@ -17,6 +18,11 @@
 //! numbers and the structs that `zeroable_new!` checks. The shared tables
 //! (the CELT mode, the built-in neural network models) are built in place
 //! too, through `compat::OnceCell::get_or_write`.
+//!
+//! With the feature `heap` the large fields are boxes. `boxed` and
+//! `write_box` write their contents in place too. `OpusEncoder::reset_state`
+//! writes a new encoder over the old one with `HeapMemory::Reuse`, which
+//! keeps the memory of every box, so a reset allocates nothing.
 //!
 //! These functions keep large values off the stack in an optimized build.
 //! An unoptimized build may still copy some through the stack.
@@ -70,6 +76,51 @@ pub(crate) unsafe fn boxed<T>(init: impl FnOnce(*mut T)) -> Box<T> {
     init(b.as_mut_ptr());
     // SAFETY: the caller guarantees that `init` initialized the value.
     unsafe { b.assume_init() }
+}
+
+/// What the function that writes an encoder in place does with the heap
+/// memory of the feature `heap`.
+///
+/// - `Allocate`: the encoder is new, so each box is allocated.
+/// - `Reuse`: the memory holds an encoder already, which is being reset.
+///   Each box it holds keeps its memory, and only the contents are written
+///   anew, so a reset allocates nothing, as libopus `OPUS_RESET_STATE`.
+///
+/// Without `heap` an encoder holds no boxes, and both write the same.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeapMemory {
+    Allocate,
+    Reuse,
+}
+
+/// Writes a `Box<T>` to `p` whose contents `init` writes in place.
+///
+/// - With [`HeapMemory::Allocate`] the box is new, as from [`boxed`], and
+///   `p` may be uninitialized.
+/// - With [`HeapMemory::Reuse`] `p` holds a box already. Its contents are
+///   dropped, and `init` writes the new contents into the same memory, so
+///   nothing is allocated.
+///
+/// # Safety
+/// `p` must be valid for writes, and with `Reuse` it must hold a valid
+/// `Box<T>`. `init` must initialize the whole `T` that its pointer points
+/// to. With `Reuse` it must not panic, because the box then holds a value
+/// that was dropped.
+#[cfg(feature = "heap")]
+pub(crate) unsafe fn write_box<T>(p: *mut Box<T>, memory: HeapMemory, init: impl FnOnce(*mut T)) {
+    match memory {
+        // SAFETY: the caller guarantees that `p` is valid for writes and
+        // what `init` does.
+        HeapMemory::Allocate => unsafe { p.write(boxed(init)) },
+        // SAFETY: `p` holds a valid box, so its contents are a valid `T`
+        // that may be dropped once. `init` then writes a new `T` into the
+        // same memory before anything reads it.
+        HeapMemory::Reuse => unsafe {
+            let contents: *mut T = &raw mut **p;
+            core::ptr::drop_in_place(contents);
+            init(contents);
+        },
+    }
 }
 
 /// Types for which zero bytes are a valid value: the value their

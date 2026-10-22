@@ -465,7 +465,7 @@ impl Pair {
                 let mut a = vec![0i16; n];
                 let mut b = vec![0i16; n];
                 let ca = unsafe { opus_decoder_dred_decode(self.c, cd, offset, a.as_mut_ptr(), frame as i32) };
-                let rb = self.r.dred_decode(rd, offset, frame, &mut b).unwrap();
+                let rb = self.r.dred_decode_i16(rd, offset, frame, &mut b).unwrap();
                 assert_eq!(rb as i32, ca, "{what}");
                 same(&a, &b, what);
             }
@@ -473,7 +473,7 @@ impl Pair {
                 let mut a = vec![0f32; n];
                 let mut b = vec![0f32; n];
                 let ca = unsafe { opus_decoder_dred_decode_float(self.c, cd, offset, a.as_mut_ptr(), frame as i32) };
-                let rb = self.r.dred_decode_float(rd, offset, frame, &mut b).unwrap();
+                let rb = self.r.dred_decode(rd, offset, frame, &mut b).unwrap();
                 assert_eq!(rb as i32, ca, "{what}");
                 same(&bits(&a), &bits(&b), what);
             }
@@ -639,11 +639,11 @@ fn dred_decode_checks_its_arguments_as_libopus() {
         let mut b = vec![0i16; 400];
         let ca = unsafe { opus_decoder_dred_decode(pair.c, c.dred(), 320, a.as_mut_ptr(), frame as i32) };
         assert!(ca < 0, "{frame}");
-        assert!(pair.r.dred_decode(&dred, 320, frame, &mut b).is_err(), "{frame}");
+        assert!(pair.r.dred_decode_i16(&dred, 320, frame, &mut b).is_err(), "{frame}");
     }
     // A buffer that is too small is an error in opus1 only.
     let mut small = vec![0i16; 100];
-    assert!(pair.r.dred_decode(&dred, 320, 320, &mut small).is_err());
+    assert!(pair.r.dred_decode_i16(&dred, 320, 320, &mut small).is_err());
     // The state is unchanged: the next decode equals libopus's.
     pair.dred_decode(c.dred(), &dred, 320, 320, Out::I16, "after the errors");
     // process without a parsed state.

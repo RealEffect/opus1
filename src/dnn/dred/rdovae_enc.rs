@@ -109,6 +109,9 @@ fn stages<'a, 'w>(m: &'a RdovaeEnc<'w>) -> [Stage<'a, 'w>; STAGES] {
     ]
 }
 
+// `DredEncoder::write_new` writes the state in place as zero bytes.
+crate::in_place::zeroable_new!(RdovaeEncState);
+
 impl RdovaeEncState {
     /// A cleared state (libopus `DRED_rdovae_init_encoder`).
     pub(crate) const fn new() -> Self {
