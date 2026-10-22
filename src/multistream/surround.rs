@@ -10,6 +10,10 @@
 //! libopus runs the analysis only for the surround mapping type, which
 //! exists for 3 to 8 channels.
 
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
 use super::{ChannelSource, Interleaved};
 use crate::bands::compute_band_energies;
 use crate::celt::{amp2log2_enc, celt_preemphasis, resampling_factor, upsample_scale_zero};

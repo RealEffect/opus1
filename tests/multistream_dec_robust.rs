@@ -33,7 +33,7 @@ use opus1::packet::{Framing, Padding};
 /// Returns whether both accepted them.
 fn same_verdict(fs: SampleRate, channels: usize, streams: usize, coupled: usize, mapping: &[u8]) -> bool {
     let c = CMsDecoder::new(fs.hz() as i32, channels, streams, coupled, mapping);
-    let r = MultistreamDecoder::with_layout(fs, channels, streams, coupled, mapping);
+    let r = MultistreamDecoder::new(fs, channels, streams, coupled, mapping);
     assert_eq!(
         c.is_ok(),
         r.is_ok(),
@@ -116,25 +116,20 @@ fn layouts_are_accepted_and_rejected_like_libopus() {
     }
 }
 
-/// `MultistreamDecoder::new` checks the table of an Ogg Opus header like
-/// `with_layout`. The table of the old decoder's panic is rejected.
+/// `MultistreamDecoder::from_mapping_table` checks the table of an Ogg Opus
+/// header like `new`. The table of the old decoder's panic is rejected.
 #[test]
 fn mapping_tables_are_checked() {
-    let table = |channels: u8, stream_count: u8, coupled_count: u8, mapping: &[u8]| ChannelMappingTable {
-        channels,
-        stream_count,
-        coupled_count,
-        mapping: mapping.to_vec(),
-    };
+    let table = ChannelMappingTable::new;
     let mut rng = Rng(7);
     let (mut accepted, mut rejected) = (0, 0);
     for _ in 0..5000 {
         let (channels, streams, coupled) = (rng.below(9), rng.below(6), rng.below(5));
         let mapping: Vec<u8> = (0..channels).map(|_| if rng.below(6) == 0 { 255 } else { rng.below(8) as u8 }).collect();
         let c = CMsDecoder::new(48000, channels, streams, coupled, &mapping);
-        let r = MultistreamDecoder::new(
+        let r = MultistreamDecoder::from_mapping_table(
             SampleRate::Hz48000,
-            table(channels as u8, streams as u8, coupled as u8, &mapping),
+            &table(channels as u8, streams as u8, coupled as u8, &mapping),
         );
         assert_eq!(c.is_ok(), r.is_ok(), "{channels} channels, {streams} streams, {coupled} coupled, {mapping:?}");
         if r.is_ok() {
@@ -146,13 +141,13 @@ fn mapping_tables_are_checked() {
     assert!(accepted >= 500 && rejected >= 500, "{accepted} accepted, {rejected} rejected");
     // A table from a header: the tail of a 5.1 `OpusHead`.
     let parsed = ChannelMappingTable::parse(1, 6, &[4, 2, 0, 4, 1, 2, 3, 5]).unwrap();
-    let dec = MultistreamDecoder::new(SampleRate::Hz48000, parsed).unwrap();
+    let dec = MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &parsed).unwrap();
     assert_eq!((dec.layout().streams(), dec.layout().coupled_streams()), (4, 2));
     // A mapping entry that names no decoded channel.
-    assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(1, 1, 0, &[5])).is_err());
+    assert!(MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table(1, 1, 0, &[5])).is_err());
     // A mapping with the wrong number of entries.
-    assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(2, 1, 1, &[0, 1, 0])).is_err());
-    assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(2, 1, 1, &[0])).is_err());
+    assert!(MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table(2, 1, 1, &[0, 1, 0])).is_err());
+    assert!(MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table(2, 1, 1, &[0])).is_err());
 }
 
 /// Whether some stream of a valid packet is coded with another channel count
@@ -381,7 +376,7 @@ fn packets_for_another_stream_count_are_handled_like_libopus() {
     for (streams, coupled, mapping) in layouts {
         let mut pair = Pair {
             c: CMsDecoder::new(48000, mapping.len(), streams, coupled, mapping).unwrap(),
-            r: MultistreamDecoder::with_layout(SampleRate::Hz48000, mapping.len(), streams, coupled, mapping).unwrap(),
+            r: MultistreamDecoder::new(SampleRate::Hz48000, mapping.len(), streams, coupled, mapping).unwrap(),
             channels: mapping.len(),
             streams,
             coupled,

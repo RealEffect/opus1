@@ -294,7 +294,7 @@ fn multistream_ties_round_to_even() {
     for rate in RATES {
         let mut c_float = ms_support::CMsDecoder::new(rate as i32, channels, streams, coupled, &mapping).unwrap();
         let mut c_i16 = ms_support::CMsDecoder::new(rate as i32, channels, streams, coupled, &mapping).unwrap();
-        let mut ours = MultistreamDecoder::with_layout(
+        let mut ours = MultistreamDecoder::new(
             SampleRate::try_from(rate as i32).unwrap(),
             channels,
             streams,

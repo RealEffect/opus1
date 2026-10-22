@@ -152,7 +152,7 @@ fn decoding_with_deep_plc_allocates_nothing() {
     }
     // Two mono streams that carry the same packets.
     let ms_packets: Vec<Vec<u8>> = packets(ForcedMode::CeltOnly, 1).iter().map(|p| ms_packet(p)).collect();
-    let mut ms = MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
+    let mut ms = MultistreamDecoder::new(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
     ms.set_complexity(5).unwrap();
     let mut buf = vec![0f32; 960 * 2];
     let n = allocations_of(|| {

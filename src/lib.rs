@@ -4,7 +4,8 @@
 //! - [`OpusEncoder`] and [`OpusDecoder`] code one stream of mono or stereo
 //!   audio, at 8, 12, 16, 24 or 48 kHz ([`SampleRate`], [`Channels`]).
 //! - The module `multistream` codes several streams in one packet, for
-//!   example 5.1 surround sound (feature `std`, on by default).
+//!   example 5.1 surround sound (feature `alloc`, which the default feature
+//!   `std` turns on).
 //! - The module [`packet`] reads, splits and joins Opus packets without
 //!   decoding them, and [`extensions`] reads and writes the extensions in
 //!   their padding.
@@ -47,6 +48,14 @@
 #[cfg(all(test, not(feature = "std")))]
 #[macro_use]
 extern crate std;
+// `Vec` and `Box` of the `multistream` module, of the extension lists and of
+// the codec state with `heap` (feature `alloc`, which `std` and `heap` turn
+// on).
+#[cfg(feature = "alloc")]
+extern crate alloc;
+// The boxed codec state of `heap`. A `std` build has `Box` in its prelude.
+#[cfg(all(feature = "heap", not(feature = "std")))]
+use alloc::boxed::Box;
 
 mod compat;
 mod error;
@@ -83,9 +92,13 @@ mod mdct;
 mod modes;
 mod osce_args;
 /// Multichannel encoding and decoding (several Opus streams in one packet).
-/// It allocates in its constructors, so it needs the `std` feature (on by
-/// default). The single-stream codec stays `no_std` without `alloc`.
-#[cfg(feature = "std")]
+/// It allocates in its constructors, so it needs the `alloc` feature, which
+/// `std` and `heap` (both on by default) turn on. It works without `std`
+/// when the application has a global allocator. The constructors build
+/// each stream codec in place in that memory, so they need little stack,
+/// also without `heap`. The single-stream codec stays `no_std` without
+/// `alloc`.
+#[cfg(feature = "alloc")]
 pub mod multistream;
 pub mod extensions;
 pub mod packet;
@@ -5095,14 +5108,18 @@ impl OpusDecoder {
                 #[cfg(not(feature = "heap"))]
                 w_pcm_i16 = |p| FixedVec::write_from_value(p, 0i16, 960 * channels),
                 #[cfg(feature = "heap")]
-                w_pcm_i16: Box::new(FixedVec::from_value(0i16, 960 * channels)),
+                w_pcm_i16 = |p: *mut Box<FixedVec<i16, OPUS_PCM_I16>>| {
+                    p.write(in_place::boxed(|q| FixedVec::write_from_value(q, 0i16, 960 * channels)))
+                },
 
                 #[cfg(not(feature = "heap"))]
                 w_silk_out = |p| FixedVec::write_from_value(p, 0.0f32, 960 * channels),
                 #[cfg(feature = "heap")]
-                w_silk_out: Box::new(FixedVec::from_value(0.0f32, 960 * channels)),
+                w_silk_out = |p: *mut Box<FixedVec<f32, OPUS_PCM_I16>>| {
+                    p.write(in_place::boxed(|q| FixedVec::write_from_value(q, 0.0f32, 960 * channels)))
+                },
                 #[cfg(feature = "heap")]
-                w_pcm_float: Some(Box::default()),
+                w_pcm_float: Some(in_place::boxed(|q| FixedVec::write_new(q))),
 
                 // C `opus_decoder_init`: `st->complexity = 0`.
                 complexity: 0,
@@ -7082,7 +7099,7 @@ mod tests {
         let text = format!("{ms:?}");
         assert!(text.starts_with("MultistreamEncoder { sampling_rate: Hz48000, layout: "), "{text}");
         assert!(text.contains("application: Voip") && text.len() < 600, "{text}");
-        let ms = multistream::MultistreamDecoder::with_layout(SampleRate::Hz24000, 2, 2, 0, &[0, 1]).unwrap();
+        let ms = multistream::MultistreamDecoder::new(SampleRate::Hz24000, 2, 2, 0, &[0, 1]).unwrap();
         let text = format!("{ms:?}");
         assert!(text.starts_with("MultistreamDecoder { sampling_rate: Hz24000, layout: "), "{text}");
         assert!(text.len() < 400, "{text}");

@@ -244,7 +244,7 @@ pub struct Measured {
 /// An opus1 decoder with the layout of the encoder.
 pub fn rust_decoder(enc: &MultistreamEncoder) -> MultistreamDecoder {
     let layout = enc.layout();
-    MultistreamDecoder::with_layout(
+    MultistreamDecoder::new(
         enc.sampling_rate(),
         layout.channels(),
         layout.streams(),

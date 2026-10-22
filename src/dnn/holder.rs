@@ -29,9 +29,9 @@ use crate::in_place::write_fields;
 use super::{builtin, models};
 
 #[cfg(feature = "heap")]
-use std::boxed::Box;
-#[cfg(feature = "heap")]
-use std::sync::Arc;
+use alloc::boxed::Box;
+#[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
+use alloc::sync::Arc;
 
 use super::models::ERR_NO_MODEL;
 
@@ -54,12 +54,12 @@ enum Inner {
     /// A blob that lives for the whole program, already parsed.
     Static(WeightList<'static>),
     /// A copy in 64-byte aligned heap memory, shared by every clone.
-    #[cfg(feature = "heap")]
+    #[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
     Shared(Arc<SharedBlob>),
 }
 
 /// The heap copy behind `DnnBlob::from_bytes`.
-#[cfg(feature = "heap")]
+#[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
 struct SharedBlob {
     /// The parsed list. Its slices point into the allocation of `bytes`;
     /// they are typed `'static`, which is sound because that allocation is
@@ -78,13 +78,13 @@ struct SharedBlob {
 // SAFETY: `SharedBlob` owns its allocation like a `Box<[Block]>` and never
 // writes to it after `from_bytes`, so sharing it or moving it to another
 // thread is as safe as for `Box<[Block]>` and `WeightList<'static>`.
-#[cfg(feature = "heap")]
+#[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
 unsafe impl Send for SharedBlob {}
 // SAFETY: see `Send`; every access after construction is a read.
-#[cfg(feature = "heap")]
+#[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
 unsafe impl Sync for SharedBlob {}
 
-#[cfg(feature = "heap")]
+#[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
 impl Drop for SharedBlob {
     fn drop(&mut self) {
         // SAFETY: `bytes` comes from `Box::into_raw` in `from_bytes` and is
@@ -95,7 +95,7 @@ impl Drop for SharedBlob {
 }
 
 /// 64 bytes on a 64-byte boundary.
-#[cfg(feature = "heap")]
+#[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 struct Block([u8; 64]);
@@ -113,9 +113,14 @@ impl DnnBlob {
     /// Copies `bytes` into 64-byte aligned memory and checks it as
     /// `from_static` does. The copy is shared by the clones of the blob and
     /// by every decoder that loads it.
-    #[cfg(feature = "heap")]
+    ///
+    /// It needs the feature `heap`, and a target with atomic
+    /// compare-and-swap, because the clones share the copy through an
+    /// `Arc`. On a target without it, such as `thumbv6m-none-eabi`, use
+    /// [`from_static`](Self::from_static).
+    #[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
     pub fn from_bytes(bytes: &[u8]) -> Result<DnnBlob, Error> {
-        let blocks = std::vec![Block([0; 64]); bytes.len().div_ceil(64)].into_boxed_slice();
+        let blocks = alloc::vec![Block([0; 64]); bytes.len().div_ceil(64)].into_boxed_slice();
         // From here on the allocation is owned through this raw pointer
         // only. `SharedBlob::drop` frees it, and so does the failure path
         // below.
@@ -169,7 +174,7 @@ impl DnnBlob {
             #[cfg(feature = "deep-plc")]
             Inner::Builtin => builtin::weights(),
             Inner::Static(list) => list,
-            #[cfg(feature = "heap")]
+            #[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
             Inner::Shared(shared) => &shared.list,
         }
     }
@@ -201,7 +206,7 @@ impl core::fmt::Debug for DnnBlob {
             #[cfg(feature = "deep-plc")]
             Inner::Builtin => "built-in",
             Inner::Static(_) => "static",
-            #[cfg(feature = "heap")]
+            #[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
             Inner::Shared(_) => "copied",
         };
         f.debug_struct("DnnBlob").field("kind", &kind).field("weights", self.list()).finish()
@@ -588,7 +593,7 @@ mod tests {
         assert!(core::ptr::eq(d.deep_plc().unwrap(), shared));
     }
 
-    #[cfg(feature = "heap")]
+    #[cfg(all(feature = "heap", target_has_atomic = "ptr"))]
     #[test]
     fn a_copied_blob_outlives_its_source_and_is_kept_by_the_decoder() {
         let mut d = DecoderDnn::new();

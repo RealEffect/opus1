@@ -32,19 +32,32 @@ exclude = [
 [features]
 default = ["std", "heap", "analysis"]
 # `std` enables OS-backed runtime x86 SIMD detection (CPUID); without it, x86
-# SIMD falls back to compile-time `target_feature` detection.
-std = []
+# SIMD falls back to compile-time `target_feature` detection. It turns on
+# `alloc`.
+std = ["alloc"]
+# `alloc` needs a global allocator but no operating system. It adds the
+# `multistream` module, whose encoder and decoder allocate their streams
+# when they are built (`Vec`). Each stream is built in place in that
+# memory, so building them needs little stack, also without `heap`. It also
+# lets the packet functions keep more than 32 extensions and copy more than
+# 1275 bytes of old padding. A `no_std` build with an allocator enables it
+# (or `heap`, which turns it on):
+#   opus1 = { version = "...", default-features = false, features = ["alloc", "libm"] }
+alloc = []
 # With `heap` (default), the large codec state (`OpusEncoder`/`OpusDecoder`
 # working buffers) lives on the heap behind `Box`, so the public structs are
-# small (a few KB) and constructing them uses almost no stack. This requires
-# `std`.
+# small (a few KB) and constructing them uses almost no stack. It needs a
+# global allocator but not `std`, so it turns on `alloc`. A `no_std` build
+# with an allocator can enable it:
+#   opus1 = { version = "...", default-features = false, features = ["heap", "libm"] }
 #
-# Without `heap` (i.e. `default-features = false`), the crate is `#![no_std]`
-# with **no `alloc`** (fully heap-free — no global allocator required): every
-# working buffer is an inline fixed-size array, so `OpusEncoder`/`OpusDecoder`
-# are large (on aarch64 about 154 KB with `analysis` and 60 KB) and must be placed in a `static` or on a large
-# stack by the caller.
-heap = ["std"]
+# Without `heap` (i.e. `default-features = false`), every working buffer is an
+# inline fixed-size array, so `OpusEncoder`/`OpusDecoder`
+# are large (on aarch64 about 154 KB with `analysis` and 60 KB) and must be
+# placed in a `static` or on a large stack by the caller (`init` builds them
+# in place). Without `std` and `alloc` as well, the crate is `#![no_std]`
+# with **no `alloc`** (fully heap-free — no global allocator required).
+heap = ["alloc"]
 # Required for `#![no_std]` builds: provides `sin`/`cos`/`sqrt`/`exp2`/... via a
 # pure-Rust port of musl libm (`core` does not provide transcendentals). Not
 # needed when `std` is enabled. Enable with:

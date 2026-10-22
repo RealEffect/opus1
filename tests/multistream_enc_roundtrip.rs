@@ -30,7 +30,7 @@ fn rust_decoder(enc: &MultistreamEncoder) -> MultistreamDecoder {
     tail.extend_from_slice(layout.mapping());
     let table = ChannelMappingTable::parse(1, layout.channels() as u8, &tail)
         .expect("channel mapping table");
-    MultistreamDecoder::new(enc.sampling_rate(), table).expect("opus1 multistream decoder")
+    MultistreamDecoder::from_mapping_table(enc.sampling_rate(), &table).expect("opus1 multistream decoder")
 }
 
 /// Encodes `pcm` and decodes every packet with the opus1 decoder and with

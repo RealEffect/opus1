@@ -1,8 +1,8 @@
 # Multichannel audio
 
-This document explains how Opus carries more than two channels, and how the `opus1::multistream` module encodes and decodes such audio. It covers the multistream packet, the channel layout and its mapping table, and the channel mapping families of the Ogg Opus header (RFC 7845, Request for Comments 7845). It then covers how the encoder shares the bitrate between streams, the low-frequency effects (LFE) mode and the surround masking analysis. It ends with the application programming interface (API) and complete examples. It assumes the packet structure of [Opus packets](02-packets.md). The [documentation index](README.md) lists the other documents.
+This document explains how Opus carries more than two channels, and how the `opus1::multistream` module encodes and decodes such audio. It covers the multistream packet, the channel layout and its mapping table, the channel mapping families of the Ogg Opus header (RFC 7845, Request for Comments 7845), and the order of the channels. It then covers how the encoder shares the bitrate between streams, the low-frequency effects (LFE) mode and the surround masking analysis. It ends with the application programming interface (API) and complete examples. It assumes the packet structure of [Opus packets](02-packets.md). The [documentation index](README.md) lists the other documents.
 
-The [encoder](03-encoder.md) and [decoder](04-decoder.md) documents describe the single-stream `OpusEncoder` and `OpusDecoder` that every stream uses. The `multistream` module needs the `std` feature, which is on by default. Memory is allocated when an encoder or a decoder is built. Encoding and decoding allocate nothing.
+The [encoder](03-encoder.md) and [decoder](04-decoder.md) documents describe the single-stream `OpusEncoder` and `OpusDecoder` that every stream uses. The `multistream` module needs the `alloc` feature, which the default features `std` and `heap` turn on. A `no_std` build with a global allocator can use it too (`default-features = false, features = ["alloc", "libm"]`, or `["heap", "libm"]` to keep the codec state on the heap). Memory is allocated when an encoder or a decoder is built. Each stream encoder or decoder is built in place in that memory, so building needs less than 16 KB of stack, also without `heap`, where one stream codec holds 60 KB to 210 KB ([Using the library](06-using-the-library.md#building-the-encoder-and-the-decoder-in-place) has the measurements). Encoding, decoding and `reset_state` allocate nothing.
 
 ## Why multistream exists
 
@@ -136,9 +136,9 @@ An Ogg Opus file starts with an identification header called `OpusHead` (RFC 784
 | 20 | Coupled stream count `M` | Only when the family is not 0. |
 | 21 to 20 + `C` | Channel mapping | One entry per output channel. Only when the family is not 0. |
 
-Bytes 19 onward are the channel mapping table. `ChannelMappingTable::parse(family, channels, &head[19..])` reads them. `MultistreamDecoder::new` builds a decoder from the result.
+Bytes 19 onward are the channel mapping table. `ChannelMappingTable::parse(family, channels, &head[19..])` reads them. `MultistreamDecoder::from_mapping_table` builds a decoder from the result.
 
-Family 0 has no table. Its layout is implied: one stream, `M = C - 1`, and the mapping `[0]` for mono or `[0, 1]` for stereo. `ChannelMappingTable::parse` returns `None` for family 0. Build that decoder with `MultistreamDecoder::with_layout(rate, C, 1, C - 1, &[0, 1][..C])`, or use a plain `OpusDecoder`.
+Family 0 has no table. Its layout is implied: one stream, `M = C - 1`, and the mapping `[0]` for mono or `[0, 1]` for stereo. `ChannelMappingTable::parse` returns `None` for family 0. Build that decoder with `MultistreamDecoder::new(rate, C, 1, C - 1, &[0, 1][..C])`, or use a plain `OpusDecoder`.
 
 ## Channel mapping families
 
@@ -186,12 +186,34 @@ Family 3 is ambisonics mixed through a matrix before coding. The header stores t
 
 ### Your own layout
 
-`MultistreamEncoder::new` takes any layout that passes the checks above. Such an encoder has no surround mode and no LFE stream.
+`MultistreamEncoder::new` takes any layout that passes the checks above. So do `MultistreamEncoder::from_mapping_table`, which takes the layout as a `ChannelMappingTable`, and `MultistreamEncoder::from_layout`, which takes a `ChannelLayout`. Such an encoder has no surround mode and no LFE stream, whatever family the header names.
 
 The mapping family in the header says what the output channels mean. The stream counts and the mapping table are stored in the header for every family except 0. So a custom layout fits these families:
 
 - Family 255, when the channels have no standard meaning.
 - Family 1, when there are 1 to 8 channels in the order of the family 1 table above. The stream counts and the mapping may differ from that table.
+
+## The order of the channels
+
+The samples of a multistream encoder and decoder are interleaved: sample `i` of channel `c` is at index `i * channels + c`. Channel `c` is the one that entry `c` of the mapping table describes. So the channels come in the order of the mapping table:
+
+- The encoder reads its input in that order. For mapping family 1 (`new_surround` with family 1) that is the Vorbis order of the table above.
+- The decoder writes its output in that order. For mapping family 1 it is the Vorbis order again.
+
+Other formats use another order. A WAV file with more than two channels (the `WAVEFORMATEXTENSIBLE` format of Microsoft) stores the channels in the order of the bits of its speaker mask: front left, front right, front centre, LFE, back left, back right, front left of centre, front right of centre, back centre, side left, side right, and then the top speakers.
+
+| Layout | Vorbis order (mapping family 1) | WAV order |
+|---|---|---|
+| 5.1 | FL, C, FR, RL, RR, LFE | FL, FR, C, LFE, RL, RR |
+| 7.1 | FL, C, FR, SL, SR, RL, RR, LFE | FL, FR, C, LFE, RL, RR, SL, SR |
+
+In this table RL and RR are the back speakers of WAV (`SPEAKER_BACK_LEFT` and `SPEAKER_BACK_RIGHT`). A WAV file of 5.1 may also name the side speakers instead (`SPEAKER_SIDE_LEFT` and `SPEAKER_SIDE_RIGHT`); they then follow the LFE channel in the same place.
+
+`opus1` does not reorder channels and does not downmix them, for example from 5.1 to stereo. These steps belong to the application or to an audio processing library:
+
+- To encode a WAV file with mapping family 1, reorder its channels into the Vorbis order first.
+- To write the decoded audio to a WAV file, reorder the output into the WAV order.
+- To play 5.1 on two speakers, downmix the decoded channels.
 
 ## How the encoder shares the bitrate
 
@@ -271,18 +293,11 @@ encoder.set_bitrate(Bitrate::Auto);
 encoder.encode(&pcm, 960, &mut packet).unwrap();
 assert_eq!(encoder.bitrate(), 307_998);
 
-// The same layout without surround mode, as `MultistreamEncoder::new`
+// The same layout without surround mode, as `MultistreamEncoder::from_layout`
 // builds it: no LFE stream, so both uncoupled streams are treated alike.
 let layout = encoder.layout().clone();
-let mut plain = MultistreamEncoder::new(
-    SampleRate::Hz48000,
-    6,
-    layout.streams(),
-    layout.coupled_streams(),
-    layout.mapping(),
-    Application::Audio,
-)
-.unwrap();
+let mut plain = MultistreamEncoder::from_layout(SampleRate::Hz48000, &layout, Application::Audio).unwrap();
+assert_eq!((plain.mapping_type(), plain.lfe_stream()), (MappingType::None, None));
 plain.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(256_000).unwrap()));
 plain.encode(&pcm, 960, &mut packet).unwrap();
 assert_eq!(stream_rates(&plain), [78_666, 78_666, 49_333, 49_333]);
@@ -349,7 +364,17 @@ Each stream encoder gets the values of its channels as its energy mask (`OpusEnc
 
 ## The API
 
-All fallible calls return `Result<_, opus1::Error>` (see [Errors](06-using-the-library.md#errors)). An invalid layout is an error of kind `BadArg`, as in libopus. Samples are interleaved: sample `i` of channel `c` is at index `i * channels + c`. A frame size is in samples per channel.
+All fallible calls return `Result<_, opus1::Error>` (see [Errors](06-using-the-library.md#errors)). An invalid layout is an error of kind `BadArg`, as in libopus. Samples are interleaved: sample `i` of channel `c` is at index `i * channels + c`, in the order of the mapping table (see [The order of the channels](#the-order-of-the-channels)). A frame size is in samples per channel.
+
+The encoder and the decoder have the same three constructors. The encoder takes an `Application` as its last argument as well.
+
+| Constructor | Takes the layout as |
+|---|---|
+| `new(rate, channels, streams, coupled_streams, mapping)` | Numbers and a mapping slice, as libopus `opus_multistream_encoder_create` and `opus_multistream_decoder_create` take it. |
+| `from_mapping_table(rate, &ChannelMappingTable)` | The channel mapping table of an Ogg Opus header. `table.mapping` must have exactly `table.channels` entries. |
+| `from_layout(rate, &ChannelLayout)` | A layout that `ChannelLayout::new` or `ChannelLayout::surround` checked, for example the `layout()` of an encoder. |
+
+None of them gives the encoder surround mode or an LFE stream. `MultistreamEncoder::new_surround` does that: it picks the layout of a mapping family.
 
 ### `MultistreamEncoder`
 
@@ -358,6 +383,7 @@ A port of libopus `OpusMSEncoder`.
 | Call | What it does |
 |---|---|
 | `new(rate, channels, streams, coupled_streams, mapping, application)` | An encoder for a layout you choose. No surround mode, no LFE stream. libopus `opus_multistream_encoder_create`. |
+| `from_mapping_table(rate, &table, application)`, `from_layout(rate, &layout, application)` | The same for a layout given as a `ChannelMappingTable` or a `ChannelLayout`. |
 | `new_surround(rate, channels, family, application)` | An encoder with the layout of mapping family 0, 1, 2 or 255. libopus `opus_multistream_surround_encoder_create`. |
 | `encode(pcm, frame_size, output)` | Encodes one frame of `f32` samples (full scale ±1.0). Returns the packet length. |
 | `encode_i16(pcm, frame_size, output)` | The same for 16-bit samples. Writes the packet `encode` writes for the samples `s as f32 / 32768.0` after `set_lsb_depth(16)`. |
@@ -373,20 +399,21 @@ A port of libopus `OpusMSEncoder`.
 | `set_lsb_depth(8..=24)`, `lsb_depth()` | The precision of the input in bits, on every stream. `encode_i16` codes with at most 16. |
 | `set_dtx(bool)`, `dtx()` | Discontinuous transmission on every stream. `dtx()` reads the first stream. |
 | `set_bandwidth(Option<Bandwidth>)`, `bandwidth_setting()` | Fixes the bandwidth of every stream; `None`, the default, lets each stream choose. No effect in surround mode. |
+| `bandwidth()` | The bandwidth the first stream coded last (libopus `OPUS_GET_BANDWIDTH`). Fullband before the first frame. |
 | `set_max_bandwidth(Bandwidth)`, `max_bandwidth()` | Limits the automatic bandwidth choice. |
-| `set_force_mode(Option<ForcedMode>)` | Asks every stream for SILK-only, Hybrid or CELT-only. In surround mode the coupled streams stay CELT-only, and in ambisonics mode all streams do. |
+| `set_force_mode(Option<ForcedMode>)`, `force_mode()` | Asks every stream for SILK-only, Hybrid or CELT-only. In surround mode the coupled streams stay CELT-only, and in ambisonics mode all streams do. The getter returns the setting. |
 | `set_force_channels(Option<Channels>)`, `force_channels()` | Forces mono or stereo coding on every stream (libopus `OPUS_SET_FORCE_CHANNELS`). A mono stream codes mono whatever is set, so `Some(Channels::Stereo)` acts on the coupled streams only. libopus refuses stereo at the first mono stream, after it has set the coupled streams. In surround mode the coupled streams are forced to stereo on every frame. The getter reads the first stream. |
 | `set_prediction_disabled(bool)`, `prediction_disabled()` | Prediction from earlier frames off on every stream (libopus `OPUS_SET_PREDICTION_DISABLED`). |
 | `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off in the intensity stereo of every coupled stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). |
 | `set_application(Application)` | Changes the application of every stream before the first frame (libopus `OPUS_SET_APPLICATION`); afterwards only the current one is accepted. `RestrictedSilk` and `RestrictedCelt` can only be chosen in the constructor: a change to them or from them is refused. |
 | `voice_ratio()` | The voice ratio of the first stream, in percent, or `None` when it is not known (libopus `OPUS_GET_VOICE_RATIO`, -1). |
 | `set_expert_frame_duration(FrameDuration)`, `expert_frame_duration()` | The duration of the frame each `encode` call codes (libopus `OPUS_SET_EXPERT_FRAME_DURATION`). `FrameDuration::Argument`, the default, takes the `frame_size` of the call. The multistream encoder keeps this setting for itself, as libopus does; the setting of a stream encoder plays no part. |
-| `layout()`, `mapping_type()`, `lfe_stream()` | The layout, how it was chosen, and the LFE stream. |
+| `layout()`, `channels()`, `mapping_type()`, `lfe_stream()` | The layout, its channel count, how it was chosen, and the LFE stream. |
 | `application()`, `sampling_rate()` | The application of the first stream, and the sampling rate given at construction. |
 | `lookahead()` | The delay the encoder adds, in samples per channel. An Ogg Opus header stores it, converted to 48 kHz, as the pre-skip. |
 | `final_range()` | The final range coder states of all streams, combined with exclusive or (XOR). A decoder that read the packet correctly reports the same value. |
 | `reset_state()` | Forgets the audio coded so far. The settings stay. |
-| `stream_encoder(s)`, `stream_encoder_mut(s)` | The `OpusEncoder` of stream `s`, to read or change a setting of one stream. |
+| `stream_encoder(s)`, `stream_encoder_mut(s)` | The `OpusEncoder` of stream `s`, to read or change a setting of one stream. See below for the settings that can be changed. |
 
 `encode` takes these arguments:
 
@@ -394,6 +421,12 @@ A port of libopus `OpusMSEncoder`.
 - `pcm` holds at least `frame_size * channels` samples.
 - `frame_size` is 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms. At 48 kHz that is 120, 240, 480, 960, 1920, 2880, 3840, 4800 or 5760. With an expert frame duration set, the call codes the first frame of that duration, and `frame_size` must be at least that long.
 - `output.len()` is the largest packet allowed. The smallest buffer that can work is `2 * streams - 1` bytes.
+
+`stream_encoder_mut` gives the encoder of one stream. Not every change of it lasts or is safe:
+
+- These settings change only how that stream codes, and the change stays: the complexity, the VBR constraint, in-band FEC, the expected packet loss, DTX, the signal type, the LSB depth, the maximum bandwidth, prediction, phase inversion, the voice ratio, and with the feature `dred` the DRED duration and the weight blob. Outside surround and ambisonics mode the same holds for the bandwidth, the forced mode, the forced channel count and the energy mask.
+- The next `encode` sets these again, so a change of them has no effect: the bitrate of every stream; in surround mode the bandwidth of every stream, the mode and the channel count of the coupled streams, and (unless the application is `RestrictedSilk`) the energy mask of every stream; in ambisonics mode the mode of every stream. The expert frame duration of a stream plays no part.
+- These break the agreement between the streams or with the multistream encoder: `set_vbr` (the multistream encoder decides constant bitrate for the whole packet by the first stream), `set_application` (the streams can then add different delays), `set_lfe` (the bitrate allocation still treats the stream of `lfe_stream()` as the LFE stream) and `reset_state` (only this stream forgets the audio coded so far). Use the methods of the multistream encoder for them.
 
 From complexity 7 on, for input at 16 to 48 kHz, every stream runs the speech and music analysis, as in libopus. Each stream reads its own channels from the interleaved input of the call: a coupled stream sums its two channels and halves the sum, a mono stream reads its one channel. A 5.1 encoder therefore runs 4 analyses per frame, and a 7.1 encoder 5. The LFE stream runs one too, though LFE mode ignores most of its results.
 
@@ -403,8 +436,9 @@ A port of libopus `OpusMSDecoder`.
 
 | Call | What it does |
 |---|---|
-| `new(rate, ChannelMappingTable)` | A decoder for the table of an Ogg Opus header. `table.mapping` must have exactly `table.channels` entries. |
-| `with_layout(rate, channels, streams, coupled_streams, mapping)` | A decoder for a layout given as numbers. libopus `opus_multistream_decoder_create`. |
+| `new(rate, channels, streams, coupled_streams, mapping)` | A decoder for a layout given as numbers. libopus `opus_multistream_decoder_create`. |
+| `from_mapping_table(rate, &table)` | A decoder for the table of an Ogg Opus header. `table.mapping` must have exactly `table.channels` entries. |
+| `from_layout(rate, &layout)` | A decoder for a `ChannelLayout`, for example the layout of an encoder. |
 | `decode(packet, frame_size, out)` | Decodes one packet into `f32` samples. Returns the samples per channel written. The output is not clipped. |
 | `decode_i16(packet, frame_size, out)` | The same into 16-bit samples. Each stream is soft-clipped before it is rounded, as in libopus. |
 | `decode24(packet, frame_size, out)` | The same into 24-bit samples in `i32`, full scale 2^23, without soft clipping and without a limit (libopus `opus_multistream_decode24`). |
@@ -412,7 +446,11 @@ A port of libopus `OpusMSDecoder`.
 | `set_gain(gain)`, `gain()` | The output gain of every stream in 1/256 dB, an `i16` (libopus `OPUS_SET_GAIN`). The getter reads the first stream. |
 | `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off on every stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). At the start it is off only for mono streams, so the getter, which reads the first stream, gives `false` when the first stream is coupled and `true` when it is mono. |
 | `set_complexity(0..=10)`, `complexity()` | The decoder complexity of every stream. |
-| `layout()`, `sampling_rate()` | The settings given at construction. |
+| `set_osce_bwe(bool)`, `osce_bwe()` | The bandwidth extension of every stream (feature `osce-bwe`). The getter reads the first stream. libopus's multistream decoder answers both with `OPUS_UNIMPLEMENTED`. |
+| `set_dnn_blob(&blob)`, `dnn_models()` | Loads neural network weights into every stream decoder (feature `deep-plc`, which `osce`, `osce-bwe` and `dred` turn on). The getter reads the first stream. |
+| `layout()`, `channels()`, `sampling_rate()` | The settings given at construction. |
+| `bandwidth()` | The bandwidth of the last packet of the first stream (libopus `OPUS_GET_BANDWIDTH`), `None` before the first packet. |
+| `last_packet_duration()` | The duration of the last packet or concealed stretch, in samples per channel, as the first stream decoder has it (libopus `OPUS_GET_LAST_PACKET_DURATION`). |
 | `final_range()` | The final range decoder states of all streams, combined with XOR. |
 | `reset_state()` | Forgets the audio decoded so far. |
 | `stream_decoder(s)`, `stream_decoder_mut(s)` | The `OpusDecoder` of stream `s`. |
@@ -437,7 +475,7 @@ A port of libopus `OpusMSDecoder`.
 | `left_channel(s, prev)`, `right_channel(s, prev)`, `mono_channel(s, prev)` | The channels whose entry names a coded channel of stream `s`. Pass `None` for the first one and the previous result for the next one. |
 | `MappingType` | `None`, `Surround` or `Ambisonics`. |
 | `SILENT_CHANNEL` | The mapping entry 255. |
-| `ChannelMappingTable` | The table of an Ogg Opus header: `channels`, `stream_count`, `coupled_count`, `mapping`. |
+| `ChannelMappingTable` | The table of an Ogg Opus header: `channels`, `stream_count`, `coupled_count`, `mapping`. `ChannelMappingTable::parse` reads it from the header, and `ChannelMappingTable::new(channels, stream_count, coupled_count, &mapping)` makes one. Neither checks it. |
 | `validate_ambisonics(channels)` | The stream and coupled stream counts of an ambisonics channel count, or `None`. |
 | `split_self_delimited(data, scratch)` | Cuts the first stream out of a multistream packet. |
 
@@ -562,7 +600,7 @@ assert_eq!(head.len(), 21 + 6);
 // builds its decoder from it.
 let table = ChannelMappingTable::parse(head[18], head[9], &head[19..]).unwrap();
 assert_eq!((table.stream_count, table.coupled_count), (4, 2));
-let mut decoder = MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap();
+let mut decoder = MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table).unwrap();
 
 let pcm = vec![0.1f32; 960 * 6];
 let mut packet = vec![0u8; 4000];
@@ -618,7 +656,7 @@ let len = encoder.encode(&pcm, 960, &mut packet).unwrap();
 // both 2 and 3, and nothing on 4. Its mapping table differs from the
 // encoder's. Only the stream counts must match.
 let mut decoder =
-    MultistreamDecoder::with_layout(SampleRate::Hz48000, 5, 2, 1, &[0, 1, 2, 2, SILENT_CHANNEL]).unwrap();
+    MultistreamDecoder::new(SampleRate::Hz48000, 5, 2, 1, &[0, 1, 2, 2, SILENT_CHANNEL]).unwrap();
 let mut out = vec![1f32; 960 * 5];
 assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 for frame in out.chunks_exact(5) {
@@ -647,6 +685,6 @@ These differences from libopus 1.6.1 are known. The figures come from the projec
 
 - **Bandwidth with an automatic or maximum bitrate in surround mode.** libopus compares the raw setting (−1000 or −1) with the thresholds, so it always chooses narrowband. `opus1` uses the allocated bitrate and codes fullband. This is deliberate.
 - **Expert frame duration.** libopus's multistream encoder stores any number given to `OPUS_SET_EXPERT_FRAME_DURATION`, and then refuses every encode call when the number is no duration. `opus1` takes a `FrameDuration`, which holds only the ten values libopus defines. For those values both encoders take and refuse the same calls (`tests/multistream_long_frames.rs`). Frames of 80, 100 and 120 ms, which earlier versions did not offer (difference D3), are coded as libopus codes them.
-- **Controls.** The multistream encoder has no control for these: the forced channel count, prediction, and phase inversion. The forced channel count and the prediction switch can be set on each stream through `stream_encoder_mut`. The least significant bit (LSB) depth, the signal type, discontinuous transmission (DTX) and the in-band FEC mode are set on every stream, as in libopus (`set_lsb_depth`, `set_signal`, `set_dtx`, `set_inband_fec`).
+- **Controls.** The settings go to every stream, and the getters answer as libopus's do: most read the first stream (`tests/multistream_controls_libopus.rs`). The exceptions: `set_force_channels(Some(Channels::Stereo))` sets every stream, where libopus refuses it at the first mono stream; `set_osce_bwe` and `set_dnn_blob` of the decoder set every stream, where libopus's multistream decoder answers `OPUS_UNIMPLEMENTED`; and the getters `bandwidth_setting`, `max_bandwidth` and `force_mode` of the encoder, which libopus's multistream encoder does not answer, return what was set.
 - **Rate use and stereo Hybrid streams.** Each stream runs the speech and music analysis, as in libopus. At 16 kHz and with `Application::Voip`, the `opus1` multistream encoder codes -12.8 % to +4.1 % around the requested rate in the 25 cases of `tests/multistream_enc_signals.rs` (libopus +0.3 % to +8.3 %). In the test matrix of `tests/multistream_enc_validity.rs`, both write the same number of packets with a stereo Hybrid stream: 239, of which libopus writes 128 at 8 kilobits per second (kb/s) per channel and 111 at 24 kb/s per channel. Before the analysis was ported, `opus1` used 65 % to 80 % of the rate in four of the cases and wrote no such packet.
 - **Family 3 (projection)** is not supported.

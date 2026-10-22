@@ -256,7 +256,7 @@ fn run(data: &[u8]) -> Result<()> {
     let (channels, streams) = (layout.channels(), layout.streams());
     let mut c_dec = CMsDecoder::new(fs, channels, streams, layout.coupled_streams(), layout.mapping())
         .unwrap_or_else(|e| panic!("libopus refuses the decoder for the encoder's layout {layout:?}: {e}"));
-    let mut dec = MultistreamDecoder::with_layout(
+    let mut dec = MultistreamDecoder::new(
         SampleRate::try_from(fs).unwrap(),
         channels,
         streams,

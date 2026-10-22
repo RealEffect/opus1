@@ -915,7 +915,7 @@ impl<'a> Repacketizer<'a> {
     /// - [`InternalError`](crate::ErrorKind::InternalError) when the padding
     ///   of a packet in the range holds invalid extensions.
     /// - [`AllocFail`](crate::ErrorKind::AllocFail) without the feature
-    ///   `std`, when the packets in the range hold more than 32 extensions.
+    ///   `alloc`, when the packets in the range hold more than 32 extensions.
     pub fn out_range(&self, begin: usize, end: usize, out: &mut [u8]) -> Result<usize, Error> {
         self.out_range_ext(begin, end, out, Framing::Normal, Padding::Shortest, &[])
     }
@@ -927,7 +927,7 @@ impl<'a> Repacketizer<'a> {
     /// and otherwise those of [`out_range`](Self::out_range):
     /// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall),
     /// [`InternalError`](crate::ErrorKind::InternalError) and, without the
-    /// feature `std`, [`AllocFail`](crate::ErrorKind::AllocFail).
+    /// feature `alloc`, [`AllocFail`](crate::ErrorKind::AllocFail).
     pub fn out(&self, out: &mut [u8]) -> Result<usize, Error> {
         self.out_range_ext(0, self.nb_frames, out, Framing::Normal, Padding::Shortest, &[])
     }
@@ -947,7 +947,7 @@ impl<'a> Repacketizer<'a> {
     /// [`extensions::generate`].
     ///
     /// Up to 32 extensions in all, `extensions` and those of the padding, need
-    /// no allocation. More need the feature `std`; without it they give
+    /// no allocation. More need the feature `alloc`; without it they give
     /// [`AllocFail`](crate::ErrorKind::AllocFail).
     pub fn out_range_ext(
         &self,
@@ -1007,7 +1007,7 @@ impl<'a> Repacketizer<'a> {
 /// [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the packet is not
 /// valid; [`InternalError`](crate::ErrorKind::InternalError) when the padding
 /// of the packet holds invalid extensions;
-/// [`AllocFail`](crate::ErrorKind::AllocFail) without the feature `std`,
+/// [`AllocFail`](crate::ErrorKind::AllocFail) without the feature `alloc`,
 /// when the padding of the packet holds more than 32 extensions, or holds
 /// extensions and is longer than 1275 bytes.
 pub fn pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), Error> {
@@ -1032,7 +1032,7 @@ pub fn pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), Error> {
 /// Besides the errors of [`pad`], the extensions give those of
 /// [`extensions::generate`].
 ///
-/// Without the feature `std`, a packet whose padding already holds extensions
+/// Without the feature `alloc`, a packet whose padding already holds extensions
 /// can only be rewritten when that padding is at most 1275 bytes and the
 /// extensions are at most 32 in all; otherwise the result is
 /// [`AllocFail`](crate::ErrorKind::AllocFail).
@@ -1087,8 +1087,8 @@ fn pad_in_place(
 }
 
 /// The most bytes of padding with extensions that `pad_with_extensions`
-/// copies without the feature `std`.
-#[cfg(not(feature = "std"))]
+/// copies without the feature `alloc`.
+#[cfg(not(feature = "alloc"))]
 const NO_STD_PADDING_COPY: usize = MAX_FRAME_BYTES;
 
 /// `pad_in_place` for a packet whose padding holds `found` extensions:
@@ -1104,18 +1104,18 @@ fn pad_keeping_extensions(
     found: usize,
 ) -> Result<usize, Error> {
     let old = packet.padding(data);
-    #[cfg(feature = "std")]
+    #[cfg(feature = "alloc")]
     let owned = old.to_vec();
-    #[cfg(feature = "std")]
+    #[cfg(feature = "alloc")]
     let copy: &[u8] = &owned;
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "alloc"))]
     let mut buf = [0u8; NO_STD_PADDING_COPY];
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "alloc"))]
     let copy = {
         let n = old.len();
         let room = buf.get_mut(..n).ok_or(Error::new(
             crate::ErrorKind::AllocFail,
-            "more than 1275 bytes of padding need the std feature",
+            "more than 1275 bytes of padding need the alloc feature",
         ))?;
         room.copy_from_slice(old);
         &buf[..n]
@@ -1154,7 +1154,7 @@ pub fn unpad(data: &mut [u8], len: usize) -> Result<usize, Error> {
 /// is below `len` or `data` is shorter than either;
 /// [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when a stream is not
 /// valid; and the errors of [`pad`] for the last stream, among them
-/// [`AllocFail`](crate::ErrorKind::AllocFail) without the feature `std`.
+/// [`AllocFail`](crate::ErrorKind::AllocFail) without the feature `alloc`.
 pub fn multistream_pad(
     data: &mut [u8],
     len: usize,

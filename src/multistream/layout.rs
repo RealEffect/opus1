@@ -405,6 +405,8 @@ impl core::fmt::Debug for ChannelLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
 
     fn surround(channels: usize, family: u8) -> (ChannelLayout, MappingType, Option<usize>) {
         ChannelLayout::surround(channels, family).unwrap()

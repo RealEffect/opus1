@@ -51,8 +51,10 @@
 //! coupled stream on the mean of its two channels, a mono stream on its
 //! one channel.
 
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
 use crate::Error;
-use super::{ChannelSource, Interleaved, Sample};
+use super::{ChannelMappingTable, ChannelSource, Interleaved, Sample};
 use super::layout::{ChannelLayout, MappingType};
 use super::rate_alloc::{
     MAX_BITRATE_PER_CHANNEL, MS_FRAME_TMP, OPUS_AUTO, OPUS_BITRATE_MAX, cbr_last_stream_bitrate,
@@ -135,6 +137,8 @@ pub struct MultistreamEncoder {
     user_bandwidth: Option<Bandwidth>,
     /// What `set_max_bandwidth` was given last.
     max_bandwidth: Bandwidth,
+    /// What `set_force_mode` was given last.
+    user_force_mode: Option<ForcedMode>,
     /// One encoder per stream. The first `coupled_streams` are stereo.
     encoders: Vec<OpusEncoder>,
     /// The input channels of each stream (`stream_input_channels`).
@@ -168,6 +172,7 @@ impl core::fmt::Debug for MultistreamEncoder {
             .field("vbr", &self.vbr())
             .field("bandwidth_setting", &self.user_bandwidth)
             .field("max_bandwidth", &self.max_bandwidth)
+            .field("force_mode", &self.user_force_mode)
             .field("expert_frame_duration", &self.variable_duration)
             .finish_non_exhaustive()
     }
@@ -199,6 +204,47 @@ impl MultistreamEncoder {
     ) -> Result<Self, Error> {
         let layout = ChannelLayout::new(channels, streams, coupled_streams, mapping)?;
         Self::init(sampling_rate, layout, MappingType::None, None, application)
+    }
+
+    /// Creates an encoder for the layout of a channel mapping table, as an
+    /// Ogg Opus header stores it.
+    ///
+    /// The table is checked like the arguments of [`new`](Self::new). In
+    /// addition, `table.mapping` must hold exactly `table.channels` entries.
+    /// As with `new`, the encoder has no surround mode and no LFE stream,
+    /// whatever the mapping family of the header is; for the layouts of a
+    /// mapping family use [`new_surround`](Self::new_surround).
+    pub fn from_mapping_table(
+        sampling_rate: SampleRate,
+        table: &ChannelMappingTable,
+        application: Application,
+    ) -> Result<Self, Error> {
+        if table.mapping.len() != table.channels as usize {
+            return Err(Error::bad_arg(
+                "multistream layout: the mapping table length does not match the channel count",
+            ));
+        }
+        Self::new(
+            sampling_rate,
+            table.channels as usize,
+            table.stream_count as usize,
+            table.coupled_count as usize,
+            &table.mapping,
+            application,
+        )
+    }
+
+    /// Creates an encoder for a layout that was already checked with
+    /// [`ChannelLayout::new`]. It is [`new`](Self::new) with the parts of
+    /// `layout`: the encoder checks of
+    /// [`ChannelLayout::validate_for_encoder`] still apply, and the encoder
+    /// has no surround mode and no LFE stream.
+    pub fn from_layout(
+        sampling_rate: SampleRate,
+        layout: &ChannelLayout,
+        application: Application,
+    ) -> Result<Self, Error> {
+        Self::init(sampling_rate, layout.clone(), MappingType::None, None, application)
     }
 
     /// Creates an encoder with the layout of a mapping family of the Ogg
@@ -246,17 +292,23 @@ impl MultistreamEncoder {
         let stream_inputs = (0..streams)
             .map(|s| stream_input_channels(&layout, s))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut encoders = Vec::with_capacity(streams);
+        // Each stream encoder is built in place, in the memory of the `Vec`
+        // (`OpusEncoder::init`). Without `heap` an encoder is about 150 KB,
+        // and `OpusEncoder::new` would build it on the stack first.
+        let mut encoders: Vec<OpusEncoder> = Vec::with_capacity(streams);
         for s in 0..streams {
             let stream_channels = if s < coupled { Channels::Stereo } else { Channels::Mono };
             // A new stream encoder is at `Bitrate::Auto`, as in libopus.
             // `bitrate` reports that until the first frame sets the
             // bitrates of the streams.
-            let mut enc = OpusEncoder::new(sampling_rate, stream_channels, application)?;
+            let slot = &mut encoders.spare_capacity_mut()[0];
+            let enc = OpusEncoder::init(slot, sampling_rate, stream_channels, application)?;
             if Some(s) == lfe_stream {
                 enc.set_lfe(true);
             }
-            encoders.push(enc);
+            // SAFETY: `init` succeeded, so it initialized the first element
+            // after the `s` encoders of the `Vec`.
+            unsafe { encoders.set_len(s + 1) };
         }
 
         let sampling_rate = sampling_rate.hz() as i32;
@@ -280,6 +332,7 @@ impl MultistreamEncoder {
             bitrate_bps: OPUS_AUTO,
             user_bandwidth: None,
             max_bandwidth: Bandwidth::Fullband,
+            user_force_mode: None,
             encoders,
             stream_inputs,
             rates: vec![0; streams],
@@ -294,6 +347,12 @@ impl MultistreamEncoder {
     /// The channel layout: channels, streams, coupled streams and mapping.
     pub fn layout(&self) -> &ChannelLayout {
         &self.layout
+    }
+
+    /// The number of input channels: [`ChannelLayout::channels`] of the
+    /// layout.
+    pub fn channels(&self) -> usize {
+        self.layout.channels()
     }
 
     /// How the layout was chosen. It decides how the streams are set up:
@@ -827,10 +886,22 @@ impl MultistreamEncoder {
     /// when each stream chooses the bandwidth itself.
     ///
     /// This is the setting. libopus `OPUS_GET_BANDWIDTH` reports something
-    /// else: the bandwidth the first stream coded last. The TOC byte of a
-    /// stream of the packet tells that.
+    /// else, which [`bandwidth`](Self::bandwidth) answers.
     pub fn bandwidth_setting(&self) -> Option<Bandwidth> {
         self.user_bandwidth
+    }
+
+    /// libopus `OPUS_GET_BANDWIDTH` of a multistream encoder: the
+    /// [`OpusEncoder::bandwidth`] of the first stream, the audio bandwidth of
+    /// the last packet that stream coded. Before the first frame it is
+    /// [`Bandwidth::Fullband`], the value libopus starts with.
+    ///
+    /// Other streams can code another bandwidth, for example the LFE stream,
+    /// which is always narrowband. Their encoders
+    /// ([`stream_encoder`](Self::stream_encoder)) tell it, and so does the
+    /// TOC byte of each stream of the packet.
+    pub fn bandwidth(&self) -> Bandwidth {
+        self.encoders.first().map_or(Bandwidth::Fullband, OpusEncoder::bandwidth)
     }
 
     /// Sets the widest audio bandwidth the automatic choice of a stream may
@@ -875,9 +946,22 @@ impl MultistreamEncoder {
     /// In surround mode the encoder sets the coupled streams to CELT-only on
     /// every frame. In ambisonics mode it does so for all streams.
     pub fn set_force_mode(&mut self, mode: Option<ForcedMode>) {
+        self.user_force_mode = mode;
         for enc in &mut self.encoders {
             enc.set_force_mode(mode);
         }
+    }
+
+    /// What [`set_force_mode`](Self::set_force_mode) was given last: `None`
+    /// when each stream chooses its mode itself. libopus has no request to
+    /// read it.
+    ///
+    /// This is the setting. In surround and ambisonics mode the encoder
+    /// forces CELT-only on some streams on every frame, which this value
+    /// does not show; [`OpusEncoder::force_mode`] of a stream encoder
+    /// ([`stream_encoder`](Self::stream_encoder)) does.
+    pub fn force_mode(&self) -> Option<ForcedMode> {
+        self.user_force_mode
     }
 
     /// Forces the number of coded channels of every stream. libopus
@@ -972,9 +1056,62 @@ impl MultistreamEncoder {
     }
 
     /// Like [`stream_encoder`](Self::stream_encoder), to change a setting of
-    /// one stream. The next [`encode`](Self::encode) sets the bitrate of
-    /// every stream again, and in surround and ambisonics mode also the
-    /// bandwidth and the coding mode as described there.
+    /// one stream. libopus `OPUS_MULTISTREAM_GET_ENCODER_STATE` gives the
+    /// same access.
+    ///
+    /// These settings change only how this stream codes, and the change
+    /// stays: [`set_complexity`](OpusEncoder::set_complexity),
+    /// [`set_vbr_constraint`](OpusEncoder::set_vbr_constraint),
+    /// [`set_inband_fec`](OpusEncoder::set_inband_fec),
+    /// [`set_packet_loss_perc`](OpusEncoder::set_packet_loss_perc),
+    /// [`set_dtx`](OpusEncoder::set_dtx),
+    /// [`set_signal`](OpusEncoder::set_signal),
+    /// [`set_lsb_depth`](OpusEncoder::set_lsb_depth),
+    /// [`set_max_bandwidth`](OpusEncoder::set_max_bandwidth),
+    /// [`set_prediction_disabled`](OpusEncoder::set_prediction_disabled),
+    /// [`set_phase_inversion_disabled`](OpusEncoder::set_phase_inversion_disabled)
+    /// and [`set_voice_ratio`](OpusEncoder::set_voice_ratio), and with the
+    /// feature `dred` also `set_dred_duration` and `set_dnn_blob`. Outside
+    /// surround and ambisonics mode the same holds for
+    /// [`set_bandwidth`](OpusEncoder::set_bandwidth),
+    /// [`set_force_mode`](OpusEncoder::set_force_mode),
+    /// [`set_force_channels`](OpusEncoder::set_force_channels) and
+    /// [`set_energy_mask`](OpusEncoder::set_energy_mask).
+    ///
+    /// The next [`encode`](Self::encode) sets these again, so a change of
+    /// them has no effect:
+    ///
+    /// - [`set_bitrate`](OpusEncoder::set_bitrate), on every stream and in
+    ///   every mode. Use [`set_bitrate`](Self::set_bitrate) of the
+    ///   multistream encoder for the total.
+    /// - In surround mode: the bandwidth of every stream, the coding mode
+    ///   and the forced channel count of the coupled streams, and, unless
+    ///   the application is [`RestrictedSilk`](Application::RestrictedSilk),
+    ///   the energy mask of every stream.
+    /// - In ambisonics mode: the coding mode of every stream.
+    /// - [`set_expert_frame_duration`](OpusEncoder::set_expert_frame_duration)
+    ///   of a stream plays no part; the multistream encoder has its own
+    ///   ([`set_expert_frame_duration`](Self::set_expert_frame_duration)).
+    ///
+    /// These break the agreement between the streams or with the
+    /// multistream encoder. Use them only when you know the result:
+    ///
+    /// - [`set_vbr`](OpusEncoder::set_vbr): the multistream encoder decides
+    ///   between variable and constant bitrate for the whole packet by the
+    ///   first stream. Use [`set_vbr`](Self::set_vbr).
+    /// - [`set_application`](OpusEncoder::set_application): the streams can
+    ///   then add different delays, and the multistream encoder keeps its
+    ///   own application. Use [`set_application`](Self::set_application).
+    /// - [`set_lfe`](OpusEncoder::set_lfe): the bitrate allocation still
+    ///   treats the stream of [`lfe_stream`](Self::lfe_stream), and only it,
+    ///   as the low-frequency-effects stream.
+    /// - [`reset_state`](OpusEncoder::reset_state): only this stream
+    ///   forgets the audio coded so far, which a listener can hear as a
+    ///   click on its channels. Use [`reset_state`](Self::reset_state) to
+    ///   reset every stream.
+    ///
+    /// The getters of the multistream encoder that read the first stream,
+    /// such as [`complexity`](Self::complexity), show a change of stream 0.
     pub fn stream_encoder_mut(&mut self, stream: usize) -> Option<&mut OpusEncoder> {
         self.encoders.get_mut(stream)
     }
@@ -983,6 +1120,79 @@ impl MultistreamEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `new`, `from_mapping_table` and `from_layout` build the same encoder:
+    /// the same layout, no surround mode, and the same packets.
+    #[test]
+    fn the_three_constructors_build_the_same_encoder() {
+        let fs = SampleRate::Hz48000;
+        let app = Application::Audio;
+        // The 5.1 layout of mapping family 1, used without surround mode.
+        let mapping = [0u8, 4, 1, 2, 3, 5];
+        let table = ChannelMappingTable::new(6, 4, 2, &mapping);
+        let layout = ChannelLayout::new(6, 4, 2, &mapping).unwrap();
+        let mut encoders = [
+            MultistreamEncoder::new(fs, 6, 4, 2, &mapping, app).unwrap(),
+            MultistreamEncoder::from_mapping_table(fs, &table, app).unwrap(),
+            MultistreamEncoder::from_layout(fs, &layout, app).unwrap(),
+        ];
+        let pcm: Vec<f32> = (0..960 * 6)
+            .map(|k| 0.2 * ((k / 6) as f32 * 0.013 * (1 + k % 6) as f32).sin())
+            .collect();
+        let mut packets = Vec::new();
+        for enc in &mut encoders {
+            assert_eq!(enc.layout(), &layout);
+            assert_eq!(enc.channels(), 6);
+            assert_eq!(enc.mapping_type(), MappingType::None);
+            assert_eq!(enc.lfe_stream(), None);
+            let mut out = vec![0u8; 4000];
+            let mut frames = Vec::new();
+            for _ in 0..3 {
+                let n = enc.encode(&pcm, 960, &mut out).unwrap();
+                frames.push(out[..n].to_vec());
+            }
+            packets.push(frames);
+        }
+        assert_eq!(packets[0], packets[1]);
+        assert_eq!(packets[0], packets[2]);
+
+        // A table whose mapping does not have one entry per channel.
+        for len in [5, 7] {
+            let bad = ChannelMappingTable::new(6, 4, 2, &[0, 4, 1, 2, 3, 5, 5][..len]);
+            let err = MultistreamEncoder::from_mapping_table(fs, &bad, app).unwrap_err();
+            assert_eq!(err.kind(), crate::ErrorKind::BadArg);
+        }
+        // A layout a decoder accepts but an encoder does not: no input
+        // channel feeds the mono stream.
+        let layout = ChannelLayout::new(3, 2, 1, &[0, 1, 0]).unwrap();
+        let err = MultistreamEncoder::from_layout(fs, &layout, app).unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::BadArg);
+    }
+
+    /// `bandwidth` is the first stream's coded bandwidth, `force_mode` and
+    /// `bandwidth_setting` are what was set.
+    #[test]
+    fn bandwidth_and_force_mode_getters() {
+        let mut enc =
+            MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
+        assert_eq!(enc.bandwidth(), Bandwidth::Fullband);
+        assert_eq!(enc.force_mode(), None);
+        enc.set_force_mode(Some(ForcedMode::SilkOnly));
+        assert_eq!(enc.force_mode(), Some(ForcedMode::SilkOnly));
+        // 4000 b/s per channel: surround mode codes narrowband.
+        enc.set_bitrate(Bitrate::BitsPerSecond(core::num::NonZeroU32::new(24_000).unwrap()));
+        let pcm = vec![0.1f32; 960 * 6];
+        let mut out = vec![0u8; 4000];
+        enc.encode(&pcm, 960, &mut out).unwrap();
+        assert_eq!(enc.bandwidth(), Bandwidth::Narrowband);
+        assert_eq!(enc.bandwidth_setting(), None);
+        // The encoder forced CELT-only on the coupled streams; the setting
+        // stays the caller's.
+        assert_eq!(enc.force_mode(), Some(ForcedMode::SilkOnly));
+        assert_eq!(enc.stream_encoder(0).unwrap().force_mode(), Some(ForcedMode::CeltOnly));
+        enc.set_force_mode(None);
+        assert_eq!(enc.force_mode(), None);
+    }
 
     #[test]
     fn stream_mask_holds_the_left_channel_then_the_right() {

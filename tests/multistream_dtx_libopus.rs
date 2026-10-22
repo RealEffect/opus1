@@ -265,7 +265,7 @@ fn opus1_dtx_packets_decode_like_libopus() {
                     m => Some(m - coupled),
                 })
                 .collect();
-            let mut r_dec = MultistreamDecoder::with_layout(
+            let mut r_dec = MultistreamDecoder::new(
                 SampleRate::Hz48000,
                 channels,
                 streams,

@@ -82,12 +82,7 @@ fn goertzel_power(samples: &[f32], sample_rate: f64, freq: f64) -> f64 {
 
 fn run_diff(label: &str, data: &RefData) {
     let channels = data.table.channels as usize;
-    let mut dec = MultistreamDecoder::new(SampleRate::try_from(OPUS_DECODE_RATE).unwrap(), ChannelMappingTable {
-        channels: data.table.channels,
-        stream_count: data.table.stream_count,
-        coupled_count: data.table.coupled_count,
-        mapping: data.table.mapping.clone(),
-    })
+    let mut dec = MultistreamDecoder::from_mapping_table(SampleRate::try_from(OPUS_DECODE_RATE).unwrap(), &data.table)
     .unwrap_or_else(|e| panic!("{}: failed to build MultistreamDecoder: {}", label, e));
 
     // Frame-boundary diagnostic: independently re-run split_self_delimited on
@@ -316,14 +311,9 @@ fn run_diff(label: &str, data: &RefData) {
 /// that output channel regardless of decoded content.
 #[test]
 fn multistream_silence_mapping_produces_silence() {
-    let table = ChannelMappingTable {
-        channels: 3,
-        stream_count: 1,
-        coupled_count: 0,
-        mapping: vec![0, 0, 255],
-    };
+    let table = ChannelMappingTable::new(3, 1, 0, &[0, 0, 255]);
     let mut dec =
-        MultistreamDecoder::new(SampleRate::try_from(OPUS_DECODE_RATE).unwrap(), table).unwrap();
+        MultistreamDecoder::from_mapping_table(SampleRate::try_from(OPUS_DECODE_RATE).unwrap(), &table).unwrap();
 
     let packet = [0u8]; // not a real encoded frame; swap for a captured mono packet if rejected
     let frame_size = 960;

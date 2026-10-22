@@ -31,7 +31,7 @@
 //! the first separator belong to frame 0.
 //!
 //! Nothing here allocates, except `ExtensionList` beyond its fixed size
-//! with the feature `std`.
+//! with the feature `alloc`.
 
 use crate::Error;
 use crate::packet::Padding;
@@ -771,35 +771,35 @@ pub fn generated_len(max_len: usize, extensions: &[Extension], nb_frames: usize)
 const INLINE_EXTENSIONS: usize = 32;
 
 /// A list of extensions with room for a known number. Up to 32 live inside the
-/// value. More need the feature `std`, which puts them on the heap; without it,
+/// value. More need the feature `alloc`, which puts them on the heap; without it,
 /// [`ExtensionList::with_capacity`] fails with
 /// [`ErrorKind::AllocFail`](crate::ErrorKind::AllocFail).
 pub(crate) struct ExtensionList<'a> {
     inline: [Extension<'a>; INLINE_EXTENSIONS],
     len: usize,
-    #[cfg(feature = "std")]
-    heap: Vec<Extension<'a>>,
+    #[cfg(feature = "alloc")]
+    heap: alloc::vec::Vec<Extension<'a>>,
 }
 
 impl<'a> ExtensionList<'a> {
     pub(crate) fn with_capacity(capacity: usize) -> Result<Self, Error> {
-        #[cfg(not(feature = "std"))]
+        #[cfg(not(feature = "alloc"))]
         if capacity > INLINE_EXTENSIONS {
             return Err(Error::new(
                 crate::ErrorKind::AllocFail,
-                "more than 32 extensions need the std feature",
+                "more than 32 extensions need the alloc feature",
             ));
         }
         Ok(ExtensionList {
             inline: [Extension::default(); INLINE_EXTENSIONS],
             len: 0,
-            #[cfg(feature = "std")]
-            heap: if capacity > INLINE_EXTENSIONS { Vec::with_capacity(capacity) } else { Vec::new() },
+            #[cfg(feature = "alloc")]
+            heap: if capacity > INLINE_EXTENSIONS { alloc::vec::Vec::with_capacity(capacity) } else { alloc::vec::Vec::new() },
         })
     }
 
     pub(crate) fn push(&mut self, ext: Extension<'a>) {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "alloc")]
         if self.heap.capacity() > 0 {
             self.heap.push(ext);
             return;
@@ -809,7 +809,7 @@ impl<'a> ExtensionList<'a> {
     }
 
     pub(crate) fn as_slice(&self) -> &[Extension<'a>] {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "alloc")]
         if self.heap.capacity() > 0 {
             return &self.heap;
         }

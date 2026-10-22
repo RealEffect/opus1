@@ -145,7 +145,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
         for _ in 0..channels {
             mapping.push(if u.ratio(1, 10)? { 255 } else { u.int_in_range(0..=(streams + coupled - 1) as u8)? });
         }
-        let Ok(d) = MultistreamDecoder::with_layout(rate, channels, streams, coupled, &mapping) else { return Ok(()) };
+        let Ok(d) = MultistreamDecoder::new(rate, channels, streams, coupled, &mapping) else { return Ok(()) };
         (Dec::Multi(d), channels, Some(streams))
     } else {
         let channels = u.int_in_range(1..=2)?;

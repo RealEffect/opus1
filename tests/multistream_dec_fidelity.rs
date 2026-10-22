@@ -286,7 +286,7 @@ fn generic_layout_repeats_one_stream_and_keeps_one_output_silent() {
 fn decode_with_mapping(e: &Encoded, fs: i32, mapping: &[u8]) -> (Vec<f32>, Vec<f32>) {
     let channels = mapping.len();
     let mut c_dec = CMsDecoder::new(fs, channels, e.streams, e.coupled, mapping).unwrap();
-    let mut r_dec = MultistreamDecoder::with_layout(
+    let mut r_dec = MultistreamDecoder::new(
         SampleRate::try_from(fs).unwrap(),
         channels,
         e.streams,

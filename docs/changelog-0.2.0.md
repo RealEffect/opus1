@@ -22,7 +22,7 @@ test that compares opus1 with the C library under the same settings.
   buffer too small". `Error` is `Copy` and implements `core::error::Error`.
   Code that compared message strings now compares `err.kind()`. Kinds that
   differ from what the old messages suggested: an empty output buffer of
-  `encode` is `BadArg` (libopus `max_data_bytes <= 0`); without the `std`
+  `encode` is `BadArg` (libopus `max_data_bytes <= 0`); without the `alloc`
   feature, more than 32 extensions or more than 1275 bytes of old padding in
   one call are `AllocFail`.
 - Sampling rates and channel counts have their own types at the crate root.
@@ -48,9 +48,9 @@ test that compares opus1 with the C library under the same settings.
     `force_channels() -> Option<Channels>`. Stereo on a mono encoder, or on
     the mono streams of a multistream encoder, is kept and has no effect,
     where libopus refuses it.
-  - The sampling rate of `MultistreamEncoder::new` and `new_surround`, and of
-    `MultistreamDecoder::new` and `with_layout`, is a `SampleRate`. Their
-    channel counts stay `usize` (1 to 255).
+  - The sampling rate of every constructor of `MultistreamEncoder` and
+    `MultistreamDecoder` is a `SampleRate` (the constructors are renamed
+    below). Their channel counts stay `usize` (1 to 255).
   - `packet::samples_per_frame(toc, i32)`, `packet::nb_samples(data, i32)`,
     `packet::multistream_validate(data, nb_streams, i32)` and
     `FrameDuration::samples(self, i32)` take a `SampleRate` instead.
@@ -174,6 +174,43 @@ test that compares opus1 with the C library under the same settings.
     shows the frames it holds.
   - New constants `opus1::VERSION` (the crate version) and
     `opus1::LIBOPUS_VERSION` (`"1.6.1"`, the libopus release opus1 follows).
+- Multistream (module `multistream`):
+  - `MultistreamEncoder` and `MultistreamDecoder` have the same constructors:
+    `new(rate, channels, streams, coupled_streams, mapping)`,
+    `from_mapping_table(rate, &ChannelMappingTable)` and `from_layout(rate,
+    &ChannelLayout)`, each with an `Application` last for the encoder. The
+    encoder keeps `new_surround`. `MultistreamDecoder::new(rate,
+    ChannelMappingTable)` -> `from_mapping_table(rate, &ChannelMappingTable)`;
+    `MultistreamDecoder::with_layout(rate, channels, streams,
+    coupled_streams, mapping)` -> `new(...)` with the same arguments.
+    `MultistreamEncoder::from_mapping_table` and both `from_layout` are new;
+    the encoders they build have no surround mode and no LFE stream, like
+    those of `new`.
+  - New getters: `channels() -> usize` on both;
+    `MultistreamEncoder::bandwidth() -> Bandwidth` (libopus
+    `OPUS_GET_BANDWIDTH`, the bandwidth the first stream coded last) and
+    `force_mode() -> Option<ForcedMode>` (the setting);
+    `MultistreamDecoder::bandwidth() -> Option<Bandwidth>` and
+    `last_packet_duration() -> usize` (libopus `OPUS_GET_BANDWIDTH` and
+    `OPUS_GET_LAST_PACKET_DURATION`, answered by the first stream as libopus
+    does), `osce_bwe() -> bool` (feature `osce-bwe`) and `dnn_models() ->
+    DnnModels` (feature `dnn`).
+  - `ChannelMappingTable` is `#[non_exhaustive]`;
+    `ChannelMappingTable::new(channels, stream_count, coupled_count,
+    &mapping)` makes one. Its fields stay public.
+  - New cargo feature `alloc`, which `std` turns on. The module
+    `multistream` needs `alloc` instead of `std`, so it works in a `no_std`
+    build with a global allocator (`default-features = false, features =
+    ["alloc", "libm"]`). With `alloc`, the `packet` functions keep more than
+    32 extensions and copy more than 1275 bytes of old padding, as with
+    `std` before.
+  - The documentation of `MultistreamEncoder::stream_encoder_mut` lists
+    which settings of one stream can be changed, which the next `encode`
+    sets again, and which break the agreement between the streams.
+  - The multistream decoder writes the channels in the order of its mapping
+    table, the Vorbis order for mapping family 1. opus1 does not reorder or
+    downmix channels; [docs/05](05-multichannel.md#the-order-of-the-channels)
+    compares the Vorbis order with the WAV order.
 - `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
   so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
   call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call

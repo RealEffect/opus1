@@ -65,6 +65,9 @@ pub(crate) fn unreachable_value<T>() -> T {
     unreachable!("the field check of write_fields! is never called")
 }
 
+#[cfg(all(feature = "heap", not(feature = "std")))]
+use alloc::boxed::Box;
+
 /// A `Box<T>` whose contents `init` writes in place, so that `T` is never
 /// built on the stack.
 ///

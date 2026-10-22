@@ -118,7 +118,7 @@ impl Encoded {
     pub fn decoders(&self, fs: i32) -> (CMsDecoder, MultistreamDecoder) {
         let c = CMsDecoder::new(fs, self.channels, self.streams, self.coupled, &self.mapping)
             .unwrap_or_else(|e| panic!("{}: C decoder: {e}", self.label));
-        let r = MultistreamDecoder::with_layout(
+        let r = MultistreamDecoder::new(
             SampleRate::try_from(fs).unwrap(),
             self.channels,
             self.streams,

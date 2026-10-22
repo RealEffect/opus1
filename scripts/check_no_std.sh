@@ -12,10 +12,11 @@ TARGETS=(
     "wasm32-unknown-unknown"   # WebAssembly (no WASI)
 )
 
-# The feature sets to check: the codec alone, and with the speech and
-# music analysis of the encoder (feature `analysis`, on by default with
-# `std`).
-FEATURE_SETS=("libm" "libm,analysis")
+# The feature sets to check: the codec alone, with the speech and music
+# analysis of the encoder (feature `analysis`, on by default with `std`),
+# and with a global allocator (feature `alloc`), which adds the
+# `multistream` module.
+FEATURE_SETS=("libm" "libm,analysis" "alloc,libm")
 
 fail=0
 for features in "${FEATURE_SETS[@]}"; do
@@ -42,12 +43,37 @@ for features in "${FEATURE_SETS[@]}"; do
     RUST_MIN_STACK=${RUST_MIN_STACK:-33554432} cargo test --no-default-features --features "$features" || fail=1
 done
 
+# `heap` without `std`: the codec state on the heap of a global allocator.
+# Built for the same targets; the debug test run above already covers the
+# code without `heap`.
+for t in "${TARGETS[@]}"; do
+    if rustup target list --installed 2>/dev/null | grep -q "$t"; then
+        echo ":: building opus1 (no_std, features heap,libm) for $t"
+        if ! cargo build --no-default-features --features heap,libm --target "$t"; then
+            echo "!! FAILED: $t (heap,libm)"
+            fail=1
+        fi
+    fi
+done
+
+# The tests of building in place, in a release build without `heap`: the
+# single-stream and multistream codecs are built on a thread with a 32 KB
+# stack, and a reset allocates nothing. Only an optimized build can show
+# that; the debug test run above gives those threads 1 MiB. The same tests
+# also run with `heap` without `std`.
+for features in "alloc,libm" "alloc,libm,analysis" "heap,libm,analysis"; do
+    echo ":: testing in-place construction (no_std, features $features, release)"
+    cargo test --release --no-default-features --features "$features" \
+        --test multistream_small_stack --test encoder_init --test decoder_init \
+        --test encoder_reset || fail=1
+done
+
 # A target without compare-and-swap (CAS) instructions: ARM Cortex-M0/M0+.
 # It needs the feature `portable-atomic`, and portable-atomic needs one
 # setting from the application; this build assumes a single-core chip.
 t="thumbv6m-none-eabi"
 if rustup target list --installed 2>/dev/null | grep -q "$t"; then
-    for features in "libm,portable-atomic" "libm,portable-atomic,analysis"; do
+    for features in "libm,portable-atomic" "libm,portable-atomic,analysis" "heap,libm,portable-atomic"; do
         echo ":: building opus1 (no_std, features $features) for $t"
         if ! RUSTFLAGS="--cfg portable_atomic_unsafe_assume_single_core" \
             cargo build --no-default-features --features "$features" --target "$t"; then

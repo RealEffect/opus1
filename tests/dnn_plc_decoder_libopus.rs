@@ -528,7 +528,7 @@ fn multistream_matches_libopus() {
                     runs += 1;
                     let mut c = CMsDec::new(rate, channels, *streams, *coupled, mapping);
                     let mut c16 = CMsDec::new(rate, channels, *streams, *coupled, mapping);
-                    let mut d = MultistreamDecoder::with_layout(
+                    let mut d = MultistreamDecoder::new(
                         SampleRate::try_from(rate as i32).unwrap(),
                         channels,
                         *streams,
@@ -536,7 +536,7 @@ fn multistream_matches_libopus() {
                         mapping,
                     )
                     .unwrap();
-                    let mut d16 = MultistreamDecoder::with_layout(
+                    let mut d16 = MultistreamDecoder::new(
                         SampleRate::try_from(rate as i32).unwrap(),
                         channels,
                         *streams,

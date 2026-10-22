@@ -155,13 +155,13 @@ These files are not part of the codec. They port libopus's test programs, so tha
 | `moc.rs` | `moc`, `moc_i16`, `moc_relative`: the MOC distance of the Opus Speech Coding Enhancement draft. | `moc.py` of the libopus git repository (`dnn/torch/osce/stndrd/evaluation/`) |
 | `demo.rs` | `parse_bitstream`, `decode_bitstream`, the `DemoDecoder` trait and `opus_demo_s16`: the decoding loop of `opus_demo -d` and its 16-bit output. | `src/opus_demo.c` |
 
-### Multistream (`src/multistream/`, needs `std`)
+### Multistream (`src/multistream/`, needs `alloc`)
 
 | File | What it does | libopus counterpart |
 |---|---|---|
 | `mod.rs` | Module documentation, `ChannelMappingTable` (the channel mapping table of an Ogg Opus header, RFC 7845 section 5.1.1), `split_self_delimited` (cuts one stream out of a multistream packet), and the internal types that copy interleaved samples into one stream's input (`Interleaved`, for `f32` and `i16`). | none |
 | `layout.rs` | `ChannelLayout` and `MappingType`: streams, coupled streams, mapping, the layouts of mapping families 0, 1, 2 and 255. | `src/opus_multistream.c`, the surround layouts of `src/opus_multistream_encoder.c` |
-| `encoder.rs` | `MultistreamEncoder` and `Bitrate`. | `src/opus_multistream_encoder.c` |
+| `encoder.rs` | `MultistreamEncoder`. | `src/opus_multistream_encoder.c` |
 | `decoder.rs` | `MultistreamDecoder`. | `src/opus_multistream_decoder.c` |
 | `rate_alloc.rs` | How the encoder divides the bitrate and the packet bytes among the streams. | `surround_rate_allocation`, `ambisonics_rate_allocation`, `rate_allocation` in `src/opus_multistream_encoder.c` |
 | `surround.rs` | Surround masking analysis: how far each band of each channel lies above what the other channels mask. | `surround_analysis` in `src/opus_multistream_encoder.c` |
@@ -357,9 +357,10 @@ libopus 1.6.1 sets the extended mode only in its SILK section, so after BBWE fra
 
 ## Feature flags and where state is stored
 
-The crate has four features that decide how it is built: `std`, `heap` and `analysis` (all on by default) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`, `dred`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
+The crate has five features that decide how it is built: `std`, `heap` and `analysis` (on by default), `alloc` (on with `std` or `heap`) and `libm`. The neural network features (`dnn`, `deep-plc`, `osce`, `osce-bwe`, `dred`) add code, and `test-libopus-dnn` only compiles tests. [Using the library](06-using-the-library.md#feature-flags) describes them from the user's side. Inside the crate:
 
-- **`std`** selects `#![no_std]` when it is off (`#![cfg_attr(not(feature = "std"), no_std)]` in `src/lib.rs`). It also enables the run-time processor checks in `src/compat.rs` and `src/kiss_fft.rs`, and the `multistream` module, which uses `Vec`.
+- **`std`** selects `#![no_std]` when it is off (`#![cfg_attr(not(feature = "std"), no_std)]` in `src/lib.rs`). It also enables the run-time processor checks in `src/compat.rs` and `src/kiss_fft.rs`, and it turns on `alloc`.
+- **`alloc`** links the `alloc` crate (`extern crate alloc` in `src/lib.rs`), so it needs a global allocator but no operating system. It enables the `multistream` module, which keeps its stream encoders and decoders in a `Vec`. Each of them is built in place in the memory of the `Vec`, with `OpusEncoder::init` or `OpusDecoder::init`, so a large stream codec never passes through the stack. It also lets `ExtensionList` (`src/extensions.rs`) and `pad_keeping_extensions` (`src/packet.rs`) allocate when their fixed room of 32 extensions or 1275 bytes is too small. The files of `src/multistream/` import `Vec` and `vec!` from `alloc` under `#[cfg(not(feature = "std"))]`.
 - **`libm`** is required when `std` is off. `src/compat.rs` stops the build with `compile_error!` if both are missing. Its `Math` trait gives `f32` and `f64` the methods `sqrt`, `sin`, `exp2` and so on through the `libm` crate. Each module that needs them imports the trait under `#[cfg(not(feature = "std"))]`; with `std` the inherent methods of `f32` are used instead.
 - **`analysis`** compiles the speech and music analysis (`TonalityAnalysisState` and the network in `src/analysis/`). Without it the encoder decides as libopus does below complexity 7, at every complexity, and `OpusEncoder` is smaller. The types of `src/analysis/mod.rs` exist in both builds.
 - **`heap`** changes `src/lib.rs` and `src/silk/enc_api.rs`. Each large field of `OpusEncoder` and `OpusDecoder` is declared twice:
@@ -371,7 +372,7 @@ The crate has four features that decide how it is built: `std`, `heap` and `anal
   celt_enc: Box<CeltEncoder>,
   ```
 
-  The helper `state_mut` borrows such a field as the inner type in both builds, so the code that uses it needs no `#[cfg]`. `SilkEncoder` stores its channels and its input buffer in `Slot<T>`, which is `Box<T>` with `heap` and an inline value without it.
+  The helper `state_mut` borrows such a field as the inner type in both builds, so the code that uses it needs no `#[cfg]`. `SilkEncoder` stores its channels and its input buffer in `Slot<T>`, which is `Box<T>` with `heap` and an inline value without it. `heap` turns on `alloc` and takes `Box` from it, so it also works without `std`.
 
   `OpusEncoder::reset_state` writes the new state over the old one with the same functions that build an encoder in place (`write_new`). With `heap` they get `HeapMemory::Reuse` (`src/in_place.rs`): each box keeps its memory and only its contents are written anew, so a reset allocates nothing, as libopus `OPUS_RESET_STATE`.
 
@@ -384,7 +385,7 @@ Below the Opus layer nothing allocates. The CELT, SILK and range coder states st
 The neural network features follow the same rules:
 
 - `dnn` compiles `src/dnn/`, but adds no public API: `DnnBlob`, `DnnModels`, `set_dnn_blob` and `dnn_models` need `deep-plc`, the smallest feature with a model. `deep-plc`, `osce` and `osce-bwe` each turn on the one before and `dnn`. Each embeds the weights of its networks and adds its groups to `ModelSet` and `DecoderDnn`. `dred` turns on `deep-plc` and embeds the two RDOVAE networks; an `OpusDredDecoder` holds the RDOVAE decoder, not `ModelSet`. `#[cfg(feature = "...")]` on the fields and match arms keeps a build without a feature free of its code and its weights.
-- With `heap`, `OpusDecoder` holds `DecoderDnn` in a `Box`, and the layers of a group loaded from a blob are in a `Box` too. Without `heap`, `DecoderDnn` is inline and has room for the layers of every group. Blobs then must be `'static`, because there is no heap to copy them to.
+- With `heap`, `OpusDecoder` holds `DecoderDnn` in a `Box`, and the layers of a group loaded from a blob are in a `Box` too. Without `heap`, `DecoderDnn` is inline and has room for the layers of every group. Blobs then must be `'static`, because there is no heap to copy them to. `DnnBlob::from_bytes` shares its copy through an `Arc`, so it also needs a target with atomic compare-and-swap (`target_has_atomic = "ptr"`).
 - `test-libopus-dnn` adds nothing to the library. Test files that call a libopus built with its neural network code start with `#![cfg(feature = "test-libopus-dnn")]` (see [Testing](09-testing.md#tests-of-the-neural-network-code)).
 
 The measured sizes of both builds are in [Using the library](06-using-the-library.md#size-of-the-encoder-and-the-decoder).
