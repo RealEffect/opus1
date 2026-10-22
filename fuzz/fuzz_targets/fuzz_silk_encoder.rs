@@ -1,7 +1,8 @@
 #![no_main]
 
+use std::num::NonZeroU32;
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusEncoder, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 {
@@ -43,17 +44,17 @@ fuzz_target!(|data: &[u8]| {
         6 => 128000,
         _ => 510000,
     };
-    let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate));
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate).unwrap()));
 
     // Test CBR/VBR
     encoder.set_vbr(data[4] % 2 != 0);
 
     // Test complexity
-    let _ = encoder.set_complexity((data[5] % 11) as i32 - 1); // -1 to 10
+    let _ = encoder.set_complexity((data[5] % 11).wrapping_sub(1)); // 255 (refused), then 0 to 9
 
     // Test FEC settings
-    encoder.set_inband_fec(data[6] % 2 == 0);
-    let _ = encoder.set_packet_loss_perc((data[7] % 101) as i32);
+    encoder.set_inband_fec(if data[6] % 2 == 0 { InbandFec::On } else { InbandFec::Off });
+    let _ = encoder.set_packet_loss_perc(data[7] % 101);
 
     // Generate input with various patterns
     let samples_needed = frame_size * channels;

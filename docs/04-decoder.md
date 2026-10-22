@@ -66,7 +66,7 @@ All decoding goes through `decode_native` in `src/lib.rs`, the port of libopus `
 | `decode_fec_i16(data, frame_size, out)` | `opus_decode` with `decode_fec = 1` | As `decode_fec`, with 16-bit output. |
 | `decode24(data, frame_size, out)` | `opus_decode24` | As `decode`, then each sample scaled by 2^23 and rounded into an `i32`, without soft clipping or a limit (section 11). |
 | `decode_fec24(data, frame_size, out)` | `opus_decode24` with `decode_fec = 1` | As `decode_fec`, with 24-bit output. |
-| `set_gain(gain)`, `gain()` | `OPUS_SET_GAIN`, `OPUS_GET_GAIN` | The output gain in 1/256 dB, -32768 to 32767 (section 11). |
+| `set_gain(gain)`, `gain()` | `OPUS_SET_GAIN`, `OPUS_GET_GAIN` | The output gain in 1/256 dB, an `i16` (section 11). |
 | `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | `OPUS_SET_PHASE_INVERSION_DISABLED`, `OPUS_GET_PHASE_INVERSION_DISABLED` | Decodes intensity stereo bands without the sign inversion of the second channel (section 5). |
 | `pitch()` | `OPUS_GET_PITCH` | The pitch period of the last frame, in samples at 48 kHz (section 5). |
 | `final_range()` | `OPUS_GET_FINAL_RANGE` | The range decoder state after the last frame. |
@@ -345,7 +345,7 @@ assert_eq!(output.len(), 10 * frame);
 
 ## 9. In-band FEC: `decode_fec`
 
-A SILK-only or Hybrid packet can carry a low-bitrate copy (LBRR) of the SILK frames of the packet before it. The encoder adds it when `set_inband_fec(true)` turned FEC on and the packet loss percentage (`set_packet_loss_perc`) is above 0 (see [03-encoder.md](03-encoder.md), section 2.9). When packet `n` is lost and packet `n + 1` has arrived, the receiver can rebuild packet `n`:
+A SILK-only or Hybrid packet can carry a low-bitrate copy (LBRR) of the SILK frames of the packet before it. The encoder adds it when `set_inband_fec(InbandFec::On)` turned FEC on and the packet loss percentage (`set_packet_loss_perc`) is above 0 (see [03-encoder.md](03-encoder.md), section 2.9). When packet `n` is lost and packet `n + 1` has arrived, the receiver can rebuild packet `n`:
 
 1. Call `decode_fec(packet_n_plus_1, frame_size, out)`, with `frame_size` the duration of the lost packet. It writes exactly `frame_size` samples.
 2. Then call `decode(packet_n_plus_1, ...)` as usual for packet `n + 1`.
@@ -368,13 +368,14 @@ When the next packet has not arrived yet, a receiver conceals with an empty pack
 ### Example: using FEC when the next packet has arrived
 
 ```rust
-use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
+use std::num::NonZeroU32;
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 
 let rate = SampleRate::Hz16000;
 let frame = 320; // 20 ms
 let mut encoder = OpusEncoder::new(rate, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap(); // SILK at 16 kHz
-encoder.set_inband_fec(true); // OPUS_SET_INBAND_FEC(1)
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24_000).unwrap())); // SILK at 16 kHz
+encoder.set_inband_fec(InbandFec::On); // OPUS_SET_INBAND_FEC(1)
 encoder.set_packet_loss_perc(20).unwrap(); // OPUS_SET_PACKET_LOSS_PERC(20)
 
 let mut packets = Vec::new();
@@ -457,18 +458,19 @@ An `OpusDred` is 11,236 bytes and decoding does not change it, so one parsed pac
 
 `decode24` and `decode_fec24` follow libopus `opus_decode24` in its float build. They decode as `decode_i16` does in step 1, without soft clipping (`soft_clip` is not set, so `softclip_mem` is cleared as in libopus). Each sample then becomes `float2int(32768*256*x)`: scaled by 2^23 and rounded to the nearest integer, halfway values to the even one. Nothing limits the values to 24 bits; a sample beyond the 32-bit range gives the nearest 32-bit value on 64-bit ARM. The multistream decoder's `decode24` and `decode_fec24` (`opus_multistream_decode24`) do the same for every stream.
 
-**Output gain.** `set_gain(gain)` (libopus `OPUS_SET_GAIN`) scales the output by `celt_exp2(6.48814081e-4 * gain)`, that is `10^(gain / (20 * 256))`, with `gain` in 1/256 dB from -32768 to 32767. Any other value is an error of kind `BadArg`, and the setting stays. The default 0 skips the multiplication. As in libopus, the gain is applied at the end of every frame that is decoded or concealed (`opus_decode_frame`, `src/opus_decoder.c:681-693`): before the soft clipping and the conversion to 16 or 24 bits, and after the mode-switch cross-fades. The 2.5 or 5 ms of concealment that a cross-fade of a mode switch mixes in comes from a nested frame call, so it gets the gain twice, as in libopus. The decoder's state never sees the gain. `reset_state` keeps it. The multistream decoder sets it on every stream.
+**Output gain.** `set_gain(gain)` (libopus `OPUS_SET_GAIN`) scales the output by `celt_exp2(6.48814081e-4 * gain)`, that is `10^(gain / (20 * 256))`, with `gain` in 1/256 dB. `gain` is an `i16`: its range, -32768 to 32767, is the range libopus takes, so the call never fails. The default 0 skips the multiplication. As in libopus, the gain is applied at the end of every frame that is decoded or concealed (`opus_decode_frame`, `src/opus_decoder.c:681-693`): before the soft clipping and the conversion to 16 or 24 bits, and after the mode-switch cross-fades. The 2.5 or 5 ms of concealment that a cross-fade of a mode switch mixes in comes from a nested frame call, so it gets the gain twice, as in libopus. The decoder's state never sees the gain. `reset_state` keeps it. The multistream decoder sets it on every stream.
 
-`pcm_soft_clip` is public and can be used on float output directly:
+`pcm_soft_clip` is public and can be used on float output directly. It takes the interleaved samples, the channel count and the memory; the number of samples per channel is the length divided by the channel count. A length that is not a multiple of the channel count, no channels, or less memory than channels is an error of kind `BadArg`:
 
 ```rust
 use opus1::pcm_soft_clip;
 
 let mut pcm = vec![0.0f32, 0.8, 1.6, 0.8, 0.0, -0.5]; // one channel, a peak of 1.6
 let mut memory = [0.0f32; 1]; // one value per channel, 0 at the start of a stream
-pcm_soft_clip(&mut pcm, 6, 1, &mut memory);
+pcm_soft_clip(&mut pcm, 1, &mut memory)?;
 assert!(pcm.iter().all(|x| (-1.0..=1.0).contains(x)));
 assert!(pcm[2] > 0.99); // the peak lands just below 1
+# Ok::<(), opus1::Error>(())
 ```
 
 ## 12. The final range
@@ -483,10 +485,11 @@ The range coder ends every frame in a state, a 32-bit number. An encoder and a d
 The value is for testing. Comparing it with `OpusEncoder::final_range()` for the same packet shows whether the decoder read every symbol as the encoder wrote it. libopus's test tool `opus_demo` stores the encoder's final range with each packet. It reports "Range coder state mismatch" when the decoder ends in another state. A mismatch means a corrupted packet or a bug, even when the audio sounds right.
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
 let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 let mut packet = vec![0u8; 1276];
 let mut pcm16 = vec![0i16; 320];

@@ -10,11 +10,13 @@
 mod ms_support;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
 use opus1::{
-    Application, Bandwidth, Bitrate, Channels, ErrorKind, ForcedMode, OpusEncoder, SampleRate,
+    Application, Bandwidth, Bitrate, Channels, ErrorKind, ForcedMode, InbandFec, OpusEncoder,
+    SampleRate,
 };
 
 /// A small deterministic random number generator.
@@ -61,15 +63,15 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
             let bitrate = rng.pick(&[
                 Bitrate::Auto,
                 Bitrate::Max,
-                Bitrate::BitsPerSecond(1),
-                Bitrate::BitsPerSecond(600 * channels),
-                Bitrate::BitsPerSecond(3_000 * channels),
-                Bitrate::BitsPerSecond(8_000 * channels),
-                Bitrate::BitsPerSecond(20_000 * channels),
-                Bitrate::BitsPerSecond(64_000 * channels),
-                Bitrate::BitsPerSecond(i32::MAX),
+                Bitrate::BitsPerSecond(NonZeroU32::new(1).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(600 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(3_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(8_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(20_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(64_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::MAX),
             ]);
-            enc.set_bitrate(bitrate).unwrap();
+            enc.set_bitrate(bitrate);
             format!("{bitrate:?}")
         }
         1 => {
@@ -78,13 +80,13 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
             format!("vbr {vbr}")
         }
         2 => {
-            let complexity = rng.below(11) as i32;
+            let complexity = rng.below(11) as u8;
             enc.set_complexity(complexity).unwrap();
             format!("complexity {complexity}")
         }
         3 => {
             let fec = rng.below(2) == 0;
-            enc.set_inband_fec(fec);
+            enc.set_inband_fec(if fec { InbandFec::On } else { InbandFec::Off });
             format!("fec {fec}")
         }
         4 => {
@@ -94,13 +96,13 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
         }
         5 => {
             let bandwidth = rng.pick(&[
-                Bandwidth::Auto,
-                Bandwidth::Auto,
-                Bandwidth::Narrowband,
-                Bandwidth::Mediumband,
-                Bandwidth::Wideband,
-                Bandwidth::Superwideband,
-                Bandwidth::Fullband,
+                None,
+                None,
+                Some(Bandwidth::Narrowband),
+                Some(Bandwidth::Mediumband),
+                Some(Bandwidth::Wideband),
+                Some(Bandwidth::Superwideband),
+                Some(Bandwidth::Fullband),
             ]);
             enc.set_bandwidth(bandwidth);
             format!("{bandwidth:?}")
@@ -114,7 +116,7 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
                 Bandwidth::Fullband,
                 Bandwidth::Fullband,
             ]);
-            enc.set_max_bandwidth(bandwidth).unwrap();
+            enc.set_max_bandwidth(bandwidth);
             format!("max {bandwidth:?}")
         }
         7 => {
@@ -186,7 +188,7 @@ fn random_walk(
                 let smallest = 2 * streams - 1;
                 let limit = match enc.bitrate_setting() {
                     Bitrate::BitsPerSecond(bps) if !enc.vbr() => {
-                        let bits = bps as i64 * frame_size as i64 / fs as i64;
+                        let bits = bps.get() as i64 * frame_size as i64 / fs as i64;
                         len.min((((bits + 4) / 8) as usize).max(smallest))
                     }
                     _ => len,
@@ -304,8 +306,7 @@ fn input_that_is_not_audio() {
         for (name, value) in bad {
             for (per_channel, vbr) in [(12_000, true), (64_000, true), (32_000, false)] {
                 let mut enc = rust_encoder(case, fs, Application::Audio);
-                enc.set_bitrate(Bitrate::BitsPerSecond(per_channel * case.channels as i32))
-                    .unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new((per_channel * case.channels as i32) as u32).unwrap()));
                 enc.set_vbr(vbr);
                 let mut dec = c_decoder(&enc);
                 let streams = enc.layout().streams();
@@ -341,8 +342,7 @@ fn sixteen_bit_extremes() {
     let frame_size = 960;
     for case in CASES {
         let mut enc = rust_encoder(case, fs, Application::Audio);
-        enc.set_bitrate(Bitrate::BitsPerSecond(32_000 * case.channels as i32))
-            .unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32_000 * case.channels as u32).unwrap()));
         let mut dec = c_decoder(&enc);
         let streams = enc.layout().streams();
         let mut out = vec![0u8; max_packet_bytes(streams)];
@@ -401,7 +401,7 @@ fn silk_mediumband_10_ms_after_a_change_has_the_decoders_final_range() {
                     application,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                 enc.set_complexity(3).unwrap();
                 let mut dec = CDecoder::new(fs, 1);
                 let pcm = voiced(fs, 1, fs as usize);
@@ -414,7 +414,7 @@ fn silk_mediumband_10_ms_after_a_change_has_the_decoders_final_range() {
                 sizes.extend([fs as usize / 100; 6]);
                 for (f, &n) in sizes.iter().enumerate() {
                     if n == fs as usize / 100 {
-                        enc.set_bandwidth(Bandwidth::Mediumband);
+                        enc.set_bandwidth(Some(Bandwidth::Mediumband));
                     }
                     let len = enc.encode(&pcm[pos..pos + n], n, &mut out).unwrap();
                     pos += n;
@@ -440,8 +440,8 @@ fn silk_mediumband_10_ms_from_the_start_has_the_decoders_final_range() {
         for bitrate in [12_000, 20_000] {
             let case = Case::family("mono", 1, 0);
             let mut enc = rust_encoder(&case, fs, Application::Voip);
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
-            enc.set_bandwidth(Bandwidth::Mediumband);
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+            enc.set_bandwidth(Some(Bandwidth::Mediumband));
             enc.set_force_mode(Some(ForcedMode::SilkOnly));
             let mut dec = c_decoder(&enc);
             let frame_size = fs as usize / 100;

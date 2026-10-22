@@ -214,6 +214,7 @@ fn mapping_type_and_lfe_stream_match_libopus_behaviour() {
                 assert!(c.forced_stereo.is_empty(), "{what}");
                 assert!(!c.all_celt, "{what}: libopus forced CELT");
             }
+            other => panic!("{what}: unexpected mapping type {other:?}"),
         }
     }
     assert_eq!(seen, [6, 5, 7]);

@@ -47,10 +47,11 @@ mod dnn_plc_common;
 mod k24_common;
 mod ms_support;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use dnn_dec_common::{CDec, CMsDec, Coding, c_encode, first_difference, rs_encode, splice, toc_mode};
 use opus1::multistream::MultistreamDecoder;
-use opus1::{Application, Bitrate, Channels, OpusDecoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, SampleRate};
 
 fn all() -> bool {
     std::env::var_os("OPUS1_DNN_OSCE_ALL").is_some_and(|v| v != "0")
@@ -297,8 +298,8 @@ fn compare(packets: &[Vec<u8>], s: Setting, seed: u32) -> Result<Count, String> 
     let complexity = |c: &mut CDec, c16: &mut CDec, d: &mut OpusDecoder, d16: &mut OpusDecoder, value| {
         c.set_complexity(value);
         c16.set_complexity(value);
-        d.set_complexity(value).unwrap();
-        d16.set_complexity(value).unwrap();
+        d.set_complexity(value as u8).unwrap();
+        d16.set_complexity(value as u8).unwrap();
     };
     let bwe = |c: &mut CDec, c16: &mut CDec, d: &mut OpusDecoder, d16: &mut OpusDecoder, on| {
         c.set_osce_bwe(on);
@@ -578,9 +579,9 @@ fn multistream_matches_libopus() {
         packet_sets.push((format!("libopus {bitrate} b/s"), enc.encode_all(&pcm, 960), layout));
         let mut ours =
             opus1::multistream::MultistreamEncoder::new_surround(SampleRate::Hz48000, channels, 1, Application::Voip).unwrap();
-        ours.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        ours.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         if fec {
-            ours.set_inband_fec(true);
+            ours.set_inband_fec(InbandFec::On);
             ours.set_packet_loss_perc(20).unwrap();
         }
         let layout = ours.layout();
@@ -624,8 +625,8 @@ fn multistream_matches_libopus() {
                     c16.set_complexity(complexity);
                     c.set_osce_bwe(bwe);
                     c16.set_osce_bwe(bwe);
-                    d.set_complexity(complexity).unwrap();
-                    d16.set_complexity(complexity).unwrap();
+                    d.set_complexity(complexity as u8).unwrap();
+                    d16.set_complexity(complexity as u8).unwrap();
                     d.set_osce_bwe(bwe).unwrap();
                     d16.set_osce_bwe(bwe).unwrap();
                     let mut out = vec![0f32; 5760 * channels];
@@ -709,7 +710,7 @@ fn timing() {
             d.set_complexity(complexity).unwrap();
             d.set_osce_bwe(bwe).unwrap();
             let mut c = CDec::new(48000, 1);
-            c.set_complexity(complexity);
+            c.set_complexity(i32::from(complexity));
             c.set_osce_bwe(bwe);
             let mut out = vec![0f32; 960];
             let (mut t_ours, mut t_theirs) = (Vec::new(), Vec::new());
@@ -756,7 +757,7 @@ fn distance_to_an_o2_build() {
                     Channels::try_from(channels).unwrap(),
                 )
                 .unwrap();
-                d.set_complexity(complexity).unwrap();
+                d.set_complexity(complexity as u8).unwrap();
                 d.set_osce_bwe(bwe).unwrap();
                 let mut out = vec![0i16; 5760 * channels];
                 for p in &stream.packets {

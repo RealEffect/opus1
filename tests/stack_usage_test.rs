@@ -8,6 +8,7 @@
 //! full encode/decode round-trip must fit on a 768 KiB stack.
 
 #[cfg(feature = "heap")]
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, SampleRate};
 use opus1::{OpusDecoder, OpusEncoder};
 
@@ -75,7 +76,7 @@ fn roundtrip_on_stack_with(stack_size: usize, application: Application, bitrate:
         .spawn(move || {
             let mut enc =
                 OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, application).unwrap();
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
 
             let frame_size = 960; // 20 ms @ 48 kHz
             let mut input = vec![0.0f32; frame_size * 2];

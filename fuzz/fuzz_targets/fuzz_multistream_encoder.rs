@@ -31,29 +31,31 @@
 
 mod common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
 });
 
-const BANDWIDTHS: [Bandwidth; 6] = [
-    Bandwidth::Auto,
-    Bandwidth::Narrowband,
-    Bandwidth::Mediumband,
-    Bandwidth::Wideband,
-    Bandwidth::Superwideband,
-    Bandwidth::Fullband,
+/// The bandwidth settings: `None` is the automatic choice.
+const BANDWIDTHS: [Option<Bandwidth>; 6] = [
+    None,
+    Some(Bandwidth::Narrowband),
+    Some(Bandwidth::Mediumband),
+    Some(Bandwidth::Wideband),
+    Some(Bandwidth::Superwideband),
+    Some(Bandwidth::Fullband),
 ];
 
 /// The libopus application constant.
 fn c_app(app: Application) -> i32 {
-    app as i32
+    app.to_raw()
 }
 
 /// Builds the encoder, and checks that libopus accepts the same layouts.
@@ -156,11 +158,11 @@ fn change(u: &mut Unstructured, encs: [&mut MultistreamEncoder; 2]) -> Result<()
                 0 => Bitrate::Auto,
                 1 => Bitrate::Max,
                 2 => Bitrate::BitsPerSecond(u.arbitrary()?),
-                3 => Bitrate::BitsPerSecond(u.int_in_range(500..=20_000)?),
-                _ => Bitrate::BitsPerSecond(u.int_in_range(20_000..=1_000_000)?),
+                3 => Bitrate::BitsPerSecond(NonZeroU32::new(u.int_in_range(500..=20_000)?).unwrap()),
+                _ => Bitrate::BitsPerSecond(NonZeroU32::new(u.int_in_range(20_000..=1_000_000)?).unwrap()),
             };
             for e in encs {
-                let _ = e.set_bitrate(b);
+                e.set_bitrate(b);
             }
         }
         2 => {
@@ -170,14 +172,14 @@ fn change(u: &mut Unstructured, encs: [&mut MultistreamEncoder; 2]) -> Result<()
             }
         }
         3 => {
-            let v = if u.ratio(1, 8)? { u.arbitrary()? } else { u.int_in_range(0..=10)? };
+            let v: u8 = if u.ratio(1, 8)? { u.arbitrary()? } else { u.int_in_range(0..=10)? };
             for e in encs {
                 let _ = e.set_complexity(v);
             }
         }
         4 => {
-            let fec = u.arbitrary()?;
-            let loss = u.int_in_range(-1..=101)?;
+            let fec = *u.choose(&[InbandFec::Off, InbandFec::On, InbandFec::OnUnlessMusic])?;
+            let loss = u.int_in_range(0..=101)?;
             for e in encs {
                 e.set_inband_fec(fec);
                 let _ = e.set_packet_loss_perc(loss);
@@ -190,9 +192,11 @@ fn change(u: &mut Unstructured, encs: [&mut MultistreamEncoder; 2]) -> Result<()
             }
         }
         6 => {
-            let v = *u.choose(&BANDWIDTHS)?;
-            for e in encs {
-                let _ = e.set_max_bandwidth(v);
+            // `None` leaves the maximum as it is.
+            if let Some(v) = *u.choose(&BANDWIDTHS)? {
+                for e in encs {
+                    e.set_max_bandwidth(v);
+                }
             }
         }
         7 => {
@@ -343,7 +347,7 @@ fn run(data: &[u8]) -> Result<()> {
                 Bitrate::Auto => None,
                 Bitrate::Max => Some(out_len),
                 Bitrate::BitsPerSecond(bps) => {
-                    let bytes = ((bitrate_to_bits(bps, fs, frame_size) + 4) / 8).max(0) as usize;
+                    let bytes = ((bitrate_to_bits(bps.get() as i32, fs, frame_size) + 4) / 8).max(0) as usize;
                     Some(out_len.min(smallest.max(bytes)))
                 }
             };

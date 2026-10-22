@@ -39,6 +39,7 @@
 // Some helpers serve only the tests that need the speech and music analysis.
 #![cfg_attr(not(feature = "analysis"), allow(dead_code))]
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Bitrate as CBitrate, Channels as CCh, Decoder as CDec, Encoder as CEnc,
 };
@@ -66,7 +67,7 @@ fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
     let input = chirp(SR, 13);
     let mut enc =
         OpusEncoder::new(SampleRate::try_from(SR as i32).unwrap(), Channels::Mono, app).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     if app == Application::Audio {
         enc.set_force_mode(Some(ForcedMode::CeltOnly));
     }

@@ -21,6 +21,7 @@
 
 mod k24_common;
 
+use std::num::NonZeroU32;
 use k24_common::{resample, BW_FB, BW_WB, CDec, CEnc, MODE_CELT, MODE_HYBRID, MODE_SILK};
 use opus1::internals::silk_input::set_integer_hp_at_48k;
 use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
@@ -70,10 +71,10 @@ fn opus1_packets(pcm: &[i16], rate: i32, s: Stream, integer_hp: bool) -> Vec<Vec
     )
     .unwrap();
     set_integer_hp_at_48k(&mut enc, integer_hp);
-    enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(s.bitrate as u32).unwrap()));
     enc.set_complexity(5).unwrap();
     enc.set_force_mode(Some(if s.mode == MODE_SILK { ForcedMode::SilkOnly } else { ForcedMode::Hybrid }));
-    enc.set_bandwidth(if s.bandwidth == BW_WB { Bandwidth::Wideband } else { Bandwidth::Fullband });
+    enc.set_bandwidth(Some(if s.bandwidth == BW_WB { Bandwidth::Wideband } else { Bandwidth::Fullband }));
     let mut buf = vec![0u8; 1500];
     pcm.chunks_exact(frame)
         .map(|x| {
@@ -211,7 +212,7 @@ fn switching_bursts(x48: &[i16], rate: i32) -> usize {
     for (k, f) in pcm.chunks_exact(frame).enumerate() {
         let (mode, bitrate) = turn(k);
         enc.set_force_mode(Some(if mode == MODE_SILK { ForcedMode::SilkOnly } else { ForcedMode::CeltOnly }));
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         let n = enc.encode_i16(f, frame, &mut buf).unwrap();
         a.push(buf[..n].to_vec());
         cenc.force_mode(mode).bitrate(bitrate);

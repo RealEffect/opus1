@@ -1,5 +1,6 @@
 #![no_main]
 
+use std::num::NonZeroU32;
 use libfuzzer_sys::fuzz_target;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
@@ -34,14 +35,14 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Configure encoder
-    let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(match data[3] % 5 {
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(match data[3] % 5 {
         0 => 16000,
         1 => 32000,
         2 => 64000,
         3 => 96000,
         _ => 128000,
-    }));
-    let _ = encoder.set_complexity((data[4] % 11) as i32);
+    }).unwrap()));
+    let _ = encoder.set_complexity(data[4] % 11);
 
     // Frame size
     let frame_size = match data[5] % 4 {

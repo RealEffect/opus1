@@ -11,6 +11,7 @@
 //! taken from the placeholder TOC (or from `frame_size` for an empty packet).
 //! These tests pin that behaviour down, plus a randomized no-panic sweep.
 
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use proptest::prelude::*;
 use std::f32::consts::PI;
@@ -59,7 +60,7 @@ fn encode_stream(
         app,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     enc.set_vbr(false);
     (0..n_packets)
         .map(|p| {

@@ -5,8 +5,9 @@
 //! in the numbers comes from the encoder alone.
 #![allow(dead_code)]
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 use std::os::raw::c_int;
 
 /// The input rate under test.
@@ -295,14 +296,14 @@ pub fn rs_encoder(cfg: &Cfg) -> OpusEncoder {
         app,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(cfg.bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(cfg.bitrate as u32).unwrap()));
     enc.set_vbr(!cfg.cbr);
-    enc.set_complexity(cfg.complexity).unwrap();
-    enc.set_inband_fec(cfg.fec);
-    enc.set_packet_loss_perc(cfg.loss).unwrap();
+    enc.set_complexity(cfg.complexity as u8).unwrap();
+    enc.set_inband_fec(if cfg.fec { InbandFec::On } else { InbandFec::Off });
+    enc.set_packet_loss_perc(cfg.loss as u8).unwrap();
     enc.set_force_mode(cfg.rs_force_mode);
     if let Some(bandwidth) = cfg.rs_bandwidth {
-        enc.set_bandwidth(bandwidth);
+        enc.set_bandwidth(Some(bandwidth));
     }
     enc
 }

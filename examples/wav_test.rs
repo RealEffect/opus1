@@ -3,6 +3,7 @@
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
 // WAV file encoder/decoder test using OpusEncoder/OpusDecoder
+use std::num::NonZeroU32;
 use opus1::internals::silk::resampler::SilkResampler;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::fs::File;
@@ -214,7 +215,7 @@ fn process_mode(config: ModeConfig, src_samples: &[i16], src_rate: u32) {
     let rate = SampleRate::try_from(target_rate).expect("an Opus sampling rate");
     let mut encoder = OpusEncoder::new(rate, Channels::Mono, effective_app_mode)
         .expect("Failed to create encoder");
-    encoder.set_bitrate(Bitrate::BitsPerSecond(effective_bitrate)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(effective_bitrate as u32).unwrap()));
     encoder.set_vbr(false);
     encoder.set_complexity(5).unwrap();
 
@@ -445,7 +446,7 @@ fn main() {
             Application::Voip,
         )
         .expect("encoder");
-        enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
         enc.set_vbr(false);
         let mut dec16 = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).expect("dec 16k");
         let mut dec48 = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).expect("dec 48k");

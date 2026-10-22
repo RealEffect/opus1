@@ -32,6 +32,7 @@
 //! opus1 to CELT-only.
 #![cfg(feature = "analysis")]
 
+use std::num::NonZeroU32;
 use opus::{Application as CApp, Bitrate, Channels as CCh, Decoder as CDec, Encoder as CEnc};
 use opus1::{Application, Channels, ForcedMode, OpusEncoder, SampleRate};
 
@@ -66,7 +67,7 @@ fn opus1_packets(rate: usize, bitrate: i32, level: f64, force_celt: bool) -> Vec
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(opus1::Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_bitrate(opus1::Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     if force_celt {
         enc.set_force_mode(Some(ForcedMode::CeltOnly));
     }

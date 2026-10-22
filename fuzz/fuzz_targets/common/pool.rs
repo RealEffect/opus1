@@ -7,9 +7,10 @@
 //! extension), Hybrid, SILK narrowband and CELT, with in-band FEC and with
 //! DRED data in the padding.
 
+use std::num::NonZeroU32;
 use opus1::extensions::ExtensionIterator;
 use opus1::packet::{self, Framing};
-use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 use std::sync::OnceLock;
 
 /// The extension ID of DRED data.
@@ -56,10 +57,10 @@ struct Setting {
     fs: i32,
     channels: usize,
     app: Application,
-    bitrate: i32,
+    bitrate: u32,
     ms2: usize,
     force: Option<ForcedMode>,
-    dred: i32,
+    dred: u8,
 }
 
 fn make() -> Pool {
@@ -86,8 +87,8 @@ fn make() -> Pool {
             s.app,
         )
         .expect("encoder");
-        enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
-        enc.set_inband_fec(true);
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(s.bitrate).unwrap()));
+        enc.set_inband_fec(InbandFec::On);
         enc.set_packet_loss_perc(20).unwrap();
         enc.set_force_mode(s.force);
         if s.dred > 0 {

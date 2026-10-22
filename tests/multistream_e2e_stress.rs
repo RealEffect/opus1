@@ -29,11 +29,12 @@ mod ms_support;
 mod multistream_e2e_common;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bandwidth, Bitrate, ErrorKind, ForcedMode};
+use opus1::{Application, Bandwidth, Bitrate, ErrorKind, ForcedMode, InbandFec};
 
 /// A small deterministic random number generator.
 struct Lcg(u32);
@@ -85,16 +86,16 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
             let bitrate = rng.pick(&[
                 Bitrate::Auto,
                 Bitrate::Max,
-                Bitrate::BitsPerSecond(1),
-                Bitrate::BitsPerSecond(500 * channels),
-                Bitrate::BitsPerSecond(2_500 * channels),
-                Bitrate::BitsPerSecond(7_000 * channels),
-                Bitrate::BitsPerSecond(12_000 * channels),
-                Bitrate::BitsPerSecond(40_000 * channels),
-                Bitrate::BitsPerSecond(750_000 * channels),
-                Bitrate::BitsPerSecond(i32::MAX),
+                Bitrate::BitsPerSecond(NonZeroU32::new(1).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(500 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(2_500 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(7_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(12_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(40_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::new(750_000 * channels as u32).unwrap()),
+                Bitrate::BitsPerSecond(NonZeroU32::MAX),
             ]);
-            enc.set_bitrate(bitrate).unwrap();
+            enc.set_bitrate(bitrate);
             format!("{bitrate:?}")
         }
         1 => {
@@ -103,13 +104,13 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
             format!("vbr {vbr}")
         }
         2 => {
-            let complexity = rng.below(11) as i32;
+            let complexity = rng.below(11) as u8;
             enc.set_complexity(complexity).unwrap();
             format!("complexity {complexity}")
         }
         3 => {
             let fec = rng.below(2) == 0;
-            enc.set_inband_fec(fec);
+            enc.set_inband_fec(if fec { InbandFec::On } else { InbandFec::Off });
             format!("fec {fec}")
         }
         4 => {
@@ -119,12 +120,12 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
         }
         5 => {
             let bandwidth = rng.pick(&[
-                Bandwidth::Auto,
-                Bandwidth::Narrowband,
-                Bandwidth::Mediumband,
-                Bandwidth::Wideband,
-                Bandwidth::Superwideband,
-                Bandwidth::Fullband,
+                None,
+                Some(Bandwidth::Narrowband),
+                Some(Bandwidth::Mediumband),
+                Some(Bandwidth::Wideband),
+                Some(Bandwidth::Superwideband),
+                Some(Bandwidth::Fullband),
             ]);
             enc.set_bandwidth(bandwidth);
             format!("{bandwidth:?}")
@@ -136,7 +137,7 @@ fn change_a_setting(enc: &mut MultistreamEncoder, rng: &mut Lcg) -> String {
                 Bandwidth::Fullband,
                 Bandwidth::Fullband,
             ]);
-            enc.set_max_bandwidth(bandwidth).unwrap();
+            enc.set_max_bandwidth(bandwidth);
             format!("max {bandwidth:?}")
         }
         7 => {
@@ -296,7 +297,7 @@ fn stress(case: &Case, fs: i32, application: Application, seed: u32, frames: usi
                 assert_eq!(e.kind(), ErrorKind::BufferTooSmall, "{}", at(&history));
                 let limit = match enc.bitrate_setting() {
                     Bitrate::BitsPerSecond(bps) if !enc.vbr() => {
-                        let bits = bps as i64 * frame_size as i64 / fs as i64;
+                        let bits = bps.get() as i64 * frame_size as i64 / fs as i64;
                         len.min((((bits + 4) / 8) as usize).max(smallest))
                     }
                     _ => len,

@@ -2,6 +2,7 @@
 //!
 //! Each test mirrors the minimal reproducer from the corresponding issue.
 
+use std::num::NonZeroU32;
 use opus1::{Bitrate, Channels, OpusDecoder, SampleRate};
 
 fn try_decode(label: &str, pkt: &[u8], frame_size: usize, channels: usize) {
@@ -316,7 +317,7 @@ fn silk_plc_produces_concealment_audio() {
     let sr = 16000;
     let fs = 320;
     let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
 
     // Encode several frames of a sine wave.
     let mut packets = Vec::new();

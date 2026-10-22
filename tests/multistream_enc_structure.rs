@@ -17,6 +17,7 @@
 mod ms_support;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
@@ -56,8 +57,7 @@ fn every_channel_reaches_its_own_output() {
             } else {
                 48_000
             };
-            enc.set_bitrate(Bitrate::BitsPerSecond(per_channel * case.channels as i32))
-                .unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new((per_channel * case.channels as i32) as u32).unwrap()));
             let mut dec = c_decoder(&enc);
             let family = case.tone_family();
             let pcm = tones(fs, case.channels, family, fs as usize);

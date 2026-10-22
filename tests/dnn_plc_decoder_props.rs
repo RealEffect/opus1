@@ -11,6 +11,7 @@
 
 mod dnn_plc_common;
 
+use std::num::NonZeroU32;
 use opus1::multistream::MultistreamDecoder;
 use opus1::{
     Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
@@ -87,8 +88,8 @@ fn packets(mode: ForcedMode, channels: usize) -> Vec<Vec<u8>> {
     )
     .unwrap();
     enc.set_force_mode(Some(mode));
-    enc.set_bandwidth(if mode == ForcedMode::SilkOnly { Bandwidth::Wideband } else { Bandwidth::Fullband });
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000 * channels as i32)).unwrap();
+    enc.set_bandwidth(Some(if mode == ForcedMode::SilkOnly { Bandwidth::Wideband } else { Bandwidth::Fullband }));
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000 * channels as u32).unwrap()));
     let mut buf = vec![0u8; 1500];
     pcm.chunks_exact(960 * channels)
         .map(|frame| {
@@ -241,7 +242,7 @@ fn without_loss_the_complexity_changes_nothing() {
                     Channels::try_from(channels).unwrap(),
                 )
                 .unwrap();
-                d.set_complexity(complexity).unwrap();
+                d.set_complexity(complexity as u8).unwrap();
                 assert!(same(&want, &decode(&mut d, &packets, |_| false)), "{mode:?} {channels} ch, complexity {complexity}");
             }
         }

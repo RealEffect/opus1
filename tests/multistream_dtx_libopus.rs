@@ -23,6 +23,7 @@ mod k24_common;
 mod ms_support;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
@@ -151,7 +152,7 @@ fn celt_only_packets_are_libopus() {
                 let (mut rust, mut c) = encoders_with_dtx(case, fs, Application::Audio);
                 configure(&mut rust, &mut c, per_channel * case.channels as i32, vbr);
                 rust.set_complexity(complexity).unwrap();
-                c.set_complexity(complexity);
+                c.set_complexity(i32::from(complexity));
                 rust.set_force_mode(Some(ForcedMode::CeltOnly));
                 c.ctl(OPUS_SET_FORCE_MODE_REQUEST, MODE_CELT_ONLY);
                 let (rs, cp) = encode_both(&mut rust, &mut c, &pcm, fs as usize / 50);
@@ -192,7 +193,7 @@ fn each_stream_leaves_out_the_frames_of_libopus() {
                 let (mut rust, mut c) = encoders_with_dtx(case, fs, Application::Audio);
                 configure(&mut rust, &mut c, per_channel * case.channels as i32, vbr);
                 rust.set_complexity(complexity).unwrap();
-                c.set_complexity(complexity);
+                c.set_complexity(i32::from(complexity));
                 let frame_size = fs as usize * frame_ms / 1000;
                 let (rs, cp) = encode_both(&mut rust, &mut c, &pcm, frame_size);
                 let streams = rust.layout().streams();
@@ -249,7 +250,7 @@ fn opus1_dtx_packets_decode_like_libopus() {
             let mut rust = rust_encoder(case, fs, application);
             rust.set_dtx(true);
             rust.set_complexity(complexity).unwrap();
-            rust.set_bitrate(opus1::Bitrate::BitsPerSecond(20_000 * case.channels as i32)).unwrap();
+            rust.set_bitrate(opus1::Bitrate::BitsPerSecond(NonZeroU32::new(20_000 * case.channels as u32).unwrap()));
             let frame_size = fs as usize * frame_ms / 1000;
             let packets = rust_encode_all(&mut rust, &pcm, frame_size);
             let layout = rust.layout();

@@ -31,6 +31,7 @@ The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Applicati
 ## One frame through the encoder and the decoder
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 let rate = SampleRate::Hz16000;
@@ -42,7 +43,7 @@ let pcm: Vec<f32> = (0..frame)
     .collect();
 
 let mut encoder = OpusEncoder::new(rate, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
 
 // The length of `packet` is the largest packet the encoder may write.
 let mut packet = vec![0u8; 1276];
@@ -73,20 +74,19 @@ The rules of `OpusDecoder::decode(packet, frame_size, output)`:
 
 ## Default settings and the automatic choice of mode
 
-These settings of `OpusEncoder` can be changed at any time. The next `encode` call uses them. Each setter checks its value as the matching `OPUS_SET_*` request of libopus does. A setter that can refuse a value returns a `Result`. After an error the setting keeps its old value.
+These settings of `OpusEncoder` can be changed at any time. The next `encode` call uses them. The type of each setting holds only values that make sense, such as a `u8` for the complexity. Each setter checks its value as the matching `OPUS_SET_*` request of libopus does. A setter that can still refuse a value returns a `Result`. After an error the setting keeps its old value.
 
 | Setter | Getter | Default | Meaning |
 |---|---|---|---|
-| `set_bitrate(Bitrate)` | `bitrate_setting()`, `bitrate()` | `Bitrate::Auto` | Target bitrate for all channels together: `Bitrate::BitsPerSecond(n)`, `Bitrate::Auto` or `Bitrate::Max`. A value of 0 or less is refused. Other values are raised to at least 500 b/s and limited to at most 750,000 b/s per channel. `bitrate()` returns the rate in b/s, as libopus `OPUS_GET_BITRATE` does. |
-| `set_complexity(i32)` | `complexity()` | 9 | 0 to 10. Higher values spend more processor time for better quality. Other values are refused. |
+| `set_bitrate(Bitrate)` | `bitrate_setting()`, `bitrate()` | `Bitrate::Auto` | Target bitrate for all channels together: `Bitrate::BitsPerSecond(n)` with `n` a `NonZeroU32`, `Bitrate::Auto` or `Bitrate::Max`. `n` is raised to at least 500 b/s and limited to at most 750,000 b/s per channel, so the call never fails. `bitrate()` returns the rate in b/s, as libopus `OPUS_GET_BITRATE` does. |
+| `set_complexity(u8)` | `complexity()` | 9 | 0 to 10. Higher values spend more processor time for better quality. A value above 10 is refused. |
 | `set_vbr(bool)` | `vbr()` | `true` | `false` gives every packet the same size (constant bitrate, CBR). `true` lets the size follow the signal (variable bitrate, VBR). |
 | `set_vbr_constraint(bool)` | `vbr_constraint()` | `true` | With VBR, `true` keeps the size of CELT-only packets close to the bitrate. `false` lets it follow the signal more freely. |
-| `set_inband_fec(bool)` | `inband_fec()` | `false` | `true` lets SILK and Hybrid packets carry a low-bitrate copy of the previous frame, so a lost packet can be rebuilt (in-band forward error correction, FEC). |
-| `set_inband_fec_mode(InbandFec)` | `inband_fec_mode()` | `InbandFec::Off` | The three values of libopus `OPUS_SET_INBAND_FEC`: `Off`, `On` (as `set_inband_fec(true)`) and `OnUnlessMusic`, which does not move the encoder to SILK for FEC when the input is clearly music. |
+| `set_inband_fec(InbandFec)` | `inband_fec()` | `InbandFec::Off` | `On` lets SILK and Hybrid packets carry a low-bitrate copy of the previous frame, so a lost packet can be rebuilt (in-band forward error correction, FEC). The three values are those of libopus `OPUS_SET_INBAND_FEC`: `Off`, `On` and `OnUnlessMusic`, which does not move the encoder to SILK for FEC when the input is clearly music. |
 | `set_signal(Signal)` | `signal()` | `Signal::Auto` | What the input is: `Voice`, `Music`, or `Auto` to let the speech and music analysis decide (from complexity 7 on). See below. |
-| `set_lsb_depth(i32)` | `lsb_depth()` | 24 | The precision of the input in bits, 8 to 24. Other values are refused. Samples below `2^-depth` count as silence, and the bandwidth detection ignores noise at that level. `encode_i16` uses at most 16. |
+| `set_lsb_depth(u8)` | `lsb_depth()` | 24 | The precision of the input in bits, 8 to 24. Other values are refused. Samples below `2^-depth` count as silence, and the bandwidth detection ignores noise at that level. `encode_i16` uses at most 16. |
 | `set_dtx(bool)` | `dtx()`, `in_dtx()` | `false` | Discontinuous transmission (DTX): while the input is inactive, the encoder sends packets of one byte. `in_dtx()` says whether it is in such a pause. See below. |
-| `set_packet_loss_perc(i32)` | `packet_loss_perc()` | 0 | The packet loss the network is expected to have, 0 to 100 percent. Other values are refused. |
+| `set_packet_loss_perc(u8)` | `packet_loss_perc()` | 0 | The packet loss the network is expected to have, 0 to 100 percent. A value above 100 is refused. |
 | `set_expert_frame_duration(FrameDuration)` | `expert_frame_duration()` | `FrameDuration::Argument` | The duration of the frame each `encode` call codes. `Argument` takes the `frame_size` of the call. See [Frame duration](#frame-duration). |
 
 The three `Application` values give the encoder a hint about the signal. They match libopus's `OPUS_APPLICATION_*` values.
@@ -117,6 +117,7 @@ The default bitrate is `Bitrate::Auto`, as in libopus (`OPUS_AUTO`). It is 60 ×
 `bitrate()` returns the rate that applies, for the duration of the last frame. The automatic rate is a speech rate at 8 and 16 kHz, so a 16 kHz VoIP encoder codes SILK. A bitrate that is set explicitly changes that. At 64 kb/s the same encoder codes CELT, and libopus 1.6.1 does the same at 64 kb/s:
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 let frame = 320; // 20 ms at 16 kHz
@@ -134,7 +135,7 @@ assert_eq!(encoder.bitrate(), 19_000);
 assert!(config(&packet) <= 11); // SILK
 
 let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap()));
 encoder.encode(&pcm, frame, &mut packet).unwrap();
 assert!(config(&packet) >= 16); // CELT
 ```
@@ -181,14 +182,15 @@ Settings and the reason for each:
 - Complexity: the default, 9. SILK encoding at 16 kHz takes about 46 microseconds (µs) per 20 ms frame at complexity 10 on an Apple M4 Pro. That is a small fraction of the 20 ms the frame lasts.
 
 ```rust
-use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
+use std::num::NonZeroU32;
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 
 const RATE: SampleRate = SampleRate::Hz16000;
 const FRAME: usize = 320; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
-encoder.set_inband_fec(true);
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24_000).unwrap()));
+encoder.set_inband_fec(InbandFec::On);
 encoder.set_packet_loss_perc(10).unwrap();
 
 let mut decoder = OpusDecoder::new(RATE, Channels::Mono).unwrap();
@@ -226,13 +228,14 @@ Settings and the reason for each:
 - `Signal::Voice`: the input is speech. From complexity 7 on (the default is 9) the encoder otherwise estimates this from the input with its speech and music analysis, and may code a voice it takes for music as CELT.
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate, Signal};
 
 const RATE: SampleRate = SampleRate::Hz24000;
 const FRAME: usize = 480; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24_000).unwrap()));
 encoder.set_signal(Signal::Voice);
 
 // One utterance from the TTS engine (a stand-in signal here: a tone and
@@ -280,13 +283,14 @@ Settings and the reason for each:
 - 20 ms frames. Use 10, 5 or 2.5 ms frames when the delay must be lower. Shorter frames need more bits for the same quality.
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 const RATE: SampleRate = SampleRate::Hz48000;
 const FRAME: usize = 960; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, Channels::Stereo, Application::Audio).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(128_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(128_000).unwrap()));
 encoder.set_complexity(10).unwrap();
 let mut decoder = OpusDecoder::new(RATE, Channels::Stereo).unwrap();
 
@@ -335,11 +339,12 @@ The encoder decides the mode, the bandwidth and the channels once for the whole 
 With VBR, libopus 1.6 limits each part of such a packet to the bytes the bitrate gives one part. `opus1` leaves that limit out, so a part can take more bytes when the signal needs them, as with frames of their own. With in-band FEC the limit costs libopus much quality. One measurement: 2.4 s of speech at 8 kHz mono, `Audio`, 64 kb/s VBR, complexity 9, FEC with 10 % expected loss, decoded by libopus. libopus's SNR falls from 29.8 dB in 60 ms frames to 10.2 dB in 80 ms frames and 8.8 dB in 120 ms frames. `opus1` gives 30.2 and 29.6 dB. [Differences from libopus](10-differences-from-libopus.md) lists this with the other deliberate differences.
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 const FRAME: usize = 5760; // 120 ms at 48 kHz
 let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64_000).unwrap()));
 let pcm: Vec<f32> = (0..FRAME).map(|i| 0.3 * (i as f32 * 0.03).sin()).collect();
 let mut packet = vec![0u8; 6 * 1276];
 let len = encoder.encode(&pcm, FRAME, &mut packet).unwrap();
@@ -450,7 +455,7 @@ With in-band FEC each SILK or Hybrid packet can carry a low-bitrate copy of the 
 
 On the encoder:
 
-- Call `set_inband_fec(true)`.
+- Call `set_inband_fec(InbandFec::On)`.
 - Call `set_packet_loss_perc` with the loss you expect. With 0 % no copy is coded. The higher the value, the more bits go to the copy.
 - Give the encoder enough bitrate (see the table above).
 - CELT-only packets carry no copy. With FEC on, the encoder chooses SILK or Hybrid instead of CELT when the expected loss is above 0 % (`Application::Voip`) or above 5 % (`Application::Audio`), as libopus does.
@@ -463,14 +468,15 @@ On the decoder, when packet `n` is lost and packet `n + 1` has arrived:
 When several packets in a row are lost, conceal all but the last one with empty packets, then use `decode_fec` for the last one.
 
 ```rust
-use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
+use std::num::NonZeroU32;
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 
 const RATE: SampleRate = SampleRate::Hz16000;
 const FRAME: usize = 320; // 20 ms
 
 let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
-encoder.set_inband_fec(true);
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24_000).unwrap()));
+encoder.set_inband_fec(InbandFec::On);
 encoder.set_packet_loss_perc(10).unwrap();
 
 // 30 packets of a test signal.
@@ -530,6 +536,7 @@ When the jitter buffer (the queue that holds received packets until it is time t
 3. Decode the DRED packet itself with `decode`, as usual.
 
 ```rust
+use std::num::NonZeroU32;
 #[cfg(feature = "dred")]
 {
     use opus1::{
@@ -572,7 +579,7 @@ When the jitter buffer (the queue that holds received packets until it is time t
     // The sender: DRED of 1 s, with 20 % expected loss. Packets of a
     // libopus encoder with DRED are read the same way.
     let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24_000).unwrap()));
     encoder.set_packet_loss_perc(20).unwrap();
     encoder.set_dred_duration(100).unwrap();
     let signal: Vec<f32> = (0..FRAME * 20)
@@ -808,7 +815,7 @@ assert_eq!(decoder.decode24(&packet[..len], 960, &mut out).unwrap(), 960);
 
 ## Decoder output gain, pitch and phase inversion
 
-- `OpusDecoder::set_gain(gain)` scales the decoded audio by `gain` in 1/256 dB, from -32768 to 32767 (about -128 to +128 dB), as libopus `OPUS_SET_GAIN` does. 256 is +1 dB. The scaling comes before the soft clipping of `decode_i16` and the conversion of `decode24`. Other values are an error. `gain()` reads it.
+- `OpusDecoder::set_gain(gain)` scales the decoded audio by `gain` in 1/256 dB, as libopus `OPUS_SET_GAIN` does. 256 is +1 dB. `gain` is an `i16`, and its whole range, -32768 to 32767 (about -128 to +128 dB), is the range of libopus, so the call never fails. The scaling comes before the soft clipping of `decode_i16` and the conversion of `decode24`. `gain()` reads it.
 - `OpusDecoder::pitch()` (libopus `OPUS_GET_PITCH`) is the pitch period of the last frame in samples at 48 kHz, or 0: the post-filter period of CELT after a CELT-only frame, SILK's pitch lag otherwise.
 - `set_phase_inversion_disabled(true)` on `OpusEncoder` or `OpusDecoder` (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`) turns off the sign inversion in CELT's intensity stereo. On the encoder it makes a mono downmix of the decoded stereo sound better, at a small cost in stereo quality. A mono decoder has it on from the start, because it mixes stereo streams down; a stereo decoder has it off. The multistream encoder and decoder forward it to every stream.
 
@@ -816,9 +823,8 @@ assert_eq!(decoder.decode24(&packet[..len], 960, &mut out).unwrap(), 960);
 use opus1::{Channels, OpusDecoder, SampleRate};
 
 let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
-decoder.set_gain(-6 * 256).unwrap(); // -6 dB
+decoder.set_gain(-6 * 256); // -6 dB
 assert_eq!(decoder.gain(), -1536);
-assert!(decoder.set_gain(40_000).is_err());
 assert!(!decoder.phase_inversion_disabled());
 decoder.set_phase_inversion_disabled(true);
 assert_eq!(decoder.pitch(), 0); // nothing decoded yet
@@ -988,6 +994,7 @@ These figures depend on the code around the codec, and debug builds need more. A
 Without `heap`, keep the encoder and the decoder in a `static` (or in other memory that lives as long as they are used), not in a local variable. `OpusEncoder::new` is not a `const fn`. So the static holds uninitialized memory until the program builds the encoder at run time:
 
 ```rust
+use std::num::NonZeroU32;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
@@ -1013,7 +1020,7 @@ unsafe fn init_encoder() -> &'static mut OpusEncoder {
 
 // SAFETY: this is the first and only call.
 let encoder = unsafe { init_encoder() };
-encoder.set_bitrate(Bitrate::BitsPerSecond(16_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(16_000).unwrap()));
 let mut packet = [0u8; 1276];
 let len = encoder.encode(&[0.0f32; 320], 320, &mut packet).unwrap();
 assert!(len > 0);
@@ -1051,25 +1058,27 @@ What the encoder and the decoder reject:
 | `decode` | a packet longer than `frame_size` | `BufferTooSmall` | `output buffer too small: frame_size is shorter than the packet` |
 | `decode` and the other decode calls | an output buffer shorter than the samples to be written | `BufferTooSmall` | `output buffer too small` |
 | `decode` with an empty packet, `decode_fec` | a `frame_size` that is not a multiple of 2.5 ms | `BadArg` | `lost frame: frame_size must be a multiple of 2.5 ms` |
-| `set_bitrate` | `Bitrate::BitsPerSecond(n)` with `n` of 0 or less | `BadArg` | `invalid bitrate` |
-| `set_complexity` of the encoder, the decoder and the multistream decoder | a value outside 0 to 10 | `BadArg` | `invalid complexity` |
+| `set_complexity` of the encoders and the decoders | a value above 10 | `BadArg` | `invalid complexity` |
 | `OpusDecoder::set_osce_bwe`, `osce_bwe`, `MultistreamDecoder::set_osce_bwe` | a build without the `osce-bwe` feature | `Unimplemented` | `request not implemented` |
 | `DnnBlob::from_bytes`, `DnnBlob::from_static` | bytes that are not a blob in the libopus format | `BadArg` | `invalid DNN blob` |
 | `DnnBlob::from_static` | a blob with an array that does not start on a 4-byte boundary | `BadArg` | `DNN blob is not aligned` |
 | `set_dnn_blob` | a blob that holds no complete group of networks of this build | `BadArg` | `DNN blob holds no model of this build` |
-| `set_packet_loss_perc` | a value outside 0 to 100 | `BadArg` | `invalid packet loss percentage` |
-| `set_max_bandwidth` | `Bandwidth::Auto` | `BadArg` | `invalid maximum bandwidth` |
-| `OpusDecoder::set_gain`, `MultistreamDecoder::set_gain` | a value outside -32768 to 32767 | `BadArg` | `invalid gain` |
-| `OpusEncoder::set_voice_ratio` | a value outside -1 to 100 | `BadArg` | `invalid voice ratio` |
+| `set_packet_loss_perc` | a value above 100 | `BadArg` | `invalid packet loss percentage` |
+| `set_lsb_depth` | a value outside 8 to 24 | `BadArg` | `invalid LSB depth` |
+| `OpusEncoder::set_dred_duration` | a value above 104 | `BadArg` | `invalid DRED duration` |
+| `OpusEncoder::set_voice_ratio` | `Some` of a value above 100 | `BadArg` | `invalid voice ratio` |
+| `OpusEncoder::set_energy_mask` | a slice whose length is not 21 values per channel | `BadArg` | `invalid energy mask length` |
+| `pcm_soft_clip` | no channels, a length that is not a multiple of the channel count, or fewer memory values than channels | `BadArg` | `invalid argument` |
 | `OpusEncoder::set_application`, `MultistreamEncoder::set_application` | another application after the first frame (before `reset_state`) | `BadArg` | `application cannot change after the first frame` |
 
 The functions of the modules `packet`, `extensions` and `multistream` use the same kinds. Their documentation lists the errors of each function.
 
-What is not rejected: a positive bitrate below 500 b/s or above 750,000 b/s per channel. `set_bitrate` moves it to the nearest limit, as libopus's `OPUS_SET_BITRATE` does.
+Several settings cannot fail, because their types hold only valid values: `set_bitrate`, `set_bandwidth`, `set_max_bandwidth`, `set_force_channels` and the decoder's `set_gain`. A bitrate below 500 b/s or above 750,000 b/s per channel is not rejected: `set_bitrate` moves it to the nearest limit, as libopus's `OPUS_SET_BITRATE` does.
 
 The decoder checks the packet and the buffer sizes before it changes its state. After an invalid packet or a buffer that is too small, the next packet decodes normally.
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, ErrorKind, OpusDecoder, OpusEncoder, SampleRate};
 
 // 44.1 kHz is not an Opus sampling rate.
@@ -1088,8 +1097,8 @@ assert_eq!(err.kind(), ErrorKind::BadArg);
 assert_eq!(encoder.set_complexity(42).unwrap_err().kind(), ErrorKind::BadArg);
 assert_eq!(encoder.complexity(), 9);
 // A bitrate above 750 kb/s per channel is limited, not refused.
-encoder.set_bitrate(Bitrate::BitsPerSecond(1_000_000)).unwrap();
-assert_eq!(encoder.bitrate_setting(), Bitrate::BitsPerSecond(750_000));
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(1_000_000).unwrap()));
+assert_eq!(encoder.bitrate_setting(), Bitrate::BitsPerSecond(NonZeroU32::new(750_000).unwrap()));
 
 let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 let mut out = [0.0f32; 960];

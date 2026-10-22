@@ -70,7 +70,7 @@ fn surround_round_trip_routes_every_channel() {
         for (frame_size, vbr) in [(960usize, true), (960, false), (480, true), (2880, true)] {
             let label = format!("{channels} channels, frame {frame_size}, vbr {vbr}");
             let mut enc = rust_encoder(&case, FS, Application::Audio);
-            enc.set_bitrate(rust_bitrate(bitrate)).unwrap();
+            enc.set_bitrate(rust_bitrate(bitrate));
             enc.set_vbr(vbr);
             let lookahead = enc.lookahead() as isize;
             let pcm = tones(FS, channels, 1, FS as usize);
@@ -128,7 +128,7 @@ fn surround_round_trip_of_a_speech_like_signal() {
         let case = Case::family("surround", channels, 1);
         let label = format!("{channels} channels");
         let mut enc = rust_encoder(&case, FS, Application::Audio);
-        enc.set_bitrate(rust_bitrate(bitrate)).unwrap();
+        enc.set_bitrate(rust_bitrate(bitrate));
         let lookahead = enc.lookahead() as isize;
         let pcm = voiced(FS, channels, 2 * FS as usize);
         let (rust_out, c_out) = round_trip(&mut enc, &pcm, 960, &label);

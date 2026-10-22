@@ -13,6 +13,7 @@
 //! two encoders can be compared packet by packet.
 
 mod silkenc_common;
+use std::num::NonZeroU32;
 use silkenc_common::*;
 
 use opus1::internals::range_coder::RangeCoder;
@@ -100,8 +101,8 @@ fn seeds_of_both(case: &Case) -> (Vec<Vec<i8>>, Vec<Vec<i8>>) {
         Application::Audio,
     )
     .unwrap();
-    rs.set_bandwidth(bandwidth.0);
-    rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    rs.set_bandwidth(Some(bandwidth.0));
+    rs.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     rs.set_complexity(0).unwrap();
     let mut c = CEncoder::new(fs, channels, APP_AUDIO);
     c.bandwidth(bandwidth.1).bitrate(bitrate).complexity(0).force_channels(channels as i32);

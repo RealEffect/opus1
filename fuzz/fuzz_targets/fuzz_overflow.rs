@@ -1,5 +1,6 @@
 #![no_main]
 
+use std::num::NonZeroU32;
 use libfuzzer_sys::fuzz_target;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
@@ -30,48 +31,45 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
 
-    // Extreme settings. As in libopus, a bitrate of 0 or less, a
-    // complexity outside 0..=10 and a loss outside 0..=100 are refused, and
-    // the encoder keeps its setting.
+    // Extreme settings. As in libopus, a bitrate is limited to 500 b/s at
+    // least and 750,000 b/s per channel at most, and a complexity above 10
+    // and a loss above 100 are refused: the encoder keeps its setting.
     let bitrate = match data[3] % 8 {
-        0 => i32::MIN,
-        1 => -1,
-        2 => 0,
-        3 => 1,
-        4 => 500,
-        5 => 64000,
-        6 => 510000,
-        _ => i32::MAX,
+        0 => NonZeroU32::MIN,
+        1 => NonZeroU32::new(2).unwrap(),
+        2 => NonZeroU32::new(499).unwrap(),
+        3 => NonZeroU32::new(500).unwrap(),
+        4 => NonZeroU32::new(64000).unwrap(),
+        5 => NonZeroU32::new(510000).unwrap(),
+        6 => NonZeroU32::new(i32::MAX as u32).unwrap(),
+        _ => NonZeroU32::MAX,
     };
-    let accepted = encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).is_ok();
-    assert_eq!(accepted, bitrate > 0, "set_bitrate({bitrate})");
-    if accepted {
-        // At least 500 b/s, and at most 750,000 b/s per channel.
-        let limited = bitrate.clamp(500, 750_000 * channels as i32);
-        assert_eq!(encoder.bitrate_setting(), Bitrate::BitsPerSecond(limited));
-    }
+    encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate));
+    // At least 500 b/s, and at most 750,000 b/s per channel.
+    let limited = bitrate.get().clamp(500, 750_000 * channels as u32);
+    assert_eq!(encoder.bitrate_setting(), Bitrate::BitsPerSecond(NonZeroU32::new(limited).unwrap()));
 
     let complexity = match data[4] % 6 {
-        0 => i32::MIN,
-        1 => -1,
-        2 => 0,
-        3 => 5,
-        4 => 10,
-        _ => i32::MAX,
+        0 => 0,
+        1 => 5,
+        2 => 10,
+        3 => 11,
+        4 => 200,
+        _ => u8::MAX,
     };
     let accepted = encoder.set_complexity(complexity).is_ok();
-    assert_eq!(accepted, (0..=10).contains(&complexity), "set_complexity({complexity})");
+    assert_eq!(accepted, complexity <= 10, "set_complexity({complexity})");
     assert_eq!(encoder.complexity(), if accepted { complexity } else { 9 });
 
     let loss = match data[5] % 5 {
-        0 => -1,
-        1 => 0,
-        2 => 50,
-        3 => 100,
-        _ => 101,
+        0 => 0,
+        1 => 50,
+        2 => 100,
+        3 => 101,
+        _ => u8::MAX,
     };
     let accepted = encoder.set_packet_loss_perc(loss).is_ok();
-    assert_eq!(accepted, (0..=100).contains(&loss), "set_packet_loss_perc({loss})");
+    assert_eq!(accepted, loss <= 100, "set_packet_loss_perc({loss})");
     assert_eq!(encoder.packet_loss_perc(), if accepted { loss } else { 0 });
 
     // Determine frame size - test edge cases

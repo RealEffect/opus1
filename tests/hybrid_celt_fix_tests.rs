@@ -1,4 +1,5 @@
 /// Unit tests for Hybrid mode and CELT fixes
+use std::num::NonZeroU32;
 use opus1::internals::celt::{CeltDecoder, CeltEncoder, PcmLayout};
 use opus1::internals::modes::default_mode;
 use opus1::internals::range_coder::RangeCoder;
@@ -82,7 +83,7 @@ fn test_celt_only_bit_budget() {
 
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).expect("Encoder creation failed");
-    encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     encoder.set_vbr(false);
 
     // Create a test signal
@@ -122,7 +123,7 @@ fn test_hybrid_mode_toc() {
 
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).expect("Encoder creation failed");
-    encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
 
     // Create a test signal
     let input: Vec<f32> = (0..frame_size)
@@ -157,7 +158,7 @@ fn test_silk_only_16khz() {
 
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).expect("Encoder creation failed");
-    encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20000).unwrap()));
 
     let mut decoder =
         OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).expect("Decoder creation failed");

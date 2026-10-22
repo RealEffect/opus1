@@ -9,7 +9,8 @@
 //! flag, the energy mask, prediction, the expert frame duration,
 //! discontinuous transmission (DTX), the frame size, the size of the output
 //! buffer, the input signal and its format (`f32` or `i16`), or reset the
-//! encoder. A setting libopus refuses must be refused.
+//! encoder. A value that libopus refuses, and that opus1's types can
+//! hold, must be refused.
 //!
 //! What must hold for every frame:
 //!
@@ -36,12 +37,13 @@
 
 mod common;
 
+use std::num::NonZeroU32;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::{
-    Application, Bandwidth, Bitrate, Channels, ForcedMode, FrameDuration, OpusDecoder, OpusEncoder,
-    SampleRate,
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, FrameDuration, InbandFec, OpusDecoder,
+    OpusEncoder, SampleRate,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -51,13 +53,14 @@ fuzz_target!(|data: &[u8]| {
 /// The largest output buffer: 1 to 12,000 bytes.
 const MAX_OUT: usize = 12_000;
 
-const BANDWIDTHS: [Bandwidth; 6] = [
-    Bandwidth::Auto,
-    Bandwidth::Narrowband,
-    Bandwidth::Mediumband,
-    Bandwidth::Wideband,
-    Bandwidth::Superwideband,
-    Bandwidth::Fullband,
+/// The bandwidth settings: `None` is the automatic choice.
+const BANDWIDTHS: [Option<Bandwidth>; 6] = [
+    None,
+    Some(Bandwidth::Narrowband),
+    Some(Bandwidth::Mediumband),
+    Some(Bandwidth::Wideband),
+    Some(Bandwidth::Superwideband),
+    Some(Bandwidth::Fullband),
 ];
 
 /// One change of a setting, made on both encoders.
@@ -66,17 +69,24 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
         0 | 1 => {
             let v = match u.int_in_range(0..=9)? {
                 0 => Bitrate::BitsPerSecond(u.arbitrary()?),
-                1 => Bitrate::BitsPerSecond(*u.choose(&[i32::MIN, -1, 0, 1, 499, 500, 3_000_000, i32::MAX])?),
-                2 => Bitrate::BitsPerSecond(u.int_in_range(500..=8_000)?),
-                3 => Bitrate::BitsPerSecond(u.int_in_range(100_000..=600_000)?),
+                1 => {
+                    let bps = *u.choose(&[1, 499, 500, 3_000_000, i32::MAX as u32, u32::MAX])?;
+                    Bitrate::BitsPerSecond(NonZeroU32::new(bps).unwrap())
+                }
+                2 => Bitrate::BitsPerSecond(NonZeroU32::new(u.int_in_range(500..=8_000)?).unwrap()),
+                3 => Bitrate::BitsPerSecond(NonZeroU32::new(u.int_in_range(100_000..=600_000)?).unwrap()),
                 4 => Bitrate::Auto,
                 5 => Bitrate::Max,
-                _ => Bitrate::BitsPerSecond(u.int_in_range(6_000..=100_000)?),
+                _ => Bitrate::BitsPerSecond(NonZeroU32::new(u.int_in_range(6_000..=100_000)?).unwrap()),
             };
-            // As in libopus, a bitrate of 0 or less is refused.
-            let ok = !matches!(v, Bitrate::BitsPerSecond(bps) if bps <= 0);
             for e in encs {
-                assert_eq!(e.set_bitrate(v).is_ok(), ok, "set_bitrate({v:?})");
+                e.set_bitrate(v);
+                // As in libopus, an explicit bitrate is limited to 500 b/s
+                // at least and 750,000 b/s per channel at most.
+                if let Bitrate::BitsPerSecond(bps) = e.bitrate_setting() {
+                    let limits = 500..=750_000 * channels as u32;
+                    assert!(limits.contains(&bps.get()), "set_bitrate({v:?})");
+                }
             }
         }
         2 => {
@@ -87,9 +97,9 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
             }
         }
         3 => {
-            let v = if u.ratio(1, 8)? { u.arbitrary()? } else { u.int_in_range(0..=10)? };
+            let v: u8 = if u.ratio(1, 8)? { u.arbitrary()? } else { u.int_in_range(0..=10)? };
             for e in encs {
-                assert_eq!(e.set_complexity(v).is_ok(), (0..=10).contains(&v), "set_complexity({v})");
+                assert_eq!(e.set_complexity(v).is_ok(), v <= 10, "set_complexity({v})");
             }
         }
         4 => {
@@ -105,10 +115,11 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
             }
         }
         6 => {
-            // `Auto` is refused, which the encoder must survive.
-            let v = *u.choose(&BANDWIDTHS)?;
-            for e in encs {
-                let _ = e.set_max_bandwidth(v);
+            // `None` leaves the maximum as it is.
+            if let Some(v) = *u.choose(&BANDWIDTHS)? {
+                for e in encs {
+                    e.set_max_bandwidth(v);
+                }
             }
         }
         7 => {
@@ -119,11 +130,11 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
             }
         }
         8 => {
-            let fec = u.arbitrary()?;
-            let loss = if u.ratio(1, 8)? { u.arbitrary()? } else { u.int_in_range(0..=100)? };
+            let fec = *u.choose(&[InbandFec::Off, InbandFec::On, InbandFec::OnUnlessMusic])?;
+            let loss: u8 = if u.ratio(1, 8)? { u.arbitrary()? } else { u.int_in_range(0..=100)? };
             for e in encs {
                 e.set_inband_fec(fec);
-                assert_eq!(e.set_packet_loss_perc(loss).is_ok(), (0..=100).contains(&loss), "set_packet_loss_perc({loss})");
+                assert_eq!(e.set_packet_loss_perc(loss).is_ok(), loss <= 100, "set_packet_loss_perc({loss})");
             }
         }
         9 => {
@@ -153,8 +164,11 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
                     Some(m)
                 }
             };
+            // A mask of another length than 21 values per channel is
+            // refused, and the mask stays.
+            let ok = mask.as_ref().is_none_or(|m| m.len() == 21 * channels);
             for e in encs {
-                e.set_energy_mask(mask.as_deref());
+                assert_eq!(e.set_energy_mask(mask.as_deref()).is_ok(), ok, "set_energy_mask");
             }
         }
         11 => {

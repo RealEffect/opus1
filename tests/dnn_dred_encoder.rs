@@ -8,11 +8,12 @@
 //! `dnn_no_alloc.rs` does).
 #![cfg(all(feature = "dred", feature = "std"))]
 
+use std::num::NonZeroU32;
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::{
-    Application, Bitrate, Channels, DnnBlob, DredProcessing, ErrorKind, ForcedMode, OpusDred,
-    OpusDredDecoder, OpusEncoder, SampleRate, packet,
+    Application, Bitrate, Channels, DnnBlob, DredProcessing, ErrorKind, ForcedMode, InbandFec,
+    OpusDred, OpusDredDecoder, OpusEncoder, SampleRate, packet,
 };
 use opus1::packet::Framing;
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
@@ -107,9 +108,9 @@ fn encoder(fs: i32, channels: usize, bitrate: i32, loss: i32, dred: i32) -> Opus
         Application::Voip,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
-    enc.set_packet_loss_perc(loss).unwrap();
-    enc.set_dred_duration(dred).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+    enc.set_packet_loss_perc(loss as u8).unwrap();
+    enc.set_dred_duration(dred as u8).unwrap();
     enc
 }
 
@@ -122,7 +123,7 @@ fn the_dred_duration_takes_0_to_104_and_a_reset_clears_it() {
         enc.set_dred_duration(v).unwrap();
         assert_eq!(enc.dred_duration(), v);
     }
-    for v in [-1, 105, i32::MIN, i32::MAX] {
+    for v in [105, 200, u8::MAX] {
         assert_eq!(enc.set_dred_duration(v).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
         assert_eq!(enc.dred_duration(), 104);
     }
@@ -278,13 +279,13 @@ fn random_settings_and_inputs_do_not_panic() {
             app,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(6000 + (rng.next() % 200_000) as i32)).unwrap();
-        enc.set_packet_loss_perc((rng.next() % 101) as i32).unwrap();
-        enc.set_dred_duration((rng.next() % 105) as i32).unwrap();
-        enc.set_inband_fec(rng.next().is_multiple_of(2));
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(6000 + rng.next() % 200_000).unwrap()));
+        enc.set_packet_loss_perc((rng.next() % 101) as u8).unwrap();
+        enc.set_dred_duration((rng.next() % 105) as u8).unwrap();
+        enc.set_inband_fec(if rng.next().is_multiple_of(2) { InbandFec::On } else { InbandFec::Off });
         enc.set_vbr(!rng.next().is_multiple_of(3));
         enc.set_dtx(rng.next().is_multiple_of(4));
-        enc.set_complexity((rng.next() % 11) as i32).unwrap();
+        enc.set_complexity((rng.next() % 11) as u8).unwrap();
         let ms10 = [1usize, 2, 4, 8, 16, 24, 32, 40, 48][rng.next() as usize % 9];
         let frame = fs as usize * ms10 / 400;
         let buf_len = [1500usize, 40, 200, 1275][rng.next() as usize % 4];

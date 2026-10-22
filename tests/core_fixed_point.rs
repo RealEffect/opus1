@@ -31,10 +31,11 @@
 
 mod k24_common;
 
+use std::num::NonZeroU32;
 use opus1::internals::range_coder::RangeCoder;
 use opus1::internals::silk::dec_api::SilkDecoder;
 use opus1::internals::analysis::{AnalysisGate, set_analysis_gate};
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 use opus1::packet::Framing;
 
 /// FNV-1a, 32 bits.
@@ -70,11 +71,11 @@ fn first_difference(channels: usize, pcm: &[i16], script: &[Packet], want: &[u32
     .unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
-    enc.set_bandwidth(Bandwidth::Wideband);
+    enc.set_bandwidth(Some(Bandwidth::Wideband));
     let mut buf = vec![0u8; 4000];
     for (i, (p, input)) in script.iter().zip(pcm.chunks_exact(frame * channels)).enumerate() {
-        enc.set_bitrate(Bitrate::BitsPerSecond(p.bitrate)).unwrap();
-        enc.set_complexity(p.complexity).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(p.bitrate as u32).unwrap()));
+        enc.set_complexity(p.complexity as u8).unwrap();
         enc.set_force_channels(p.channels);
         let n = enc.encode_i16(input, frame, &mut buf).unwrap();
         if fnv1a(&buf[..n]) != want[i] {
@@ -354,11 +355,11 @@ fn hybrid_at_a_constant_bitrate_codes_the_silk_layer_of_libopus() {
     let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     opus1::internals::silk_input::set_integer_hp_at_48k(&mut enc, true);
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
-    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
     enc.set_complexity(9).unwrap();
     enc.set_vbr(false);
     enc.set_force_mode(Some(ForcedMode::Hybrid));
-    enc.set_bandwidth(Bandwidth::Fullband);
+    enc.set_bandwidth(Some(Bandwidth::Fullband));
     let mut buf = vec![0u8; 4000];
     let packets: Vec<Vec<u8>> = pcm
         .as_chunks::<960>()
@@ -421,7 +422,7 @@ fn both_stereo_channels_make_room_for_the_redundant_frame_of_a_rate_switch() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
     enc.set_complexity(9).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
     enc.set_force_channels(Some(Channels::Stereo));
@@ -433,7 +434,7 @@ fn both_stereo_channels_make_room_for_the_redundant_frame_of_a_rate_switch() {
         .take(318)
         .enumerate()
         .map(|(i, input)| {
-            enc.set_bandwidth(if i < 150 { Bandwidth::Wideband } else { Bandwidth::Narrowband });
+            enc.set_bandwidth(Some(if i < 150 { Bandwidth::Wideband } else { Bandwidth::Narrowband }));
             let n = enc.encode_i16(input, 320, &mut buf).unwrap();
             buf[..n].to_vec()
         })
@@ -535,12 +536,13 @@ fn stereo_that_starts_with_a_silk_rate_switch_runs_the_side_through_the_transiti
     let mut buf = vec![0u8; 4000];
     let mut differ = Vec::new();
     for (i, input) in pcm.chunks_exact(2 * frame).enumerate().take(272) {
-        enc.set_bitrate(Bitrate::BitsPerSecond(match i {
+        let bitrate = match i {
             0..40 => 40000,
             40..170 => 7000,
             170 => 14000,
             _ => 40000,
-        })).unwrap();
+        };
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate).unwrap()));
         let n = enc.encode_i16(input, frame, &mut buf).unwrap();
         if i == 170 || i == 171 {
             // One channel at 12 kHz, then two at 16 kHz.
@@ -589,9 +591,9 @@ fn prediction_disabled_codes_every_silk_packet_alone_like_libopus() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
-    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
     enc.set_complexity(9).unwrap();
-    enc.set_inband_fec(true);
+    enc.set_inband_fec(InbandFec::On);
     enc.set_packet_loss_perc(5).unwrap();
     let mut buf = vec![0u8; 4000];
     let mut differ = Vec::new();
@@ -649,14 +651,14 @@ fn a_stereo_silk_rate_switch_gives_the_side_the_mids_low_pass_state() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
-    enc.set_bitrate(Bitrate::BitsPerSecond(40000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(40000).unwrap()));
     enc.set_complexity(5).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
     enc.set_force_channels(Some(Channels::Stereo));
     let mut buf = vec![0u8; 4000];
     let mut differ = Vec::new();
     for (i, input) in pcm.chunks_exact(2 * frame).enumerate().take(160) {
-        enc.set_bandwidth(if i * 20 < 1500 { Bandwidth::Narrowband } else { Bandwidth::Wideband });
+        enc.set_bandwidth(Some(if i * 20 < 1500 { Bandwidth::Narrowband } else { Bandwidth::Wideband }));
         let n = enc.encode_i16(input, frame, &mut buf).unwrap();
         if fnv1a(&buf[..n]) != STEREO_RATE_SWITCH[i] {
             differ.push(i);
@@ -759,8 +761,8 @@ fn silk_dtx_leaves_out_the_frames_of_libopus() {
         )
         .unwrap();
         set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
-        enc.set_complexity(complexity).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+        enc.set_complexity(complexity as u8).unwrap();
         enc.set_vbr(vbr);
         enc.set_dtx(true);
         let mut buf = vec![0u8; 4000];

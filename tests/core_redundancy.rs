@@ -22,6 +22,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{speech, to_stereo};
 use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
@@ -42,10 +43,10 @@ fn signal(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
 struct Step {
     mode: Option<(i32, ForcedMode)>,
     bitrate: i32,
-    bandwidth: (i32, Bandwidth),
+    bandwidth: (i32, Option<Bandwidth>),
 }
 
-const AUTO_BW: (i32, Bandwidth) = (-1000, Bandwidth::Auto);
+const AUTO_BW: (i32, Option<Bandwidth>) = (-1000, None);
 const SILK: Option<(i32, ForcedMode)> = Some((MODE_SILK, ForcedMode::SilkOnly));
 const HYBRID: Option<(i32, ForcedMode)> = Some((MODE_HYBRID, ForcedMode::Hybrid));
 const CELT: Option<(i32, ForcedMode)> = Some((MODE_CELT, ForcedMode::CeltOnly));
@@ -144,7 +145,7 @@ fn run(stream: &Stream) -> Outcome {
     for (i, input) in pcm.chunks_exact(frame * channels).take(packets_total).enumerate() {
         let step = schedule[i / hold];
         c_enc.bitrate(step.bitrate).bandwidth(step.bandwidth.0);
-        enc.set_bitrate(Bitrate::BitsPerSecond(step.bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(step.bitrate as u32).unwrap()));
         enc.set_bandwidth(step.bandwidth.1);
         match step.mode {
             Some((c_mode, forced)) => {
@@ -252,7 +253,7 @@ fn check(what: &str, outcome: &Outcome, min_switches: usize, margins: &Margins) 
 /// forced SILK-only stream is Hybrid unless the bandwidth is limited, so
 /// the Hybrid steps differ from the SILK ones only with `silk_bandwidth`
 /// set to wideband.
-fn forced_schedule(bitrate: i32, silk_bandwidth: (i32, Bandwidth)) -> Vec<Step> {
+fn forced_schedule(bitrate: i32, silk_bandwidth: (i32, Option<Bandwidth>)) -> Vec<Step> {
     [SILK, CELT, HYBRID, CELT, SILK, HYBRID, SILK, CELT, SILK]
         .into_iter()
         .map(|mode| Step { mode, bitrate, bandwidth: if mode == SILK { silk_bandwidth } else { AUTO_BW } })
@@ -265,7 +266,7 @@ fn forced_schedule(bitrate: i32, silk_bandwidth: (i32, Bandwidth)) -> Vec<Step> 
 /// count, and so the same packet for every switch.
 #[test]
 fn forced_mode_switches_match_libopus_mono() {
-    let wideband = (BW_WB, Bandwidth::Wideband);
+    let wideband = (BW_WB, Some(Bandwidth::Wideband));
     for (rate, bitrate, silk_bandwidth) in [
         (48000usize, 32000, AUTO_BW),
         (48000, 32000, wideband),
@@ -301,7 +302,7 @@ fn forced_mode_switches_match_libopus_mono() {
 /// Stereo input at a bitrate where libopus codes stereo. `hybrid` says
 /// whether the schedule has Hybrid steps besides SILK-only and CELT-only.
 fn stereo_switches(hybrid: bool) {
-    let wideband = (BW_WB, Bandwidth::Wideband);
+    let wideband = (BW_WB, Some(Bandwidth::Wideband));
     for (rate, bitrate) in [(48000usize, 64000), (24000, 48000), (16000, 40000)] {
         for frame_ms in [10usize, 20] {
             for cbr in [false, true] {
@@ -394,11 +395,11 @@ fn bitrate_changes_switch_the_mode_like_libopus() {
 #[test]
 fn silk_bandwidth_switches_match_libopus() {
     let steps = [
-        (BW_WB, Bandwidth::Wideband),
-        (BW_NB, Bandwidth::Narrowband),
-        (BW_WB, Bandwidth::Wideband),
-        (BW_MB, Bandwidth::Mediumband),
-        (BW_NB, Bandwidth::Narrowband),
+        (BW_WB, Some(Bandwidth::Wideband)),
+        (BW_NB, Some(Bandwidth::Narrowband)),
+        (BW_WB, Some(Bandwidth::Wideband)),
+        (BW_MB, Some(Bandwidth::Mediumband)),
+        (BW_NB, Some(Bandwidth::Narrowband)),
     ];
     // 20 ms frames only: a 10 ms SILK frame at 12 kHz that follows frames
     // of another size has a known fault in src/silk/encode_pulses.rs (the
@@ -508,7 +509,7 @@ fn step_means(application: (i32, Application), rate: usize, offset: f32) -> Vec<
     )
     .unwrap();
     enc.set_complexity(5).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     let (mut dec, mut c_dec) = (CDecoder::new(rate, 1), CDecoder::new(rate, 1));
     let mut buf = vec![0u8; 1500];
     let mut sums = vec![(0f64, 0f64); schedule.len()];
@@ -572,7 +573,7 @@ fn an_input_offset_is_removed_in_every_mode_like_libopus() {
 /// 0.4 dB.
 #[test]
 fn forced_mode_switches_with_long_packets_voip_and_low_rates_match_libopus() {
-    let wideband = (BW_WB, Bandwidth::Wideband);
+    let wideband = (BW_WB, Some(Bandwidth::Wideband));
     for (name, rate, channels, frame_ms, bitrate, application, cbr, silk_bandwidth) in [
         ("48 kHz, 40 ms", 48000usize, 1usize, 40usize, 32000, AUDIO, false, AUTO_BW),
         ("48 kHz, 60 ms", 48000, 1, 60, 32000, AUDIO, false, AUTO_BW),
@@ -642,7 +643,7 @@ fn hybrid_after_silk_only_starts_its_celt_layer_afresh() {
         .unwrap();
         enc.set_complexity(5).unwrap();
         enc.set_vbr(!cbr);
-        enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
         enc.set_force_mode(Some(ForcedMode::SilkOnly));
         let (mut dec, mut c_dec) = (CDecoder::new(rate, 1), CDecoder::new(rate, 1));
         let mut buf = vec![0u8; 1500];
@@ -652,7 +653,7 @@ fn hybrid_after_silk_only_starts_its_celt_layer_afresh() {
             // Forced SILK-only is Hybrid at fullband and SILK-only at
             // wideband. The steps start with Hybrid.
             let hybrid = (i / hold) % 2 == 0;
-            let bandwidth = if hybrid { (BW_FB, Bandwidth::Fullband) } else { (BW_WB, Bandwidth::Wideband) };
+            let bandwidth = if hybrid { (BW_FB, Some(Bandwidth::Fullband)) } else { (BW_WB, Some(Bandwidth::Wideband)) };
             c_enc.bandwidth(bandwidth.0);
             enc.set_bandwidth(bandwidth.1);
             let c_packet = c_enc.encode(input);

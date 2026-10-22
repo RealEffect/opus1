@@ -82,7 +82,7 @@ fn run_case(
     pcm: &[f32],
 ) -> Outcome {
     let mut enc = rust_encoder(case, fs, application);
-    enc.set_bitrate(rust_bitrate(bitrate)).unwrap();
+    enc.set_bitrate(rust_bitrate(bitrate));
     enc.set_vbr(vbr);
     if force_stereo {
         // OPUS_SET_FORCE_CHANNELS(2) on every coupled stream encoder.
@@ -389,8 +389,7 @@ fn sixteen_bit_input_gives_the_bytes_of_float_input() {
                     let mut float_enc = rust_encoder(case, fs, Application::Audio);
                     let mut int_enc = rust_encoder(case, fs, Application::Audio);
                     for enc in [&mut float_enc, &mut int_enc] {
-                        enc.set_bitrate(rust_bitrate(per_channel * case.channels as i32))
-                            .unwrap();
+                        enc.set_bitrate(rust_bitrate(per_channel * case.channels as i32));
                         enc.set_vbr(vbr);
                     }
                     // 16-bit input is coded at a depth of 16 bits, as libopus

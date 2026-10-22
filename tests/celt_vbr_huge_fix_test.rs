@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fn max_abs(v: &[f32]) -> f32 {
@@ -23,7 +24,7 @@ fn vbr_near_silence_192k_not_huge() {
     }
     let mut enc =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     enc.set_vbr(true);
     let mut out = vec![0u8; 1276];
     let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
@@ -59,7 +60,7 @@ fn high_bitrate_matrix_48k_stereo() {
         }
         let mut enc =
             OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(kbps * 1000)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new((kbps * 1000) as u32).unwrap()));
         enc.set_vbr(true);
         let mut out = vec![0u8; 1276];
         let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
@@ -92,7 +93,7 @@ fn per_packet_fresh_decoder_192k() {
     }
     let mut enc =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     enc.set_vbr(true);
     let mut out = vec![0u8; 1276];
     let n = enc.encode(&pcm, frame_size, &mut out).unwrap();

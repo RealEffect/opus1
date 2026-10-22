@@ -61,8 +61,8 @@ fn time_rust(
     out: &mut [u8],
 ) -> (Duration, usize) {
     let mut enc = rust_encoder(case, FS, Application::Audio);
-    enc.set_bitrate(rust_bitrate(bitrate)).unwrap();
-    enc.set_complexity(complexity).unwrap();
+    enc.set_bitrate(rust_bitrate(bitrate));
+    enc.set_complexity(complexity as u8).unwrap();
     let mut bytes = 0;
     let start = Instant::now();
     for frame in pcm.chunks_exact(FRAME * case.channels) {

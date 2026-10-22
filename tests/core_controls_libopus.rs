@@ -13,11 +13,12 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech};
 use opus1::{
-    Application, Bitrate, Channels, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+    Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
 };
 
 /// Stereo music whose right channel is mostly the inverted left channel.
@@ -155,7 +156,7 @@ fn phase_inversion_disabled_encodes_as_libopus() {
                         Application::Audio,
                     )
                     .unwrap();
-                    rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                    rust.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                     rust.set_vbr(vbr);
                     rust.set_force_mode(Some(rust_mode(mode)));
                     rust.set_phase_inversion_disabled(disabled);
@@ -256,7 +257,7 @@ fn phase_inversion_disabled_decodes_as_libopus() {
 
 // --- Output gain ---
 
-const GAINS: [i32; 13] = [-32768, -32767, -12000, -1536, -256, -1, 0, 1, 255, 1536, 6000, 20000, 32767];
+const GAINS: [i16; 13] = [-32768, -32767, -12000, -1536, -256, -1, 0, 1, 255, 1536, 6000, 20000, 32767];
 
 /// The gain over SILK, Hybrid and CELT frames with mode changes, losses
 /// and FEC, with float, 16-bit and 24-bit output. Out-of-range values are
@@ -282,25 +283,25 @@ fn gain_matches_libopus() {
             )
             .unwrap();
             let mut c = CDecoder::new(rate, channels);
-            rust.set_gain(gain).unwrap();
-            assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, gain), 0);
-            assert_eq!(rust.gain(), c.get(sys::OPUS_GET_GAIN_REQUEST), "{label}: getter");
+            rust.set_gain(gain);
+            assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, i32::from(gain)), 0);
+            assert_eq!(i32::from(rust.gain()), c.get(sys::OPUS_GET_GAIN_REQUEST), "{label}: getter");
             decode_both(&mut rust, &mut c, &steps, frame, &label, |_, _, _| {});
 
             // 16-bit and 24-bit output, after a reset that keeps the gain.
             rust.reset_state();
             c.reset();
-            assert_eq!(rust.gain(), c.get(sys::OPUS_GET_GAIN_REQUEST), "{label}: after reset");
+            assert_eq!(i32::from(rust.gain()), c.get(sys::OPUS_GET_GAIN_REQUEST), "{label}: after reset");
             let mut out16 = vec![0i16; 5760 * channels];
             let mut out24 = vec![0i32; 5760 * channels];
             let mut c24 = CDecoder::new(rate, channels);
-            assert_eq!(c24.try_set(sys::OPUS_SET_GAIN_REQUEST, gain), 0);
+            assert_eq!(c24.try_set(sys::OPUS_SET_GAIN_REQUEST, i32::from(gain)), 0);
             let mut rust24 = OpusDecoder::new(
                 SampleRate::try_from(rate as i32).unwrap(),
                 Channels::try_from(channels).unwrap(),
             )
             .unwrap();
-            rust24.set_gain(gain).unwrap();
+            rust24.set_gain(gain);
             for (i, step) in steps.iter().enumerate() {
                 let label = format!("{label}, call {i}");
                 let (n16, e16, n24, e24) = match step {
@@ -332,12 +333,13 @@ fn gain_matches_libopus() {
     }
     let mut rust = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut c = CDecoder::new(48_000, 2);
-    rust.set_gain(1000).unwrap();
+    rust.set_gain(1000);
     assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, 1000), 0);
+    // libopus refuses the values outside the range of an `i16`, which
+    // opus1's `set_gain` cannot be given.
     for v in [i32::MIN, -32769, 32768, i32::MAX] {
         assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, v), sys::OPUS_BAD_ARG, "gain {v}");
-        assert_eq!(rust.set_gain(v).map_err(|e| e.kind()), Err(ErrorKind::BadArg), "gain {v}");
-        assert_eq!(rust.gain(), c.get(sys::OPUS_GET_GAIN_REQUEST), "gain {v}: kept");
+        assert_eq!(i32::from(rust.gain()), c.get(sys::OPUS_GET_GAIN_REQUEST), "gain {v}: kept");
     }
 }
 
@@ -600,6 +602,17 @@ fn set_application_follows_libopus() {
     }
 }
 
+/// opus1's voice ratio for the libopus value `v` (-1 is `None`), or `None`
+/// for a value that `set_voice_ratio` cannot be given.
+fn rust_ratio(v: i32) -> Option<Option<u8>> {
+    if v == -1 { Some(None) } else { u8::try_from(v).ok().map(Some) }
+}
+
+/// The libopus value of opus1's voice ratio.
+fn c_ratio(ratio: Option<u8>) -> i32 {
+    ratio.map_or(-1, i32::from)
+}
+
 /// The voice ratio: the values libopus takes, the value after each frame
 /// (set by the caller, kept over silent frames, or replaced by the
 /// analysis), and the configuration of each packet.
@@ -615,11 +628,14 @@ fn voice_ratio_follows_libopus() {
     )
     .unwrap();
     let get = OPUS_GET_VOICE_RATIO_REQUEST;
-    assert_eq!(rust.voice_ratio(), c.get(get));
-    for v in [i32::MIN, -2, -1, 0, 1, 50, 99, 100, 101, i32::MAX] {
+    assert_eq!(c_ratio(rust.voice_ratio()), c.get(get));
+    for v in [i32::MIN, -2, -1, 0, 1, 50, 99, 100, 101, 255, i32::MAX] {
         let c_ok = c.try_set(OPUS_SET_VOICE_RATIO_REQUEST, v) == 0;
-        assert_eq!(rust.set_voice_ratio(v).is_ok(), c_ok, "ratio {v}");
-        assert_eq!(rust.voice_ratio(), c.get(get), "ratio {v}");
+        match rust_ratio(v) {
+            Some(ratio) => assert_eq!(rust.set_voice_ratio(ratio).is_ok(), c_ok, "ratio {v}"),
+            None => assert!(!c_ok, "ratio {v}"),
+        }
+        assert_eq!(c_ratio(rust.voice_ratio()), c.get(get), "ratio {v}");
     }
     // Speech, silence and music, with a voice ratio set before every fifth
     // frame.
@@ -627,13 +643,13 @@ fn voice_ratio_follows_libopus() {
     pcm.extend(std::iter::repeat_n(0.0, rate));
     pcm.extend(multitone(rate, rate));
     c.bitrate(20_000);
-    rust.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
+    rust.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20_000).unwrap()));
     let mut out = vec![0u8; 1500];
     for (i, f) in pcm.chunks_exact(frame).enumerate() {
         if i % 5 == 0 {
             let v = [0, 100, 30, -1][(i / 5) % 4];
             c.set(OPUS_SET_VOICE_RATIO_REQUEST, v);
-            rust.set_voice_ratio(v).unwrap();
+            rust.set_voice_ratio(rust_ratio(v).unwrap()).unwrap();
         }
         let expected = c.encode(f);
         let n = rust.encode(f, frame, &mut out).unwrap();
@@ -641,9 +657,9 @@ fn voice_ratio_follows_libopus() {
         // bandwidth and the frame size in the first byte are.
         assert_eq!(out[0] >> 3, expected[0] >> 3, "configuration of packet {i}");
         assert!(n > 0);
-        assert_eq!(rust.voice_ratio(), c.get(get), "ratio after packet {i}");
+        assert_eq!(c_ratio(rust.voice_ratio()), c.get(get), "ratio after packet {i}");
     }
     rust.reset_state();
     c.reset();
-    assert_eq!(rust.voice_ratio(), c.get(get), "after reset");
+    assert_eq!(c_ratio(rust.voice_ratio()), c.get(get), "after reset");
 }

@@ -49,6 +49,7 @@
 
 mod common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
@@ -90,7 +91,7 @@ struct Settings {
     /// bitrate.
     bitrate: Option<i32>,
     vbr: bool,
-    complexity: i32,
+    complexity: u8,
 }
 
 impl Settings {
@@ -110,7 +111,7 @@ impl Settings {
     fn bitrate_for(&self, channels: usize) -> Bitrate {
         match self.bitrate {
             None => Bitrate::Auto,
-            Some(per_channel) => Bitrate::BitsPerSecond(per_channel * channels as i32),
+            Some(per_channel) => Bitrate::BitsPerSecond(NonZeroU32::new((per_channel * channels as i32) as u32).unwrap()),
         }
     }
 
@@ -219,21 +220,16 @@ fn stereo(u: &mut Unstructured, s: Settings) -> Result<()> {
     let mode = *u.choose(&[None, Some(ForcedMode::SilkOnly), Some(ForcedMode::Hybrid), Some(ForcedMode::CeltOnly)])?;
     let mut rust =
         OpusEncoder::new(SampleRate::try_from(s.fs).unwrap(), Channels::Stereo, s.app).unwrap();
-    rust.set_bitrate(s.bitrate_for(2)).unwrap();
+    rust.set_bitrate(s.bitrate_for(2));
     rust.set_vbr(s.vbr);
     rust.set_complexity(s.complexity).unwrap();
     rust.set_force_mode(mode);
-    let mut c = CEncoder::new(s.fs, 2, s.app as i32);
+    let mut c = CEncoder::new(s.fs, 2, s.app.to_raw());
     c.set(sys::OPUS_SET_BITRATE_REQUEST, s.c_bitrate_for(2));
     c.set(sys::OPUS_SET_VBR_REQUEST, s.vbr as i32);
-    c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, s.complexity);
+    c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(s.complexity));
     if let Some(mode) = mode {
-        let c_mode = match mode {
-            ForcedMode::SilkOnly => MODE_SILK_ONLY,
-            ForcedMode::Hybrid => MODE_HYBRID,
-            ForcedMode::CeltOnly => MODE_CELT_ONLY,
-        };
-        c.set(OPUS_SET_FORCE_MODE_REQUEST, c_mode);
+        c.set(OPUS_SET_FORCE_MODE_REQUEST, mode.to_raw());
     }
 
     let tone = [TONES[0], TONES[7]];
@@ -269,7 +265,7 @@ fn stereo(u: &mut Unstructured, s: Settings) -> Result<()> {
 
 /// A multistream encoder.
 fn multistream(u: &mut Unstructured, s: Settings) -> Result<()> {
-    let c_app = s.app as i32;
+    let c_app = s.app.to_raw();
     let (rust, c, lfe) = if u.arbitrary()? {
         let family = *u.choose(&[0u8, 1, 1, 2, 255])?;
         let channels = match family {
@@ -327,12 +323,12 @@ fn multistream(u: &mut Unstructured, s: Settings) -> Result<()> {
     } else {
         s
     };
-    rust.set_bitrate(s.bitrate_for(channels)).unwrap();
+    rust.set_bitrate(s.bitrate_for(channels));
     rust.set_vbr(s.vbr);
     rust.set_complexity(s.complexity).unwrap();
     c.set(sys::OPUS_SET_BITRATE_REQUEST, s.c_bitrate_for(channels));
     c.set(sys::OPUS_SET_VBR_REQUEST, s.vbr as i32);
-    c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, s.complexity);
+    c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(s.complexity));
 
     let tone: Vec<f32> = (0..channels).map(|ch| if Some(ch) == lfe { LFE_TONE } else { TONES[ch] }).collect();
     // The input channel each output channel carries: the first one that

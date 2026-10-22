@@ -742,11 +742,12 @@ The `heap` feature (on by default) moves the large codec state to the heap when 
 To time opus1 inside your own program, measure many frames and divide, as the harness does:
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 use std::time::Instant;
 
 let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(128_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(128_000).unwrap()));
 encoder.set_complexity(5).unwrap();
 
 let frame = 960; // 20 ms at 48 kHz, samples per channel

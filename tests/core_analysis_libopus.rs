@@ -44,6 +44,7 @@ mod analysis_common;
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use analysis_common::{CAnalysis, Layout, Pcm, info_difference};
 use audiopus_sys as sys;
 use core_common::*;
@@ -144,17 +145,17 @@ impl Setup {
             self.app.rs,
         )
         .unwrap();
-        enc.set_complexity(self.complexity).unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
+        enc.set_complexity(self.complexity as u8).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(self.bitrate as u32).unwrap()));
         enc.set_vbr(self.rc != Rc::Cbr);
         enc.set_vbr_constraint(self.rc == Rc::Cvbr);
         if self.force_celt {
             enc.set_force_mode(Some(ForcedMode::CeltOnly));
         }
         enc.set_signal(self.signal);
-        enc.set_lsb_depth(self.lsb_depth).unwrap();
-        enc.set_inband_fec_mode(self.fec);
-        enc.set_packet_loss_perc(self.loss).unwrap();
+        enc.set_lsb_depth(self.lsb_depth as u8).unwrap();
+        enc.set_inband_fec(self.fec);
+        enc.set_packet_loss_perc(self.loss as u8).unwrap();
         enc.set_expert_frame_duration(self.expert);
         enc
     }
@@ -166,30 +167,15 @@ impl Setup {
         if self.force_celt {
             enc.force_mode(MODE_CELT);
         }
-        enc.set(sys::OPUS_SET_SIGNAL_REQUEST, c_signal(self.signal));
+        enc.set(sys::OPUS_SET_SIGNAL_REQUEST, self.signal.to_raw());
         enc.set(sys::OPUS_SET_LSB_DEPTH_REQUEST, self.lsb_depth);
-        enc.set(sys::OPUS_SET_INBAND_FEC_REQUEST, c_fec(self.fec));
+        enc.set(sys::OPUS_SET_INBAND_FEC_REQUEST, self.fec.to_raw());
         enc.set(sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, self.loss);
         enc.set(sys::OPUS_SET_EXPERT_FRAME_DURATION_REQUEST, self.expert.to_raw());
         enc
     }
 }
 
-fn c_signal(signal: Signal) -> i32 {
-    match signal {
-        Signal::Auto => sys::OPUS_AUTO,
-        Signal::Voice => sys::OPUS_SIGNAL_VOICE,
-        Signal::Music => sys::OPUS_SIGNAL_MUSIC,
-    }
-}
-
-fn c_fec(fec: InbandFec) -> i32 {
-    match fec {
-        InbandFec::Off => 0,
-        InbandFec::On => 1,
-        InbandFec::OnUnlessMusic => 2,
-    }
-}
 
 /// The input of one stream: float, and its 16-bit version.
 struct Input {
@@ -559,7 +545,7 @@ fn complexity_changes_and_reset() {
                     if k % 15 == 0 {
                         let complexity = [7, 9, 6, 10, 10, 8, 6, 9][(k / 15) % 8];
                         c.complexity(complexity);
-                        rs.set_complexity(complexity).unwrap();
+                        rs.set_complexity(complexity as u8).unwrap();
                         if (k / 15) % 8 == 4 {
                             c.reset();
                             rs.reset_state();
@@ -720,24 +706,24 @@ fn controls() {
         OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     assert_eq!(enc.signal(), Signal::Auto);
     assert_eq!(enc.lsb_depth(), 24);
-    assert_eq!(enc.inband_fec_mode(), InbandFec::Off);
+    assert_eq!(enc.inband_fec(), InbandFec::Off);
     assert!(enc.set_lsb_depth(7).is_err());
     assert!(enc.set_lsb_depth(25).is_err());
     assert_eq!(enc.lsb_depth(), 24);
     enc.set_lsb_depth(8).unwrap();
     enc.set_signal(Signal::Music);
-    enc.set_inband_fec_mode(InbandFec::OnUnlessMusic);
-    assert!(enc.inband_fec());
+    enc.set_inband_fec(InbandFec::OnUnlessMusic);
+    assert_eq!(enc.inband_fec(), InbandFec::OnUnlessMusic);
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.reset_state();
     assert_eq!(enc.lsb_depth(), 8);
     assert_eq!(enc.signal(), Signal::Music);
-    assert_eq!(enc.inband_fec_mode(), InbandFec::OnUnlessMusic);
+    assert_eq!(enc.inband_fec(), InbandFec::OnUnlessMusic);
     assert_eq!(opus1::internals::analysis::analysis_gate(&enc), AnalysisGate::FixedPointBuild);
-    enc.set_inband_fec(false);
-    assert_eq!(enc.inband_fec_mode(), InbandFec::Off);
-    enc.set_inband_fec(true);
-    assert_eq!(enc.inband_fec_mode(), InbandFec::On);
+    enc.set_inband_fec(InbandFec::Off);
+    assert_eq!(enc.inband_fec(), InbandFec::Off);
+    enc.set_inband_fec(InbandFec::On);
+    assert_eq!(enc.inband_fec(), InbandFec::On);
 }
 
 /// The analysis gate: `Off` runs no analysis at any complexity, and

@@ -2,6 +2,7 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
+use std::num::NonZeroU32;
 use opus1::internals::silk::define::*;
 use opus1::internals::silk::nlsf_decode::silk_nlsf_decode;
 use opus1::internals::silk::nlsf_encode::silk_nlsf_encode;
@@ -231,13 +232,13 @@ fn test_nlsf_interpolation_activated_at_complexity5() {
     let mut encoder_interp =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).expect("Failed to create encoder");
     encoder_interp.set_complexity(5).unwrap(); // NLSF interpolation activates at complexity >= 5
-    encoder_interp.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder_interp.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20000).unwrap()));
     encoder_interp.set_vbr(true);
 
     let mut encoder_no_interp =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).expect("Failed to create encoder");
     encoder_no_interp.set_complexity(0).unwrap(); // No interpolation
-    encoder_no_interp.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder_no_interp.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20000).unwrap()));
     encoder_no_interp.set_vbr(true);
 
     // Encode multiple frames and verify output is valid (non-empty, non-crashing)
@@ -303,7 +304,7 @@ fn test_nlsf_interpolation_40ms_frames() {
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).expect("Failed to create encoder");
     encoder.set_complexity(5).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(20000).unwrap()));
     encoder.set_vbr(true);
 
     // Encode several 40ms frames and verify they don't crash

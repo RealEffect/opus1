@@ -13,6 +13,7 @@
 //! the unfixed tree the 24 kHz CELT windows score ~0.04; now they track
 //! libopus (which scores ~0.9 on the same signal).
 
+use std::num::NonZeroU32;
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::f32::consts::TAU;
@@ -61,7 +62,7 @@ fn rust_roundtrip(rate: usize, ch: usize, app: Application, br: i32) -> (u8, f64
         app,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(ch).unwrap()).unwrap();
     let (mut out, mut pkt, mut pcm) = (Vec::new(), [0u8; 8000], vec![0f32; 5760 * ch]);
     let mut toc = 0;

@@ -15,6 +15,7 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
+use opus1::InbandFec;
 use opus1::Application;
 use opus1::multistream::MultistreamEncoder;
 
@@ -166,8 +167,7 @@ fn one_channel_at_a_time_with_16_bit_input() {
             let mut enc = rust_encoder(case, fs, Application::RestrictedLowDelay);
             // A 5 ms frame needs more bits to keep a 60 Hz sine.
             let per_channel = if frame_size < 480 { 96_000 } else { 48_000 };
-            enc.set_bitrate(rust_bitrate(per_channel * channels as i32))
-                .unwrap();
+            enc.set_bitrate(rust_bitrate(per_channel * channels as i32));
             let mut out = vec![0u8; max_packet_bytes(enc.layout().streams())];
             let packets: Vec<Vec<u8>> = pcm16
                 .chunks_exact(frame_size * channels)
@@ -303,7 +303,7 @@ fn inband_fec_of_silk_streams_rebuilds_a_lost_frame_in_libopus() {
             for fec in [false, true] {
                 let (mut rust, mut c) = encoders(&case, fs, Application::Voip);
                 configure(&mut rust, &mut c, per_channel * channels as i32, true);
-                rust.set_inband_fec(fec);
+                rust.set_inband_fec(if fec { InbandFec::On } else { InbandFec::Off });
                 rust.set_packet_loss_perc(if fec { 25 } else { 0 }).unwrap();
                 c.set_inband_fec(fec)
                     .set_packet_loss_perc(if fec { 25 } else { 0 });
@@ -312,7 +312,7 @@ fn inband_fec_of_silk_streams_rebuilds_a_lost_frame_in_libopus() {
                 // 24 kHz, the same packets in both).
                 rust.set_signal(opus1::Signal::Voice);
                 c.ctl(audiopus_sys::OPUS_SET_SIGNAL_REQUEST, audiopus_sys::OPUS_SIGNAL_VOICE);
-                assert_eq!(rust.inband_fec(), fec);
+                assert_eq!(rust.inband_fec() != InbandFec::Off, fec);
                 let packets = rust_encode_all(&mut rust, &pcm, frame_size);
                 // The test is about SILK streams.
                 let silk = packets

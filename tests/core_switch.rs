@@ -5,6 +5,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{aligned_snr, multitone, speech, to_stereo, toc_summary};
 use opus1::{
@@ -57,7 +58,7 @@ fn mode_changes_in_a_running_stream_keep_the_final_range() {
             Application::Audio,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         enc.set_complexity(5).unwrap();
         let mut c_dec = CDecoder::new(rate, 1);
         let mut dec =
@@ -107,7 +108,7 @@ fn bandwidth_limits_and_lfe_changed_in_a_running_stream() {
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(40000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(40000).unwrap()));
     enc.set_complexity(5).unwrap();
     let mut c_dec = CDecoder::new(rate, 1);
     let mut buf = vec![0u8; 4000];
@@ -118,12 +119,12 @@ fn bandwidth_limits_and_lfe_changed_in_a_running_stream() {
                 0 => {
                     c_enc.lfe(false).bandwidth(audiopus_sys::OPUS_AUTO).max_bandwidth(BW_FB);
                     enc.set_lfe(false);
-                    enc.set_bandwidth(Bandwidth::Auto);
-                    enc.set_max_bandwidth(Bandwidth::Fullband).unwrap();
+                    enc.set_bandwidth(None);
+                    enc.set_max_bandwidth(Bandwidth::Fullband);
                 }
                 1 => {
                     c_enc.max_bandwidth(BW_WB);
-                    enc.set_max_bandwidth(Bandwidth::Wideband).unwrap();
+                    enc.set_max_bandwidth(Bandwidth::Wideband);
                 }
                 2 => {
                     c_enc.lfe(true);
@@ -132,16 +133,16 @@ fn bandwidth_limits_and_lfe_changed_in_a_running_stream() {
                 3 => {
                     c_enc.lfe(false).max_bandwidth(BW_SWB);
                     enc.set_lfe(false);
-                    enc.set_max_bandwidth(Bandwidth::Superwideband).unwrap();
+                    enc.set_max_bandwidth(Bandwidth::Superwideband);
                 }
                 4 => {
                     // A forced bandwidth is not limited by the maximum.
                     c_enc.bandwidth(BW_FB);
-                    enc.set_bandwidth(Bandwidth::Fullband);
+                    enc.set_bandwidth(Some(Bandwidth::Fullband));
                 }
                 _ => {
                     c_enc.bandwidth(BW_NB);
-                    enc.set_bandwidth(Bandwidth::Narrowband);
+                    enc.set_bandwidth(Some(Bandwidth::Narrowband));
                 }
             }
         }
@@ -187,13 +188,13 @@ fn cbr_run(rate: usize, channels: usize, mode: usize, frame_2_5ms: usize, pcm: &
     )
     .unwrap();
     enc.set_force_mode(Some(forced));
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     enc.set_vbr(false);
     enc.set_complexity(5).unwrap();
     if c_mode == MODE_SILK && rate > 16000 {
         // SILK-only reaches wideband at most.
         c_enc.max_bandwidth(BW_WB);
-        enc.set_max_bandwidth(Bandwidth::Wideband).unwrap();
+        enc.set_max_bandwidth(Bandwidth::Wideband);
     }
     let c_packets = c_enc.encode_all(pcm, frame);
     let pcm16 = to_i16(pcm);
@@ -349,7 +350,7 @@ fn packets_too_small_to_code_name_the_last_coded_mode() {
                     }
                     if let Some((c_bw, bw)) = bandwidth {
                         c_enc.bandwidth(c_bw);
-                        enc.set_bandwidth(bw);
+                        enc.set_bandwidth(Some(bw));
                     }
                     let mut buf = vec![0u8; 4000];
                     let (mut seen, mut coded) = (0, 0);
@@ -359,7 +360,7 @@ fn packets_too_small_to_code_name_the_last_coded_mode() {
                         let low = (ms % 300 >= 200) != low_first;
                         let bitrate = if low { 600 } else { 32000 };
                         c_enc.bitrate(bitrate);
-                        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                         let c_packet = c_enc.encode(input);
                         let n = enc.encode(input, frame, &mut buf).unwrap_or_else(|e| panic!("{what}, packet {i}: {e}"));
                         let packet = &buf[..n];
@@ -414,7 +415,7 @@ fn placeholders_in_short_frames_after_longer_coded_packets() {
                 )
                 .unwrap();
                 enc.set_force_mode(Some(forced));
-                enc.set_bandwidth(bw);
+                enc.set_bandwidth(Some(bw));
                 enc.set_vbr(!cbr);
                 enc.set_complexity(5).unwrap();
                 let mut buf = vec![0u8; 4000];
@@ -426,7 +427,7 @@ fn placeholders_in_short_frames_after_longer_coded_packets() {
                     let coding = (at / 480) % 25 < 20;
                     let (frame, bitrate) = if coding { (960, 32000) } else { (short, 600) };
                     c_enc.bitrate(bitrate);
-                    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                     let input = &pcm[at..at + frame];
                     at += frame;
                     let c_packet = c_enc.encode(input);

@@ -16,9 +16,10 @@
 #![cfg(feature = "std")]
 
 
+use std::num::NonZeroU32;
 use opus1::multistream::MultistreamEncoder;
 use opus1::multistream::MappingType;
-use opus1::{Application, Bandwidth, Bitrate, SampleRate};
+use opus1::{Application, Bandwidth, Bitrate, InbandFec, SampleRate};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -137,8 +138,7 @@ fn encode_does_not_allocate() {
 
                         // Everything from here on is measured.
                         let before = allocations();
-                        enc.set_bitrate(Bitrate::BitsPerSecond(per_channel * channels as i32))
-                            .unwrap();
+                        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new((per_channel * channels as i32) as u32).unwrap()));
                         enc.set_vbr(vbr);
                         enc.set_complexity(9).unwrap();
                         let step = frame_size * channels;
@@ -156,11 +156,11 @@ fn encode_does_not_allocate() {
                                 enc.encode_i16(frame16, frame_size, &mut out)
                             };
                             if f == 3 {
-                                enc.set_inband_fec(true);
+                                enc.set_inband_fec(InbandFec::On);
                                 let _ = enc.set_packet_loss_perc(10);
-                                enc.set_bandwidth(Bandwidth::Wideband);
-                                let _ = enc.set_max_bandwidth(Bandwidth::Superwideband);
-                                let _ = enc.set_bitrate(Bitrate::Auto);
+                                enc.set_bandwidth(Some(Bandwidth::Wideband));
+                                enc.set_max_bandwidth(Bandwidth::Superwideband);
+                                enc.set_bitrate(Bitrate::Auto);
                             }
                             let _ = (enc.bitrate(), enc.final_range(), enc.lookahead());
                             if result.is_err() {

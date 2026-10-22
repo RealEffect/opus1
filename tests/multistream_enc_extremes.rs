@@ -11,6 +11,7 @@
 mod ms_support;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::{Application, Bitrate, SampleRate};
@@ -258,31 +259,29 @@ fn empty_input_and_empty_output_are_errors() {
 fn settings_at_the_ends_of_their_types() {
     let case = Case::family("7.1", 8, 1);
     let (mut rust, mut c) = encoders(&case, 48_000, Application::Audio);
-    for value in [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX] {
-        assert_eq!(
-            rust.set_bitrate(Bitrate::BitsPerSecond(value)).is_ok(),
-            value > 0,
-            "bitrate {value}"
-        );
+    for value in [NonZeroU32::MIN, NonZeroU32::MAX] {
+        rust.set_bitrate(Bitrate::BitsPerSecond(value));
+    }
+    for value in [0, 1, u8::MAX - 1, u8::MAX] {
         assert_eq!(
             rust.set_complexity(value).is_ok(),
-            c.try_ctl(audiopus_sys::OPUS_SET_COMPLEXITY_REQUEST, value) == 0,
+            c.try_ctl(audiopus_sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(value)) == 0,
             "complexity {value}"
         );
         assert_eq!(
             rust.set_packet_loss_perc(value).is_ok(),
-            c.try_ctl(audiopus_sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, value) == 0,
+            c.try_ctl(audiopus_sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, i32::from(value)) == 0,
             "loss {value}"
         );
     }
-    // What was refused changed nothing.
-    assert_eq!(rust.bitrate_setting(), Bitrate::BitsPerSecond(8 * 750_000));
+    // The largest bitrate is limited; what was refused changed nothing.
+    assert_eq!(rust.bitrate_setting(), Bitrate::BitsPerSecond(NonZeroU32::new(8 * 750_000).unwrap()));
     assert_eq!(
-        rust.complexity(),
+        i32::from(rust.complexity()),
         c.get(audiopus_sys::OPUS_GET_COMPLEXITY_REQUEST)
     );
     assert_eq!(
-        rust.packet_loss_perc(),
+        i32::from(rust.packet_loss_perc()),
         c.get(audiopus_sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST)
     );
     // The encoder still works, at the highest bitrate.

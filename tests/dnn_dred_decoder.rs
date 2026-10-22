@@ -8,6 +8,7 @@
 //! `dnn_no_alloc.rs` does).
 #![cfg(all(feature = "dred", feature = "std"))]
 
+use std::num::NonZeroU32;
 use opus1::extensions::Extension;
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
@@ -85,7 +86,7 @@ fn encode(fs: i32, channels: usize, application: Application, bitrate: i32, fram
         application,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     let mut out = Vec::new();
     for k in 0..n {
         let pcm: Vec<f32> = (0..frame * channels)

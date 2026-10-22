@@ -11,6 +11,7 @@
 // `RangeCoder::finish` needs the `std` feature.
 #![cfg(feature = "std")]
 mod silkenc_common;
+use std::num::NonZeroU32;
 use silkenc_common::*;
 
 use opus1::internals::range_coder::RangeCoder;
@@ -36,7 +37,7 @@ fn mediumband_10_ms_after_a_longer_frame_has_the_decoders_final_range() {
                     application,
                 )
                 .unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                 enc.set_complexity(3).unwrap();
                 let mut dec = CDecoder::new(fs, 1);
                 let pcm = speech_like(fs, 1, fs, 7);
@@ -49,7 +50,7 @@ fn mediumband_10_ms_after_a_longer_frame_has_the_decoders_final_range() {
                 sizes.extend([fs / 100; 30]);
                 for (f, &n) in sizes.iter().enumerate() {
                     if n == fs / 100 {
-                        enc.set_bandwidth(Bandwidth::Mediumband);
+                        enc.set_bandwidth(Some(Bandwidth::Mediumband));
                     }
                     let len = enc.encode(&pcm[pos..pos + n], n, &mut out).unwrap();
                     pos += n;

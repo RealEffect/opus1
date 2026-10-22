@@ -72,6 +72,7 @@ mod ms_support;
 mod multistream_e2e_common;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
@@ -522,8 +523,7 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
     // bitrate libopus codes narrowband in surround mode (difference D1 of
     // src/multistream/encoder.rs).
     let mut per_channel = 32_000;
-    rust.set_bitrate(Bitrate::BitsPerSecond(per_channel * channels as i32))
-        .unwrap();
+    rust.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new((per_channel * channels as i32) as u32).unwrap()));
     c.set_bitrate(per_channel * channels as i32);
     let sizes = frame_sizes(fs);
     let longest = sizes[5];
@@ -544,7 +544,7 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
                         4_000, 6_000, 9_000, 12_000, 16_000, 24_000, 48_000, 96_000,
                     ]);
                     let bitrate = per_channel * channels as i32;
-                    rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                    rust.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                     c.set_bitrate(bitrate);
                     history.push(format!("frame {f}: {per_channel} b/s per channel"));
                 }
@@ -566,7 +566,7 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
                 6 => {
                     // Up to 6: libopus does not use its analysis.
                     let complexity = rng.below(7) as i32;
-                    rust.set_complexity(complexity).unwrap();
+                    rust.set_complexity(complexity as u8).unwrap();
                     c.set_complexity(complexity);
                     history.push(format!("frame {f}: complexity {complexity}"));
                 }
@@ -581,10 +581,10 @@ fn walk(case: &Case, fs: i32, seed: u32, frames: usize) -> Walk {
                     rust.set_force_mode(mode);
                     assert_eq!(c.try_ctl(OPUS_SET_FORCE_MODE_REQUEST, c_mode), 0);
                     let (bandwidth, c_bandwidth) = rng.pick(&[
-                        (opus1::Bandwidth::Auto, AUTO),
-                        (opus1::Bandwidth::Narrowband, 1101),
-                        (opus1::Bandwidth::Wideband, 1103),
-                        (opus1::Bandwidth::Fullband, 1105),
+                        (None, AUTO),
+                        (Some(opus1::Bandwidth::Narrowband), 1101),
+                        (Some(opus1::Bandwidth::Wideband), 1103),
+                        (Some(opus1::Bandwidth::Fullband), 1105),
                     ]);
                     rust.set_bandwidth(bandwidth);
                     assert_eq!(c.try_ctl(OPUS_SET_BANDWIDTH_REQUEST, c_bandwidth), 0);

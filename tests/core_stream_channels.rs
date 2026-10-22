@@ -11,6 +11,7 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
@@ -104,7 +105,7 @@ fn sweep(
     let (mut channels, mut modes, mut configs) = (Vec::new(), Vec::new(), Vec::new());
     for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
         c_enc.bitrate(bitrate(i));
-        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate(i))).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate(i) as u32).unwrap()));
         let n = enc.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("packet {i}: {e}"));
         let c_packet = c_enc.encode(pcm);
         out.extend(dec.decode(Some(&buf[..n]), frame, false).unwrap());
@@ -247,7 +248,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
         .unwrap();
         enc.set_complexity(5).unwrap();
         enc.set_force_mode(Some(opus1::ForcedMode::Hybrid));
-        enc.set_bandwidth(opus1::Bandwidth::Fullband);
+        enc.set_bandwidth(Some(opus1::Bandwidth::Fullband));
         let mut buf = vec![0u8; 4000];
         let mut channels = Vec::new();
         for (i, pcm) in input.chunks_exact(2 * frame).enumerate() {
@@ -255,7 +256,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
             let ms = i * frame_ms;
             let bitrate = if ms < 1200 { 40000 } else if ms < 2400 { 12000 } else { 64000 };
             c_enc.bitrate(bitrate);
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             if ms == 4800 {
                 // The caller lets the bitrate decide again.
                 c_enc.force_channels(-1000);
@@ -311,8 +312,8 @@ fn stereo_after_mono_with_a_new_silk_rate_codes_like_libopus() {
                 (64000, (BW_FB, opus1::Bandwidth::Fullband))
             };
             c_enc.bitrate(bitrate).bandwidth(bandwidth.0).force_mode(if bitrate > 10000 { MODE_HYBRID } else { MODE_SILK });
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
-            enc.set_bandwidth(bandwidth.1);
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+            enc.set_bandwidth(Some(bandwidth.1));
             enc.set_force_mode(Some(if bitrate > 10000 { opus1::ForcedMode::Hybrid } else { opus1::ForcedMode::SilkOnly }));
             let n = enc.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("{what}: {e}"));
             let c_packet = c_enc.encode(pcm);
@@ -367,7 +368,7 @@ fn loud_stereo_coded_as_mono_clips_the_sum_like_libopus() {
 /// SILK-only wideband in both encoders.
 fn silk_wideband(enc: &mut OpusEncoder, c_enc: &mut CEncoder) {
     enc.set_force_mode(Some(opus1::ForcedMode::SilkOnly));
-    enc.set_bandwidth(opus1::Bandwidth::Wideband);
+    enc.set_bandwidth(Some(opus1::Bandwidth::Wideband));
     c_enc.force_mode(MODE_SILK).bandwidth(BW_WB);
 }
 
@@ -383,7 +384,7 @@ fn decode_both(rate: usize, frame: usize, bitrate: i32, input: &[f32]) -> (Vec<f
     )
     .unwrap();
     enc.set_complexity(5).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     silk_wideband(&mut enc, &mut c_enc);
     let (mut dec, mut c_dec) = (CDecoder::new(rate, 2), CDecoder::new(rate, 2));
     let mut buf = vec![0u8; 1500];
@@ -443,7 +444,7 @@ fn forced_mono_turns_the_stereo_width_off_like_libopus() {
                 enc.set_force_channels(None);
             }
             c_enc.bitrate(bitrate);
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             enc.encode(pcm, frame, &mut buf).unwrap_or_else(|e| panic!("{what}: {e}"));
             let c_packet = c_enc.encode(pcm);
             assert_eq!(mode_of(buf[0]), mode_of(c_packet[0]), "{what}: mode at {bitrate} b/s");

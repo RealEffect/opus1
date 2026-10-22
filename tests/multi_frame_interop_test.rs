@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fn make_sine(
@@ -81,7 +82,7 @@ fn test_celt_multi_frame_code_0_and_1() {
         Application::RestrictedLowDelay,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
     enc.set_vbr(false);
@@ -139,7 +140,7 @@ fn test_celt_multi_frame_code_2() {
         Application::RestrictedLowDelay,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(880.0, sr, fs, ch, 1);
@@ -190,7 +191,7 @@ fn test_celt_multi_frame_code_3_with_padding() {
         Application::RestrictedLowDelay,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
     // Zero-padding payloads is only neutral when both already share a size;
     // VBR sizes vary legitimately, so pin CBR to keep the resize a no-op.
     enc.set_vbr(false);
@@ -249,7 +250,7 @@ fn test_celt_multi_frame_code_3_self_delimiting() {
         Application::RestrictedLowDelay,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
 
     let pcm0 = make_sine(440.0, sr, fs, ch, 0);
     let pcm1 = make_sine(880.0, sr, fs, ch, 1);
@@ -296,7 +297,7 @@ fn test_silk_multi_frame_code_3_padding_roundtrip() {
     let target_size = 100usize;
 
     let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     enc.set_vbr(false);
 
     let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
@@ -328,7 +329,7 @@ fn test_hybrid_multi_frame_roundtrip() {
     let fs = 960;
     let mut enc =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
     enc.set_vbr(false);
@@ -380,7 +381,7 @@ fn test_multi_frame_code_2_unequal_payloads() {
         Application::RestrictedLowDelay,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
 
     let pcm_silence = vec![0.0f32; fs];
     let pcm_tone = make_sine(440.0, sr, fs, ch, 0);
@@ -392,7 +393,7 @@ fn test_multi_frame_code_2_unequal_payloads() {
         Application::RestrictedLowDelay,
     )
     .unwrap();
-    enc2.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
     let pkt_tone = encode_full(&mut enc2, &pcm_tone, fs, 400);
 
     // Baseline: both frames through same decoder
@@ -436,7 +437,7 @@ fn test_multi_frame_all_codes_stereo() {
 
     let mut enc =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(96000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(96000).unwrap()));
     // Code 1 requires equal-sized frames (RFC 6716 §3.2.1); VBR sizes vary
     // legitimately, so pin CBR for deterministic equal payloads.
     enc.set_vbr(false);

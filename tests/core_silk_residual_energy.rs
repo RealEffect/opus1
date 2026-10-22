@@ -24,6 +24,7 @@
 
 mod k24_common;
 
+use std::num::NonZeroU32;
 use k24_common::*;
 use opus1::internals::silk_input::set_fixed_point_res_nrg;
 use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
@@ -101,7 +102,7 @@ fn decoded(packets: &[Vec<u8>], len: usize) -> Vec<f32> {
 fn opus1_packets(pcm: &[i16], complexity: i32, fixed_point: bool) -> Vec<Vec<u8>> {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Voip).unwrap();
-    enc.set_complexity(complexity).unwrap();
+    enc.set_complexity(complexity as u8).unwrap();
     set_fixed_point_res_nrg(&mut enc, fixed_point);
     let mut buf = vec![0u8; 4000];
     pcm.as_chunks::<{ 960 * 2 }>()
@@ -109,7 +110,7 @@ fn opus1_packets(pcm: &[i16], complexity: i32, fixed_point: bool) -> Vec<Vec<u8>
         .iter()
         .enumerate()
         .map(|(k, x)| {
-            enc.set_bitrate(Bitrate::BitsPerSecond(bitrate(k))).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate(k) as u32).unwrap()));
             let n = enc.encode_i16(x, 960, &mut buf).unwrap();
             buf[..n].to_vec()
         })
@@ -200,7 +201,7 @@ fn speech_at_a_constant_bitrate_codes_the_packets_of_the_fixed_point_energies() 
                 )
                 .unwrap();
                 enc.set_complexity(9).unwrap();
-                enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+                enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
                 set_fixed_point_res_nrg(&mut enc, fixed_point);
                 let mut buf = vec![0u8; 4000];
                 pcm.chunks_exact(frame)

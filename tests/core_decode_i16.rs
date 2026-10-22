@@ -12,7 +12,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{full_scale, speech_fullband, to_stereo};
-use opus1::{Channels, OpusDecoder, SampleRate, pcm_soft_clip};
+use opus1::{Channels, ErrorKind, OpusDecoder, SampleRate, pcm_soft_clip};
 use std::f64::consts::PI;
 
 /// A signal that overshoots full scale in several ways:
@@ -272,7 +272,7 @@ fn pcm_soft_clip_matches_libopus() {
                 }
                 let expected = c_soft_clip(&pcm, n, channels, &mut c_mem);
                 let mut ours = pcm.clone();
-                pcm_soft_clip(&mut ours, n, channels, &mut rs_mem);
+                pcm_soft_clip(&mut ours, channels, &mut rs_mem).unwrap();
                 let exact = cfg!(target_arch = "aarch64");
                 for (i, (a, b)) in expected.iter().zip(&ours).enumerate() {
                     worst = worst.max((a - b).abs());
@@ -291,16 +291,22 @@ fn pcm_soft_clip_matches_libopus() {
     println!("largest difference from libopus {worst:e}; {clipped_buffers} buffers were changed by the clipper");
     assert!(clipped_buffers > 300);
 
-    // Arguments that do not fit change nothing and do not panic.
+    // Arguments that do not fit are refused with `BadArg` and change
+    // nothing: no channels, a length that is not a whole number of samples
+    // per channel, and too little memory.
     let mut pcm = [1.5f32, -1.5, 1.5];
-    pcm_soft_clip(&mut pcm, 0, 1, &mut [0.0]);
-    pcm_soft_clip(&mut pcm, 3, 0, &mut [0.0]);
-    pcm_soft_clip(&mut pcm, 4, 1, &mut [0.0]);
-    pcm_soft_clip(&mut pcm, 3, 2, &mut [0.0, 0.0]);
-    pcm_soft_clip(&mut pcm, 3, 1, &mut []);
+    let kind = |r: Result<(), opus1::Error>| r.map_err(|e| e.kind());
+    assert_eq!(kind(pcm_soft_clip(&mut pcm, 0, &mut [0.0])), Err(ErrorKind::BadArg));
+    let mut memory = [0.0, 0.0];
+    assert_eq!(kind(pcm_soft_clip(&mut pcm, 2, &mut memory)), Err(ErrorKind::BadArg));
+    assert_eq!(kind(pcm_soft_clip(&mut pcm, 1, &mut [])), Err(ErrorKind::BadArg));
     assert_eq!(pcm, [1.5, -1.5, 1.5]);
+    assert_eq!(memory, [0.0, 0.0]);
+    // An empty buffer is accepted and changes nothing.
+    pcm_soft_clip(&mut [], 2, &mut memory).unwrap();
+    assert_eq!(memory, [0.0, 0.0]);
     // Not-a-number samples pass through without a panic or an endless loop.
     let mut pcm = [0.5f32, f32::NAN, 1.7, f32::INFINITY, -0.3];
-    pcm_soft_clip(&mut pcm, 5, 1, &mut [0.0]);
+    pcm_soft_clip(&mut pcm, 1, &mut [0.0]).unwrap();
     assert!(pcm[1].is_nan());
 }

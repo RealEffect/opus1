@@ -121,13 +121,13 @@ impl Walk {
                 let per_channel = rng.pick(&[6_000, 12_000, 16_000, 24_000, 32_000, 64_000, 128_000]);
                 let value = per_channel * self.channels as i32;
                 let value = if self.surround { value } else { rng.pick(&[value, OPUS_AUTO, OPUS_BITRATE_MAX]) };
-                rust.set_bitrate(rust_bitrate(value)).unwrap();
+                rust.set_bitrate(rust_bitrate(value));
                 c.set_bitrate(value);
                 format!("bitrate {value}")
             }
             1 | 2 => {
                 let complexity = rng.below(11) as i32;
-                rust.set_complexity(complexity).unwrap();
+                rust.set_complexity(complexity as u8).unwrap();
                 c.set_complexity(complexity);
                 format!("complexity {complexity}")
             }
@@ -143,7 +143,7 @@ impl Walk {
             }
             4 => {
                 let depth = 8 + rng.below(17) as i32;
-                rust.set_lsb_depth(depth).unwrap();
+                rust.set_lsb_depth(depth as u8).unwrap();
                 c.ctl(sys::OPUS_SET_LSB_DEPTH_REQUEST, depth);
                 format!("lsb depth {depth}")
             }
@@ -168,11 +168,11 @@ impl Walk {
             }
             8 => {
                 let (rs, cv) = rng.pick(&[
-                    (Bandwidth::Auto, OPUS_AUTO),
-                    (Bandwidth::Narrowband, sys::OPUS_BANDWIDTH_NARROWBAND),
-                    (Bandwidth::Wideband, sys::OPUS_BANDWIDTH_WIDEBAND),
-                    (Bandwidth::Superwideband, sys::OPUS_BANDWIDTH_SUPERWIDEBAND),
-                    (Bandwidth::Fullband, sys::OPUS_BANDWIDTH_FULLBAND),
+                    (None, OPUS_AUTO),
+                    (Some(Bandwidth::Narrowband), sys::OPUS_BANDWIDTH_NARROWBAND),
+                    (Some(Bandwidth::Wideband), sys::OPUS_BANDWIDTH_WIDEBAND),
+                    (Some(Bandwidth::Superwideband), sys::OPUS_BANDWIDTH_SUPERWIDEBAND),
+                    (Some(Bandwidth::Fullband), sys::OPUS_BANDWIDTH_FULLBAND),
                 ]);
                 rust.set_bandwidth(rs);
                 c.ctl(sys::OPUS_SET_BANDWIDTH_REQUEST, cv);
@@ -181,7 +181,7 @@ impl Walk {
             9 => {
                 let loss = rng.pick(&[0, 2, 5, 15]);
                 rust.set_packet_loss_perc(loss).unwrap();
-                c.set_packet_loss_perc(loss);
+                c.set_packet_loss_perc(i32::from(loss));
                 format!("loss {loss}")
             }
             10 => {
@@ -225,7 +225,7 @@ fn celt_only_multistream_with_changing_settings_is_libopus() {
             let (mut rust, mut c) = encoders(case, fs as i32, application);
             configure(&mut rust, &mut c, 32_000 * case.channels as i32, true);
             let complexity = 7 + rng.below(4) as i32;
-            rust.set_complexity(complexity).unwrap();
+            rust.set_complexity(complexity as u8).unwrap();
             c.set_complexity(complexity);
             rust.set_force_mode(Some(ForcedMode::CeltOnly));
             c.ctl(OPUS_SET_FORCE_MODE_REQUEST, MODE_CELT_ONLY);

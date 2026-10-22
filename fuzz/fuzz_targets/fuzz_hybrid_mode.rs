@@ -1,5 +1,6 @@
 #![no_main]
 
+use std::num::NonZeroU32;
 use libfuzzer_sys::fuzz_target;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
@@ -43,16 +44,16 @@ fuzz_target!(|data: &[u8]| {
             }
 
             // Configure encoder with various settings
-            let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(match data[2] % 6 {
+            encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(match data[2] % 6 {
                 0 => 16000,
                 1 => 32000,
                 2 => 64000,
                 3 => 96000,
                 4 => 128000,
                 _ => 256000,
-            }));
+            }).unwrap()));
 
-            let _ = encoder.set_complexity((data[3] % 11) as i32);
+            let _ = encoder.set_complexity(data[3] % 11);
             encoder.set_vbr(data[4] % 2 != 0);
 
             // Generate test input

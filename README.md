@@ -29,13 +29,14 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 ## Quick Start
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 // Encode. Without `set_bitrate` the encoder uses libopus's automatic
 // bitrate (`Bitrate::Auto`, 19 kb/s for 16 kHz mono in 20 ms frames).
 // Each setter refuses what libopus refuses, for example a complexity of 11.
 let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(16000).unwrap()));
 encoder.set_vbr(false); // constant bitrate: every packet has 40 bytes
 assert!(encoder.set_complexity(11).is_err());
 
@@ -69,13 +70,14 @@ Decoding to 16-bit PCM, and recovering a lost packet from the in-band
 forward error correction (FEC) data of the next one:
 
 ```rust
-use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
+use std::num::NonZeroU32;
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 
 // Three 20 ms packets of a 180 Hz tone at 16 kHz. Each packet after the
 // first also carries a low-bitrate copy of the frame before it (in-band FEC).
 let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
-encoder.set_inband_fec(true);
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
+encoder.set_inband_fec(InbandFec::On);
 encoder.set_packet_loss_perc(10).unwrap();
 let tone: Vec<f32> = (0..3 * 320)
     .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 180.0 * i as f32 / 16000.0).sin())
@@ -102,12 +104,13 @@ Float output is not clipped to [-1, 1], as in libopus's `opus_decode_float`.
 ### Multichannel
 
 ```rust
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, SampleRate};
 use opus1::multistream::{MultistreamEncoder, MultistreamDecoder};
 
 // 5.1 at 48 kHz in Vorbis channel order (mapping family 1).
 let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
-encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
+encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(256_000).unwrap()));
 let layout = encoder.layout().clone(); // streams, coupled streams and mapping for the Ogg header
 
 let pcm = vec![0.0f32; 960 * 6]; // 20 ms, interleaved
@@ -377,6 +380,17 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   Bad arguments such as more than 48 frames are errors instead of panics.
   `Repacketizer` is no longer `Copy`. `OpusDredDecoder::parse` takes a
   `DredProcessing` instead of a bool.
+- Settings: `Bandwidth` has no `Auto`; `set_bandwidth` takes
+  `Option<Bandwidth>`, and `set_max_bandwidth` no longer fails.
+  `Bitrate::BitsPerSecond` holds a `NonZeroU32`, and `set_bitrate` no longer
+  fails. The complexity, packet loss, LSB depth and DRED duration are `u8`,
+  the voice ratio is `Option<u8>`, and the decoder gain is an `i16` (its
+  setter no longer fails). In-band FEC is set with `set_inband_fec(InbandFec)`
+  only. `set_energy_mask` refuses a mask of the wrong length, and
+  `pcm_soft_clip(pcm, channels, memory)` returns a `Result`. `Application`,
+  `ForcedMode`, `Signal`, `InbandFec` and `MappingType` are
+  `#[non_exhaustive]`; the enums with a libopus number have `to_raw` and
+  `TryFrom<i32>`.
 - The settings of `OpusEncoder` are methods instead of public fields:
   `set_bitrate`, `set_complexity`, `set_vbr` (instead of `use_cbr`, with the
   opposite meaning), `set_inband_fec` and `set_packet_loss_perc`, each with its
@@ -422,7 +436,7 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   `reset_state`, `last_packet_duration`, `set_gain`, `pitch` and
   `set_phase_inversion_disabled`. Encoder: `set_force_mode`, `set_bandwidth`,
   `set_max_bandwidth`, `set_force_channels`, `set_signal`, `set_lsb_depth`,
-  `set_inband_fec_mode`, `set_vbr_constraint`, `set_application`,
+  `InbandFec::OnUnlessMusic`, `set_vbr_constraint`, `set_application`,
   `set_voice_ratio`, `set_phase_inversion_disabled` and `lookahead`. The
   multistream encoder and decoder forward the controls that libopus's forward.
 - The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,

@@ -616,7 +616,7 @@ pub fn cbr_packet_len(
     let user = match setting {
         Bitrate::Auto => 60 * fs / frame_size as i32 + fs * channels as i32,
         Bitrate::Max => 1_500_000,
-        Bitrate::BitsPerSecond(bps) => bps,
+        Bitrate::BitsPerSecond(bps) => bps.get() as i32,
     };
     let bitrate = user.min(max_bitrate);
     let cbr_bytes = ((bitrate_to_bits(bitrate, fs, frame_size) + 4) / 8).min(max_data_bytes);

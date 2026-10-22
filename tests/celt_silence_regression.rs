@@ -11,6 +11,7 @@
 //! - VBR shrink behavior
 //! - hybrid mode sanity
 //! - known bad pattern regression (fc 7f fe) not produced for true silence
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::process::Command;
 
@@ -162,7 +163,7 @@ fn celt_only_zero_pcm_cross_decode() {
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     // Verify that at 192k it selects CELT-only (TOC should be 0xfc for 20ms stereo FB)
     let zero = vec![0.0f32; FRAME_SIZE * 2 * 5];
     let mut out = vec![0u8; 1500];
@@ -253,7 +254,7 @@ fn audio_to_silence_to_audio_transition() {
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     for f in 0..total {
         let chunk = &pcm[f * FRAME_SIZE * 2..(f + 1) * FRAME_SIZE * 2];
         let n = enc.encode(chunk, FRAME_SIZE, &mut out).unwrap();
@@ -331,7 +332,7 @@ fn repeated_silence_no_burst() {
             Application::Audio,
         )
         .unwrap();
-        enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
         let zero = vec![0.0f32; FRAME_SIZE * 2];
         let mut packets = Vec::new();
         let mut out = vec![0u8; 1500];
@@ -389,7 +390,7 @@ fn near_silence_threshold() {
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     let mut out = vec![0u8; 1500];
     // prime with silence to get overlap_max=0
     let zero = vec![0.0f32; FRAME_SIZE * 2];
@@ -426,7 +427,7 @@ fn near_silence_threshold() {
         Application::Audio,
     )
     .unwrap();
-    enc2.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     // encode below and decode
     let mut pkts = Vec::new();
     for _ in 0..3 {
@@ -456,7 +457,7 @@ fn vbr_shrink_and_cbr_no_shrink() {
         Application::Audio,
     )
     .unwrap();
-    enc_vbr.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc_vbr.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     enc_vbr.set_vbr(true);
     let n_vbr = enc_vbr.encode(&zero, FRAME_SIZE, &mut out).unwrap();
     assert!(
@@ -471,7 +472,7 @@ fn vbr_shrink_and_cbr_no_shrink() {
         Application::Audio,
     )
     .unwrap();
-    enc_cbr.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc_cbr.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     enc_cbr.set_vbr(false);
     let n_cbr = enc_cbr.encode(&zero, FRAME_SIZE, &mut out).unwrap();
     assert!(
@@ -492,7 +493,7 @@ fn vbr_shrink_and_cbr_no_shrink() {
         Application::Audio,
     )
     .unwrap();
-    enc_vbr2.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc_vbr2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     enc_vbr2.set_vbr(true);
     let n = enc_vbr2.encode(&zero, FRAME_SIZE, &mut out).unwrap();
     assert_eq!(out[1], 0xff, "VBR silence bit not true {:02x}", out[1]);
@@ -510,7 +511,7 @@ fn hybrid_zero_sanity() {
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap(); // low enough to force Hybrid? Check encoder logic
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap())); // low enough to force Hybrid? Check encoder logic
     // Ensure mode is Hybrid by checking TOC? TOC for Hybrid has different config.
     let zero = vec![0.0f32; FRAME_SIZE * 2];
     let mut out = vec![0u8; 1500];
@@ -546,7 +547,7 @@ fn known_bad_pattern_not_emitted_for_true_silence() {
         Application::Audio,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(192000).unwrap()));
     enc.set_vbr(true);
     let zero = vec![0.0f32; FRAME_SIZE * 2];
     let mut out = vec![0u8; 1500];

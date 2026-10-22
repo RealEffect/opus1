@@ -8,6 +8,7 @@
 //!
 //! P1: guards for direct calls into the low-level public components.
 
+use std::num::NonZeroU32;
 use opus1::internals::silk::SilkResampler;
 use opus1::internals::silk::dec_api::SilkDecoder;
 use opus1::internals::silk::init_decoder::silk_decoder_set_fs;
@@ -29,7 +30,7 @@ fn p0_cross_bandwidth_plc_lag_no_panic() {
     let wb_frame = 320usize; // 20 ms @ 16 kHz
     let mut wb_enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-    wb_enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    wb_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     wb_enc.set_vbr(false);
     let wb_input: Vec<f32> = (0..wb_frame)
         .map(|i| (2.0 * PI * 120.0 * (i as f32 / 16000.0)).sin() * 0.4)
@@ -39,7 +40,7 @@ fn p0_cross_bandwidth_plc_lag_no_panic() {
     let nb_frame = 160usize; // 20 ms @ 8 kHz
     let mut nb_enc =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
-    nb_enc.set_bitrate(Bitrate::BitsPerSecond(12000)).unwrap();
+    nb_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(12000).unwrap()));
     nb_enc.set_vbr(false);
     let nb_input = vec![0.0f32; nb_frame];
 
@@ -120,7 +121,7 @@ fn p0_silk_layer_cross_bandwidth_recovery() {
 
     let mut wb_enc =
         OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
-    wb_enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
+    wb_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(24000).unwrap()));
     wb_enc.set_vbr(false);
     let wb_input: Vec<f32> = (0..wb_frame)
         .map(|i| (2.0 * PI * 120.0 * (i as f32 / 16000.0)).sin() * 0.4)
@@ -132,7 +133,7 @@ fn p0_silk_layer_cross_bandwidth_recovery() {
 
     let mut nb_enc =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
-    nb_enc.set_bitrate(Bitrate::BitsPerSecond(12000)).unwrap();
+    nb_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(12000).unwrap()));
     nb_enc.set_vbr(false);
     let nb_input = vec![0.0f32; nb_frame];
     let mut nb_pkt = vec![0u8; 1500];
@@ -275,10 +276,10 @@ fn p1_pitch_xcorr_short_y_no_panic() {
 fn p2_encoder_extreme_settings_no_panic() {
     let mut enc =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(i32::MAX)).unwrap();
-    assert_eq!(enc.bitrate_setting(), Bitrate::BitsPerSecond(750_000));
-    assert!(enc.set_complexity(i32::MAX).is_err());
-    assert!(enc.set_packet_loss_perc(i32::MAX).is_err());
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::MAX));
+    assert_eq!(enc.bitrate_setting(), Bitrate::BitsPerSecond(NonZeroU32::new(750_000).unwrap()));
+    assert!(enc.set_complexity(u8::MAX).is_err());
+    assert!(enc.set_packet_loss_perc(u8::MAX).is_err());
     let input = vec![0.0f32; 960];
     let mut pkt = vec![0u8; 1500];
     let res = enc.encode(&input, 960, &mut pkt);
@@ -286,11 +287,10 @@ fn p2_encoder_extreme_settings_no_panic() {
 
     let mut enc2 =
         OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
-    assert!(enc2.set_bitrate(Bitrate::BitsPerSecond(i32::MIN)).is_err());
-    assert!(enc2.set_complexity(i32::MIN).is_err());
-    assert!(enc2.set_packet_loss_perc(i32::MIN).is_err());
-    enc2.set_bitrate(Bitrate::BitsPerSecond(1)).unwrap();
-    assert_eq!(enc2.bitrate_setting(), Bitrate::BitsPerSecond(500));
+    assert!(enc2.set_complexity(11).is_err());
+    assert!(enc2.set_packet_loss_perc(101).is_err());
+    enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(1).unwrap()));
+    assert_eq!(enc2.bitrate_setting(), Bitrate::BitsPerSecond(NonZeroU32::new(500).unwrap()));
     let res2 = enc2.encode(&input, 960, &mut pkt);
     assert!(res2.is_ok(), "encode with extreme settings must not panic");
 }

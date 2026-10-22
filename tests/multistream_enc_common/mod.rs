@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use std::num::NonZeroU32;
 use crate::ms_support::*;
 use opus1::multistream::MultistreamEncoder;
 use opus1::{Application, Bitrate, OpusEncoder, SampleRate};
@@ -16,7 +17,7 @@ use opus1::{Application, Bitrate, OpusEncoder, SampleRate};
 /// encodes a frame.
 pub fn bitrate_set(enc: &OpusEncoder) -> i32 {
     match enc.bitrate_setting() {
-        Bitrate::BitsPerSecond(bps) => bps,
+        Bitrate::BitsPerSecond(bps) => bps.get() as i32,
         other => panic!("the stream encoder has no explicit bitrate: {other:?}"),
     }
 }
@@ -113,11 +114,7 @@ pub const SURROUND_CASES: &[Case] = &[
 
 /// The application value of the C API.
 pub fn c_application(application: Application) -> i32 {
-    match application {
-        Application::Voip => APP_VOIP,
-        Application::Audio => APP_AUDIO,
-        Application::RestrictedLowDelay => APP_LOWDELAY,
-    }
+    application.to_raw()
 }
 
 /// The opus1 encoder of a case.
@@ -186,7 +183,7 @@ pub fn rust_bitrate(c_value: i32) -> Bitrate {
     match c_value {
         OPUS_AUTO => Bitrate::Auto,
         OPUS_BITRATE_MAX => Bitrate::Max,
-        bps => Bitrate::BitsPerSecond(bps),
+        bps => Bitrate::BitsPerSecond(NonZeroU32::new(bps as u32).unwrap()),
     }
 }
 
@@ -194,7 +191,7 @@ pub fn rust_bitrate(c_value: i32) -> Bitrate {
 /// `bitrate` is a value of the C API: bits per second, `OPUS_AUTO` or
 /// `OPUS_BITRATE_MAX`.
 pub fn configure(rust: &mut MultistreamEncoder, c: &mut CMsEncoder, bitrate: i32, vbr: bool) {
-    rust.set_bitrate(rust_bitrate(bitrate)).unwrap();
+    rust.set_bitrate(rust_bitrate(bitrate));
     rust.set_vbr(vbr);
     c.set_bitrate(bitrate);
     c.set_vbr(vbr);

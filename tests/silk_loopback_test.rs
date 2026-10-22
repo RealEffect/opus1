@@ -5,6 +5,7 @@
 /// SILK encoder-decoder loopback test
 /// Encodes a 440Hz sine wave with SILK and decodes it back,
 /// then verifies the output is valid (non-zero) and has reasonable SNR.
+use std::num::NonZeroU32;
 use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 /// Generate a 440Hz sine wave at the given sample rate
@@ -48,7 +49,7 @@ fn test_silk_encode_decode_loopback() {
     // Create encoder
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
     encoder.set_vbr(false);
 
     // Create decoder
@@ -159,7 +160,7 @@ fn test_silk_encode_decode_nonzero_output() {
 
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(10000)).unwrap();
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(10000).unwrap()));
     encoder.set_vbr(false);
 
     let mut decoder = OpusDecoder::new(SampleRate::Hz8000, Channels::Mono).unwrap();
@@ -201,7 +202,7 @@ fn test_silk_multi_frame_continuity() {
 
     let mut encoder =
         OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).unwrap();
-    encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap(); // Higher bitrate for better quality
+    encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(16000).unwrap())); // Higher bitrate for better quality
     encoder.set_vbr(false);
 
     let mut decoder = OpusDecoder::new(SampleRate::Hz8000, Channels::Mono).unwrap();

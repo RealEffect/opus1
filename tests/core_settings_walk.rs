@@ -27,10 +27,11 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate, packet};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate, packet};
 use opus1::packet::Framing;
 
 /// A small deterministic generator (the 64-bit LCG of Knuth's MMIX).
@@ -106,7 +107,7 @@ struct Settings {
     bitrate: i32,
     cbr: bool,
     mode: Option<(i32, ForcedMode)>,
-    bandwidth: (i32, Bandwidth),
+    bandwidth: (i32, Option<Bandwidth>),
     max_bandwidth: (i32, Bandwidth),
     fec: bool,
     loss: i32,
@@ -146,7 +147,14 @@ fn change(rng: &mut Rng, s: &mut Settings, low_delay: bool) {
                 Some((MODE_CELT, ForcedMode::CeltOnly)),
             ])
         }
-        5 => s.bandwidth = if rng.chance(50) { (-1000, Bandwidth::Auto) } else { rng.pick(&BANDWIDTHS) },
+        5 => {
+            s.bandwidth = if rng.chance(50) {
+                (-1000, None)
+            } else {
+                let (c, rs) = rng.pick(&BANDWIDTHS);
+                (c, Some(rs))
+            }
+        }
         6 => s.max_bandwidth = rng.pick(&BANDWIDTHS),
         7 => {
             s.fec = rng.chance(50);
@@ -220,7 +228,7 @@ fn walk(
         bitrate: 24_000,
         cbr: false,
         mode: None,
-        bandwidth: (-1000, Bandwidth::Auto),
+        bandwidth: (-1000, None),
         max_bandwidth: (BW_FB, Bandwidth::Fullband),
         fec: false,
         loss: 0,
@@ -258,14 +266,14 @@ fn walk(
         c_enc.set(sys::OPUS_SET_INBAND_FEC_REQUEST, s.fec as i32);
         c_enc.set(sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, s.loss);
         c_enc.set(sys::OPUS_SET_COMPLEXITY_REQUEST, s.complexity);
-        enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
+        enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(s.bitrate as u32).unwrap()));
         enc.set_vbr(!s.cbr);
         enc.set_force_mode(s.mode.map(|m| m.1));
         enc.set_bandwidth(s.bandwidth.1);
-        enc.set_max_bandwidth(s.max_bandwidth.1).unwrap();
-        enc.set_inband_fec(s.fec);
-        enc.set_packet_loss_perc(s.loss).unwrap();
-        enc.set_complexity(s.complexity).unwrap();
+        enc.set_max_bandwidth(s.max_bandwidth.1);
+        enc.set_inband_fec(if s.fec { InbandFec::On } else { InbandFec::Off });
+        enc.set_packet_loss_perc(s.loss as u8).unwrap();
+        enc.set_complexity(s.complexity as u8).unwrap();
 
         let frame = rate * s.tenth_ms / 10_000;
         if at + frame * channels > pcm.len() {

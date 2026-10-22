@@ -44,6 +44,7 @@
 
 mod ms_support;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use ms_support::{
     APP_AUDIO, CMsEncoder, MODE_CELT_ONLY, Mode, OPUS_SET_ENERGY_MASK_REQUEST,
@@ -737,9 +738,9 @@ fn rust_stream_bytes(setup: Setup, pcm: &[f32], rates: &[i32], use_mask: bool) -
                 Application::Audio,
             )
             .unwrap();
-            enc.set_bitrate(Bitrate::BitsPerSecond(rates[s])).unwrap();
+            enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(rates[s] as u32).unwrap()));
             enc.set_vbr(true);
-            enc.set_bandwidth(bandwidth);
+            enc.set_bandwidth(Some(bandwidth));
             enc.set_force_mode(Some(ForcedMode::CeltOnly));
             enc.set_lfe(lfe_stream == Some(s));
             enc
@@ -754,7 +755,7 @@ fn rust_stream_bytes(setup: Setup, pcm: &[f32], rates: &[i32], use_mask: bool) -
         for (s, &of) in layout.iter().enumerate() {
             let x = stream_pcm(frame, channels, of);
             if use_mask {
-                encoders[s].set_energy_mask(Some(&stream_mask(&band_smr, of)));
+                encoders[s].set_energy_mask(Some(&stream_mask(&band_smr, of))).unwrap();
             }
             bytes[s] += encoders[s].encode(&x, frame_size, &mut out).unwrap();
         }

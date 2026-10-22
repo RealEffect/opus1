@@ -13,11 +13,12 @@
 //!   20 ms packets do, and libopus must recover lost frames from the LBRR
 //!   section.
 
+use std::num::NonZeroU32;
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate, Signal};
+use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, OpusEncoder, SampleRate, Signal};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -265,13 +266,13 @@ fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
         Application::Voip,
     )
     .unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(32000).unwrap()));
     enc.set_vbr(!cbr);
     // As for libopus above: the speech and music analysis reads the steady
     // harmonic tone as music and would move the stream to CELT.
     enc.set_signal(Signal::Voice);
     if fec {
-        enc.set_inband_fec(true);
+        enc.set_inband_fec(InbandFec::On);
         enc.set_packet_loss_perc(40).unwrap();
     }
     let mut c_dec = CDec::new(sr as u32, c_channels(ch)).unwrap();

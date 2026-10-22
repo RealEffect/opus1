@@ -21,6 +21,7 @@
 mod ms_support;
 mod multistream_enc_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_enc_common::*;
@@ -164,7 +165,7 @@ fn a_cbr_stream_of_three_bytes_is_coded_like_libopus() {
             Application::RestrictedLowDelay,
         )
         .unwrap();
-        rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+        rust.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
         rust.set_vbr(false);
         let pcm = noise(1, frame_size, 0.3, 3);
         let (mut a, mut b) = (vec![0u8; 1500], vec![0u8; 1500]);
@@ -378,7 +379,7 @@ fn a_buffer_below_the_smallest_packet_leaves_the_encoder_untouched() {
         let (mut fresh, _) = encoders(case, fs, Application::Audio);
         let bitrate = 40_000 * case.channels as i32;
         configure(&mut rust, &mut c, bitrate, true);
-        fresh.set_bitrate(rust_bitrate(bitrate)).unwrap();
+        fresh.set_bitrate(rust_bitrate(bitrate));
         let streams = c.streams;
         let pcm = voiced(fs, case.channels, 6 * frame_size);
         let before = rust.bitrate();

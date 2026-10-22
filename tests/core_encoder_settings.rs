@@ -11,10 +11,11 @@
 mod core_common;
 mod k24_common;
 
+use std::num::NonZeroU32;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::{Application, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 
 /// libopus's `OPUS_AUTO` and `OPUS_BITRATE_MAX`.
 const OPUS_AUTO: i32 = -1000;
@@ -40,31 +41,34 @@ fn signal(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
 /// Every getter of opus1 against the matching `OPUS_GET_*` request.
 fn assert_same_settings(rust: &OpusEncoder, c: &mut CEncoder, label: &str) {
     assert_eq!(rust.bitrate(), c.get(sys::OPUS_GET_BITRATE_REQUEST), "{label}: bitrate");
-    assert_eq!(rust.complexity(), c.get(sys::OPUS_GET_COMPLEXITY_REQUEST), "{label}: complexity");
+    assert_eq!(i32::from(rust.complexity()), c.get(sys::OPUS_GET_COMPLEXITY_REQUEST), "{label}: complexity");
     assert_eq!(rust.vbr() as i32, c.get(sys::OPUS_GET_VBR_REQUEST), "{label}: VBR");
     assert_eq!(
         rust.vbr_constraint() as i32,
         c.get(sys::OPUS_GET_VBR_CONSTRAINT_REQUEST),
         "{label}: VBR constraint"
     );
-    assert_eq!(rust.inband_fec() as i32, c.get(sys::OPUS_GET_INBAND_FEC_REQUEST), "{label}: FEC");
+    assert_eq!(rust.inband_fec().to_raw(), c.get(sys::OPUS_GET_INBAND_FEC_REQUEST), "{label}: FEC");
     assert_eq!(
-        rust.packet_loss_perc(),
+        i32::from(rust.packet_loss_perc()),
         c.get(sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST),
         "{label}: packet loss"
     );
 }
 
 /// A value libopus refuses is refused, and the setting keeps its value; a
-/// value libopus takes is taken, and both read back the same.
+/// value libopus takes is taken, and both read back the same. Values that
+/// opus1's types cannot hold (bitrates of 0 and below other than the two
+/// special values, negative complexities and losses) are refused by
+/// libopus.
 #[test]
 fn setters_refuse_what_libopus_refuses() {
     let bitrates = [
         i32::MIN, -1001, OPUS_AUTO, -999, -2, OPUS_BITRATE_MAX, 0, 1, 499, 500, 501, 64_000,
         749_999, 750_000, 750_001, 1_499_999, 1_500_000, 1_500_001, 3_000_000, i32::MAX,
     ];
-    let complexities = [i32::MIN, -1, 0, 1, 5, 9, 10, 11, i32::MAX];
-    let losses = [i32::MIN, -1, 0, 1, 50, 100, 101, i32::MAX];
+    let complexities = [i32::MIN, -1, 0, 1, 5, 9, 10, 11, 255, i32::MAX];
+    let losses = [i32::MIN, -1, 0, 1, 50, 100, 101, 255, i32::MAX];
     for rate in RATES {
         for channels in [1, 2] {
             let label = format!("{rate} Hz, {channels} channels");
@@ -79,21 +83,33 @@ fn setters_refuse_what_libopus_refuses() {
             for v in bitrates {
                 let c_ok = c.try_set(sys::OPUS_SET_BITRATE_REQUEST, v) == 0;
                 let setting = match v {
-                    OPUS_AUTO => Bitrate::Auto,
-                    OPUS_BITRATE_MAX => Bitrate::Max,
-                    _ => Bitrate::BitsPerSecond(v),
+                    OPUS_AUTO => Some(Bitrate::Auto),
+                    OPUS_BITRATE_MAX => Some(Bitrate::Max),
+                    _ => u32::try_from(v).ok().and_then(NonZeroU32::new).map(Bitrate::BitsPerSecond),
                 };
-                assert_eq!(rust.set_bitrate(setting).is_ok(), c_ok, "{label}: bitrate {v}");
+                match setting {
+                    Some(setting) => {
+                        assert!(c_ok, "{label}: bitrate {v}");
+                        rust.set_bitrate(setting);
+                    }
+                    None => assert!(!c_ok, "{label}: bitrate {v}"),
+                }
                 assert_same_settings(&rust, &mut c, &format!("{label}, bitrate {v}"));
             }
             for v in complexities {
                 let c_ok = c.try_set(sys::OPUS_SET_COMPLEXITY_REQUEST, v) == 0;
-                assert_eq!(rust.set_complexity(v).is_ok(), c_ok, "{label}: complexity {v}");
+                match u8::try_from(v) {
+                    Ok(v) => assert_eq!(rust.set_complexity(v).is_ok(), c_ok, "{label}: complexity {v}"),
+                    Err(_) => assert!(!c_ok, "{label}: complexity {v}"),
+                }
                 assert_same_settings(&rust, &mut c, &format!("{label}, complexity {v}"));
             }
             for v in losses {
                 let c_ok = c.try_set(sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST, v) == 0;
-                assert_eq!(rust.set_packet_loss_perc(v).is_ok(), c_ok, "{label}: loss {v}");
+                match u8::try_from(v) {
+                    Ok(v) => assert_eq!(rust.set_packet_loss_perc(v).is_ok(), c_ok, "{label}: loss {v}"),
+                    Err(_) => assert!(!c_ok, "{label}: loss {v}"),
+                }
                 assert_same_settings(&rust, &mut c, &format!("{label}, loss {v}"));
             }
             for on in [false, true] {
@@ -101,7 +117,7 @@ fn setters_refuse_what_libopus_refuses() {
                 c.vbr(on);
                 rust.set_vbr_constraint(!on);
                 c.set(sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, !on as i32);
-                rust.set_inband_fec(on);
+                rust.set_inband_fec(if on { InbandFec::On } else { InbandFec::Off });
                 c.set(sys::OPUS_SET_INBAND_FEC_REQUEST, on as i32);
                 assert_same_settings(&rust, &mut c, &format!("{label}, switches {on}"));
             }
@@ -120,11 +136,11 @@ fn setters_refuse_what_libopus_refuses() {
 fn bitrate_readback_follows_the_last_frame() {
     for (c_app, rate, channels) in [(APP_AUDIO, 48000, 2), (APP_VOIP, 16000, 1), (APP_LOWDELAY, 24000, 1)] {
         let pcm = signal(rate, channels, 0.5);
-        for setting in [Bitrate::Auto, Bitrate::Max, Bitrate::BitsPerSecond(600_000)] {
+        for setting in [Bitrate::Auto, Bitrate::Max, Bitrate::BitsPerSecond(NonZeroU32::new(600_000).unwrap())] {
             let c_value = match setting {
                 Bitrate::Auto => OPUS_AUTO,
                 Bitrate::Max => OPUS_BITRATE_MAX,
-                Bitrate::BitsPerSecond(bps) => bps,
+                Bitrate::BitsPerSecond(bps) => bps.get() as i32,
             };
             let mut rust = OpusEncoder::new(
                 SampleRate::try_from(rate as i32).unwrap(),
@@ -133,7 +149,7 @@ fn bitrate_readback_follows_the_last_frame() {
             )
             .unwrap();
             rust.set_complexity(5).unwrap();
-            rust.set_bitrate(setting).unwrap();
+            rust.set_bitrate(setting);
             let mut c = CEncoder::new(rate, channels, c_app);
             c.complexity(5).bitrate(c_value);
             let mut out = vec![0u8; 4000];
@@ -205,7 +221,7 @@ fn maximum_bitrate_gives_the_packets_of_libopus() {
                     )
                     .unwrap();
                     rust.set_complexity(5).unwrap();
-                    rust.set_bitrate(Bitrate::Max).unwrap();
+                    rust.set_bitrate(Bitrate::Max);
                     rust.set_vbr(vbr);
                     rust.set_force_mode(Some(ForcedMode::CeltOnly));
                     let mut c = CEncoder::new(rate, channels, APP_AUDIO);
@@ -243,7 +259,7 @@ fn unconstrained_vbr_follows_libopus() {
             )
             .unwrap();
             rust.set_complexity(5).unwrap();
-            rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
+            rust.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
             rust.set_vbr_constraint(constrained);
             let mut c = CEncoder::new(rate, channels, APP_LOWDELAY);
             c.complexity(5).bitrate(bitrate);

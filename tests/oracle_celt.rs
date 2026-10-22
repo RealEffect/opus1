@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
 use opus1::{
     Application as RsApp, Bitrate, Channels, OpusDecoder as RsDec, OpusEncoder as RsEnc, SampleRate,
@@ -65,7 +66,7 @@ fn impulse_fixture_hex() -> Option<&'static str> {
 #[cfg(target_arch = "aarch64")]
 fn first_packets(pcm: &[f32]) -> (Vec<u8>, Vec<u8>) {
     let mut rs_enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
-    rs_enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
     rs_enc.set_vbr(false);
     rs_enc.set_complexity(10).unwrap();
     let mut rs_buf = vec![0u8; 1276];
@@ -128,7 +129,7 @@ fn oracle_celt_sine_48k_mono_64k() {
     let fs = 960;
     let pcm = make_sine(sr, ch, fs, 440.0);
     let mut rs_enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
-    rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     rs_enc.set_vbr(false);
     rs_enc.set_complexity(10).unwrap();
     let mut rs_buf = vec![0u8; 1276];
@@ -174,7 +175,7 @@ fn oracle_celt_sine_48k_mono_64k() {
     }
     // Determinism: re-encode same input must be byte-identical
     let mut rs_enc2 = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
-    rs_enc2.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     rs_enc2.set_vbr(false);
     rs_enc2.set_complexity(10).unwrap();
     let mut rs_buf2 = vec![0u8; 1276];
@@ -196,7 +197,7 @@ fn oracle_impulse_48k_mono_64k() {
     let mut pcm = vec![0.0f32; fs * ch];
     pcm[0] = 1.0;
     let mut rs_enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
-    rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     rs_enc.set_vbr(false);
     rs_enc.set_complexity(10).unwrap();
     let mut rs_buf = vec![0u8; 1276];
@@ -239,7 +240,7 @@ fn oracle_impulse_48k_mono_64k() {
         );
     }
     let mut rs_enc2 = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
-    rs_enc2.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+    rs_enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     rs_enc2.set_vbr(false);
     rs_enc2.set_complexity(10).unwrap();
     let mut rs_buf2 = vec![0u8; 1276];
@@ -265,7 +266,7 @@ fn oracle_all_sr_ch_br() {
                     RsApp::Audio,
                 )
                 .unwrap();
-                rs_enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
+                rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
                 rs_enc.set_vbr(false);
                 rs_enc.set_complexity(10).unwrap();
                 let mut rs_buf = vec![0u8; 1276];

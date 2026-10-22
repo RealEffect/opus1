@@ -103,11 +103,9 @@ impl Error {
     /// (forward error correction), is not a whole number of 2.5 ms.
     pub(crate) const LOST_FRAME_SIZE: Error =
         Error::bad_arg("lost frame: frame_size must be a multiple of 2.5 ms");
-    pub(crate) const INVALID_BITRATE: Error = Error::bad_arg("invalid bitrate");
     pub(crate) const INVALID_COMPLEXITY: Error = Error::bad_arg("invalid complexity");
     pub(crate) const INVALID_LSB_DEPTH: Error = Error::bad_arg("invalid LSB depth");
     pub(crate) const INVALID_PACKET_LOSS: Error = Error::bad_arg("invalid packet loss percentage");
-    pub(crate) const INVALID_MAX_BANDWIDTH: Error = Error::bad_arg("invalid maximum bandwidth");
 
     /// An error of kind `kind` with the message `message`.
     pub(crate) const fn new(kind: ErrorKind, message: &'static str) -> Self {
