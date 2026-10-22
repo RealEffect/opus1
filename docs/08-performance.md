@@ -937,9 +937,11 @@ A check later that day ran the builds in turns with the default build on the A55
 
 The measurement of 2026-10-17 ran each build in turns with the default build, three passes, on both cores. It also measured the release profile, `cortex-a53`, and a `cortex-a55` build without the ARMv8.2-A extensions. Its results are in [Build settings for applications](#build-settings-for-applications). In short: ordering the instructions for the Cortex-A55 makes encoding 4 % to 5 % and decoding 1.3 % to 2.2 % faster on that core. Removing the ARMv8.2-A extensions keeps that gain, and the program then also runs on older cores. Ordering them for the Cortex-A76 makes the A55 15 % slower in encoding. All builds give the golden hashes of the default build.
 
-## Earlier measurement on x86-64
+## On x86-64
 
-The README keeps an older measurement on AMD Ryzen 7 5700X with the earlier `opus_vs_c` benchmark (opus-rs 0.1.x, mono encode, complexity 0). In the release described here, the x86-64 code paths were only compiled, not run. See [Differences from libopus](10-differences-from-libopus.md#platforms).
+The bench set ran once on x86-64, on an Intel Core i7-12700 (AVX2, FMA and AVX-VNNI, no AVX-512), on 2026-10-21, against libopus 1.6.1 at `-O2`. Geometric means over the bench set: opus1 took 0.90 of libopus's time to encode and 0.81 to decode under Linux in WSL2, and 0.88 and 0.80 natively on Windows. Low-complexity SILK encoding took 1.04 to 1.10 of libopus's time. On x86-64 the output is correct but not bit-exact with libopus. See [Differences from libopus](10-differences-from-libopus.md#platforms).
+
+The README also keeps an older measurement on AMD Ryzen 7 5700X with the earlier `opus_vs_c` benchmark (opus-rs 0.1.x, mono encode, complexity 0).
 
 ## See also
 

@@ -19,8 +19,13 @@ audiopus_sys = "0.2"
 # target requires it, and `fuzz.sh` builds it in a separate cargo call, so
 # the other targets keep opus1's default features (the neural network
 # features change what the decoder does on lost packets).
+#
+# `dred`: opus1's `osce-bwe` and `dred`, for `fuzz_dred` and
+# `fuzz_decoder_dnn` only. `fuzz.sh` builds them in a cargo call of their
+# own, for the same reason.
 [features]
 dnn = ["opus1/osce-bwe"]
+dred = ["opus1/osce-bwe", "opus1/dred"]
 
 [dev-dependencies]
 
@@ -164,6 +169,36 @@ test = false
 doc = false
 bench = false
 required-features = ["dnn"]
+
+[[bin]]
+name = "fuzz_extensions"
+path = "fuzz_targets/fuzz_extensions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_repacketizer"
+path = "fuzz_targets/fuzz_repacketizer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dred"
+path = "fuzz_targets/fuzz_dred.rs"
+test = false
+doc = false
+bench = false
+required-features = ["dred"]
+
+[[bin]]
+name = "fuzz_decoder_dnn"
+path = "fuzz_targets/fuzz_decoder_dnn.rs"
+test = false
+doc = false
+bench = false
+required-features = ["dred"]
 
 [profile.release]
 debug = 1

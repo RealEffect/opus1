@@ -54,6 +54,10 @@ build() {
     # its own keeps them out of the other targets.
     (cd "$FUZZ_DIR" && cargo build --release --target "$HOST" --manifest-path "$FUZZ_DIR/Cargo.toml" \
         --bin fuzz_dnn_blob --features dnn)
+    # fuzz_dred and fuzz_decoder_dnn need DRED as well, in a call of their
+    # own for the same reason.
+    (cd "$FUZZ_DIR" && cargo build --release --target "$HOST" --manifest-path "$FUZZ_DIR/Cargo.toml" \
+        --bin fuzz_dred --bin fuzz_decoder_dnn --features dred)
 }
 
 run() {

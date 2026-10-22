@@ -16,6 +16,7 @@ These documents explain the Opus audio codec and `opus1`. Opus is defined in RFC
 | [08 Performance](08-performance.md) | How speed is measured against libopus, the latest results, the changes that made the code fast, and how to reproduce the numbers. |
 | [09 Testing](09-testing.md) | How libopus is linked for the tests, what the tests compare, the groups of test files, the evaluation tools (the RFC 8251 conformance test, and the comparison of decoded audio with libopus's), the documentation examples, fuzzing, and the command for each part. |
 | [10 Differences from libopus](10-differences-from-libopus.md) | What `opus1` does not implement, where it differs on purpose, and how far its output differs from libopus, with the measured figures and the results of the evaluation tools. |
+| [Changes in 0.2.0](changelog-0.2.0.md) | The detailed list of changes from opus-rs 0.1.37 to opus1 0.2.0, with the measurements behind each fix. The README has the short release note. |
 | [Glossary](glossary.md) | The terms used in these documents, in alphabetical order. |
 
 ## Reading order for users

@@ -13,6 +13,10 @@
 
 #![allow(dead_code)]
 
+/// Encoded packets for the targets with the neural network features.
+#[cfg(feature = "dred")]
+pub mod pool;
+
 use audiopus_sys as sys;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use opus1::{Bitrate, FrameDuration};
@@ -759,4 +763,160 @@ impl Modes {
     pub fn reset(&mut self) {
         self.0 = None;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Packet extensions
+// ---------------------------------------------------------------------------
+//
+// libopus's extension code (src/extensions.c) and `opus_packet_pad_impl`
+// are internal, but the static library keeps their names, as for
+// `opus_packet_parse_impl` above. `tests/core_packet_extensions_libopus.rs`
+// calls them in the same way.
+
+/// libopus `opus_extension_data` (src/opus_private.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CExt {
+    pub id: c_int,
+    pub frame: c_int,
+    pub data: *const c_uchar,
+    pub len: i32,
+}
+
+pub const C_EXT_EMPTY: CExt = CExt { id: 0, frame: 0, data: std::ptr::null(), len: 0 };
+
+/// libopus `OpusExtensionIterator` (src/opus_private.h).
+#[repr(C)]
+pub struct CIter {
+    pub data: *const c_uchar,
+    pub curr_data: *const c_uchar,
+    pub repeat_data: *const c_uchar,
+    pub last_long: *const c_uchar,
+    pub src_data: *const c_uchar,
+    pub len: i32,
+    pub curr_len: i32,
+    pub repeat_len: i32,
+    pub src_len: i32,
+    pub trailing_short_len: i32,
+    pub nb_frames: c_int,
+    pub frame_max: c_int,
+    pub curr_frame: c_int,
+    pub repeat_frame: c_int,
+    pub repeat_l: c_uchar,
+}
+
+unsafe extern "C" {
+    pub fn opus_extension_iterator_init(iter: *mut CIter, data: *const c_uchar, len: i32, nb_frames: i32);
+    pub fn opus_extension_iterator_reset(iter: *mut CIter);
+    pub fn opus_extension_iterator_set_frame_max(iter: *mut CIter, frame_max: c_int);
+    pub fn opus_extension_iterator_next(iter: *mut CIter, ext: *mut CExt) -> c_int;
+    pub fn opus_extension_iterator_find(iter: *mut CIter, ext: *mut CExt, id: c_int) -> c_int;
+    pub fn opus_packet_extensions_count(data: *const c_uchar, len: i32, nb_frames: c_int) -> i32;
+    pub fn opus_packet_extensions_count_ext(data: *const c_uchar, len: i32, nb_frame_exts: *mut i32, nb_frames: c_int) -> i32;
+    pub fn opus_packet_extensions_parse(data: *const c_uchar, len: i32, exts: *mut CExt, nb: *mut i32, nb_frames: c_int) -> i32;
+    pub fn opus_packet_extensions_parse_ext(
+        data: *const c_uchar,
+        len: i32,
+        exts: *mut CExt,
+        nb: *mut i32,
+        nb_frame_exts: *const i32,
+        nb_frames: c_int,
+    ) -> i32;
+    pub fn opus_packet_extensions_generate(
+        data: *mut c_uchar,
+        len: i32,
+        exts: *const CExt,
+        nb: i32,
+        nb_frames: c_int,
+        pad: c_int,
+    ) -> i32;
+    pub fn opus_packet_pad_impl(data: *mut c_uchar, len: i32, new_len: i32, pad: c_int, exts: *const CExt, nb: c_int) -> i32;
+}
+
+/// The message opus1 gives for a libopus error code.
+pub fn err_str(code: i32) -> &'static str {
+    match code {
+        -1 => "Invalid argument",
+        -2 => "Output buffer too small",
+        -3 => "Internal error",
+        -4 => "Invalid packet",
+        0.. => "no error",
+        _ => panic!("unexpected libopus error {code}"),
+    }
+}
+
+/// An extension as plain values: ID, frame, payload.
+pub type Plain = (u8, usize, Vec<u8>);
+
+pub fn plain(e: &opus1::extensions::Extension) -> Plain {
+    (e.id, e.frame, e.data.to_vec())
+}
+
+pub fn c_plain(e: &CExt) -> Plain {
+    let data = if e.len > 0 { unsafe { std::slice::from_raw_parts(e.data, e.len as usize) }.to_vec() } else { Vec::new() };
+    (e.id as u8, e.frame as usize, data)
+}
+
+pub fn to_c(exts: &[opus1::extensions::Extension]) -> Vec<CExt> {
+    exts.iter()
+        .map(|e| CExt { id: e.id as c_int, frame: e.frame as c_int, data: e.data.as_ptr(), len: e.data.len() as i32 })
+        .collect()
+}
+
+/// A list of up to `max` extensions for `nb_frames` frames from the input,
+/// payloads cut from `pool`. Most are valid; some have an ID, a frame or a
+/// short payload that `generate` refuses. Some lists repeat one pattern in
+/// every frame from some frame on, so that `generate` writes repeats.
+pub fn arbitrary_extensions<'a>(
+    u: &mut Unstructured,
+    pool: &'a [u8],
+    nb_frames: usize,
+    max: usize,
+) -> Result<Vec<opus1::extensions::Extension<'a>>> {
+    use opus1::extensions::Extension;
+    let payload = |u: &mut Unstructured, id: u8| -> Result<&'a [u8]> {
+        let len = if id < 32 {
+            if u.ratio(1, 30)? { 2 } else { u.int_in_range(0..=1)? }
+        } else {
+            match u.int_in_range(0..=9)? {
+                0 => u.int_in_range(0..=700)?,
+                _ => u.int_in_range(0..=8)?,
+            }
+        };
+        let len = len.min(pool.len());
+        let start = u.int_in_range(0..=pool.len() - len)?;
+        Ok(&pool[start..start + len])
+    };
+    let id = |u: &mut Unstructured| -> Result<u8> {
+        Ok(if u.ratio(1, 40)? { u.arbitrary()? } else { u.int_in_range(3..=127)? })
+    };
+    let frame = |u: &mut Unstructured| -> Result<usize> {
+        Ok(if u.ratio(1, 40)? { u.int_in_range(0..=60)? } else { u.int_in_range(0..=nb_frames.max(1) - 1)? })
+    };
+    let mut exts = Vec::new();
+    if nb_frames > 0 && u.ratio(1, 3)? {
+        // One pattern in every frame from `first` on.
+        let first = u.int_in_range(0..=nb_frames - 1)?;
+        let mut pattern = Vec::new();
+        for _ in 0..u.int_in_range(1..=4)? {
+            let i = id(u)?;
+            pattern.push((i, payload(u, i)?));
+        }
+        for f in first..nb_frames {
+            for &(id, data) in &pattern {
+                if exts.len() < max {
+                    exts.push(Extension { id, frame: f, data });
+                }
+            }
+        }
+    }
+    let n = u.int_in_range(0..=max.saturating_sub(exts.len()).min(24))?;
+    for _ in 0..n {
+        let i = id(u)?;
+        let data = payload(u, i)?;
+        let at = u.int_in_range(0..=exts.len())?;
+        exts.insert(at, Extension { id: i, frame: frame(u)?, data });
+    }
+    Ok(exts)
 }

@@ -410,7 +410,7 @@ Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch
 
 `src/mathops.rs` also depends on the processor, for rounding rather than speed. On aarch64, `mac` and `mac_f64` compute `acc + a * b` with one fused multiply-add, which rounds once. The arm64 build of libopus does the same, because clang fuses such C expressions there. On other targets the product is rounded first.
 
-For this release the x86 code was compiled but not run on an x86 processor (the README lists this among the known gaps). The aarch64 code runs in every test on Apple silicon.
+The x86 code ran once on an Intel Core i7-12700 (AVX2, FMA and AVX-VNNI), on 2026-10-21. Its output is correct but not bit-exact with libopus: its vector kernels do not follow libopus's x86 kernels (see [Differences from libopus](10-differences-from-libopus.md#platforms)). The aarch64 code runs in every test on Apple silicon.
 
 ### The kernels of the neural networks
 

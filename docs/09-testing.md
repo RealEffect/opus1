@@ -21,14 +21,14 @@ Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-appl
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 280 | 1258 |
+| Integration tests in `tests/*.rs` | 282 | 1273 |
 | Unit tests inside `src/` | - | 377 |
-| Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (52) | - | 54 |
-| **Total** | | **1689** |
+| Documentation tests: the module `multistream` (2) and the Rust examples of `README.md` and `docs/` (53) | - | 55 |
+| **Total** | | **1705** |
 
-30 of these tests are ignored (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 16 directories of shared helper code (for example `tests/k24_common/` and `tests/analysis_common/`) and 6 files of recorded reference values (`*.expected`).
+29 of these tests are ignored, and the listing shows one more documentation example apart, which is not run (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 16 directories of shared helper code (for example `tests/k24_common/` and `tests/analysis_common/`) and 6 files of recorded reference values (`*.expected`).
 
-A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1645 tests that are not ignored on Apple M4 Pro (commit `5e899cd`). On the branch `next-dred` (commit `8aedd12`), `cargo test --release` passed all 1659 tests that are not ignored. On the branch `next-gaps`, with the tests of phase inversion disabling, the decoder gain and pitch, the 24-bit calls and the multistream controls (`core_controls_libopus`, `multistream_controls_libopus`), it passed all 1676 tests that are not ignored (30 ignored).
+A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1645 tests that are not ignored on Apple M4 Pro (commit `5e899cd`). On the branch `next-dred` (commit `8aedd12`), `cargo test --release` passed all 1659 tests that are not ignored. On the branch `next-gaps`, with the tests of phase inversion disabling, the decoder gain and pitch, the 24-bit calls and the multistream controls (`core_controls_libopus`, `multistream_controls_libopus`), it passed all 1676 tests that are not ignored (30 ignored). On the branch `next-release` (commit `3ecd7e0`, the x86 work included), `cargo test --release` without the corpora passed all 1676 tests that are not ignored (30 ignored, the documentation example included).
 
 The 23 files of the neural network code (`tests/dnn_*.rs`) have no tests in the default build: they need a model feature, and 12 of them also need `test-libopus-dnn` (see [Tests of the neural network code](#tests-of-the-neural-network-code)).
 
@@ -116,8 +116,8 @@ A test file's name starts with a prefix that says what it covers. The counts are
 
 | Prefix | Files | Tests | What the files cover |
 |---|---:|---:|---|
-| `multistream_` | 35 | 288 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`), the surround analysis (`_surround_*`), and the speech and music analysis and DTX of each stream (`_analysis_libopus`, `_analysis_walk_libopus`, `_dtx_libopus`). |
-| `core_` | 36 | 231 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the stereo width estimate (`core_stereo_width_libopus`, bit for bit against libopus's `compute_stereo_width`), the speech and music analysis (`core_analysis_libopus`, and with settings that change during a stream `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`) and the decoder controls of the neural network features. |
+| `multistream_` | 36 | 294 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`), the surround analysis (`_surround_*`), and the speech and music analysis and DTX of each stream (`_analysis_libopus`, `_analysis_walk_libopus`, `_dtx_libopus`). |
+| `core_` | 37 | 240 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the stereo width estimate (`core_stereo_width_libopus`, bit for bit against libopus's `compute_stereo_width`), the speech and music analysis (`core_analysis_libopus`, and with settings that change during a stream `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`) and the decoder controls of the neural network features. |
 | `dnn_` | 23 | 0 | The neural network code: kernels, the layers of every network, weights, signal analysis, the models of deep PLC and of OSCE. Their tests compile only with a model feature (see [Tests of the neural network code](#tests-of-the-neural-network-code)). |
 | `perfk_` | 33 | 114 | Guards for the speed work. Each rewritten kernel is compared with the libopus function, with reference values recorded from libopus, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
 | `celtenc_` | 19 | 93 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching, the rate rules (`celtenc_rate_rules.rs`), the results of the speech and music analysis (`celtenc_analysis_info_libopus.rs`). |

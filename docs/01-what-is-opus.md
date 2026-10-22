@@ -408,9 +408,9 @@ opus1 is a port of libopus 1.6 to Rust. It has no C code and no C dependency. Bu
 The main gaps:
 
 - the integer version of the speech/music analysis that the fixed-point build of libopus runs (opus1 ports the floating-point version);
-- some controls, for example phase inversion and a decoder output gain;
+- a few controls, for example the decoder's `OPUS_GET_BANDWIDTH` and `OPUS_SET_IGNORE_EXTENSIONS`;
 - the quality extension (the machine-learning tools deep PLC, OSCE and DRED are there, behind the cargo features `deep-plc`, `osce`, `osce-bwe` and `dred`, and so are packet extensions);
 - ambisonics with a demixing matrix (mapping family 3);
-- on x86-64, the code compiles but has not been run.
+- bit-exact output on x86-64: there the output is correct, but it is not libopus's to the last bit.
 
 [Differences from libopus](10-differences-from-libopus.md) lists every known difference with its measured size. [Performance](08-performance.md) compares the speed of opus1 with that of libopus. To start using the library, read [Using the library](06-using-the-library.md).

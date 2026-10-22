@@ -16,9 +16,11 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 ## Features
 
 - **Pure Rust** — no C dependencies
-- **High performance:** on Apple M4 Pro, decoding takes 0.56-0.81x and encoding 0.48-0.71x the time of C libopus 1.6.1 built at `-O2`, the optimization level of libopus's own build, at every complexity, with the speech and music analysis in both from complexity 7 on. Against the Homebrew build of libopus 1.6.1, which behaves like a build at `-Os` and takes about 24 % more time to encode and 12 % more to decode, the ranges are 0.49-0.76x and 0.37-0.63x. opus1 is also faster than libopus on the big and the small cores of an Android phone (see [Performance](#performance))
+- **High performance:** on Apple M4 Pro, decoding takes 0.56-0.81x and encoding 0.48-0.71x the time of C libopus 1.6.1 built at `-O2`, the optimization level of libopus's own build, at every complexity, with the speech and music analysis in both from complexity 7 on. Against the Homebrew build of libopus 1.6.1, which behaves like a build at `-Os` and takes about 24 % more time to encode and 12 % more to decode, the ranges are 0.49-0.76x and 0.37-0.63x. opus1 is also faster than libopus on the big and the small cores of an Android phone, and on average over the bench set on an Intel Core i7-12700 (x86-64) (see [Performance](#performance))
 - **Multichannel:** multistream encoder and decoder (mapping families 0, 1, 2 and 255), interoperable with libopus
-- **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels, signal type, input bit depth, DTX)
+- **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels, signal type, input bit depth, DTX, frame duration from 2.5 to 120 ms)
+- **Packets:** the `packet` module parses, writes and pads packets and has libopus's repacketizer. The `extensions` module reads and writes the padding extensions of libopus 1.5 and later
+- **64-bit ARM and x86-64:** on 64-bit ARM the output is checked bit for bit against libopus 1.6.1. On x86-64 it is correct but not bit-exact with libopus: opus1's x86 vector kernels do not follow libopus's, and libopus's own x86 output depends on the C compiler (see [docs/10](docs/10-differences-from-libopus.md#platforms))
 - **The speech and music analysis of libopus:** from complexity 7 on, the encoder estimates whether the input is speech or music and which bandwidth it uses, as libopus does, with the same results to the last bit on 64-bit ARM. CELT-only packets at complexity 7 to 10 are libopus's byte for byte
 - **The neural decoder features of libopus 1.5 and 1.6 (optional):** deep packet loss concealment, the LACE and NoLACE speech enhancement of SILK, and the bandwidth extension of SILK wideband to fullband. Each is compiled only with its cargo feature and runs only when the decoder complexity is raised, as in libopus: `set_complexity(5)` for deep PLC (packet loss concealment), 6 for LACE, 7 for NoLACE, and 4 with `set_osce_bwe(true)` for the bandwidth extension. On 64-bit ARM the output is that of libopus 1.6.1 built with these features (without loop vectorization) to the last bit.
 - **Deep redundancy (DRED, optional):** with the cargo feature `dred`, the encoder adds a compressed description of up to about one second of earlier speech to each packet (`set_dred_duration`, libopus `OPUS_SET_DRED_DURATION`), and the decoder rebuilds a burst of lost packets from the next packet that arrives (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`). CELT-only packets with DRED, and the DRED data in SILK and Hybrid packets with the `Audio` application and VBR, are those of libopus 1.6.1 built with DRED, byte for byte. Decoding gives libopus's output to the last bit.
@@ -58,7 +60,9 @@ assert_eq!(samples, 320);
 
 The public API is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`,
 `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec`,
-`pcm_soft_clip`) and the modules `packet` and `multistream`. [docs/06](docs/06-using-the-library.md) shows the settings and
+`pcm_soft_clip`) and the modules `packet`, `extensions` and `multistream` (which
+needs `std`). The neural network features add `DnnBlob` and `DnnModels`, and
+`dred` adds `OpusDredDecoder`, `OpusDred` and `DredParse`. [docs/06](docs/06-using-the-library.md) shows the settings and
 recipes for calls, voice agents and music.
 
 Decoding to 16-bit PCM, and recovering a lost packet from the in-band
@@ -160,6 +164,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 | `osce`   | no      | LACE and NoLACE, the speech enhancement of SILK (decoder complexity 6 and 7; weights 1,573,440 bytes). Turns on `deep-plc`, as libopus's `--enable-osce` does. |
 | `osce-bwe` | no    | The bandwidth extension of SILK wideband to 48 kHz fullband output, switched on with `set_osce_bwe` (weights 685,888 bytes). Turns on `osce`. |
 | `dred`   | no      | Deep redundancy (DRED): the encoder writes DRED data (`OpusEncoder::set_dred_duration`), the decoder rebuilds lost packets from it (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`). Embeds the RDOVAE encoder and decoder (weights 565,440 bytes). Turns on `deep-plc`, as libopus's `--enable-dred` does. |
+| `dnn`    | no      | The code that the neural network features share (layer kernels, weight blob parser). Not meant to be selected alone: `deep-plc`, `osce`, `osce-bwe` and `dred` turn it on. |
 | `test-libopus-dnn` | no | Test only: compiles the tests that compare with a libopus built with its neural network code (see [docs/09](docs/09-testing.md#tests-of-the-neural-network-code)). |
 | `libm`   | no      | Required for `#![no_std]` builds — provides float math via a pure-Rust port of musl `libm`. Not needed when `std` is on. |
 
@@ -168,7 +173,9 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 ### Notes for `no_std` users
 
 - **Large structs:** without `heap`, every working buffer is inline, so
-  `OpusEncoder`/`OpusDecoder` are large (~154 KB with the `analysis` feature, ~128 KB without it / ~60 KB). Place them in a
+  `OpusEncoder` and `OpusDecoder` are large: on aarch64 the encoder takes
+  about 154 KB with the `analysis` feature and 128 KB without it, and the
+  decoder about 60 KB. Place them in a
   `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather
   than on the stack. The test suite of this build needs big test-thread stacks:
   `scripts/check_no_std.sh` sets `RUST_MIN_STACK=33554432` (32 MiB).
@@ -298,11 +305,20 @@ On aarch64 the FFT uses the FEAT_FCMA complex multiply-add instructions (part of
 the Apple aarch64 baseline). Other aarch64 targets detect them at run time with
 `std`. On aarch64 the FFT and MDCT give the same bits as the arm64 build of libopus.
 
+### x86-64 (Intel Core i7-12700)
+
+Measured on 2026-10-21 on an Intel Core i7-12700 (AVX2, FMA and AVX-VNNI, no
+AVX-512) against libopus 1.6.1 at `-O2` (geometric means over the bench set):
+opus1 takes 0.90 of libopus's time to encode and 0.81 to decode under Linux in
+WSL2, and 0.88 and 0.80 natively on Windows. Low-complexity SILK encoding took
+1.04 to 1.10 of libopus's time. On x86-64 the output is correct but not
+bit-exact with libopus (see
+[docs/10](docs/10-differences-from-libopus.md#platforms)).
+
 ### Earlier measurement: x86-64 (AVX2/FMA), opus-rs 0.1.x
 
 Measured on AMD Ryzen 7 5700X with the earlier `opus_vs_c` benchmark (mono encode only,
-complexity 0). The x86-64 code paths were only compile-checked in the work described
-under Unreleased below; they were not run.
+complexity 0).
 
 | Config | Pure Rust | C Opus | Ratio |
 |--------|-----------|--------|-------|
@@ -316,335 +332,128 @@ under Unreleased below; they were not run.
 
 ### 0.2.0 (unreleased)
 
-The crate is renamed from `opus-rs` to `opus1`. Code that used `opus_rs::` now uses `opus1::`.
+The crate is renamed from `opus-rs` to `opus1`: code that used `opus_rs::` now
+uses `opus1::`. This release follows libopus 1.6.1 and was checked against it
+throughout: every fix has a test that compares opus1 with the C library under
+the same settings. The full list of changes, with the measurements behind each
+fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
 
-This release was checked against libopus 1.6.1 throughout: every fix below has a
-test that compares opus1 with the C library under the same settings.
-
-**Breaking changes to the public interface**
-- `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
-  so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
-  call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
-  `set_bandwidth(Bandwidth::Superwideband)` or `set_bandwidth(Bandwidth::Fullband)`,
-  so that low bitrates do not fall back to wideband SILK.
-- The public field `OpusDecoder::hybrid_skip_celt` is removed. The decoder never
-  read it.
+**Breaking changes**
+- The crate name: `opus1` instead of `opus-rs`.
 - The settings of `OpusEncoder` are methods instead of public fields:
-  `set_bitrate` with `bitrate_setting` and `bitrate`, `set_complexity` and
-  `complexity`, `set_vbr` and `vbr` (instead of `use_cbr`, with the opposite
-  meaning), `set_inband_fec` and `inband_fec`, `set_packet_loss_perc` and
-  `packet_loss_perc`. Each setter checks its value as libopus's `OPUS_SET_*`
-  request does. A bitrate of 0 or less, a complexity outside 0-10 and a packet
-  loss outside 0-100 % are errors, and the setting keeps its old value. A
-  bitrate is raised to at least 500 b/s and limited to at most 750,000 b/s per
-  channel. The encoder no longer
-  clamps the settings on every `encode` call.
-- The default bitrate of `OpusEncoder` is libopus's automatic one,
-  `Bitrate::Auto`: 60 × rate / frame size + rate × channels b/s, for example
-  19 kb/s for 16 kHz mono and 99 kb/s for 48 kHz stereo in 20 ms frames. It was
-  a fixed 64 kb/s. An encoder that is given a bitrate writes the same packets as
-  before.
-- `Bitrate` moved from `opus1::multistream` to the crate root.
-  `OpusEncoder::set_bitrate` takes it too, so a single stream now also has
-  `Bitrate::Auto` (libopus `OPUS_AUTO`) and `Bitrate::Max` (`OPUS_BITRATE_MAX`).
-- New: `set_vbr_constraint` on `OpusEncoder` and `MultistreamEncoder` (libopus
-  `OPUS_SET_VBR_CONSTRAINT`). Turning the constraint off gives CELT-only packets
-  an unconstrained variable bitrate.
-- The internal modules are private. The public API is the crate root
-  (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`,
-  `ForcedMode`, `pcm_soft_clip`) and the modules `packet` and `multistream`. The
-  modules `bands`, `celt`, `celt_lpc`, `hp_cutoff`, `kiss_fft`, `mdct`, `modes`,
-  `pitch`, `pvq`, `quant_bands`, `range_coder`, `rate` and `silk`, the types
-  `CeltEncoder`, `CeltDecoder`, `SilkResampler`, `SilkResamplerDown1_3` and
-  `SilkResamplerDown1_6` at the crate root, and the macro `tell_frac_inline!`
-  are no longer exported. The submodules of
-  `multistream` are private too; their public items, `validate_ambisonics`
-  included, are in `opus1::multistream`. The tests of this repository reach
-  internal items through `opus1::internals`, which is hidden from the
-  documentation and not part of the stable API.
-- `OpusDecoder::decode` no longer sets the part of `output` after the decoded
-  samples to zero. As in libopus, it writes only the samples it returns. A program
-  that relied on the zeros must clear the buffer itself.
-
-**24 kHz audio**
-- **Fix: Hybrid super-wideband packets decoded with 21 CELT bands instead of 19.**
-  Every 24 kHz speech stream at the usual VoIP bitrates is Hybrid super-wideband,
-  so its 8-12 kHz band decoded to unrelated content. Now within 124 dB of libopus.
-- **Fix: the encoder chooses mode and bandwidth from the bitrate, as libopus does.**
-  24 kHz input was always coded super-wideband; Hybrid VBR coded about 25 kb/s
-  when 14 kb/s was asked for; in-band forward error correction (FEC) that lowered
-  the bandwidth divided by zero.
-- Other decoder fixes found on the way, none specific to 24 kHz: 10 ms SILK and
-  Hybrid frames decoded to noise; mode switches and redundancy frames; SILK output
-  at 8 and 12 kHz used the wrong resampler; SILK packet loss concealment (four
-  differences, plus comfort noise); two CELT band rules for 2.5 and 5 ms frames.
+  `set_bitrate`, `set_complexity`, `set_vbr` (instead of `use_cbr`, with the
+  opposite meaning), `set_inband_fec` and `set_packet_loss_perc`, each with its
+  getter. Each setter refuses the values that libopus refuses, and the setting
+  then keeps its old value.
+- The default bitrate is libopus's automatic one, `Bitrate::Auto` (for example
+  19 kb/s for 16 kHz mono in 20 ms frames), instead of a fixed 64 kb/s.
+  `Bitrate` moved from `opus1::multistream` to the crate root.
+- `OpusEncoder::enable_hybrid_mode` and the field `OpusDecoder::hybrid_skip_celt`
+  are removed. To ask for Hybrid packets, call
+  `set_force_mode(Some(ForcedMode::Hybrid))` and `set_bandwidth`.
+- The internal modules are private. The public API is the crate root and the
+  modules `packet`, `extensions` and `multistream`.
+- `OpusDecoder::decode` writes only the samples it returns and no longer sets
+  the rest of `output` to zero. Float output is no longer clamped to [-1, 1].
+- The encoder now chooses mode, bandwidth and channel count as libopus does, so
+  its packets change: for example a 16 kHz `Voip` encoder codes CELT at 64 kb/s
+  and SILK at speech rates. `encode_i16` codes with an input precision of 16
+  bits, as libopus `opus_encode` does.
 
 **New features**
-- `multistream::MultistreamEncoder` (surround families 0, 1, 2 and 255, rate
-  allocation, LFE stream, surround masking) and a general `MultistreamDecoder`
-  (any valid layout, 16-bit output, loss concealment, FEC). Packets interoperate
-  with libopus's multistream encoder and decoder in both directions.
-- `OpusDecoder`: `decode_i16` (soft clipping as `opus_decode`), `decode_fec`,
-  `decode_fec_i16`, `final_range`, `reset_state`; packets whose channel count
-  differs from the decoder's; CELT packet loss concealment ported from libopus.
-- `OpusEncoder`: `set_force_mode`, `set_bandwidth`, `set_max_bandwidth`,
-  `set_force_channels`, `set_lfe`, `set_energy_mask`, `final_range`,
-  `reset_state`, `lookahead`.
-- Frames of 80, 100 and 120 ms in `OpusEncoder` and `MultistreamEncoder`,
-  coded as libopus 1.6.1 codes them: CELT and Hybrid as four to six 20 ms
-  frames, SILK as two 40 ms, five 20 ms or two 60 ms frames, in one packet.
-  With CBR every packet has libopus's size, and CELT-only packets at
-  complexity 0 to 5 are libopus's byte for byte. With VBR a part is not cut
-  to its share of the bitrate, as with 40 and 60 ms (with in-band FEC that
-  limit cost libopus about 20 dB in the streams measured).
-- `set_expert_frame_duration` and `expert_frame_duration` on `OpusEncoder`
-  and `MultistreamEncoder`, with the new type `FrameDuration` (libopus
-  `OPUS_SET_EXPERT_FRAME_DURATION`): each call codes one frame of the duration
-  that is set. The multistream encoder no longer differs from libopus in its
-  frame sizes (difference D3).
-- `packet` module: parse, write and pad packets, self-delimited framing.
-- The speech and music analysis of libopus (`analysis.c`, `mlp.c`), in the
-  new module `src/analysis/` (cargo feature `analysis`, on by default). From
-  complexity 7 on, for input at 16 to 48 kHz, it estimates per packet how
-  likely the input is speech or music, how tonal it is, whether it holds any
-  sound and which bandwidth it uses. The mode, bandwidth, channel and FEC
-  decisions, the activity given to SILK, and five decisions of the CELT
-  encoder (allocation trim, extra bits for leaking bands, pre-filter gain, VBR
-  target, coded bandwidth) use it as libopus does. On 64-bit ARM the analysis
-  gives libopus's results in every field of every frame, and CELT-only packets
-  at complexity 7 to 10 are libopus's byte for byte. Its NEON code takes 0.27 to
-  0.40 of the time of libopus's analysis.
-- Discontinuous transmission (DTX): `set_dtx`, `dtx` and `in_dtx` on
-  `OpusEncoder`, `set_dtx` and `dtx` on `MultistreamEncoder` (libopus
-  `OPUS_SET_DTX`, `OPUS_GET_IN_DTX`), with both kinds of DTX of libopus: that
-  of the Opus layer, which uses the analysis, and SILK's.
-- New encoder controls of libopus: `set_signal` with the type `Signal`
-  (`OPUS_SET_SIGNAL`), `set_lsb_depth` (`OPUS_SET_LSB_DEPTH`) and
-  `set_inband_fec_mode` with the type `InbandFec` (`OPUS_SET_INBAND_FEC` 2,
-  FEC that does not move music to SILK). The multistream encoder forwards
-  them to every stream.
-- The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity`, `set_osce_bwe` and `set_dnn_blob` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/10](docs/10-differences-from-libopus.md)).
-- `OpusDecoder::last_packet_duration()` and `packet::has_lbrr()`, as libopus has them.
-- Phase inversion disabling: `set_phase_inversion_disabled` and
-  `phase_inversion_disabled` on `OpusEncoder`, `OpusDecoder`,
-  `MultistreamEncoder` and `MultistreamDecoder`
-  (`OPUS_SET_PHASE_INVERSION_DISABLED`). CELT's intensity stereo then never
-  inverts the second channel, which makes a mono downmix sound better.
-- Decoder output gain and pitch: `OpusDecoder::set_gain` and `gain`
-  (`OPUS_SET_GAIN`, in 1/256 dB, also on `MultistreamDecoder`) and
-  `OpusDecoder::pitch` (`OPUS_GET_PITCH`).
+- Multichannel: `multistream::MultistreamEncoder` (mapping families 0, 1, 2 and
+  255, with libopus's rate allocation, LFE stream and surround masking) and
+  `MultistreamDecoder` (any valid layout). Packets interoperate with libopus in
+  both directions.
+- Every frame duration from 2.5 to 120 ms: frames of 80, 100 and 120 ms are new,
+  and `set_expert_frame_duration` with the type `FrameDuration` sets one.
+- The speech and music analysis of libopus (feature `analysis`, on by default),
+  which runs from complexity 7 on, and discontinuous transmission (DTX):
+  `set_dtx`, `dtx` and `in_dtx`.
+- The neural decoder features of libopus 1.5 and 1.6 (features `deep-plc`,
+  `osce`, `osce-bwe`): deep packet loss concealment, the LACE and NoLACE speech
+  enhancement of SILK, and the bandwidth extension (BWE) of SILK wideband to
+  fullband.
+- Deep redundancy (DRED, feature `dred`): `OpusEncoder::set_dred_duration`,
+  and `OpusDredDecoder`, `OpusDred` and `OpusDecoder::dred_decode` on the
+  decoder side.
+- Packet extensions of libopus 1.5 and later: the module `extensions`,
+  `packet::Repacketizer`, `packet::pad_with_extensions`, `packet::unpad` and
+  `packet::multistream_unpad`.
+- New controls of libopus. Decoder: `decode_i16`, `decode_fec`, `final_range`,
+  `reset_state`, `last_packet_duration`, `set_gain`, `pitch` and
+  `set_phase_inversion_disabled`. Encoder: `set_force_mode`, `set_bandwidth`,
+  `set_max_bandwidth`, `set_force_channels`, `set_signal`, `set_lsb_depth`,
+  `set_inband_fec_mode`, `set_vbr_constraint`, `set_application`,
+  `set_voice_ratio`, `set_phase_inversion_disabled` and `lookahead`. The
+  multistream encoder and decoder forward the controls that libopus's forward.
 - The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,
-  `OpusDecoder::decode24` and `decode_fec24`, and the multistream versions
-  (`opus_encode24`, `opus_decode24`, `opus_multistream_encode24`,
-  `opus_multistream_decode24`).
-- `OpusEncoder::set_application` and `application` (`OPUS_SET_APPLICATION`,
-  before the first frame), and `set_voice_ratio` and `voice_ratio`
-  (`OPUS_SET_VOICE_RATIO`).
-- `MultistreamEncoder` forwards the forced channel count, the prediction and
-  phase inversion switches, the application and the voice ratio as libopus
-  does (difference D5 closed).
-- Deep redundancy (DRED, cargo feature `dred`, off by default), as in libopus 1.5 and later: `OpusEncoder::set_dred_duration` and `dred_duration` (`OPUS_SET_DRED_DURATION`, `OPUS_GET_DRED_DURATION`), `OpusEncoder::set_dnn_blob`, and on the decoder side `OpusDredDecoder` (`opus_dred_decoder_*`, `opus_dred_parse`, `opus_dred_process`), `OpusDred` (`opus_dred_alloc`) and `OpusDecoder::dred_decode`, `dred_decode_float` and `dred_decode24` (`opus_decoder_dred_decode*`). Without the feature, or with a duration of 0, the packets do not change.
-- Packet extensions of libopus 1.5 and later: the module `extensions` (libopus `src/extensions.c`), `packet::Repacketizer` (libopus `OpusRepacketizer`), which carries extensions, and `packet::pad_with_extensions`, `packet::unpad` and `packet::multistream_unpad`.
-- Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/09](docs/09-testing.md#evaluation-tools)).
+  `OpusDecoder::decode24` and `decode_fec24`, and their multistream versions.
 
-**Behaviour changes**
-- Float output is no longer clamped to [-1, 1] (libopus does not clip float output).
-  Use `decode_i16` for 16-bit output.
-- `packet::pad` and `packet::multistream_pad` keep the extensions in the padding
-  of a packet, and fail with "Internal error" when the padding is not valid
-  extension data, as libopus does. Before, they wrote zeros.
-- The automatic mode choice follows libopus. At 64 kb/s a 16 kHz VoIP encoder
-  now codes CELT, as libopus does at that bitrate. At speech rates (for example
-  16-24 kb/s, or the automatic 19 kb/s of 20 ms frames) it codes SILK.
-- Stereo input is coded as mono at low bitrates, as libopus does.
-- `encode_i16` codes with an input precision of 16 bits, as libopus
-  `opus_encode` does. From complexity 7 on its packets can differ from those
-  of `encode` with the default precision of 24 bits; `set_lsb_depth(16)` makes
-  them equal.
-- From complexity 7 on, the speech and music analysis changes the packets of
-  every stream at 16 to 48 kHz, towards those of libopus.
-- Encoder output changed to follow libopus in many places (stereo pitch
-  pre-filter, `theta_rdo` at complexity 8 and above, SILK pitch analysis, pulse
-  search, band energies, FFT and MDCT rounding on aarch64). A voiced 300-packet
-  SILK stream is byte-identical to fixed-point libopus.
-- With `Voip` at 48 kHz, SILK now reads the float high-pass filter's output,
-  as the float build of libopus does. The integer filter of the fixed-point
-  build added a constant of about -9 to the 16-bit signal there, which SILK
-  coded as low-frequency energy in 7.6 to 9.2 % of the 10 ms frames of speech.
-  On 222 TSP speech files the error against the original, relative to
-  libopus's, fell from between 1.21 and 3.28 to between 0.98 and 1.09
-  (complexity 5, 20 ms, 6 to 64 kb/s). At 8 to 24 kHz SILK keeps the integer
-  filter ([docs/10](docs/10-differences-from-libopus.md#paired-comparison-with-the-evaluation-harness)).
-- With `Voip` at 8 to 24 kHz the integer high-pass filter in front of SILK
-  runs on every frame, as in the fixed-point build of libopus. It ran only on
-  frames that SILK coded, so the first SILK frame after CELT-only frames
-  started from an old filter state, which SILK coded as energy below 200 Hz.
-  Streams that change between SILK and CELT-only no longer have that energy.
-  Streams without CELT-only frames do not change.
-- SILK's NLSF weights follow libopus for the last coefficient (distance to
-  `1 << 15`, not to 32767). Stereo SILK streams that left the fixed-point
-  build's packets after 274 and 322 packets now stay byte-identical.
+**Quality fixes**
+- 48 kHz `Voip`: SILK now reads the float high-pass filter's output, as the
+  float build of libopus does. The integer filter added a constant of about -9
+  to the 16-bit signal, which SILK coded as a burst of low-frequency energy in
+  7.6 to 9.2 % of the 10 ms frames of speech. On 222 TSP speech files the error
+  against the original, relative to libopus's, fell from between 1.21 and 3.28
+  to between 0.98 and 1.09.
+- 8 to 24 kHz `Voip`: the first SILK frame after CELT-only frames no longer
+  codes energy below 200 Hz.
+- 24 kHz: Hybrid super-wideband packets decoded with 21 CELT bands instead of
+  19, so the 8-12 kHz band of every 24 kHz speech stream at the usual VoIP
+  bitrates decoded to unrelated content.
+- Stereo SILK and Hybrid: the decoded channels had the wrong sign and level
+  (issue #42), and the side signal is now coded as libopus codes it (issue #48).
+- SILK: VBR ignored the bitrate (issue #43); CBR with in-band FEC turned
+  packets into concealed frames (issue #51); 12 kHz (mediumband) packets
+  decoded to noise (issue #53); 10 ms SILK and Hybrid frames decoded to noise.
+- Closer to libopus on 64-bit ARM: the CELT encoder writes libopus's packets in
+  all 1,080,000 packets of the 960 streams of `celtenc_gap_report` (up from
+  91.2 %), and the CELT decoder gives libopus's samples in 51 of 51 CELT
+  streams and 28 of 29 Hybrid streams of `perf_harness modes`.
 
-**Closer to libopus** (aarch64, against libopus 1.6.1)
-- The CELT encoder writes the packets of libopus: all 1,080,000 packets of the
-  960 streams of `celtenc_gap_report` (mono and stereo, 16 and 48 kHz, 2.5 to
-  20 ms, CBR and VBR, complexity 4 to 9), up from 91.2 %. Through `OpusEncoder`,
-  with the speech and music analysis, CELT-only packets at complexity 7 to 10
-  are libopus's too. Stereo input whose channels are scaled copies of
-  each other, and very quiet signals such as the decaying output of the DC
-  filter after a signal stops, give the packets of libopus too
-  (`intensity_stereo`, the transient analysis and the fades of the Opus layer
-  now round as libopus does).
-- Digital silence is handled as libopus handles it: CELT measures the silence
-  flag of a stereo input coded as mono over the first half of the frame, and
-  SILK is told that a frame of digital silence has no voice activity.
-- The CELT decoder gives the samples of libopus: 51 of 51 CELT streams and 28 of
-  29 Hybrid streams of `perf_harness modes` (8 and 25 before), and every
-  concealed frame of the CELT loss tests and the multistream loss tests.
-- What changed: the pitch analysis of the pre-filter and the loss concealment
-  (one shared, libopus-rounded set of functions; the concealment's copies are
-  gone), the comb filter (four taps had too few digits, and its rounding), the
-  coarse energy prediction, a dynalloc boost that only libopus's main branch
-  has, the 750 kb/s per channel limit and the silent VBR frame of the CELT
-  encoder, `celt_log2` in the surround masking, and one `silk_lin2log` that
-  gives libopus's result for 0.
-- Speed: the pitch analysis got new kernels (the decimation and lag 4 inside
-  the autocorrelation chain, eight samples per step in the correlation, energy
-  sums inside the correlation passes), and the comb filter became faster.
-  Against the state before these changes, in the 13 CELT scenarios of the
-  bench, encode time changed by -1.4 to +0.9 % and decode time by -2.9 to
-  +0.5 % (three alternating runs on a busy machine, where single rows vary by
-  about 2 %). Frames of 20 ms are faster. Frames of 2.5 ms are slightly
-  slower: the exact pitch analysis costs about 0.3 µs more per frame, and six
-  more alternating runs measured +0.6 % encode time for stereo 128 kb/s c9
-  with 2.5 ms frames.
+**Speed** (opus1's time divided by libopus 1.6.1's; below 1 means opus1 is
+faster; geometric means over the bench set; see [Performance](#performance))
 
-**Performance** (Apple M4 Pro, see [Performance](#performance))
-- Decoding takes 35-62 % less time than in 0.1.37 and is now faster than libopus
-  in every measured scenario (it was 3-33 % slower).
-- Encoding takes 33-56 % less time for SILK and Hybrid and 29-49 % less for
-  mono CELT. Stereo CELT encoding takes 24-30 % less at complexity 0 and 5, and
-  2-22 % more at complexity 9 and 10, where it now runs libopus's stereo pitch
-  pre-filter and `theta_rdo`.
-- The main changes: NEON kernels for the delayed-decision quantizer, warped
-  autocorrelation, cross-correlations, comb filters and de-emphasis; FFT with
-  FEAT_FCMA instructions; fewer copies and no zero-filling of buffers that are
-  overwritten.
-- Work for in-order cores such as the Cortex-A55: the pitch analysis of the
-  CELT encoder, the post-filter of the CELT decoder, the SILK noise-shaping
-  quantizers, and the PVQ search, the spreading rotation and the bit allocation
-  of the CELT encoder now give such a core independent work at each step. The output is the same.
-  Against the code before, run in turns (geometric means over the bench set),
-  encoding takes 10.8-11.1 % less time on the Cortex-A55 of an Android phone,
-  7.5 % less on its Cortex-A76 and 2.5-2.8 % less on Apple M4 Pro. Decoding
-  takes 1.9-2.0 % less on the Cortex-A55 and 1.0 % less on the Cortex-A76.
-- A second round of this work, again with the same output:
-  - The PVQ search places the next pulse in advance and checks each pulse
-    with fewer instructions.
-  - `bits2pulses` and the two allocation searches use vector compares and
-    sums instead of chains of dependent steps.
-  - The cosines of the spreading rotation no longer call the C library.
-  - The delayed-decision quantizer keeps its shaping coefficients in
-    registers. On Apple cores it starts its shaping filter before the
-    survivors are chosen.
-  - The CELT decoder builds its spectrum in place. Its FFT, inverse MDCT and
-    de-emphasis work on two independent groups per step.
+| | Encoding | Decoding |
+|---|---:|---:|
+| Apple M4 Pro, libopus at `-O2` | 0.572 | 0.669 |
+| Apple M4 Pro, Homebrew libopus | 0.461 | 0.598 |
+| Cortex-A76 (Android phone, MediaTek MT6833) | 0.668 | 0.768 |
+| Cortex-A55 (same phone) | 0.698 | 0.824 |
+| Intel Core i7-12700, Linux in WSL2 | 0.90 | 0.81 |
+| Intel Core i7-12700, Windows | 0.88 | 0.80 |
 
-  Against the code before, run in turns, encoding takes 3.1-3.5 % less time
-  on Apple M4 Pro, 1.5 % less on the Cortex-A76 and 1.5-1.8 % less on the
-  Cortex-A55. Decoding takes 1.9-2.2 %, 1.4 % and 1.7-1.8 % less.
-- The C reference for these numbers is the release libopus 1.6.1, built from
-  Xiph's release file with the settings of its own `configure`
-  (`scripts/android/build-libopus.sh --src`). Earlier phone runs linked the
-  libopus main branch, which writes other packets than 1.6.1 for many SILK,
-  Hybrid and LFE streams.
-- Fixes found in review: several vector kernels read past the end of short
-  slices; `compute_theta` wrote through a shared reference, so its output depended
-  on inlining.
+On x86-64, low-complexity SILK encoding took 1.04 to 1.10 of libopus's time.
+Against opus-rs 0.1.37 on Apple M4 Pro, decoding takes 35-62 % less time, and
+encoding 33-56 % less for SILK and Hybrid and 29-49 % less for mono CELT.
+Stereo CELT encoding at complexity 9 and 10 takes 2-22 % more time, because it
+now runs libopus's stereo pitch pre-filter and `theta_rdo`.
 
-**Fuzzing**
-- The 19 fuzz targets in `fuzz/` build and run on the stable toolchain
-  (`fuzz/fuzz.sh`), with overflow checks on. Six of them compare with
-  libopus: packet parsing, padding and writing; a decoder fed packet
-  streams with losses and FEC; the multistream decoder and encoder; an
-  encoder whose settings change between frames; and the channel order of
-  both encoders. They also check the packet length of a constant bitrate
-  against libopus's rule, and that the multistream decoder writes only the
-  samples it returns.
+**Platforms**
+- 64-bit ARM is the reference platform. There the output is checked bit for
+  bit against libopus 1.6.1, and every test that requires libopus's bits
+  passes. [docs/10](docs/10-differences-from-libopus.md) lists the remaining
+  differences and their sizes.
+- x86-64 gives correct output but is not bit-exact with libopus. opus1's x86
+  vector kernels do not follow libopus's x86 kernels, and libopus's own x86
+  output depends on the C compiler. About 40 tests that require libopus's bits
+  are ignored on targets other than 64-bit ARM. x86-64 was run on an Intel
+  Core i7-12700 (AVX2, FMA and AVX-VNNI), under Linux in WSL2 and natively on
+  Windows ([docs/10](docs/10-differences-from-libopus.md#platforms)).
+- The minimum Rust version is 1.98: the 64-bit ARM dot-product intrinsics of
+  the neural network code are stable from that version on.
 
-**Known gaps** (measured against libopus 1.6.1)
-- x86-64 code was only compile-checked in this release, not run.
+**Known gaps** (see [docs/10](docs/10-differences-from-libopus.md#not-implemented))
+- The scalable quality extension of libopus 1.6 (QEXT) is not ported.
+- Mapping family 3 (ambisonics mixed through a matrix, libopus's
+  `opus_projection_*` functions) is not implemented.
+- A few controls have no equivalent: the decoder's `OPUS_GET_BANDWIDTH` (the
+  `packet` functions read the bandwidth from the packet's first byte) and
+  `OPUS_SET_IGNORE_EXTENSIONS`, and the multistream decoder's
+  `OPUS_GET_BANDWIDTH` and `OPUS_GET_LAST_PACKET_DURATION`.
 - SILK stereo with a constant bitrate at 12 kHz can lose its stereo image on
-  tones, as the fixed-point build of libopus does; the float build keeps it
-  ([docs/10](docs/10-differences-from-libopus.md#silk)).
-
-### Unreleased (earlier)
-
-- **Fix: SILK CBR with in-band FEC busted packets into concealed frames
-  (issue #51).** SILK's frame target now leaves room for the packet's LBRR
-  section, as libopus's does. This ports `enc_API.c`'s per-frame target, for
-  mono and stereo: the moving average of LBRR bits (`nBitsUsedLBRR`), the
-  bit reservoir across packets (`nBitsExceeded`) and the balance within a
-  multi-frame packet (`bitsBalance`). The frame cap no longer takes the
-  LBRR bits off a second time, since the rate control already counts them.
-  At 16-48 kb/s, 20 ms and 40% loss, mono busts 0-1 packets in 50 (was up
-  to 8; libopus 0-2) and stereo 0-2 (was up to 15). Stereo carries LBRR in
-  22-31 packets (was 5-20; libopus 29-30). Mono's main frame codes as well
-  as without FEC (worst window 4.6 dB, was 0.3). Hybrid's SILK layer also
-  pays back its overshoot of the target rate, as libopus's does.
-- **Stereo SILK/Hybrid codes the side, as libopus does (issue #48).** L and R
-  are resampled separately and converted to mid/side at the internal rate by
-  a bit-exact port of libopus's `silk_stereo_LR_to_MS`: predictor estimation
-  and quantization, stereo-width smoothing, the panned-mono and reduced-width
-  decisions, and the mid/side bit split. A second SILK channel codes the
-  side, with its own VAD, LBRR (in-band FEC) and rate control, and libopus's
-  side reset after mid-only frames. On the #42 signal each channel now
-  measures within 0.3 dB of libopus (R: +3.8 → +5.1 dB, libopus +5.1).
-  Anti-phase input, which decoded as silence, measures +7.0 dB per channel,
-  as libopus does. Two unrelated voices go from +1.9/+2.8 to +6.0/+9.3 dB
-  (libopus +5.4/+8.0). Hybrid splits its SILK rate per channel, as libopus's
-  `compute_silk_rate_for_hybrid` does. Mono output is unchanged, byte for
-  byte. Under CBR with in-band FEC the side's LBRR at first crowded LBRR
-  out of many packets; #51 (above) fixes that.
-- **Fix: stereo SILK/Hybrid decoded as L ≈ −0.63·mid, R ≈ 2.63·mid (issue
-  #42).** The encoder codes stereo SILK as the mid only, but wrote stereo
-  predictor index 0, which dequantizes to `pred_Q13 = (0, −13364)`. The
-  decoder applies the predictor to mid-only frames too, so the left channel
-  came out phase-inverted and the right ~8 dB hot. It now writes the zero
-  predictor, joint symbol 12, as libopus does for its `toMono` frames. Hybrid
-  also fed SILK the interleaved L,R input as if it were mono; it is now
-  downmixed like SILK-only, which lifts the 24/48 kHz Hybrid mid from −2.4 dB
-  to +5.8 dB SNR (libopus +5.9 dB). Both channels now carry the mid
-  (L = R ≈ 0.85·mid, SNR +5.2/+3.8 dB, libopus +5.1/+5.1 dB with real side
-  coding), until #48 (above) adds the side.
-- **Fix: the SILK decoder's stereo predictor levels match libopus.** The
-  half-step constant was `(1 << 16) / 10` = 6553 instead of libopus's
-  `SILK_FIX_CONST(0.1, 16)` = 6554, so 45 of the 75 levels came out a few
-  Q13 units off and libopus stereo streams decoded at ~65 dB against libopus
-  instead of bit-exactly. The stereo state is no longer cleared on frames
-  whose predictor is zero (libopus clears it only on a mono→stereo switch),
-  and a lost frame keeps the last mid-only flag and conceals the side only
-  if the last good frame coded one (dec_API.c).
-- **Fix: SILK-only VBR ignored `bitrate_bps` (issue #43).** The SILK target
-  rate came from the packet budget, which under VBR is the caller's output
-  buffer: a 1500-byte buffer asked SILK for ~510 kb/s, so every bitrate coded
-  the same ~87-byte packets (16 kHz, 20 ms). The rate now follows libopus
-  1.6's `bits_target` / `total_bitRate` (opus_encoder.c): the requested
-  bitrate, capped by the buffer, less the TOC byte. The buffer stays the hard
-  cap (`maxBits`). At 12-64 kb/s, 16 kHz VBR now codes 21-69 bytes a packet,
-  against libopus's 27-73. CBR and Hybrid streams are byte-identical to
-  before. Known gap: at wideband, opus-rs codes fewer excitation bits than
-  libopus at the same gains (0.78x libopus's size at 12 kb/s, 1.01x at
-  narrowband). That is a separate SILK encoder divergence, tracked for
-  follow-up.
-- **Fix: mediumband (12 kHz) SILK decoded to noise (issue #53).** The decoder
-  gave 12 kHz the NB/MB NLSF codebook (order 10) but the wideband LPC order
-  (16), so it built a 16-tap synthesis filter from ten decoded NLSFs. Every
-  mediumband packet, from libopus or from opus-rs, decoded to loud noise at
-  every output rate (-14 to -18 dB against libopus). The order and the
-  codebook now come from one branch, as in libopus's `decoder_set_fs.c`: mono
-  mediumband decodes bit-exactly against libopus, and stereo matches it as
-  far as the stereo predictor allows (issue #42).
+  tones, as the fixed-point build of libopus does.
 
 ### 0.1.37
 
@@ -667,7 +476,7 @@ test that compares opus1 with the C library under the same settings.
   lag 0, correlation 1.00 from the first window, and only the onset frame
   is coded with short blocks.
 
-### Unreleased
+### 0.1.37 (earlier changes)
 
 - **Fix: CELT from 24 kHz input stuck at ~20 dB SNR (issue #54).** When
   `run_prefilter` cancelled the pitch pre-filter for a frame (libopus 1.6's
@@ -823,7 +632,7 @@ test that compares opus1 with the C library under the same settings.
 
 ## License
 
-See [COPYING](COPYING) for the original Opus license (BSD-3-Clause).
+opus1 is released under the BSD-3-Clause license; the full text is in [COPYING](COPYING). It is a port of libopus, so the copyright of the libopus authors (Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon) applies together with that of restsend.com (opus-rs) and gaojiangjie (opus1). The neural network weights in `dnn-weights/` come from libopus 1.6.1 under the same license ([dnn-weights/COPYING](dnn-weights/COPYING)).
 
 ## Links
 

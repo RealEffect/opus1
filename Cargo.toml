@@ -3,7 +3,7 @@ edition = "2024"
 # The aarch64 DotProd intrinsics of the neural network code are stable from
 # Rust 1.98 on.
 rust-version = "1.98"
-authors = ["jinti<shenjindi@fourz.cn>"]
+authors = ["jinti <shenjindi@fourz.cn>", "gaojiangjie <gaojiangjie@live.com>"]
 name = "opus1"
 version = "0.2.0"
 description = "Pure-Rust implementation of the Opus audio codec (RFC 6716), following libopus 1.x"
@@ -12,11 +12,19 @@ categories = ["multimedia::audio", "multimedia::encoding", "no-std", "embedded"]
 readme = "README.md"
 license = "BSD-3-Clause"
 repository = "https://github.com/restsend/opus-rs"
+# Left out of the published crate: repository-only files. The tests compare
+# with a linked libopus and read corpora that are not packaged, and the scripts
+# build libopus and run the phone and x86 checks. `docs/` and `README.md` stay:
+# src/lib.rs includes them for the documentation tests. `dnn-weights/` stays:
+# the neural network features embed it with `include_bytes!`.
 exclude = [
     "opus-1.6.1/",
     "fuzz/",
     "fixtures/",
     "corpus/",
+    "/tests/",
+    "/scripts/",
+    "/bench_quick.sh",
 ]
 
 [features]
@@ -32,7 +40,7 @@ std = []
 # Without `heap` (i.e. `default-features = false`), the crate is `#![no_std]`
 # with **no `alloc`** (fully heap-free — no global allocator required): every
 # working buffer is an inline fixed-size array, so `OpusEncoder`/`OpusDecoder`
-# are large (~135 KB / ~67 KB) and must be placed in a `static` or on a large
+# are large (on aarch64 about 154 KB with `analysis` and 60 KB) and must be placed in a `static` or on a large
 # stack by the caller.
 heap = ["std"]
 # Required for `#![no_std]` builds: provides `sin`/`cos`/`sqrt`/`exp2`/... via a
