@@ -346,7 +346,7 @@ Each stream encoder gets the values of its channels as its energy mask (`OpusEnc
 
 ## The API
 
-All fallible calls return `Result<_, &'static str>`. Samples are interleaved: sample `i` of channel `c` is at index `i * channels + c`. A frame size is in samples per channel.
+All fallible calls return `Result<_, opus1::Error>` (see [Errors](06-using-the-library.md#errors)). An invalid layout is an error of kind `BadArg`, as in libopus. Samples are interleaved: sample `i` of channel `c` is at index `i * channels + c`. A frame size is in samples per channel.
 
 ### `MultistreamEncoder`
 

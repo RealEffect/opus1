@@ -33,7 +33,6 @@ use opus1::multistream::split_self_delimited;
 use opus1::packet::{self, ParsedPacket};
 
 const OPUS_BAD_ARG: i32 = -1;
-const OPUS_BUFFER_TOO_SMALL: i32 = -2;
 const OPUS_INVALID_PACKET: i32 = -4;
 
 fuzz_target!(|data: &[u8]| {
@@ -51,21 +50,12 @@ fn run(data: &[u8]) -> Result<()> {
     }
 }
 
-/// The libopus error code of an opus1 packet error.
-fn code(e: &str) -> i32 {
-    match e {
-        "Invalid argument" => OPUS_BAD_ARG,
-        "Output buffer too small" => OPUS_BUFFER_TOO_SMALL,
-        "Invalid packet" => OPUS_INVALID_PACKET,
-        _ => panic!("unexpected packet error {e:?}"),
-    }
-}
-
-/// opus1's result in the form of the C result: 0 for success.
-fn c_form<T>(r: &std::result::Result<T, &'static str>) -> i32 {
+/// opus1's result in the form of the C result: 0 for success, else the
+/// libopus error code.
+fn c_form<T>(r: &std::result::Result<T, opus1::Error>) -> i32 {
     match r {
         Ok(_) => 0,
-        Err(e) => code(e),
+        Err(e) => e.to_raw(),
     }
 }
 
@@ -92,7 +82,7 @@ fn compare_parse(data: &[u8], self_delimited: bool) -> Option<ParsedPacket> {
             Some(*r)
         }
         (Err(e), Err(c)) => {
-            assert_eq!(code(e), *c, "parse(sd={self_delimited}) error for {data:02x?}");
+            assert_eq!(e.to_raw(), *c, "parse(sd={self_delimited}) error for {data:02x?}");
             None
         }
         _ => panic!(
@@ -161,7 +151,7 @@ fn compare_write(toc: u8, frames: &[&[u8]], maxlen: usize, self_delimited: bool,
         // libopus does not take these frames (too many, too long, more
         // than 120 ms). Neither may opus1.
         assert_eq!(
-            rust.map_err(code),
+            rust.map_err(|e| e.to_raw()),
             Err(OPUS_BAD_ARG),
             "write took frames the repacketizer refuses"
         );
@@ -183,7 +173,7 @@ fn compare_write(toc: u8, frames: &[&[u8]], maxlen: usize, self_delimited: bool,
             let got: Vec<&[u8]> = p.frames(&out[..n]).collect();
             assert_eq!(got, frames);
         }
-        Err(e) => assert_eq!(code(e), c, "write(sd={self_delimited}, pad={pad}) error"),
+        Err(e) => assert_eq!(e.to_raw(), c, "write(sd={self_delimited}, pad={pad}) error"),
     }
 }
 
@@ -205,13 +195,13 @@ fn single(rest: &[u8]) -> Result<()> {
         let c = c_nb_samples(data, fs);
         match rust {
             Ok(n) => assert_eq!(n as i32, c, "nb_samples at {fs}"),
-            Err(e) => assert_eq!(code(e), c, "nb_samples error at {fs}"),
+            Err(e) => assert_eq!(e.to_raw(), c, "nb_samples error at {fs}"),
         }
     }
     let c = unsafe { audiopus_sys::opus_packet_get_nb_frames(data_ptr(data), data.len() as i32) };
     match packet::nb_frames(data) {
         Ok(n) => assert_eq!(n as i32, c, "nb_frames"),
-        Err(e) => assert_eq!(code(e), c, "nb_frames error"),
+        Err(e) => assert_eq!(e.to_raw(), c, "nb_frames error"),
     }
 
     let plain = compare_parse(data, false);

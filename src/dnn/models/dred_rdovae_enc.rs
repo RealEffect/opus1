@@ -5,6 +5,7 @@
 //! and `dnn/dred_rdovae_enc_data.c` (`init_rdovaeenc`). Do not edit: change the
 //! generator and run it again (`tools/dnn-gen/README.md`).
 
+use crate::Error;
 use super::{Layer, LayerSpec, LinearSpec};
 use crate::dnn::nnet::LinearLayer;
 use crate::dnn::weights::WeightList;
@@ -468,7 +469,7 @@ impl<'w> RdovaeEnc<'w> {
     /// libopus `init_rdovaeenc`: builds every layer from the arrays of `list`,
     /// in the order of `LAYERS`. Fails at the first layer whose arrays are
     /// missing, have the wrong size or are malformed; then nothing is built.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(RdovaeEnc {
             enc_dense1: LAYERS[0].linear(list)?,
             enc_zdense: LAYERS[1].linear(list)?,

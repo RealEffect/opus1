@@ -4,7 +4,7 @@
 //! only a little stack, even without the `heap` feature.
 
 use core::mem::MaybeUninit;
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, ErrorKind, OpusDecoder, OpusEncoder};
 
 /// 50 packets of 20 ms: a sine per channel, with another pitch on the
 /// second channel.
@@ -81,8 +81,8 @@ fn init_decodes_like_new() {
 #[test]
 fn init_rejects_invalid_settings() {
     let mut slot = Box::<OpusDecoder>::new_uninit();
-    assert_eq!(OpusDecoder::init(&mut slot, 44100, 2).err(), Some("Invalid sampling rate"));
-    assert_eq!(OpusDecoder::init(&mut slot, 48000, 3).err(), Some("Invalid number of channels"));
+    assert_eq!(OpusDecoder::init(&mut slot, 44100, 2).err().map(|e| e.kind()), Some(ErrorKind::BadArg));
+    assert_eq!(OpusDecoder::init(&mut slot, 48000, 3).err().map(|e| e.kind()), Some(ErrorKind::BadArg));
 }
 
 /// Builds a decoder with `init` and decodes on a thread with a 32 KB stack

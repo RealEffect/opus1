@@ -8,6 +8,7 @@
 // The float constants keep every digit of the C header.
 #![allow(clippy::excessive_precision)]
 
+use crate::Error;
 use super::{Layer, LayerSpec, LinearSpec};
 use crate::dnn::nnet::LinearLayer;
 use crate::dnn::weights::WeightList;
@@ -523,7 +524,7 @@ impl<'w> BbwenetLayers<'w> {
     /// `list`, in the order of `LAYERS`. Fails at the first layer whose arrays
     /// are missing, have the wrong size or are malformed; then nothing is
     /// built.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(BbwenetLayers {
             bbwenet_fnet_conv1: LAYERS[0].linear(list)?,
             bbwenet_fnet_conv2: LAYERS[1].linear(list)?,

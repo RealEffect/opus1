@@ -16,7 +16,7 @@
 //! with a libopus that has it.
 
 use audiopus_sys as sys;
-use opus1::OpusDecoder;
+use opus1::{ErrorKind, OpusDecoder};
 use opus1::multistream::MultistreamDecoder;
 use std::os::raw::c_int;
 
@@ -62,12 +62,10 @@ impl Drop for CDec {
 }
 
 /// opus1's result as a libopus return code.
-fn code<T>(r: &Result<T, &'static str>) -> c_int {
+fn code<T>(r: &Result<T, opus1::Error>) -> c_int {
     match r {
         Ok(_) => sys::OPUS_OK,
-        Err("Invalid complexity") => sys::OPUS_BAD_ARG,
-        Err("Request not implemented") => sys::OPUS_UNIMPLEMENTED,
-        Err(e) => panic!("unexpected error {e:?}"),
+        Err(e) => e.to_raw(),
     }
 }
 
@@ -88,7 +86,7 @@ fn complexity_starts_at_0_and_takes_0_to_10_like_libopus() {
             c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, 6);
             for value in BAD_COMPLEXITIES {
                 let r = d.set_complexity(value);
-                assert_eq!(r, Err("Invalid complexity"));
+                assert_eq!(r.unwrap_err().kind(), ErrorKind::BadArg);
                 assert_eq!(code(&r), c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, value), "complexity {value}");
                 // A refused value leaves the setting as it was.
                 assert_eq!(d.complexity(), 6);
@@ -117,11 +115,11 @@ fn bwe_requests_are_unimplemented_without_the_feature_like_libopus() {
     let mut c = CDec::new(48000, 1);
     for on in [false, true] {
         let r = d.set_osce_bwe(on);
-        assert_eq!(r, Err("Request not implemented"));
+        assert_eq!(r.unwrap_err().kind(), ErrorKind::Unimplemented);
         assert_eq!(code(&r), c.set(OPUS_SET_OSCE_BWE_REQUEST, on as i32));
     }
     let r = d.osce_bwe();
-    assert_eq!(r, Err("Request not implemented"));
+    assert_eq!(r.unwrap_err().kind(), ErrorKind::Unimplemented);
     assert_eq!(code(&r), c.get(OPUS_GET_OSCE_BWE_REQUEST).0);
 }
 
@@ -301,7 +299,7 @@ fn the_multistream_decoder_forwards_the_bwe_switch() {
     let (mut d, mut c) = surround();
     #[cfg(not(feature = "osce-bwe"))]
     {
-        assert_eq!(d.set_osce_bwe(true), Err("Request not implemented"));
+        assert_eq!(d.set_osce_bwe(true).unwrap_err().kind(), ErrorKind::Unimplemented);
         // libopus's multistream decoder does not know the request at all.
         assert_eq!(c.set(OPUS_SET_OSCE_BWE_REQUEST, 1), sys::OPUS_UNIMPLEMENTED);
     }
@@ -324,9 +322,15 @@ fn the_multistream_decoder_forwards_the_bwe_switch() {
 #[cfg(feature = "dnn")]
 mod blobs {
     use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
-    use opus1::{DnnBlob, DnnModels, OpusDecoder};
+    use opus1::{DnnBlob, DnnModels, ErrorKind, OpusDecoder};
 
     const NO_MODEL: &str = "DNN blob holds no model of this build";
+
+    /// The kind and the message of an error. Every blob error is
+    /// `BadArg`; the message tells them apart.
+    fn kind_message<T>(r: Result<T, opus1::Error>) -> Result<T, (ErrorKind, &'static str)> {
+        r.map_err(|e| (e.kind(), e.message()))
+    }
 
     /// The groups this build contains.
     fn all() -> DnnModels {
@@ -369,20 +373,20 @@ mod blobs {
     fn a_blob_without_a_model_of_this_build_changes_nothing() {
         let mut d = OpusDecoder::new(16000, 1).unwrap();
         let empty = DnnBlob::from_static(&EMPTY.0).unwrap();
-        assert_eq!(d.set_dnn_blob(&empty), Err(NO_MODEL));
+        assert_eq!(kind_message(d.set_dnn_blob(&empty)), Err((ErrorKind::BadArg, NO_MODEL)));
         assert_eq!(d.dnn_models(), all());
         #[cfg(feature = "heap")]
         {
             let blob = DnnBlob::from_bytes(&[]).unwrap();
-            assert_eq!(d.set_dnn_blob(&blob), Err(NO_MODEL));
+            assert_eq!(kind_message(d.set_dnn_blob(&blob)), Err((ErrorKind::BadArg, NO_MODEL)));
         }
     }
 
     #[cfg(feature = "heap")]
     #[test]
     fn malformed_and_misaligned_blobs_are_refused() {
-        assert_eq!(DnnBlob::from_bytes(&[1, 2, 3]).err(), Some("Invalid DNN blob"));
-        assert_eq!(DnnBlob::from_bytes(&[0u8; 64]).err(), Some("Invalid DNN blob"));
+        assert_eq!(kind_message(DnnBlob::from_bytes(&[1, 2, 3])).err(), Some((ErrorKind::BadArg, "invalid DNN blob")));
+        assert_eq!(kind_message(DnnBlob::from_bytes(&[0u8; 64])).err(), Some((ErrorKind::BadArg, "invalid DNN blob")));
         #[cfg(feature = "deep-plc")]
         {
             // A static blob whose arrays start 1 byte after a 4-byte
@@ -395,7 +399,10 @@ mod blobs {
                 unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 4) };
             bytes[1..1 + src.len()].copy_from_slice(&src);
             let shifted: &'static [u8] = &bytes[1..1 + src.len()];
-            assert_eq!(DnnBlob::from_static(shifted).err(), Some("DNN blob is not aligned"));
+            assert_eq!(
+                kind_message(DnnBlob::from_static(shifted)).err(),
+                Some((ErrorKind::BadArg, "DNN blob is not aligned"))
+            );
             // A copy is aligned whatever the source.
             assert!(DnnBlob::from_bytes(shifted).is_ok());
         }
@@ -414,7 +421,7 @@ mod blobs {
         assert_eq!(d.dnn_models(), all());
         // Two of the three deep PLC models are not a group: nothing loads.
         let partial = DnnBlob::from_bytes(&bytes[..file("pitchdnn.bin").len()]).unwrap();
-        assert_eq!(d.set_dnn_blob(&partial), Err(NO_MODEL));
+        assert_eq!(kind_message(d.set_dnn_blob(&partial)), Err((ErrorKind::BadArg, NO_MODEL)));
         d.reset_state();
         assert_eq!(d.dnn_models(), all());
         assert_eq!(d.set_dnn_blob(&DnnBlob::builtin()), Ok(all()));
@@ -472,7 +479,7 @@ mod blobs {
         let table = ChannelMappingTable { channels: 3, stream_count: 2, coupled_count: 1, mapping: vec![0, 2, 1] };
         let mut d = MultistreamDecoder::new(48000, table).unwrap();
         let empty = DnnBlob::from_static(&EMPTY.0).unwrap();
-        assert_eq!(d.set_dnn_blob(&empty), Err(NO_MODEL));
+        assert_eq!(kind_message(d.set_dnn_blob(&empty)), Err((ErrorKind::BadArg, NO_MODEL)));
         #[cfg(feature = "deep-plc")]
         {
             assert_eq!(d.set_dnn_blob(&DnnBlob::builtin()), Ok(all()));

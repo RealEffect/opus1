@@ -45,6 +45,7 @@ use opus1::internals::dnn::models::Layer;
 use opus1::internals::dnn::models::LayerSpec;
 use opus1::internals::dnn::weights::{ERR_SPARSE_INDEX, WeightList, linear_init};
 use opus1::internals::dnn::{Conv2dLayer, LinearLayer};
+use opus1::Error;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
@@ -162,7 +163,7 @@ fn owned<'w>(layers: &[Layer<'_, 'w>]) -> Vec<RustLayer<'w>> {
 }
 
 /// A model's descriptors, and its layers as opus1 builds them.
-type Built<'w> = (&'static [LayerSpec], Result<Vec<RustLayer<'w>>, &'static str>);
+type Built<'w> = (&'static [LayerSpec], Result<Vec<RustLayer<'w>>, Error>);
 
 /// opus1's model `key` built from `list`, with its descriptors, when this
 /// build includes the model.
@@ -207,7 +208,7 @@ fn rust_model<'w>(key: &str, list: &WeightList<'w>) -> Option<Built<'w>> {
 }
 
 /// Every layer of a descriptor list, built by opus1's `LayerSpec` methods.
-fn rust_layers<'w>(specs: &[LayerSpec], list: &WeightList<'w>) -> Result<Vec<RustLayer<'w>>, &'static str> {
+fn rust_layers<'w>(specs: &[LayerSpec], list: &WeightList<'w>) -> Result<Vec<RustLayer<'w>>, Error> {
     specs
         .iter()
         .map(|s| match s {
@@ -524,7 +525,7 @@ fn parse_weights_accepts_and_refuses_alike() {
 /// `linear_init` of libopus and of opus1 on the layer `name` of the RDOVAE
 /// encoder, from a blob whose index table of that layer is `idx`: whether
 /// each accepts it.
-fn sparse_alike(idx: &[i32]) -> (bool, Result<(), &'static str>) {
+fn sparse_alike(idx: &[i32]) -> (bool, Result<(), Error>) {
     let model = MODELS.iter().find(|m| m.key == "dred_rdovae_enc").unwrap();
     let LayerSpec::Linear(spec) = *model.layers.iter().find(|s| s.name() == "gdense1").unwrap() else { unreachable!() };
     let mut blob = Vec::new();

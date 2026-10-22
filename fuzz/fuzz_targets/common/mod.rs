@@ -834,18 +834,6 @@ unsafe extern "C" {
     pub fn opus_packet_pad_impl(data: *mut c_uchar, len: i32, new_len: i32, pad: c_int, exts: *const CExt, nb: c_int) -> i32;
 }
 
-/// The message opus1 gives for a libopus error code.
-pub fn err_str(code: i32) -> &'static str {
-    match code {
-        -1 => "Invalid argument",
-        -2 => "Output buffer too small",
-        -3 => "Internal error",
-        -4 => "Invalid packet",
-        0.. => "no error",
-        _ => panic!("unexpected libopus error {code}"),
-    }
-}
-
 /// An extension as plain values: ID, frame, payload.
 pub type Plain = (u8, usize, Vec<u8>);
 

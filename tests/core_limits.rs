@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{chirp, to_stereo};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder, packet, pcm_soft_clip};
+use opus1::{Application, Bandwidth, Bitrate, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder, packet, pcm_soft_clip};
 
 /// Frame sizes no buffer can hold. Several are chosen so that
 /// `frame_size * 2` overflows to a small number, or so that their lowest 32
@@ -293,7 +293,7 @@ fn c_pad(data: &[u8], new_len: usize) -> Result<Vec<u8>, i32> {
 
 /// Padding a packet that is padded already, with random bytes in the old
 /// padding. libopus reads the old padding as packet extensions: it keeps
-/// the extensions it finds and rejects the packet ("Internal error") when
+/// the extensions it finds and rejects the packet (`OPUS_INTERNAL_ERROR`) when
 /// the bytes are not valid extensions. `pad` must do the same, byte for
 /// byte.
 #[test]
@@ -331,7 +331,7 @@ fn pad_of_a_packet_with_padding_content() {
             }
             Err(code) => {
                 assert_eq!(code, -3, "round {round}");
-                assert_eq!(result, Err("Internal error"), "round {round}");
+                assert_eq!(result.map_err(|e| e.kind()), Err(ErrorKind::InternalError), "round {round}");
                 rejected += 1;
             }
         }

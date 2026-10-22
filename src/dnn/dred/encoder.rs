@@ -17,6 +17,7 @@
 //! the result into the padding of the packet as the extension with ID
 //! `DRED_EXTENSION_ID` (126).
 
+use crate::Error;
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 
@@ -148,9 +149,9 @@ impl DredEncoder {
 
     /// libopus `OPUS_SET_DRED_DURATION`: 0 to `DRED_MAX_FRAMES` frames of
     /// 10 ms.
-    pub(crate) fn set_duration(&mut self, frames: i32) -> Result<(), &'static str> {
+    pub(crate) fn set_duration(&mut self, frames: i32) -> Result<(), Error> {
         if !(0..=DRED_MAX_FRAMES as i32).contains(&frames) {
-            return Err("Invalid DRED duration");
+            return Err(Error::bad_arg("invalid DRED duration"));
         }
         self.duration = frames;
         Ok(())
@@ -169,7 +170,7 @@ impl DredEncoder {
     /// libopus `dred_encoder_load_model`: the RDOVAE encoder and PitchDNN
     /// from `blob`. When one of them is missing, returns `"DNN blob holds
     /// no model of this build"` and keeps the models it had.
-    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), &'static str> {
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), Error> {
         self.dnn.load(blob)
     }
 

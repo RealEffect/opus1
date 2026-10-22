@@ -191,7 +191,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   let slot = &raw mut DECODER;
   // SAFETY: run once, while nothing else uses `DECODER`.
   let decoder = OpusDecoder::init(unsafe { &mut *slot }, 48000, 2)?;
-  # Ok::<(), &'static str>(())
+  # Ok::<(), opus1::Error>(())
   ```
 
   The encoder has no `init` yet. The test suite of this build needs big
@@ -358,6 +358,11 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
 
 **Breaking changes**
 - The crate name: `opus1` instead of `opus-rs`.
+- Calls that can fail return `Result<T, opus1::Error>` instead of
+  `Result<T, &'static str>`. `Error::kind()` gives an `ErrorKind`, one per
+  libopus error code (`BadArg`, `BufferTooSmall`, `InvalidPacket`, ...), and
+  `message()` the text. Compare kinds, not messages. `Error` implements
+  `core::error::Error`.
 - The settings of `OpusEncoder` are methods instead of public fields:
   `set_bitrate`, `set_complexity`, `set_vbr` (instead of `use_cbr`, with the
   opposite meaning), `set_inband_fec` and `set_packet_loss_perc`, each with its

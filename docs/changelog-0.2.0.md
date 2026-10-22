@@ -9,6 +9,22 @@ test that compares opus1 with the C library under the same settings.
 
 ## Breaking changes to the public interface
 
+- Errors: every call that can fail returns `Result<T, opus1::Error>` instead of
+  `Result<T, &'static str>`, and `TryFrom<i32> for FrameDuration` has
+  `type Error = opus1::Error`. `Error::kind()` returns an `ErrorKind` with one
+  value per libopus error code: `BadArg`, `BufferTooSmall`, `InternalError`,
+  `InvalidPacket`, `Unimplemented`, `InvalidState` and `AllocFail`
+  (`#[non_exhaustive]`). Each call returns the kind that libopus returns in the
+  same case. `Error::to_raw()` and `ErrorKind::to_raw()` give the libopus code
+  (-1 to -7). `Error::message()` and `Display` give a short text. The texts
+  start with a lowercase letter, have no final period, and one error has one
+  wording: for example every output buffer that is too small gives "output
+  buffer too small". `Error` is `Copy` and implements `core::error::Error`.
+  Code that compared message strings now compares `err.kind()`. Kinds that
+  differ from what the old messages suggested: an empty output buffer of
+  `encode` is `BadArg` (libopus `max_data_bytes <= 0`); without the `std`
+  feature, more than 32 extensions or more than 1275 bytes of old padding in
+  one call are `AllocFail`.
 - `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
   so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
   call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
@@ -143,7 +159,7 @@ test that compares opus1 with the C library under the same settings.
 - Float output is no longer clamped to [-1, 1] (libopus does not clip float output).
   Use `decode_i16` for 16-bit output.
 - `packet::pad` and `packet::multistream_pad` keep the extensions in the padding
-  of a packet, and fail with "Internal error" when the padding is not valid
+  of a packet, and fail with `ErrorKind::InternalError` when the padding is not valid
   extension data, as libopus does. Before, they wrote zeros.
 - The automatic mode choice follows libopus. At 64 kb/s a 16 kHz VoIP encoder
   now codes CELT, as libopus does at that bitrate. At speech rates (for example

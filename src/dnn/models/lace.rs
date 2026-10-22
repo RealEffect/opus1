@@ -8,6 +8,7 @@
 // The float constants keep every digit of the C header.
 #![allow(clippy::excessive_precision)]
 
+use crate::Error;
 use super::{Layer, LayerSpec, LinearSpec};
 use crate::dnn::nnet::LinearLayer;
 use crate::dnn::weights::WeightList;
@@ -459,7 +460,7 @@ impl<'w> LaceLayers<'w> {
     /// libopus `init_lacelayers`: builds every layer from the arrays of `list`,
     /// in the order of `LAYERS`. Fails at the first layer whose arrays are
     /// missing, have the wrong size or are malformed; then nothing is built.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(LaceLayers {
             lace_pitch_embedding: LAYERS[0].linear(list)?,
             lace_fnet_conv1: LAYERS[1].linear(list)?,

@@ -1714,7 +1714,7 @@ fn rust_decode_all(sc: &Scenario, packets: &Packets, loss: Loss) -> Result<Decod
             }
             Err(e) => {
                 hash.bytes(b"error:");
-                hash.bytes(e.as_bytes());
+                hash.bytes(e.message().as_bytes());
                 decoded.errors += 1;
                 decoded
                     .first_error

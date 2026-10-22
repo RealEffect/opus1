@@ -24,7 +24,7 @@ mod multistream_enc_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, ErrorKind, OpusEncoder};
 
 /// What a C stream encoder reports for `OPUS_GET_BITRATE` when it was set to
 /// `rate` and its last coded frame has `coded_frame` samples: at most what
@@ -219,7 +219,7 @@ fn maximum_bitrate_cbr(frame_ms: &[usize], buffers: &[usize]) -> (usize, Vec<Str
                             let n = match rust.encode(frame, frame_size, &mut out) {
                                 Ok(n) => n,
                                 Err(e) => {
-                                    assert_eq!(e, "Output buffer too small", "{label}");
+                                    assert_eq!(e.kind(), ErrorKind::BufferTooSmall, "{label}");
                                     refused.push(label);
                                     rust.reset_state();
                                     dec = c_decoder(&rust);
@@ -381,8 +381,8 @@ fn a_buffer_below_the_smallest_packet_leaves_the_encoder_untouched() {
         for len in 0..2 * streams - 1 {
             let mut out = vec![0u8; len];
             assert_eq!(
-                rust.encode(&pcm, frame_size, &mut out),
-                Err("Output buffer too small"),
+                rust.encode(&pcm, frame_size, &mut out).map_err(|e| e.kind()),
+                Err(ErrorKind::BufferTooSmall),
                 "{}: buffer of {len} bytes",
                 case.name
             );

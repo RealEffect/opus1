@@ -22,6 +22,7 @@ use opus1::internals::dnn::weights::{
     linear_init,
 };
 use opus1::internals::dnn::{Conv2dLayer, LinearLayer, MAX_INPUTS};
+use opus1::Error;
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -142,7 +143,7 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// The descriptors and built layers of every model of this build, from
 /// `list`: (model, descriptors, init result as layer copies).
-type ModelCheck<'w> = (&'static str, &'static [LayerSpec], Result<Vec<OwnedLayer<'w>>, &'static str>);
+type ModelCheck<'w> = (&'static str, &'static [LayerSpec], Result<Vec<OwnedLayer<'w>>, Error>);
 
 // A build with only `dnn` has no model to build.
 #[cfg_attr(not(feature = "deep-plc"), allow(dead_code))]
@@ -574,7 +575,7 @@ fn layer_blob(idx: &[i32], blocks: usize) -> Aligned {
 }
 
 /// Builds the sparse layer of `layer_blob`, with int8 or float weights.
-fn sparse(list: &WeightList<'_>, float: bool) -> Result<(), &'static str> {
+fn sparse(list: &WeightList<'_>, float: bool) -> Result<(), Error> {
     linear_init(
         list,
         Some("s_bias"),
@@ -609,7 +610,7 @@ fn sparse_index_tables() {
     let buf2 = Aligned::new(&b);
     assert!(sparse(&WeightList::parse(buf2.bytes()).unwrap(), false).is_ok());
 
-    let bad: &[(&[i32], usize, &str)] = &[
+    let bad: &[(&[i32], usize, Error)] = &[
         (&[-1, 0, 0], 1, ERR_SPARSE_INDEX),             // negative count
         (&[2, 0, 12, -3, 4], 3, ERR_SPARSE_INDEX),     // negative count in the second row block
         (&[1, -4, 1, 4], 2, ERR_SPARSE_INDEX),          // negative position

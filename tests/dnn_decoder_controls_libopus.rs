@@ -62,8 +62,7 @@ fn complexity_matches_a_libopus_with_the_features() {
         let want = c.set(sys::OPUS_SET_COMPLEXITY_REQUEST, value);
         let got = match d.set_complexity(value) {
             Ok(()) => sys::OPUS_OK,
-            Err("Invalid complexity") => sys::OPUS_BAD_ARG,
-            Err(e) => panic!("{e}"),
+            Err(e) => e.to_raw(),
         };
         assert_eq!(got, want, "complexity {value}");
         assert_eq!(c.get(OPUS_GET_COMPLEXITY_REQUEST), (sys::OPUS_OK, d.complexity()));

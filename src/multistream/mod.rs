@@ -72,7 +72,7 @@
 //! let mut packet = vec![0u8; 4000];
 //! let len = encoder.encode(&pcm, 960, &mut packet)?;
 //! assert!(len > 0 && len <= packet.len());
-//! # Ok::<(), &'static str>(())
+//! # Ok::<(), opus1::Error>(())
 //! ```
 //!
 //! # Decoding
@@ -111,7 +111,7 @@
 //! // An empty packet stands for a lost one: the decoder fills the gap.
 //! let samples = decoder.decode(&[], 960, &mut out)?;
 //! assert_eq!(samples, 960);
-//! # Ok::<(), &'static str>(())
+//! # Ok::<(), opus1::Error>(())
 //! ```
 //!
 //! `examples/multistream.rs` encodes and decodes a longer 5.1 signal and
@@ -131,6 +131,7 @@ pub use decoder::MultistreamDecoder;
 pub use encoder::MultistreamEncoder;
 pub use layout::{ChannelLayout, MappingType, SILENT_CHANNEL, validate_ambisonics};
 
+use crate::Error;
 use crate::{float2int16, float2int24, int16_to_res, int24_to_res, packet};
 
 /// Source of the input samples of one frame, by input channel.
@@ -340,8 +341,8 @@ impl ChannelMappingTable {
 pub fn split_self_delimited<'a>(
     data: &[u8],
     scratch: &'a mut Vec<u8>,
-) -> Result<(&'a [u8], usize), &'static str> {
-    const INVALID: &str = "Invalid packet";
+) -> Result<(&'a [u8], usize), Error> {
+    const INVALID: Error = Error::INVALID_PACKET;
     let parsed = packet::parse(data, true)?;
     // The extra field is the last thing before the first frame. It holds the
     // size of the last frame.

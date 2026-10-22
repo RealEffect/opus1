@@ -25,7 +25,7 @@
 use audiopus_sys as sys;
 use opus1::extensions::Extension;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
-use opus1::{OpusDecoder, OpusDred, OpusDredDecoder, packet};
+use opus1::{ErrorKind, OpusDecoder, OpusDred, OpusDredDecoder, packet};
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uchar, c_void};
 
@@ -631,7 +631,7 @@ fn dred_decode_checks_its_arguments_as_libopus() {
     // process without a parsed state.
     let empty = OpusDred::new();
     let mut dst = OpusDred::new();
-    assert_eq!(r.process(&empty, &mut dst), Err("Invalid argument"));
+    assert_eq!(r.process(&empty, &mut dst).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     // A packet without DRED: zeros, and the state is not usable.
     let plain = split_dred(p).unwrap().0;
     let (ret, end) = c.parse(&plain, 16000, 16000, false);
@@ -641,7 +641,7 @@ fn dred_decode_checks_its_arguments_as_libopus() {
     assert!(!dred.is_parsed());
     // Not a positive sampling rate: an error in opus1 (libopus divides by
     // it).
-    assert_eq!(r.parse(&mut dred, p, 16000, 0, false), Err("Invalid argument"));
+    assert_eq!(r.parse(&mut dred, p, 16000, 0, false).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     // A decode with the unusable state conceals as without DRED.
     pair.dred_decode(c.dred(), &dred, 320, 320, Out::F32, "without DRED");
 }

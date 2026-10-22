@@ -19,6 +19,8 @@
 //!
 //! Nothing here allocates: a layout stores its mapping in a fixed array.
 
+use crate::Error;
+
 /// Mapping value that means "this output channel is silent" for a decoder and
 /// "this input channel is not encoded" for an encoder.
 pub const SILENT_CHANNEL: u8 = 255;
@@ -105,23 +107,27 @@ impl ChannelLayout {
         streams: usize,
         coupled_streams: usize,
         mapping: &[u8],
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, Error> {
         if !(1..=MAX_CHANNELS).contains(&channels) {
-            return Err("multistream layout: the channel count must be 1 to 255");
+            return Err(Error::bad_arg("multistream layout: the channel count must be 1 to 255"));
         }
         if coupled_streams > streams {
-            return Err("multistream layout: more coupled streams than streams");
+            return Err(Error::bad_arg("multistream layout: more coupled streams than streams"));
         }
         if streams < 1 {
-            return Err("multistream layout: at least one stream is needed");
+            return Err(Error::bad_arg("multistream layout: at least one stream is needed"));
         }
         // The sum saturates, so huge counts are an error and do not wrap.
         let max_channel = streams.saturating_add(coupled_streams);
         if max_channel > MAX_CHANNELS {
-            return Err("multistream layout: streams plus coupled streams must be at most 255");
+            return Err(Error::bad_arg(
+                "multistream layout: streams plus coupled streams must be at most 255",
+            ));
         }
         if mapping.len() < channels {
-            return Err("multistream layout: the mapping has fewer entries than channels");
+            return Err(Error::bad_arg(
+                "multistream layout: the mapping has fewer entries than channels",
+            ));
         }
         // validate_layout.
         let mapping = &mapping[..channels];
@@ -129,9 +135,9 @@ impl ChannelLayout {
             .iter()
             .any(|&m| m as usize >= max_channel && m != SILENT_CHANNEL)
         {
-            return Err(
+            return Err(Error::bad_arg(
                 "multistream layout: a mapping entry names a stream channel that does not exist",
-            );
+            ));
         }
         let mut stored = [0u8; MAX_CHANNELS];
         stored[..channels].copy_from_slice(mapping);
@@ -147,22 +153,28 @@ impl ChannelLayout {
     /// `opus_multistream_encoder_init_impl` and `validate_encoder_layout`:
     /// there are not more coded channels than input channels, and every
     /// stream gets its input from some channel.
-    pub fn validate_for_encoder(&self) -> Result<(), &'static str> {
+    pub fn validate_for_encoder(&self) -> Result<(), Error> {
         if self.streams() + self.coupled_streams() > self.channels() {
-            return Err(
+            return Err(Error::bad_arg(
                 "multistream layout: an encoder cannot code more channels than it is given",
-            );
+            ));
         }
         for s in 0..self.streams() {
             if s < self.coupled_streams() {
                 if self.left_channel(s, None).is_none() {
-                    return Err("multistream layout: a coupled stream has no left input channel");
+                    return Err(Error::bad_arg(
+                        "multistream layout: a coupled stream has no left input channel",
+                    ));
                 }
                 if self.right_channel(s, None).is_none() {
-                    return Err("multistream layout: a coupled stream has no right input channel");
+                    return Err(Error::bad_arg(
+                        "multistream layout: a coupled stream has no right input channel",
+                    ));
                 }
             } else if self.mono_channel(s, None).is_none() {
-                return Err("multistream layout: a mono stream has no input channel");
+                return Err(Error::bad_arg(
+                    "multistream layout: a mono stream has no input channel",
+                ));
             }
         }
         Ok(())
@@ -184,9 +196,9 @@ impl ChannelLayout {
     pub fn surround(
         channels: usize,
         mapping_family: u8,
-    ) -> Result<(Self, MappingType, Option<usize>), &'static str> {
+    ) -> Result<(Self, MappingType, Option<usize>), Error> {
         if !(1..=MAX_CHANNELS).contains(&channels) {
-            return Err("multistream layout: the channel count must be 1 to 255");
+            return Err(Error::bad_arg("multistream layout: the channel count must be 1 to 255"));
         }
         let mut mapping = [0u8; MAX_CHANNELS];
         let mut lfe_stream = None;
@@ -201,7 +213,11 @@ impl ChannelLayout {
                     mapping[1] = 1;
                     (1, 1)
                 }
-                _ => return Err("multistream layout: mapping family 0 has 1 or 2 channels"),
+                _ => {
+                    return Err(Error::bad_arg(
+                        "multistream layout: mapping family 0 has 1 or 2 channels",
+                    ));
+                }
             },
             1 if channels <= 8 => {
                 let (nb_streams, nb_coupled_streams, table) = VORBIS_MAPPINGS[channels - 1];
@@ -219,7 +235,7 @@ impl ChannelLayout {
             }
             2 => {
                 let (streams, coupled_streams) = validate_ambisonics(channels)
-                    .ok_or("multistream layout: not an ambisonics channel count")?;
+                    .ok_or(Error::bad_arg("multistream layout: not an ambisonics channel count"))?;
                 // The mono streams come first in channel order. The stereo
                 // stream, which is stream 0, takes the last two channels.
                 for i in 0..streams - coupled_streams {
@@ -230,7 +246,11 @@ impl ChannelLayout {
                 }
                 (streams, coupled_streams)
             }
-            _ => return Err("multistream layout: unsupported mapping family or channel count"),
+            _ => {
+                return Err(Error::bad_arg(
+                    "multistream layout: unsupported mapping family or channel count",
+                ));
+            }
         };
         let mapping_type = if channels > 2 && mapping_family == 1 {
             MappingType::Surround

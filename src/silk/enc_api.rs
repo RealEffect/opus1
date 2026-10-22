@@ -1,3 +1,4 @@
+use crate::Error;
 use crate::fixedvec::FixedVec;
 use crate::float2int16;
 use crate::range_coder::{RangeCoder, RangeCoderState};
@@ -1262,7 +1263,7 @@ fn silk_carry_history_to_rate(
     resampler: &mut SilkResampler,
     api_hz: i32,
     new_khz: i32,
-) -> Result<(), &'static str> {
+) -> Result<(), Error> {
     let old_khz = enc.s_cmn.fs_khz;
     // 2 frames of history and the noise-shaping look-ahead: 45 ms, or 25 ms
     // for 10 ms packets.
@@ -1273,7 +1274,7 @@ fn silk_carry_history_to_rate(
     let mut at_api_rate = [0i16; 45 * 48];
     let mut at_new_rate = [0i16; 45 * 16];
     if old_n > enc.s_cmn.x_buf.len() || api_n > at_api_rate.len() || new_n > at_new_rate.len() {
-        return Err("Unsupported SILK rate switch");
+        return Err(Error::internal("unsupported SILK rate switch"));
     }
     let mut to_api = SilkResampler::default();
     if to_api.init(old_khz * 1000, api_hz) != 0
@@ -1281,7 +1282,7 @@ fn silk_carry_history_to_rate(
         || resampler.init_for_enc(api_hz, new_khz * 1000) != 0
         || resampler.process(&mut at_new_rate[..new_n], &at_api_rate[..api_n], api_n as i32) != 0
     {
-        return Err("Unsupported SILK rate switch");
+        return Err(Error::internal("unsupported SILK rate switch"));
     }
     enc.s_cmn.x_buf[..new_n].copy_from_slice(&at_new_rate[..new_n]);
     Ok(())
@@ -1530,7 +1531,7 @@ impl SilkEncoder {
         input: SilkInput<'_>,
         prefill: Option<SilkPrefill<'_>>,
         rc: &mut RangeCoder,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), Error> {
         let sch = if ctl.channels_internal == 2 && self.side.is_some() { 2 } else { 1 };
         // libopus runs the rate switch state machine
         // (silk_control_audio_bandwidth) in the control call of each coded
@@ -1591,7 +1592,7 @@ impl SilkEncoder {
             // C: "if( ( ret = silk_control_encoder( ... ) ) != 0 )" ends the
             // packet with the error (enc_API.c:256-260).
             if ret != 0 {
-                return Err("SILK cannot code this rate or packet duration");
+                return Err(Error::internal("SILK cannot code this rate or packet duration"));
             }
             // control_codec.c:76. SILK's noise shaping reads the flag
             // (noise_shape_analysis_FIX.c:171).
@@ -1608,7 +1609,7 @@ impl SilkEncoder {
             // C silk_setup_resamplers: a new encoder sets up its input
             // resampler; the input delay comes from delay_matrix_enc.
             if self.mid.resampler.init_for_enc(self.api_hz, fs_khz * 1000) != 0 {
-                return Err("Unsupported SILK resampling ratio");
+                return Err(Error::internal("unsupported SILK resampling ratio"));
             }
             if let Some(side) = self.side.as_deref_mut() {
                 side.resampler = self.mid.resampler.clone();
@@ -1658,7 +1659,7 @@ impl SilkEncoder {
             ctl.to_mono,
         );
         if ret != 0 {
-            return Err("SILK encoding failed");
+            return Err(Error::internal("SILK encoding failed"));
         }
         let side = self.side.as_deref().filter(|_| sch == 2).map(|ch| &ch.state);
         ctl.zero_bytes = silk_packet_in_dtx(&self.mid.state, side);
@@ -1753,8 +1754,8 @@ impl SilkEncoder {
     /// right channel into the side's. `first_frame` is the length of the
     /// packet's first frame at the internal rate. Returns the samples per
     /// channel at the internal rate.
-    fn resample(&mut self, input: SilkInput<'_>, sch: usize, first_frame: usize) -> Result<usize, &'static str> {
-        const FAILED: Result<usize, &str> = Err("SILK input resampling failed");
+    fn resample(&mut self, input: SilkInput<'_>, sch: usize, first_frame: usize) -> Result<usize, Error> {
+        const FAILED: Result<usize, Error> = Err(Error::internal("SILK input resampling failed"));
         let api_channels = 1 + self.side.is_some() as usize;
         let frames = input.len() / api_channels;
         let mid = &mut *self.mid;
@@ -1762,7 +1763,7 @@ impl SilkEncoder {
         let api_khz = (self.api_hz / 1000).max(1) as usize;
         let n = frames * fs_khz / api_khz;
         if frames > MAX_API_SAMPLES || n > MAX_PACKET_SAMPLES {
-            return Err("SILK input longer than a packet");
+            return Err(Error::internal("SILK input longer than a packet"));
         }
         let api = &mut self.api_buf[..frames];
         let prev_channels = mid.state.stereo.n_prev_channels_internal;

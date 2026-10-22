@@ -699,7 +699,7 @@ The controls follow libopus:
 | Call | libopus request | What it does |
 |---|---|---|
 | `OpusDecoder::set_complexity`, `complexity` | `OPUS_SET_COMPLEXITY`, `OPUS_GET_COMPLEXITY` of the decoder | The decoder complexity, 0 to 10. The default is 0. It selects the networks: deep PLC from 5, LACE at 6, NoLACE from 7, and the BWE from 4 when it is switched on. It exists in every build; without the features it is only stored, as in libopus. |
-| `OpusDecoder::set_osce_bwe`, `osce_bwe` | `OPUS_SET_OSCE_BWE`, `OPUS_GET_OSCE_BWE` | Switches the BWE on or off. The default is off. It acts at complexity 4 and above with 48 kHz output. Without the `osce-bwe` feature both return `"Request not implemented"`, as libopus returns `OPUS_UNIMPLEMENTED`. |
+| `OpusDecoder::set_osce_bwe`, `osce_bwe` | `OPUS_SET_OSCE_BWE`, `OPUS_GET_OSCE_BWE` | Switches the BWE on or off. The default is off. It acts at complexity 4 and above with 48 kHz output. Without the `osce-bwe` feature both return an error of kind `ErrorKind::Unimplemented`, as libopus returns `OPUS_UNIMPLEMENTED`. |
 | `OpusDecoder::set_dnn_blob`, `dnn_models` | `OPUS_SET_DNN_BLOB` | Loads other weights from a blob in the libopus format, and tells which groups of networks are loaded. Only with a neural network feature. |
 | `MultistreamDecoder::set_complexity`, `complexity` | `OPUS_SET_COMPLEXITY`, `OPUS_GET_COMPLEXITY` | Sets every stream; reads the first stream, as libopus does. |
 | `MultistreamDecoder::set_osce_bwe`, `set_dnn_blob` | none | Set every stream. libopus's multistream decoder does not forward these requests. |
@@ -717,19 +717,19 @@ A `DnnBlob` is made in one of three ways:
 Cloning a `DnnBlob` does not copy the bytes. A decoder keeps a clone of the blob for as long as it uses its weights. `set_dnn_blob` allocates the layer tables of each group it loads (with `heap`); decoding allocates nothing.
 
 ```rust
-use opus1::OpusDecoder;
+use opus1::{ErrorKind, OpusDecoder};
 
 let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
 assert_eq!(decoder.complexity(), 0);
 // Deep PLC and NoLACE, in a build with those features.
 decoder.set_complexity(7).unwrap();
-assert_eq!(decoder.set_complexity(11), Err("Invalid complexity"));
+assert_eq!(decoder.set_complexity(11).unwrap_err().kind(), ErrorKind::BadArg);
 assert_eq!(decoder.complexity(), 7);
 
 // The bandwidth extension needs the `osce-bwe` feature.
 match decoder.set_osce_bwe(true) {
     Ok(()) => assert_eq!(decoder.osce_bwe(), Ok(true)),
-    Err(message) => assert_eq!(message, "Request not implemented"),
+    Err(e) => assert_eq!(e.kind(), ErrorKind::Unimplemented),
 }
 
 #[cfg(feature = "deep-plc")]
@@ -737,7 +737,8 @@ match decoder.set_osce_bwe(true) {
     use opus1::{DnnBlob, DnnModels};
     assert!(decoder.dnn_models().contains(DnnModels::DEEP_PLC));
     // Bytes that are not a blob are refused.
-    assert_eq!(DnnBlob::from_bytes(&[1, 2, 3]).err(), Some("Invalid DNN blob"));
+    let err = DnnBlob::from_bytes(&[1, 2, 3]).err().unwrap();
+    assert_eq!(err.kind(), ErrorKind::BadArg);
     // Back to the built-in weights, after another blob was loaded.
     let loaded = decoder.set_dnn_blob(&DnnBlob::builtin()).unwrap();
     assert!(loaded.contains(DnnModels::DEEP_PLC));
@@ -900,7 +901,7 @@ let decoder: &'static mut OpusDecoder = OpusDecoder::init(unsafe { &mut *slot },
 
 let mut pcm = [0.0f32; 960 * 2];
 decoder.decode(&[], 960, &mut pcm)?; // conceals a lost frame
-# Ok::<(), &'static str>(())
+# Ok::<(), opus1::Error>(())
 ```
 
 Measured in a release build for aarch64 without `heap`, with and without the neural network features:
@@ -1019,58 +1020,71 @@ An embedded framework often has its own way to do this, such as a cell that is i
 
 ## Errors
 
-Every function that can fail returns `Result<T, &'static str>`. The string says what was wrong. There is no error enum. The strings are fixed messages, so a program can log them or compare them.
+Every function that can fail returns `Result<T, opus1::Error>`. An `Error` holds two things:
 
-What is rejected:
+- `kind()` returns an `ErrorKind`, one per libopus error code. The kinds are `BadArg` (libopus `OPUS_BAD_ARG`), `BufferTooSmall` (`OPUS_BUFFER_TOO_SMALL`), `InternalError` (`OPUS_INTERNAL_ERROR`), `InvalidPacket` (`OPUS_INVALID_PACKET`), `Unimplemented` (`OPUS_UNIMPLEMENTED`), `InvalidState` (`OPUS_INVALID_STATE`) and `AllocFail` (`OPUS_ALLOC_FAIL`). opus1 returns the kind that libopus returns in the same case.
+- `message()` returns a short text that says what was wrong, such as `"invalid complexity"`. `Display` writes the same text.
 
-| Call | Input | Error |
-|---|---|---|
-| `OpusEncoder::new`, `OpusDecoder::new` | a sampling rate other than 8000, 12000, 16000, 24000, 48000 | `"Invalid sampling rate"` |
-| `OpusEncoder::new`, `OpusDecoder::new` | a channel count other than 1 or 2 | `"Invalid number of channels"` |
-| `encode`, `encode_i16`, `encode24` | a frame size that is not 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms; with an expert frame duration, a frame size shorter than that duration | `"Invalid frame size for sampling rate"` |
-| `encode`, `encode_i16`, `encode24` | fewer than `frame_size * channels` input samples | `"Input buffer too small for frame"` |
-| `encode`, `encode_i16`, `encode24` | an empty output buffer, or a 100 ms frame into a 1-byte buffer | `"Output buffer too small"` |
-| `decode` and the other decode calls | a packet that breaks the rules of section 3 of RFC 6716 (Request for Comments 6716, the Opus specification) | `"Invalid packet"` |
-| `decode` | a packet longer than `frame_size` | `"frame_size too small for packet"` |
-| `decode` and the other decode calls | an output buffer shorter than the samples to be written | `"Output buffer too small for packet"` |
-| `decode` with an empty packet, `decode_fec` | a `frame_size` that is not a multiple of 2.5 ms | `"Lost frame: frame_size must be a multiple of 2.5 ms"` |
-| `set_bitrate` | `Bitrate::BitsPerSecond(n)` with `n` of 0 or less | `"Invalid bitrate"` |
-| `set_complexity` of the encoder, the decoder and the multistream decoder | a value outside 0 to 10 | `"Invalid complexity"` |
-| `OpusDecoder::set_osce_bwe`, `osce_bwe`, `MultistreamDecoder::set_osce_bwe` | a build without the `osce-bwe` feature | `"Request not implemented"` |
-| `DnnBlob::from_bytes`, `DnnBlob::from_static` | bytes that are not a blob in the libopus format | `"Invalid DNN blob"` |
-| `DnnBlob::from_static` | a blob with an array that does not start on a 4-byte boundary | `"DNN blob is not aligned"` |
-| `set_dnn_blob` | a blob that holds no complete group of networks of this build | `"DNN blob holds no model of this build"` |
-| `set_packet_loss_perc` | a value outside 0 to 100 | `"Invalid packet loss percentage"` |
-| `set_max_bandwidth` | `Bandwidth::Auto` | `"Invalid maximum bandwidth"` |
-| `set_force_channels` | more channels than the encoder has, or 0 | `"Invalid forced channel count"` |
-| `MultistreamEncoder::set_force_channels` | as above, for the first stream that refuses it (`Some(2)` with a mono stream); the streams before it keep the new value, as in libopus | `"Invalid forced channel count"` |
-| `OpusDecoder::set_gain`, `MultistreamDecoder::set_gain` | a value outside -32768 to 32767 | `"Invalid gain"` |
-| `OpusEncoder::set_voice_ratio` | a value outside -1 to 100 | `"Invalid voice ratio"` |
-| `OpusEncoder::set_application`, `MultistreamEncoder::set_application` | another application after the first frame (before `reset_state`) | `"Application cannot change after the first frame"` |
+`to_raw()` gives the libopus number of the kind, for example -1 for `BadArg`. That helps where opus1 replaces libopus behind a C interface.
+
+A program should decide what to do from the kind, not from the message. The messages are for logs. Their wording can change in any release. `ErrorKind` is `#[non_exhaustive]`: a later release may add kinds, so a `match` on it needs a `_` arm.
+
+`Error` implements `core::error::Error`, which is `std::error::Error` in a `std` build. So `?` turns it into a `Box<dyn std::error::Error>` or the error type of an application. `Error` is `Copy` and holds no allocation, so it also works in `no_std` builds.
+
+`InternalError` means that the codec reached a state that should not happen. Please report it with the input that caused it.
+
+What the encoder and the decoder reject:
+
+| Call | Input | Kind | Message |
+|---|---|---|---|
+| `OpusEncoder::new`, `OpusDecoder::new` | a sampling rate other than 8000, 12000, 16000, 24000, 48000 | `BadArg` | `invalid sampling rate` |
+| `OpusEncoder::new`, `OpusDecoder::new` | a channel count other than 1 or 2 | `BadArg` | `invalid number of channels` |
+| `encode`, `encode_i16`, `encode24` | a frame size that is not 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms; with an expert frame duration, a frame size shorter than that duration | `BadArg` | `invalid frame size` |
+| `encode`, `encode_i16`, `encode24` | fewer than `frame_size * channels` input samples | `BadArg` | `input buffer too small for frame` |
+| `encode`, `encode_i16`, `encode24` | an empty output buffer | `BadArg` | `output buffer is empty` |
+| `encode`, `encode_i16`, `encode24` | a 100 ms frame into a 1-byte buffer | `BufferTooSmall` | `output buffer too small` |
+| `decode` and the other decode calls | a packet that breaks the rules of section 3 of RFC 6716 (Request for Comments 6716, the Opus specification) | `InvalidPacket` | `invalid packet` |
+| `decode` and the other decode calls | a `frame_size` of 0 | `BadArg` | `invalid frame size` |
+| `decode` | a packet longer than `frame_size` | `BufferTooSmall` | `output buffer too small: frame_size is shorter than the packet` |
+| `decode` and the other decode calls | an output buffer shorter than the samples to be written | `BufferTooSmall` | `output buffer too small` |
+| `decode` with an empty packet, `decode_fec` | a `frame_size` that is not a multiple of 2.5 ms | `BadArg` | `lost frame: frame_size must be a multiple of 2.5 ms` |
+| `set_bitrate` | `Bitrate::BitsPerSecond(n)` with `n` of 0 or less | `BadArg` | `invalid bitrate` |
+| `set_complexity` of the encoder, the decoder and the multistream decoder | a value outside 0 to 10 | `BadArg` | `invalid complexity` |
+| `OpusDecoder::set_osce_bwe`, `osce_bwe`, `MultistreamDecoder::set_osce_bwe` | a build without the `osce-bwe` feature | `Unimplemented` | `request not implemented` |
+| `DnnBlob::from_bytes`, `DnnBlob::from_static` | bytes that are not a blob in the libopus format | `BadArg` | `invalid DNN blob` |
+| `DnnBlob::from_static` | a blob with an array that does not start on a 4-byte boundary | `BadArg` | `DNN blob is not aligned` |
+| `set_dnn_blob` | a blob that holds no complete group of networks of this build | `BadArg` | `DNN blob holds no model of this build` |
+| `set_packet_loss_perc` | a value outside 0 to 100 | `BadArg` | `invalid packet loss percentage` |
+| `set_max_bandwidth` | `Bandwidth::Auto` | `BadArg` | `invalid maximum bandwidth` |
+| `set_force_channels` | more channels than the encoder has, or 0 | `BadArg` | `invalid forced channel count` |
+| `MultistreamEncoder::set_force_channels` | as above, for the first stream that refuses it (`Some(2)` with a mono stream); the streams before it keep the new value, as in libopus | `BadArg` | `invalid forced channel count` |
+| `OpusDecoder::set_gain`, `MultistreamDecoder::set_gain` | a value outside -32768 to 32767 | `BadArg` | `invalid gain` |
+| `OpusEncoder::set_voice_ratio` | a value outside -1 to 100 | `BadArg` | `invalid voice ratio` |
+| `OpusEncoder::set_application`, `MultistreamEncoder::set_application` | another application after the first frame (before `reset_state`) | `BadArg` | `application cannot change after the first frame` |
+
+The functions of the modules `packet`, `extensions` and `multistream` use the same kinds. Their documentation lists the errors of each function.
 
 What is not rejected: a positive bitrate below 500 b/s or above 750,000 b/s per channel. `set_bitrate` moves it to the nearest limit, as libopus's `OPUS_SET_BITRATE` does.
 
 The decoder checks the packet and the buffer sizes before it changes its state. After an invalid packet or a buffer that is too small, the next packet decodes normally.
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, ErrorKind, OpusDecoder, OpusEncoder};
 
 // 44.1 kHz is not an Opus sampling rate.
-assert_eq!(
-    OpusEncoder::new(44_100, 1, Application::Audio).err(),
-    Some("Invalid sampling rate")
-);
+let err = OpusEncoder::new(44_100, 1, Application::Audio).err().unwrap();
+assert_eq!(err.kind(), ErrorKind::BadArg);
+assert_eq!(err.to_raw(), -1); // OPUS_BAD_ARG
+assert_eq!(err.to_string(), "invalid sampling rate");
 
 let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
 let mut packet = [0u8; 1276];
 // 441 samples is not a valid frame duration at 48 kHz.
-assert_eq!(
-    encoder.encode(&[0.0; 441], 441, &mut packet),
-    Err("Invalid frame size for sampling rate")
-);
+let err = encoder.encode(&[0.0; 441], 441, &mut packet).unwrap_err();
+assert_eq!(err.kind(), ErrorKind::BadArg);
 
 // A complexity above 10 is refused, and the old value stays.
-assert_eq!(encoder.set_complexity(42), Err("Invalid complexity"));
+assert_eq!(encoder.set_complexity(42).unwrap_err().kind(), ErrorKind::BadArg);
 assert_eq!(encoder.complexity(), 9);
 // A bitrate above 750 kb/s per channel is limited, not refused.
 encoder.set_bitrate(Bitrate::BitsPerSecond(1_000_000)).unwrap();
@@ -1079,11 +1093,25 @@ assert_eq!(encoder.bitrate_setting(), Bitrate::BitsPerSecond(750_000));
 let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
 let mut out = [0.0f32; 960];
 // Frame count code 3 needs a second byte.
-assert_eq!(decoder.decode(&[0x03], 960, &mut out), Err("Invalid packet"));
+let err = decoder.decode(&[0x03], 960, &mut out).unwrap_err();
+assert_eq!(err.kind(), ErrorKind::InvalidPacket);
+// A lost frame must last a whole number of 2.5 ms.
 match decoder.decode(&[], 100, &mut out) {
     Ok(_) => unreachable!(),
-    Err(message) => assert!(message.contains("2.5 ms")),
+    Err(e) if e.kind() == ErrorKind::BadArg => println!("refused: {e}"),
+    Err(e) => panic!("unexpected error: {e}"),
 }
+
+// `?` turns an `Error` into a `Box<dyn std::error::Error>`.
+fn first_packet(pcm: &[f32]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio)?;
+    let mut packet = vec![0u8; 1276];
+    let len = encoder.encode(pcm, 960, &mut packet)?;
+    packet.truncate(len);
+    Ok(packet)
+}
+assert!(first_packet(&[0.0; 960]).is_ok());
+assert!(first_packet(&[0.0; 100]).is_err());
 ```
 
 ## Threads

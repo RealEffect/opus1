@@ -33,7 +33,7 @@ use ms_support::*;
 use multistream_e2e_common::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode};
+use opus1::{Application, Bandwidth, Bitrate, ErrorKind, ForcedMode};
 
 /// A small deterministic random number generator.
 struct Lcg(u32);
@@ -293,7 +293,7 @@ fn stress(case: &Case, fs: i32, application: Application, seed: u32, frames: usi
                 // Only too few bytes are a reason to refuse a frame. The
                 // packet is limited by the buffer, and with constant
                 // bitrate also by the bitrate.
-                assert_eq!(e, "Output buffer too small", "{}", at(&history));
+                assert_eq!(e.kind(), ErrorKind::BufferTooSmall, "{}", at(&history));
                 let limit = match enc.bitrate_setting() {
                     Bitrate::BitsPerSecond(bps) if !enc.vbr() => {
                         let bits = bps as i64 * frame_size as i64 / fs as i64;

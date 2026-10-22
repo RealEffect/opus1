@@ -33,15 +33,13 @@
 //! Nothing here allocates, except `ExtensionList` beyond its fixed size
 //! with the feature `std`.
 
+use crate::Error;
+
 /// The extension IDs 0, 1 and 2 are padding, separators and repeats. The
 /// IDs of real extensions are 3 to 127.
 pub const MIN_ID: u8 = 3;
 /// The largest extension ID.
 pub const MAX_ID: u8 = 127;
-
-const BAD_ARG: &str = "Invalid argument";
-const BUFFER_TOO_SMALL: &str = "Output buffer too small";
-const INVALID_PACKET: &str = "Invalid packet";
 
 /// The most frames of a packet (120 ms of 2.5 ms frames).
 const MAX_FRAMES: usize = 48;
@@ -219,14 +217,14 @@ impl<'a> ExtensionIterator<'a> {
         self.frame_max = frame_max;
     }
 
-    fn fail(&mut self) -> &'static str {
+    fn fail(&mut self) -> Error {
         self.failed = true;
-        INVALID_PACKET
+        Error::INVALID_PACKET
     }
 
     /// The next repeated extension, or `None` when the repeats are done.
     /// libopus `opus_extension_iterator_next_repeat`.
-    fn next_repeat(&mut self) -> Result<Option<Extension<'a>>, &'static str> {
+    fn next_repeat(&mut self) -> Result<Option<Extension<'a>>, Error> {
         debug_assert!(self.repeat_frame > 0);
         while self.repeat_frame < self.nb_frames {
             while self.src_len > 0 {
@@ -285,13 +283,13 @@ impl<'a> ExtensionIterator<'a> {
         Ok(None)
     }
 
-    /// The next extension, `None` at the end, or an error ("Invalid packet")
-    /// when the padding is not valid. libopus
-    /// `opus_extension_iterator_next`.
+    /// The next extension, `None` at the end, or an error
+    /// ([`InvalidPacket`](crate::ErrorKind::InvalidPacket)) when the padding is
+    /// not valid. libopus `opus_extension_iterator_next`.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<Extension<'a>>, &'static str> {
+    pub fn next(&mut self) -> Result<Option<Extension<'a>>, Error> {
         if self.failed {
-            return Err(INVALID_PACKET);
+            return Err(Error::INVALID_PACKET);
         }
         if self.repeat_frame > 0 {
             // In the middle of a repeat.
@@ -363,7 +361,7 @@ impl<'a> ExtensionIterator<'a> {
 
     /// The next extension with ID `id`. libopus
     /// `opus_extension_iterator_find`.
-    pub fn find(&mut self, id: u8) -> Result<Option<Extension<'a>>, &'static str> {
+    pub fn find(&mut self, id: u8) -> Result<Option<Extension<'a>>, Error> {
         while let Some(ext) = self.next()? {
             if ext.id == id {
                 return Ok(Some(ext));
@@ -389,7 +387,7 @@ pub fn count(data: &[u8], nb_frames: usize) -> usize {
 }
 
 /// Like [`count`], but an error when the padding is not valid.
-pub(crate) fn count_checked(data: &[u8], nb_frames: usize) -> Result<usize, &'static str> {
+pub(crate) fn count_checked(data: &[u8], nb_frames: usize) -> Result<usize, Error> {
     let mut iter = ExtensionIterator::new(data, nb_frames);
     let mut n = 0;
     while iter.next()?.is_some() {
@@ -420,14 +418,14 @@ pub fn count_ext(data: &[u8], nb_frame_exts: &mut [usize], nb_frames: usize) -> 
 /// frames into `out`, in the order of the bytes, and returns their number.
 /// libopus `opus_packet_extensions_parse`.
 ///
-/// Errors: "Invalid packet" when the padding is not valid, "Output buffer
-/// too small" when `out` is too short. In both cases `out` holds the
-/// extensions read before.
-pub fn parse<'a>(data: &'a [u8], out: &mut [Extension<'a>], nb_frames: usize) -> Result<usize, &'static str> {
+/// Errors: [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the padding
+/// is not valid, [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when
+/// `out` is too short. In both cases `out` holds the extensions read before.
+pub fn parse<'a>(data: &'a [u8], out: &mut [Extension<'a>], nb_frames: usize) -> Result<usize, Error> {
     let mut iter = ExtensionIterator::new(data, nb_frames);
     let mut n = 0;
     while let Some(ext) = iter.next()? {
-        let slot = out.get_mut(n).ok_or(BUFFER_TOO_SMALL)?;
+        let slot = out.get_mut(n).ok_or(Error::BUFFER_TOO_SMALL)?;
         *slot = ext;
         n += 1;
     }
@@ -439,8 +437,9 @@ pub fn parse<'a>(data: &'a [u8], out: &mut [Extension<'a>], nb_frames: usize) ->
 /// `nb_frame_exts` must hold what [`count_ext`] counted for the same
 /// padding. libopus `opus_packet_extensions_parse_ext`.
 ///
-/// When `nb_frame_exts` does not hold the counts of `data`, the order of
-/// `out` is unspecified, and the result may be "Output buffer too small".
+/// When `nb_frame_exts` does not hold the counts of `data`, the order of `out`
+/// is unspecified, and the result may be
+/// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall).
 ///
 /// # Panics
 ///
@@ -451,7 +450,7 @@ pub fn parse_ext<'a>(
     out: &mut [Extension<'a>],
     nb_frame_exts: &[usize],
     nb_frames: usize,
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     assert!(nb_frames <= MAX_FRAMES, "a packet has at most 48 frames");
     // Where the extensions of each frame start.
     let mut next = [0usize; MAX_FRAMES + 1];
@@ -466,7 +465,7 @@ pub fn parse_ext<'a>(
     while let Some(ext) = iter.next()? {
         let idx = next[ext.frame];
         next[ext.frame] += 1;
-        let slot = out.get_mut(idx).ok_or(BUFFER_TOO_SMALL)?;
+        let slot = out.get_mut(idx).ok_or(Error::BUFFER_TOO_SMALL)?;
         *slot = ext;
         n += 1;
     }
@@ -495,16 +494,16 @@ impl Out<'_> {
 
 /// Writes the payload of `ext` at `pos`, with its length unless `last`.
 /// libopus `write_extension_payload`.
-fn write_extension_payload(out: &mut Out, pos: usize, ext: &Extension, last: bool) -> Result<usize, &'static str> {
+fn write_extension_payload(out: &mut Out, pos: usize, ext: &Extension, last: bool) -> Result<usize, Error> {
     let mut pos = pos;
     let n = ext.data.len();
     if ext.id < 32 {
         if n > 1 {
-            return Err(BAD_ARG);
+            return Err(Error::BAD_ARG);
         }
         if n > 0 {
             if out.len - pos < n {
-                return Err(BUFFER_TOO_SMALL);
+                return Err(Error::BUFFER_TOO_SMALL);
             }
             out.put(pos, ext.data[0]);
             pos += 1;
@@ -512,7 +511,7 @@ fn write_extension_payload(out: &mut Out, pos: usize, ext: &Extension, last: boo
     } else {
         let length_bytes = if last { 0 } else { 1 + n / 255 };
         if out.len - pos < length_bytes + n {
-            return Err(BUFFER_TOO_SMALL);
+            return Err(Error::BUFFER_TOO_SMALL);
         }
         if !last {
             for _ in 0..n / 255 {
@@ -529,9 +528,9 @@ fn write_extension_payload(out: &mut Out, pos: usize, ext: &Extension, last: boo
 }
 
 /// Writes `ext`, its ID byte first. libopus `write_extension`.
-fn write_extension(out: &mut Out, pos: usize, ext: &Extension, last: bool) -> Result<usize, &'static str> {
+fn write_extension(out: &mut Out, pos: usize, ext: &Extension, last: bool) -> Result<usize, Error> {
     if out.len - pos < 1 {
-        return Err(BUFFER_TOO_SMALL);
+        return Err(Error::BUFFER_TOO_SMALL);
     }
     // For a short extension the L flag is its length; libopus writes this
     // byte before it checks the length.
@@ -547,9 +546,9 @@ fn generate_impl(
     extensions: &[Extension],
     nb_frames: usize,
     pad: bool,
-) -> Result<usize, &'static str> {
+) -> Result<usize, Error> {
     if nb_frames > MAX_FRAMES {
-        return Err(BAD_ARG);
+        return Err(Error::BAD_ARG);
     }
     let n = extensions.len();
     let len = out.len;
@@ -561,7 +560,7 @@ fn generate_impl(
     for (i, ext) in extensions.iter().enumerate() {
         let f = ext.frame;
         if f >= nb_frames || ext.id < MIN_ID || ext.id > MAX_ID {
-            return Err(BAD_ARG);
+            return Err(Error::BAD_ARG);
         }
         frame_min_idx[f] = frame_min_idx[f].min(i);
         frame_max_idx[f] = frame_max_idx[f].max(i + 1);
@@ -622,7 +621,7 @@ fn generate_impl(
                 if f != curr_frame {
                     let diff = f - curr_frame;
                     if len - pos < 2 {
-                        return Err(BUFFER_TOO_SMALL);
+                        return Err(Error::BUFFER_TOO_SMALL);
                     }
                     if diff == 1 {
                         out.put(pos, 0x02);
@@ -642,7 +641,7 @@ fn generate_impl(
                     let nb_repeated = repeat_count * (nb_frames - (f + 1));
                     let last = written + nb_repeated == n || (last_long_idx.is_none() && i + 1 >= frame_max_idx[f]);
                     if len - pos < 1 {
-                        return Err(BUFFER_TOO_SMALL);
+                        return Err(Error::BUFFER_TOO_SMALL);
                     }
                     out.put(pos, 0x04 + u8::from(!last));
                     pos += 1;
@@ -685,11 +684,12 @@ fn generate_impl(
 /// order. Where the same extensions follow in every later frame, a repeat
 /// codes them. With `pad`, bytes 0x01 in front fill `out` to its length.
 ///
-/// Errors: "Invalid argument" for more than 48 frames, a frame number of
-/// `nb_frames` or more, an ID outside 3 to 127, or a short extension (ID
-/// below 32) with more than one byte; "Output buffer too small" when `out`
-/// is too short. `out` may then hold part of the result.
-pub fn generate(out: &mut [u8], extensions: &[Extension], nb_frames: usize, pad: bool) -> Result<usize, &'static str> {
+/// Errors: [`BadArg`](crate::ErrorKind::BadArg) for more than 48 frames, a
+/// frame number of `nb_frames` or more, an ID outside 3 to 127, or a short
+/// extension (ID below 32) with more than one byte;
+/// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when `out` is too
+/// short. `out` may then hold part of the result.
+pub fn generate(out: &mut [u8], extensions: &[Extension], nb_frames: usize, pad: bool) -> Result<usize, Error> {
     let len = out.len();
     generate_impl(Out { data: Some(out), len }, extensions, nb_frames, pad)
 }
@@ -697,7 +697,7 @@ pub fn generate(out: &mut [u8], extensions: &[Extension], nb_frames: usize, pad:
 /// The bytes [`generate`] would write into a buffer of `max_len` bytes
 /// without padding, with its errors. libopus
 /// `opus_packet_extensions_generate` with a null `data` pointer.
-pub fn generated_len(max_len: usize, extensions: &[Extension], nb_frames: usize) -> Result<usize, &'static str> {
+pub fn generated_len(max_len: usize, extensions: &[Extension], nb_frames: usize) -> Result<usize, Error> {
     generate_impl(Out { data: None, len: max_len }, extensions, nb_frames, false)
 }
 
@@ -705,9 +705,10 @@ pub fn generated_len(max_len: usize, extensions: &[Extension], nb_frames: usize)
 /// few: libopus's `all_extensions` of `opus_repacketizer_out_range_impl`.
 const INLINE_EXTENSIONS: usize = 32;
 
-/// A list of extensions with room for a known number. Up to 32 live inside
-/// the value. More need the feature `std`, which puts them on the heap;
-/// without it, [`ExtensionList::with_capacity`] fails ("Internal error").
+/// A list of extensions with room for a known number. Up to 32 live inside the
+/// value. More need the feature `std`, which puts them on the heap; without it,
+/// [`ExtensionList::with_capacity`] fails with
+/// [`ErrorKind::AllocFail`](crate::ErrorKind::AllocFail).
 pub(crate) struct ExtensionList<'a> {
     inline: [Extension<'a>; INLINE_EXTENSIONS],
     len: usize,
@@ -716,10 +717,13 @@ pub(crate) struct ExtensionList<'a> {
 }
 
 impl<'a> ExtensionList<'a> {
-    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, &'static str> {
+    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, Error> {
         #[cfg(not(feature = "std"))]
         if capacity > INLINE_EXTENSIONS {
-            return Err("Internal error");
+            return Err(Error::new(
+                crate::ErrorKind::AllocFail,
+                "more than 32 extensions need the std feature",
+            ));
         }
         Ok(ExtensionList {
             inline: [Extension::default(); INLINE_EXTENSIONS],
@@ -755,7 +759,7 @@ mod tests {
     /// ID, frame and payload of each extension.
     type Plain = (u8, usize, Vec<u8>);
 
-    fn all(data: &[u8], nb_frames: usize) -> Result<Vec<Plain>, &'static str> {
+    fn all(data: &[u8], nb_frames: usize) -> Result<Vec<Plain>, Error> {
         let mut it = ExtensionIterator::new(data, nb_frames);
         let mut v = Vec::new();
         while let Some(e) = it.next()? {
@@ -775,7 +779,7 @@ mod tests {
         // Zeros are padding to the end.
         assert_eq!(all(&[0, 0, 0], 1).unwrap(), []);
         // A length past the end.
-        assert_eq!(all(&[0x41, 5, 1], 1), Err(INVALID_PACKET));
+        assert_eq!(all(&[0x41, 5, 1], 1), Err(Error::INVALID_PACKET));
     }
 
     #[test]
@@ -786,7 +790,7 @@ mod tests {
         let v = all(&data, 4).unwrap();
         assert_eq!(v, [(3, 0, vec![]), (4, 1, vec![]), (5, 3, vec![])]);
         // A separator past the last frame.
-        assert_eq!(all(&data, 3), Err(INVALID_PACKET));
+        assert_eq!(all(&data, 3), Err(Error::INVALID_PACKET));
         let mut it = ExtensionIterator::new(&data, 4);
         it.set_frame_max(2);
         assert_eq!(it.next().unwrap().map(|e| e.frame), Some(0));
@@ -821,11 +825,11 @@ mod tests {
         assert_eq!(count(&buf, 4), 8);
         // Bad arguments.
         let bad = [Extension { id: 2, frame: 0, data: &[] }];
-        assert_eq!(generate(&mut buf, &bad, 1, false), Err(BAD_ARG));
+        assert_eq!(generate(&mut buf, &bad, 1, false), Err(Error::BAD_ARG));
         let bad = [Extension { id: 3, frame: 1, data: &[] }];
-        assert_eq!(generate(&mut buf, &bad, 1, false), Err(BAD_ARG));
+        assert_eq!(generate(&mut buf, &bad, 1, false), Err(Error::BAD_ARG));
         let bad = [Extension { id: 3, frame: 0, data: &[1, 2] }];
-        assert_eq!(generate(&mut buf, &bad, 1, false), Err(BAD_ARG));
-        assert_eq!(generate(&mut buf[..5], &exts, 4, false), Err(BUFFER_TOO_SMALL));
+        assert_eq!(generate(&mut buf, &bad, 1, false), Err(Error::BAD_ARG));
+        assert_eq!(generate(&mut buf[..5], &exts, 4, false), Err(Error::BUFFER_TOO_SMALL));
     }
 }

@@ -5,6 +5,7 @@
 //! `dnn/plc_data.c` (`init_plcmodel`). Do not edit: change the generator and
 //! run it again (`tools/dnn-gen/README.md`).
 
+use crate::Error;
 use super::{Layer, LayerSpec, LinearSpec};
 use crate::dnn::nnet::LinearLayer;
 use crate::dnn::weights::WeightList;
@@ -134,7 +135,7 @@ impl<'w> PlcModel<'w> {
     /// libopus `init_plcmodel`: builds every layer from the arrays of `list`,
     /// in the order of `LAYERS`. Fails at the first layer whose arrays are
     /// missing, have the wrong size or are malformed; then nothing is built.
-    pub fn init(list: &WeightList<'w>) -> Result<Self, &'static str> {
+    pub fn init(list: &WeightList<'w>) -> Result<Self, Error> {
         Ok(PlcModel {
             plc_dense_in: LAYERS[0].linear(list)?,
             plc_dense_out: LAYERS[1].linear(list)?,

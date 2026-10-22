@@ -250,7 +250,7 @@ TOC  count   padding length   frame 1       padding
 
 ## Limits
 
-A packet that breaks one of these rules is invalid. The decoder rejects it with the error `"Invalid packet"`.
+A packet that breaks one of these rules is invalid. The decoder rejects it with an error of kind `ErrorKind::InvalidPacket`.
 
 - A packet has at least 1 byte, the TOC byte.
 - A frame has at most 1275 bytes (`opus1::packet::MAX_FRAME_BYTES`).
@@ -323,7 +323,7 @@ Some packets carry no coded audio. The decoder fills the time they cover with co
 |---|---|---|
 | 0 bytes (`&[]`) | Not a packet. The application programming interface (API) of the decoder uses it to say "this packet was lost". | Conceals `frame_size` samples per channel. `frame_size` must be a multiple of 2.5 ms. |
 | 1 byte, code 0 or 1 | A valid packet whose frames have 0 bytes. | Conceals the duration the TOC byte describes: one frame for code 0, two frames for code 1. |
-| 1 byte, code 2 or 3 | An invalid packet: these codes need more bytes. | Returns the error `"Invalid packet"`. |
+| 1 byte, code 2 or 3 | An invalid packet: these codes need more bytes. | Returns an error of kind `InvalidPacket`. |
 | A frame of 0 or 1 byte inside a longer packet | A frame without audio. | Conceals that frame. |
 
 Concealment continues in the mode of the audio the decoder produced last, as in libopus. The mode and bandwidth in the TOC byte of a packet without audio are not used for it. Before the first decoded packet, concealment gives silence.
@@ -362,7 +362,7 @@ assert!(decoder.decode(&[0xFA], 2 * 960, &mut out).is_err());
 
 ## The `opus1::packet` module
 
-The module is a port of the framing code of libopus 1.6. It reads the frames out of a packet, writes frames into a packet, joins and splits packets, and pads packets. It is available in the `#![no_std]` build. It does not allocate memory, except in the rare cases of [Packet extensions](#packet-extensions). A parsed packet is a small value that holds offsets and sizes in the caller's buffer. It does not copy the frames. Errors are `&'static str` values: `"Invalid packet"`, `"Output buffer too small"`, `"Invalid argument"` and `"Internal error"`.
+The module is a port of the framing code of libopus 1.6. It reads the frames out of a packet, writes frames into a packet, joins and splits packets, and pads packets. It is available in the `#![no_std]` build. It does not allocate memory, except in the rare cases of [Packet extensions](#packet-extensions). A parsed packet is a small value that holds offsets and sizes in the caller's buffer. It does not copy the frames. Errors are `opus1::Error` values of the kinds `InvalidPacket`, `BufferTooSmall`, `BadArg` and `InternalError` (see [Errors](06-using-the-library.md#errors)).
 
 | Function | libopus function | What it does |
 |---|---|---|
@@ -598,19 +598,19 @@ The length of a long extension is written like the padding length of a packet, b
 | `generate(out, extensions, nb_frames, pad)` | `opus_packet_extensions_generate` | Writes extensions, with a repeat where the same extensions follow in every later frame. With `pad`, bytes `01` in front fill `out`. |
 | `generated_len(max_len, extensions, nb_frames)` | the same with a null buffer | The number of bytes `generate` writes. |
 
-An `Extension` has an `id`, a `frame` and its payload `data`. Errors: `"Invalid packet"` for invalid padding, `"Output buffer too small"`, and `"Invalid argument"` for an ID outside 3 to 127, a frame number past the last frame, or a short extension with more than one byte.
+An `Extension` has an `id`, a `frame` and its payload `data`. Errors: `InvalidPacket` for invalid padding, `BufferTooSmall` when the output is too short, and `BadArg` for an ID outside 3 to 127, a frame number past the last frame, or a short extension with more than one byte.
 
 The packet functions use extensions as libopus does:
 
 - `parse` does not read the padding. `ParsedPacket::padding` returns it.
 - `Repacketizer` carries the extensions of its packets into the packets it writes. Their frame numbers then count from the first frame of the new packet. The extensions of a packet go with its first frame: when `out_range` leaves that frame out, they are dropped.
-- `pad` and `multistream_pad` keep the extensions of the packet. When its padding is not valid extension data, they fail with `"Internal error"`, as libopus does. Zeros are valid: ID 0 with `L` = 0 is padding to the end.
+- `pad` and `multistream_pad` keep the extensions of the packet. When its padding is not valid extension data, they fail with `InternalError`, as libopus does. Zeros are valid: ID 0 with `L` = 0 is padding to the end.
 - `pad_with_extensions(data, len, new_len, pad, extensions)` adds extensions before those the packet has. Without `pad` the packet takes only the room it needs. It returns the new length, or 0 when `len` equals `new_len`. In that case it changes nothing, as libopus does.
 - `unpad` and `multistream_unpad` drop the padding with its extensions.
 - The decoder ignores extensions, as libopus 1.6.1 does without its quality extension (QEXT).
 - The encoder of libopus writes an extension only for DRED, and so does the encoder of `opus1` (feature `dred`, see [The encoder](03-encoder.md#18-deep-redundancy-dred)).
 
-Up to 32 extensions in one call need no memory allocation. More need the `std` feature, which allocates them. `pad` with extensions in the old padding also copies that padding, because the new packet may overwrite it. Without `std`, these cases fail with `"Internal error"` when there are more than 32 extensions or the old padding is longer than 1275 bytes.
+Up to 32 extensions in one call need no memory allocation. More need the `std` feature, which allocates them. `pad` with extensions in the old padding also copies that padding, because the new packet may overwrite it. Without `std`, these cases fail with `AllocFail` when there are more than 32 extensions or the old padding is longer than 1275 bytes.
 
 ```rust
 use opus1::extensions::{self, Extension};

@@ -17,6 +17,7 @@
 //! previous packet that a packet can carry (in-band forward error
 //! correction). libopus calls that copy LBRR, "low bit rate redundancy".
 
+use crate::Error;
 use crate::deep_plc::DeepPlcArgs;
 #[cfg(feature = "osce-bwe")]
 use crate::dnn::DnnArch;
@@ -253,7 +254,7 @@ impl SilkDecoder {
         output: &mut [i16],
         lost_flag: i32,
         new_packet: bool,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         self.decode_with_dnn(control, range_dec, output, lost_flag, new_packet, None, false, None)
     }
 
@@ -281,9 +282,9 @@ impl SilkDecoder {
         deep_plc: Option<&mut DeepPlcArgs>,
         enable_deep_plc: bool,
         osce: Option<&OsceArgs>,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, Error> {
         if !matches!(control.api_sample_rate, 8000 | 12000 | 16000 | 24000 | 48000) {
-            return Err("SILK decoder: invalid output sampling rate");
+            return Err(Error::bad_arg("SILK decoder: invalid output sampling rate"));
         }
         let fs_khz_dec = check_control(control, lost_flag)?;
         let n_api = control.n_channels_api as usize;
@@ -299,7 +300,7 @@ impl SilkDecoder {
         };
         let n_out = (frame_ms * control.api_sample_rate / 1000) as usize;
         if output.len() < n_out * n_api {
-            return Err("SILK decoder: output buffer too small");
+            return Err(Error::buffer_too_small("SILK decoder: output buffer too small"));
         }
 
         let frame = self.decode_to_silk_rate(
@@ -314,7 +315,7 @@ impl SilkDecoder {
         )?;
         let n_dec = frame.n_samples;
         if n_dec * control.api_sample_rate as usize != n_out * fs_khz as usize * 1000 {
-            return Err("SILK decoder: unexpected frame length");
+            return Err(Error::internal("SILK decoder: unexpected frame length"));
         }
 
         // Resample to the output rate, or extend the bandwidth. The input
@@ -408,7 +409,7 @@ impl SilkDecoder {
         mut deep_plc: Option<&mut DeepPlcArgs>,
         enable_deep_plc: bool,
         osce: Option<&OsceArgs>,
-    ) -> Result<DecodedFrame, &'static str> {
+    ) -> Result<DecodedFrame, Error> {
         let n_api = control.n_channels_api as usize;
         let n_int = control.n_channels_internal as usize;
 
@@ -450,7 +451,7 @@ impl SilkDecoder {
                 // The frame length and the pitch contour table follow from
                 // `nb_subfr` inside silk_decoder_set_fs.
                 if silk_decoder_set_fs(state, fs_khz_dec, control.api_sample_rate) < 0 {
-                    return Err("SILK decoder: unsupported sampling rate");
+                    return Err(Error::bad_arg("SILK decoder: unsupported sampling rate"));
                 }
             }
         }
@@ -481,7 +482,9 @@ impl SilkDecoder {
         for state in &self.channel_state[..n_int] {
             if lost_flag != FLAG_PACKET_LOST && state.n_frames_decoded >= state.n_frames_per_packet
             {
-                return Err("SILK decoder: more frames requested than the packet holds");
+                return Err(Error::bad_arg(
+                    "SILK decoder: more frames requested than the packet holds",
+                ));
             }
             if state.fs_khz != fs_khz
                 || state.frame_length != frame_length
@@ -489,7 +492,7 @@ impl SilkDecoder {
                 || frame_length as usize > MAX_FRAME_LENGTH
                 || state.resampler_api_hz != control.api_sample_rate
             {
-                return Err("SILK decoder: inconsistent state");
+                return Err(Error::internal("SILK decoder: inconsistent state"));
             }
         }
 
@@ -658,7 +661,7 @@ impl SilkDecoder {
                     osce_models,
                 );
                 if ret < 0 {
-                    return Err("SILK decoder: frame decoding failed");
+                    return Err(Error::internal("SILK decoder: frame decoding failed"));
                 }
             } else {
                 self.w_silk_buf[n][2..2 + n_samples as usize].fill(0);
@@ -843,22 +846,22 @@ impl<'a> OutputStage<'a> {
 
 /// Check the values every decode call depends on. Returns the SILK rate in
 /// kHz.
-fn check_control(control: &SilkDecControl, lost_flag: i32) -> Result<i32, &'static str> {
+fn check_control(control: &SilkDecControl, lost_flag: i32) -> Result<i32, Error> {
     if !matches!(control.n_channels_api, 1 | 2) || !matches!(control.n_channels_internal, 1 | 2) {
-        return Err("SILK decoder: channel count must be 1 or 2");
+        return Err(Error::bad_arg("SILK decoder: channel count must be 1 or 2"));
     }
     if !matches!(control.payload_size_ms, 0 | 10 | 20 | 40 | 60) {
-        return Err("SILK decoder: invalid frame duration");
+        return Err(Error::bad_arg("SILK decoder: invalid frame duration"));
     }
     let fs_khz_dec = (control.internal_sample_rate >> 10) + 1;
     if !matches!(fs_khz_dec, 8 | 12 | 16) {
-        return Err("SILK decoder: invalid sampling rate");
+        return Err(Error::bad_arg("SILK decoder: invalid sampling rate"));
     }
     if !matches!(
         lost_flag,
         FLAG_DECODE_NORMAL | FLAG_PACKET_LOST | FLAG_DECODE_LBRR
     ) {
-        return Err("SILK decoder: invalid lost flag");
+        return Err(Error::bad_arg("SILK decoder: invalid lost flag"));
     }
     Ok(fs_khz_dec)
 }
