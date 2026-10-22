@@ -10,6 +10,8 @@
 //! encoder is libopus's byte for byte: CELT-only frames of up to 20 ms
 //! (see docs/10-differences-from-libopus.md). Elsewhere a test compares
 //! the mode of each packet.
+// Without `analysis`, the tests that compare encoded packets are left out.
+#![cfg_attr(not(feature = "analysis"), allow(dead_code, unused_imports))]
 
 mod core_common;
 mod k24_common;
@@ -142,6 +144,8 @@ fn decode_both(
 /// CELT-only stereo at bitrates that use intensity stereo, VBR and CBR:
 /// the packets of opus1 equal libopus's with and without phase inversion,
 /// and disabling it changes the packets.
+// libopus runs its speech and music analysis at the default complexity.
+#[cfg(feature = "analysis")]
 #[test]
 #[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn phase_inversion_disabled_encodes_as_libopus() {
@@ -440,6 +444,8 @@ fn pcm24(rate: usize, channels: usize, seconds: f64) -> Vec<i32> {
 /// frames of 10 and 20 ms with VBR, 40 and 60 ms with CBR (opus1 codes
 /// longer VBR packets differently on purpose). `decode24` of those packets
 /// gives libopus's samples, values beyond 24 bits included.
+// libopus runs its speech and music analysis at the default complexity.
+#[cfg(feature = "analysis")]
 #[test]
 #[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn encode24_and_decode24_match_libopus() {
@@ -485,7 +491,7 @@ fn encode24_and_decode24_match_libopus() {
                 let expected = c_dec.decode24(Some(p), 5760, false).unwrap();
                 let n = rust_dec.decode24(p, 5760, &mut out24).unwrap();
                 assert!(out24[..n * channels] == expected[..], "{label}: decoded {i}");
-                beyond |= expected.iter().any(|v| v.abs() > 8_388_608);
+                beyond |= expected.iter().any(|v| v.unsigned_abs() > 8_388_608);
             }
             assert!(beyond, "{label}: no decoded value beyond 24 bits");
         }
@@ -564,6 +570,8 @@ fn errors_of_the_24_bit_calls_follow_libopus() {
 /// `set_application` before the first frame gives libopus's packets, also
 /// a change to and from `RestrictedLowDelay`. After the first frame only
 /// the current application is accepted; after a reset any again.
+// libopus runs its speech and music analysis at the default complexity.
+#[cfg(feature = "analysis")]
 #[test]
 #[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn set_application_follows_libopus() {
@@ -623,6 +631,8 @@ fn c_ratio(ratio: Option<u8>) -> i32 {
 /// The voice ratio: the values libopus takes, the value after each frame
 /// (set by the caller, kept over silent frames, or replaced by the
 /// analysis), and the configuration of each packet.
+// libopus runs its speech and music analysis at the default complexity.
+#[cfg(feature = "analysis")]
 #[test]
 fn voice_ratio_follows_libopus() {
     let rate = 48_000;
@@ -683,6 +693,8 @@ fn c_bandwidth(bandwidth: Option<Bandwidth>) -> i32 {
 /// `OPUS_GET_MAX_BANDWIDTH`: before the first packet, after every packet
 /// while the bitrate, the bandwidth setting and the maximum bandwidth
 /// change, for packets too small to code audio, and after a reset.
+// libopus runs its speech and music analysis at the default complexity.
+#[cfg(feature = "analysis")]
 #[test]
 #[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn encoder_bandwidth_matches_libopus() {

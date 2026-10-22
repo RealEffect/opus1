@@ -9,7 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-opus1 = { path = ".." }
+# `__internals`: the test-only module `opus1::internals`, which
+# `fuzz_dnn_blob` uses. opus1's default features stay on.
+opus1 = { path = "..", features = ["__internals"] }
 # The raw C interface of libopus, the reference the differential targets
 # compare with. It finds libopus as the main crate's tests do (see
 # docs/09-testing.md, "How libopus is linked").

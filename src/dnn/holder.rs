@@ -161,7 +161,9 @@ impl DnnBlob {
     ///
     /// Hidden from the documentation: `WeightList` is a type of the
     /// internal `dnn` module, which applications cannot name (tests reach
-    /// it through `opus1::internals::dnn`).
+    /// it through `opus1::internals::dnn`). Only with the test-only feature
+    /// `__internals`.
+    #[cfg(feature = "__internals")]
     #[doc(hidden)]
     pub fn weights(&self) -> &WeightList<'_> {
         self.list()

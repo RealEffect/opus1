@@ -22,6 +22,9 @@
 mod core_common;
 mod k24_common;
 mod ms_support;
+// The module `multistream` needs `alloc`; the multistream tests run with
+// `std`, as in the other test files.
+#[cfg(feature = "std")]
 mod multistream_dec_common;
 
 use std::num::NonZeroU32;
@@ -486,6 +489,7 @@ fn rfc8251_test_vectors() {
 /// bitrates, 5 frame durations and 2 signals, some loud enough for the soft
 /// clipper. Each is decoded at every output rate with concealed and rebuilt
 /// packets: 7,500 decodes.
+#[cfg(feature = "std")]
 #[test]
 #[ignore = "takes about 4 minutes"]
 fn multistream_streams() {

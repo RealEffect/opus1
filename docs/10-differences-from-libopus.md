@@ -38,6 +38,35 @@ opus1 follows libopus 1.6, the reference implementation of Opus in C. This docum
 
 ## Not implemented
 
+### The libopus interface
+
+opus1 offers the functions, requests and constants of the public headers of libopus 1.6.1 (`opus.h`, `opus_multistream.h` and `opus_defines.h`) in a Rust form, except those in the second table below. Constructors, `Drop` and `size_of` take the place of the `*_get_size`, `*_create` and `*_destroy` functions. A typed method takes the place of each request of the `*_ctl` functions.
+
+The interface review of opus1 0.2 added the parts that were still missing (the [changelog](changelog-0.2.0.md) lists the changes since opus-rs 0.1.37):
+
+| libopus | opus1 0.2 |
+|---|---|
+| The error codes `OPUS_BAD_ARG` to `OPUS_ALLOC_FAIL`, and `opus_strerror` | `Error`: `kind()` gives an `ErrorKind`, `to_raw()` the libopus code, `message()` and `Display` the text. |
+| `opus_get_version_string` | `LIBOPUS_VERSION`, the libopus release that opus1 follows (`"1.6.1"`), and `VERSION`, the version of the crate. |
+| `opus_encoder_init` | `OpusEncoder::init`, like `OpusDecoder::init` for `opus_decoder_init`. |
+| `opus_packet_get_bandwidth`, `opus_packet_get_nb_channels` | `packet::bandwidth`, `packet::nb_channels`. |
+| `opus_decoder_get_nb_samples` | `OpusDecoder::nb_samples`. |
+| `OPUS_GET_BANDWIDTH` | `bandwidth()` of `OpusEncoder` and `OpusDecoder`: the bandwidth of the last packet. The multistream encoder and decoder answer it from their first stream, as libopus does. |
+| `OPUS_GET_MAX_BANDWIDTH` of a single-stream encoder | `OpusEncoder::max_bandwidth`. |
+| `OPUS_GET_LAST_PACKET_DURATION` of the multistream decoder | `MultistreamDecoder::last_packet_duration`, answered from the first stream, as libopus does. |
+| `OPUS_APPLICATION_RESTRICTED_SILK`, `OPUS_APPLICATION_RESTRICTED_CELT` | `Application::RestrictedSilk`, `Application::RestrictedCelt`, with their behaviour (see [Encoder features and controls](#encoder-features-and-controls)). |
+
+Still missing:
+
+| libopus | In opus1 | Why, and what to use instead |
+|---|---|---|
+| `opus_projection_*` (`opus_projection.h`): mapping family 3 | Not implemented. | Families 0, 1, 2 and 255 are implemented (see [Multichannel](#multichannel)). |
+| `opus_custom_*` (`opus_custom.h`): Opus Custom | Not implemented. | Opus Custom codes CELT at rates and frame sizes that standard Opus does not have, for example 44.1 kHz. Its streams are not Opus streams of RFC 6716, and libopus builds it only with `--enable-custom-modes` or `--enable-opus-custom-api`. |
+| `OPUS_SET_QEXT`, `OPUS_GET_QEXT` | Not ported. | The scalable quality extension, which libopus 1.6.1 builds only with `--enable-qext` (see [Optional libopus features](#optional-libopus-features)). |
+| `opus_multistream_encoder_init`, `opus_multistream_surround_encoder_init`, `opus_multistream_decoder_init` | No construction in memory that the caller provides. | The multistream encoder and decoder allocate their streams when they are built (feature `alloc`). For one stream, `OpusEncoder::init` and `OpusDecoder::init` exist. |
+| `OPUS_SET_IGNORE_EXTENSIONS`, `OPUS_GET_IGNORE_EXTENSIONS` | Not offered. | In libopus 1.6.1 only the quality extension reads extensions in the decoder, so the request changes nothing there (see [Packet padding extensions](#packet-padding-extensions)). |
+| The smaller encoder of `OPUS_APPLICATION_RESTRICTED_SILK` and `OPUS_APPLICATION_RESTRICTED_CELT` | The full encoder state. | The unused parts change no packet; they only take memory (see [Encoder features and controls](#encoder-features-and-controls)). |
+
 ### Encoder features and controls
 
 - The applications of libopus 1.6 are all there. `Application::RestrictedSilk` (`OPUS_APPLICATION_RESTRICTED_SILK`, 2052) and `Application::RestrictedCelt` (`OPUS_APPLICATION_RESTRICTED_CELT`, 2053) were added in opus1 0.2, with their behaviour (see [CELT encoder](#celt-encoder) and [SILK](#silk) for how close their packets are). One part is not ported: libopus allocates a smaller encoder for them. A `RestrictedSilk` encoder of libopus has no CELT encoder, a `RestrictedCelt` encoder has no SILK encoder, and neither has the delay buffer. An opus1 encoder keeps its full state with every application, so it takes the same memory whatever the application is.
@@ -50,6 +79,7 @@ The decoder decodes every valid packet, up to 120 ms. The decoder requests of li
 ### Multichannel
 
 - **Mapping family 3** (ambisonics mixed through a matrix, libopus's `opus_projection_*` functions) is not implemented. Families 0, 1, 2 and 255 are.
+- The multistream encoder and decoder cannot be built in memory that the caller provides (libopus `opus_multistream_encoder_init`, `opus_multistream_surround_encoder_init` and `opus_multistream_decoder_init`). They allocate their streams when they are built, so they need the feature `alloc`. Each stream codec is built in place in that memory, so building needs little stack, also without `heap`.
 - The multistream encoder forwards every request of libopus's multistream encoder ctl as libopus does (since opus1 0.2 also the forced channel count, prediction, phase inversion, the application and `OPUS_GET_VOICE_RATIO`), except the quality extension (`OPUS_SET_QEXT`), which is not ported. libopus has no multistream request for `OPUS_GET_IN_DTX`; `OpusEncoder::in_dtx` of each stream encoder (`MultistreamEncoder::stream_encoder`) tells whether that stream is in DTX. The module documentation in `src/multistream/encoder.rs` names this former difference D5, and the surround bandwidth choice D1 (see [Deliberate differences](#deliberate-differences)).
 - The multistream decoder forwards the complexity, the gain and phase inversion disabling, as libopus does. It answers `OPUS_GET_BANDWIDTH` and `OPUS_GET_LAST_PACKET_DURATION` from the first stream, as libopus does (`MultistreamDecoder::bandwidth` and `last_packet_duration`). The multistream encoder answers `OPUS_GET_BANDWIDTH` from the first stream too (`MultistreamEncoder::bandwidth`).
 
@@ -370,7 +400,7 @@ Before, opus1 rounded every halfway value to the even integer. On 64-bit ARM, a 
 The other integer outputs convert each sample on its own, as libopus does, and round halfway values to the even integer on every target:
 
 - `MultistreamDecoder::decode_i16`: libopus `opus_multistream_decode` converts each sample with `FLOAT2INT16` (`RES2INT16`).
-- The 24-bit output of the evaluation tools (`internals::eval::res2int24`, like libopus `opus_decode24`): `RES2INT24` is `float2int` of each sample. opus1 has no public 24-bit decode call.
+- The 24-bit output of `OpusDecoder::decode24` and `decode_fec24` (libopus `opus_decode24`), `MultistreamDecoder::decode24` and `decode_fec24` (libopus `opus_multistream_decode24`) and `OpusDecoder::dred_decode24` (libopus `opus_decoder_dred_decode24`): `RES2INT24` is `float2int` of each sample scaled by 2^23, without soft clipping and without a limit to 24 bits.
 
 `tests/core_decode_i16_ties.rs` decodes loud CELT and Hybrid streams at every output rate, mono and stereo, with losses, and finds the halfway values in the float output of libopus. It requires the 16-bit samples of libopus, with halfway values both in the blocks and after them, and does the same for the multistream decoder.
 

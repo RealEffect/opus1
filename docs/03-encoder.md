@@ -119,7 +119,7 @@ The encoder hands the result to the CELT encoder once per frame, before any CELT
 - `set_signal(Signal)` (`OPUS_SET_SIGNAL`): `Signal::Voice` or `Signal::Music` replaces the speech estimate of the analysis. The analysis still runs for the other uses.
 - `set_lsb_depth(u8)` (`OPUS_SET_LSB_DEPTH`): the precision of the input, 8 to 24 bits, default 24. It sets the silence threshold and the noise floor of the bandwidth detection and of CELT. `encode_i16` codes with at most 16.
 - `set_inband_fec(InbandFec::OnUnlessMusic)` (`OPUS_SET_INBAND_FEC` 2): FEC that does not move the encoder to SILK when the analysis is confident the input is music.
-- `opus1::internals::analysis::set_analysis_gate` is not part of the public interface. Tests use it to run the analysis at complexity 10 only, as the fixed-point build of libopus does, or never.
+- `opus1::internals::analysis::set_analysis_gate` is not part of the public interface: it exists only with the test-only feature `__internals`. Tests use it to run the analysis at complexity 10 only, as the fixed-point build of libopus does, or never.
 
 **Exactness and cost.** On 64-bit ARM the analysis gives the results of the Homebrew build of libopus 1.6.1 in every field of every frame. It rounds as clang at `-Os` does: the same products are fused into one rounding, and the same sums run in the same order. So CELT-only packets at complexity 7 to 10 are libopus's byte for byte. Builds of libopus at `-O2` differ from the Homebrew build in the last bits of some results ([Differences from libopus](10-differences-from-libopus.md#what-the-figures-were-measured-against)). The busiest loops have NEON versions (`src/analysis/neon.rs`) that give the same bits as the scalar code. One 20 ms call takes about 2.9 µs at 48 kHz on Apple M4 Pro, 11.6 µs on a Cortex-A76 and 34.7 µs on a Cortex-A55, 0.27 to 0.40 of the time of libopus's analysis ([Performance](08-performance.md#the-speech-and-music-analysis)).
 
@@ -766,9 +766,8 @@ The encoder follows libopus 1.6 with these differences. The doc comment of `enco
 1. With `Voip` at 8 to 24 kHz, SILK reads the output of the integer high-pass filter of the fixed-point build. At 48 kHz, and with the other applications, SILK follows the float build.
 2. VBR packets made of several frames have no limit per frame (1.6).
 3. The CELT bitrate of a Hybrid packet is at least 501 b/s.
-4. No control for phase inversion.
-5. A frame that announces the switch to CELT-only without room for the redundant frame still resets the CELT encoder.
-6. The energy mask is copied, not kept as a pointer.
-7. With DRED, in packets of several frames with VBR, the first frame has more room for the DRED data than in libopus (this follows from 2). libopus can then cut its DRED data shorter.
+4. A frame that announces the switch to CELT-only without room for the redundant frame still resets the CELT encoder.
+5. The energy mask is copied, not kept as a pointer.
+6. With DRED, in packets of several frames with VBR, the first frame has more room for the DRED data than in libopus (this follows from 2). libopus can then cut its DRED data shorter.
 
 The SILK encoder is a port of the fixed-point one of libopus, so SILK and Hybrid packets differ from those of the float build of libopus. Its feedback (its voice activity, its signal type, the bits it used) reaches later decisions, so a stream with SILK packets can take other decisions than libopus after its first SILK packet. CELT-only packets, and the analysis itself, are libopus's (1.3).

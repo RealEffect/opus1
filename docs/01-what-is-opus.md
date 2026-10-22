@@ -300,7 +300,7 @@ Real-time audio usually travels over the User Datagram Protocol (UDP). UDP can l
 | Tool | What it does | In opus1 |
 |---|---|---|
 | **Packet loss concealment (PLC)** | The decoder makes up audio for a lost packet, from the audio before it. | Yes. Pass an empty packet to `OpusDecoder::decode`. The SILK and CELT concealment are ports of libopus. |
-| **In-band forward error correction (FEC)** | A SILK frame can carry a low-bitrate copy of the frame before it, called **low bitrate redundancy (LBRR)**. When a packet is lost, the decoder rebuilds it from the copy in the next packet. | Yes. Encoder: `use_inband_fec` and `packet_loss_perc`. Decoder: `OpusDecoder::decode_fec`. |
+| **In-band forward error correction (FEC)** | A SILK frame can carry a low-bitrate copy of the frame before it, called **low bitrate redundancy (LBRR)**. When a packet is lost, the decoder rebuilds it from the copy in the next packet. | Yes. Encoder: `set_inband_fec` and `set_packet_loss_perc`. Decoder: `OpusDecoder::decode_fec`. |
 | **Discontinuous transmission (DTX)** | During silence the encoder sends almost nothing. The decoder fills the gaps with comfort noise. | Yes. Encoder: `set_dtx(true)`, with both kinds of DTX of libopus (that of the Opus layer and that of SILK). The decoder conceals the missing packets and the 1-byte packets of a DTX stream, as libopus does. SILK's concealment adds comfort noise. |
 
 Notes on these tools:
@@ -411,7 +411,9 @@ opus1 is a port of libopus 1.6 to Rust. It has no C code and no C dependency. Bu
 The main gaps:
 
 - the integer version of the speech/music analysis that the fixed-point build of libopus runs (opus1 ports the floating-point version);
-- a few controls, for example the decoder's `OPUS_GET_BANDWIDTH` and `OPUS_SET_IGNORE_EXTENSIONS`;
+- one control, the decoder's `OPUS_SET_IGNORE_EXTENSIONS`, which changes nothing in libopus 1.6.1 without the quality extension;
+- building the multistream encoder and decoder in memory that the caller provides (they allocate their streams);
+- Opus Custom, the interface of `opus_custom.h` for rates and frame sizes that standard Opus does not have;
 - the quality extension (the machine-learning tools deep PLC, OSCE and DRED are there, behind the cargo features `deep-plc`, `osce`, `osce-bwe` and `dred`, and so are packet extensions);
 - ambisonics with a demixing matrix (mapping family 3);
 - bit-exact output on x86-64: there the output is correct, but it is not libopus's to the last bit.

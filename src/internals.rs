@@ -1,9 +1,13 @@
 //! Internal parts of the codec, for the tests, benchmarks, examples and
 //! fuzz targets of this repository.
 //!
-//! This module is not part of the stable API. It is hidden from the
-//! documentation, and any release may change or remove what it holds
-//! without notice. Applications use the items at the crate root and the
+//! This module is not part of the stable API. It exists only with the
+//! test-only cargo feature `__internals`, which is outside semantic
+//! versioning, and it is hidden from the documentation. Any release may
+//! change or remove what it holds without notice. The tests, benchmarks
+//! and examples get the feature through the development dependency of
+//! opus1 on itself in `Cargo.toml`, the fuzz targets through
+//! `fuzz/Cargo.toml`. Applications use the items at the crate root and the
 //! modules `packet`, `extensions` and `multistream`.
 //!
 //! Each module here has the name and the place of the internal module whose
