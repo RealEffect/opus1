@@ -2,7 +2,7 @@
 
 A pure-Rust implementation of the [Opus audio codec](https://opus-codec.org/) (RFC 6716), ported from the reference C implementation (libopus 1.6). The name says what it follows: the Opus 1.x bitstream and the behaviour of libopus 1.x.
 
-This crate was published as `opus-rs` up to version 0.1.37. From 0.2.0 it is published as `opus1`:
+opus1 is a hard fork of [opus-rs](https://github.com/restsend/opus-rs), taken at version 0.1.37. It is developed separately at [github.com/RealEffect/opus1](https://github.com/RealEffect/opus1); opus-rs continues on its own. Code that used `opus_rs::` uses `opus1::` (see the [0.2.0 notes](#020-unreleased) for the API changes):
 
 ```toml
 [dependencies]
@@ -657,6 +657,12 @@ now runs libopus's stereo pitch pre-filter and `theta_rdo`.
 opus1 is released under the BSD-3-Clause license; the full text is in [COPYING](COPYING). It is a port of libopus, so the copyright of the libopus authors (Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon) applies together with that of restsend.com (opus-rs) and gaojiangjie (opus1). The neural network weights in `dnn-weights/` come from libopus 1.6.1 under the same license ([dnn-weights/COPYING](dnn-weights/COPYING)).
 
 ## Links
+
+- **Repository**: <https://github.com/RealEffect/opus1>
+- **Documentation**: <https://docs.rs/opus1>
+- **Forked from**: [opus-rs](https://github.com/restsend/opus-rs) by restsend
+
+Other projects of the opus-rs authors:
 
 - **RustPBX**: <https://github.com/restsend/rustpbx>
 - **RustRTC**: <https://github.com/restsend/rustrtc>

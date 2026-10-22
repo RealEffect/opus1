@@ -11,7 +11,9 @@ keywords = ["opus", "audio", "codec", "no_std"]
 categories = ["multimedia::audio", "multimedia::encoding", "no-std", "embedded"]
 readme = "README.md"
 license = "BSD-3-Clause"
-repository = "https://github.com/restsend/opus-rs"
+repository = "https://github.com/RealEffect/opus1"
+homepage = "https://github.com/RealEffect/opus1"
+documentation = "https://docs.rs/opus1"
 # Left out of the published crate: repository-only files. The tests compare
 # with a linked libopus and read corpora that are not packaged, and the scripts
 # build libopus and run the phone and x86 checks. `docs/` and `README.md` stay:
