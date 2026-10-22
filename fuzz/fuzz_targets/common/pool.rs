@@ -8,7 +8,7 @@
 //! DRED data in the padding.
 
 use opus1::extensions::ExtensionIterator;
-use opus1::packet;
+use opus1::packet::{self, Framing};
 use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 use std::sync::OnceLock;
 
@@ -24,8 +24,8 @@ pub struct Pool {
 
 /// Whether `data` carries an extension with the DRED ID.
 pub fn has_dred(data: &[u8]) -> bool {
-    let Ok(p) = packet::parse(data, false) else { return false };
-    matches!(ExtensionIterator::new(p.padding(data), p.count).find(DRED_ID), Ok(Some(_)))
+    let Ok(p) = packet::parse(data, Framing::Normal) else { return false };
+    matches!(ExtensionIterator::new(p.padding(data), p.nb_frames()).find_id(DRED_ID), Ok(Some(_)))
 }
 
 /// `n` samples per channel of the made-up voice at `fs`.

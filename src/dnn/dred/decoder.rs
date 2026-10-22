@@ -9,7 +9,7 @@
 //!    vectors. This is cheap.
 //! 2. `process` runs the RDOVAE decoder, which turns the latent vectors
 //!    into features, four 10 ms frames per vector. `parse` does it at once
-//!    unless it is told to defer it.
+//!    unless it gets `DredProcessing::Deferred`.
 //!
 //! The processed `OpusDred` then goes to `OpusDecoder::dred_decode` (and
 //! its float and 24-bit variants), which queues the features for deep PLC
@@ -121,7 +121,11 @@ impl Default for OpusDred {
 }
 
 /// What [`OpusDredDecoder::parse`] found in a packet.
+///
+/// Only opus1 makes these values; more fields may be added in a later
+/// release.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DredParse {
     /// libopus's return value: how far back the DRED data reaches, in
     /// samples at the `sampling_rate` of the call, counted back from the
@@ -131,6 +135,21 @@ pub struct DredParse {
     /// the newest DRED data, when the encoder left out the newest frames.
     /// Usually 0.
     pub end: i32,
+}
+
+/// When [`OpusDredDecoder::parse`] runs the RDOVAE decoder: libopus's
+/// `defer_processing` flag of `opus_dred_parse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DredProcessing {
+    /// Run it in `parse`, so that the [`OpusDred`] is ready to decode audio
+    /// (libopus `defer_processing` = 0).
+    Now,
+    /// Only read the bits, which is cheap. Call
+    /// [`OpusDredDecoder::process`] or
+    /// [`process_in_place`](OpusDredDecoder::process_in_place) before
+    /// decoding audio with the [`OpusDred`] (libopus `defer_processing` =
+    /// 1).
+    Deferred,
 }
 
 /// The DRED decoder (libopus `OpusDREDDecoder`): the RDOVAE decoder's
@@ -175,8 +194,9 @@ impl OpusDredDecoder {
     ///   that cover it are read, plus up to two 10 ms frames of margin.
     /// - `sampling_rate`: the rate of `max_dred_samples` and of the result.
     ///   It need not be the rate of the decoder.
-    /// - `defer_processing`: when true, the RDOVAE decoder does not run;
-    ///   call [`process`](Self::process) before decoding audio.
+    /// - `processing`: [`DredProcessing::Now`] runs the RDOVAE decoder.
+    ///   With [`DredProcessing::Deferred`] it does not run; call
+    ///   [`process`](Self::process) before decoding audio.
     ///
     /// Returns what was found ([`DredParse`]). A packet without DRED data gives
     /// zeros and leaves `dred` unusable for decoding. Errors:
@@ -191,7 +211,7 @@ impl OpusDredDecoder {
         data: &[u8],
         max_dred_samples: i32,
         sampling_rate: SampleRate,
-        defer_processing: bool,
+        processing: DredProcessing,
     ) -> Result<DredParse, Error> {
         if !self.is_loaded() {
             return Err(Error::UNIMPLEMENTED);
@@ -204,7 +224,7 @@ impl OpusDredDecoder {
         let offset = 100i32.wrapping_mul(max_dred_samples) / sampling_rate;
         let min_feature_frames = 2i32.wrapping_add(offset).min(2 * DRED_NUM_REDUNDANCY_FRAMES as i32);
         ec_decode(dred, payload, min_feature_frames, dred_frame_offset);
-        if !defer_processing {
+        if processing == DredProcessing::Now {
             self.process_in_place(dred)?;
         }
         let end = (-dred.dred_offset).wrapping_mul(sampling_rate) / 400;
@@ -267,10 +287,10 @@ impl Default for OpusDredDecoder {
 /// 2-byte header, and the position of the frame that carries it in units of
 /// 2.5 ms. The first DRED extension with the right header wins.
 fn find_payload(data: &[u8]) -> Result<Option<(&[u8], i32)>, Error> {
-    let parsed = packet::parse(data, false)?;
-    let frame_size = packet::samples_per_frame(data[0], SampleRate::Hz48000);
-    let mut iter = ExtensionIterator::new(parsed.padding(data), parsed.count);
-    while let Some(ext) = iter.find(DRED_EXTENSION_ID)? {
+    let parsed = packet::parse(data, packet::Framing::Normal)?;
+    let frame_size = packet::samples_per_frame(parsed.toc(), SampleRate::Hz48000);
+    let mut iter = ExtensionIterator::new(parsed.padding(data), parsed.nb_frames());
+    while let Some(ext) = iter.find_id(DRED_EXTENSION_ID)? {
         // DRED position in the packet, in units of 2.5 ms like the offset
         // that the DRED data signals.
         let dred_frame_offset = (ext.frame * frame_size / 120) as i32;

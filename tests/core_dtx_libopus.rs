@@ -55,6 +55,7 @@ use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
 use opus1::{Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate};
+use opus1::packet::Framing;
 
 /// Whether the packets must be libopus's. The speech and music analysis
 /// rounds as the libopus the tests link only on 64-bit ARM.
@@ -313,7 +314,7 @@ fn encode_both(s: &Setup, input: &Input) -> Run {
 fn dtx_frames(packets: &[Vec<u8>]) -> Vec<bool> {
     let mut out = Vec::new();
     for p in packets {
-        let parsed = opus1::packet::parse(p, false).expect("valid packet");
+        let parsed = opus1::packet::parse(p, Framing::Normal).expect("valid packet");
         out.extend(parsed.frames(p).map(|f| f.is_empty()));
     }
     out

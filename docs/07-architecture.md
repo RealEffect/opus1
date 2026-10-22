@@ -18,10 +18,11 @@ This document describes how the source code of `opus1` is organised, for maintai
 
 ### The public interface and `internals`
 
-The public interface is the crate root and two modules:
+The public interface is the crate root and three modules:
 
 - At the crate root: `OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec` and `pcm_soft_clip`. With a neural network feature also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)).
 - `packet`: reading, writing and padding packets.
+- `extensions`: the packet extensions stored in the padding of a packet.
 - `multistream`: the multistream encoder and decoder and their channel layouts.
 
 Every other module is private. The tests, benchmarks, examples and fuzz targets of the repository reach internal items through the module `opus1::internals` (`src/internals.rs`). That module is hidden from the documentation and is not part of the stable API. Each module inside it has the name and the place of an internal module, and re-exports only the items that code outside the crate uses, for example `opus1::internals::range_coder::RangeCoder`. So the compiler reports an internal item that neither the codec nor a test uses as dead code.

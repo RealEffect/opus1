@@ -114,7 +114,7 @@ Bit `s` is set for a stereo packet. The frame count code says how the frames fol
 | 2 | two frames; the size of the first is coded |
 | 3 | 1 to 48 frames; a count byte follows, with optional padding and sizes |
 
-`decode_native` reads the mode (`mode_from_toc`), the bandwidth (`bandwidth_from_toc`), the frame duration (`packet::samples_per_frame`) and the channel count (`channels_from_toc`) from the TOC byte. `packet::parse` (`src/packet.rs`, the port of `opus_packet_parse_impl`) checks the framing and returns the frame count and the size of each frame in a `ParsedPacket`. A packet that does not parse is an error, and the decoder state stays as it was.
+`decode_native` reads the mode (`mode_from_toc`), the bandwidth (`packet::bandwidth`), the frame duration (`packet::samples_per_frame`) and the channel count (`packet::nb_channels`) from the TOC byte. `packet::parse` (`src/packet.rs`, the port of `opus_packet_parse_impl`) checks the framing and returns the frame count and the size of each frame in a `ParsedPacket`. A packet that does not parse is an error, and the decoder state stays as it was.
 
 The decoder state (mode, bandwidth, frame duration, channel count of the last packet) is updated only after these checks.
 
@@ -420,7 +420,7 @@ Decoding DRED takes three steps. The first two belong to an `OpusDredDecoder` an
    - latent vectors of 25 values, newest first. Each stands for 40 ms (four frames of 10 ms).
 
    Only the vectors that cover `max_dred_samples` and 20 ms more are read, at most 26. Reading also stops when fewer than 8 bits are left. The result (`DredParse`) holds libopus's return value (`samples`: how far back the data reaches, at the rate of the call) and `dred_end` (`end`: the samples between the start of the packet and the newest data, when the encoder left out the newest frames).
-2. **Process** (`OpusDredDecoder::process` or `process_in_place`, libopus `opus_dred_process`). The RDOVAE decoder (`src/dnn/dred/rdovae_dec.rs`) turns the initial state into the states of its five GRUs, and each latent vector into four frames of 20 features, newest first. `parse` processes at once unless `defer_processing` is set.
+2. **Process** (`OpusDredDecoder::process` or `process_in_place`, libopus `opus_dred_process`). The RDOVAE decoder (`src/dnn/dred/rdovae_dec.rs`) turns the initial state into the states of its five GRUs, and each latent vector into four frames of 20 features, newest first. `parse` processes at once unless it gets `DredProcessing::Deferred` (libopus `defer_processing`).
 3. **Decode** (`OpusDecoder::dred_decode_float` and the 16-bit and 24-bit variants). `dred_offset` is the distance in samples, at the decoder's rate, from the start of the audio to make up to the start of the DRED packet. The decoder first fills the feature queue of deep PLC, as the DRED step of libopus `opus_decode_native` does (`src/opus_decoder.c:735-758`):
    - It empties the queue.
    - It queues one feature frame per 10 ms of `frame_size`, at least one. When the last call of deep PLC added decoded audio to its history instead of concealing, two more frames come first.

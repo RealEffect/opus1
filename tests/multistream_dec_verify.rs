@@ -36,6 +36,7 @@ use ms_support::*;
 use multistream_dec_common::*;
 use opus1::SampleRate;
 use opus1::multistream::MultistreamDecoder;
+use opus1::packet::{Framing, Padding};
 use std::f64::consts::PI;
 
 /// The limit for "the same samples as the C decoder", as in
@@ -867,7 +868,8 @@ fn random_frame_data_has_the_final_range_of_libopus() {
                     let len = 2 + rng.below(if long { 300 } else { 60 });
                     let frame: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
                     let mut buf = vec![0u8; len + 8];
-                    let n = opus1::packet::write(toc_byte, &[&frame], &mut buf, s + 1 != streams, false).unwrap();
+                    let framing = if s + 1 != streams { Framing::SelfDelimited } else { Framing::Normal };
+                    let n = opus1::packet::write(toc_byte, &[&frame], &mut buf, framing, Padding::Shortest).unwrap();
                     packet.extend_from_slice(&buf[..n]);
                 }
                 let what = format!("{streams} streams at {fs} Hz, packet {round}, {}", toc(config << 3));

@@ -12,9 +12,10 @@ use opus1::extensions::Extension;
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::{
-    Application, Bitrate, Channels, DnnBlob, ErrorKind, OpusDecoder, OpusDred, OpusDredDecoder,
-    OpusEncoder, SampleRate, packet,
+    Application, Bitrate, Channels, DnnBlob, DredProcessing, ErrorKind, OpusDecoder, OpusDred,
+    OpusDredDecoder, OpusEncoder, SampleRate, packet,
 };
+use opus1::packet::{Framing, Padding};
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
 use std::cell::Cell;
 
@@ -108,9 +109,9 @@ fn with_dred(plain: &[u8], payload: &[u8], frame: usize) -> Vec<u8> {
     data.extend_from_slice(payload);
     let mut buf = plain.to_vec();
     buf.resize(plain.len() + data.len() + 64, 0);
-    let ext = [Extension { id: DRED_EXTENSION_ID, frame, data: &data }];
+    let ext = [Extension::new(DRED_EXTENSION_ID, frame, &data)];
     let new_len = buf.len();
-    let n = packet::pad_with_extensions(&mut buf, plain.len(), new_len, false, &ext).unwrap();
+    let n = packet::pad_with_extensions(&mut buf, plain.len(), new_len, Padding::Shortest, &ext).unwrap();
     buf.truncate(n);
     buf
 }
@@ -151,12 +152,12 @@ fn malformed_dred_data_does_not_panic() {
         let mut pcm24 = vec![0i32; 48000 * 2];
         for n in 0..300 {
             let plain = &packets[n % packets.len()];
-            let frames = packet::parse(plain, false).unwrap().count;
+            let frames = packet::parse(plain, Framing::Normal).unwrap().nb_frames();
             let data = with_dred(plain, &random_payload(&mut rng), rng.next() as usize % frames);
             let max = (rng.next() % 100_000) as i32 - 20_000;
             let rate = SampleRate::ALL[rng.next() as usize % SampleRate::ALL.len()];
-            let defer = rng.next().is_multiple_of(2);
-            let got = r.parse(&mut dred, &data, max, rate, defer).unwrap();
+            let processing = if rng.next().is_multiple_of(2) { DredProcessing::Deferred } else { DredProcessing::Now };
+            let got = r.parse(&mut dred, &data, max, rate, processing).unwrap();
             assert!(got.samples >= 0 && got.end >= 0);
             if dred.is_parsed() {
                 r.process_in_place(&mut dred).unwrap();
@@ -187,7 +188,7 @@ fn malformed_dred_data_does_not_panic() {
                 data[0] |= 3;
                 data[1] |= 0x40;
             }
-            if let Ok(got) = r.parse(&mut dred, &data, 48000, SampleRate::Hz48000, false) {
+            if let Ok(got) = r.parse(&mut dred, &data, 48000, SampleRate::Hz48000, DredProcessing::Now) {
                 assert!(got.samples >= 0);
             }
         }
@@ -204,7 +205,7 @@ fn dred_decode_checks_its_arguments() {
     // A payload that gives latent vectors up to the start of the packet.
     let data = loop {
         let data = with_dred(&packets[9], &random_payload(&mut rng), 0);
-        let got = r.parse(&mut dred, &data, 16000, SampleRate::Hz16000, false).unwrap();
+        let got = r.parse(&mut dred, &data, 16000, SampleRate::Hz16000, DredProcessing::Now).unwrap();
         if got.samples > 0 && got.end == 0 && dred.nb_latents() > 2 {
             break data;
         }
@@ -242,22 +243,22 @@ fn dred_decode_checks_its_arguments() {
     assert_eq!(r.process(&OpusDred::new(), &mut dst).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     assert_eq!(r.process_in_place(&mut OpusDred::new()).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     let mut deferred = OpusDred::new();
-    r.parse(&mut deferred, &data, 16000, SampleRate::Hz16000, true).unwrap();
+    r.parse(&mut deferred, &data, 16000, SampleRate::Hz16000, DredProcessing::Deferred).unwrap();
     assert!(deferred.is_parsed() && !deferred.is_processed());
     r.process(&deferred, &mut dst).unwrap();
     assert!(dst.is_processed() && !deferred.is_processed());
     assert_eq!(dst.features(), dred.features());
 
     // Parsing: an empty packet, a packet without DRED.
-    assert_eq!(r.parse(&mut dred, &[], 16000, SampleRate::Hz16000, false).map_err(|e| e.kind()), Err(ErrorKind::InvalidPacket));
+    assert_eq!(r.parse(&mut dred, &[], 16000, SampleRate::Hz16000, DredProcessing::Now).map_err(|e| e.kind()), Err(ErrorKind::InvalidPacket));
     assert!(!dred.is_parsed());
-    let got = r.parse(&mut dred, &packets[0], 16000, SampleRate::Hz16000, false).unwrap();
+    let got = r.parse(&mut dred, &packets[0], 16000, SampleRate::Hz16000, DredProcessing::Now).unwrap();
     assert_eq!((got.samples, got.end), (0, 0));
     // A DRED extension with another version is skipped.
     let mut other = data.clone();
     let at = other.windows(2).position(|w| w == [b'D', DRED_EXPERIMENTAL_VERSION]).unwrap();
     other[at + 1] ^= 1;
-    assert_eq!(r.parse(&mut dred, &other, 16000, SampleRate::Hz16000, false).unwrap().samples, 0);
+    assert_eq!(r.parse(&mut dred, &other, 16000, SampleRate::Hz16000, DredProcessing::Now).unwrap().samples, 0);
 }
 
 #[test]
@@ -283,8 +284,8 @@ fn dred_decoder_loads_weights() {
     let builtin = OpusDredDecoder::new();
     for _ in 0..50 {
         let data = with_dred(&packets[1], &random_payload(&mut rng), 0);
-        r.parse(&mut a, &data, 48000, SampleRate::Hz48000, false).unwrap();
-        builtin.parse(&mut b, &data, 48000, SampleRate::Hz48000, false).unwrap();
+        r.parse(&mut a, &data, 48000, SampleRate::Hz48000, DredProcessing::Now).unwrap();
+        builtin.parse(&mut b, &data, 48000, SampleRate::Hz48000, DredProcessing::Now).unwrap();
         assert_eq!(a.features(), b.features());
     }
 }
@@ -298,7 +299,7 @@ fn parse_process_and_decode_allocate_nothing() {
     let mut rng = Rng(5);
     let data = loop {
         let data = with_dred(&packets[11], &random_payload(&mut rng), 0);
-        if r.parse(&mut dred, &data, 48000, SampleRate::Hz48000, false).unwrap().samples > 0 && dred.nb_latents() > 2 {
+        if r.parse(&mut dred, &data, 48000, SampleRate::Hz48000, DredProcessing::Now).unwrap().samples > 0 && dred.nb_latents() > 2 {
             break data;
         }
     };
@@ -313,7 +314,7 @@ fn parse_process_and_decode_allocate_nothing() {
     // Losses longer than 120 ms, which the integer variants conceal in
     // pieces.
     let n = allocations(|| {
-        r.parse(&mut dred, &data, 48000, SampleRate::Hz48000, true).unwrap();
+        r.parse(&mut dred, &data, 48000, SampleRate::Hz48000, DredProcessing::Deferred).unwrap();
         r.process(&dred, &mut other).unwrap();
         r.process_in_place(&mut dred).unwrap();
         dec.dred_decode_float(&dred, 9600, 9600, &mut pcm).unwrap();

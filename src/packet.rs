@@ -19,9 +19,14 @@
 //! - code 3: any number of frames, of one size (CBR) or with a size each
 //!   (VBR), and optional padding at the end.
 //!
-//! "Self-delimited" framing (RFC 6716 appendix B) adds the size of the last
-//! frame, so that a decoder knows where the packet ends. A multistream packet
-//! uses it for every stream but the last.
+//! "Self-delimited" framing (RFC 6716 appendix B,
+//! [`Framing::SelfDelimited`]) adds the size of the last frame, so that a
+//! decoder knows where the packet ends. A multistream packet uses it for
+//! every stream but the last.
+//!
+//! The TOC byte also gives the mode, the audio bandwidth ([`bandwidth`]), the
+//! frame duration ([`samples_per_frame`]) and the channel count
+//! ([`nb_channels`]).
 //!
 //! The padding of a code 3 packet can hold packet extensions (libopus 1.5
 //! and later; see [`crate::extensions`]). As in libopus:
@@ -41,7 +46,7 @@
 //! The decoder ignores extensions, as libopus 1.6.1 without its quality
 //! extension (QEXT) does.
 
-use crate::{Error, SampleRate};
+use crate::{Bandwidth, Channels, Error, SampleRate};
 use crate::extensions::{self, Extension, ExtensionIterator, ExtensionList};
 
 /// The most frames a packet can hold: 120 ms of 2.5 ms frames.
@@ -59,26 +64,109 @@ pub(crate) const fn max_packet_samples(fs: i32) -> usize {
     fs as usize / 25 * 3
 }
 
-/// Result of parsing one Opus packet. libopus `opus_packet_parse_impl`.
+/// How a packet shows where it ends: libopus's `self_delimited` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Framing {
+    /// The packet ends where its data ends (RFC 6716 section 3). The last
+    /// frame takes the bytes that are left.
+    Normal,
+    /// The packet also codes the size of its last frame (RFC 6716
+    /// appendix B), so other data can follow it. Every stream but the last
+    /// of a multistream packet has this framing.
+    SelfDelimited,
+}
+
+impl Framing {
+    /// [`Framing::SelfDelimited`] when `self_delimited` is true: the libopus
+    /// flag as a `Framing`.
+    pub(crate) const fn from_flag(self_delimited: bool) -> Self {
+        if self_delimited { Framing::SelfDelimited } else { Framing::Normal }
+    }
+
+    const fn is_self_delimited(self) -> bool {
+        matches!(self, Framing::SelfDelimited)
+    }
+}
+
+/// How long a written packet or list of extensions is: libopus's `pad`
+/// flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Padding {
+    /// No more bytes than the content needs.
+    Shortest,
+    /// Padding fills the output buffer, so the result takes exactly the
+    /// length of the buffer.
+    FillBuffer,
+}
+
+impl Padding {
+    /// [`Padding::FillBuffer`] when `pad` is true: the libopus flag as a
+    /// `Padding`.
+    pub(crate) const fn from_flag(pad: bool) -> Self {
+        if pad { Padding::FillBuffer } else { Padding::Shortest }
+    }
+
+    pub(crate) const fn fills_buffer(self) -> bool {
+        matches!(self, Padding::FillBuffer)
+    }
+}
+
+/// Result of parsing one Opus packet: libopus `opus_packet_parse_impl`.
+///
+/// It holds the sizes and offsets that [`parse`] found, not the bytes. Pass
+/// the parsed `data` to [`frames`](Self::frames), [`frame`](Self::frame) and
+/// [`padding`](Self::padding) to get the bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedPacket {
-    /// The table-of-contents byte.
-    pub toc: u8,
+    toc: u8,
     /// Number of frames, 1..=48.
-    pub count: usize,
+    count: usize,
     /// Size of each frame in bytes; only `sizes[..count]` is meaningful.
-    pub sizes: [u16; MAX_FRAMES],
-    /// Offset of the first frame's first byte from the start of the packet.
-    pub payload_offset: usize,
-    /// Bytes this packet occupies, padding included. For a self-delimited
-    /// packet this is where the next stream starts.
-    pub packet_offset: usize,
-    /// Bytes of padding at the end. They are the last `padding_len` bytes
-    /// before `packet_offset`.
-    pub padding_len: usize,
+    sizes: [u16; MAX_FRAMES],
+    payload_offset: usize,
+    packet_offset: usize,
+    /// Never more than `packet_offset`.
+    padding_len: usize,
 }
 
 impl ParsedPacket {
+    /// The table-of-contents (TOC) byte.
+    pub fn toc(&self) -> u8 {
+        self.toc
+    }
+
+    /// The number of frames, 1 to 48.
+    pub fn nb_frames(&self) -> usize {
+        self.count
+    }
+
+    /// The size of each frame in bytes, in the order of the frames.
+    /// libopus `size` of `opus_packet_parse`.
+    pub fn frame_sizes(&self) -> &[u16] {
+        &self.sizes[..self.count]
+    }
+
+    /// Where the first frame starts, in bytes from the start of the packet.
+    /// libopus `payload_offset` of `opus_packet_parse`.
+    pub fn payload_offset(&self) -> usize {
+        self.payload_offset
+    }
+
+    /// The bytes the packet takes, padding included. For a self-delimited
+    /// packet this is where the data after it starts, such as the next
+    /// stream of a multistream packet. libopus `packet_offset` of
+    /// `opus_packet_parse_impl`.
+    pub fn packet_offset(&self) -> usize {
+        self.packet_offset
+    }
+
+    /// The bytes of padding at the end of the packet: the last
+    /// `padding_len()` bytes before [`packet_offset`](Self::packet_offset).
+    /// libopus `padding_len` of `opus_packet_parse_impl`.
+    pub fn padding_len(&self) -> usize {
+        self.padding_len
+    }
+
     /// The frames of the packet `data` this value was parsed from, in order.
     pub fn frames<'a>(&self, data: &'a [u8]) -> Frames<'a, '_> {
         Frames {
@@ -95,9 +183,10 @@ impl ParsedPacket {
     }
 
     /// The padding of the packet `data` this value was parsed from: the
-    /// `padding_len` bytes after the last frame, where packet extensions
-    /// live (see [`crate::extensions`]). libopus returns it from
-    /// `opus_packet_parse_impl`.
+    /// [`padding_len`](Self::padding_len) bytes after the last frame, where
+    /// packet extensions live (see [`crate::extensions`]). libopus returns
+    /// it from `opus_packet_parse_impl`. When `data` is not that packet and
+    /// is too short, the result is empty.
     pub fn padding<'a>(&self, data: &'a [u8]) -> &'a [u8] {
         data.get(self.packet_offset - self.padding_len..self.packet_offset).unwrap_or(&[])
     }
@@ -147,6 +236,40 @@ pub fn samples_per_frame(toc: u8, sampling_rate: SampleRate) -> usize {
         if shift == 3 { fs * 60 / 1000 } else { (fs << shift) / 100 }
     };
     audiosize as usize
+}
+
+/// libopus `opus_packet_get_bandwidth`: the audio bandwidth of a packet with
+/// this TOC byte.
+///
+/// SILK-only packets are narrowband, mediumband or wideband, Hybrid packets
+/// superwideband or fullband. CELT-only packets have no mediumband: their
+/// configurations 16 to 19 are narrowband.
+pub fn bandwidth(toc: u8) -> Bandwidth {
+    if toc & 0x80 != 0 {
+        // CELT-only.
+        match (toc >> 5) & 0x3 {
+            0 => Bandwidth::Narrowband,
+            1 => Bandwidth::Wideband,
+            2 => Bandwidth::Superwideband,
+            _ => Bandwidth::Fullband,
+        }
+    } else if toc & 0x60 == 0x60 {
+        // Hybrid.
+        if toc & 0x10 != 0 { Bandwidth::Fullband } else { Bandwidth::Superwideband }
+    } else {
+        // SILK-only: bits 5 and 6 are 0, 1 or 2 here, since 3 is Hybrid.
+        match (toc >> 5) & 0x3 {
+            0 => Bandwidth::Narrowband,
+            1 => Bandwidth::Mediumband,
+            _ => Bandwidth::Wideband,
+        }
+    }
+}
+
+/// libopus `opus_packet_get_nb_channels`: the number of channels a packet
+/// with this TOC byte codes, from its stereo flag (bit 2).
+pub fn nb_channels(toc: u8) -> Channels {
+    if toc & 0x4 != 0 { Channels::Stereo } else { Channels::Mono }
 }
 
 /// libopus `opus_packet_get_nb_frames`: the number of frames a packet says
@@ -199,7 +322,7 @@ pub fn has_lbrr(data: &[u8]) -> Result<bool, Error> {
     let frame_size = samples_per_frame(toc, SampleRate::Hz48000);
     let nb_frames = if frame_size > 960 { frame_size / 960 } else { 1 };
     let stereo = toc & 0x4 != 0;
-    let parsed = parse(data, false)?;
+    let parsed = parse(data, Framing::Normal)?;
     let Some(&first) = parsed.frame(data, 0).first() else {
         return Ok(false);
     };
@@ -254,12 +377,14 @@ fn parse_size(data: &[u8], pos: usize, len: i64) -> Option<(i64, i64)> {
 /// Parse the framing of one Opus packet: libopus `opus_packet_parse_impl`
 /// (opus.c).
 ///
-/// With `self_delimited`, `data` starts with a self-delimited packet and may
-/// continue with other data, such as the next stream of a multistream
-/// packet. [`ParsedPacket::packet_offset`] then says where the packet ends.
+/// With [`Framing::SelfDelimited`], `data` starts with a self-delimited
+/// packet and may continue with other data, such as the next stream of a
+/// multistream packet. [`ParsedPacket::packet_offset`] then says where the
+/// packet ends.
 ///
 /// Returns an error wherever libopus returns `OPUS_INVALID_PACKET`.
-pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, Error> {
+pub fn parse(data: &[u8], framing: Framing) -> Result<ParsedPacket, Error> {
+    let self_delimited = framing.is_self_delimited();
     let Some(&toc) = data.first() else {
         return Err(Error::INVALID_PACKET);
     };
@@ -431,7 +556,7 @@ pub fn multistream_validate(
         if rest.is_empty() {
             return Err(Error::INVALID_PACKET);
         }
-        let packet = parse(rest, s != nb_streams - 1)?;
+        let packet = parse(rest, Framing::from_flag(s != nb_streams - 1))?;
         // opus_packet_get_nb_samples: no more than 120 ms.
         let tmp_samples = packet.count * samples_per_frame(packet.toc, sampling_rate);
         if tmp_samples as i64 * 25 > sampling_rate.hz() as i64 * 3 {
@@ -595,7 +720,7 @@ fn emit(
     if !extensions.is_empty() {
         let ext_begin = plan.total - plan.ext_len;
         out[pos..ext_begin].fill(0x01);
-        let written = extensions::generate(&mut out[ext_begin..plan.total], extensions, sizes.len(), false);
+        let written = extensions::generate(&mut out[ext_begin..plan.total], extensions, sizes.len(), Padding::Shortest);
         debug_assert_eq!(written, Ok(plan.ext_len));
     } else if pad {
         // Fill the padding with zeros.
@@ -639,22 +764,29 @@ fn copy_frames(frames: &[&[u8]], out: &mut [u8], at: usize) {
 ///
 /// - `toc` supplies the configuration and the stereo flag; its frame-count
 ///   code is replaced by the one that fits the frames.
-/// - `self_delimited` adds the size of the last frame.
-/// - `pad` fills `out` to its full length with padding. The packet then is
-///   exactly `out.len()` bytes long.
+/// - [`Framing::SelfDelimited`] adds the size of the last frame.
+/// - [`Padding::FillBuffer`] fills `out` to its full length with padding.
+///   The packet then is exactly `out.len()` bytes long.
 ///
 /// Returns the number of bytes written. [`Repacketizer`] does the same for
 /// the frames of whole packets, and carries their extensions.
+///
+/// Errors: [`BadArg`](crate::ErrorKind::BadArg) when there are no frames,
+/// more than 120 ms of them, or a frame of more than 1275 bytes;
+/// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when the packet
+/// does not fit in `out`.
 pub fn write(
     toc: u8,
     frames: &[&[u8]],
     out: &mut [u8],
-    self_delimited: bool,
-    pad: bool,
+    framing: Framing,
+    padding: Padding,
 ) -> Result<usize, Error> {
     let sizes = frame_sizes(toc, frames)?;
     let sizes = &sizes[..frames.len()];
-    emit(toc, sizes, out, self_delimited, pad, &[], |out, at| copy_frames(frames, out, at))
+    emit(toc, sizes, out, framing.is_self_delimited(), padding.fills_buffer(), &[], |out, at| {
+        copy_frames(frames, out, at)
+    })
 }
 
 /// Joins the frames of Opus packets into new packets, and splits packets
@@ -672,7 +804,7 @@ pub fn write(
 ///
 /// The repacketizer borrows the packets; it copies nothing until a packet
 /// is written. libopus's `opus_repacketizer_init` is [`reset`](Self::reset).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Repacketizer<'a> {
     toc: u8,
     nb_frames: usize,
@@ -742,7 +874,7 @@ impl<'a> Repacketizer<'a> {
         if (curr_nb_frames + self.nb_frames) * samples_per_frame(self.toc, SampleRate::Hz8000) > 960 {
             return Err(Error::INVALID_PACKET);
         }
-        let packet = parse(data, self_delimited)?;
+        let packet = parse(data, Framing::from_flag(self_delimited))?;
         let n = self.nb_frames;
         for (k, frame) in packet.frames(data).enumerate() {
             self.frames[n + k] = frame;
@@ -759,29 +891,44 @@ impl<'a> Repacketizer<'a> {
     /// the largest packet allowed. Returns its length. libopus
     /// `opus_repacketizer_out_range`.
     ///
-    /// Errors: [`BadArg`](crate::ErrorKind::BadArg) when the range is empty or
-    /// goes past the last frame,
-    /// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when the packet
-    /// does not fit in `out`, and
-    /// [`InternalError`](crate::ErrorKind::InternalError) when the padding of a
-    /// packet in the range holds invalid extensions.
+    /// The extensions in the padding of the packets in the range are kept.
+    /// Their frame numbers then count from frame `begin`. The extensions of
+    /// a packet whose first frame is outside the range are dropped.
+    ///
+    /// Errors:
+    /// - [`BadArg`](crate::ErrorKind::BadArg) when the range is empty or goes
+    ///   past the last frame. Also when a packet in the range has an
+    ///   extension for one of its frames at or after `end`, as in libopus.
+    /// - [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when the packet
+    ///   does not fit in `out`.
+    /// - [`InternalError`](crate::ErrorKind::InternalError) when the padding
+    ///   of a packet in the range holds invalid extensions.
+    /// - [`AllocFail`](crate::ErrorKind::AllocFail) without the feature
+    ///   `std`, when the packets in the range hold more than 32 extensions.
     pub fn out_range(&self, begin: usize, end: usize, out: &mut [u8]) -> Result<usize, Error> {
-        self.out_range_ext(begin, end, out, false, false, &[])
+        self.out_range_ext(begin, end, out, Framing::Normal, Padding::Shortest, &[])
     }
 
     /// Writes a packet of all frames into `out`. libopus
     /// `opus_repacketizer_out`.
+    ///
+    /// Errors: [`BadArg`](crate::ErrorKind::BadArg) when no frame was added,
+    /// and otherwise those of [`out_range`](Self::out_range):
+    /// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall),
+    /// [`InternalError`](crate::ErrorKind::InternalError) and, without the
+    /// feature `std`, [`AllocFail`](crate::ErrorKind::AllocFail).
     pub fn out(&self, out: &mut [u8]) -> Result<usize, Error> {
-        self.out_range_ext(0, self.nb_frames, out, false, false, &[])
+        self.out_range_ext(0, self.nb_frames, out, Framing::Normal, Padding::Shortest, &[])
     }
 
     /// [`out_range`](Self::out_range) with the options of libopus's
     /// internal `opus_repacketizer_out_range_impl`:
     ///
-    /// - `self_delimited` adds the size of the last frame (RFC 6716
+    /// - [`Framing::SelfDelimited`] adds the size of the last frame (RFC 6716
     ///   appendix B), as every stream but the last of a multistream packet
     ///   needs.
-    /// - `pad` makes the packet exactly `out.len()` bytes long.
+    /// - [`Padding::FillBuffer`] makes the packet exactly `out.len()` bytes
+    ///   long.
     /// - `extensions` are added before those of the packets' padding. Their
     ///   frame numbers count from frame `begin`.
     ///
@@ -796,10 +943,11 @@ impl<'a> Repacketizer<'a> {
         begin: usize,
         end: usize,
         out: &mut [u8],
-        self_delimited: bool,
-        pad: bool,
+        framing: Framing,
+        padding: Padding,
         extensions: &[Extension],
     ) -> Result<usize, Error> {
+        let (self_delimited, pad) = (framing.is_self_delimited(), padding.fills_buffer());
         if begin >= end || end > self.nb_frames {
             return Err(Error::BAD_ARG);
         }
@@ -824,8 +972,8 @@ impl<'a> Repacketizer<'a> {
             all.push(ext);
         }
         for i in begin..end {
-            let mut iter = ExtensionIterator::new(self.paddings[i], self.padding_nb_frames[i] as usize);
-            while let Ok(Some(mut ext)) = iter.next() {
+            let iter = ExtensionIterator::new(self.paddings[i], self.padding_nb_frames[i] as usize);
+            for mut ext in iter.map_while(Result::ok) {
                 ext.frame += i - begin;
                 all.push(ext);
             }
@@ -839,23 +987,35 @@ impl<'a> Repacketizer<'a> {
 ///
 /// The result is a code 3 packet whose padding holds the extensions the
 /// packet had, then zeros when it had none, unless one more byte is all
-/// that is needed. `data` must hold at least `new_len` bytes.
+/// that is needed. `data` must hold at least `new_len` bytes. When `len`
+/// equals `new_len`, the packet stays as it is and is not read, as in
+/// libopus.
 ///
 /// Errors: [`BadArg`](crate::ErrorKind::BadArg) when `len` is 0, `new_len` is
 /// below `len` or `data` is shorter than either;
 /// [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the packet is not
 /// valid; [`InternalError`](crate::ErrorKind::InternalError) when the padding
-/// of the packet holds invalid extensions.
+/// of the packet holds invalid extensions;
+/// [`AllocFail`](crate::ErrorKind::AllocFail) without the feature `std`,
+/// when the padding of the packet holds more than 32 extensions, or holds
+/// extensions and is longer than 1275 bytes.
 pub fn pad(data: &mut [u8], len: usize, new_len: usize) -> Result<(), Error> {
-    pad_with_extensions(data, len, new_len, true, &[]).map(|_| ())
+    pad_with_extensions(data, len, new_len, Padding::FillBuffer, &[]).map(|_| ())
 }
 
 /// libopus's internal `opus_packet_pad_impl`: rewrites the packet
 /// `data[..len]` in place, in at most `new_len` bytes, with `extensions`
-/// added before the extensions it has. With `pad` the packet takes exactly
-/// `new_len` bytes. Returns the new length, or 0 when `len == new_len`:
-/// then, as in libopus, the packet stays as it is and `extensions` are not
-/// added.
+/// added before the extensions it has. With [`Padding::FillBuffer`] the
+/// packet takes exactly `new_len` bytes. Returns the new length of the
+/// packet.
+///
+/// When `len == new_len` and `extensions` is empty, there is nothing to
+/// do: the packet stays as it is, and the result is `len`. When
+/// `extensions` is not empty, they are always written, also when
+/// `len == new_len`; if they do not fit in `new_len` bytes, the result is
+/// an error of kind [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall).
+/// (libopus returns `OPUS_OK` when `len == new_len` and leaves the
+/// extensions out; its only caller never gets there.)
 ///
 /// The frame numbers of `extensions` count the frames of this packet.
 /// Besides the errors of [`pad`], the extensions give those of
@@ -869,20 +1029,24 @@ pub fn pad_with_extensions(
     data: &mut [u8],
     len: usize,
     new_len: usize,
-    pad: bool,
+    padding: Padding,
     extensions: &[Extension],
 ) -> Result<usize, Error> {
+    let pad = padding.fills_buffer();
     if len < 1 || len > data.len() {
         return Err(Error::BAD_ARG);
     }
-    if len == new_len {
-        return Ok(0);
+    // libopus returns here whether there are extensions or not, without
+    // reading the packet. Extensions go on below, so that they are written
+    // or the call fails.
+    if len == new_len && extensions.is_empty() {
+        return Ok(len);
     }
     if len > new_len || new_len > data.len() {
         return Err(Error::BAD_ARG);
     }
     // The checks of opus_repacketizer_cat: `parse` makes the same ones.
-    let packet = parse(&data[..len], false)?;
+    let packet = parse(&data[..len], Framing::Normal)?;
     let found = extensions::count_checked(packet.padding(&data[..len]), packet.count).map_err(|_| Error::INTERNAL_ERROR)?;
     if found == 0 {
         return pad_in_place(data, new_len, &packet, pad, extensions);
@@ -949,8 +1113,7 @@ fn pad_keeping_extensions(
     for &ext in extensions {
         all.push(ext);
     }
-    let mut iter = ExtensionIterator::new(copy, packet.count);
-    while let Ok(Some(ext)) = iter.next() {
+    for ext in ExtensionIterator::new(copy, packet.count).map_while(Result::ok) {
         all.push(ext);
     }
     pad_in_place(data, new_len, packet, pad, all.as_slice())
@@ -967,7 +1130,7 @@ pub fn unpad(data: &mut [u8], len: usize) -> Result<usize, Error> {
     if len < 1 || len > data.len() {
         return Err(Error::BAD_ARG);
     }
-    let packet = parse(&data[..len], false)?;
+    let packet = parse(&data[..len], Framing::Normal)?;
     pad_in_place(data, len, &packet, false, &[])
 }
 
@@ -975,6 +1138,12 @@ pub fn unpad(data: &mut [u8], len: usize) -> Result<usize, Error> {
 /// to `new_len` bytes: libopus `opus_multistream_packet_pad`
 /// (repacketizer.c). The padding goes into the last stream, which keeps its
 /// extensions as with [`pad`].
+///
+/// Errors: [`BadArg`](crate::ErrorKind::BadArg) when `len` is 0, `new_len`
+/// is below `len` or `data` is shorter than either;
+/// [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when a stream is not
+/// valid; and the errors of [`pad`] for the last stream, among them
+/// [`AllocFail`](crate::ErrorKind::AllocFail) without the feature `std`.
 pub fn multistream_pad(
     data: &mut [u8],
     len: usize,
@@ -997,7 +1166,7 @@ pub fn multistream_pad(
         if start >= len {
             return Err(Error::INVALID_PACKET);
         }
-        start += parse(&data[start..len], true)?.packet_offset;
+        start += parse(&data[start..len], Framing::SelfDelimited)?.packet_offset;
     }
     let last_len = len.checked_sub(start).ok_or(Error::INVALID_PACKET)?;
     pad(&mut data[start..], last_len, last_len + amount)
@@ -1018,7 +1187,7 @@ pub fn multistream_unpad(data: &mut [u8], len: usize, nb_streams: usize) -> Resu
         if src >= len {
             return Err(Error::INVALID_PACKET);
         }
-        let packet = parse(&data[src..len], self_delimited)?;
+        let packet = parse(&data[src..len], Framing::from_flag(self_delimited))?;
         // The checks of opus_repacketizer_cat_impl on this stream.
         let mut rp = Repacketizer::new();
         rp.cat_impl(&data[src..src + packet.packet_offset], self_delimited)?;
@@ -1064,76 +1233,76 @@ mod tests {
 
     #[test]
     fn code_0_is_one_frame_to_the_end() {
-        let p = parse(&[TOC_CELT_20, 1, 2, 3], false).unwrap();
+        let p = parse(&[TOC_CELT_20, 1, 2, 3], Framing::Normal).unwrap();
         assert_eq!((p.count, p.sizes[0], p.payload_offset, p.packet_offset), (1, 3, 1, 4));
         // A TOC byte alone is one empty frame.
-        let p = parse(&[TOC_CELT_20], false).unwrap();
+        let p = parse(&[TOC_CELT_20], Framing::Normal).unwrap();
         assert_eq!((p.count, p.sizes[0], p.packet_offset), (1, 0, 1));
-        assert!(parse(&[], false).is_err());
+        assert!(parse(&[], Framing::Normal).is_err());
     }
 
     #[test]
     fn code_1_needs_an_even_payload() {
-        let p = parse(&[TOC_CELT_20 | 1, 1, 2, 3, 4], false).unwrap();
+        let p = parse(&[TOC_CELT_20 | 1, 1, 2, 3, 4], Framing::Normal).unwrap();
         assert_eq!((p.count, p.sizes[0], p.sizes[1]), (2, 2, 2));
         assert_eq!(p.frame(&[TOC_CELT_20 | 1, 1, 2, 3, 4], 1), &[3, 4]);
-        assert!(parse(&[TOC_CELT_20 | 1, 1, 2, 3], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 1, 1, 2, 3], Framing::Normal).is_err());
     }
 
     #[test]
     fn code_2_reads_the_first_size() {
         let data = [TOC_CELT_20 | 2, 1, 9, 8, 7];
-        let p = parse(&data, false).unwrap();
+        let p = parse(&data, Framing::Normal).unwrap();
         assert_eq!((p.count, p.sizes[0], p.sizes[1], p.payload_offset), (2, 1, 2, 2));
         let frames: Vec<&[u8]> = p.frames(&data).collect();
         assert_eq!(frames, [&[9u8][..], &[8, 7][..]]);
         // The first size runs past the end.
-        assert!(parse(&[TOC_CELT_20 | 2, 4, 9, 8, 7], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 2, 4, 9, 8, 7], Framing::Normal).is_err());
         // The size field is missing.
-        assert!(parse(&[TOC_CELT_20 | 2], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 2], Framing::Normal).is_err());
     }
 
     #[test]
     fn code_3_checks_count_duration_and_padding() {
         // No frames.
-        assert!(parse(&[TOC_CELT_20 | 3, 0], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 3, 0], Framing::Normal).is_err());
         // 7 frames of 20 ms are more than 120 ms.
-        assert!(parse(&[TOC_CELT_20 | 3, 7], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 3, 7], Framing::Normal).is_err());
         // 48 frames of 2.5 ms are exactly 120 ms.
-        assert_eq!(parse(&[TOC_CELT_2_5 | 3, 48], false).unwrap().count, 48);
-        assert!(parse(&[TOC_CELT_2_5 | 3, 49], false).is_err());
+        assert_eq!(parse(&[TOC_CELT_2_5 | 3, 48], Framing::Normal).unwrap().count, 48);
+        assert!(parse(&[TOC_CELT_2_5 | 3, 49], Framing::Normal).is_err());
         // CBR: the payload must divide by the count.
-        assert!(parse(&[TOC_CELT_20 | 3, 2, 1, 2, 3], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 3, 2, 1, 2, 3], Framing::Normal).is_err());
         // Padding: 2 bytes at the end are not part of a frame.
-        let p = parse(&[TOC_CELT_20 | 3, 0x41, 2, 7, 0, 0], false).unwrap();
+        let p = parse(&[TOC_CELT_20 | 3, 0x41, 2, 7, 0, 0], Framing::Normal).unwrap();
         assert_eq!((p.count, p.sizes[0], p.padding_len, p.packet_offset), (1, 1, 2, 6));
         // Padding longer than the packet.
-        assert!(parse(&[TOC_CELT_20 | 3, 0x41, 9, 7], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 3, 0x41, 9, 7], Framing::Normal).is_err());
         // The padding flag without a length byte.
-        assert!(parse(&[TOC_CELT_20 | 3, 0x41], false).is_err());
+        assert!(parse(&[TOC_CELT_20 | 3, 0x41], Framing::Normal).is_err());
     }
 
     #[test]
     fn self_delimited_packet_ends_before_the_next_stream() {
         // Code 0, size 2, then 3 bytes of another stream.
         let data = [TOC_CELT_20, 2, 5, 6, 0xAA, 0xBB, 0xCC];
-        let p = parse(&data, true).unwrap();
+        let p = parse(&data, Framing::SelfDelimited).unwrap();
         assert_eq!((p.count, p.sizes[0], p.payload_offset, p.packet_offset), (1, 2, 2, 4));
         // Code 1: the one size applies to both frames.
         let data = [TOC_CELT_20 | 1, 2, 5, 6, 7, 8, 0xAA];
-        let p = parse(&data, true).unwrap();
+        let p = parse(&data, Framing::SelfDelimited).unwrap();
         assert_eq!((p.count, p.sizes[0], p.sizes[1], p.packet_offset), (2, 2, 2, 6));
         // The size does not fit.
-        assert!(parse(&[TOC_CELT_20, 3, 5, 6], true).is_err());
-        assert!(parse(&[TOC_CELT_20 | 1, 2, 5, 6, 7], true).is_err());
+        assert!(parse(&[TOC_CELT_20, 3, 5, 6], Framing::SelfDelimited).is_err());
+        assert!(parse(&[TOC_CELT_20 | 1, 2, 5, 6, 7], Framing::SelfDelimited).is_err());
     }
 
     #[test]
     fn a_frame_may_not_exceed_1275_bytes() {
         let mut data = vec![0u8; 1 + 1276];
         data[0] = TOC_CELT_20;
-        assert!(parse(&data, false).is_err());
-        assert_eq!(parse(&data[..1276], false).unwrap().sizes[0], 1275);
+        assert!(parse(&data, Framing::Normal).is_err());
+        assert_eq!(parse(&data[..1276], Framing::Normal).unwrap().sizes[0], 1275);
     }
 
     #[test]
@@ -1143,28 +1312,28 @@ mod tests {
         let b = [4u8, 5, 6];
         let c = [7u8];
         // One frame: code 0.
-        let n = write(TOC_CELT_20 | 3, &[&a], &mut out, false, false).unwrap();
+        let n = write(TOC_CELT_20 | 3, &[&a], &mut out, Framing::Normal, Padding::Shortest).unwrap();
         assert_eq!(&out[..n], &[TOC_CELT_20, 1, 2, 3]);
         // Two frames of one size: code 1.
-        let n = write(TOC_CELT_20, &[&a, &b], &mut out, false, false).unwrap();
+        let n = write(TOC_CELT_20, &[&a, &b], &mut out, Framing::Normal, Padding::Shortest).unwrap();
         assert_eq!(&out[..n], &[TOC_CELT_20 | 1, 1, 2, 3, 4, 5, 6]);
         // Two frames of different sizes: code 2.
-        let n = write(TOC_CELT_20, &[&a, &c], &mut out, false, false).unwrap();
+        let n = write(TOC_CELT_20, &[&a, &c], &mut out, Framing::Normal, Padding::Shortest).unwrap();
         assert_eq!(&out[..n], &[TOC_CELT_20 | 2, 3, 1, 2, 3, 7]);
         // Three frames of one size: code 3, CBR.
-        let n = write(TOC_CELT_20, &[&a, &b, &a], &mut out, false, false).unwrap();
+        let n = write(TOC_CELT_20, &[&a, &b, &a], &mut out, Framing::Normal, Padding::Shortest).unwrap();
         assert_eq!(&out[..n], &[TOC_CELT_20 | 3, 3, 1, 2, 3, 4, 5, 6, 1, 2, 3]);
         // Three frames of different sizes: code 3, VBR.
-        let n = write(TOC_CELT_20, &[&a, &c, &b], &mut out, false, false).unwrap();
+        let n = write(TOC_CELT_20, &[&a, &c, &b], &mut out, Framing::Normal, Padding::Shortest).unwrap();
         assert_eq!(&out[..n], &[TOC_CELT_20 | 3, 0x83, 3, 1, 1, 2, 3, 7, 4, 5, 6]);
     }
 
     #[test]
     fn write_self_delimited_adds_the_last_size() {
         let mut out = [0u8; 16];
-        let n = write(TOC_CELT_20, &[&[9, 9]], &mut out, true, false).unwrap();
+        let n = write(TOC_CELT_20, &[&[9, 9]], &mut out, Framing::SelfDelimited, Padding::Shortest).unwrap();
         assert_eq!(&out[..n], &[TOC_CELT_20, 2, 9, 9]);
-        let p = parse(&out[..n], true).unwrap();
+        let p = parse(&out[..n], Framing::SelfDelimited).unwrap();
         assert_eq!((p.count, p.sizes[0], p.packet_offset), (1, 2, n));
     }
 
@@ -1173,30 +1342,30 @@ mod tests {
         let frame = [5u8; 4];
         // One byte short of the buffer: code 3 without padding.
         let mut out = [0xEEu8; 6];
-        assert_eq!(write(TOC_CELT_20, &[&frame], &mut out, false, true), Ok(6));
+        assert_eq!(write(TOC_CELT_20, &[&frame], &mut out, Framing::Normal, Padding::FillBuffer), Ok(6));
         assert_eq!(out, [TOC_CELT_20 | 3, 1, 5, 5, 5, 5]);
         // The buffer fits exactly: the packet stays code 0.
         let mut out = [0xEEu8; 5];
-        assert_eq!(write(TOC_CELT_20, &[&frame], &mut out, false, true), Ok(5));
+        assert_eq!(write(TOC_CELT_20, &[&frame], &mut out, Framing::Normal, Padding::FillBuffer), Ok(5));
         assert_eq!(out, [TOC_CELT_20, 5, 5, 5, 5]);
         // More room: a length byte and zeros.
         let mut out = [0xEEu8; 10];
-        assert_eq!(write(TOC_CELT_20, &[&frame], &mut out, false, true), Ok(10));
+        assert_eq!(write(TOC_CELT_20, &[&frame], &mut out, Framing::Normal, Padding::FillBuffer), Ok(10));
         assert_eq!(out, [TOC_CELT_20 | 3, 0x41, 3, 5, 5, 5, 5, 0, 0, 0]);
-        let p = parse(&out, false).unwrap();
+        let p = parse(&out, Framing::Normal).unwrap();
         assert_eq!((p.count, p.sizes[0], p.padding_len), (1, 4, 3));
     }
 
     #[test]
     fn write_rejects_bad_input_without_panicking() {
         let mut out = [0u8; 8];
-        assert!(write(TOC_CELT_20, &[], &mut out, false, false).is_err());
-        assert!(write(TOC_CELT_20, &[&[0; 9]], &mut out, false, false).is_err());
-        assert!(write(TOC_CELT_20, &[&[0; 1276]], &mut [0u8; 2000], false, false).is_err());
+        assert!(write(TOC_CELT_20, &[], &mut out, Framing::Normal, Padding::Shortest).is_err());
+        assert!(write(TOC_CELT_20, &[&[0; 9]], &mut out, Framing::Normal, Padding::Shortest).is_err());
+        assert!(write(TOC_CELT_20, &[&[0; 1276]], &mut [0u8; 2000], Framing::Normal, Padding::Shortest).is_err());
         // 7 frames of 20 ms are more than 120 ms.
         let f: &[u8] = &[1];
-        assert!(write(TOC_CELT_20, &[f; 7], &mut [0u8; 64], false, false).is_err());
-        assert!(write(TOC_CELT_20, &[f], &mut [], false, false).is_err());
+        assert!(write(TOC_CELT_20, &[f; 7], &mut [0u8; 64], Framing::Normal, Padding::Shortest).is_err());
+        assert!(write(TOC_CELT_20, &[f], &mut [], Framing::Normal, Padding::Shortest).is_err());
     }
 
     #[test]
@@ -1205,13 +1374,58 @@ mod tests {
         pad(&mut data, 5, 10).unwrap();
         // Code 3, VBR, 2 frames, padding: 1 length byte and 3 zeros.
         assert_eq!(data, [TOC_CELT_20 | 3, 0xC2, 3, 1, 9, 8, 7, 0, 0, 0]);
-        let p = parse(&data, false).unwrap();
+        let p = parse(&data, Framing::Normal).unwrap();
         assert_eq!((p.count, p.sizes[0], p.sizes[1], p.padding_len), (2, 1, 2, 3));
         // Nothing to do, and arguments that make no sense.
         assert_eq!(pad(&mut data, 10, 10), Ok(()));
         assert!(pad(&mut data, 10, 9).is_err());
         assert!(pad(&mut data, 0, 5).is_err());
         assert!(pad(&mut data, 5, 11).is_err());
+        // With `len == new_len`, as in libopus, the packet is not read.
+        assert_eq!(pad(&mut [0xFF], 1, 1), Ok(()));
+    }
+
+    #[test]
+    fn pad_with_extensions_writes_the_extensions_or_fails() {
+        let ext = [Extension::new(5, 0, &[1])];
+        // A CELT packet of one frame of 3 bytes. With the extension (2
+        // bytes) it is a code 3 packet of 8 bytes: TOC, frame count,
+        // padding length, the frame and the extension.
+        let plain = [TOC_CELT_20, 1, 2, 3];
+        // Nothing to do: the packet keeps its length.
+        let mut data = plain;
+        for padding in [Padding::Shortest, Padding::FillBuffer] {
+            assert_eq!(pad_with_extensions(&mut data, 4, 4, padding, &[]), Ok(4));
+            assert_eq!(data, plain);
+        }
+        // Too little room is an error, also when `len == new_len`. libopus
+        // returns OPUS_OK when `len == new_len` and drops the extension.
+        for new_len in [4, 5, 7] {
+            let mut data = [0u8; 8];
+            data[..4].copy_from_slice(&plain);
+            let err = pad_with_extensions(&mut data, 4, new_len, Padding::Shortest, &ext).unwrap_err();
+            assert_eq!(err.kind(), crate::ErrorKind::BufferTooSmall, "new_len {new_len}");
+        }
+        let mut data = [0u8; 8];
+        data[..4].copy_from_slice(&plain);
+        assert_eq!(pad_with_extensions(&mut data, 4, 8, Padding::Shortest, &ext), Ok(8));
+        let p = parse(&data, Framing::Normal).unwrap();
+        let mut found = [Extension::default(); 2];
+        assert_eq!(extensions::parse(p.padding(&data), &mut found, p.nb_frames()), Ok(1));
+        assert_eq!(found[0], ext[0]);
+        // A packet whose padding has room for the extension takes it
+        // without growing, also when `len == new_len`.
+        for (padding, want) in [(Padding::Shortest, 8), (Padding::FillBuffer, 12)] {
+            let mut data = [0u8; 12];
+            data[..4].copy_from_slice(&plain);
+            pad(&mut data, 4, 12).unwrap();
+            assert_eq!(pad_with_extensions(&mut data, 12, 12, padding, &ext), Ok(want));
+            let p = parse(&data[..want], Framing::Normal).unwrap();
+            assert!(p.frames(&data[..want]).eq([&plain[1..]]));
+            let mut found = [Extension::default(); 2];
+            assert_eq!(extensions::parse(p.padding(&data[..want]), &mut found, 1), Ok(1));
+            assert_eq!(found[0], ext[0]);
+        }
     }
 
     #[test]
@@ -1233,5 +1447,74 @@ mod tests {
         multistream_pad(&mut data, 6, 9, 2).unwrap();
         assert_eq!(data, [TOC_CELT_20, 1, 7, TOC_CELT_20 | 3, 0x41, 1, 8, 9, 0]);
         assert_eq!(multistream_validate(&data, 2, SampleRate::Hz48000), Ok(960));
+    }
+
+    #[test]
+    fn bandwidth_and_channels_of_every_toc_byte() {
+        // RFC 6716 table 2: the bandwidth of each configuration.
+        let expected = |config: u8| match config {
+            0..=3 | 16..=19 => Bandwidth::Narrowband,
+            4..=7 => Bandwidth::Mediumband,
+            8..=11 | 20..=23 => Bandwidth::Wideband,
+            12..=13 | 24..=27 => Bandwidth::Superwideband,
+            _ => Bandwidth::Fullband,
+        };
+        for toc in 0..=255u8 {
+            assert_eq!(bandwidth(toc), expected(toc >> 3), "TOC {toc:#04x}");
+            let channels = if toc & 0x04 != 0 { Channels::Stereo } else { Channels::Mono };
+            assert_eq!(nb_channels(toc), channels, "TOC {toc:#04x}");
+        }
+    }
+
+    #[test]
+    fn parsed_packet_methods_give_what_parse_found() {
+        // Code 3, VBR, padding, 3 frames of 1, 2 and 1 bytes, 2 bytes of
+        // padding.
+        let data = [TOC_CELT_20 | 3, 0xC3, 2, 1, 2, 9, 8, 7, 6, 0, 0];
+        let p = parse(&data, Framing::Normal).unwrap();
+        assert_eq!(p.toc(), TOC_CELT_20 | 3);
+        assert_eq!(p.nb_frames(), 3);
+        assert_eq!(p.frame_sizes(), &[1, 2, 1]);
+        assert_eq!((p.payload_offset(), p.packet_offset(), p.padding_len()), (5, 11, 2));
+        let frames: Vec<&[u8]> = p.frames(&data).collect();
+        assert_eq!(frames, [&[9u8][..], &[8, 7][..], &[6][..]]);
+        assert_eq!(p.padding(&data), &[0, 0]);
+        // Self-delimited: the packet ends before the data that follows.
+        let data = [TOC_CELT_20 | 4, 2, 5, 6, 0xAA];
+        let p = parse(&data, Framing::SelfDelimited).unwrap();
+        assert_eq!((p.toc(), p.nb_frames(), p.frame_sizes()), (TOC_CELT_20 | 4, 1, &[2u16][..]));
+        assert_eq!((p.payload_offset(), p.packet_offset(), p.padding_len()), (2, 4, 0));
+        assert_eq!(nb_channels(p.toc()), Channels::Stereo);
+        // The same bytes as an ordinary packet: one frame of 4 bytes.
+        let p = parse(&data, Framing::Normal).unwrap();
+        assert_eq!((p.frame_sizes(), p.payload_offset(), p.packet_offset()), (&[4u16][..], 1, 5));
+    }
+
+    #[test]
+    fn parsed_packet_with_other_data_gives_empty_slices() {
+        let data = [TOC_CELT_20 | 3, 0xC3, 2, 1, 2, 9, 8, 7, 6, 0, 0];
+        let p = parse(&data, Framing::Normal).unwrap();
+        for short in [&data[..0], &data[..3], &data[..5]] {
+            assert_eq!(p.frames(short).count(), 3);
+            assert!(p.frames(short).all(|f| f.is_empty()));
+            assert_eq!(p.frame(short, 2), &[] as &[u8]);
+            assert_eq!(p.padding(short), &[] as &[u8]);
+        }
+        // The frames fit in 10 bytes, the padding does not.
+        let cut = &data[..10];
+        assert_eq!(p.frame(cut, 2), &[6]);
+        assert_eq!(p.padding(cut), &[] as &[u8]);
+        assert_eq!(p.frame(&data, 3), &[] as &[u8]);
+        assert_eq!(p.frame(&data, usize::MAX), &[] as &[u8]);
+    }
+
+    #[test]
+    fn framing_and_padding_follow_the_libopus_flags() {
+        assert_eq!(Framing::from_flag(false), Framing::Normal);
+        assert_eq!(Framing::from_flag(true), Framing::SelfDelimited);
+        assert!(Framing::SelfDelimited.is_self_delimited() && !Framing::Normal.is_self_delimited());
+        assert_eq!(Padding::from_flag(false), Padding::Shortest);
+        assert_eq!(Padding::from_flag(true), Padding::FillBuffer);
+        assert!(Padding::FillBuffer.fills_buffer() && !Padding::Shortest.fills_buffer());
     }
 }

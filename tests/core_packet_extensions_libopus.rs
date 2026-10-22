@@ -19,7 +19,7 @@
 use audiopus_sys as sys;
 use opus1::SampleRate;
 use opus1::extensions::{self, Extension, ExtensionIterator};
-use opus1::packet::{self, Repacketizer};
+use opus1::packet::{self, Framing, Padding, Repacketizer};
 use std::os::raw::{c_int, c_uchar};
 
 /// libopus `opus_extension_data` (src/opus_private.h).
@@ -103,6 +103,35 @@ unsafe extern "C" {
         nb: c_int,
     ) -> i32;
     fn opus_packet_pad_impl(data: *mut c_uchar, len: i32, new_len: i32, pad: c_int, exts: *const CExt, nb: c_int) -> i32;
+}
+
+/// What `packet::pad_with_extensions` does, in libopus terms:
+/// `opus_packet_pad_impl`, with two changes when `len == new_len`.
+/// Without extensions the result is `len`, not 0. With extensions the
+/// packet is rewritten as libopus rewrites it for a longer `new_len`,
+/// instead of being left as it is without them.
+///
+/// # Safety
+/// `data` must hold at least `len` and `new_len` bytes.
+unsafe fn c_pad_with_extensions(data: &mut [u8], len: usize, new_len: usize, pad: bool, exts: &[CExt]) -> i32 {
+    unsafe {
+        if len < 1 || len != new_len {
+            return opus_packet_pad_impl(data.as_mut_ptr(), len as i32, new_len as i32, pad as c_int, exts.as_ptr(), exts.len() as c_int);
+        }
+        if exts.is_empty() {
+            return len as i32;
+        }
+        // The rest of `opus_packet_pad_impl`.
+        let copy = data[..len].to_vec();
+        let rp = sys::opus_repacketizer_create();
+        let mut ret = sys::opus_repacketizer_cat(rp, copy.as_ptr(), len as i32);
+        if ret == 0 {
+            let nb = sys::opus_repacketizer_get_nb_frames(rp);
+            ret = opus_repacketizer_out_range_impl(rp, 0, nb, data.as_mut_ptr(), new_len as i32, 0, pad as c_int, exts.as_ptr(), exts.len() as c_int);
+        }
+        sys::opus_repacketizer_destroy(rp);
+        ret
+    }
 }
 
 /// A small deterministic random number generator.
@@ -219,11 +248,11 @@ fn random_extensions<'a>(rng: &mut Rng, pool: &'a [u8], nb_frames: usize, invali
         for f in 0..nb_frames {
             for (k, &id) in pattern.iter().enumerate() {
                 let data = if id < 32 { &pool[k..k + short_len[k]] } else { payload(rng, id) };
-                exts.push(Extension { id, frame: f, data });
+                exts.push(Extension::new(id, f, data));
             }
             if rng.chance(20) {
                 let id = 3 + rng.below(125) as u8;
-                exts.push(Extension { id, frame: f, data: payload(rng, id) });
+                exts.push(Extension::new(id, f, payload(rng, id)));
             }
         }
         // Out of frame order now and then.
@@ -236,7 +265,7 @@ fn random_extensions<'a>(rng: &mut Rng, pool: &'a [u8], nb_frames: usize, invali
         for _ in 0..rng.below(8) {
             let id = 3 + rng.below(125) as u8;
             let frame = rng.below(nb_frames);
-            exts.push(Extension { id, frame, data: payload(rng, id) });
+            exts.push(Extension::new(id, frame, payload(rng, id)));
         }
         if rng.chance(50) {
             exts.sort_by_key(|e| e.frame);
@@ -260,13 +289,23 @@ fn random_extensions<'a>(rng: &mut Rng, pool: &'a [u8], nb_frames: usize, invali
 // Reading extensions
 // ---------------------------------------------------------------------------
 
+/// opus1's framing for libopus's `self_delimited` flag.
+fn framing_of(self_delimited: bool) -> Framing {
+    if self_delimited { Framing::SelfDelimited } else { Framing::Normal }
+}
+
+/// opus1's padding for libopus's `pad` flag.
+fn padding_of(pad: bool) -> Padding {
+    if pad { Padding::FillBuffer } else { Padding::Shortest }
+}
+
 /// All the readers of libopus and opus1 on one padding.
 fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
     let len = data.len() as i32;
     let nf = nb_frames as c_int;
     // count
     let c_count = unsafe { opus_packet_extensions_count(data.as_ptr(), len, nf) };
-    assert_eq!(extensions::count(data, nb_frames), c_count as usize, "{what}: count");
+    assert_eq!(extensions::count(data, nb_frames), Ok(c_count as usize), "{what}: count");
     // parse
     let mut c_exts = vec![EMPTY; 3000];
     let mut c_n = c_exts.len() as i32;
@@ -296,7 +335,7 @@ fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
     let c_total = unsafe { opus_packet_extensions_count_ext(data.as_ptr(), len, c_counts.as_mut_ptr(), nf) };
     let mut counts = [0usize; 48];
     let total = extensions::count_ext(data, &mut counts, nb_frames);
-    assert_eq!(total, c_total as usize, "{what}: count_ext");
+    assert_eq!(total, Ok(c_total as usize), "{what}: count_ext");
     for f in 0..nb_frames {
         assert_eq!(counts[f], c_counts[f] as usize, "{what}: count_ext of frame {f}");
     }
@@ -312,12 +351,15 @@ fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
         assert_eq!(a, b, "{what}: parse_ext");
         assert!(a.windows(2).all(|w| w[0].1 <= w[1].1), "{what}: frame order");
     }
-    // The iterator with a frame limit, find, and reset.
+    // The iterator with a frame limit, find, and reset. After an error
+    // libopus returns it again on every call, while opus1's iterator ends:
+    // `None` from `next`, `Ok(None)` from `find_id`.
     let frame_max = rng.below(nb_frames + 2);
     let find_id = if rng.chance(50) { 3 + rng.below(125) as u8 } else { 0 };
     let mut c_iter: CIter = unsafe { std::mem::zeroed() };
     unsafe { opus_extension_iterator_init(&mut c_iter, data.as_ptr(), len, nf) };
     let mut iter = ExtensionIterator::new(data, nb_frames);
+    let mut failed: Option<i32> = None;
     for step in 0..2 * c_count as usize + 8 {
         if step == 3 {
             unsafe { opus_extension_iterator_set_frame_max(&mut c_iter, frame_max as c_int) };
@@ -326,20 +368,24 @@ fn compare_reading(data: &[u8], nb_frames: usize, rng: &mut Rng, what: &str) {
         if step == 6 {
             unsafe { opus_extension_iterator_reset(&mut c_iter) };
             iter.reset();
+            failed = None;
         }
         let mut c_ext = EMPTY;
         let (c_ret, ret) = if find_id != 0 && step % 2 == 1 {
-            (unsafe { opus_extension_iterator_find(&mut c_iter, &mut c_ext, find_id as c_int) }, iter.find(find_id))
+            (unsafe { opus_extension_iterator_find(&mut c_iter, &mut c_ext, find_id as c_int) }, iter.find_id(find_id))
         } else {
-            (unsafe { opus_extension_iterator_next(&mut c_iter, &mut c_ext) }, iter.next())
+            (unsafe { opus_extension_iterator_next(&mut c_iter, &mut c_ext) }, iter.next().transpose())
         };
         match ret {
             Ok(Some(e)) => {
                 assert_eq!(c_ret, 1, "{what}: step {step}");
                 assert_eq!(plain(&e), c_plain(&c_ext), "{what}: step {step}");
             }
-            Ok(None) => assert_eq!(c_ret, 0, "{what}: step {step}"),
-            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: step {step}"),
+            Ok(None) => assert_eq!(c_ret, failed.unwrap_or(0), "{what}: step {step}"),
+            Err(e) => {
+                assert_eq!(e.to_raw(), c_ret, "{what}: step {step}");
+                failed = Some(c_ret);
+            }
         }
     }
 }
@@ -353,7 +399,7 @@ fn random_paddings_read_like_libopus() {
         let nb_frames = if rng.chance(20) { rng.below(49) } else { 1 + rng.below(6) };
         let data = random_padding(&mut rng, nb_frames);
         compare_reading(&data, nb_frames, &mut rng, &format!("case {case}"));
-        found += extensions::count(&data, nb_frames);
+        found += extensions::count(&data, nb_frames).unwrap();
         invalid += extensions::parse(&data, &mut [Extension::default(); 4000], nb_frames).is_err() as usize;
     }
     // The inputs reach both valid and invalid paddings.
@@ -432,7 +478,7 @@ fn generate_writes_the_bytes_of_libopus() {
             opus_packet_extensions_generate(c_out.as_mut_ptr(), len as i32, c.as_ptr(), c.len() as i32, nb_frames as c_int, pad as c_int)
         };
         let mut out = vec![0xEEu8; len];
-        let ret = extensions::generate(&mut out, &exts, nb_frames, pad);
+        let ret = extensions::generate(&mut out, &exts, nb_frames, padding_of(pad));
         let c_len = unsafe {
             opus_packet_extensions_generate(std::ptr::null_mut(), len as i32, c.as_ptr(), c.len() as i32, nb_frames as c_int, 0)
         };
@@ -448,7 +494,7 @@ fn generate_writes_the_bytes_of_libopus() {
                 // It reads back as the same extensions, in frame order.
                 let mut back = vec![Extension::default(); exts.len()];
                 let mut counts = [0usize; 48];
-                extensions::count_ext(&out[..n], &mut counts, nb_frames);
+                extensions::count_ext(&out[..n], &mut counts, nb_frames).unwrap();
                 let m = extensions::parse_ext(&out[..n], &mut back, &counts, nb_frames).unwrap();
                 let mut want: Vec<Plain> = exts.iter().map(plain).collect();
                 want.sort_by_key(|e| e.1);
@@ -474,7 +520,7 @@ fn packet_with_padding(rng: &mut Rng, toc: u8, count: usize, padding: &[u8]) -> 
     }).collect();
     let slices: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
     let mut out = vec![0u8; 16000];
-    let n = packet::write(toc, &slices, &mut out, false, false).unwrap();
+    let n = packet::write(toc, &slices, &mut out, Framing::Normal, Padding::Shortest).unwrap();
     out.truncate(n);
     if padding.is_empty() && rng.chance(50) {
         return out;
@@ -487,15 +533,15 @@ fn packet_with_padding(rng: &mut Rng, toc: u8, count: usize, padding: &[u8]) -> 
     // Find the length whose zero padding is exactly `padding.len()` bytes.
     loop {
         let mut tmp = buf.clone();
-        packet::write(toc, &slices, &mut tmp[..new_len], false, true).unwrap();
-        let p = packet::parse(&tmp[..new_len], false).unwrap();
-        if p.padding_len == padding.len() {
+        packet::write(toc, &slices, &mut tmp[..new_len], Framing::Normal, Padding::FillBuffer).unwrap();
+        let p = packet::parse(&tmp[..new_len], Framing::Normal).unwrap();
+        if p.padding_len() == padding.len() {
             let start = new_len - padding.len();
             tmp[start..new_len].copy_from_slice(padding);
             tmp.truncate(new_len);
             return tmp;
         }
-        if p.padding_len < padding.len() {
+        if p.padding_len() < padding.len() {
             new_len += 1;
         } else {
             new_len -= 1;
@@ -546,7 +592,7 @@ fn pad_and_unpad_carry_extensions_like_libopus() {
             _ => {
                 let exts = random_extensions(&mut rng, &pool, count, false);
                 let mut buf = vec![0u8; 4000];
-                let n = extensions::generate(&mut buf, &exts, count, false).unwrap();
+                let n = extensions::generate(&mut buf, &exts, count, Padding::Shortest).unwrap();
                 buf.truncate(n);
                 if rng.chance(30) {
                     buf.insert(0, 0x01);
@@ -556,16 +602,19 @@ fn pad_and_unpad_carry_extensions_like_libopus() {
         };
         let data = packet_with_padding(&mut rng, toc, count, &padding);
         let what = format!("case {case}: {count} frames, padding {}", padding.len());
-        let parsed = packet::parse(&data, false).unwrap();
+        let parsed = packet::parse(&data, Framing::Normal).unwrap();
         let (off, plen) = c_padding(&data).unwrap();
-        assert_eq!(parsed.padding_len, plen, "{what}");
+        assert_eq!(parsed.padding_len(), plen, "{what}");
         if plen > 0 {
-            assert_eq!(parsed.packet_offset - parsed.padding_len, off, "{what}");
+            assert_eq!(parsed.packet_offset() - parsed.padding_len(), off, "{what}");
         }
         assert_eq!(parsed.padding(&data), &padding[..], "{what}");
 
         // opus_packet_pad and opus_packet_pad_impl with extra extensions.
-        let new_len = data.len() + rng.below(3000);
+        // One packet in eight keeps its length, where
+        // `pad_with_extensions` differs from libopus
+        // (`c_pad_with_extensions`).
+        let new_len = if rng.chance(12) { data.len() } else { data.len() + rng.below(3000) };
         let extra = if rng.chance(50) { random_extensions(&mut rng, &pool, count, true) } else { Vec::new() };
         let c_extra = to_c(&extra);
         for (pad_flag, with_extra) in [(true, false), (true, true), (false, true)] {
@@ -575,13 +624,13 @@ fn pad_and_unpad_carry_extensions_like_libopus() {
             let mut buf = c_buf.clone();
             let c_ret = unsafe {
                 if with_extra {
-                    opus_packet_pad_impl(c_buf.as_mut_ptr(), data.len() as i32, new_len as i32, pad_flag as c_int, c_extra.as_ptr(), c_extra.len() as c_int)
+                    c_pad_with_extensions(&mut c_buf, data.len(), new_len, pad_flag, &c_extra)
                 } else {
                     sys::opus_packet_pad(c_buf.as_mut_ptr(), data.len() as i32, new_len as i32)
                 }
             };
             let ret = if with_extra {
-                packet::pad_with_extensions(&mut buf, data.len(), new_len, pad_flag, exts)
+                packet::pad_with_extensions(&mut buf, data.len(), new_len, padding_of(pad_flag), exts)
             } else {
                 packet::pad(&mut buf, data.len(), new_len).map(|_| 0)
             };
@@ -592,10 +641,9 @@ fn pad_and_unpad_carry_extensions_like_libopus() {
                     if with_extra {
                         assert_eq!(n as i32, c_ret, "{w}");
                     }
-                    // 0: the length did not change, and nothing was done.
-                    let n = if with_extra && n > 0 { n } else { new_len };
+                    let n = if with_extra { n } else { new_len };
                     assert_eq!(buf[..n], c_buf[..n], "{w}: bytes");
-                    kept += extensions::count(packet::parse(&buf[..n], false).unwrap().padding(&buf[..n]), count);
+                    kept += extensions::count(packet::parse(&buf[..n], Framing::Normal).unwrap().padding(&buf[..n]), count).unwrap();
                 }
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{w}: error"),
             }
@@ -633,7 +681,7 @@ fn repacketizer_carries_extensions_like_libopus() {
             let padding = if rng.chance(70) {
                 let exts = random_extensions(&mut rng, &pool, count, false);
                 let mut buf = vec![0u8; 4000];
-                let n = extensions::generate(&mut buf, &exts, count, false).unwrap();
+                let n = extensions::generate(&mut buf, &exts, count, Padding::Shortest).unwrap();
                 buf.truncate(n);
                 buf
             } else if rng.chance(10) {
@@ -682,14 +730,14 @@ fn repacketizer_carries_extensions_like_libopus() {
                     c_extra.len() as c_int,
                 )
             };
-            let ret = rp.out_range_ext(begin, end, &mut out, self_delimited, pad, &extra);
+            let ret = rp.out_range_ext(begin, end, &mut out, framing_of(self_delimited), padding_of(pad), &extra);
             let w = format!("{what}: frames {begin}..{end} of {nb}, sd {self_delimited}, pad {pad}, {} extra, {maxlen} bytes", extra.len());
             match ret {
                 Ok(n) => {
                     assert_eq!(n as i32, c_ret, "{w}");
                     assert_eq!(out[..n], c_out[..n], "{w}: bytes");
-                    let p = packet::parse(&out[..n], self_delimited).unwrap();
-                    carried += extensions::count(p.padding(&out[..n]), p.count);
+                    let p = packet::parse(&out[..n], framing_of(self_delimited)).unwrap();
+                    carried += extensions::count(p.padding(&out[..n]), p.nb_frames()).unwrap();
                 }
                 Err(e) => assert_eq!(e.to_raw(), c_ret, "{w}: error"),
             }
@@ -725,7 +773,7 @@ fn multistream_pad_and_unpad_like_libopus() {
             let count = 1 + rng.below(3);
             let exts = if rng.chance(60) { random_extensions(&mut rng, &pool, count, false) } else { Vec::new() };
             let mut padding = vec![0u8; 4000];
-            let n = extensions::generate(&mut padding, &exts, count, false).unwrap();
+            let n = extensions::generate(&mut padding, &exts, count, Padding::Shortest).unwrap();
             padding.truncate(n);
             let single = packet_with_padding(&mut rng, 0xE0, count, &padding);
             if s + 1 < streams {
@@ -733,7 +781,7 @@ fn multistream_pad_and_unpad_like_libopus() {
                 let mut rp = Repacketizer::new();
                 rp.cat(&single).unwrap();
                 let mut out = vec![0u8; single.len() + 8];
-                let n = rp.out_range_ext(0, count, &mut out, true, false, &[]).unwrap();
+                let n = rp.out_range_ext(0, count, &mut out, Framing::SelfDelimited, Padding::Shortest, &[]).unwrap();
                 data.extend_from_slice(&out[..n]);
             } else {
                 data.extend_from_slice(&single);
@@ -854,19 +902,19 @@ fn encoded_packets_with_extensions_decode_as_without() {
         let len = enc.encode(&pcm, 960, &mut buf[..200]).unwrap();
         let plain = buf[..len].to_vec();
         let exts = [
-            Extension { id: 5, frame: 0, data: &payload[..1] },
-            Extension { id: 126, frame: 0, data: &payload[..(n * 7) % 300] },
+            Extension::new(5, 0, &payload[..1]),
+            Extension::new(126, 0, &payload[..(n * 7) % 300]),
         ];
         let c_exts = to_c(&exts);
         let mut c_buf = buf.clone();
         let target = len + 320;
         let c_ret = unsafe { opus_packet_pad_impl(c_buf.as_mut_ptr(), len as i32, target as i32, 0, c_exts.as_ptr(), 2) };
-        let m = packet::pad_with_extensions(&mut buf, len, target, false, &exts).unwrap();
+        let m = packet::pad_with_extensions(&mut buf, len, target, Padding::Shortest, &exts).unwrap();
         assert_eq!(m as i32, c_ret, "packet {n}");
         assert_eq!(buf[..m], c_buf[..m], "packet {n}");
-        let p = packet::parse(&buf[..m], false).unwrap();
+        let p = packet::parse(&buf[..m], Framing::Normal).unwrap();
         let mut found = [Extension::default(); 4];
-        assert_eq!(extensions::parse(p.padding(&buf[..m]), &mut found, p.count), Ok(2));
+        assert_eq!(extensions::parse(p.padding(&buf[..m]), &mut found, p.nb_frames()), Ok(2));
         assert_eq!(&found[..2], &exts[..]);
         // Decoding ignores the extensions.
         let mut out = vec![0f32; 960];

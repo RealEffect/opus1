@@ -31,6 +31,7 @@ use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
 use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate, packet};
+use opus1::packet::Framing;
 
 /// A small deterministic generator (the 64-bit LCG of Knuth's MMIX).
 struct Rng(u64);
@@ -321,8 +322,8 @@ fn walk(
         // A packet without audio (every frame empty) is libopus's byte for
         // byte, but for the bandwidth in its first byte: it repeats the
         // last coded packet's.
-        let parsed = packet::parse(c_packet, false).unwrap();
-        let without_audio = parsed.sizes[..parsed.count].iter().all(|&size| size == 0);
+        let parsed = packet::parse(c_packet, Framing::Normal).unwrap();
+        let without_audio = parsed.frame_sizes().iter().all(|&size| size == 0);
         if without_audio {
             assert_eq!(n, c_len, "{what}: packet without audio");
             assert_eq!(packet[0] & 7, c_packet[0] & 7, "{what}: packet without audio");

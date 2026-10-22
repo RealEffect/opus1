@@ -7,6 +7,7 @@ mod k24_common;
 use core_common::*;
 use k24_common::{multitone, speech_fullband, to_stereo};
 use opus1::{Channels, OpusDecoder, SampleRate, packet};
+use opus1::packet::{Framing, Padding};
 
 /// A stream from the C encoder with the mode and bandwidth forced.
 fn c_stream(rate: usize, channels: usize, mode: i32, bandwidth: i32, bitrate: i32, frame: usize) -> (Vec<Vec<u8>>, Vec<u32>) {
@@ -124,7 +125,7 @@ fn frames_without_data_inside_a_packet_are_concealed() {
                 let mut frames: Vec<&[u8]> = group.iter().map(|p| &p[1..]).collect();
                 frames[gap] = filler;
                 let mut out = vec![0u8; 4000];
-                let n = packet::write(toc, &frames, &mut out, false, false).unwrap();
+                let n = packet::write(toc, &frames, &mut out, Framing::Normal, Padding::Shortest).unwrap();
                 out.truncate(n);
                 packets.push(out);
             }

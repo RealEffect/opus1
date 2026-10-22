@@ -37,7 +37,7 @@ mod dnn;
 #[cfg(feature = "dnn")]
 pub use dnn::{DnnBlob, DnnModels};
 #[cfg(feature = "dred")]
-pub use dnn::dred::decoder::{DredParse, OpusDred, OpusDredDecoder};
+pub use dnn::dred::decoder::{DredParse, DredProcessing, OpusDred, OpusDredDecoder};
 mod hp_cutoff;
 #[doc(hidden)]
 pub mod internals;
@@ -3864,9 +3864,10 @@ impl OpusEncoder {
             let room = orig_max_data_bytes as i32 - ret as i32 - 3;
             let n = self.dred.write_extension(&mut self.rc, &mut buf, room, !self.use_cbr);
             if n > 0 {
-                let ext = [extensions::Extension { id: DRED_EXTENSION_ID, frame: 0, data: &buf[..n] }];
+                let ext = [extensions::Extension::new(DRED_EXTENSION_ID, 0, &buf[..n])];
+                let padding = packet::Padding::from_flag(self.use_cbr);
                 // C returns `OPUS_INTERNAL_ERROR` when this fails.
-                return packet::pad_with_extensions(output, ret, orig_max_data_bytes, self.use_cbr, &ext)
+                return packet::pad_with_extensions(output, ret, orig_max_data_bytes, padding, &ext)
                     .map_err(|_| Error::INTERNAL_ERROR);
             }
         }
@@ -4201,8 +4202,8 @@ impl OpusEncoder {
             0,
             nb,
             &mut output[..repacketize_len],
-            false,
-            self.use_cbr && dtx_count != nb,
+            packet::Framing::Normal,
+            packet::Padding::from_flag(self.use_cbr && dtx_count != nb),
             &[],
         )
         .map_err(|_| Error::INTERNAL_ERROR)
@@ -4791,7 +4792,7 @@ impl OpusDecoder {
                 return Err(Error::BUFFER_TOO_SMALL);
             }
             if !data.is_empty() {
-                packet::parse(data, false)?;
+                packet::parse(data, packet::Framing::Normal)?;
             }
         }
 
@@ -4907,10 +4908,10 @@ impl OpusDecoder {
 
         let toc = data[0];
         let packet_mode = mode_from_toc(toc);
-        let packet_bandwidth = bandwidth_from_toc(toc);
+        let packet_bandwidth = packet::bandwidth(toc);
         let packet_frame_size = packet::samples_per_frame(toc, self.sampling_rate());
-        let packet_channels = channels_from_toc(toc);
-        let parsed = packet::parse(data, self_delimited)?;
+        let packet_channels = packet::nb_channels(toc).count();
+        let parsed = packet::parse(data, packet::Framing::from_flag(self_delimited))?;
 
         if decode_fec {
             if lost_len.is_none_or(|len| len > output.len()) {
@@ -4923,7 +4924,7 @@ impl OpusDecoder {
             {
                 self.conceal(frame_size, &mut output[..frame_size * channels])?;
                 self.last_packet_duration = frame_size;
-                return Ok((frame_size, parsed.packet_offset));
+                return Ok((frame_size, parsed.packet_offset()));
             }
             let frame = parsed.frame(data, 0);
             // Otherwise, conceal everything except the duration the FEC
@@ -4948,12 +4949,12 @@ impl OpusDecoder {
                 true,
             )?;
             self.last_packet_duration = frame_size;
-            return Ok((frame_size, parsed.packet_offset));
+            return Ok((frame_size, parsed.packet_offset()));
         }
 
         // The duration comes from the ToC, not from the caller's
         // `frame_size`, which only says how much room there is.
-        let decoded_total = parsed.count * packet_frame_size;
+        let decoded_total = parsed.nb_frames() * packet_frame_size;
         if decoded_total > frame_size {
             return Err(Error::FRAME_SIZE_TOO_SMALL);
         }
@@ -4992,7 +4993,7 @@ impl OpusDecoder {
         } else {
             self.softclip_mem = [0.0; OPUS_MAX_CHANNELS];
         }
-        Ok((decoded_total, parsed.packet_offset))
+        Ok((decoded_total, parsed.packet_offset()))
     }
 
     /// One frame of a packet: decode it, or conceal it when it carries no
@@ -6245,41 +6246,6 @@ fn mode_from_toc(toc: u8) -> OpusMode {
     }
 }
 
-fn bandwidth_from_toc(toc: u8) -> Bandwidth {
-    let mode = mode_from_toc(toc);
-    match mode {
-        OpusMode::SilkOnly => {
-            let bw_bits = (toc >> 5) & 0x03;
-            match bw_bits {
-                0 => Bandwidth::Narrowband,
-                1 => Bandwidth::Mediumband,
-                2 => Bandwidth::Wideband,
-                _ => Bandwidth::Wideband,
-            }
-        }
-        OpusMode::Hybrid => {
-            let bw_bit = (toc >> 4) & 0x01;
-            if bw_bit == 0 {
-                Bandwidth::Superwideband
-            } else {
-                Bandwidth::Fullband
-            }
-        }
-        OpusMode::CeltOnly => {
-            // CELT has no mediumband: configurations 16..19 are narrowband
-            // (libopus `opus_packet_get_bandwidth`).
-            let bw_bits = (toc >> 5) & 0x03;
-            match bw_bits {
-                0 => Bandwidth::Narrowband,
-                1 => Bandwidth::Wideband,
-                2 => Bandwidth::Superwideband,
-                3 => Bandwidth::Fullband,
-                _ => Bandwidth::Fullband,
-            }
-        }
-    }
-}
-
 #[cfg(all(test, feature = "std"))]
 fn frame_duration_ms_from_toc(toc: u8) -> i32 {
     let mode = mode_from_toc(toc);
@@ -6309,10 +6275,6 @@ fn frame_duration_ms_from_toc(toc: u8) -> i32 {
             }
         }
     }
-}
-
-fn channels_from_toc(toc: u8) -> usize {
-    if toc & 0x04 != 0 { 2 } else { 1 }
 }
 
 /// Cross-fade `overlap` interleaved samples per channel between `out` and
@@ -6353,6 +6315,7 @@ fn smooth_fade(
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use crate::packet::{Framing, Padding};
 
     #[test]
     fn sample_rates_convert_to_and_from_numbers() {
@@ -6420,7 +6383,7 @@ mod tests {
             let len = enc.encode(&pcm, 960, &mut out).unwrap();
             let plain_len = plain.encode(&pcm, 960, &mut plain_out).unwrap();
             assert_eq!(out[..len], plain_out[..plain_len], "packet {k}");
-            assert_eq!(channels_from_toc(out[0]), 1);
+            assert_eq!(packet::nb_channels(out[0]), Channels::Mono);
         }
         enc.set_force_channels(None);
         assert_eq!(enc.force_channels(), None);
@@ -6476,7 +6439,7 @@ mod tests {
             Bandwidth::Fullband,
             2,
         );
-        assert_eq!(channels_from_toc(stereo_toc), 2);
+        assert_eq!(packet::nb_channels(stereo_toc), Channels::Stereo);
     }
 
     #[test]
@@ -6677,11 +6640,11 @@ mod tests {
             let mut delimited = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             let (mut a, mut b) = (vec![0f32; frame_size], vec![0f32; frame_size]);
             for p in encode_tone(&mut enc, frame_size, 12) {
-                let parsed = packet::parse(&p, false).unwrap();
-                assert_eq!(parsed.count, frame_size / 960);
+                let parsed = packet::parse(&p, Framing::Normal).unwrap();
+                assert_eq!(parsed.nb_frames(), frame_size / 960);
                 let frames: Vec<&[u8]> = parsed.frames(&p).collect();
                 let mut stream = vec![0u8; p.len() + 16];
-                let len = packet::write(parsed.toc, &frames, &mut stream, true, false).unwrap();
+                let len = packet::write(parsed.toc(), &frames, &mut stream, Framing::SelfDelimited, Padding::Shortest).unwrap();
                 // The next stream of a multistream packet would follow here.
                 stream.truncate(len);
                 stream.extend_from_slice(&[0xF8, 1, 2, 3, 4]);
@@ -6736,15 +6699,15 @@ mod tests {
         let mut a16 = vec![0i16; frame_size];
         let mut fec_calls = 0;
         for (i, p) in packets.iter().enumerate() {
-            let parsed = packet::parse(p, false).unwrap();
+            let parsed = packet::parse(p, Framing::Normal).unwrap();
             let frames: Vec<&[u8]> = parsed.frames(p).collect();
             // Every third packet is padded by 1, 2 or 300 bytes.
             let extra = if i % 3 == 0 { [1usize, 2, 300][(i / 3) % 3] } else { 0 };
             let mut stream = vec![0u8; p.len() + 2 + extra];
             let len = if extra == 0 {
-                packet::write(parsed.toc, &frames, &mut stream, true, false).unwrap()
+                packet::write(parsed.toc(), &frames, &mut stream, Framing::SelfDelimited, Padding::Shortest).unwrap()
             } else {
-                packet::write(parsed.toc, &frames, &mut stream, true, true).unwrap()
+                packet::write(parsed.toc(), &frames, &mut stream, Framing::SelfDelimited, Padding::FillBuffer).unwrap()
             };
             stream.truncate(len);
             stream.extend_from_slice(&[0x0B, 0xFF, 7]);

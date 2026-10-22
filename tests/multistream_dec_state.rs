@@ -31,6 +31,7 @@ use audiopus_sys as sys;
 use ms_support::*;
 use multistream_dec_common::*;
 use opus1::{Channels, OpusDecoder, SampleRate, pcm_soft_clip};
+use opus1::packet::{Framing, Padding};
 use std::f64::consts::PI;
 
 const OPUS_SET_FORCE_CHANNELS_REQUEST: i32 = 4022;
@@ -192,7 +193,7 @@ fn mono_silk_stream_has_fec(stream: &StreamPacket) -> bool {
     let t = toc(stream.toc);
     assert!(t.mode == Mode::Silk && !t.stereo);
     let silk_frames = (t.frame_48k / 960).max(1);
-    let parsed = opus1::packet::parse(&stream.packet, false).unwrap();
+    let parsed = opus1::packet::parse(&stream.packet, Framing::Normal).unwrap();
     let first = parsed.frame(&stream.packet, 0);
     !first.is_empty() && first[0] & (0x80 >> silk_frames) != 0
 }
@@ -643,11 +644,12 @@ fn join_packets(e: &Encoded, group: &[Vec<u8>]) -> Option<Vec<u8>> {
         let mut frames: Vec<&[u8]> = Vec::new();
         for parts in &split {
             let stream = &parts[s].packet;
-            let parsed = opus1::packet::parse(stream, false).unwrap();
+            let parsed = opus1::packet::parse(stream, Framing::Normal).unwrap();
             frames.extend(parsed.frames(stream));
         }
         let mut buf = vec![0u8; 6 * 1277 + 8];
-        let len = opus1::packet::write(toc_byte, &frames, &mut buf, s + 1 != e.streams, false).unwrap();
+        let framing = if s + 1 != e.streams { Framing::SelfDelimited } else { Framing::Normal };
+        let len = opus1::packet::write(toc_byte, &frames, &mut buf, framing, Padding::Shortest).unwrap();
         joined.extend_from_slice(&buf[..len]);
     }
     Some(joined)

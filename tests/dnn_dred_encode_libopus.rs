@@ -33,9 +33,10 @@ use audiopus_sys as sys;
 use opus1::internals::dnn::dred::DRED_EXTENSION_ID;
 use opus1::multistream::MultistreamEncoder;
 use opus1::{
-    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusDred, OpusDredDecoder,
-    OpusEncoder, SampleRate, packet,
+    Application, Bandwidth, Bitrate, Channels, DredProcessing, ForcedMode, OpusDecoder, OpusDred,
+    OpusDredDecoder, OpusEncoder, SampleRate, packet,
 };
+use opus1::packet::Framing;
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uchar, c_void};
 
@@ -228,9 +229,9 @@ fn encode_opus1(enc: &mut OpusEncoder, pcm: &[i16], frame: usize) -> Vec<u8> {
 /// The DRED extension of a packet: its frame and its data (with the two
 /// experimental bytes).
 fn dred_of(data: &[u8]) -> Option<(usize, Vec<u8>)> {
-    let parsed = packet::parse(data, false).unwrap();
-    let mut it = opus1::extensions::ExtensionIterator::new(parsed.padding(data), parsed.count);
-    let ext = it.find(DRED_EXTENSION_ID).unwrap()?;
+    let parsed = packet::parse(data, Framing::Normal).unwrap();
+    let mut it = opus1::extensions::ExtensionIterator::new(parsed.padding(data), parsed.nb_frames());
+    let ext = it.find_id(DRED_EXTENSION_ID).unwrap()?;
     Some((ext.frame, ext.data.to_vec()))
 }
 
@@ -703,10 +704,11 @@ fn multistream_packets_with_dred_on_the_streams_equal_libopus() {
         // Every stream but the last is self-delimited.
         let mut rest = &b[..nb];
         for (s, count) in with_dred.iter_mut().enumerate() {
-            let p = packet::parse(rest, s + 1 < streams).unwrap();
-            let mut it = opus1::extensions::ExtensionIterator::new(p.padding(rest), p.count);
-            *count += it.find(DRED_EXTENSION_ID).unwrap().is_some() as usize;
-            rest = &rest[p.packet_offset..];
+            let framing = if s + 1 < streams { Framing::SelfDelimited } else { Framing::Normal };
+            let p = packet::parse(rest, framing).unwrap();
+            let mut it = opus1::extensions::ExtensionIterator::new(p.padding(rest), p.nb_frames());
+            *count += it.find_id(DRED_EXTENSION_ID).unwrap().is_some() as usize;
+            rest = &rest[p.packet_offset()..];
         }
     }
     unsafe { sys::opus_multistream_encoder_destroy(c) };
@@ -822,7 +824,7 @@ fn recover(cfg: &Cfg, opus1_packets: bool) -> (f64, f64) {
             let mut end = 0;
             let ret = unsafe { opus_dred_parse(c.dec, c.dred, p.as_ptr(), p.len() as i32, max, FS, &mut end, 0) };
             let got =
-                rd.parse(&mut dred, p, max, SampleRate::try_from(FS).unwrap(), false).unwrap();
+                rd.parse(&mut dred, p, max, SampleRate::try_from(FS).unwrap(), DredProcessing::Now).unwrap();
             assert_eq!((got.samples, got.end), (ret, end), "packet {i}");
             for fr in 0..lost_count {
                 if ret > 0 {

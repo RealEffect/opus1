@@ -11,6 +11,7 @@ use opus1::{
     Application, Bandwidth, Bitrate, Channels, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder,
     SampleRate, packet, pcm_soft_clip,
 };
+use opus1::packet::{Framing, Padding};
 
 /// Frame sizes no buffer can hold. Several are chosen so that
 /// `frame_size * 2` overflows to a small number, or so that their lowest 32
@@ -167,11 +168,11 @@ fn frames_longer_than_1275_bytes_are_rejected_like_libopus() {
     }
     let (mut accepted, mut rejected) = (0, 0);
     for data in &cases {
-        let ours = packet::parse(data, false);
+        let ours = packet::parse(data, Framing::Normal);
         match c_parse_sizes(data) {
             Some(sizes) => {
                 let p = ours.unwrap_or_else(|e| panic!("libopus accepts {:02x?} + {} bytes, opus1: {e}", &data[..4], data.len() - 4));
-                assert_eq!(p.sizes[..p.count].iter().map(|&s| s as usize).collect::<Vec<_>>(), sizes);
+                assert_eq!(p.frame_sizes().iter().map(|&s| s as usize).collect::<Vec<_>>(), sizes);
                 assert!(sizes.iter().all(|&s| s <= packet::MAX_FRAME_BYTES));
                 accepted += 1;
             }
@@ -191,8 +192,8 @@ fn frames_longer_than_1275_bytes_are_rejected_like_libopus() {
     // `write` takes no frame beyond the limit either.
     let long = vec![1u8; packet::MAX_FRAME_BYTES + 1];
     let mut out = vec![0u8; 4000];
-    assert!(packet::write(0x48, &[&long], &mut out, false, false).is_err());
-    assert_eq!(packet::write(0x48, &[&long[..1275]], &mut out, false, false), Ok(1276));
+    assert!(packet::write(0x48, &[&long], &mut out, Framing::Normal, Padding::Shortest).is_err());
+    assert_eq!(packet::write(0x48, &[&long[..1275]], &mut out, Framing::Normal, Padding::Shortest), Ok(1276));
 }
 
 /// A forced mode and bandwidth with bitrates from the lowest to the highest
@@ -337,9 +338,9 @@ fn pad_of_a_packet_with_padding_content() {
             Ok(expected) => {
                 assert_eq!(result, Ok(()), "round {round}");
                 assert_eq!(ours, expected, "round {round}: the bytes of libopus");
-                let parsed = packet::parse(&ours, false).unwrap();
+                let parsed = packet::parse(&ours, Framing::Normal).unwrap();
                 assert_eq!(parsed.frame(&ours, 0), &data[3..3 + frame_len], "round {round}: the frame");
-                if ours[new_len - parsed.padding_len..].iter().all(|&b| b == 0) {
+                if ours[new_len - parsed.padding_len()..].iter().all(|&b| b == 0) {
                     zeros_out += 1;
                 } else {
                     kept += 1;

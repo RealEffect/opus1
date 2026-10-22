@@ -21,7 +21,7 @@ use audiopus_sys as sys;
 use opus1::extensions::{self, Extension};
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::internals::dnn::models::dred_rdovae_stats as stats;
-use opus1::packet::{self, Repacketizer};
+use opus1::packet::{self, Framing, Repacketizer};
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uchar};
 
@@ -134,20 +134,20 @@ fn dred_packets_of_libopus_carry_the_extension() {
     let packets = dred_packets();
     let mut with_dred = 0;
     for (k, p) in packets.iter().enumerate() {
-        let parsed = packet::parse(p, false).unwrap();
+        let parsed = packet::parse(p, Framing::Normal).unwrap();
         let padding = parsed.padding(p);
         let mut ours = [Extension::default(); 8];
-        let n = extensions::parse(padding, &mut ours, parsed.count).unwrap();
+        let n = extensions::parse(padding, &mut ours, parsed.nb_frames()).unwrap();
         let mut c = [CExt { id: 0, frame: 0, data: std::ptr::null(), len: 0 }; 8];
         let mut c_n = 8;
-        let ret = unsafe { opus_packet_extensions_parse(padding.as_ptr(), padding.len() as i32, c.as_mut_ptr(), &mut c_n, parsed.count as c_int) };
+        let ret = unsafe { opus_packet_extensions_parse(padding.as_ptr(), padding.len() as i32, c.as_mut_ptr(), &mut c_n, parsed.nb_frames() as c_int) };
         assert_eq!((ret, c_n as usize), (0, n), "packet {k}");
         for (a, b) in ours[..n].iter().zip(&c) {
             let data = unsafe { std::slice::from_raw_parts(b.data, b.len as usize) };
             assert_eq!((a.id as c_int, a.frame as c_int, a.data), (b.id, b.frame, data), "packet {k}");
         }
-        let mut iter = extensions::ExtensionIterator::new(padding, parsed.count);
-        if let Some(ext) = iter.find(DRED_EXTENSION_ID).unwrap() {
+        let mut iter = extensions::ExtensionIterator::new(padding, parsed.nb_frames());
+        if let Some(ext) = iter.find_id(DRED_EXTENSION_ID).unwrap() {
             assert_eq!(&ext.data[..2], &[b'D', DRED_EXPERIMENTAL_VERSION], "packet {k}");
             assert_eq!(ext.frame, 0, "packet {k}");
             with_dred += 1;
@@ -169,11 +169,11 @@ fn dred_packets_of_libopus_carry_the_extension() {
         let n = rp.out(&mut out).unwrap();
         assert_eq!(n as i32, c_n, "group {k}");
         assert_eq!(out[..n], c_out[..n], "group {k}");
-        let parsed = packet::parse(&out[..n], false).unwrap();
+        let parsed = packet::parse(&out[..n], Framing::Normal).unwrap();
         let frames: Vec<usize> = {
             let mut v = Vec::new();
-            let mut iter = extensions::ExtensionIterator::new(parsed.padding(&out[..n]), parsed.count);
-            while let Some(e) = iter.find(DRED_EXTENSION_ID).unwrap() {
+            let mut iter = extensions::ExtensionIterator::new(parsed.padding(&out[..n]), parsed.nb_frames());
+            while let Some(e) = iter.find_id(DRED_EXTENSION_ID).unwrap() {
                 v.push(e.frame);
             }
             v

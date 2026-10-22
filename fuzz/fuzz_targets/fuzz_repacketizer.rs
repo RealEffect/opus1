@@ -15,7 +15,9 @@
 //!   written fits the buffer, fills it with `pad`, and parses to the frames
 //!   of the range.
 //! - `pad` and `pad_with_extensions` of one packet against
-//!   `opus_packet_pad` and `opus_packet_pad_impl`; `unpad` against
+//!   `opus_packet_pad` and `opus_packet_pad_impl` (when `len == new_len`,
+//!   `pad_with_extensions` writes the extensions it is given, where libopus
+//!   leaves them out); `unpad` against
 //!   `opus_packet_unpad`. The same result and bytes. A padded or unpadded
 //!   packet keeps its frames; an unpadded packet has no padding.
 //! - `multistream_pad` and `multistream_unpad` of a multistream packet
@@ -33,13 +35,51 @@ use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::SampleRate;
 use opus1::extensions::{self, Extension};
-use opus1::packet::{self, Repacketizer};
+use opus1::packet::{self, Framing, Padding, Repacketizer};
 use std::os::raw::c_int;
 
 fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
     let _ = run(&mut u);
 });
+
+/// What `packet::pad_with_extensions` does, in libopus terms:
+/// `opus_packet_pad_impl`, with two changes when `len == new_len`.
+/// Without extensions the result is `len`, not 0. With extensions the
+/// packet is rewritten as libopus rewrites it for a longer `new_len`,
+/// instead of being left as it is without them.
+fn c_pad_with_extensions(data: &mut [u8], len: usize, new_len: usize, pad: bool, exts: &[CExt]) -> i32 {
+    assert!(data.len() >= len.max(new_len));
+    if len < 1 || len != new_len {
+        return unsafe {
+            opus_packet_pad_impl(data.as_mut_ptr(), len as i32, new_len as i32, pad as c_int, exts.as_ptr(), exts.len() as c_int)
+        };
+    }
+    if exts.is_empty() {
+        return len as i32;
+    }
+    // The rest of `opus_packet_pad_impl`.
+    let copy = data[..len].to_vec();
+    let mut rp = CRepacketizer::new();
+    let ret = rp.cat(&copy);
+    if ret != 0 {
+        return ret;
+    }
+    let nb = rp.nb_frames();
+    unsafe {
+        opus_repacketizer_out_range_impl(
+            rp.0,
+            0,
+            nb,
+            data.as_mut_ptr(),
+            new_len as i32,
+            0,
+            pad as c_int,
+            exts.as_ptr() as *const u8,
+            exts.len() as c_int,
+        )
+    }
+}
 
 /// The frame sizes of a code 3 packet: one byte below 252, else two.
 fn push_size(out: &mut Vec<u8>, size: usize) {
@@ -96,7 +136,7 @@ fn arbitrary_packet(u: &mut Unstructured, toc: u8, pool: &[u8]) -> Result<Vec<u8
     }
     if kind == 1 {
         let mut out = vec![0u8; 48 * 1277 + 8];
-        return match packet::write(toc, &frames, &mut out, false, false) {
+        return match packet::write(toc, &frames, &mut out, Framing::Normal, Padding::Shortest) {
             Ok(n) => {
                 out.truncate(n);
                 Ok(out)
@@ -115,7 +155,7 @@ fn arbitrary_packet(u: &mut Unstructured, toc: u8, pool: &[u8]) -> Result<Vec<u8
                 .filter(|e| (3..=127).contains(&e.id) && e.frame < count && (e.id >= 32 || e.data.len() <= 1))
                 .collect();
             let mut buf = vec![0u8; 40 * 710 + 2 * 48];
-            let n = extensions::generate(&mut buf, &exts, count, false).unwrap_or(0);
+            let n = extensions::generate(&mut buf, &exts, count, Padding::Shortest).unwrap_or(0);
             buf.truncate(n);
             let fill = if u.ratio(1, 4)? { u.int_in_range(1..=3)? } else { 0 };
             let mut padding = vec![0x01; fill];
@@ -129,7 +169,7 @@ fn arbitrary_packet(u: &mut Unstructured, toc: u8, pool: &[u8]) -> Result<Vec<u8
 
 /// The frames of `data`, or nothing when it does not parse.
 fn frames_of(data: &[u8], self_delimited: bool) -> Option<Vec<Vec<u8>>> {
-    let p = packet::parse(data, self_delimited).ok()?;
+    let p = packet::parse(data, framing_of(self_delimited)).ok()?;
     Some(p.frames(data).map(|f| f.to_vec()).collect())
 }
 
@@ -156,7 +196,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
         match ret {
             Ok(()) => {
                 assert_eq!(c_ret, 0, "cat of packet {i}");
-                let p = packet::parse(p, false).expect("a packet that cat takes parses");
+                let p = packet::parse(p, Framing::Normal).expect("a packet that cat takes parses");
                 frames.extend(p.frames(&packets[i]));
             }
             Err(e) => assert_eq!(e.to_raw(), c_ret, "cat of packet {i}"),
@@ -172,8 +212,8 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 let nb = rp.nb_frames();
                 let begin = u.int_in_range(0..=nb + 1)?;
                 let end = u.int_in_range(0..=nb + 1)?;
-                let self_delimited = u.arbitrary()?;
-                let pad = u.arbitrary()?;
+                let self_delimited: bool = u.arbitrary()?;
+                let pad: bool = u.arbitrary()?;
                 let extra =
                     if u.ratio(1, 2)? { arbitrary_extensions(u, pool, end.saturating_sub(begin), 20)? } else { Vec::new() };
                 let maxlen = match u.int_in_range(0..=3)? {
@@ -201,7 +241,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                     "{what}: out_range_ext {begin}..{end} of {nb}, {maxlen} bytes, self-delimited {self_delimited}, pad {pad}, {} extra",
                     extra.len()
                 );
-                match rp.out_range_ext(begin, end, &mut out, self_delimited, pad, &extra) {
+                match rp.out_range_ext(begin, end, &mut out, framing_of(self_delimited), padding_of(pad), &extra) {
                     Ok(n) => {
                         assert_eq!(n as i32, c_ret, "{what}");
                         assert!(n <= maxlen, "{what}: {n} bytes");
@@ -237,7 +277,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                     0 => u.int_in_range(0..=len + 2)?,
                     _ => len + u.int_in_range(0..=3000)?,
                 };
-                let pad = u.arbitrary()?;
+                let pad: bool = u.arbitrary()?;
                 let count = packet::nb_frames(&data[..len]).unwrap_or(1);
                 let with_extra = u.arbitrary()?;
                 let extra = if with_extra { arbitrary_extensions(u, pool, count, 20)? } else { Vec::new() };
@@ -245,15 +285,13 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 let mut c_buf = data.clone();
                 c_buf.resize(new_len.max(len) + 8, 0xEE);
                 let mut buf = c_buf.clone();
-                let c_ret = unsafe {
-                    if with_extra {
-                        opus_packet_pad_impl(c_buf.as_mut_ptr(), len as i32, new_len as i32, pad as c_int, c_extra.as_ptr(), c_extra.len() as c_int)
-                    } else {
-                        sys::opus_packet_pad(c_buf.as_mut_ptr(), len as i32, new_len as i32)
-                    }
+                let c_ret = if with_extra {
+                    c_pad_with_extensions(&mut c_buf, len, new_len, pad, &c_extra)
+                } else {
+                    unsafe { sys::opus_packet_pad(c_buf.as_mut_ptr(), len as i32, new_len as i32) }
                 };
                 let ret = if with_extra {
-                    packet::pad_with_extensions(&mut buf, len, new_len, pad, &extra)
+                    packet::pad_with_extensions(&mut buf, len, new_len, padding_of(pad), &extra)
                 } else {
                     packet::pad(&mut buf, len, new_len).map(|_| 0)
                 };
@@ -264,8 +302,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         if with_extra {
                             assert_eq!(n as i32, c_ret, "{what}");
                         }
-                        // 0: the length did not change, and nothing was done.
-                        let n = if with_extra && n > 0 { n } else { new_len };
+                        let n = if with_extra { n } else { new_len };
                         assert!(n <= new_len, "{what}: {n} bytes");
                         assert_eq!(buf[..n], c_buf[..n], "{what}: bytes");
                         assert_eq!(frames_of(&buf[..n], false), frames_of(&data[..len], false), "{what}: frames");
@@ -286,8 +323,8 @@ fn run(u: &mut Unstructured) -> Result<()> {
                         assert_eq!(n as i32, c_ret, "{what}");
                         assert!(n <= len, "{what}: {n} bytes");
                         assert_eq!(buf[..n], c_buf[..n], "{what}: bytes");
-                        let p = packet::parse(&buf[..n], false).unwrap_or_else(|e| panic!("{what}: does not parse: {e}"));
-                        assert_eq!(p.padding_len, 0, "{what}: padding left");
+                        let p = packet::parse(&buf[..n], Framing::Normal).unwrap_or_else(|e| panic!("{what}: does not parse: {e}"));
+                        assert_eq!(p.padding_len(), 0, "{what}: padding left");
                         assert_eq!(frames_of(&buf[..n], false), frames_of(&data[..len], false), "{what}: frames");
                     }
                     Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: error"),
@@ -357,7 +394,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 match rp.cat(p) {
                     Ok(()) => {
                         assert_eq!(c_ret, 0, "cat after reset");
-                        frames.extend(packet::parse(p, false).unwrap().frames(p));
+                        frames.extend(packet::parse(p, Framing::Normal).unwrap().frames(p));
                     }
                     Err(e) => assert_eq!(e.to_raw(), c_ret, "cat after reset"),
                 }

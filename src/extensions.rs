@@ -34,6 +34,7 @@
 //! with the feature `std`.
 
 use crate::Error;
+use crate::packet::Padding;
 
 /// The extension IDs 0, 1 and 2 are padding, separators and repeats. The
 /// IDs of real extensions are 3 to 127.
@@ -44,8 +45,17 @@ pub const MAX_ID: u8 = 127;
 /// The most frames of a packet (120 ms of 2.5 ms frames).
 const MAX_FRAMES: usize = 48;
 
+/// `nb_frames` is above 48. libopus only asserts this.
+const TOO_MANY_FRAMES: Error = Error::bad_arg("invalid argument: nb_frames is above 48");
+/// `nb_frame_exts` holds fewer than `nb_frames` values.
+const COUNTS_TOO_SHORT: Error = Error::bad_arg("invalid argument: nb_frame_exts is shorter than nb_frames");
+
 /// One extension: libopus `opus_extension_data`.
+///
+/// The fields can be read. To make one, use [`Extension::new`]: more fields
+/// may be added in a later release.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Extension<'a> {
     /// The ID, 3 to 127. IDs 3 to 31 are short extensions with at most one
     /// byte of payload, IDs 32 to 127 long extensions.
@@ -54,6 +64,16 @@ pub struct Extension<'a> {
     pub frame: usize,
     /// The payload.
     pub data: &'a [u8],
+}
+
+impl<'a> Extension<'a> {
+    /// An extension with ID `id` for frame `frame` of a packet, with the
+    /// payload `data`. It is not checked here: [`generate`] refuses an ID
+    /// outside 3 to 127, a frame past the last frame, and a short extension
+    /// (ID below 32) with more than one byte.
+    pub const fn new(id: u8, frame: usize, data: &'a [u8]) -> Self {
+        Extension { id, frame, data }
+    }
 }
 
 /// Skips the payload of an extension whose ID byte was `id_byte`. The
@@ -130,13 +150,33 @@ fn skip_extension(data: &[u8], pos: usize, len: usize) -> Option<(usize, usize, 
 /// Reads the extensions of a padding one by one: libopus
 /// `OpusExtensionIterator`.
 ///
-/// It returns every extension but padding, separators and repeats, and
-/// includes the extensions that a repeat adds. They come in the order of
-/// the bytes, which is not always the order of the frames: repeated
-/// extensions come right after the repeat.
+/// It is an [`Iterator`] over `Result<Extension, Error>`. It returns every
+/// extension but padding, separators and repeats, and includes the
+/// extensions that a repeat adds. They come in the order of the bytes,
+/// which is not always the order of the frames: repeated extensions come
+/// right after the repeat.
 ///
-/// After an error, every later call returns the same error, until
-/// [`reset`](Self::reset).
+/// Errors: [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the
+/// padding is not valid, and [`BadArg`](crate::ErrorKind::BadArg) when
+/// `nb_frames` is above 48. After an error the iterator ends: later calls of
+/// `next` return `None`, until [`reset`](Self::reset). (libopus returns the
+/// error again on every later call.)
+///
+/// ```
+/// use opus1::extensions::{Extension, ExtensionIterator};
+///
+/// // ID 3 with one byte in frame 0, a separator, ID 4 without payload in
+/// // frame 1.
+/// let padding = [0x07, 0xAA, 0x02, 0x08];
+/// let found: Vec<Extension> = ExtensionIterator::new(&padding, 2).collect::<Result<_, _>>().unwrap();
+/// assert_eq!(found, [Extension::new(3, 0, &[0xAA]), Extension::new(4, 1, &[])]);
+///
+/// // A separator past the last frame makes the padding invalid.
+/// let mut iter = ExtensionIterator::new(&padding, 1);
+/// assert!(iter.next().unwrap().is_ok());
+/// assert!(iter.next().unwrap().is_err());
+/// assert!(iter.next().is_none());
+/// ```
 #[derive(Clone, Debug)]
 pub struct ExtensionIterator<'a> {
     data: &'a [u8],
@@ -170,11 +210,9 @@ impl<'a> ExtensionIterator<'a> {
     /// An iterator over the padding `data` of a packet of `nb_frames`
     /// frames. libopus `opus_extension_iterator_init`.
     ///
-    /// # Panics
-    ///
-    /// When `nb_frames` is above 48, as libopus asserts.
+    /// When `nb_frames` is above 48, which libopus only asserts, the first
+    /// call of `next` returns [`BadArg`](crate::ErrorKind::BadArg).
     pub fn new(data: &'a [u8], nb_frames: usize) -> Self {
-        assert!(nb_frames <= MAX_FRAMES, "a packet has at most 48 frames");
         ExtensionIterator {
             data,
             curr: 0,
@@ -286,11 +324,7 @@ impl<'a> ExtensionIterator<'a> {
     /// The next extension, `None` at the end, or an error
     /// ([`InvalidPacket`](crate::ErrorKind::InvalidPacket)) when the padding is
     /// not valid. libopus `opus_extension_iterator_next`.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<Extension<'a>>, Error> {
-        if self.failed {
-            return Err(Error::INVALID_PACKET);
-        }
+    fn next_extension(&mut self) -> Result<Option<Extension<'a>>, Error> {
         if self.repeat_frame > 0 {
             // In the middle of a repeat.
             if let Some(ext) = self.next_repeat()? {
@@ -359,10 +393,14 @@ impl<'a> ExtensionIterator<'a> {
         Ok(None)
     }
 
-    /// The next extension with ID `id`. libopus
+    /// The next extension with ID `id`, `None` when no other extension has
+    /// it, or the error that ends the iterator. libopus
     /// `opus_extension_iterator_find`.
-    pub fn find(&mut self, id: u8) -> Result<Option<Extension<'a>>, Error> {
-        while let Some(ext) = self.next()? {
+    ///
+    /// The name is not `find`, so that [`Iterator::find`] stays callable.
+    pub fn find_id(&mut self, id: u8) -> Result<Option<Extension<'a>>, Error> {
+        for ext in self.by_ref() {
+            let ext = ext?;
             if ext.id == id {
                 return Ok(Some(ext));
             }
@@ -371,26 +409,42 @@ impl<'a> ExtensionIterator<'a> {
     }
 }
 
+impl<'a> Iterator for ExtensionIterator<'a> {
+    type Item = Result<Extension<'a>, Error>;
+
+    /// The next extension, `None` at the end, or an error. libopus
+    /// `opus_extension_iterator_next`. After an error, `None`.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        if self.nb_frames > MAX_FRAMES {
+            self.failed = true;
+            return Some(Err(TOO_MANY_FRAMES));
+        }
+        self.next_extension().transpose()
+    }
+}
+
 /// The number of extensions in the padding `data` of a packet of
 /// `nb_frames` frames, repeated ones included. libopus
 /// `opus_packet_extensions_count`.
 ///
 /// As in libopus, invalid padding is not an error: the count stops at the
-/// first entry that cannot be read.
-pub fn count(data: &[u8], nb_frames: usize) -> usize {
-    let mut iter = ExtensionIterator::new(data, nb_frames);
-    let mut n = 0;
-    while let Ok(Some(_)) = iter.next() {
-        n += 1;
+/// first entry that cannot be read. The only error is
+/// [`BadArg`](crate::ErrorKind::BadArg) when `nb_frames` is above 48.
+pub fn count(data: &[u8], nb_frames: usize) -> Result<usize, Error> {
+    if nb_frames > MAX_FRAMES {
+        return Err(TOO_MANY_FRAMES);
     }
-    n
+    Ok(ExtensionIterator::new(data, nb_frames).map_while(Result::ok).count())
 }
 
 /// Like [`count`], but an error when the padding is not valid.
 pub(crate) fn count_checked(data: &[u8], nb_frames: usize) -> Result<usize, Error> {
-    let mut iter = ExtensionIterator::new(data, nb_frames);
     let mut n = 0;
-    while iter.next()?.is_some() {
+    for ext in ExtensionIterator::new(data, nb_frames) {
+        ext?;
         n += 1;
     }
     Ok(n)
@@ -400,18 +454,21 @@ pub(crate) fn count_checked(data: &[u8], nb_frames: usize) -> Result<usize, Erro
 /// and returns their total. libopus `opus_packet_extensions_count_ext`.
 /// Like [`count`], it stops at invalid padding.
 ///
-/// # Panics
-///
-/// When `nb_frame_exts` holds fewer than `nb_frames` values.
-pub fn count_ext(data: &[u8], nb_frame_exts: &mut [usize], nb_frames: usize) -> usize {
-    let mut iter = ExtensionIterator::new(data, nb_frames);
-    nb_frame_exts[..nb_frames].fill(0);
+/// Errors: [`BadArg`](crate::ErrorKind::BadArg) when `nb_frames` is above 48
+/// or `nb_frame_exts` holds fewer than `nb_frames` values. `nb_frame_exts`
+/// then stays as it was.
+pub fn count_ext(data: &[u8], nb_frame_exts: &mut [usize], nb_frames: usize) -> Result<usize, Error> {
+    if nb_frames > MAX_FRAMES {
+        return Err(TOO_MANY_FRAMES);
+    }
+    let counts = nb_frame_exts.get_mut(..nb_frames).ok_or(COUNTS_TOO_SHORT)?;
+    counts.fill(0);
     let mut n = 0;
-    while let Ok(Some(ext)) = iter.next() {
-        nb_frame_exts[ext.frame] += 1;
+    for ext in ExtensionIterator::new(data, nb_frames).map_while(Result::ok) {
+        counts[ext.frame] += 1;
         n += 1;
     }
-    n
+    Ok(n)
 }
 
 /// Reads the extensions of the padding `data` of a packet of `nb_frames`
@@ -421,10 +478,14 @@ pub fn count_ext(data: &[u8], nb_frame_exts: &mut [usize], nb_frames: usize) -> 
 /// Errors: [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the padding
 /// is not valid, [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when
 /// `out` is too short. In both cases `out` holds the extensions read before.
+/// [`BadArg`](crate::ErrorKind::BadArg) when `nb_frames` is above 48.
 pub fn parse<'a>(data: &'a [u8], out: &mut [Extension<'a>], nb_frames: usize) -> Result<usize, Error> {
-    let mut iter = ExtensionIterator::new(data, nb_frames);
+    if nb_frames > MAX_FRAMES {
+        return Err(TOO_MANY_FRAMES);
+    }
     let mut n = 0;
-    while let Some(ext) = iter.next()? {
+    for ext in ExtensionIterator::new(data, nb_frames) {
+        let ext = ext?;
         let slot = out.get_mut(n).ok_or(Error::BUFFER_TOO_SMALL)?;
         *slot = ext;
         n += 1;
@@ -441,30 +502,33 @@ pub fn parse<'a>(data: &'a [u8], out: &mut [Extension<'a>], nb_frames: usize) ->
 /// is unspecified, and the result may be
 /// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall).
 ///
-/// # Panics
-///
-/// When `nb_frames` is above 48 or `nb_frame_exts` holds fewer than
-/// `nb_frames` values.
+/// Errors: those of [`parse`], and [`BadArg`](crate::ErrorKind::BadArg) when
+/// `nb_frames` is above 48 or `nb_frame_exts` holds fewer than `nb_frames`
+/// values.
 pub fn parse_ext<'a>(
     data: &'a [u8],
     out: &mut [Extension<'a>],
     nb_frame_exts: &[usize],
     nb_frames: usize,
 ) -> Result<usize, Error> {
-    assert!(nb_frames <= MAX_FRAMES, "a packet has at most 48 frames");
-    // Where the extensions of each frame start.
-    let mut next = [0usize; MAX_FRAMES + 1];
-    let mut total = 0;
-    for f in 0..nb_frames {
-        next[f] = total;
-        total += nb_frame_exts[f];
+    if nb_frames > MAX_FRAMES {
+        return Err(TOO_MANY_FRAMES);
     }
-    next[nb_frames] = total;
-    let mut iter = ExtensionIterator::new(data, nb_frames);
+    let counts = nb_frame_exts.get(..nb_frames).ok_or(COUNTS_TOO_SHORT)?;
+    // Where the extensions of each frame start. Counts that are not those
+    // of `data` may be huge: the sums saturate, and an index past `out` is
+    // BufferTooSmall.
+    let mut next = [0usize; MAX_FRAMES];
+    let mut total = 0usize;
+    for (start, &count) in next.iter_mut().zip(counts) {
+        *start = total;
+        total = total.saturating_add(count);
+    }
     let mut n = 0;
-    while let Some(ext) = iter.next()? {
+    for ext in ExtensionIterator::new(data, nb_frames) {
+        let ext = ext?;
         let idx = next[ext.frame];
-        next[ext.frame] += 1;
+        next[ext.frame] = idx.saturating_add(1);
         let slot = out.get_mut(idx).ok_or(Error::BUFFER_TOO_SMALL)?;
         *slot = ext;
         n += 1;
@@ -548,7 +612,7 @@ fn generate_impl(
     pad: bool,
 ) -> Result<usize, Error> {
     if nb_frames > MAX_FRAMES {
-        return Err(Error::BAD_ARG);
+        return Err(TOO_MANY_FRAMES);
     }
     let n = extensions.len();
     let len = out.len;
@@ -682,16 +746,17 @@ fn generate_impl(
 ///
 /// The extensions may come in any order; within a frame they keep their
 /// order. Where the same extensions follow in every later frame, a repeat
-/// codes them. With `pad`, bytes 0x01 in front fill `out` to its length.
+/// codes them. With [`Padding::FillBuffer`], bytes 0x01 in front fill `out`
+/// to its length.
 ///
 /// Errors: [`BadArg`](crate::ErrorKind::BadArg) for more than 48 frames, a
 /// frame number of `nb_frames` or more, an ID outside 3 to 127, or a short
 /// extension (ID below 32) with more than one byte;
 /// [`BufferTooSmall`](crate::ErrorKind::BufferTooSmall) when `out` is too
 /// short. `out` may then hold part of the result.
-pub fn generate(out: &mut [u8], extensions: &[Extension], nb_frames: usize, pad: bool) -> Result<usize, Error> {
+pub fn generate(out: &mut [u8], extensions: &[Extension], nb_frames: usize, padding: Padding) -> Result<usize, Error> {
     let len = out.len();
-    generate_impl(Out { data: Some(out), len }, extensions, nb_frames, pad)
+    generate_impl(Out { data: Some(out), len }, extensions, nb_frames, padding.fills_buffer())
 }
 
 /// The bytes [`generate`] would write into a buffer of `max_len` bytes
@@ -755,17 +820,13 @@ impl<'a> ExtensionList<'a> {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
 
     /// ID, frame and payload of each extension.
     type Plain = (u8, usize, Vec<u8>);
 
     fn all(data: &[u8], nb_frames: usize) -> Result<Vec<Plain>, Error> {
-        let mut it = ExtensionIterator::new(data, nb_frames);
-        let mut v = Vec::new();
-        while let Some(e) = it.next()? {
-            v.push((e.id, e.frame, e.data.to_vec()));
-        }
-        Ok(v)
+        ExtensionIterator::new(data, nb_frames).map(|e| e.map(|e| (e.id, e.frame, e.data.to_vec()))).collect()
     }
 
     #[test]
@@ -775,7 +836,7 @@ mod tests {
         let data = [0x01, 0x07, 0xAA, 0x41, 2, 1, 2, 0x42, 9, 9, 9];
         let v = all(&data, 1).unwrap();
         assert_eq!(v, [(3, 0, vec![0xAA]), (32, 0, vec![1, 2]), (33, 0, vec![9, 9, 9])]);
-        assert_eq!(count(&data, 1), 3);
+        assert_eq!(count(&data, 1), Ok(3));
         // Zeros are padding to the end.
         assert_eq!(all(&[0, 0, 0], 1).unwrap(), []);
         // A length past the end.
@@ -793,9 +854,92 @@ mod tests {
         assert_eq!(all(&data, 3), Err(Error::INVALID_PACKET));
         let mut it = ExtensionIterator::new(&data, 4);
         it.set_frame_max(2);
-        assert_eq!(it.next().unwrap().map(|e| e.frame), Some(0));
-        assert_eq!(it.next().unwrap().map(|e| e.frame), Some(1));
-        assert_eq!(it.next().unwrap(), None);
+        assert_eq!(it.next().map(|e| e.unwrap().frame), Some(0));
+        assert_eq!(it.next().map(|e| e.unwrap().frame), Some(1));
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn the_iterator_ends_after_an_error_until_reset() {
+        // ID 3, then a separator past the last frame of a 1-frame packet.
+        let data = [0x06, 0x02, 0x08];
+        let mut it = ExtensionIterator::new(&data, 1);
+        assert_eq!(it.next(), Some(Ok(Extension::new(3, 0, &[]))));
+        assert_eq!(it.next().map(|e| e.map_err(|e| e.kind())), Some(Err(ErrorKind::InvalidPacket)));
+        assert_eq!(it.next(), None);
+        assert_eq!(it.next(), None);
+        it.reset();
+        assert_eq!(it.next(), Some(Ok(Extension::new(3, 0, &[]))));
+        // find_id reports the error once too.
+        it.reset();
+        assert_eq!(it.find_id(4).map_err(|e| e.kind()), Err(ErrorKind::InvalidPacket));
+        assert_eq!(it.find_id(4), Ok(None));
+        // With enough frames there is no error, and the iterator adapters
+        // work.
+        let mut it = ExtensionIterator::new(&data, 2);
+        assert_eq!(it.find_id(4), Ok(Some(Extension::new(4, 1, &[]))));
+        assert_eq!(it.next(), None);
+        let ids: Result<Vec<u8>, Error> = ExtensionIterator::new(&data, 2).map(|e| e.map(|e| e.id)).collect();
+        assert_eq!(ids, Ok(vec![3, 4]));
+        assert_eq!(ExtensionIterator::new(&data, 2).find(|e| e.as_ref().is_ok_and(|e| e.frame == 1)), Some(Ok(Extension::new(4, 1, &[]))));
+    }
+
+    #[test]
+    fn more_than_48_frames_is_an_error_not_a_panic() {
+        let data = [0x07, 0xAA];
+        // The iterator: BadArg once, then the end.
+        let mut it = ExtensionIterator::new(&data, 49);
+        assert_eq!(it.next().map(|e| e.map_err(|e| e.kind())), Some(Err(ErrorKind::BadArg)));
+        assert_eq!(it.next(), None);
+        assert_eq!(ExtensionIterator::new(&data, usize::MAX).find_id(3).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+        // 48 frames are fine.
+        assert_eq!(ExtensionIterator::new(&data, 48).next(), Some(Ok(Extension::new(3, 0, &[0xAA]))));
+        assert_eq!(count(&data, 48), Ok(1));
+        // The functions.
+        let kind = |r: Result<usize, Error>| r.map_err(|e| e.kind());
+        assert_eq!(kind(count(&data, 49)), Err(ErrorKind::BadArg));
+        let mut counts = [7usize; 64];
+        assert_eq!(kind(count_ext(&data, &mut counts, 49)), Err(ErrorKind::BadArg));
+        assert_eq!(counts, [7; 64], "counts change on an error");
+        let mut out = [Extension::default(); 4];
+        assert_eq!(kind(parse(&data, &mut out, 49)), Err(ErrorKind::BadArg));
+        assert_eq!(kind(parse_ext(&data, &mut out, &counts, 49)), Err(ErrorKind::BadArg));
+        assert_eq!(kind(generate(&mut [0u8; 8], &[], 49, Padding::Shortest)), Err(ErrorKind::BadArg));
+        assert_eq!(kind(generated_len(8, &[], 49)), Err(ErrorKind::BadArg));
+    }
+
+    #[test]
+    fn too_few_frame_counts_is_an_error_not_a_panic() {
+        // ID 3 in frame 0, a separator, ID 4 in frame 1.
+        let data = [0x06, 0x02, 0x08];
+        let mut counts = [9usize; 1];
+        assert_eq!(count_ext(&data, &mut counts, 2).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+        assert_eq!(counts, [9], "counts change on an error");
+        let mut out = [Extension::default(); 4];
+        assert_eq!(parse_ext(&data, &mut out, &[1], 2).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+        assert_eq!(parse_ext(&data, &mut out, &[], 1).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+        // Enough counts; the ones past nb_frames are not touched.
+        let mut counts = [9usize; 3];
+        assert_eq!(count_ext(&data, &mut counts, 2), Ok(2));
+        assert_eq!(counts, [1, 1, 9]);
+        assert_eq!(parse_ext(&data, &mut out, &counts, 2), Ok(2));
+        assert_eq!(out[..2], [Extension::new(3, 0, &[]), Extension::new(4, 1, &[])]);
+        // Counts that are not those of the padding, even huge ones, give
+        // BufferTooSmall or some order, never a panic.
+        for bad in [[usize::MAX, usize::MAX], [usize::MAX, 0], [0, 0], [0, usize::MAX], [3, 3]] {
+            let r = parse_ext(&data, &mut out, &bad, 2);
+            assert!(matches!(r.map_err(|e| e.kind()), Ok(2) | Err(ErrorKind::BufferTooSmall)), "{bad:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn extension_new_sets_the_fields() {
+        let payload = [1u8, 2];
+        const EMPTY: Extension<'static> = Extension::new(5, 2, &[]);
+        assert_eq!((EMPTY.id, EMPTY.frame, EMPTY.data), (5, 2, &[][..]));
+        let ext = Extension::new(40, 1, &payload);
+        assert_eq!((ext.id, ext.frame, ext.data), (40, 1, &payload[..]));
+        assert_eq!(ext, Extension { id: 40, frame: 1, data: &payload });
     }
 
     #[test]
@@ -803,33 +947,33 @@ mod tests {
         let payload = [1u8, 2, 3];
         let mut exts = Vec::new();
         for f in 0..4 {
-            exts.push(Extension { id: 3, frame: f, data: &[] });
-            exts.push(Extension { id: 40, frame: f, data: &payload });
+            exts.push(Extension::new(3, f, &[]));
+            exts.push(Extension::new(40, f, &payload));
         }
         let mut buf = [0u8; 64];
-        let n = generate(&mut buf, &exts, 4, false).unwrap();
+        let n = generate(&mut buf, &exts, 4, Padding::Shortest).unwrap();
         assert_eq!(generated_len(64, &exts, 4), Ok(n));
         // Two ID bytes, the length, the payload, the repeat and three
         // payloads, the last without a length.
         assert_eq!(n, 1 + 1 + 1 + 3 + 1 + 4 + 4 + 3);
         let mut out = [Extension::default(); 8];
         let mut counts = [0usize; 4];
-        assert_eq!(count_ext(&buf[..n], &mut counts, 4), 8);
+        assert_eq!(count_ext(&buf[..n], &mut counts, 4), Ok(8));
         assert_eq!(counts, [2, 2, 2, 2]);
         assert_eq!(parse_ext(&buf[..n], &mut out, &counts, 4), Ok(8));
         assert_eq!(&out[..], &exts[..]);
         // Padded to the end with 0x01 in front.
-        let n2 = generate(&mut buf, &exts, 4, true).unwrap();
+        let n2 = generate(&mut buf, &exts, 4, Padding::FillBuffer).unwrap();
         assert_eq!(n2, 64);
         assert_eq!(buf[0], 0x01);
-        assert_eq!(count(&buf, 4), 8);
+        assert_eq!(count(&buf, 4), Ok(8));
         // Bad arguments.
-        let bad = [Extension { id: 2, frame: 0, data: &[] }];
-        assert_eq!(generate(&mut buf, &bad, 1, false), Err(Error::BAD_ARG));
-        let bad = [Extension { id: 3, frame: 1, data: &[] }];
-        assert_eq!(generate(&mut buf, &bad, 1, false), Err(Error::BAD_ARG));
-        let bad = [Extension { id: 3, frame: 0, data: &[1, 2] }];
-        assert_eq!(generate(&mut buf, &bad, 1, false), Err(Error::BAD_ARG));
-        assert_eq!(generate(&mut buf[..5], &exts, 4, false), Err(Error::BUFFER_TOO_SMALL));
+        let bad = [Extension::new(2, 0, &[])];
+        assert_eq!(generate(&mut buf, &bad, 1, Padding::Shortest), Err(Error::BAD_ARG));
+        let bad = [Extension::new(3, 1, &[])];
+        assert_eq!(generate(&mut buf, &bad, 1, Padding::Shortest), Err(Error::BAD_ARG));
+        let bad = [Extension::new(3, 0, &[1, 2])];
+        assert_eq!(generate(&mut buf, &bad, 1, Padding::Shortest), Err(Error::BAD_ARG));
+        assert_eq!(generate(&mut buf[..5], &exts, 4, Padding::Shortest), Err(Error::BUFFER_TOO_SMALL));
     }
 }

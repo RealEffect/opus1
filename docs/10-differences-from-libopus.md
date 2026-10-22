@@ -44,7 +44,7 @@ opus1 follows libopus 1.6, the reference implementation of Opus in C. This docum
 
 ### Decoder controls
 
-The decoder decodes every valid packet, up to 120 ms. The decoder requests of libopus 1.6.1 have equivalents in `OpusDecoder` (phase inversion disabling, the output gain and the pitch since opus1 0.2), with two exceptions: `OPUS_GET_BANDWIDTH`, the bandwidth of the last packet, which `packet` functions read from the packet's first byte instead, and `OPUS_SET_IGNORE_EXTENSIONS` (see [Packet padding extensions](#packet-padding-extensions)). The decoder complexity (`OPUS_SET_COMPLEXITY`), the BWE switch (`OPUS_SET_OSCE_BWE`) and weight blobs (`OPUS_SET_DNN_BLOB`) act as in libopus when the matching feature is compiled: deep PLC from complexity 5, LACE at 6, NoLACE from 7, and the BWE from 4 (see [Optional libopus features](#optional-libopus-features)).
+The decoder decodes every valid packet, up to 120 ms. The decoder requests of libopus 1.6.1 have equivalents in `OpusDecoder` (phase inversion disabling, the output gain and the pitch since opus1 0.2), with two exceptions: `OPUS_GET_BANDWIDTH`, the bandwidth of the last packet, which `packet::bandwidth` (libopus `opus_packet_get_bandwidth`) reads from the packet's first byte instead, and `OPUS_SET_IGNORE_EXTENSIONS` (see [Packet padding extensions](#packet-padding-extensions)). The decoder complexity (`OPUS_SET_COMPLEXITY`), the BWE switch (`OPUS_SET_OSCE_BWE`) and weight blobs (`OPUS_SET_DNN_BLOB`) act as in libopus when the matching feature is compiled: deep PLC from complexity 5, LACE at 6, NoLACE from 7, and the BWE from 4 (see [Optional libopus features](#optional-libopus-features)).
 
 ### Multichannel
 
