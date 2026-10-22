@@ -28,6 +28,10 @@ impl KissCpx {
     }
 }
 
+// SAFETY: zero bytes are the number 0 + 0i (two `f32` zeros, no padding),
+// and the type has no destructor.
+unsafe impl crate::in_place::Zeroable for KissCpx {}
+
 /// How the portable code computes `a * b + c`.
 ///
 /// libopus writes such an expression in C. A compiler may round the product

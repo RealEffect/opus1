@@ -12,7 +12,7 @@
 //!    unless it gets `DredProcessing::Deferred`.
 //!
 //! The processed `OpusDred` then goes to `OpusDecoder::dred_decode` (and
-//! its float and 24-bit variants), which queues the features for deep PLC
+//! its 16-bit and 24-bit variants), which queues the features for deep PLC
 //! and conceals the lost audio with them.
 
 use crate::{Error, SampleRate};
@@ -120,6 +120,20 @@ impl Default for OpusDred {
     }
 }
 
+impl core::fmt::Debug for OpusDred {
+    /// Whether the state is parsed and processed, how many latent vectors
+    /// it holds and where the newest is. The features and vectors
+    /// themselves are left out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpusDred")
+            .field("parsed", &self.is_parsed())
+            .field("processed", &self.is_processed())
+            .field("nb_latents", &self.nb_latents())
+            .field("dred_offset", &self.dred_offset)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What [`OpusDredDecoder::parse`] found in a packet.
 ///
 /// Only opus1 makes these values; more fields may be added in a later
@@ -159,6 +173,13 @@ pub struct OpusDredDecoder {
     dnn: DredDecoderDnn,
 }
 
+impl core::fmt::Debug for OpusDredDecoder {
+    /// Whether the RDOVAE decoder is loaded; the weights are left out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpusDredDecoder").field("loaded", &self.is_loaded()).finish_non_exhaustive()
+    }
+}
+
 impl OpusDredDecoder {
     /// A DRED decoder with the built-in weights (libopus
     /// `opus_dred_decoder_create` and `opus_dred_decoder_init`).
@@ -167,14 +188,16 @@ impl OpusDredDecoder {
     }
 
     /// libopus `OPUS_SET_DNN_BLOB` on a DRED decoder: loads the RDOVAE decoder
-    /// from a blob in the libopus format. When the blob does not hold all of
-    /// its arrays, returns [`BadArg`](crate::ErrorKind::BadArg) and keeps the
-    /// weights it had. [`DnnBlob::builtin`] brings back the built-in weights.
+    /// from a blob in the libopus format and returns
+    /// [`DnnModels::DRED_DECODER`](crate::DnnModels::DRED_DECODER). When the
+    /// blob does not hold all of its arrays, returns
+    /// [`BadArg`](crate::ErrorKind::BadArg) and keeps the weights it had.
+    /// [`DnnBlob::builtin`] brings back the built-in weights.
     ///
     /// libopus offers the request only when built with `USE_WEIGHTS_FILE`,
     /// returns `OPUS_BAD_ARG` on a failure, and can leave the model half
     /// replaced.
-    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<(), Error> {
+    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<crate::DnnModels, Error> {
         self.dnn.load(blob)
     }
 

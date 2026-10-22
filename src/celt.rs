@@ -4206,9 +4206,29 @@ impl CeltEncoder {
         channels: usize,
         sampling_rate: i32,
     ) -> Self {
+        let mut enc = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_new` initializes every field of `enc`.
+        unsafe {
+            Self::write_new(enc.as_mut_ptr(), mode, channels, sampling_rate);
+            enc.assume_init()
+        }
+    }
+
+    /// Writes the encoder of [`with_sampling_rate`](Self::with_sampling_rate)
+    /// to `this`, which may be uninitialized memory, without building it on
+    /// the stack first (see `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(
+        this: *mut Self,
+        mode: &'static CeltMode,
+        channels: usize,
+        sampling_rate: i32,
+    ) {
         // All internal buffers are sized for at most 2 channels. A larger
-        // value would panic later inside `FixedVec::from_value` with an
-        // unhelpful message.
+        // value would panic later inside `FixedVec::write_from_value` with
+        // an unhelpful message.
         assert!(
             (1..=2).contains(&channels),
             "CeltEncoder::new: channels must be 1 or 2 (got {channels})"
@@ -4219,80 +4239,83 @@ impl CeltEncoder {
         let nb_x_ch = nb_ebands * channels;
         let frame_x_ch = CELT_ENC_MAX_FRAME * channels;
         let bufstride_x_ch = (CELT_ENC_MAX_FRAME + overlap) * channels;
-        Self {
-            mode,
-            channels,
-            upsample,
-            end_band: mode.nb_ebands,
-            start_band: 0,
-            complexity: 9,
-            in_mem: FixedVec::from_value(0.0, channels * overlap),
-            old_band_e: FixedVec::from_value(0.0, nb_x_ch),
-            preemph_mem: FixedVec::from_value(0.0, channels),
-            tonal_average: 256,
-            hf_average: 0,
-            tapset_decision: 0,
-            spread_decision: SPREAD_NORMAL,
-            intensity: 0,
-            last_coded_bands: 0,
-            prefilter_buf: FixedVec::from_value(0.0, channels * PREFILTER_STRIDE),
-            // libopus clears its state, so the first frame has no pitch
-            // period to continue.
-            prefilter_period: 0,
-            prefilter_gain: 0.0,
-            prefilter_tapset: 0,
-            old_band_e2: FixedVec::from_value(OLD_LOG_E_RESET, nb_x_ch),
-            old_band_e3: FixedVec::from_value(OLD_LOG_E_RESET, nb_x_ch),
-            last_band_log_e: FixedVec::from_value(0.0, nb_x_ch),
-            delayed_intra: DELAYED_INTRA_RESET,
-            lsb_depth: 24,
-            overlap_max: 0.0,
-            bitrate: OPUS_BITRATE_MAX,
-            vbr: false,
-            constrained_vbr: true,
-            vbr_state: VbrState::default(),
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below fills the whole buffer it is given.
+        unsafe {
+            write_fields!(this, {
+                mode: mode,
+                channels: channels,
+                upsample: upsample,
+                end_band: mode.nb_ebands,
+                start_band: 0,
+                complexity: 9,
+                in_mem = |p| FixedVec::write_from_value(p, 0.0, channels * overlap),
+                old_band_e = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                preemph_mem = |p| FixedVec::write_from_value(p, 0.0, channels),
+                tonal_average: 256,
+                hf_average: 0,
+                tapset_decision: 0,
+                spread_decision: SPREAD_NORMAL,
+                intensity: 0,
+                last_coded_bands: 0,
+                prefilter_buf = |p| FixedVec::write_from_value(p, 0.0, channels * PREFILTER_STRIDE),
+                // libopus clears its state, so the first frame has no pitch
+                // period to continue.
+                prefilter_period: 0,
+                prefilter_gain: 0.0,
+                prefilter_tapset: 0,
+                old_band_e2 = |p| FixedVec::write_from_value(p, OLD_LOG_E_RESET, nb_x_ch),
+                old_band_e3 = |p| FixedVec::write_from_value(p, OLD_LOG_E_RESET, nb_x_ch),
+                last_band_log_e = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                delayed_intra: DELAYED_INTRA_RESET,
+                lsb_depth: 24,
+                overlap_max: 0.0,
+                bitrate: OPUS_BITRATE_MAX,
+                vbr: false,
+                constrained_vbr: true,
+                vbr_state: VbrState::default(),
 
-            w_in_buf: FixedVec::from_value(0.0, bufstride_x_ch),
-            w_freq: FixedVec::from_value(0.0, frame_x_ch + 4),
-            w_band_e: FixedVec::from_value(0.0, nb_x_ch),
-            w_band_e2: FixedVec::from_value(0.0, nb_x_ch),
+                w_in_buf = |p| FixedVec::write_from_value(p, 0.0, bufstride_x_ch),
+                w_freq = |p| FixedVec::write_from_value(p, 0.0, frame_x_ch + 4),
+                w_band_e = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                w_band_e2 = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
 
-            w_x: FixedVec::from_value(0.0, frame_x_ch + STRIDE_ACCESS_PAD),
-            w_band_log_e: FixedVec::from_value(0.0, nb_x_ch),
-            w_band_log_e2: FixedVec::from_value(0.0, nb_x_ch),
-            w_error: FixedVec::from_value(0.0, nb_x_ch),
-            w_tf_res: FixedVec::from_value(0, nb_ebands),
-            w_cap: FixedVec::from_value(0, nb_ebands),
-            w_offsets: FixedVec::from_value(0, nb_ebands),
-            w_pulses: FixedVec::from_value(0, nb_ebands),
-            w_ebits: FixedVec::from_value(0, nb_x_ch),
-            w_fine_priority: FixedVec::from_value(0, nb_x_ch),
-            w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
+                w_x = |p| FixedVec::write_from_value(p, 0.0, frame_x_ch + STRIDE_ACCESS_PAD),
+                w_band_log_e = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                w_band_log_e2 = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                w_error = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                w_tf_res = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_cap = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_offsets = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_pulses = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_ebits = |p| FixedVec::write_from_value(p, 0, nb_x_ch),
+                w_fine_priority = |p| FixedVec::write_from_value(p, 0, nb_x_ch),
+                w_collapse_masks = |p| FixedVec::write_from_value(p, 0, nb_x_ch),
 
-            w_prefilter_pitch_buf: FixedVec::from_value(
-                0.0,
-                (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME) >> 1,
-            ),
-            w_prefilter_before: FixedVec::from_value(0.0, channels),
-            w_prefilter_after: FixedVec::from_value(0.0, channels),
-            w_analysis_tmp: FixedVec::from_value(0.0, CELT_ANALYSIS_TMP),
-            consec_transient: 0,
-            rng: 0,
+                w_prefilter_pitch_buf = |p| {
+                    FixedVec::write_from_value(p, 0.0, (COMBFILTER_MAXPERIOD + CELT_ENC_MAX_FRAME) >> 1)
+                },
+                w_prefilter_before = |p| FixedVec::write_from_value(p, 0.0, channels),
+                w_prefilter_after = |p| FixedVec::write_from_value(p, 0.0, channels),
+                w_analysis_tmp = |p| FixedVec::write_from_value(p, 0.0, CELT_ANALYSIS_TMP),
+                consec_transient: 0,
+                rng: 0,
 
-            loss_rate: 0,
-            silk_offset: 0,
-            silk_signal_type: 0,
-            analysis: AnalysisInfo::default(),
-            lfe: false,
-            energy_mask: None,
-            stream_channels: channels,
-            disable_pf: false,
-            disable_inv: false,
-            force_intra: false,
-            energy_error: FixedVec::from_value(0.0, nb_x_ch),
-            rotations: crate::pvq::RotationCache::new(),
-            spec_avg: 0.0,
-            stereo_saving: 0.0,
+                loss_rate: 0,
+                silk_offset: 0,
+                silk_signal_type: 0,
+                analysis: AnalysisInfo::default(),
+                lfe: false,
+                energy_mask: None,
+                stream_channels: channels,
+                disable_pf: false,
+                disable_inv: false,
+                force_intra: false,
+                energy_error = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                rotations: crate::pvq::RotationCache::new(),
+                spec_avg: 0.0,
+                stereo_saving: 0.0,
+            });
         }
     }
 

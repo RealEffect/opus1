@@ -804,7 +804,7 @@ pub fn write(
 ///
 /// The repacketizer borrows the packets; it copies nothing until a packet
 /// is written. libopus's `opus_repacketizer_init` is [`reset`](Self::reset).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Repacketizer<'a> {
     toc: u8,
     nb_frames: usize,
@@ -814,6 +814,17 @@ pub struct Repacketizer<'a> {
     paddings: [&'a [u8]; MAX_FRAMES],
     /// The number of frames of the packet each padding belongs to.
     padding_nb_frames: [u8; MAX_FRAMES],
+}
+
+impl core::fmt::Debug for Repacketizer<'_> {
+    /// The TOC byte and the number of frames added so far. The bytes of
+    /// the frames and their padding are left out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Repacketizer")
+            .field("toc", &self.toc)
+            .field("nb_frames", &self.nb_frames)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Repacketizer<'_> {

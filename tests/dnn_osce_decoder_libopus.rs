@@ -304,8 +304,8 @@ fn compare(packets: &[Vec<u8>], s: Setting, seed: u32) -> Result<Count, String> 
     let bwe = |c: &mut CDec, c16: &mut CDec, d: &mut OpusDecoder, d16: &mut OpusDecoder, on| {
         c.set_osce_bwe(on);
         c16.set_osce_bwe(on);
-        d.set_osce_bwe(on).unwrap();
-        d16.set_osce_bwe(on).unwrap();
+        d.set_osce_bwe(on);
+        d16.set_osce_bwe(on);
     };
     complexity(&mut c, &mut c16, &mut d, &mut d16, s.complexity);
     bwe(&mut c, &mut c16, &mut d, &mut d16, s.bwe);
@@ -537,7 +537,7 @@ fn osce_changes_the_output_of_libopus() {
     c.set_osce_bwe(true);
     let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     d.set_complexity(7).unwrap();
-    d.set_osce_bwe(true).unwrap();
+    d.set_osce_bwe(true);
     let mut out = vec![0f32; 960];
     let (mut silent, mut celt) = (0, 0);
     for p in &packets {
@@ -627,8 +627,8 @@ fn multistream_matches_libopus() {
                     c16.set_osce_bwe(bwe);
                     d.set_complexity(complexity as u8).unwrap();
                     d16.set_complexity(complexity as u8).unwrap();
-                    d.set_osce_bwe(bwe).unwrap();
-                    d16.set_osce_bwe(bwe).unwrap();
+                    d.set_osce_bwe(bwe);
+                    d16.set_osce_bwe(bwe);
                     let mut out = vec![0f32; 5760 * channels];
                     let mut out16 = vec![0i16; 5760 * channels];
                     for (index, call) in calls(packets, rate, events, 3).into_iter().enumerate() {
@@ -708,7 +708,7 @@ fn timing() {
         for _ in 0..5 {
             let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             d.set_complexity(complexity).unwrap();
-            d.set_osce_bwe(bwe).unwrap();
+            d.set_osce_bwe(bwe);
             let mut c = CDec::new(48000, 1);
             c.set_complexity(i32::from(complexity));
             c.set_osce_bwe(bwe);
@@ -758,7 +758,7 @@ fn distance_to_an_o2_build() {
                 )
                 .unwrap();
                 d.set_complexity(complexity as u8).unwrap();
-                d.set_osce_bwe(bwe).unwrap();
+                d.set_osce_bwe(bwe);
                 let mut out = vec![0i16; 5760 * channels];
                 for p in &stream.packets {
                     let want = c.decode_i16(Some(p), 5760, false).unwrap();

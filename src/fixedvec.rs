@@ -98,6 +98,19 @@ impl<T, const N: usize> FixedVec<T, N> {
         unsafe { (&raw mut (*this).len).write(len) };
     }
 
+    /// Writes an empty buffer to `this`, which may be uninitialized memory:
+    /// `new` for a struct that is built in place (see `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    #[inline]
+    pub(crate) unsafe fn write_new(this: *mut Self) {
+        let () = Self::NO_DESTRUCTOR;
+        // SAFETY: the caller guarantees that `this` is valid for writes. The
+        // elements are `MaybeUninit` and need no value.
+        unsafe { (&raw mut (*this).len).write(0) };
+    }
+
     /// Writes `len` clones of `value` to `this`, which may be uninitialized
     /// memory: `from_value` for a struct that is built in place (see
     /// `crate::in_place`). Panics if `len > N`, before anything is written.

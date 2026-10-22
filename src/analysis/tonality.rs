@@ -20,6 +20,7 @@ use super::mlp::{self, LAYER0, LAYER1, LAYER2, MAX_NEURONS};
 use super::tables::{ANALYSIS_WINDOW, DCT_TABLE, STD_FEATURE_BIAS, TBANDS};
 use super::{AnalysisInfo, AnalysisPcm, LEAK_BANDS, PcmRef, SecondChannel, is_digital_silence};
 use crate::kiss_fft::{KissCpx, KissFftState, opus_fft_impl};
+use crate::in_place::{write_fields, write_zero};
 use crate::mathops::mac;
 
 /// libopus `NB_FRAMES`: frames of band energies kept for the stationarity
@@ -248,6 +249,21 @@ impl Cache {
     fn new() -> Self {
         Self { e_sqrt: [[0.0; NB_TBANDS]; NB_FRAMES], dist: [[0.0; NB_FRAMES]; NB_FRAMES] }
     }
+
+    /// Writes the cleared cache of [`new`](Self::new) to `this` (see
+    /// `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    unsafe fn write_new(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                e_sqrt = |p| write_zero(p),
+                dist = |p| write_zero(p),
+            });
+        }
+    }
 }
 
 /// Buffers that hold data only during one block. Not part of the C state.
@@ -261,11 +277,18 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new() -> Self {
-        Self {
-            fft: [KissCpx::new(0.0, 0.0); N],
-            bins: BinScratch::new(),
-            downmix: [0.0; MAX_DOWNMIX],
+    /// Writes cleared buffers to `this` (see `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    unsafe fn write_new(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                fft = |p| write_zero(p),
+                bins = |p| BinScratch::write_new(p),
+                downmix = |p| write_zero(p),
+            });
         }
     }
 }
@@ -279,39 +302,63 @@ impl TonalityAnalysisState {
     /// libopus `tonality_analysis_init`. `fs` is the input rate, which
     /// must be 16000, 24000 or 48000 when the analysis runs.
     pub fn new(fs: i32) -> Self {
-        Self {
-            fs,
-            angle: [0.0; 240],
-            d_angle: [0.0; 240],
-            d2_angle: [0.0; 240],
-            inmem: [0.0; ANALYSIS_BUF_SIZE],
-            mem_fill: 0,
-            prev_band_tonality: [0.0; NB_TBANDS],
-            prev_tonality: 0.0,
-            prev_bandwidth: 0,
-            e: [[0.0; NB_TBANDS]; NB_FRAMES],
-            log_e: [[0.0; NB_TBANDS]; NB_FRAMES],
-            low_e: [0.0; NB_TBANDS],
-            high_e: [0.0; NB_TBANDS],
-            mean_e: [0.0; NB_TBANDS + 1],
-            mem: [0.0; 32],
-            cmean: [0.0; 8],
-            std: [0.0; 9],
-            e_tracker: 0.0,
-            low_e_count: 0.0,
-            e_count: 0,
-            count: 0,
-            analysis_offset: 0,
-            write_pos: 0,
-            read_pos: 0,
-            read_subframe: 0,
-            hp_ener_accum: 0.0,
-            initialized: false,
-            rnn_state: [0.0; MAX_NEURONS],
-            downmix_state: [0.0; 3],
-            info: [AnalysisInfo::default(); DETECT_SIZE],
-            cache: Cache::new(),
-            scratch: Scratch::new(),
+        let mut st = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_new` initializes every field of `st`.
+        unsafe {
+            Self::write_new(st.as_mut_ptr(), fs);
+            st.assume_init()
+        }
+    }
+
+    /// Writes the state of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`). The state is 26 KB.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut Self, fs: i32) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below writes the whole field it is given.
+        unsafe {
+            write_fields!(this, {
+                fs: fs,
+                angle = |p| write_zero(p),
+                d_angle = |p| write_zero(p),
+                d2_angle = |p| write_zero(p),
+                inmem = |p| write_zero(p),
+                mem_fill: 0,
+                prev_band_tonality: [0.0; NB_TBANDS],
+                prev_tonality: 0.0,
+                prev_bandwidth: 0,
+                e = |p| write_zero(p),
+                log_e = |p| write_zero(p),
+                low_e: [0.0; NB_TBANDS],
+                high_e: [0.0; NB_TBANDS],
+                mean_e: [0.0; NB_TBANDS + 1],
+                mem: [0.0; 32],
+                cmean: [0.0; 8],
+                std: [0.0; 9],
+                e_tracker: 0.0,
+                low_e_count: 0.0,
+                e_count: 0,
+                count: 0,
+                analysis_offset: 0,
+                write_pos: 0,
+                read_pos: 0,
+                read_subframe: 0,
+                hp_ener_accum: 0.0,
+                initialized: false,
+                rnn_state = |p| write_zero(p),
+                downmix_state: [0.0; 3],
+                info = |p: *mut [AnalysisInfo; DETECT_SIZE]| {
+                    let first = p.cast::<AnalysisInfo>();
+                    for i in 0..DETECT_SIZE {
+                        first.add(i).write(AnalysisInfo::default());
+                    }
+                },
+                cache = |p| Cache::write_new(p),
+                scratch = |p| Scratch::write_new(p),
+            });
         }
     }
 
@@ -1060,8 +1107,26 @@ pub(super) struct BinScratch {
 }
 
 impl BinScratch {
+    /// Cleared buffers, for the tests of the NEON version.
+    #[cfg(all(test, target_arch = "aarch64"))]
     pub(super) fn new() -> Self {
         Self { tonality: [0.0; N2], tonality2: [0.0; N2], noisiness: [0.0; N2], energy: [0.0; N2] }
+    }
+
+    /// Writes cleared buffers to `this` (see `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    unsafe fn write_new(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                tonality = |p| write_zero(p),
+                tonality2 = |p| write_zero(p),
+                noisiness = |p| write_zero(p),
+                energy = |p| write_zero(p),
+            });
+        }
     }
 }
 

@@ -13,8 +13,8 @@ use opus1::extensions::Extension;
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::{
-    Application, Bitrate, Channels, DnnBlob, DredProcessing, ErrorKind, OpusDecoder, OpusDred,
-    OpusDredDecoder, OpusEncoder, SampleRate, packet,
+    Application, Bitrate, Channels, DnnBlob, DnnModels, DredProcessing, ErrorKind, OpusDecoder,
+    OpusDred, OpusDredDecoder, OpusEncoder, SampleRate, packet,
 };
 use opus1::packet::{Framing, Padding};
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
@@ -171,8 +171,8 @@ fn malformed_dred_data_does_not_panic() {
             let frame = f2_5 * (1 + rng.next() as usize % 160);
             let offset = (rng.next() % 200_000) as i32 - 50_000;
             let samples = match n % 3 {
-                0 => dec.dred_decode_float(&dred, offset, frame, &mut pcm).unwrap(),
-                1 => dec.dred_decode(&dred, offset, frame, &mut pcm16).unwrap(),
+                0 => dec.dred_decode(&dred, offset, frame, &mut pcm).unwrap(),
+                1 => dec.dred_decode_i16(&dred, offset, frame, &mut pcm16).unwrap(),
                 _ => dec.dred_decode24(&dred, offset, frame, &mut pcm24).unwrap(),
             };
             assert_eq!(samples, frame);
@@ -220,21 +220,21 @@ fn dred_decode_checks_its_arguments() {
         dec.decode(p, 320, &mut a).unwrap();
         plain.decode(p, 320, &mut b).unwrap();
     }
-    assert_eq!(dec.dred_decode_float(&dred, 320, 0, &mut a).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
+    assert_eq!(dec.dred_decode(&dred, 320, 0, &mut a).map_err(|e| e.kind()), Err(ErrorKind::BadArg));
     for frame in [1, 39, 41, 330] {
-        assert!(dec.dred_decode_float(&dred, 320, frame, &mut a).is_err(), "{frame}");
+        assert!(dec.dred_decode(&dred, 320, frame, &mut a).is_err(), "{frame}");
     }
-    assert!(dec.dred_decode_float(&dred, 320, 320, &mut a[..319]).is_err());
+    assert!(dec.dred_decode(&dred, 320, 320, &mut a[..319]).is_err());
     let mut small = [0i16; 100];
-    assert!(dec.dred_decode(&dred, 320, 320, &mut small).is_err());
+    assert!(dec.dred_decode_i16(&dred, 320, 320, &mut small).is_err());
     // The errors changed nothing: an unprocessed state conceals as a lost
     // packet does.
     let unprocessed = OpusDred::new();
-    assert_eq!(dec.dred_decode_float(&unprocessed, 320, 320, &mut a), Ok(320));
+    assert_eq!(dec.dred_decode(&unprocessed, 320, 320, &mut a), Ok(320));
     assert_eq!(plain.decode(&[], 320, &mut b), Ok(320));
     assert_eq!(a[..320], b[..320]);
     // With DRED features the concealment differs.
-    assert_eq!(dec.dred_decode_float(&dred, 320, 320, &mut a), Ok(320));
+    assert_eq!(dec.dred_decode(&dred, 320, 320, &mut a), Ok(320));
     assert_eq!(plain.decode(&[], 320, &mut b), Ok(320));
     assert_ne!(a[..320], b[..320]);
     assert_eq!(dec.last_packet_duration(), 320);
@@ -273,9 +273,9 @@ fn dred_decoder_loads_weights() {
         Err((ErrorKind::BadArg, "DNN blob holds no model of this build"))
     );
     assert!(r.is_loaded());
-    r.set_dnn_blob(&DnnBlob::builtin()).unwrap();
+    assert_eq!(r.set_dnn_blob(&DnnBlob::builtin()), Ok(DnnModels::DRED_DECODER));
     let own = DnnBlob::from_bytes(builtin::dred_rdovae_dec()).unwrap();
-    r.set_dnn_blob(&own).unwrap();
+    assert_eq!(r.set_dnn_blob(&own), Ok(DnnModels::DRED_DECODER));
     drop(own);
     // The decoder keeps the blob alive.
     let packets = encode(16000, 1, Application::Voip, 24000, 320, 2);
@@ -318,8 +318,8 @@ fn parse_process_and_decode_allocate_nothing() {
         r.parse(&mut dred, &data, 48000, SampleRate::Hz48000, DredProcessing::Deferred).unwrap();
         r.process(&dred, &mut other).unwrap();
         r.process_in_place(&mut dred).unwrap();
-        dec.dred_decode_float(&dred, 9600, 9600, &mut pcm).unwrap();
-        dec.dred_decode(&dred, 9600, 9600, &mut pcm16).unwrap();
+        dec.dred_decode(&dred, 9600, 9600, &mut pcm).unwrap();
+        dec.dred_decode_i16(&dred, 9600, 9600, &mut pcm16).unwrap();
         dec.dred_decode24(&dred, 9600, 9600, &mut pcm24).unwrap();
     });
     assert_eq!(n, 0);

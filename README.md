@@ -181,25 +181,29 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   about 154 KB with the `analysis` feature and 128 KB without it, and the
   decoder about 60 KB. Place them in a
   `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather
-  than on the stack. `OpusDecoder::new` returns the decoder through the stack;
-  `OpusDecoder::init` builds it directly in memory you provide, with less than
-  16 KB of stack (see [docs/06](docs/06-using-the-library.md#building-a-decoder-in-place)):
+  than on the stack. `OpusEncoder::new` and `OpusDecoder::new` return the codec
+  through the stack; `OpusEncoder::init` and `OpusDecoder::init` build it
+  directly in memory you provide, with less than 16 KB of stack (see
+  [docs/06](docs/06-using-the-library.md#building-the-encoder-and-the-decoder-in-place)):
 
   ```rust
   use core::mem::MaybeUninit;
-  use opus1::{Channels, OpusDecoder, SampleRate};
+  use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
+  static mut ENCODER: MaybeUninit<OpusEncoder> = MaybeUninit::uninit();
   static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
 
-  let slot = &raw mut DECODER;
-  // SAFETY: run once, while nothing else uses `DECODER`.
-  let decoder = OpusDecoder::init(unsafe { &mut *slot }, SampleRate::Hz48000, Channels::Stereo)?;
+  // SAFETY: run once, while nothing else uses `ENCODER` and `DECODER`.
+  let encoder = OpusEncoder::init(unsafe { &mut *&raw mut ENCODER }, SampleRate::Hz48000, Channels::Stereo, Application::Audio)?;
+  let decoder = OpusDecoder::init(unsafe { &mut *&raw mut DECODER }, SampleRate::Hz48000, Channels::Stereo)?;
   # Ok::<(), opus1::Error>(())
   ```
 
-  The encoder has no `init` yet. The test suite of this build needs big
-  test-thread stacks: `scripts/check_no_std.sh` sets `RUST_MIN_STACK=33554432`
-  (32 MiB).
+  The memory of such a codec is never freed, which is what a `static` wants.
+  With `heap`, a second `init` on the same slot leaks the heap memory of the
+  first codec (see the `init` documentation). The test suite of this build
+  needs big test-thread stacks: `scripts/check_no_std.sh` sets
+  `RUST_MIN_STACK=33554432` (32 MiB).
 - **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
 - **Frames are capped** at the RFC 6716 maximum of 1275 bytes (the heap-free range-coder buffer is sized accordingly). A packet of 40 to 120 ms holds up to six such frames.
 - **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target; with `portable-atomic`, also `thumbv6m-none-eabi` (Cortex-M0/M0+). Check with `scripts/check_no_std.sh`.
@@ -426,23 +430,29 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   enhancement of SILK, and the bandwidth extension (BWE) of SILK wideband to
   fullband.
 - Deep redundancy (DRED, feature `dred`): `OpusEncoder::set_dred_duration`,
-  and `OpusDredDecoder`, `OpusDred` and `OpusDecoder::dred_decode` on the
-  decoder side.
+  and `OpusDredDecoder`, `OpusDred` and `OpusDecoder::dred_decode` (with
+  `dred_decode_i16` and `dred_decode24`) on the decoder side.
 - Packet extensions of libopus 1.5 and later: the module `extensions`,
   `packet::Repacketizer`, `packet::pad_with_extensions`, `packet::unpad` and
   `packet::multistream_unpad`. `packet::bandwidth` and `packet::nb_channels`
   read the TOC byte.
 - New controls of libopus. Decoder: `decode_i16`, `decode_fec`, `final_range`,
-  `reset_state`, `last_packet_duration`, `set_gain`, `pitch` and
-  `set_phase_inversion_disabled`. Encoder: `set_force_mode`, `set_bandwidth`,
-  `set_max_bandwidth`, `set_force_channels`, `set_signal`, `set_lsb_depth`,
-  `InbandFec::OnUnlessMusic`, `set_vbr_constraint`, `set_application`,
-  `set_voice_ratio`, `set_phase_inversion_disabled` and `lookahead`. The
-  multistream encoder and decoder forward the controls that libopus's forward.
+  `reset_state`, `last_packet_duration`, `set_gain`, `pitch`,
+  `set_phase_inversion_disabled`, `bandwidth` (`OPUS_GET_BANDWIDTH`) and
+  `nb_samples` (`opus_decoder_get_nb_samples`). Encoder: `set_force_mode`,
+  `set_bandwidth`, `set_max_bandwidth`, `set_force_channels`, `set_signal`,
+  `set_lsb_depth`, `InbandFec::OnUnlessMusic`, `set_vbr_constraint`,
+  `set_application`, `set_voice_ratio`, `set_phase_inversion_disabled`,
+  `lookahead`, `bandwidth` (`OPUS_GET_BANDWIDTH`, the bandwidth of the last
+  packet) and `max_bandwidth`. The multistream encoder and decoder forward the
+  controls that libopus's forward. `opus1::VERSION` and
+  `opus1::LIBOPUS_VERSION` give the crate version and the libopus release it
+  follows.
 - The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,
   `OpusDecoder::decode24` and `decode_fec24`, and their multistream versions.
-- `OpusDecoder::init` builds a decoder in memory the caller provides, such as
-  a `static`, with little stack, as upstream opus-rs PR #65 does. The feature
+- `OpusDecoder::init` and `OpusEncoder::init` build a codec in memory the
+  caller provides, such as a `static`, with little stack, as upstream opus-rs
+  PR #65 does for the decoder. The feature
   `portable-atomic` lets the crate build for targets without atomic
   compare-and-swap, as upstream opus-rs PR #64 (by Alix ANNERAUD) does.
 

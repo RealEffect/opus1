@@ -1,6 +1,6 @@
 //! DRED (deep redundancy) parsing and decoding: `OpusDredDecoder::parse`,
-//! `process` and `process_in_place`, and `OpusDecoder::dred_decode_float`,
-//! `dred_decode` and `dred_decode24`.
+//! `process` and `process_in_place`, and `OpusDecoder::dred_decode`,
+//! `dred_decode_i16` and `dred_decode24`.
 //!
 //! The first input byte picks the packet:
 //!
@@ -211,7 +211,7 @@ fn run(mode: u8, u: &mut Unstructured) -> Result<()> {
     )
     .unwrap();
     decoder.set_complexity(u.int_in_range(0..=10)?).unwrap();
-    decoder.set_osce_bwe(u.arbitrary()?).unwrap();
+    decoder.set_osce_bwe(u.arbitrary()?);
     let max_frame = fs as usize * 120 / 1000;
     let mut out = vec![0f32; max_frame * channels];
     for _ in 0..u.int_in_range(0..=3)? {
@@ -243,7 +243,7 @@ fn run(mode: u8, u: &mut Unstructured) -> Result<()> {
         match u.int_in_range(0..=3)? {
             0 => {
                 let mut pcm = vec![0i16; len];
-                if let Ok(n) = decoder.dred_decode(dred, offset, frame_size, &mut pcm) {
+                if let Ok(n) = decoder.dred_decode_i16(dred, offset, frame_size, &mut pcm) {
                     assert_eq!(n, frame_size, "{what}");
                     assert!(n * channels <= len, "{what}");
                 }
@@ -257,7 +257,7 @@ fn run(mode: u8, u: &mut Unstructured) -> Result<()> {
             }
             _ => {
                 let mut pcm = vec![f32::from_bits(UNWRITTEN); len];
-                if let Ok(n) = decoder.dred_decode_float(dred, offset, frame_size, &mut pcm) {
+                if let Ok(n) = decoder.dred_decode(dred, offset, frame_size, &mut pcm) {
                     assert_eq!(n, frame_size, "{what}");
                     assert!(n * channels <= len, "{what}");
                     finite(&pcm[..n * channels], &what);

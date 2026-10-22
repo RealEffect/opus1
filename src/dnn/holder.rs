@@ -7,7 +7,9 @@
 //! `silk_InitDecoder`), or, when built with `USE_WEIGHTS_FILE`, from a blob
 //! given with `OPUS_SET_DNN_BLOB`. opus1 parses the built-in weights with
 //! the same code as a blob given at run time (`plan.md` section 3), and
-//! offers `set_dnn_blob` in every build with a neural network feature.
+//! offers `set_dnn_blob` in every build with a model (feature `deep-plc`,
+//! which the other neural network features turn on; `dnn` alone has no
+//! model and no public API).
 //!
 //! Where the layers live:
 //!
@@ -206,7 +208,9 @@ impl core::fmt::Debug for DnnBlob {
     }
 }
 
-/// A set of model groups, as returned by `OpusDecoder::set_dnn_blob`.
+/// A set of model groups, as returned by every `set_dnn_blob`
+/// (`OpusDecoder`, `OpusEncoder`, `OpusDredDecoder` and
+/// `multistream::MultistreamDecoder`): the groups that the call loaded.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DnnModels(u8);
 
@@ -221,8 +225,11 @@ impl DnnModels {
     pub const NOLACE: DnnModels = DnnModels(1 << 2);
     /// BBWENet, the network of the bandwidth extension.
     pub const BBWENET: DnnModels = DnnModels(1 << 3);
-    // Bits 4 and 5 are kept for the DRED encoder and decoder of a later
-    // `dred` feature.
+    /// The models of the DRED encoder, which load together: the RDOVAE
+    /// encoder and PitchDNN (for `OpusEncoder` with the feature `dred`).
+    pub const DRED_ENCODER: DnnModels = DnnModels(1 << 4);
+    /// The RDOVAE decoder of DRED (for `OpusDredDecoder`).
+    pub const DRED_DECODER: DnnModels = DnnModels(1 << 5);
 
     /// The bits of the set.
     pub const fn bits(self) -> u8 {
@@ -488,10 +495,11 @@ impl DredDecoderDnn {
         DredDecoderDnn { arch: arch::detect(), model: Slot::builtin(builtin::rdovae_dec()) }
     }
 
-    /// Loads the RDOVAE decoder from `blob`. When the blob lacks it, or one
-    /// of its arrays does not load, returns [`ERR_NO_MODEL`] and keeps the
-    /// model it had.
-    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), Error> {
+    /// Loads the RDOVAE decoder from `blob` and returns
+    /// [`DnnModels::DRED_DECODER`]. When the blob lacks it, or one of its
+    /// arrays does not load, returns [`ERR_NO_MODEL`] and keeps the model it
+    /// had.
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<DnnModels, Error> {
         if let Inner::Builtin = blob.inner {
             self.model = Slot::Builtin(builtin::rdovae_dec().ok_or(ERR_NO_MODEL)?);
         } else {
@@ -499,7 +507,7 @@ impl DredDecoderDnn {
             self.model = Slot::loaded(model, blob);
         }
         blob.prefault();
-        Ok(())
+        Ok(DnnModels::DRED_DECODER)
     }
 
     /// The model, when loaded.
@@ -530,10 +538,11 @@ impl DredEncoderDnn {
         DredEncoderDnn { arch: arch::detect(), model: Slot::builtin(builtin::dred_enc()) }
     }
 
-    /// Loads the RDOVAE encoder and PitchDNN from `blob`. When the blob
-    /// lacks one of them, or one of their arrays does not load, returns
-    /// [`ERR_NO_MODEL`] and keeps the models it had.
-    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), Error> {
+    /// Loads the RDOVAE encoder and PitchDNN from `blob` and returns
+    /// [`DnnModels::DRED_ENCODER`]. When the blob lacks one of them, or one
+    /// of their arrays does not load, returns [`ERR_NO_MODEL`] and keeps the
+    /// models it had.
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<DnnModels, Error> {
         if let Inner::Builtin = blob.inner {
             self.model = Slot::Builtin(builtin::dred_enc().ok_or(ERR_NO_MODEL)?);
         } else {
@@ -541,7 +550,7 @@ impl DredEncoderDnn {
             self.model = Slot::loaded(model, blob);
         }
         blob.prefault();
-        Ok(())
+        Ok(DnnModels::DRED_ENCODER)
     }
 
     /// The models, when loaded.

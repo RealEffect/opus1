@@ -27,8 +27,10 @@ pub enum ErrorKind {
     /// The compressed data is corrupted or not a valid Opus packet (libopus
     /// `OPUS_INVALID_PACKET`, -4).
     InvalidPacket,
-    /// The request is not supported, for example because the cargo feature
-    /// it needs is off (libopus `OPUS_UNIMPLEMENTED`, -5).
+    /// The request cannot be served, for example DRED parsing when the
+    /// model it needs is not loaded (libopus `OPUS_UNIMPLEMENTED`, -5).
+    /// Methods that need a cargo feature exist only with that feature, so
+    /// they never return this kind for a missing feature.
     Unimplemented,
     /// The encoder or decoder is not in a state that allows the call
     /// (libopus `OPUS_INVALID_STATE`, -6).

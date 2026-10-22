@@ -69,7 +69,7 @@ fn init_decodes_like_new() {
             for decoder in [&mut *expected, &mut *actual] {
                 decoder.set_complexity(complexity).unwrap();
                 #[cfg(feature = "osce-bwe")]
-                decoder.set_osce_bwe(true).unwrap();
+                decoder.set_osce_bwe(true);
             }
             assert_eq!(
                 decode_all(actual, &packets, frame_size, channels),

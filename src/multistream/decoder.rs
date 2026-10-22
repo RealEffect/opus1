@@ -28,6 +28,20 @@ pub struct MultistreamDecoder {
     buf: Vec<f32>,
 }
 
+impl core::fmt::Debug for MultistreamDecoder {
+    /// The layout and the main settings, as their getters return them. The
+    /// stream decoders and the buffer are left out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MultistreamDecoder")
+            .field("sampling_rate", &self.sampling_rate)
+            .field("layout", &self.layout)
+            .field("complexity", &self.complexity())
+            .field("gain", &self.gain())
+            .field("phase_inversion_disabled", &self.phase_inversion_disabled())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Interleaved output: libopus `opus_copy_channel_out_float` and
 /// `opus_copy_channel_out_short`. 16-bit samples are rounded and limited to
 /// the 16-bit range.
@@ -238,6 +252,10 @@ impl MultistreamDecoder {
         self.decode_native(packet, frame_size, &mut InterleavedSink { out, channels }, true, false)
     }
 
+    /// The final range values of all streams after the last packet,
+    /// combined with XOR: libopus `OPUS_GET_FINAL_RANGE`. For a packet that
+    /// both read correctly it equals the encoder's
+    /// [`MultistreamEncoder::final_range`](super::MultistreamEncoder::final_range).
     pub fn final_range(&self) -> u32 {
         self.decoders.iter().fold(0, |acc, dec| acc ^ dec.final_range())
     }
@@ -300,16 +318,15 @@ impl MultistreamDecoder {
         self.decoders.first().is_some_and(OpusDecoder::phase_inversion_disabled)
     }
 
-    /// [`OpusDecoder::set_osce_bwe`] for every stream decoder. libopus's
-    /// multistream decoder does not forward `OPUS_SET_OSCE_BWE`; there each
-    /// stream decoder must be set on its own. Without the cargo feature
-    /// `osce-bwe` this returns
-    /// [`Unimplemented`](crate::ErrorKind::Unimplemented).
-    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), Error> {
+    /// [`OpusDecoder::set_osce_bwe`] for every stream decoder (feature
+    /// `osce-bwe`). libopus's multistream decoder does not forward
+    /// `OPUS_SET_OSCE_BWE`; there each stream decoder must be set on its
+    /// own.
+    #[cfg(feature = "osce-bwe")]
+    pub fn set_osce_bwe(&mut self, enabled: bool) {
         for dec in &mut self.decoders {
-            dec.set_osce_bwe(enabled)?;
+            dec.set_osce_bwe(enabled);
         }
-        Ok(())
     }
 
     /// [`OpusDecoder::set_dnn_blob`] for every stream decoder: each one loads
@@ -317,8 +334,9 @@ impl MultistreamDecoder {
     /// those groups, or [`BadArg`](crate::ErrorKind::BadArg) when the blob
     /// holds no complete group of this build, and then no stream changes.
     /// libopus's multistream decoder does not forward `OPUS_SET_DNN_BLOB`;
-    /// there each stream decoder must load the blob on its own.
-    #[cfg(feature = "dnn")]
+    /// there each stream decoder must load the blob on its own. Feature
+    /// `deep-plc`, as for [`OpusDecoder::set_dnn_blob`].
+    #[cfg(feature = "deep-plc")]
     pub fn set_dnn_blob(&mut self, blob: &crate::DnnBlob) -> Result<crate::DnnModels, Error> {
         // Every stream decoder has the same build, so the first one's
         // result is everyone's: when it fails, none would load.

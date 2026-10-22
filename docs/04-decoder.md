@@ -71,12 +71,14 @@ All decoding goes through `decode_native` in `src/lib.rs`, the port of libopus `
 | `pitch()` | `OPUS_GET_PITCH` | The pitch period of the last frame, in samples at 48 kHz (section 5). |
 | `final_range()` | `OPUS_GET_FINAL_RANGE` | The range decoder state after the last frame. |
 | `last_packet_duration()` | `OPUS_GET_LAST_PACKET_DURATION` | The samples per channel of the last successful decode, concealment or FEC call. 0 at the start and after `reset_state`. |
+| `bandwidth()` | `OPUS_GET_BANDWIDTH` | The bandwidth of the last packet, from its first byte. `None` at the start and after `reset_state` (libopus 0). Concealment does not change it. |
+| `nb_samples(packet)` | `opus_decoder_get_nb_samples` | The duration of a packet in samples per channel at the decoder's rate, without decoding it. |
 | `reset_state()` | `OPUS_RESET_STATE` | Forgets the stream decoded so far. |
-| `dred_decode_float(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode_float` | Conceals `frame_size` samples with the deep redundancy (DRED) data of a later packet (feature `dred`, section 10). |
-| `dred_decode(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode` | As `dred_decode_float`, with 16-bit output. |
-| `dred_decode24(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode24` | As `dred_decode_float`, with 24-bit output in `i32`. |
+| `dred_decode(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode_float` | Conceals `frame_size` samples with the deep redundancy (DRED) data of a later packet, to `f32` (feature `dred`, section 10). |
+| `dred_decode_i16(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode` | As `dred_decode`, with 16-bit output. |
+| `dred_decode24(dred, dred_offset, frame_size, out)` | `opus_decoder_dred_decode24` | As `dred_decode`, with 24-bit output in `i32`. |
 
-All of them return the number of samples per channel written. The output is interleaved: left, right, left, right for two channels.
+The decode calls return the number of samples per channel written. The output is interleaved: left, right, left, right for two channels.
 
 For a packet that arrived, `frame_size` is the room in `out` in samples per channel, and the packet decides how many samples come out. A packet longer than `frame_size` is an error of kind `BufferTooSmall`, as libopus returns `OPUS_BUFFER_TOO_SMALL`. A `frame_size` of 0 is an error of kind `BadArg`, as in libopus. Only the samples a call returns are written; the rest of `out` is left as it was, as in libopus. To decode any packet, pass room for 120 ms: 5760 samples per channel at 48 kHz.
 
@@ -422,7 +424,7 @@ Decoding DRED takes three steps. The first two belong to an `OpusDredDecoder` an
 
    Only the vectors that cover `max_dred_samples` and 20 ms more are read, at most 26. Reading also stops when fewer than 8 bits are left. The result (`DredParse`) holds libopus's return value (`samples`: how far back the data reaches, at the rate of the call) and `dred_end` (`end`: the samples between the start of the packet and the newest data, when the encoder left out the newest frames).
 2. **Process** (`OpusDredDecoder::process` or `process_in_place`, libopus `opus_dred_process`). The RDOVAE decoder (`src/dnn/dred/rdovae_dec.rs`) turns the initial state into the states of its five GRUs, and each latent vector into four frames of 20 features, newest first. `parse` processes at once unless it gets `DredProcessing::Deferred` (libopus `defer_processing`).
-3. **Decode** (`OpusDecoder::dred_decode_float` and the 16-bit and 24-bit variants). `dred_offset` is the distance in samples, at the decoder's rate, from the start of the audio to make up to the start of the DRED packet. The decoder first fills the feature queue of deep PLC, as the DRED step of libopus `opus_decode_native` does (`src/opus_decoder.c:735-758`):
+3. **Decode** (`OpusDecoder::dred_decode` for `f32` output, and its 16-bit and 24-bit variants `dred_decode_i16` and `dred_decode24`). `dred_offset` is the distance in samples, at the decoder's rate, from the start of the audio to make up to the start of the DRED packet. The decoder first fills the feature queue of deep PLC, as the DRED step of libopus `opus_decode_native` does (`src/opus_decoder.c:735-758`):
    - It empties the queue.
    - It queues one feature frame per 10 ms of `frame_size`, at least one. When the last call of deep PLC added decoded audio to its history instead of concealing, two more frames come first.
    - Frame `i` of the queue is DRED frame `k = init - i - 2 + floor((dred_offset + dred.dred_offset * F10 / 4) / F10)`, with `init` the number of extra frames (2 or 0) and `F10` the samples of 10 ms. A frame `k` that `dred` holds goes in. A `k` beyond the oldest frame goes in as a gap, which deep PLC fills with its own prediction. A negative `k` (newer than the newest DRED frame) is left out.

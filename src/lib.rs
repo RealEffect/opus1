@@ -1,3 +1,38 @@
+//! opus1: the Opus audio codec (RFC 6716) in Rust, ported from libopus
+//! 1.6.1, the reference implementation in C.
+//!
+//! - [`OpusEncoder`] and [`OpusDecoder`] code one stream of mono or stereo
+//!   audio, at 8, 12, 16, 24 or 48 kHz ([`SampleRate`], [`Channels`]).
+//! - The module `multistream` codes several streams in one packet, for
+//!   example 5.1 surround sound (feature `std`, on by default).
+//! - The module [`packet`] reads, splits and joins Opus packets without
+//!   decoding them, and [`extensions`] reads and writes the extensions in
+//!   their padding.
+//! - With the feature `dred`, the encoder adds deep redundancy (DRED) to
+//!   its packets, and `OpusDredDecoder` reads it back to rebuild lost
+//!   audio.
+//!
+//! Every call that can fail returns [`Error`], whose [`ErrorKind`] is the
+//! error code libopus returns in the same case.
+//!
+//! ```
+//! use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
+//!
+//! let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)?;
+//! let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono)?;
+//! let pcm: Vec<f32> = (0..960).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+//! let mut packet = [0u8; 1275];
+//! let len = encoder.encode(&pcm, 960, &mut packet)?;
+//! let mut out = [0.0f32; 960];
+//! assert_eq!(decoder.decode(&packet[..len], 960, &mut out)?, 960);
+//! # Ok::<(), opus1::Error>(())
+//! ```
+//!
+//! opus1 follows libopus [`LIBOPUS_VERSION`]. The tests of the repository
+//! compare its packets and its decoded audio with that release. The `docs`
+//! folder of the repository explains the codec, the library and where
+//! opus1 differs from libopus.
+
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::too_many_arguments)]
@@ -34,7 +69,9 @@ mod celt_lpc;
 mod deep_plc;
 #[cfg(feature = "dnn")]
 mod dnn;
-#[cfg(feature = "dnn")]
+// `dnn` alone builds the shared code but no model, so the weight API comes
+// with `deep-plc`, the smallest feature that has a model.
+#[cfg(feature = "deep-plc")]
 pub use dnn::{DnnBlob, DnnModels};
 #[cfg(feature = "dred")]
 pub use dnn::dred::decoder::{DredParse, DredProcessing, OpusDred, OpusDredDecoder};
@@ -100,10 +137,24 @@ mod doc_examples {
     struct DifferencesFromLibopus;
 }
 
+/// The version of this crate, for example `"0.2.0"`: the `version` of its
+/// `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The libopus release that opus1 follows. A packet that opus1 encodes or
+/// decodes is compared with that release in the tests. (libopus
+/// `opus_get_version_string` gives `"libopus 1.6.1"` for it.)
+///
+/// ```
+/// assert_eq!(opus1::LIBOPUS_VERSION, "1.6.1");
+/// assert!(!opus1::VERSION.is_empty());
+/// ```
+pub const LIBOPUS_VERSION: &str = "1.6.1";
+
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
-use crate::in_place::write_fields;
+use crate::in_place::{HeapMemory, write_fields};
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use analysis::{AnalysisGate, AnalysisInfo, AnalysisPcm, PcmRef, SecondChannel, is_digital_silence};
@@ -897,6 +948,30 @@ fn encode_celt_redundancy(
     Ok(rc.rng)
 }
 
+/// An encoder of one Opus stream of mono or stereo audio: libopus
+/// `OpusEncoder`.
+///
+/// [`new`](Self::new) builds one for a sampling rate, a channel count and
+/// an [`Application`]. [`init`](Self::init) builds the same encoder in
+/// memory that the caller provides. Each call of [`encode`](Self::encode)
+/// (`f32` samples), [`encode_i16`](Self::encode_i16) or
+/// [`encode24`](Self::encode24) codes one packet from 2.5 to 120 ms of
+/// interleaved audio. The `set_*` methods are the requests of libopus
+/// `opus_encoder_ctl`, and most have a getter.
+///
+/// ```
+/// use opus1::{Application, Channels, OpusEncoder, SampleRate};
+///
+/// let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio)?;
+/// let pcm = [0.0f32; 960 * 2]; // 20 ms of stereo silence
+/// let mut packet = [0u8; 1275];
+/// let len = encoder.encode(&pcm, 960, &mut packet)?;
+/// assert!(len > 0);
+/// # Ok::<(), opus1::Error>(())
+/// ```
+///
+/// Without the `heap` feature the encoder holds all of its state inline,
+/// about 150 KB; see [`init`](Self::init).
 pub struct OpusEncoder {
     #[cfg(not(feature = "heap"))]
     celt_enc: CeltEncoder,
@@ -1585,6 +1660,110 @@ fn state_mut<T: ?Sized>(b: &mut T) -> &mut T {
     b
 }
 
+impl core::fmt::Debug for OpusEncoder {
+    /// The main settings, as their getters return them. The state of the
+    /// codec and its buffers are left out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("OpusEncoder");
+        d.field("sampling_rate", &self.sampling_rate())
+            .field("channels", &self.channels())
+            .field("application", &self.application)
+            .field("bitrate_setting", &self.user_bitrate)
+            .field("complexity", &self.complexity())
+            .field("vbr", &self.vbr())
+            .field("vbr_constraint", &self.vbr_constraint)
+            .field("bandwidth_setting", &self.user_bandwidth)
+            .field("max_bandwidth", &self.max_bandwidth)
+            .field("force_mode", &self.force_mode())
+            .field("force_channels", &self.force_channels())
+            .field("signal", &self.signal)
+            .field("inband_fec", &self.fec_config)
+            .field("packet_loss_perc", &self.packet_loss_perc())
+            .field("dtx", &self.use_dtx)
+            .field("lsb_depth", &self.lsb_depth())
+            .field("expert_frame_duration", &self.variable_duration);
+        #[cfg(feature = "dred")]
+        d.field("dred_duration", &self.dred_duration());
+        d.finish_non_exhaustive()
+    }
+}
+
+/// Defines [`KeptOnReset`] from a list of `OpusEncoder` fields.
+macro_rules! kept_on_reset {
+    ($( $(#[$doc:meta])* $field:ident: $ty:ty, )*) => {
+        /// What [`OpusEncoder::reset_state`] keeps of an encoder: the
+        /// settings, and the values that libopus keeps because they lie
+        /// before `OPUS_ENCODER_RESET_START` in its `OpusEncoder`
+        /// (opus_encoder.c:3243-3271). Each field is the field of the same
+        /// name in `OpusEncoder`.
+        struct KeptOnReset {
+            $( $(#[$doc])* $field: $ty, )*
+            /// C: `disable_inv` lies before the part of the CELT encoder that a
+            /// reset clears.
+            phase_inversion_disabled: bool,
+        }
+
+        impl KeptOnReset {
+            /// The values of `enc`.
+            fn of(enc: &OpusEncoder) -> Self {
+                Self {
+                    $( $field: enc.$field, )*
+                    phase_inversion_disabled: enc.celt_enc.phase_inversion_disabled(),
+                }
+            }
+
+            /// Puts the values back into `enc`.
+            fn restore(self, enc: &mut OpusEncoder) {
+                $( enc.$field = self.$field; )*
+                enc.celt_enc.set_phase_inversion_disabled(self.phase_inversion_disabled);
+            }
+        }
+    };
+}
+
+kept_on_reset! {
+    user_bitrate: Bitrate,
+    complexity: i32,
+    use_cbr: bool,
+    vbr_constraint: bool,
+    fec_config: InbandFec,
+    packet_loss_perc: i32,
+    user_forced_mode: Option<OpusMode>,
+    user_bandwidth: Option<Bandwidth>,
+    max_bandwidth: Bandwidth,
+    lfe: bool,
+    prediction_disabled: bool,
+    variable_duration: FrameDuration,
+    /// C `force_channels` and `silk_mode.toMono` lie before
+    /// `OPUS_ENCODER_RESET_START` too.
+    force_channels: Option<usize>,
+    silk_to_mono: bool,
+    /// The SILK control structure `silk_mode` lies before
+    /// `OPUS_ENCODER_RESET_START`, so what SILK reported for the last
+    /// packet stays. The first of these values shows after a reset: it is
+    /// the hysteresis of the next FEC decision.
+    silk_lbrr_coded: i32,
+    silk_allow_bandwidth_switch: bool,
+    silk_in_wb_mode_without_variable_lp: bool,
+    /// Test controls, not codec state.
+    integer_hp_at_48k: bool,
+    fixed_point_res_nrg: bool,
+    /// C `signal_type`, `voice_ratio` and `lsb_depth` lie before
+    /// `OPUS_ENCODER_RESET_START` too. The analysis state lies before it as
+    /// well, but `tonality_analysis_reset` clears it, which `write_new`
+    /// does.
+    signal: Signal,
+    voice_ratio: i32,
+    lsb_depth: i32,
+    analysis_gate: AnalysisGate,
+    /// C `use_dtx` lies before `OPUS_ENCODER_RESET_START`, and
+    /// `silk_mode.useDTX` and `silk_mode.nChannelsInternal` are part of
+    /// `silk_mode`. The time without activity is cleared.
+    use_dtx: bool,
+    silk_use_dtx: bool,
+    silk_channels_internal: usize,
+}
+
 /// Runs `$body` with `$p` bound to the deep PLC argument of the SILK and
 /// CELT decoders: `Some(&mut DeepPlcArgs)` with this `OpusDecoder`'s deep
 /// PLC state, models and kernel variant, or `None` in a build without the
@@ -1606,130 +1785,233 @@ macro_rules! with_deep_plc {
 }
 
 impl OpusEncoder {
+    /// libopus `opus_encoder_create`: a new encoder for audio at
+    /// `sampling_rate` with `channels` channels, tuned for `application`.
+    /// The settings start at the defaults of libopus, for example
+    /// [`Bitrate::Auto`] and complexity 9.
+    ///
+    /// It cannot fail at present: the `Result` leaves room for checks that
+    /// a later release may need.
+    ///
+    /// Without the `heap` feature the encoder is returned through the
+    /// stack, which needs more than 256 KB of stack. [`init`](Self::init)
+    /// builds it in place instead.
     pub fn new(
         sampling_rate: SampleRate,
         channels: Channels,
         application: Application,
     ) -> Result<Self, Error> {
-        let sampling_rate = sampling_rate.hz() as i32;
-        let channels = channels.count();
+        let mut enc = MaybeUninit::<Self>::uninit();
+        Self::init(&mut enc, sampling_rate, channels, application)?;
+        // SAFETY: `init` succeeded, so it initialized `enc`.
+        Ok(unsafe { enc.assume_init() })
+    }
 
+    /// Builds an encoder in `slot`, memory that the caller provides, and
+    /// returns it. The encoder is the same as the one of [`new`](Self::new).
+    /// Like `new`, it cannot fail at present.
+    ///
+    /// Without the `heap` feature an encoder holds all of its state inline:
+    /// about 150 KB, and 210 KB with the `dred` feature. `new` returns it
+    /// through the stack, which needs more than 256 KB. `init` writes the
+    /// encoder straight into `slot`, so building it needs only a little
+    /// stack (less than 16 KB). With `heap` it writes the large parts
+    /// straight into their heap memory.
+    ///
+    /// The intended use is memory that lives as long as the program, such
+    /// as a `static`: build the encoder there once and never drop it.
+    ///
+    /// ```
+    /// use core::mem::MaybeUninit;
+    /// use opus1::{Application, Channels, OpusEncoder, SampleRate};
+    ///
+    /// static mut ENCODER: MaybeUninit<OpusEncoder> = MaybeUninit::uninit();
+    ///
+    /// // Run once at start-up.
+    /// let slot = &raw mut ENCODER;
+    /// // SAFETY: nothing else uses `ENCODER` at the same time.
+    /// let encoder: &'static mut OpusEncoder =
+    ///     OpusEncoder::init(unsafe { &mut *slot }, SampleRate::Hz16000, Channels::Mono, Application::Voip)?;
+    ///
+    /// let mut packet = [0u8; 1275];
+    /// let len = encoder.encode(&[0.0f32; 320], 320, &mut packet)?;
+    /// assert!(len > 0);
+    /// # Ok::<(), opus1::Error>(())
+    /// ```
+    ///
+    /// `init` does not drop what `slot` holds. With the `heap` feature an
+    /// encoder owns heap memory, so a second `init` on the same slot leaks
+    /// the memory of the first encoder. To free an encoder built with
+    /// `init`, call [`MaybeUninit::assume_init_drop`] on `slot` when it is
+    /// no longer used. Without `heap` an encoder owns no other memory, so
+    /// nothing leaks and nothing needs to be dropped.
+    ///
+    /// [`reset_state`](Self::reset_state) also writes the new state in
+    /// place, so it needs only a little stack too.
+    pub fn init(
+        slot: &mut MaybeUninit<Self>,
+        sampling_rate: SampleRate,
+        channels: Channels,
+        application: Application,
+    ) -> Result<&mut Self, Error> {
+        // SAFETY: `slot` is valid for writes of `Self`, and `write_new`
+        // initializes every field, so `slot` holds an encoder afterwards.
+        unsafe {
+            Self::write_new(
+                slot.as_mut_ptr(),
+                sampling_rate.hz() as i32,
+                channels.count(),
+                application,
+                HeapMemory::Allocate,
+            );
+            Ok(slot.assume_init_mut())
+        }
+    }
+
+    /// Writes a new encoder to `this` field by field (see
+    /// `crate::in_place`). The arguments must be valid. With
+    /// [`HeapMemory::Allocate`] `this` may be uninitialized memory. With
+    /// [`HeapMemory::Reuse`] it holds an encoder with the same channel
+    /// count, and the new encoder keeps the heap memory of that one (feature
+    /// `heap`): [`reset_state`](Self::reset_state).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`, and with `Reuse` it must
+    /// hold a valid encoder.
+    unsafe fn write_new(
+        this: *mut Self,
+        sampling_rate: i32,
+        channels: usize,
+        application: Application,
+        memory: HeapMemory,
+    ) {
         let mode = modes::default_mode();
-        #[cfg(feature = "heap")]
-        let celt_enc = Box::new(CeltEncoder::with_sampling_rate(mode, channels, sampling_rate));
-        #[cfg(not(feature = "heap"))]
-        let celt_enc = CeltEncoder::with_sampling_rate(mode, channels, sampling_rate);
-
         // C `opus_encoder_init`: `st->mode = MODE_HYBRID` and
         // `st->bandwidth = OPUS_BANDWIDTH_FULLBAND`, whatever the application
         // and the sampling rate. Both are decided again for the first packet
         // that is coded.
         let (opus_mode, bw) = (OpusMode::Hybrid, Bandwidth::Fullband);
+        // `RestrictedLowDelay` codes CELT alone, without the lookahead that
+        // aligns CELT with SILK.
+        let low_delay = matches!(application, Application::RestrictedLowDelay);
 
-        use silk::lin2log::silk_lin2log;
-        let variable_hp_smth2_q15 = silk_lin2log(60) << 8;
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below writes the whole field it is given.
+        unsafe {
+            write_fields!(this, {
+                #[cfg(not(feature = "heap"))]
+                celt_enc = |p| CeltEncoder::write_new(p, mode, channels, sampling_rate),
+                #[cfg(feature = "heap")]
+                celt_enc = |p: *mut Box<CeltEncoder>| {
+                    let celt = |q| CeltEncoder::write_new(q, mode, channels, sampling_rate);
+                    in_place::write_box(p, memory, celt)
+                },
+                silk = |p| SilkEncoder::write_new(p, sampling_rate, channels, memory),
+                application: application,
+                sampling_rate: sampling_rate,
+                channels: channels,
+                bandwidth: bw,
+                auto_bandwidth: bw,
+                user_bandwidth: None,
+                max_bandwidth: Bandwidth::Fullband,
+                user_forced_mode: None,
+                lfe: false,
+                energy_mask: None,
+                range_final: 0,
+                first: true,
+                silk_allow_bandwidth_switch: false,
+                silk_in_wb_mode_without_variable_lp: false,
+                silk_opus_can_switch: false,
+                silk_lbrr_coded: 0,
+                nonfinal_frame: false,
+                stream_channels: channels,
+                force_channels: None,
+                prev_channels: 0,
+                silk_to_mono: false,
+                silk_bw_switch: false,
+                // C `opus_encoder_init`: `hybrid_stereo_width_Q14 = 1 << 14`.
+                hybrid_stereo_width_q14: 1 << 14,
+                silk_stereo_width_q14: 1 << 14,
+                width_mem: StereoWidthState::default(),
+                stereo_width: 0.0,
+                // C `opus_encoder_init`: `user_bitrate_bps = OPUS_AUTO` and
+                // `bitrate_bps = 3000 + Fs * channels`. Each packet sets the
+                // second again before it is read.
+                user_bitrate: Bitrate::Auto,
+                packet_bitrate_bps: 3000 + sampling_rate * channels as i32,
+                complexity: 9,
+                use_cbr: false,
+                vbr_constraint: true,
+                fec_config: InbandFec::Off,
+                packet_loss_perc: 0,
+                prev_frame_size: 0,
+                prediction_disabled: false,
+                variable_duration: FrameDuration::Argument,
+                #[cfg(not(feature = "heap"))]
+                celt_prefill = |p| in_place::write_zero(p),
+                #[cfg(feature = "heap")]
+                celt_prefill = |p: *mut Box<[f32; CELT_PREFILL]>| {
+                    in_place::write_box(p, memory, |q| in_place::write_zero(q))
+                },
+                mode: opus_mode,
+                prev_enc_mode: None,
+                variable_hp_smth2_q15: silk_lin2log(60) << 8,
+                hp_mem = |p| FixedVec::write_from_value(p, 0, channels * 2),
+                integer_hp_at_48k: false,
+                fixed_point_res_nrg: false,
 
-        Ok(Self {
-            celt_enc,
-            silk: SilkEncoder::new(sampling_rate, channels),
-            application,
-            sampling_rate,
-            channels,
-            bandwidth: bw,
-            auto_bandwidth: bw,
-            user_bandwidth: None,
-            max_bandwidth: Bandwidth::Fullband,
-            user_forced_mode: None,
-            lfe: false,
-            energy_mask: None,
-            range_final: 0,
-            first: true,
-            silk_allow_bandwidth_switch: false,
-            silk_in_wb_mode_without_variable_lp: false,
-            silk_opus_can_switch: false,
-            silk_lbrr_coded: 0,
-            nonfinal_frame: false,
-            stream_channels: channels,
-            force_channels: None,
-            prev_channels: 0,
-            silk_to_mono: false,
-            silk_bw_switch: false,
-            // C `opus_encoder_init`: `hybrid_stereo_width_Q14 = 1 << 14`.
-            hybrid_stereo_width_q14: 1 << 14,
-            silk_stereo_width_q14: 1 << 14,
-            width_mem: StereoWidthState::default(),
-            stereo_width: 0.0,
-            // C `opus_encoder_init`: `user_bitrate_bps = OPUS_AUTO` and
-            // `bitrate_bps = 3000 + Fs * channels`. Each packet sets the
-            // second again before it is read.
-            user_bitrate: Bitrate::Auto,
-            packet_bitrate_bps: 3000 + sampling_rate * channels as i32,
-            complexity: 9,
-            use_cbr: false,
-            vbr_constraint: true,
-            fec_config: InbandFec::Off,
-            packet_loss_perc: 0,
-            prev_frame_size: 0,
-            prediction_disabled: false,
-            variable_duration: FrameDuration::Argument,
-            #[cfg(not(feature = "heap"))]
-            celt_prefill: [0.0; CELT_PREFILL],
-            #[cfg(feature = "heap")]
-            celt_prefill: Box::new([0.0; CELT_PREFILL]),
-            prev_enc_mode: None,
-            mode: opus_mode,
-            variable_hp_smth2_q15,
-            hp_mem: FixedVec::from_value(0, channels * 2),
-            integer_hp_at_48k: false,
-            fixed_point_res_nrg: false,
-
-            #[cfg(not(feature = "heap"))]
-            buf_filtered: FixedVec::new(),
-            #[cfg(feature = "heap")]
-            buf_filtered: Box::new(FixedVec::new()),
-            #[cfg(not(feature = "heap"))]
-            delay_buffer: FixedVec::from_value(0.0, OPUS_DELAY_BUF),
-            #[cfg(feature = "heap")]
-            delay_buffer: Box::new(FixedVec::from_value(0.0, OPUS_DELAY_BUF)),
-            #[cfg(not(feature = "heap"))]
-            buf_celt_pcm: FixedVec::new(),
-            #[cfg(feature = "heap")]
-            buf_celt_pcm: Box::new(FixedVec::new()),
-            encoder_buffer: if matches!(application, Application::RestrictedLowDelay) {
-                0
-            } else {
-                (sampling_rate / 100) as usize
-            },
-            delay_compensation: if matches!(application, Application::RestrictedLowDelay) {
-                0
-            } else {
-                (sampling_rate / 250) as usize
-            },
-            hp_mem_float: [0.0; 4],
-            prev_hb_gain: 1.0,
-            #[cfg(all(feature = "analysis", feature = "heap"))]
-            analysis: Box::new(analysis::TonalityAnalysisState::new(sampling_rate)),
-            #[cfg(all(feature = "analysis", not(feature = "heap")))]
-            analysis: analysis::TonalityAnalysisState::new(sampling_rate),
-            analysis_gate: AnalysisGate::FloatBuild,
-            float_api: true,
-            last_analysis: AnalysisInfo::default(),
-            // C `opus_encoder_init`: `voice_ratio = -1`, `signal_type =
-            // OPUS_AUTO`, `lsb_depth = 24`.
-            voice_ratio: -1,
-            signal: Signal::Auto,
-            lsb_depth: 24,
-            peak_signal_energy: 0.0,
-            use_dtx: false,
-            silk_use_dtx: false,
-            silk_channels_internal: channels,
-            nb_no_activity_ms_q1: 0,
-            rc: RangeCoder::new_encoder(1),
-            #[cfg(all(feature = "dred", feature = "heap"))]
-            dred: Box::new(dnn::dred::encoder::DredEncoder::new(sampling_rate, channels)),
-            #[cfg(all(feature = "dred", not(feature = "heap")))]
-            dred: dnn::dred::encoder::DredEncoder::new(sampling_rate, channels),
-        })
+                #[cfg(not(feature = "heap"))]
+                buf_filtered = |p| FixedVec::write_new(p),
+                #[cfg(feature = "heap")]
+                buf_filtered = |p: *mut Box<FixedVec<i16, OPUS_MAX_FRAME>>| {
+                    in_place::write_box(p, memory, |q| FixedVec::write_new(q))
+                },
+                #[cfg(not(feature = "heap"))]
+                delay_buffer = |p| FixedVec::write_from_value(p, 0.0, OPUS_DELAY_BUF),
+                #[cfg(feature = "heap")]
+                delay_buffer = |p: *mut Box<FixedVec<f32, OPUS_DELAY_BUF>>| {
+                    in_place::write_box(p, memory, |q| FixedVec::write_from_value(q, 0.0, OPUS_DELAY_BUF))
+                },
+                #[cfg(not(feature = "heap"))]
+                buf_celt_pcm = |p| FixedVec::write_new(p),
+                #[cfg(feature = "heap")]
+                buf_celt_pcm = |p: *mut Box<FixedVec<f32, OPUS_PCM_BUF>>| {
+                    in_place::write_box(p, memory, |q| FixedVec::write_new(q))
+                },
+                encoder_buffer: if low_delay { 0 } else { (sampling_rate / 100) as usize },
+                delay_compensation: if low_delay { 0 } else { (sampling_rate / 250) as usize },
+                hp_mem_float: [0.0; 4],
+                prev_hb_gain: 1.0,
+                #[cfg(all(feature = "analysis", not(feature = "heap")))]
+                analysis = |p| analysis::TonalityAnalysisState::write_new(p, sampling_rate),
+                #[cfg(all(feature = "analysis", feature = "heap"))]
+                analysis = |p: *mut Box<analysis::TonalityAnalysisState>| {
+                    let state = |q| analysis::TonalityAnalysisState::write_new(q, sampling_rate);
+                    in_place::write_box(p, memory, state)
+                },
+                analysis_gate: AnalysisGate::FloatBuild,
+                float_api: true,
+                last_analysis: AnalysisInfo::default(),
+                // C `opus_encoder_init`: `voice_ratio = -1`, `signal_type =
+                // OPUS_AUTO`, `lsb_depth = 24`.
+                voice_ratio: -1,
+                signal: Signal::Auto,
+                lsb_depth: 24,
+                peak_signal_energy: 0.0,
+                use_dtx: false,
+                silk_use_dtx: false,
+                silk_channels_internal: channels,
+                nb_no_activity_ms_q1: 0,
+                rc: RangeCoder::new_encoder(1),
+                #[cfg(all(feature = "dred", not(feature = "heap")))]
+                dred = |p| dnn::dred::encoder::DredEncoder::write_new(p, sampling_rate, channels),
+                #[cfg(all(feature = "dred", feature = "heap"))]
+                dred = |p: *mut Box<dnn::dred::encoder::DredEncoder>| {
+                    let dred = |q| dnn::dred::encoder::DredEncoder::write_new(q, sampling_rate, channels);
+                    in_place::write_box(p, memory, dred)
+                },
+            });
+        }
     }
 
     /// The decisions libopus's `opus_encode_native` makes for a packet
@@ -2345,7 +2627,7 @@ impl OpusEncoder {
     /// the padding of the packet, as the packet extension with ID 126, in
     /// the first frame that is coded. A decoder that knows nothing of DRED
     /// skips it. Decode it with [`OpusDredDecoder`] and
-    /// [`OpusDecoder::dred_decode_float`].
+    /// [`OpusDecoder::dred_decode`].
     ///
     /// [`reset_state`](Self::reset_state) sets the duration back to 0, as
     /// libopus does.
@@ -2363,15 +2645,16 @@ impl OpusEncoder {
 
     /// libopus `OPUS_SET_DNN_BLOB` on an encoder (feature `dred`): loads the
     /// models of the DRED encoder (the RDOVAE encoder and PitchDNN) from a blob
-    /// in the libopus format. When the blob does not hold all of their arrays,
-    /// returns [`BadArg`](crate::ErrorKind::BadArg) and keeps the models it
-    /// had. [`DnnBlob::builtin`] brings back the built-in weights. Without the
-    /// models the encoder writes no DRED data.
+    /// in the libopus format, and returns the group it loaded,
+    /// [`DnnModels::DRED_ENCODER`]. When the blob does not hold all of their
+    /// arrays, returns [`BadArg`](crate::ErrorKind::BadArg) and keeps the
+    /// models it had. [`DnnBlob::builtin`] brings back the built-in weights.
+    /// Without the models the encoder writes no DRED data.
     ///
     /// libopus offers the request only when built with `USE_WEIGHTS_FILE`
     /// and returns `OPUS_BAD_ARG` on a failure.
     #[cfg(feature = "dred")]
-    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<(), Error> {
+    pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<DnnModels, Error> {
         self.dred.load(blob)
     }
 
@@ -2398,6 +2681,17 @@ impl OpusEncoder {
         });
     }
 
+    /// The mode set with [`set_force_mode`](Self::set_force_mode): `None`
+    /// when the encoder chooses the mode itself. libopus has no request to
+    /// read it.
+    pub fn force_mode(&self) -> Option<ForcedMode> {
+        self.user_forced_mode.map(|mode| match mode {
+            OpusMode::SilkOnly => ForcedMode::SilkOnly,
+            OpusMode::Hybrid => ForcedMode::Hybrid,
+            OpusMode::CeltOnly => ForcedMode::CeltOnly,
+        })
+    }
+
     /// libopus `OPUS_SET_BANDWIDTH`: code this audio bandwidth instead of
     /// the one the bitrate calls for. `None`, the default, gives the choice
     /// back to the encoder (libopus `OPUS_AUTO`).
@@ -2411,9 +2705,24 @@ impl OpusEncoder {
     }
 
     /// The value set with [`set_bandwidth`](Self::set_bandwidth): `None`
-    /// when the encoder chooses the bandwidth itself.
+    /// when the encoder chooses the bandwidth itself. This is not libopus
+    /// `OPUS_GET_BANDWIDTH`, which [`bandwidth`](Self::bandwidth) answers.
     pub fn bandwidth_setting(&self) -> Option<Bandwidth> {
         self.user_bandwidth
+    }
+
+    /// libopus `OPUS_GET_BANDWIDTH` of the encoder: the audio bandwidth of
+    /// the last packet that was coded, whether the encoder chose it or it
+    /// was set. Before the first packet and after
+    /// [`reset_state`](Self::reset_state) it is [`Bandwidth::Fullband`], the
+    /// value libopus starts with.
+    ///
+    /// For a packet too small to code any audio, libopus decides no
+    /// bandwidth, so the value stays that of the packet before. (The first
+    /// byte of such a packet can name another bandwidth.) The setting
+    /// itself is [`bandwidth_setting`](Self::bandwidth_setting).
+    pub fn bandwidth(&self) -> Bandwidth {
+        self.bandwidth
     }
 
     /// libopus `OPUS_SET_MAX_BANDWIDTH`: the widest audio bandwidth the
@@ -2422,6 +2731,12 @@ impl OpusEncoder {
     /// [`set_bandwidth`](Self::set_bandwidth) is not limited by it.
     pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) {
         self.max_bandwidth = bandwidth;
+    }
+
+    /// The value set with [`set_max_bandwidth`](Self::set_max_bandwidth)
+    /// (libopus `OPUS_GET_MAX_BANDWIDTH`).
+    pub fn max_bandwidth(&self) -> Bandwidth {
+        self.max_bandwidth
     }
 
     /// libopus `OPUS_SET_LFE`: this encoder codes the low-frequency-effects
@@ -2686,62 +3001,37 @@ impl OpusEncoder {
     /// `dred_duration` is 0 afterwards. The DRED models stay, also those
     /// loaded with `set_dnn_blob`. (These methods exist only with the
     /// feature, so they are not linked here.)
+    ///
+    /// The new state is written in place, as [`init`](Self::init) writes
+    /// it, so a reset needs only a little stack, also without `heap`. With
+    /// `heap` it goes into the heap memory the encoder already has: like
+    /// libopus `OPUS_RESET_STATE`, a reset allocates nothing.
     pub fn reset_state(&mut self) {
-        // `new` accepted this sampling rate, channel count and application
-        // before, so it does again.
-        let Ok(mut fresh) = Self::new(self.sampling_rate(), self.channels(), self.application) else {
-            return;
-        };
-        fresh.user_bitrate = self.user_bitrate;
-        fresh.complexity = self.complexity;
-        fresh.use_cbr = self.use_cbr;
-        fresh.vbr_constraint = self.vbr_constraint;
-        fresh.fec_config = self.fec_config;
-        fresh.packet_loss_perc = self.packet_loss_perc;
-        fresh.user_forced_mode = self.user_forced_mode;
-        fresh.user_bandwidth = self.user_bandwidth;
-        fresh.max_bandwidth = self.max_bandwidth;
-        fresh.lfe = self.lfe;
-        fresh.prediction_disabled = self.prediction_disabled;
-        fresh.variable_duration = self.variable_duration;
-        // C `force_channels` and `silk_mode.toMono` lie before
-        // `OPUS_ENCODER_RESET_START` too.
-        fresh.force_channels = self.force_channels;
-        fresh.silk_to_mono = self.silk_to_mono;
-        // libopus clears its state from `OPUS_ENCODER_RESET_START` on. The
-        // SILK control structure `silk_mode` lies before that, so what SILK
-        // reported for the last packet stays (opus_encoder.c:3243-3271).
-        // The first of them shows after a reset: it is the hysteresis of
-        // the next FEC decision.
-        fresh.silk_lbrr_coded = self.silk_lbrr_coded;
-        fresh.silk_allow_bandwidth_switch = self.silk_allow_bandwidth_switch;
-        fresh.silk_in_wb_mode_without_variable_lp = self.silk_in_wb_mode_without_variable_lp;
-        // Test controls, not codec state.
-        fresh.integer_hp_at_48k = self.integer_hp_at_48k;
-        fresh.fixed_point_res_nrg = self.fixed_point_res_nrg;
-        // C `signal_type`, `voice_ratio` and `lsb_depth` lie before
-        // `OPUS_ENCODER_RESET_START` too. The analysis state lies before it
-        // as well, but `tonality_analysis_reset` clears it, which `new`
-        // has done.
-        fresh.signal = self.signal;
-        fresh.voice_ratio = self.voice_ratio;
-        fresh.lsb_depth = self.lsb_depth;
-        fresh.analysis_gate = self.analysis_gate;
-        // C `use_dtx` lies before `OPUS_ENCODER_RESET_START`, and
-        // `silk_mode.useDTX` and `silk_mode.nChannelsInternal` are part of
-        // `silk_mode`. The time without activity is cleared.
-        fresh.use_dtx = self.use_dtx;
-        fresh.silk_use_dtx = self.silk_use_dtx;
-        fresh.silk_channels_internal = self.silk_channels_internal;
-        // C: `disable_inv` lies before the part of the CELT encoder that a
-        // reset clears.
-        fresh.celt_enc.set_phase_inversion_disabled(self.celt_enc.phase_inversion_disabled());
+        let kept = KeptOnReset::of(self);
         // The DRED fields of libopus's encoder lie after
         // `OPUS_ENCODER_RESET_START`, `dred_duration` included, so a reset
-        // turns DRED off. `dred_encoder_reset` keeps the models.
+        // turns DRED off. `dred_encoder_reset` keeps the models. The DRED
+        // state left behind holds the built-in models, which own no heap
+        // memory.
         #[cfg(feature = "dred")]
-        fresh.dred.swap_models(&mut self.dred);
-        *self = fresh;
+        let models = self.dred.take_models();
+        let (sampling_rate, channels, application) = (self.sampling_rate, self.channels, self.application);
+        // A second encoder would need 150 KB of stack without `heap`, and
+        // new heap memory with it. So the new encoder is written over the
+        // old one. Without `heap` such an encoder owns no other memory, so
+        // the old one needs no drop, and each field is written with a valid
+        // value, so the encoder stays valid at every step. With `heap`
+        // (`HeapMemory::Reuse`), each box keeps its memory and only its
+        // contents are written anew, the boxes of the SILK encoder too. The
+        // other fields own no memory.
+        #[cfg(not(feature = "heap"))]
+        const { assert!(!core::mem::needs_drop::<Self>()) };
+        // SAFETY: `self` is a valid encoder, and the arguments are those of
+        // this encoder, which were valid.
+        unsafe { Self::write_new(self, sampling_rate, channels, application, HeapMemory::Reuse) };
+        kept.restore(self);
+        #[cfg(feature = "dred")]
+        self.dred.set_models(models);
     }
 
     /// The sampling rate of the input (`OPUS_GET_SAMPLE_RATE`).
@@ -4404,6 +4694,29 @@ use celt::PcmLayout;
 #[cfg(feature = "osce-bwe")]
 use dnn::osce::OsceExtMode;
 
+/// A decoder of one Opus stream to mono or stereo audio: libopus
+/// `OpusDecoder`.
+///
+/// [`new`](Self::new) builds one for an output sampling rate and channel
+/// count, which need not be those of the encoder. [`init`](Self::init)
+/// builds the same decoder in memory that the caller provides. Each call of
+/// [`decode`](Self::decode) (`f32` samples), [`decode_i16`](Self::decode_i16)
+/// or [`decode24`](Self::decode24) decodes one packet, or conceals a lost
+/// one, into interleaved audio.
+///
+/// ```
+/// use opus1::{Channels, OpusDecoder, SampleRate};
+///
+/// let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo)?;
+/// let mut pcm = [0.0f32; 960 * 2];
+/// // A lost packet of 20 ms: the decoder conceals it.
+/// let samples = decoder.decode(&[], 960, &mut pcm)?;
+/// assert_eq!(samples, 960);
+/// # Ok::<(), opus1::Error>(())
+/// ```
+///
+/// Without the `heap` feature the decoder holds all of its state inline,
+/// about 60 KB; see [`init`](Self::init).
 pub struct OpusDecoder {
     #[cfg(not(feature = "heap"))]
     celt_dec: CeltDecoder,
@@ -4422,6 +4735,9 @@ pub struct OpusDecoder {
     /// C `st->prev_mode`: the mode the last frame was decoded or concealed
     /// in.
     prev_mode: Option<OpusMode>,
+    /// C `st->bandwidth`: the audio bandwidth of the last packet that was
+    /// decoded, set with `mode`. `None` before the first packet (libopus 0).
+    bandwidth: Option<Bandwidth>,
 
     /// Whether the previous frame had redundancy (mode transition marker).
     prev_redundancy: bool,
@@ -4502,7 +4818,34 @@ pub struct OpusDecoder {
     deep_plc: dnn::plc::DeepPlc,
 }
 
+impl core::fmt::Debug for OpusDecoder {
+    /// The main settings, as their getters return them. The state of the
+    /// codec and its buffers are left out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("OpusDecoder");
+        d.field("sampling_rate", &self.sampling_rate())
+            .field("channels", &self.channels())
+            .field("complexity", &self.complexity())
+            .field("gain", &self.gain())
+            .field("phase_inversion_disabled", &self.phase_inversion_disabled());
+        #[cfg(feature = "osce-bwe")]
+        d.field("osce_bwe", &self.osce_bwe);
+        d.finish_non_exhaustive()
+    }
+}
+
 impl OpusDecoder {
+    /// libopus `opus_decoder_create`: a new decoder whose output has
+    /// `sampling_rate` and `channels` channels. A packet coded at another
+    /// rate or with another channel count is converted, as in libopus. The
+    /// complexity starts at 0 and the gain at 0 dB.
+    ///
+    /// It cannot fail at present: the `Result` leaves room for checks that
+    /// a later release may need.
+    ///
+    /// Without the `heap` feature the decoder is returned through the
+    /// stack, which needs about 200 KB of stack (500 KB with the neural
+    /// network features). [`init`](Self::init) builds it in place instead.
     pub fn new(sampling_rate: SampleRate, channels: Channels) -> Result<Self, Error> {
         let mut dec = MaybeUninit::<Self>::uninit();
         Self::init(&mut dec, sampling_rate, channels)?;
@@ -4511,33 +4854,42 @@ impl OpusDecoder {
     }
 
     /// Builds a decoder in `slot`, memory that the caller provides, and
-    /// returns it. The decoder is the same as the one of
-    /// [`new`](Self::new). Like `new`, it cannot fail at present: the
-    /// `Result` leaves room for checks that a later release may need.
+    /// returns it. The decoder is the same as the one of [`new`](Self::new).
+    /// Like `new`, it cannot fail at present.
     ///
-    /// Without the `heap` feature a decoder holds all of its state inline
-    /// (about 60 KB, 160 KB with the neural network features), and `new`
-    /// returns it through the stack, which needs about twice that. `init`
-    /// writes the decoder straight into `slot`, for example a `static`, so
-    /// building it needs only a little stack. With `heap` it writes the
-    /// boxed parts straight into their heap memory.
+    /// Without the `heap` feature a decoder holds all of its state inline:
+    /// about 60 KB, and 160 KB with the neural network features. `new`
+    /// returns it through the stack, which needs about three times that.
+    /// `init` writes the decoder straight into `slot`, so building it needs
+    /// only a little stack. With `heap` it writes the large parts straight
+    /// into their heap memory.
     ///
-    /// A decoder that `slot` already holds is overwritten without being
-    /// dropped: with `heap` its memory leaks. To drop a decoder built with
-    /// `init` (which matters only with `heap`), call
-    /// [`MaybeUninit::assume_init_drop`] on `slot`.
+    /// The intended use is memory that lives as long as the program, such
+    /// as a `static`: build the decoder there once and never drop it.
     ///
     /// ```
     /// use core::mem::MaybeUninit;
     /// use opus1::{Channels, OpusDecoder, SampleRate};
     ///
-    /// // In a `no_std` program this would be a `static`.
-    /// let mut slot = MaybeUninit::<OpusDecoder>::uninit();
-    /// let decoder = OpusDecoder::init(&mut slot, SampleRate::Hz48000, Channels::Stereo)?;
+    /// static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
+    ///
+    /// // Run once at start-up.
+    /// let slot = &raw mut DECODER;
+    /// // SAFETY: nothing else uses `DECODER` at the same time.
+    /// let decoder: &'static mut OpusDecoder =
+    ///     OpusDecoder::init(unsafe { &mut *slot }, SampleRate::Hz48000, Channels::Stereo)?;
+    ///
     /// let mut pcm = [0.0f32; 960 * 2];
     /// decoder.decode(&[], 960, &mut pcm)?; // a lost frame
     /// # Ok::<(), opus1::Error>(())
     /// ```
+    ///
+    /// `init` does not drop what `slot` holds. With the `heap` feature a
+    /// decoder owns heap memory, so a second `init` on the same slot leaks
+    /// the memory of the first decoder. To free a decoder built with
+    /// `init`, call [`MaybeUninit::assume_init_drop`] on `slot` when it is
+    /// no longer used. Without `heap` a decoder owns no other memory, so
+    /// nothing leaks and nothing needs to be dropped.
     pub fn init(
         slot: &mut MaybeUninit<Self>,
         sampling_rate: SampleRate,
@@ -4581,6 +4933,7 @@ impl OpusDecoder {
                 channels: channels,
                 mode: None,
                 prev_mode: None,
+                bandwidth: None,
                 prev_redundancy: false,
                 // C `opus_decoder_init`: `st->frame_size = Fs/400`.
                 frame_size: sampling_rate as usize / 400,
@@ -4754,8 +5107,13 @@ impl OpusDecoder {
         self.decode_int_native(data, frame_size, output, true, false, res_to_int24)
     }
 
-    /// Conceal lost audio with deep redundancy (DRED) data: libopus
-    /// `opus_decoder_dred_decode_float`.
+    /// Conceal lost audio with deep redundancy (DRED) data into interleaved
+    /// `f32` PCM: libopus `opus_decoder_dred_decode_float`. The names
+    /// follow those of [`decode`](Self::decode):
+    /// [`dred_decode_i16`](Self::dred_decode_i16) writes 16-bit samples
+    /// (libopus `opus_decoder_dred_decode`) and
+    /// [`dred_decode24`](Self::dred_decode24) 24-bit samples (libopus
+    /// `opus_decoder_dred_decode24`).
     ///
     /// `dred` holds the processed DRED data of a packet received after the
     /// loss ([`OpusDredDecoder::parse`]). `dred_offset` is the position of
@@ -4773,7 +5131,7 @@ impl OpusDecoder {
     /// those of a lost packet in [`decode`](Self::decode). These checks come
     /// before any change of the decoder.
     #[cfg(feature = "dred")]
-    pub fn dred_decode_float(
+    pub fn dred_decode(
         &mut self,
         dred: &OpusDred,
         dred_offset: i32,
@@ -4786,12 +5144,12 @@ impl OpusDecoder {
             .map(|(samples, _)| samples)
     }
 
-    /// [`dred_decode_float`](Self::dred_decode_float) with 16-bit output:
-    /// libopus `opus_decoder_dred_decode`. Each sample is rounded to the
-    /// nearest integer, halfway values to the even one, and limited to the
-    /// 16-bit range, as libopus's `FLOAT2INT16` does.
+    /// [`dred_decode`](Self::dred_decode) with 16-bit output: libopus
+    /// `opus_decoder_dred_decode`. Each sample is rounded to the nearest
+    /// integer, halfway values to the even one, and limited to the 16-bit
+    /// range, as libopus's `FLOAT2INT16` does.
     #[cfg(feature = "dred")]
-    pub fn dred_decode(
+    pub fn dred_decode_i16(
         &mut self,
         dred: &OpusDred,
         dred_offset: i32,
@@ -4801,7 +5159,7 @@ impl OpusDecoder {
         self.dred_decode_int(dred, dred_offset, frame_size, output, float2int16)
     }
 
-    /// [`dred_decode_float`](Self::dred_decode_float) with 24-bit output in
+    /// [`dred_decode`](Self::dred_decode) with 24-bit output in
     /// 32-bit integers: libopus `opus_decoder_dred_decode24`. Each sample
     /// is scaled by 2^23 and rounded to the nearest integer, halfway values
     /// to the even one. There is no limit to 24 bits, as in libopus.
@@ -4872,7 +5230,7 @@ impl OpusDecoder {
         }
     }
 
-    /// `dred_decode` and `dred_decode24`: conceal into a float buffer, then
+    /// `dred_decode_i16` and `dred_decode24`: conceal into a float buffer, then
     /// convert each sample. The buffer holds 120 ms, as in
     /// `decode_i16_native`. A longer loss is concealed 60 ms at a time,
     /// which gives the same samples as one call; the DRED features are
@@ -5128,6 +5486,7 @@ impl OpusDecoder {
             }
             // Complete with FEC.
             self.mode = Some(packet_mode);
+            self.bandwidth = Some(packet_bandwidth);
             self.frame_size = packet_frame_size;
             self.stream_channels = packet_channels;
             self.decode_or_conceal_frame(
@@ -5154,6 +5513,7 @@ impl OpusDecoder {
         // Update the state as the last step, so that an invalid packet
         // leaves it alone.
         self.mode = Some(packet_mode);
+        self.bandwidth = Some(packet_bandwidth);
         self.frame_size = packet_frame_size;
         self.stream_channels = packet_channels;
 
@@ -5234,6 +5594,31 @@ impl OpusDecoder {
         self.last_packet_duration
     }
 
+    /// libopus `OPUS_GET_BANDWIDTH` of the decoder: the audio bandwidth of
+    /// the last packet that was decoded, read from its first byte
+    /// ([`packet::bandwidth`]). `None` before the first packet and after
+    /// [`reset_state`](Self::reset_state), where libopus returns 0.
+    ///
+    /// Concealment of a lost packet does not change it. An FEC call
+    /// ([`decode_fec`](Self::decode_fec)) sets it to the bandwidth of the
+    /// packet it reads, unless that packet holds no FEC data and the call
+    /// only conceals.
+    pub fn bandwidth(&self) -> Option<Bandwidth> {
+        self.bandwidth
+    }
+
+    /// libopus `opus_decoder_get_nb_samples`: the duration of `packet` in
+    /// samples per channel at this decoder's sampling rate. It is
+    /// [`packet::nb_samples`] with [`sampling_rate`](Self::sampling_rate).
+    ///
+    /// Errors: [`BadArg`](crate::ErrorKind::BadArg) for an empty packet,
+    /// and [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the
+    /// packet is too short to say its frame count or says more than
+    /// 120 ms.
+    pub fn nb_samples(&self, packet: &[u8]) -> Result<usize, Error> {
+        packet::nb_samples(packet, self.sampling_rate())
+    }
+
     /// libopus `OPUS_RESET_STATE`: forget the stream decoded so far. The
     /// decoder then behaves like a new one with the same sampling rate and
     /// channel count. The settings stay: the complexity, the bandwidth
@@ -5266,6 +5651,7 @@ impl OpusDecoder {
         self.silk_dec.reset();
         self.mode = None;
         self.prev_mode = None;
+        self.bandwidth = None;
         self.prev_redundancy = false;
         self.frame_size = self.sampling_rate as usize / 400;
         self.stream_channels = self.channels;
@@ -5290,9 +5676,9 @@ impl OpusDecoder {
     /// features that were compiled in: deep packet loss concealment from 5
     /// (cargo feature `deep-plc`), the LACE speech enhancer at 6 and NoLACE
     /// from 7 (feature `osce`), and from 4 the bandwidth extension, when it
-    /// is switched on with [`set_osce_bwe`](Self::set_osce_bwe) (feature
-    /// `osce-bwe`). Without these features the value is only stored, as in
-    /// a libopus built without them.
+    /// is switched on with `set_osce_bwe` (feature `osce-bwe`). Without
+    /// these features the value is only stored, as in a libopus built
+    /// without them.
     ///
     /// LACE and NoLACE enhance SILK frames of 20 ms at the 16 kHz SILK
     /// rate: wideband SILK-only frames and the SILK layer of Hybrid frames.
@@ -5408,36 +5794,20 @@ impl OpusDecoder {
     /// with BWE (it outputs silence until the next SILK frame). opus1
     /// decodes them, as libopus main does.
     ///
-    /// Without the cargo feature `osce-bwe` this returns
-    /// [`Unimplemented`](crate::ErrorKind::Unimplemented), as libopus returns
-    /// `OPUS_UNIMPLEMENTED` when it was built without the extension.
+    /// The method exists only with the cargo feature `osce-bwe`. (libopus
+    /// built without the extension answers `OPUS_UNIMPLEMENTED`.)
     /// [`reset_state`](Self::reset_state) keeps the switch, and so does the
     /// state of the extension, as in libopus.
-    pub fn set_osce_bwe(&mut self, enabled: bool) -> Result<(), Error> {
-        #[cfg(feature = "osce-bwe")]
-        {
-            self.osce_bwe = enabled;
-            Ok(())
-        }
-        #[cfg(not(feature = "osce-bwe"))]
-        {
-            let _ = enabled;
-            Err(Error::UNIMPLEMENTED)
-        }
+    #[cfg(feature = "osce-bwe")]
+    pub fn set_osce_bwe(&mut self, enabled: bool) {
+        self.osce_bwe = enabled;
     }
 
     /// The switch set with [`set_osce_bwe`](Self::set_osce_bwe)
-    /// (`OPUS_GET_OSCE_BWE`). Without the cargo feature `osce-bwe` this returns
-    /// [`Unimplemented`](crate::ErrorKind::Unimplemented), as libopus does.
-    pub fn osce_bwe(&self) -> Result<bool, Error> {
-        #[cfg(feature = "osce-bwe")]
-        {
-            Ok(self.osce_bwe)
-        }
-        #[cfg(not(feature = "osce-bwe"))]
-        {
-            Err(Error::UNIMPLEMENTED)
-        }
+    /// (`OPUS_GET_OSCE_BWE`, feature `osce-bwe`).
+    #[cfg(feature = "osce-bwe")]
+    pub fn osce_bwe(&self) -> bool {
+        self.osce_bwe
     }
 
     /// libopus `OPUS_SET_DNN_BLOB`: loads neural network weights from a
@@ -5460,13 +5830,17 @@ impl OpusDecoder {
     /// libopus differs: the request exists only in a libopus built with
     /// `USE_WEIGHTS_FILE` (and so without built-in weights), returns 1 on
     /// any failure, and can leave a model half loaded.
-    #[cfg(feature = "dnn")]
+    ///
+    /// The method exists only with the cargo feature `deep-plc` (which
+    /// `osce`, `osce-bwe` and `dred` turn on): a build without a model
+    /// could load nothing.
+    #[cfg(feature = "deep-plc")]
     pub fn set_dnn_blob(&mut self, blob: &DnnBlob) -> Result<DnnModels, Error> {
         self.dnn.load(blob)
     }
 
-    /// The model groups the decoder has loaded.
-    #[cfg(feature = "dnn")]
+    /// The model groups the decoder has loaded (feature `deep-plc`).
+    #[cfg(feature = "deep-plc")]
     pub fn dnn_models(&self) -> DnnModels {
         self.dnn.models()
     }
@@ -6530,6 +6904,80 @@ fn smooth_fade(
 mod tests {
     use super::*;
     use crate::packet::{Framing, Padding};
+
+    /// The `Debug` output of the codecs shows their settings and none of
+    /// their buffers, so it stays short.
+    #[test]
+    fn debug_shows_the_settings_only() {
+        let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
+        enc.set_force_mode(Some(ForcedMode::CeltOnly));
+        let text = format!("{enc:?}");
+        assert!(text.starts_with("OpusEncoder { sampling_rate: Hz48000, channels: Stereo, application: Audio, bitrate_setting: Auto, complexity: 9,"), "{text}");
+        assert!(text.contains("force_mode: Some(CeltOnly)") && text.ends_with(", .. }"), "{text}");
+        assert!(text.len() < 600, "{text}");
+
+        let dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
+        let text = format!("{dec:?}");
+        assert!(text.starts_with("OpusDecoder { sampling_rate: Hz16000, channels: Mono, complexity: 0, gain: 0, phase_inversion_disabled: true"), "{text}");
+        assert!(text.len() < 200, "{text}");
+
+        let packet = [0xfc, 1, 2, 3];
+        let mut rp = packet::Repacketizer::new();
+        rp.cat(&packet).unwrap();
+        assert_eq!(format!("{rp:?}"), "Repacketizer { toc: 252, nb_frames: 1, .. }");
+
+        let ms = multistream::MultistreamEncoder::new(SampleRate::Hz48000, 2, 1, 1, &[0, 1], Application::Voip).unwrap();
+        let text = format!("{ms:?}");
+        assert!(text.starts_with("MultistreamEncoder { sampling_rate: Hz48000, layout: "), "{text}");
+        assert!(text.contains("application: Voip") && text.len() < 600, "{text}");
+        let ms = multistream::MultistreamDecoder::with_layout(SampleRate::Hz24000, 2, 2, 0, &[0, 1]).unwrap();
+        let text = format!("{ms:?}");
+        assert!(text.starts_with("MultistreamDecoder { sampling_rate: Hz24000, layout: "), "{text}");
+        assert!(text.len() < 400, "{text}");
+
+        #[cfg(feature = "dred")]
+        {
+            assert_eq!(
+                format!("{:?}", OpusDred::new()),
+                "OpusDred { parsed: false, processed: false, nb_latents: 0, dred_offset: 0, .. }"
+            );
+            assert_eq!(format!("{:?}", OpusDredDecoder::new()), "OpusDredDecoder { loaded: true, .. }");
+        }
+    }
+
+    /// The getters of the settings that have no libopus request return
+    /// what was set; the bandwidth getters follow libopus
+    /// (`core_controls_libopus.rs` compares them).
+    #[test]
+    fn the_new_getters_return_what_was_set() {
+        let mut enc = OpusEncoder::new(SampleRate::Hz24000, Channels::Mono, Application::Voip).unwrap();
+        assert_eq!(enc.force_mode(), None);
+        for mode in [ForcedMode::SilkOnly, ForcedMode::Hybrid, ForcedMode::CeltOnly] {
+            enc.set_force_mode(Some(mode));
+            assert_eq!(enc.force_mode(), Some(mode));
+        }
+        enc.set_force_mode(None);
+        assert_eq!(enc.force_mode(), None);
+        assert_eq!(enc.max_bandwidth(), Bandwidth::Fullband);
+        enc.set_max_bandwidth(Bandwidth::Wideband);
+        assert_eq!(enc.max_bandwidth(), Bandwidth::Wideband);
+        // libopus starts with fullband, whatever the rate.
+        assert_eq!(enc.bandwidth(), Bandwidth::Fullband);
+        let mut packet = [0u8; 1275];
+        enc.encode(&[0.1f32; 480], 480, &mut packet).unwrap();
+        assert!(matches!(enc.bandwidth(), Bandwidth::Narrowband | Bandwidth::Mediumband | Bandwidth::Wideband));
+
+        let mut dec = OpusDecoder::new(SampleRate::Hz24000, Channels::Mono).unwrap();
+        assert_eq!(dec.bandwidth(), None);
+        assert_eq!(dec.nb_samples(&packet), Ok(480));
+        let mut pcm = [0.0f32; 480];
+        dec.decode(&packet, 480, &mut pcm).unwrap();
+        assert_eq!(dec.bandwidth(), Some(packet::bandwidth(packet[0])));
+        dec.decode(&[], 480, &mut pcm).unwrap();
+        assert_eq!(dec.bandwidth(), Some(packet::bandwidth(packet[0])), "a loss keeps it");
+        dec.reset_state();
+        assert_eq!(dec.bandwidth(), None);
+    }
 
     #[test]
     fn sample_rates_convert_to_and_from_numbers() {

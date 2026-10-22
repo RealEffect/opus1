@@ -135,6 +135,38 @@ test that compares opus1 with the C library under the same settings.
     number of samples per channel is `pcm.len() / channels`. No channels, a
     length that is not a multiple of `channels` and fewer memory values than
     channels are `BadArg`; they used to leave `pcm` unchanged silently.
+- The single-stream encoder and decoder:
+  - The DRED decode calls follow the names of the decode calls:
+    `OpusDecoder::dred_decode_float` -> `dred_decode` (`f32` output, libopus
+    `opus_decoder_dred_decode_float`), `dred_decode` -> `dred_decode_i16`
+    (libopus `opus_decoder_dred_decode`). `dred_decode24` keeps its name.
+  - New `OpusEncoder::init(slot, SampleRate, Channels, Application) ->
+    Result<&mut OpusEncoder, Error>` builds an encoder in memory that the
+    caller provides, as `OpusDecoder::init` builds a decoder. Without `heap`
+    it needs less than 16 KB of stack, where `new` needs more than 256 KB.
+    `OpusEncoder::reset_state` now writes the new state in place too.
+  - New getters: `OpusEncoder::bandwidth() -> Bandwidth` (libopus
+    `OPUS_GET_BANDWIDTH`: the bandwidth of the last packet, fullband before
+    the first), `max_bandwidth() -> Bandwidth` (`OPUS_GET_MAX_BANDWIDTH`) and
+    `force_mode() -> Option<ForcedMode>`; `OpusDecoder::bandwidth() ->
+    Option<Bandwidth>` (`OPUS_GET_BANDWIDTH`, `None` before the first packet)
+    and `nb_samples(packet) -> Result<usize, Error>`
+    (`opus_decoder_get_nb_samples`).
+  - A method that needs a cargo feature exists only with it. `set_osce_bwe`
+    and `osce_bwe` of `OpusDecoder`, and `MultistreamDecoder::set_osce_bwe`,
+    need `osce-bwe`; without it they used to return `Unimplemented`.
+    `set_osce_bwe(bool)` returns `()` instead of `Result<(), Error>`, and
+    `osce_bwe()` returns `bool` instead of `Result<bool, Error>`.
+  - Every `set_dnn_blob` returns `Result<DnnModels, Error>`: those of
+    `OpusEncoder` (feature `dred`) and `OpusDredDecoder` returned `Result<(),
+    Error>`. New `DnnModels::DRED_ENCODER` (the RDOVAE encoder and PitchDNN)
+    and `DnnModels::DRED_DECODER` (the RDOVAE decoder) are what they load.
+  - `Debug` for `OpusEncoder`, `OpusDecoder`, `MultistreamEncoder`,
+    `MultistreamDecoder`, `OpusDred` and `OpusDredDecoder`. It shows the
+    settings, never the buffers. The `Debug` of `Repacketizer` no longer
+    shows the frames it holds.
+  - New constants `opus1::VERSION` (the crate version) and
+    `opus1::LIBOPUS_VERSION` (`"1.6.1"`, the libopus release opus1 follows).
 - `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
   so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
   call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
@@ -259,10 +291,10 @@ test that compares opus1 with the C library under the same settings.
 - `MultistreamEncoder` forwards the forced channel count, the prediction and
   phase inversion switches, the application and the voice ratio as libopus
   does (difference D5 closed).
-- Deep redundancy (DRED, cargo feature `dred`, off by default), as in libopus 1.5 and later: `OpusEncoder::set_dred_duration` and `dred_duration` (`OPUS_SET_DRED_DURATION`, `OPUS_GET_DRED_DURATION`), `OpusEncoder::set_dnn_blob`, and on the decoder side `OpusDredDecoder` (`opus_dred_decoder_*`, `opus_dred_parse`, `opus_dred_process`), `OpusDred` (`opus_dred_alloc`) and `OpusDecoder::dred_decode`, `dred_decode_float` and `dred_decode24` (`opus_decoder_dred_decode*`). Without the feature, or with a duration of 0, the packets do not change.
+- Deep redundancy (DRED, cargo feature `dred`, off by default), as in libopus 1.5 and later: `OpusEncoder::set_dred_duration` and `dred_duration` (`OPUS_SET_DRED_DURATION`, `OPUS_GET_DRED_DURATION`), `OpusEncoder::set_dnn_blob`, and on the decoder side `OpusDredDecoder` (`opus_dred_decoder_*`, `opus_dred_parse`, `opus_dred_process`), `OpusDred` (`opus_dred_alloc`) and `OpusDecoder::dred_decode` (`f32` output, `opus_decoder_dred_decode_float`), `dred_decode_i16` (`opus_decoder_dred_decode`) and `dred_decode24` (`opus_decoder_dred_decode24`). Without the feature, or with a duration of 0, the packets do not change.
 - Packet extensions of libopus 1.5 and later: the module `extensions` (libopus `src/extensions.c`), `packet::Repacketizer` (libopus `OpusRepacketizer`), which carries extensions, and `packet::pad_with_extensions`, `packet::unpad` and `packet::multistream_unpad`.
 - Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/09](09-testing.md#evaluation-tools)).
-- `OpusDecoder::init(slot, sampling_rate, channels)` builds a decoder in memory that the caller provides (`&mut MaybeUninit<OpusDecoder>`, for example a `static`) and returns `&mut OpusDecoder`. Upstream opus-rs added the same function in PR #65 (by Alix ANNERAUD); opus1 implements it in its own way, because its decoder also holds the state of the neural network features. Every part of the decoder is written in place, field by field: the CELT and SILK decoders, the OSCE and BWE states, deep PLC and the model holder. A macro, `write_fields!`, checks at compile time that every field of each struct is written. `new` now goes through the same code. The tables that every decoder shares (the CELT mode and the built-in models) are also built in place, on first use. Measured in a release build for aarch64 without `heap`: `init` needs less than 16 KB of stack, also with `osce-bwe` and `dred` and on the first call of a program, where `new` needs about 192 KB (512 KB with those features). With `heap`, `init` writes the boxed parts straight into their heap memory. Tested by `tests/decoder_init.rs`, adapted from upstream: the output of a decoder from `init` equals that of one from `new` (five settings, with lost packets, at complexity 0 and 10), and `init` and decoding run on a thread with a 32 KB stack. The encoder and the multistream decoder have no `init` yet.
+- `OpusDecoder::init(slot, sampling_rate, channels)` builds a decoder in memory that the caller provides (`&mut MaybeUninit<OpusDecoder>`, for example a `static`) and returns `&mut OpusDecoder`. Upstream opus-rs added the same function in PR #65 (by Alix ANNERAUD); opus1 implements it in its own way, because its decoder also holds the state of the neural network features. Every part of the decoder is written in place, field by field: the CELT and SILK decoders, the OSCE and BWE states, deep PLC and the model holder. A macro, `write_fields!`, checks at compile time that every field of each struct is written. `new` now goes through the same code. The tables that every decoder shares (the CELT mode and the built-in models) are also built in place, on first use. Measured in a release build for aarch64 without `heap`: `init` needs less than 16 KB of stack, also with `osce-bwe` and `dred` and on the first call of a program, where `new` needs about 192 KB (512 KB with those features). With `heap`, `init` writes the boxed parts straight into their heap memory. Tested by `tests/decoder_init.rs`, adapted from upstream: the output of a decoder from `init` equals that of one from `new` (five settings, with lost packets, at complexity 0 and 10), and `init` and decoding run on a thread with a 32 KB stack. `OpusEncoder::init` builds an encoder in the same way: the CELT and SILK encoders, the speech and music analysis and the DRED encoder are written in place, and `tests/encoder_init.rs` checks that its packets equal those of `new` and that `init` and `reset_state` run on a 32 KB stack. The multistream encoder and decoder have no `init` yet.
 - The feature `portable-atomic`: the crate builds for targets without atomic compare-and-swap (CAS), such as `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf` (ESP32-C3), as upstream opus-rs PR #64 (by Alix ANNERAUD) does. The only compare-and-swap of the crate guards the lazily built shared tables (`compat::OnceCell`); with the feature its atomic comes from the `portable-atomic` crate. `Arc` is used only with `heap`, which needs `std`. On such a target the application also sets portable-atomic's `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip. Checked with `cargo build --target thumbv6m-none-eabi --no-default-features --features libm,portable-atomic` (also with `analysis`, and with `osce-bwe,dred`); `scripts/check_no_std.sh` now builds it.
 
 ## Behaviour changes

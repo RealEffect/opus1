@@ -1,5 +1,6 @@
 use crate::Error;
 use crate::fixedvec::FixedVec;
+use crate::in_place::{HeapMemory, write_fields, write_zero};
 use crate::float2int16;
 use crate::range_coder::{RangeCoder, RangeCoderState};
 use crate::silk::control_codec::{
@@ -1318,11 +1319,59 @@ impl<T> core::ops::DerefMut for Inline<T> {
     }
 }
 
-fn slot<T>(value: T) -> Slot<T> {
+/// Writes a [`Slot`] whose value `init` writes in place: on the heap with
+/// the `heap` feature (in the box `this` holds with
+/// [`HeapMemory::Reuse`]), in `this` itself without it.
+///
+/// # Safety
+/// `this` must be valid for writes of `Slot<T>`, and `init` must
+/// initialize the whole `T` that its pointer points to. With `Reuse` and
+/// `heap`, `this` must hold a valid slot, and `init` must not panic.
+unsafe fn write_slot<T>(this: *mut Slot<T>, memory: HeapMemory, init: impl FnOnce(*mut T)) {
+    // SAFETY: the caller guarantees the conditions of `write_box`.
     #[cfg(feature = "heap")]
-    return Box::new(value);
+    unsafe {
+        crate::in_place::write_box(this, memory, init)
+    }
+    // SAFETY: as above. `Inline<T>` holds only the `T`.
     #[cfg(not(feature = "heap"))]
-    return Inline(value);
+    unsafe {
+        let _ = memory;
+        init(&raw mut (*this).0)
+    }
+}
+
+/// The side channel of [`SilkEncoder`], for stereo input only (libopus
+/// `state_Fxx[1]`). With the `heap` feature it is on the heap, and a mono
+/// encoder has none.
+#[cfg(feature = "heap")]
+type SideSlot = Option<Box<SilkChannel>>;
+#[cfg(not(feature = "heap"))]
+type SideSlot = InlineSide;
+
+/// [`SideSlot`] without the `heap` feature. The channel is always there,
+/// as it would be in an `Option`, so that it can be written in place;
+/// `stereo` says whether it is used. The methods are those of `Option`
+/// that the encoder calls.
+#[cfg(not(feature = "heap"))]
+struct InlineSide {
+    stereo: bool,
+    ch: SilkChannel,
+}
+
+#[cfg(not(feature = "heap"))]
+impl InlineSide {
+    fn is_some(&self) -> bool {
+        self.stereo
+    }
+
+    fn as_deref(&self) -> Option<&SilkChannel> {
+        self.stereo.then_some(&self.ch)
+    }
+
+    fn as_deref_mut(&mut self) -> Option<&mut SilkChannel> {
+        if self.stereo { Some(&mut self.ch) } else { None }
+    }
 }
 
 /// The input of [`SilkEncoder::encode`]: interleaved samples at the input
@@ -1448,10 +1497,26 @@ struct SilkChannel {
 }
 
 impl SilkChannel {
-    fn new() -> Self {
-        let mut state = SilkEncoderState::default();
-        silk_init_encoder(&mut state, 0);
-        Self { state, resampler: SilkResampler::default(), x: [0; MAX_PACKET_SAMPLES] }
+    /// Writes a new channel to `this`, which may be uninitialized memory
+    /// (see `crate::in_place`): a state that `silk_init_encoder` has set
+    /// up, a resampler that the first packet sets up, and a cleared
+    /// buffer.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    unsafe fn write_new(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below writes the whole field it is given.
+        unsafe {
+            write_fields!(this, {
+                state = |p: *mut SilkEncoderState| {
+                    p.write(SilkEncoderState::default());
+                    silk_init_encoder(&mut *p, 0);
+                },
+                resampler: SilkResampler::default(),
+                x = |p| write_zero(p),
+            });
+        }
     }
 }
 
@@ -1469,7 +1534,7 @@ pub struct SilkEncoder {
     /// the packet's bit counters.
     mid: Slot<SilkChannel>,
     /// The side channel, for stereo input only (libopus `state_Fxx[1]`).
-    side: Option<Slot<SilkChannel>>,
+    side: SideSlot,
     /// One input channel at the input rate, before resampling.
     api_buf: Slot<[i16; MAX_API_SAMPLES]>,
     /// The channels are set up for a rate. A restart clears this until the
@@ -1484,13 +1549,53 @@ impl SilkEncoder {
     /// An encoder for input at `api_hz` with `api_channels` (1 or 2)
     /// channels. The first call of [`encode`](Self::encode) sets it up.
     pub fn new(api_hz: i32, api_channels: usize) -> Self {
-        Self {
-            api_hz,
-            mid: slot(SilkChannel::new()),
-            side: (api_channels == 2).then(|| slot(SilkChannel::new())),
-            api_buf: slot([0; MAX_API_SAMPLES]),
-            initialized: false,
-            time_since_switch_allowed_ms: 0,
+        let mut enc = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_new` initializes every field of `enc`.
+        unsafe {
+            Self::write_new(enc.as_mut_ptr(), api_hz, api_channels, HeapMemory::Allocate);
+            enc.assume_init()
+        }
+    }
+
+    /// Writes the encoder of [`new`](Self::new) to `this` without building
+    /// it on the stack first (see `crate::in_place`). With
+    /// [`HeapMemory::Allocate`] `this` may be uninitialized memory. With
+    /// [`HeapMemory::Reuse`] it holds an encoder, whose heap memory (feature
+    /// `heap`) the new one keeps: the opus encoder's reset.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`, and with `Reuse` it must
+    /// hold a valid encoder.
+    pub(crate) unsafe fn write_new(this: *mut Self, api_hz: i32, api_channels: usize, memory: HeapMemory) {
+        let stereo = api_channels == 2;
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below writes the whole field it is given.
+        unsafe {
+            write_fields!(this, {
+                api_hz: api_hz,
+                mid = |p| write_slot(p, memory, |q| SilkChannel::write_new(q)),
+                // With `Reuse` a stereo encoder keeps the box of its side
+                // channel. Otherwise the old value, if there is one, is
+                // dropped, and a new one is written.
+                #[cfg(feature = "heap")]
+                side = |p: *mut SideSlot| {
+                    if memory == HeapMemory::Reuse {
+                        if let (true, Some(side)) = (stereo, &mut *p) {
+                            return SilkChannel::write_new(&raw mut **side);
+                        }
+                        core::ptr::drop_in_place(p);
+                    }
+                    p.write(stereo.then(|| crate::in_place::boxed(|q| SilkChannel::write_new(q))))
+                },
+                #[cfg(not(feature = "heap"))]
+                side = |p: *mut InlineSide| {
+                    (&raw mut (*p).stereo).write(stereo);
+                    SilkChannel::write_new(&raw mut (*p).ch)
+                },
+                api_buf = |p| write_slot(p, memory, |q| write_zero(q)),
+                initialized: false,
+                time_since_switch_allowed_ms: 0,
+            });
         }
     }
 

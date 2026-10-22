@@ -18,6 +18,7 @@
 //! `DRED_EXTENSION_ID` (126).
 
 use crate::Error;
+use crate::in_place::{write_fields, write_zero};
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 
@@ -124,27 +125,43 @@ pub(crate) struct DredEncoder {
 }
 
 impl DredEncoder {
-    /// libopus `dred_encoder_init` with the built-in models, and DRED off.
-    pub(crate) fn new(fs: i32, channels: usize) -> Self {
-        DredEncoder {
-            dnn: DredEncoderDnn::new(),
-            duration: 0,
-            q0: 0,
-            dq: 0,
-            qmax: 0,
-            target_chunks: 0,
-            bitrate_bps: 0,
-            activity_mem: [0; 4 * DRED_MAX_FRAMES],
-            enc: DredEnc::new(fs, channels),
+    /// libopus `dred_encoder_init` with the built-in models, and DRED off,
+    /// written to `this`, which may be uninitialized memory, without
+    /// building it on the stack first (see `crate::in_place`). It holds
+    /// about 52 KB.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut Self, fs: i32, channels: usize) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below writes the whole field it is given.
+        unsafe {
+            write_fields!(this, {
+                dnn: DredEncoderDnn::new(),
+                duration: 0,
+                q0: 0,
+                dq: 0,
+                qmax: 0,
+                target_chunks: 0,
+                bitrate_bps: 0,
+                activity_mem = |p| write_zero(p),
+                enc = |p| DredEnc::write_new(p, fs, channels),
+            });
         }
     }
 
-    /// Swaps the models with those of `other`. `OpusEncoder::reset_state`
-    /// gives a new encoder the models of the old one: libopus's
+    /// Takes the models out and leaves the built-in ones in their place.
+    /// `OpusEncoder::reset_state` gives the models back to the encoder it
+    /// writes anew, with [`set_models`](Self::set_models): libopus's
     /// `OPUS_RESET_STATE` clears the DRED state and turns DRED off, but
     /// keeps the RDOVAE encoder.
-    pub(crate) fn swap_models(&mut self, other: &mut DredEncoder) {
-        core::mem::swap(&mut self.dnn, &mut other.dnn);
+    pub(crate) fn take_models(&mut self) -> DredEncoderDnn {
+        core::mem::replace(&mut self.dnn, DredEncoderDnn::new())
+    }
+
+    /// Puts back the models that [`take_models`](Self::take_models) took.
+    pub(crate) fn set_models(&mut self, dnn: DredEncoderDnn) {
+        self.dnn = dnn;
     }
 
     /// libopus `OPUS_SET_DRED_DURATION`: 0 to `DRED_MAX_FRAMES` frames of
@@ -168,9 +185,10 @@ impl DredEncoder {
     }
 
     /// libopus `dred_encoder_load_model`: the RDOVAE encoder and PitchDNN
-    /// from `blob`. When one of them is missing, returns `"DNN blob holds
-    /// no model of this build"` and keeps the models it had.
-    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<(), Error> {
+    /// from `blob`. Returns `DnnModels::DRED_ENCODER`. When one of them is
+    /// missing, returns "DNN blob holds no model of this build" and keeps
+    /// the models it had.
+    pub(crate) fn load(&mut self, blob: &DnnBlob) -> Result<crate::DnnModels, Error> {
         self.dnn.load(blob)
     }
 
@@ -400,22 +418,30 @@ impl DredEncoder {
 }
 
 impl DredEnc {
-    /// libopus `dred_encoder_reset` on a new state.
-    fn new(fs: i32, channels: usize) -> Self {
-        DredEnc {
-            lpcnet: LpcnetEncState::new(),
-            rdovae: RdovaeEncState::new(),
-            fs,
-            channels,
-            input_buffer: [0.0; 2 * DRED_DFRAME_SIZE],
-            input_buffer_fill: DRED_SILK_ENCODER_DELAY,
-            dred_offset: 0,
-            latent_offset: 0,
-            last_extra_dred_offset: 0,
-            latents_buffer: [0.0; DRED_MAX_FRAMES * DRED_LATENT_DIM],
-            latents_buffer_fill: 0,
-            state_buffer: [0.0; DRED_MAX_FRAMES * DRED_STATE_DIM],
-            resample_mem: [0.0; RESAMPLING_ORDER + 1],
+    /// libopus `dred_encoder_reset` on a new state, written to `this`, which
+    /// may be uninitialized memory (see `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    unsafe fn write_new(this: *mut Self, fs: i32, channels: usize) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below writes the whole field it is given.
+        unsafe {
+            write_fields!(this, {
+                lpcnet = |p| write_zero(p),
+                rdovae = |p| write_zero(p),
+                fs: fs,
+                channels: channels,
+                input_buffer = |p| write_zero(p),
+                input_buffer_fill: DRED_SILK_ENCODER_DELAY,
+                dred_offset: 0,
+                latent_offset: 0,
+                last_extra_dred_offset: 0,
+                latents_buffer = |p| write_zero(p),
+                latents_buffer_fill: 0,
+                state_buffer = |p| write_zero(p),
+                resample_mem: [0.0; RESAMPLING_ORDER + 1],
+            });
         }
     }
 
