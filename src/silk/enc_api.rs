@@ -1294,6 +1294,9 @@ const MAX_PACKET_SAMPLES: usize = MAX_FRAMES_PER_PACKET * MAX_FRAME_LENGTH;
 /// Largest packet of one input channel at the input rate: 60 ms at 48 kHz.
 const MAX_API_SAMPLES: usize = 2880;
 
+#[cfg(all(feature = "heap", not(feature = "std")))]
+use alloc::boxed::Box;
+
 /// A value of [`SilkEncoder`] on the heap (`heap` feature) or in place.
 #[cfg(feature = "heap")]
 type Slot<T> = Box<T>;

@@ -129,13 +129,8 @@ fn the_multistream_decoder_of_libopus_does_not_forward_the_bwe_switch() {
     assert_eq!(unsafe { sys::opus_multistream_decoder_ctl(st, OPUS_SET_OSCE_BWE_REQUEST, 1) }, sys::OPUS_UNIMPLEMENTED);
     unsafe { sys::opus_multistream_decoder_destroy(st) };
 
-    let table = opus1::multistream::ChannelMappingTable {
-        channels: 2,
-        stream_count: 2,
-        coupled_count: 0,
-        mapping: mapping.to_vec(),
-    };
-    let mut d = opus1::multistream::MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap();
+    let table = opus1::multistream::ChannelMappingTable::new(2, 2, 0, &mapping);
+    let mut d = opus1::multistream::MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table).unwrap();
     d.set_complexity(7).unwrap();
     assert_eq!(d.stream_decoder(1).unwrap().complexity(), 7);
     #[cfg(feature = "osce-bwe")]

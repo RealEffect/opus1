@@ -1152,7 +1152,7 @@ mod tests {
                 assert_eq!((rd[0], got[0]), (expected_rd[l], expected[l]), "1, order {order}");
             }
             let none: [i32; 0] = silk_nlsf_del_dec_quant_group(&mut [], &[]);
-            assert_eq!(none, []);
+            assert_eq!(none, [0i32; 0]);
         }
         // Both kinds of search occurred in the groups of 4: handed over and
         // not handed over.

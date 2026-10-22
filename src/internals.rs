@@ -128,7 +128,7 @@ pub mod modes {
         CeltMode, SPREAD_ICDF, TAPSET_ICDF, TF_SELECT_TABLE, TRIM_ICDF, default_mode,
     };
 }
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 pub mod multistream {
     pub mod rate_alloc {
         pub use crate::multistream::rate_alloc::{

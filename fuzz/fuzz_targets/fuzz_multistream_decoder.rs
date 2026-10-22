@@ -141,7 +141,7 @@ fn run(data: &[u8]) -> Result<()> {
         };
     }
 
-    let rust = MultistreamDecoder::with_layout(
+    let rust = MultistreamDecoder::new(
         SampleRate::try_from(fs).unwrap(),
         channels,
         streams,
@@ -165,7 +165,7 @@ fn run(data: &[u8]) -> Result<()> {
     tail.extend_from_slice(&mapping[..channels]);
     let family = *u.choose(&[1u8, 2, 255])?;
     let table = ChannelMappingTable::parse(family, channels as u8, &tail).expect("a whole table");
-    assert!(MultistreamDecoder::new(SampleRate::try_from(fs).unwrap(), table).is_ok(), "the decoder refuses the table of a valid layout");
+    assert!(MultistreamDecoder::from_mapping_table(SampleRate::try_from(fs).unwrap(), &table).is_ok(), "the decoder refuses the table of a valid layout");
     assert!(ChannelMappingTable::parse(0, channels as u8, &tail).is_none());
     assert!(ChannelMappingTable::parse(family, channels as u8, &tail[..tail.len() - 1]).is_none());
 

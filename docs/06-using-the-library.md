@@ -726,7 +726,7 @@ A new decoder has the built-in weights of every network of its build. `set_dnn_b
 
 A `DnnBlob` is made in one of three ways:
 
-- `DnnBlob::from_bytes(&bytes)` copies the bytes into memory that starts on a 64-byte boundary. It needs the `heap` feature.
+- `DnnBlob::from_bytes(&bytes)` copies the bytes into memory that starts on a 64-byte boundary. It needs the `heap` feature and a target with atomic compare-and-swap (see [Targets without compare-and-swap](#targets-without-compare-and-swap)).
 - `DnnBlob::from_static(bytes)` uses bytes that live as long as the program, without a copy. Every array of the blob must start on a 4-byte boundary.
 - `DnnBlob::builtin()` is the built-in weights (with `deep-plc`, `osce` or `osce-bwe`).
 
@@ -840,7 +840,7 @@ assert_eq!(decoder.pitch(), 0); // nothing decoded yet
 
 ## More than two channels
 
-`OpusEncoder` and `OpusDecoder` handle 1 or 2 channels. For 3 to 255 channels, such as 5.1 surround, use `opus1::multistream::MultistreamEncoder` and `MultistreamDecoder`. A multistream packet holds one ordinary Opus packet per stream. Each stream has its own `OpusEncoder` or `OpusDecoder`. The module needs the `std` feature. [Multichannel audio](05-multichannel.md) explains the channel layouts and the settings.
+`OpusEncoder` and `OpusDecoder` handle 1 or 2 channels. For 3 to 255 channels, such as 5.1 surround, use `opus1::multistream::MultistreamEncoder` and `MultistreamDecoder`. A multistream packet holds one ordinary Opus packet per stream. Each stream has its own `OpusEncoder` or `OpusDecoder`. The module needs the `alloc` feature, which `std` turns on. [Multichannel audio](05-multichannel.md) explains the channel layouts, the channel order of the output and the settings.
 
 ```rust
 use opus1::{Application, SampleRate};
@@ -848,15 +848,7 @@ use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
 
 // 5.1 at 48 kHz, channel mapping family 1 (Vorbis channel order).
 let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
-let layout = encoder.layout().clone();
-let mut decoder = MultistreamDecoder::with_layout(
-    SampleRate::Hz48000,
-    6,
-    layout.streams(),
-    layout.coupled_streams(),
-    layout.mapping(),
-)
-.unwrap();
+let mut decoder = MultistreamDecoder::from_layout(SampleRate::Hz48000, encoder.layout()).unwrap();
 
 let pcm = vec![0.0f32; 960 * 6]; // 20 ms, interleaved
 let mut packet = vec![0u8; 4000];
@@ -871,8 +863,9 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 
 | Feature | Default | What it does |
 |---|---|---|
-| `std` | on | Links the standard library. On x86-64 it detects the vector instructions AVX and AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add) at run time. On aarch64 it detects FEAT_FCMA (the complex-number instructions of ARMv8.3) at run time where the target does not include them already. Without `std` the crate is `#![no_std]`. |
-| `heap` | on | Keeps the large codec state behind `Box`, so `OpusEncoder` and `OpusDecoder` themselves are small. Requires `std`. |
+| `std` | on | Links the standard library. On x86-64 it detects the vector instructions AVX and AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add) at run time. On aarch64 it detects FEAT_FCMA (the complex-number instructions of ARMv8.3) at run time where the target does not include them already. Without `std` the crate is `#![no_std]`. It turns on `alloc`. |
+| `alloc` | on (through `std`) | Uses a global allocator, without the rest of the standard library. It adds the `multistream` module. It also lets the `packet` functions keep more than 32 extensions and copy more than 1275 bytes of old padding in one call; without it they return an error of kind `AllocFail` there. |
+| `heap` | on | Keeps the large codec state behind `Box`, so `OpusEncoder` and `OpusDecoder` themselves are small. It turns on `alloc`, so it also works without `std` when the program has a global allocator. |
 | `analysis` | on | The speech and music analysis of the encoder. It adds about 28 KB of machine code and 24 KB of tables, most of them the weights of its network as `f32` (measured in a release build for aarch64-apple-darwin that encodes one frame). Without it the encoder decides at every complexity as at complexity 6, and `OpusEncoder` is 25,968 bytes smaller without `heap` (see below). It works with and without `std`. |
 | `libm` | off | Provides `sin`, `cos`, `sqrt` and the other float functions through the `libm` crate, a pure-Rust port of the musl C library's math functions. A build without `std` needs it. |
 | `portable-atomic` | off | For targets without atomic compare-and-swap (CAS) instructions, such as `thumbv6m-none-eabi` (Cortex-M0 and M0+). The shared tables are then built with the atomics of the `portable-atomic` crate. See [Targets without compare-and-swap](#targets-without-compare-and-swap). |
@@ -880,10 +873,12 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 | `dnn` | off | The code that the neural network features share. The features above turn it on. Alone it adds no public API. |
 | `test-libopus-dnn` | off | For the tests of this repository only. It adds nothing to the library. It compiles the tests that call a libopus built with its neural network code. `cargo test --all-features` fails to link against a libopus without that code, such as the Homebrew build. |
 
-Three builds are possible:
+Five builds are possible:
 
 - Default (`std`, `heap` and `analysis`): no dependencies at run time.
 - `std` without `heap` (`default-features = false, features = ["std", "analysis"]`): the codec state is stored inline, and the `multistream` module is available.
+- `#![no_std]` with `heap` (`default-features = false, features = ["heap", "libm", "analysis"]`): for a target without an operating system that has a global allocator. The codec state is on the heap, as in the default build, and the `multistream` module is available. One dependency, `libm` (two with `portable-atomic`).
+- `#![no_std]` with `alloc` (`default-features = false, features = ["alloc", "libm", "analysis"]`): for a target without an operating system that has a global allocator. The codec state is stored inline, as without `heap`, and the `multistream` module is available. Its encoder and decoder build each stream codec in place in the memory they allocate, so building them needs little stack (see [Building the encoder and the decoder in place](#building-the-encoder-and-the-decoder-in-place)). One dependency, `libm` (two with `portable-atomic`).
 - `#![no_std]` without `alloc` (`default-features = false, features = ["libm", "analysis"]`): no allocator is needed at all. One dependency, `libm` (two with `portable-atomic`). The `multistream` module is not available. A build with neither `std` nor `libm` stops with a compile error that names the missing feature.
 
 ```toml
@@ -893,7 +888,7 @@ default-features = false
 features = ["libm", "analysis"]
 ```
 
-The neural network features work in all three builds. Without `heap`, `DnnBlob::from_bytes` is missing, and a blob must live as long as the program (`DnnBlob::from_static`). Without `std`, the networks take `exp`, `log` and the other functions they need from the `libm` crate, whose last bits can differ from those of the platform's C library.
+The neural network features work in all five builds. Without `heap`, `DnnBlob::from_bytes` is missing, and a blob must live as long as the program (`DnnBlob::from_static`). Without `std`, the networks take `exp`, `log` and the other functions they need from the `libm` crate, whose last bits can differ from those of the platform's C library.
 
 Leave out `analysis` to save its code and tables and the 26 KB of its state, for example on a small processor that encodes at complexity 6 or below anyway.
 
@@ -929,7 +924,18 @@ Measured in a release build for aarch64 without `heap`, with and without the neu
 
 `init` overwrites what the slot holds without dropping it. A codec without `heap` owns no other memory, so there is nothing to drop and nothing leaks. With `heap`, `init` also works: it writes the large parts straight into their heap memory. A second `init` on the same slot then leaks the heap memory of the first codec. Drop a codec that `init` built with `MaybeUninit::assume_init_drop` when it is no longer used. The intended use is a slot that lives as long as the program and is built once, as in the example above and in [Placing the codec in a static](#placing-the-codec-in-a-static).
 
-`tests/decoder_init.rs` and `tests/encoder_init.rs` check that a codec from `init` decodes or encodes exactly like one from `new`, and build it on a thread with a 32 KB stack. The multistream encoder and decoder have no `init` yet.
+`tests/decoder_init.rs` and `tests/encoder_init.rs` check that a codec from `init` decodes or encodes exactly like one from `new`, and build it on a thread with a 32 KB stack.
+
+The multistream encoder and decoder have no `init` yet: they allocate their memory when they are built (feature `alloc`). But their constructors build each stream encoder or decoder in place in that memory, with `OpusEncoder::init` or `OpusDecoder::init`. So `MultistreamEncoder::new`, `from_mapping_table`, `from_layout` and `new_surround`, and the constructors of `MultistreamDecoder`, need only a little stack, also without `heap`, and so does `reset_state` of both. Measured in a release build for aarch64, on a new thread with a given stack size, with each case in a program of its own, so that the first call also built the shared tables:
+
+| Work on the thread | Without `heap` (`alloc`, `libm`, `analysis`) | With `heap` (default) |
+|---|---|---|
+| `MultistreamEncoder::new` for stereo (one coupled stream) | 16 KiB was enough | 16 KiB was enough |
+| `MultistreamEncoder::new_surround` for 5.1 (4 streams) and 7.1 (5 streams) | 16 KiB was enough | 16 KiB was enough |
+| `new_surround` for 5.1, then `reset_state` | 16 KiB was enough | 16 KiB was enough |
+| `MultistreamDecoder::new` for stereo, 5.1 and 7.1 | 16 KiB was enough | 16 KiB was enough |
+
+16 KiB is the smallest stack that macOS gives a thread, so the real need is at most that. The same held with the features `osce-bwe` and `dred`, where a stream encoder holds 210 KB and a stream decoder 160 KB without `heap`. Before the constructors built the streams in place, a build without `heap` needed more than 256 KB to build a 5.1 encoder and more than 128 KB for a 5.1 decoder. `tests/multistream_small_stack.rs` builds every constructor on a thread with a 32 KB stack and checks that the codecs code exactly like codecs built on the main thread; `scripts/check_no_std.sh` runs it in a release build without `heap`.
 
 ### Targets without compare-and-swap
 
@@ -947,7 +953,7 @@ On such a target portable-atomic needs one more setting from the application:
 - On a single-core chip, build with `RUSTFLAGS="--cfg portable_atomic_unsafe_assume_single_core"`. portable-atomic then makes the compare-and-swap safe by turning interrupts off around it.
 - Otherwise, turn on portable-atomic's `critical-section` feature, and provide an implementation of the [`critical-section`](https://crates.io/crates/critical-section) crate (most hardware support crates have one).
 
-Without one of these, portable-atomic stops the build with an error that says so. Targets that have CAS do not need the feature; with it, they use their own atomic instructions. The `heap` feature needs `std`, and with `std` the crate uses `Arc` for a weight blob loaded at run time; targets without CAS have no `std`, so this does not concern them.
+Without one of these, portable-atomic stops the build with an error that says so. Targets that have CAS do not need the feature; with it, they use their own atomic instructions. The `heap` feature works on such targets too. Only `DnnBlob::from_bytes` is left out there: it shares its copy of a weight blob through an `Arc`, which needs CAS. Use `DnnBlob::from_static` instead.
 
 `scripts/check_no_std.sh` builds the crate for `thumbv6m-none-eabi` with `portable-atomic` when that target is installed. The neural network features build there as well.
 

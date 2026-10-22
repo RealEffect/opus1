@@ -7,6 +7,9 @@ use crate::silk::define::*;
 use crate::silk::resampler::SilkResampler;
 use crate::silk::structs::{NLSFCodebook, SideInfoIndices};
 
+#[cfg(all(feature = "osce", feature = "heap", not(feature = "std")))]
+use alloc::boxed::Box;
+
 /// Where a channel keeps its OSCE states (14 KB and 8 KB): behind a `Box`
 /// with the feature `heap`, inline without it. A `SilkDecoder` with them
 /// inline would be built on the stack before `OpusDecoder` boxes it, which

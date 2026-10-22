@@ -53,13 +53,7 @@ fn main() -> Result<(), opus1::Error> {
     if let Some(stream) = encoder.lfe_stream() {
         println!("stream {stream} carries the LFE channel");
     }
-    let mut decoder = MultistreamDecoder::with_layout(
-        SAMPLE_RATE,
-        layout.channels(),
-        layout.streams(),
-        layout.coupled_streams(),
-        layout.mapping(),
-    )?;
+    let mut decoder = MultistreamDecoder::from_layout(SAMPLE_RATE, &layout)?;
 
     // The test signal, interleaved: sample `i` of channel `c` is
     // `pcm[i * CHANNELS + c]`. Every channel has a note of its own with

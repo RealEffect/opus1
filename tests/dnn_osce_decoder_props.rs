@@ -222,7 +222,7 @@ fn decoding_with_osce_allocates_nothing() {
     }
     // Two mono streams that carry the same packets.
     let ms_packets: Vec<Vec<u8>> = packets(Kind::SilkWb, 1).iter().map(|p| ms_packet(p)).collect();
-    let mut ms = MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
+    let mut ms = MultistreamDecoder::new(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
     ms.set_complexity(7).unwrap();
     ms.set_osce_bwe(true);
     let mut buf = vec![0f32; 960 * 2];
@@ -384,7 +384,7 @@ fn the_multistream_decoder_forwards_bwe_to_every_stream() {
     for (complexity, bwe) in [(7, true), (4, true), (6, false)] {
         let want = signal(&decode(&mut decoder(48000, 1, complexity, bwe), &packets, |k| k % 9 == 4));
         let mut ms =
-            MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
+            MultistreamDecoder::new(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
         ms.set_complexity(complexity as u8).unwrap();
         ms.set_osce_bwe(bwe);
         let mut buf = vec![0f32; 960 * 2];

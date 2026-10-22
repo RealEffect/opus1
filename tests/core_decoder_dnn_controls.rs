@@ -244,13 +244,8 @@ impl Drop for CMsDec {
 /// A 5.1 decoder (4 streams, 2 of them coupled) on both sides.
 fn surround() -> (MultistreamDecoder, CMsDec) {
     let mapping = [0u8, 4, 1, 2, 3, 5];
-    let table = opus1::multistream::ChannelMappingTable {
-        channels: 6,
-        stream_count: 4,
-        coupled_count: 2,
-        mapping: mapping.to_vec(),
-    };
-    (MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap(), CMsDec::new(48000, 6, 4, 2, &mapping))
+    let table = opus1::multistream::ChannelMappingTable::new(6, 4, 2, &mapping);
+    (MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table).unwrap(), CMsDec::new(48000, 6, 4, 2, &mapping))
 }
 
 #[test]
@@ -288,12 +283,18 @@ fn the_multistream_decoder_sets_the_complexity_of_every_stream_like_libopus() {
 #[test]
 fn the_multistream_decoder_forwards_the_bwe_switch() {
     let (mut d, _) = surround();
+    assert!(!d.osce_bwe());
     d.set_osce_bwe(true);
+    assert!(d.osce_bwe());
     for s in 0..4 {
         assert!(d.stream_decoder(s).unwrap().osce_bwe());
     }
     d.reset_state();
+    assert!(d.osce_bwe());
     assert!(d.stream_decoder(3).unwrap().osce_bwe());
+    // The getter reads the first stream, as libopus's getters do.
+    d.stream_decoder_mut(0).unwrap().set_osce_bwe(false);
+    assert!(!d.osce_bwe());
 }
 
 // ---------------------------------------------------------------------------
@@ -457,13 +458,17 @@ mod blobs {
 
     #[test]
     fn the_multistream_decoder_loads_a_blob_into_every_stream() {
-        let table = ChannelMappingTable { channels: 3, stream_count: 2, coupled_count: 1, mapping: vec![0, 2, 1] };
-        let mut d = MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap();
+        let table = ChannelMappingTable::new(3, 2, 1, &[0, 2, 1]);
+        let mut d = MultistreamDecoder::from_mapping_table(SampleRate::Hz48000, &table).unwrap();
         let empty = DnnBlob::from_static(&EMPTY.0).unwrap();
         assert_eq!(kind_message(d.set_dnn_blob(&empty)), Err((ErrorKind::BadArg, NO_MODEL)));
+        // A new decoder has the built-in models of this build.
+        assert_eq!(d.dnn_models(), d.stream_decoder(0).unwrap().dnn_models());
         #[cfg(feature = "deep-plc")]
         {
+            assert_eq!(d.dnn_models(), all());
             assert_eq!(d.set_dnn_blob(&DnnBlob::builtin()), Ok(all()));
+            assert_eq!(d.dnn_models(), all());
             for s in 0..2 {
                 assert_eq!(d.stream_decoder(s).unwrap().dnn_models(), all());
             }

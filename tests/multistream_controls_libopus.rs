@@ -1,8 +1,10 @@
 //! The multistream controls that opus1 0.2 added, against libopus 1.6.1:
 //! the encoder's forwarding of the forced channel count, the prediction
 //! switch, phase inversion disabling, the application change and the voice
-//! ratio; the decoder's output gain and phase inversion disabling; and the
-//! 24-bit calls `opus_multistream_encode24` and `opus_multistream_decode24`.
+//! ratio; the decoder's output gain and phase inversion disabling; the
+//! getters that libopus answers from the first stream (bandwidth and last
+//! packet duration); and the 24-bit calls `opus_multistream_encode24` and
+//! `opus_multistream_decode24`.
 //!
 //! Packets are compared byte for byte for CELT-only streams, where opus1's
 //! encoder is libopus's byte for byte. Decoded samples are compared bit for
@@ -257,7 +259,7 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
         }
         for (gain, inversion) in [(None, None), (Some(-3000i16), Some(true)), (Some(32767), Some(false)), (Some(-32768), None), (Some(700), Some(true))] {
             let label = format!("layout {layout:?}, gain {gain:?}, inversion off {inversion:?}");
-            let mut rust = MultistreamDecoder::with_layout(
+            let mut rust = MultistreamDecoder::new(
                 SampleRate::try_from(FS).unwrap(),
                 channels,
                 streams,
@@ -281,7 +283,7 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
             assert_eq!(rust.phase_inversion_disabled() as i32, c.get(get_inv), "{label}");
             let mut out = vec![0f32; MAX_FRAME * channels];
             let mut out24 = vec![0i32; MAX_FRAME * channels];
-            let mut rust24 = MultistreamDecoder::with_layout(
+            let mut rust24 = MultistreamDecoder::new(
                 SampleRate::try_from(FS).unwrap(),
                 channels,
                 streams,
@@ -312,7 +314,7 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
         }
         // Gains outside the range of an `i16`, which opus1's `set_gain`
         // cannot be given: libopus refuses them, and the setting stays.
-        let mut rust = MultistreamDecoder::with_layout(
+        let mut rust = MultistreamDecoder::new(
             SampleRate::try_from(FS).unwrap(),
             channels,
             streams,
@@ -351,7 +353,7 @@ fn encode24_and_decode24_follow_libopus() {
             })
             .collect();
         let mut out = vec![0u8; max_packet_bytes(streams)];
-        let mut rust_dec = MultistreamDecoder::with_layout(
+        let mut rust_dec = MultistreamDecoder::new(
             SampleRate::try_from(FS).unwrap(),
             channels,
             streams,
@@ -403,5 +405,118 @@ fn surround_encode24_codes_as_encode_of_the_scaled_samples() {
             let nb = b.encode(pf, FRAME, &mut out_b).unwrap();
             same_bytes(&out_a[..na], &out_b[..nb], &format!("{label}: packet {i}"));
         }
+    }
+}
+
+/// The getters that libopus answers from the first stream: the encoder's
+/// `OPUS_GET_BANDWIDTH`, and the decoder's `OPUS_GET_BANDWIDTH` and
+/// `OPUS_GET_LAST_PACKET_DURATION`. They equal libopus's before the first
+/// frame and after every call, over packets of every coding mode at several
+/// bitrates, with losses, FEC calls and a reset. The encoder's setting
+/// getters (`bandwidth_setting`, `force_mode`) keep what was set. Packets
+/// with SILK are not compared byte for byte (see the top of this file); the
+/// decoder reads libopus's packets.
+#[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+fn getters_of_the_first_stream_follow_libopus() {
+    let get_bw = sys::OPUS_GET_BANDWIDTH_REQUEST;
+    let get_dur = sys::OPUS_GET_LAST_PACKET_DURATION_REQUEST;
+    for layout in LAYOUTS {
+        let (channels, streams, coupled, mapping) = layout;
+        let label = format!("layout {layout:?}");
+        let (mut rust, mut c) = pair(layout, APP_AUDIO);
+        assert_eq!(rust.channels(), channels, "{label}");
+        assert_eq!(rust.bandwidth().to_raw(), c.get(get_bw), "{label}: encoder before the first frame");
+        let pcm = voiced(FS, channels, FRAME * 36);
+        let mut out = vec![0u8; max_packet_bytes(streams)];
+        let mut packets = Vec::new();
+        for (i, f) in pcm.chunks_exact(channels * FRAME).enumerate() {
+            // Low to high bitrates in each coding mode, so that the
+            // bandwidth changes.
+            let (mode, forced) = [
+                (MODE_CELT_ONLY, ForcedMode::CeltOnly),
+                (MODE_SILK_ONLY, ForcedMode::SilkOnly),
+                (MODE_HYBRID, ForcedMode::Hybrid),
+            ][(i / 12) % 3];
+            let bitrate = [8_000, 14_000, 24_000, 64_000][(i / 3) % 4] * streams as i32;
+            rust.set_force_mode(Some(forced));
+            c.ctl(OPUS_SET_FORCE_MODE_REQUEST, mode);
+            rust.set_bitrate(opus1::Bitrate::BitsPerSecond(NonZeroU32::new(bitrate as u32).unwrap()));
+            c.set_bitrate(bitrate);
+            assert_eq!(rust.force_mode(), Some(forced), "{label}: frame {i}");
+            let expected = c.encode_float(f, FRAME, out.len()).unwrap();
+            rust.encode(f, FRAME, &mut out).unwrap();
+            assert_eq!(rust.bandwidth().to_raw(), c.get(get_bw), "{label}: encoder after frame {i}");
+            assert_eq!(rust.bandwidth(), rust.stream_encoder(0).unwrap().bandwidth(), "{label}: frame {i}");
+            packets.push(expected);
+        }
+        assert_eq!(rust.bandwidth_setting(), None, "{label}");
+
+        let mut rust_dec =
+            MultistreamDecoder::new(SampleRate::try_from(FS).unwrap(), channels, streams, coupled, mapping).unwrap();
+        let mut c_dec = CMsDecoder::new(FS, channels, streams, coupled, mapping).unwrap();
+        assert_eq!(rust_dec.channels(), channels, "{label}");
+        let check = |rust_dec: &MultistreamDecoder, c_dec: &mut CMsDecoder, what: &str| {
+            assert_eq!(rust_dec.bandwidth().map_or(0, |b| b.to_raw()), c_dec.get(get_bw), "{label}: decoder {what}");
+            assert_eq!(rust_dec.last_packet_duration() as i32, c_dec.get(get_dur), "{label}: decoder {what}");
+        };
+        check(&rust_dec, &mut c_dec, "before the first packet");
+        let mut pcm_out = vec![0f32; MAX_FRAME * channels];
+        for (i, p) in packets.iter().enumerate() {
+            if i == 20 {
+                rust_dec.reset_state();
+                assert_eq!(c_dec.try_ctl(sys::OPUS_RESET_STATE, 0), 0);
+                check(&rust_dec, &mut c_dec, "after a reset");
+            }
+            let what = format!("after packet {i}");
+            match i % 6 {
+                // A loss of 10 ms.
+                2 => {
+                    let expected = c_dec.decode_float(None, FRAME / 2, false).unwrap();
+                    let n = rust_dec.decode(&[], FRAME / 2, &mut pcm_out).unwrap();
+                    same_f32(&pcm_out[..n * channels], &expected, &format!("{label}: {what}"));
+                }
+                // The packet before this one was lost: rebuild it from this
+                // one, then decode this one.
+                4 => {
+                    let expected = c_dec.decode_float(Some(p), FRAME, true).unwrap();
+                    let n = rust_dec.decode_fec(p, FRAME, &mut pcm_out).unwrap();
+                    same_f32(&pcm_out[..n * channels], &expected, &format!("{label}: FEC {what}"));
+                    check(&rust_dec, &mut c_dec, &format!("FEC {what}"));
+                    let expected = c_dec.decode_float(Some(p), MAX_FRAME, false).unwrap();
+                    let n = rust_dec.decode(p, MAX_FRAME, &mut pcm_out).unwrap();
+                    same_f32(&pcm_out[..n * channels], &expected, &format!("{label}: {what}"));
+                }
+                _ => {
+                    let expected = c_dec.decode_float(Some(p), MAX_FRAME, false).unwrap();
+                    let n = rust_dec.decode(p, MAX_FRAME, &mut pcm_out).unwrap();
+                    same_f32(&pcm_out[..n * channels], &expected, &format!("{label}: {what}"));
+                }
+            }
+            check(&rust_dec, &mut c_dec, &what);
+            assert_eq!(rust_dec.bandwidth(), rust_dec.stream_decoder(0).unwrap().bandwidth(), "{label}: {what}");
+        }
+    }
+
+    // A 5.1 surround encoder with an explicit bitrate, where the encoder
+    // sets the bandwidth of every stream on every frame (docs/10, D1 is
+    // about the automatic bitrate only).
+    let mut rust =
+        MultistreamEncoder::new_surround(SampleRate::try_from(FS).unwrap(), 6, 1, Application::Audio).unwrap();
+    let mut c = CMsEncoder::surround(FS, 6, 1, APP_AUDIO).unwrap();
+    assert_eq!(rust.bandwidth().to_raw(), c.get(get_bw), "surround before the first frame");
+    let pcm = tones(FS, 6, 1, FRAME * 12);
+    let mut out = vec![0u8; max_packet_bytes(c.streams)];
+    for (i, f) in pcm.chunks_exact(c.channels * FRAME).enumerate() {
+        let bitrate = [24_000, 40_000, 56_000, 128_000][i % 4];
+        rust.set_bitrate(opus1::Bitrate::BitsPerSecond(NonZeroU32::new(bitrate).unwrap()));
+        c.set_bitrate(bitrate as i32);
+        c.encode_float(f, FRAME, out.len()).unwrap();
+        rust.encode(f, FRAME, &mut out).unwrap();
+        assert_eq!(rust.bandwidth().to_raw(), c.get(get_bw), "surround after frame {i}");
+        // The coupled streams were forced to CELT-only; the setting is
+        // still the caller's.
+        assert_eq!(rust.stream_encoder(0).unwrap().force_mode(), Some(ForcedMode::CeltOnly));
+        assert_eq!(rust.force_mode(), None, "surround frame {i}");
     }
 }

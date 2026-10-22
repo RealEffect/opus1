@@ -258,7 +258,7 @@ More channels need **multistream** Opus:
 - A table says which stream each channel goes to.
 - Multistream Opus carries up to 255 channels.
 
-opus1 implements this in the `multistream` module, which needs the `std` feature. [Multichannel audio](05-multichannel.md) explains it.
+opus1 implements this in the `multistream` module, which needs the `alloc` feature (on by default through `std`). [Multichannel audio](05-multichannel.md) explains it.
 
 ## Delay
 

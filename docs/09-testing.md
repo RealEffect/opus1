@@ -603,13 +603,15 @@ The four targets then ran again without a defect, 10.5 minutes each, as four pro
 
 Without its default features, opus1 builds as `#![no_std]` with no heap allocation (see the [README](../README.md)). `scripts/check_no_std.sh` checks this:
 
-It does each step twice: with `--features libm`, and with `--features libm,analysis`, which adds the speech and music analysis.
+It does each step three times: with `--features libm`, with `--features libm,analysis`, which adds the speech and music analysis, and with `--features alloc,libm`, which adds the `multistream` module for a target that has a global allocator.
 
 1. It builds with `--no-default-features` and those features for `thumbv7em-none-eabi` (ARM Cortex-M) and `wasm32-unknown-unknown` (WebAssembly). A target that is not installed is skipped with a message. Add it with `rustup target add <target>`.
 2. It builds the same configuration for the host.
 3. It runs `cargo test --no-default-features` with those features on the host with `RUST_MIN_STACK=33554432` (32 mebibytes). Without the `heap` feature, the encoder and decoder hold all their buffers inline: 127,936 bytes (153,904 with `analysis`) and 59,728 bytes on aarch64 (see [Size of the encoder and the decoder](06-using-the-library.md#size-of-the-encoder-and-the-decoder)). So test threads need a large stack.
 
-The multistream module needs `std`. The multistream test files that use it (30 of 31) are compiled only with the `std` feature, so they are left out of this run. At git commit `f952b46`, the run with `--features libm,analysis` passed 985 tests (26 ignored), in a debug build. `tests/stack_usage_test.rs` checks the sizes for both builds: small structs with `heap`, large ones without it.
+Then it builds `--features heap,libm` (the codec state on the heap, without `std`) for the same targets. It runs the tests of building in place in a release build: `multistream_small_stack`, `encoder_init`, `decoder_init` and `encoder_reset`, with `alloc,libm`, `alloc,libm,analysis` and `heap,libm,analysis`. They build the codecs on a thread with a 32 KB stack, which only an optimized build can check (a debug build gives those threads 1 MiB), and check that a reset allocates nothing.
+
+The multistream module needs the `alloc` feature, so the first two runs leave it out. The run with `alloc` compiles it and runs its unit tests. The multistream test files in `tests/` (30 of 31) are compiled only with the `std` feature, so every run leaves them out. At git commit `f952b46`, the run with `--features libm,analysis` passed 985 tests (26 ignored), in a debug build. `tests/stack_usage_test.rs` checks the sizes for both builds: small structs with `heap`, large ones without it.
 
 ## Ignored tests
 

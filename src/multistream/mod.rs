@@ -30,10 +30,23 @@
 //!   cuts one stream out of a multistream packet, for code that wants to
 //!   look at the streams itself. The decoder does not need it.
 //!
-//! The module needs the `std` feature. The number of streams is known only at
-//! run time (up to 255), so the stream encoders and decoders live in a
-//! `Vec`. Memory is allocated when an encoder or a decoder is built.
-//! Encoding and decoding allocate nothing.
+//! The module needs the `alloc` feature, which the default features `std`
+//! and `heap` turn on. It works in a `no_std` build that has a global
+//! allocator. The number of streams is known only at run time (up to 255),
+//! so the stream encoders and decoders live in a `Vec`. Memory is allocated
+//! when an encoder or a decoder is built, and each stream codec is built in
+//! place in it ([`OpusEncoder::init`](crate::OpusEncoder::init),
+//! [`OpusDecoder::init`](crate::OpusDecoder::init)), so building needs
+//! little stack, also without `heap`. Encoding, decoding and `reset_state`
+//! allocate nothing.
+//!
+//! Both [`MultistreamEncoder`](crate::multistream::MultistreamEncoder) and
+//! [`MultistreamDecoder`](crate::multistream::MultistreamDecoder) have the
+//! same three constructors: `new` takes the layout as numbers,
+//! `from_mapping_table` takes the table of an Ogg Opus header, and
+//! `from_layout` takes a checked
+//! [`ChannelLayout`](crate::multistream::ChannelLayout). The encoder also
+//! has `new_surround`, which picks the layout of a mapping family.
 //!
 //! # Encoding
 //!
@@ -94,14 +107,8 @@
 //! let len = encoder.encode(&pcm, 960, &mut packet)?;
 //!
 //! // The decoder for the same layout.
-//! let layout = encoder.layout();
-//! let mut decoder = MultistreamDecoder::with_layout(
-//!     SampleRate::Hz48000,
-//!     layout.channels(),
-//!     layout.streams(),
-//!     layout.coupled_streams(),
-//!     layout.mapping(),
-//! )?;
+//! let mut decoder = MultistreamDecoder::from_layout(SampleRate::Hz48000, encoder.layout())?;
+//! assert_eq!(decoder.channels(), 4);
 //!
 //! // `out` has room for 960 samples per channel. The result is the number
 //! // of samples per channel that were written, interleaved like the input.
@@ -114,6 +121,13 @@
 //! assert_eq!(samples, 960);
 //! # Ok::<(), opus1::Error>(())
 //! ```
+//!
+//! The decoder writes the output channels in the order of its mapping
+//! table. For mapping family 1 that is the channel order of Vorbis, for
+//! example front left, centre, front right, rear left, rear right and LFE
+//! for 5.1. A WAV file orders the same channels differently. The decoder
+//! does not reorder or downmix the channels; that is left to the
+//! application.
 //!
 //! `examples/multistream.rs` encodes and decodes a longer 5.1 signal and
 //! prints the packet sizes and the quality of every channel.
@@ -132,6 +146,8 @@ pub use decoder::MultistreamDecoder;
 pub use encoder::MultistreamEncoder;
 pub use layout::{ChannelLayout, MappingType, SILENT_CHANNEL, validate_ambisonics};
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use crate::Error;
 use crate::{float2int16, float2int24, int16_to_res, int24_to_res, packet};
 
@@ -287,8 +303,14 @@ pub(crate) trait ChannelSink {
 /// mapping family is not 0.
 ///
 /// A table read from a file is not checked.
-/// [`MultistreamDecoder::new`] checks it.
+/// [`MultistreamDecoder::from_mapping_table`] and
+/// [`MultistreamEncoder::from_mapping_table`] check it.
+///
+/// The fields can be read and changed. More fields may come in a later
+/// release, so a value is built with [`new`](Self::new) or
+/// [`parse`](Self::parse).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelMappingTable {
     /// Number of output channels.
     pub channels: u8,
@@ -305,6 +327,25 @@ pub struct ChannelMappingTable {
 }
 
 impl ChannelMappingTable {
+    /// A table with these values. Nothing is checked, as for a table read
+    /// from a file.
+    ///
+    /// ```
+    /// use opus1::multistream::ChannelMappingTable;
+    ///
+    /// // The 5.1 layout of mapping family 1: 4 streams, 2 of them stereo.
+    /// let table = ChannelMappingTable::new(6, 4, 2, &[0, 4, 1, 2, 3, 5]);
+    /// assert_eq!(table.mapping, [0, 4, 1, 2, 3, 5]);
+    /// ```
+    pub fn new(channels: u8, stream_count: u8, coupled_count: u8, mapping: &[u8]) -> Self {
+        Self {
+            channels,
+            stream_count,
+            coupled_count,
+            mapping: mapping.to_vec(),
+        }
+    }
+
     /// Reads the table. `tail` starts right after the output gain of
     /// `OpusHead`, at byte 19 of the header.
     ///

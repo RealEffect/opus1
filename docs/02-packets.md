@@ -559,7 +559,7 @@ let bad = [0xF8, 0x01, 0x07, 0xE0, 0x08, 0x09];
 assert!(packet::multistream_validate(&bad, 2, SampleRate::Hz48000).is_err());
 ```
 
-`opus1::multistream::split_self_delimited` (in the `std` build) cuts the first stream out of a multistream packet. It returns that stream as an ordinary packet, which any decoder accepts, and the offset of the next stream.
+`opus1::multistream::split_self_delimited` (feature `alloc`, on by default through `std`) cuts the first stream out of a multistream packet. It returns that stream as an ordinary packet, which any decoder accepts, and the offset of the next stream.
 
 ### `Repacketizer`
 
@@ -623,7 +623,7 @@ The packet functions use extensions as libopus does:
 - The decoder ignores extensions, as libopus 1.6.1 does without its quality extension (QEXT).
 - The encoder of libopus writes an extension only for DRED, and so does the encoder of `opus1` (feature `dred`, see [The encoder](03-encoder.md#18-deep-redundancy-dred)).
 
-Up to 32 extensions in one call need no memory allocation. More need the `std` feature, which allocates them. `pad` with extensions in the old padding also copies that padding, because the new packet may overwrite it. Without `std`, these cases fail with `AllocFail` when there are more than 32 extensions or the old padding is longer than 1275 bytes.
+Up to 32 extensions in one call need no memory allocation. More need the `alloc` feature (on by default through `std`), which allocates them. `pad` with extensions in the old padding also copies that padding, because the new packet may overwrite it. Without `alloc`, these cases fail with `AllocFail` when there are more than 32 extensions or the old padding is longer than 1275 bytes.
 
 ```rust
 use opus1::extensions::{self, Extension};

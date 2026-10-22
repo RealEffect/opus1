@@ -7,7 +7,8 @@
 //!   already has. The same holds for the decoder and for the multistream
 //!   encoder and decoder.
 //!
-//! The file runs with and without `heap`.
+//! The file runs with and without `heap`; `scripts/check_no_std.sh` runs
+//! it without.
 
 use opus1::{Application, Bitrate, Channels, InbandFec, OpusDecoder, OpusEncoder, SampleRate};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -182,22 +183,14 @@ fn a_reset_allocates_nothing() {
 
 /// The multistream codecs reset every stream codec, which allocates
 /// nothing either.
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 #[test]
 fn a_multistream_reset_allocates_nothing() {
     use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
     let rate = SampleRate::Hz48000;
     for (channels, family) in [(2, 0), (6, 1), (8, 1), (4, 255)] {
         let mut encoder = MultistreamEncoder::new_surround(rate, channels, family, Application::Audio).unwrap();
-        let layout = encoder.layout();
-        let mut decoder = MultistreamDecoder::with_layout(
-            rate,
-            layout.channels(),
-            layout.streams(),
-            layout.coupled_streams(),
-            layout.mapping(),
-        )
-        .unwrap();
+        let mut decoder = MultistreamDecoder::from_layout(rate, encoder.layout()).unwrap();
         let pcm = signal(48_000, channels, 0.2);
         let mut packet = vec![0u8; 1500 * channels];
         let mut out = vec![0.0f32; 960 * channels];

@@ -24,7 +24,7 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 - **The speech and music analysis of libopus:** from complexity 7 on, the encoder estimates whether the input is speech or music and which bandwidth it uses, as libopus does, with the same results to the last bit on 64-bit ARM. CELT-only packets at complexity 7 to 10 are libopus's byte for byte
 - **The neural decoder features of libopus 1.5 and 1.6 (optional):** deep packet loss concealment, the LACE and NoLACE speech enhancement of SILK, and the bandwidth extension of SILK wideband to fullband. Each is compiled only with its cargo feature and runs only when the decoder complexity is raised, as in libopus: `set_complexity(5)` for deep PLC (packet loss concealment), 6 for LACE, 7 for NoLACE, and 4 with `set_osce_bwe(true)` for the bandwidth extension. On 64-bit ARM the output is that of libopus 1.6.1 built with these features (without loop vectorization) to the last bit.
 - **Deep redundancy (DRED, optional):** with the cargo feature `dred`, the encoder adds a compressed description of up to about one second of earlier speech to each packet (`set_dred_duration`, libopus `OPUS_SET_DRED_DURATION`), and the decoder rebuilds a burst of lost packets from the next packet that arrives (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`). CELT-only packets with DRED, and the DRED data in SILK and Hybrid packets with the `Audio` application and VBR, are those of libopus 1.6.1 built with DRED, byte for byte. Decoding gives libopus's output to the last bit.
-- **`#![no_std]` + no `alloc`:** fully heap-free — runs on bare metal, RTOS, and WebAssembly with **no global allocator**
+- **`#![no_std]` + no `alloc`:** fully heap-free — runs on bare metal, RTOS, and WebAssembly with **no global allocator**. With a global allocator, the feature `alloc` adds the multistream module to a `no_std` build
 
 ## Quick Start
 
@@ -62,7 +62,7 @@ assert_eq!(samples, 320);
 The public API is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`,
 `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec`,
 `pcm_soft_clip`) and the modules `packet`, `extensions` and `multistream` (which
-needs `std`). The neural network features add `DnnBlob` and `DnnModels`, and
+needs the feature `alloc`, on by default through `std`). The neural network features add `DnnBlob` and `DnnModels`, and
 `dred` adds `OpusDredDecoder`, `OpusDred` and `DredParse`. [docs/06](docs/06-using-the-library.md) shows the settings and
 recipes for calls, voice agents and music.
 
@@ -117,10 +117,11 @@ let pcm = vec![0.0f32; 960 * 6]; // 20 ms, interleaved
 let mut packet = vec![0u8; 4000];
 let len = encoder.encode(&pcm, 960, &mut packet).unwrap();
 
-let mut decoder = MultistreamDecoder::with_layout(
-    SampleRate::Hz48000, 6, layout.streams(), layout.coupled_streams(), layout.mapping()).unwrap();
+let mut decoder = MultistreamDecoder::from_layout(SampleRate::Hz48000, &layout).unwrap();
 let mut out = vec![0.0f32; 960 * 6];
 decoder.decode(&packet[..len], 960, &mut out).unwrap();
+// `out` holds the channels in the same Vorbis order. WAV files use another
+// order; reordering and downmixing are left to the application.
 ```
 
 `cargo run --release --example multistream` encodes and decodes a 5.1 test
@@ -160,7 +161,8 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 
 | Feature  | Default | Description |
 |----------|---------|-------------|
-| `std`    | yes     | Enables OS-backed runtime x86 SIMD detection (CPUID). Without it the crate is `#![no_std]`. |
+| `std`    | yes     | Enables OS-backed runtime x86 SIMD detection (CPUID). Without it the crate is `#![no_std]`. Turns on `alloc`. |
+| `alloc`  | yes (through `std`) | Uses a global allocator without the rest of the standard library. Adds the `multistream` module, and lets the `packet` functions keep more than 32 extensions in one call. For `no_std` with an allocator: `default-features = false, features = ["alloc", "libm"]`. |
 | `heap`   | yes     | Allocates the large codec state on the heap (`Box`), shrinking `OpusEncoder`/`OpusDecoder` to a few KB so they can live on ordinary stacks. Requires `std`. |
 | `analysis` | yes   | The speech and music analysis of the encoder (libopus `analysis.c`), which runs from complexity 7 on. Without it the encoder decides as libopus does below complexity 7, and its state is about 26 KB smaller. Works with and without `std`. |
 | `deep-plc` | no    | Deep packet loss concealment (PitchDNN, the PLC network, FARGAN) with its built-in weights (1,432,768 bytes). Runs at decoder complexity 5 and above. |
@@ -377,6 +379,14 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   check a number. `set_force_channels` takes `Option<Channels>` and no longer
   fails. The multistream constructors, the `packet` functions with a sampling
   rate and `OpusDredDecoder::parse` take a `SampleRate` too.
+- Multistream: `MultistreamEncoder` and `MultistreamDecoder` have the same
+  constructors, `new` (the layout as numbers), `from_mapping_table` (the table
+  of an Ogg Opus header) and `from_layout` (a `ChannelLayout`); the encoder
+  keeps `new_surround`. The decoder's old `new(rate, table)` is
+  `from_mapping_table(rate, &table)`, and its old `with_layout` is `new`.
+  `ChannelMappingTable` is `#[non_exhaustive]`; `ChannelMappingTable::new`
+  makes one. The module needs the new feature `alloc` instead of `std`, so it
+  also works in a `no_std` build with a global allocator.
 - `packet` and `extensions`: the flags `self_delimited` and `pad` are the
   enums `Framing` and `Padding`; `ParsedPacket` has read-only methods instead
   of public fields; `Extension::new` makes an extension; `ExtensionIterator`
@@ -445,7 +455,9 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   `set_application`, `set_voice_ratio`, `set_phase_inversion_disabled`,
   `lookahead`, `bandwidth` (`OPUS_GET_BANDWIDTH`, the bandwidth of the last
   packet) and `max_bandwidth`. The multistream encoder and decoder forward the
-  controls that libopus's forward. `opus1::VERSION` and
+  controls that libopus's forward, and answer `OPUS_GET_BANDWIDTH` and the
+  decoder's `OPUS_GET_LAST_PACKET_DURATION` from the first stream, as
+  libopus does. Both have `channels()`. `opus1::VERSION` and
   `opus1::LIBOPUS_VERSION` give the crate version and the libopus release it
   follows.
 - The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,
@@ -514,10 +526,9 @@ now runs libopus's stereo pitch pre-filter and `theta_rdo`.
 - The scalable quality extension of libopus 1.6 (QEXT) is not ported.
 - Mapping family 3 (ambisonics mixed through a matrix, libopus's
   `opus_projection_*` functions) is not implemented.
-- A few controls have no equivalent: the decoder's `OPUS_GET_BANDWIDTH` (the
-  `packet` functions read the bandwidth from the packet's first byte) and
-  `OPUS_SET_IGNORE_EXTENSIONS`, and the multistream decoder's
-  `OPUS_GET_BANDWIDTH` and `OPUS_GET_LAST_PACKET_DURATION`.
+- One control has no equivalent: the decoder's `OPUS_SET_IGNORE_EXTENSIONS`.
+  In libopus 1.6.1 only the quality extension, which is not ported, reads
+  extensions in the decoder.
 - SILK stereo with a constant bitrate at 12 kHz can lose its stereo image on
   tones, as the fixed-point build of libopus does.
 
