@@ -176,6 +176,7 @@ fn decode_single(label: &str, packets: &[(Vec<u8>, usize)], rate: usize, channel
 /// CELT: ties in the blocks and after them, at every output rate, mono and
 /// stereo.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn celt_ties_round_as_opus_decode() {
     for channels in [1, 2] {
         let packets = c_packets(MODE_CELT, channels, 6.0, &DURATIONS);
@@ -201,6 +202,7 @@ fn celt_ties_round_as_opus_decode() {
 /// the CELT band of Hybrid (above 8 kHz) is beyond the output band, so the
 /// output is SILK's 16-bit samples and has no ties.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn hybrid_ties_round_as_opus_decode() {
     for channels in [1, 2] {
         let packets = c_packets(MODE_HYBRID, channels, 3.0, &[4, 8]);
@@ -221,6 +223,7 @@ fn hybrid_ties_round_as_opus_decode() {
 /// same places. A loss of 122.5 ms leaves values after the last block at
 /// 48 kHz in mono.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn long_loss_converts_like_one_call() {
     let (rate, channels) = (48000, 1);
     let packets = c_packets(MODE_CELT, channels, 1.0, &[8]);
@@ -263,6 +266,7 @@ fn long_loss_converts_like_one_call() {
 /// every target. Three channels in two streams (one stereo, one mono), at
 /// every output rate.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn multistream_ties_round_to_even() {
     let (fs, channels, streams, coupled, mapping) = (48000, 3, 2, 1, [0u8, 1, 2]);
     let pcm = loud(fs as usize, channels, 4 * fs as usize, 0x1357_9bdf);

@@ -275,16 +275,19 @@ fn quad_conceals_lost_tones_like_libopus() {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn surround_5_1_conceals_lost_speech_like_libopus() {
     check_voiced(SURROUND_5_1);
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn surround_5_1_conceals_lost_tones_like_libopus() {
     check_tones(SURROUND_5_1);
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn surround_7_1_conceals_lost_speech_like_libopus() {
     check_voiced(SURROUND_7_1);
 }

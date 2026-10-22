@@ -846,6 +846,7 @@ fn malformed_packets_give_the_errors_of_libopus() {
 /// extensions added: libopus and opus1 decode them as the packets without
 /// extensions, and the repacketizer gives libopus's bytes.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn encoded_packets_with_extensions_decode_as_without() {
     use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
     let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();

@@ -244,6 +244,7 @@ fn rfc8251_test_vectors() {
 /// libopus decodes the vectors through the same loop; its output must be
 /// opus1's, bit for bit.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn rfc8251_vectors_decode_as_libopus() {
     let Some(dir) = find_vectors() else {
         println!("skipped: RFC 8251 test vectors not found (set OPUS1_TESTVECTORS or OPUS1_CORPUS)");

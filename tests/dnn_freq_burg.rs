@@ -1,4 +1,7 @@
-#![cfg(feature = "test-libopus-dnn")]
+// opus1 computes the 64-bit ARM bits of the neural network code on every
+// target, and these tests compare with the bits of the linked libopus, so
+// they are compiled for 64-bit ARM only (docs/10, Platforms).
+#![cfg(all(feature = "test-libopus-dnn", target_arch = "aarch64"))]
 #![cfg(feature = "dnn")]
 //! The signal processing of the neural network code (`dnn/freq.c`,
 //! `dnn/burg.c`, `dnn/lpcnet_tables.c`) against the same functions inside a

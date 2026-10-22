@@ -96,6 +96,7 @@ fn frames_of_2_5_ms_are_coded_as_mid_and_side() {
 /// products as clang does, 30 of these 103,500 packets differed, in 4
 /// streams (at -110 dBFS and at -40 dBFS).
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn a_source_panned_to_one_side_is_coded_as_libopus_codes_it() {
     let fs = 48_000usize;
     // A debug build (the `no_std` check runs one) codes the levels and

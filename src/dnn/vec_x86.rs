@@ -79,6 +79,20 @@ pub unsafe fn sgemv_avx2(
     col_stride: usize,
     x: &[f32],
 ) {
+    // The reads of row `r` and column `j` are at `w[j * col_stride + r]`,
+    // so they end at `(cols - 1) * col_stride + rows`. Checked without
+    // wrapping around; `nnet` never calls with `cols == 0`.
+    assert!(
+        out.len() >= rows
+            && x.len() >= cols
+            && (rows == 0
+                || cols > 0
+                    && (cols - 1)
+                        .checked_mul(col_stride)
+                        .and_then(|n| n.checked_add(rows))
+                        .is_some_and(|n| weights.len() >= n)),
+        "sgemv_avx2: slices shorter than the layer"
+    );
     let o = out.as_mut_ptr();
     let w = weights.as_ptr();
     let xp = x.as_ptr();
@@ -141,24 +155,31 @@ pub unsafe fn sparse_sgemv8x4_avx2(
     rows: usize,
     x: &[f32],
 ) {
-    let mut ip = idx.as_ptr();
-    let mut w = weights.as_ptr();
+    // Each block of 8 rows stores 8 values. `nnet` checks the index table
+    // (`sparse_blocks`); the debug checks below repeat that per entry.
+    assert!(rows.is_multiple_of(8) && out.len() >= rows);
+    let w = weights.as_ptr();
     let xp = x.as_ptr();
     let o = out.as_mut_ptr();
+    // The next entry of `idx` and the next block of `weights`.
+    let mut p = 0usize;
+    let mut wo = 0usize;
     // SAFETY: the caller guarantees the table and the lengths.
     unsafe {
         for i in (0..rows).step_by(8) {
             let mut y = _mm256_setzero_ps();
-            let count = *ip as usize;
-            ip = ip.add(1);
+            let count = idx[p] as usize;
+            p += 1;
             for _ in 0..count {
-                let pos = *ip as usize;
-                ip = ip.add(1);
+                debug_assert!(p < idx.len() && wo + 32 <= weights.len());
+                let pos = *idx.get_unchecked(p) as usize;
+                debug_assert!(pos + 4 <= x.len());
+                p += 1;
                 for c in 0..4 {
                     let xc = _mm256_set1_ps(*xp.add(pos + c));
-                    y = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(8 * c)), xc, y);
+                    y = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(wo + 8 * c)), xc, y);
                 }
-                w = w.add(32);
+                wo += 32;
             }
             _mm256_storeu_ps(o.add(i), y);
         }
@@ -278,6 +299,17 @@ macro_rules! int8_kernels {
             cols: usize,
             x: &[f32],
         ) {
+            // `quantize` writes `cols` bytes into a buffer of `MAX_INPUTS`;
+            // block `b` stores rows `8 * b..8 * b + 8`; the weights are read
+            // up to `rows * cols`.
+            assert!(
+                cols <= MAX_INPUTS
+                    && x.len() >= cols
+                    && out.len() >= rows
+                    && scale.len() >= rows
+                    && rows.checked_mul(cols).is_some_and(|n| weights.len() >= n),
+                "cgemv8x4: slices shorter than the layer"
+            );
             let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
             let q = xq.as_mut_ptr() as *mut i8;
             let o = out.as_mut_ptr();
@@ -335,25 +367,42 @@ macro_rules! int8_kernels {
             cols: usize,
             x: &[f32],
         ) {
+            // `quantize` writes `cols` bytes into a buffer of `MAX_INPUTS`;
+            // each block of 8 rows stores 8 values. `nnet` checks the index
+            // table (`sparse_blocks`); the debug checks below repeat that per
+            // entry.
+            assert!(
+                rows.is_multiple_of(8)
+                    && cols <= MAX_INPUTS
+                    && x.len() >= cols
+                    && out.len() >= rows
+                    && scale.len() >= rows,
+                "sparse_cgemv8x4: slices shorter than the layer"
+            );
             let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
             let q = xq.as_mut_ptr() as *mut i8;
             let o = out.as_mut_ptr();
             let s = scale.as_ptr();
-            let mut ip = idx.as_ptr();
-            let mut w = weights.as_ptr();
+            let w = weights.as_ptr();
+            // The next entry of `idx` and the next block of `weights`.
+            let mut p = 0usize;
+            let mut wo = 0usize;
             // SAFETY: the caller guarantees the table and the lengths, so
             // only bytes written by `quantize` are read.
             unsafe {
                 quantize(q, x.as_ptr(), cols);
                 for i in (0..rows).step_by(8) {
                     let mut acc = _mm256_setzero_si256();
-                    let count = *ip as usize;
-                    ip = ip.add(1);
+                    let count = idx[p] as usize;
+                    p += 1;
                     for _ in 0..count {
-                        let vx = load_x4(q.add(*ip as usize));
-                        acc = $dot(acc, _mm256_loadu_si256(w as *const __m256i), vx);
-                        ip = ip.add(1);
-                        w = w.add(32);
+                        debug_assert!(p < idx.len() && wo + 32 <= weights.len());
+                        let pos = *idx.get_unchecked(p) as usize;
+                        debug_assert!(pos + 4 <= cols);
+                        let vx = load_x4(q.add(pos));
+                        acc = $dot(acc, _mm256_loadu_si256(w.add(wo) as *const __m256i), vx);
+                        p += 1;
+                        wo += 32;
                     }
                     store8(o.add(i), s.add(i), acc);
                 }
@@ -432,6 +481,17 @@ pub unsafe fn cgemv8x4_avx512vnni(
     cols: usize,
     x: &[f32],
 ) {
+    // `quantize` writes `cols` bytes into a buffer of `MAX_INPUTS`;
+    // block `b` stores rows `8 * b..8 * b + 8`; the weights are read
+    // up to `rows * cols`.
+    assert!(
+        cols <= MAX_INPUTS
+            && x.len() >= cols
+            && out.len() >= rows
+            && scale.len() >= rows
+            && rows.checked_mul(cols).is_some_and(|n| weights.len() >= n),
+        "cgemv8x4: slices shorter than the layer"
+    );
     let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
     let q = xq.as_mut_ptr() as *mut i8;
     let o = out.as_mut_ptr();
@@ -479,36 +539,56 @@ pub unsafe fn sparse_cgemv8x4_avx512vnni(
     cols: usize,
     x: &[f32],
 ) {
+    // `quantize` writes `cols` bytes into a buffer of `MAX_INPUTS`;
+    // each block of 8 rows stores 8 values. `nnet` checks the index
+    // table (`sparse_blocks`); the debug checks below repeat that per
+    // entry.
+    assert!(
+        rows.is_multiple_of(8)
+            && cols <= MAX_INPUTS
+            && x.len() >= cols
+            && out.len() >= rows
+            && scale.len() >= rows,
+        "sparse_cgemv8x4: slices shorter than the layer"
+    );
     let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
     let q = xq.as_mut_ptr() as *mut i8;
     let o = out.as_mut_ptr();
     let s = scale.as_ptr();
-    let mut ip = idx.as_ptr();
-    let mut w = weights.as_ptr();
+    let w = weights.as_ptr();
+    // The next entry of `idx` and the next block of `weights`.
+    let mut p = 0usize;
+    let mut wo = 0usize;
     // SAFETY: the caller guarantees the table and the lengths.
     unsafe {
         quantize(q, x.as_ptr(), cols);
         for i in (0..rows).step_by(8) {
             let mut acc = _mm512_setzero_si512();
-            let count = *ip as usize;
-            ip = ip.add(1);
+            let count = idx[p] as usize;
+            p += 1;
             let mut c = 0;
             while c + 2 <= count {
-                let lo = _mm256_set1_epi32(ptr::read_unaligned(q.add(*ip as usize) as *const i32));
-                let hi =
-                    _mm256_set1_epi32(ptr::read_unaligned(q.add(*ip.add(1) as usize) as *const i32));
+                debug_assert!(p + 1 < idx.len() && wo + 64 <= weights.len());
+                let pos0 = *idx.get_unchecked(p) as usize;
+                let pos1 = *idx.get_unchecked(p + 1) as usize;
+                debug_assert!(pos0 + 4 <= cols && pos1 + 4 <= cols);
+                let lo = _mm256_set1_epi32(ptr::read_unaligned(q.add(pos0) as *const i32));
+                let hi = _mm256_set1_epi32(ptr::read_unaligned(q.add(pos1) as *const i32));
                 let vx = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi);
-                acc = dot_avx512vnni(acc, _mm512_loadu_si512(w as *const _), vx);
-                ip = ip.add(2);
-                w = w.add(64);
+                acc = dot_avx512vnni(acc, _mm512_loadu_si512(w.add(wo) as *const _), vx);
+                p += 2;
+                wo += 64;
                 c += 2;
             }
             let mut acc = fold512(acc);
             if c < count {
-                let vx = load_x4(q.add(*ip as usize));
-                acc = dot_avx2(acc, _mm256_loadu_si256(w as *const __m256i), vx);
-                ip = ip.add(1);
-                w = w.add(32);
+                // Checked: at most once per block of 8 rows.
+                let pos = idx[p] as usize;
+                debug_assert!(pos + 4 <= cols && wo + 32 <= weights.len());
+                let vx = load_x4(q.add(pos));
+                acc = dot_avx2(acc, _mm256_loadu_si256(w.add(wo) as *const __m256i), vx);
+                p += 1;
+                wo += 32;
             }
             store8(o.add(i), s.add(i), acc);
         }

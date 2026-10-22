@@ -96,6 +96,8 @@ fn float2int(x: f32) -> i32 {
         // 2^23 leaves no fraction bits either, so the sum rounds to an
         // integer, to nearest and ties to even.
         const TWO_23: f32 = 8_388_608.0;
+        // NaN must take this branch, so the comparison is negated.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         let r = if !(x.abs() < TWO_23) {
             x
         } else if x >= 0.0 {

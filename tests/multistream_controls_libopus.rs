@@ -126,6 +126,7 @@ fn forced_channels_are_forwarded_as_libopus_does() {
 /// CELT-only packets equal libopus's with each setting. Disabling phase
 /// inversion changes the packets of the coupled streams.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn prediction_and_phase_inversion_are_forwarded_as_libopus_does() {
     for layout in LAYOUTS {
         let (channels, streams, coupled, _) = layout;
@@ -173,6 +174,7 @@ fn prediction_and_phase_inversion_are_forwarded_as_libopus_does() {
 /// current application is accepted. The voice ratio of the first stream
 /// equals libopus's after every frame.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn application_and_voice_ratio_follow_libopus() {
     let apps = [
         (APP_VOIP, Application::Voip),
@@ -214,6 +216,7 @@ fn application_and_voice_ratio_follow_libopus() {
 /// output. The defaults are libopus's: phase inversion is disabled at the
 /// start only when the first stream is mono.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn decoder_gain_and_phase_inversion_follow_libopus() {
     for layout in LAYOUTS {
         let (channels, streams, coupled, mapping) = layout;
@@ -283,6 +286,7 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
 /// `encode24` and `decode24` of the multistream encoder and decoder against
 /// libopus, CELT-only, with input at and beyond the 24-bit limits.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn encode24_and_decode24_follow_libopus() {
     for layout in LAYOUTS {
         let (mut rust, mut c) = pair(layout, APP_AUDIO);

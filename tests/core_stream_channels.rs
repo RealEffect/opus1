@@ -327,6 +327,7 @@ fn peak_and_level_db(x: &[f32]) -> (f64, f64) {
 /// libopus's. The VoIP application keeps the fixed-point rule: SILK's input
 /// for it is the fixed-point build's (see `OpusEncoder::encode_impl`).
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn loud_stereo_coded_as_mono_clips_the_sum_like_libopus() {
     for (rate, frame_ms, bitrate) in [(16000usize, 20usize, 12000), (48000, 20, 12000), (16000, 10, 14000)] {
         let what = format!("{rate} Hz, {frame_ms} ms, {bitrate} b/s");

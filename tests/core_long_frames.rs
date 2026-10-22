@@ -317,6 +317,7 @@ fn long_frames_at_8_khz_match_libopus() {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn long_frames_at_16_khz_match_libopus() {
     check_matrix(16000);
 }
@@ -431,6 +432,7 @@ fn first_byte_is_libopus_where_the_mode_is_forced_at_48_khz() {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn celt_only_cbr_packets_are_libopus_byte_for_byte() {
     // The CELT encoder alone writes libopus's packets at complexity 0 to 5
     // (libopus runs its speech and music analysis from complexity 7). A
@@ -483,6 +485,7 @@ fn check_celt_cbr_bytes(fs: usize, channels: usize, bitrate: i32, out_len: usize
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn celt_only_cbr_budgets_that_do_not_split_evenly_are_libopus() {
     // A long CBR packet gives each part an equal share of the packet once
     // the largest header the packet can need is taken off (C 1735-1785).
@@ -508,6 +511,7 @@ fn celt_only_cbr_budgets_that_do_not_split_evenly_are_libopus() {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn celt_only_cbr_with_settings_changed_between_packets_is_libopus() {
     // Between packets the frame duration (2.5 to 120 ms), the bitrate, the
     // output buffer (1 byte to more than six full frames), the complexity
@@ -661,6 +665,7 @@ fn maximum_bitrate_with_cbr_fills_the_buffer_as_libopus_does() {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn silence_flag_of_stereo_input_coded_as_mono_is_libopus() {
     // A stereo encoder with a small buffer codes one channel. Its CELT
     // encoder then sets the silence flag from the first half of each frame

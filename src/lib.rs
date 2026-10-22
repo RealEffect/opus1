@@ -2327,9 +2327,9 @@ impl OpusEncoder {
     /// have another bandwidth than those of a new encoder.
     ///
     /// With the feature `dred`, a reset also turns DRED off, as in libopus:
-    /// [`dred_duration`](Self::dred_duration) is 0 afterwards. The DRED
-    /// models stay, also those loaded with
-    /// [`set_dnn_blob`](Self::set_dnn_blob).
+    /// `dred_duration` is 0 afterwards. The DRED models stay, also those
+    /// loaded with `set_dnn_blob`. (These methods exist only with the
+    /// feature, so they are not linked here.)
     pub fn reset_state(&mut self) {
         // `new` accepted this sampling rate, channel count and application
         // before, so it does again.

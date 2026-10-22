@@ -1,4 +1,7 @@
-#![cfg(feature = "test-libopus-dnn")]
+// opus1 computes the 64-bit ARM bits of the neural network code on every
+// target, and these tests compare with the bits of the linked libopus, so
+// they are compiled for 64-bit ARM only (docs/10, Platforms).
+#![cfg(all(feature = "test-libopus-dnn", target_arch = "aarch64"))]
 #![cfg(feature = "osce")]
 //! The OSCE port (`src/dnn/osce/`: LACE, NoLACE, the bandwidth extension,
 //! their features and the filters of `nndsp.c`) against libopus 1.6.1's

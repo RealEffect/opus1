@@ -1,4 +1,7 @@
-#![cfg(feature = "test-libopus-dnn")]
+// opus1 computes the 64-bit ARM bits of the neural network code on every
+// target, and these tests compare with the bits of the linked libopus, so
+// they are compiled for 64-bit ARM only (docs/10, Platforms).
+#![cfg(all(feature = "test-libopus-dnn", target_arch = "aarch64"))]
 #![cfg(feature = "deep-plc")]
 //! Deep PLC (`opus1::internals::dnn::plc`) against libopus 1.6.1's own
 //! functions, whole models at a time: the feature analysis

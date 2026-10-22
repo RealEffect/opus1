@@ -1350,8 +1350,8 @@ use core::arch::x86_64::*;
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
-    // The caller guarantees this; every load below stays inside `len`.
-    debug_assert!(ptr1.len() >= len && ptr2.len() >= len);
+    // The caller guarantees this; checked here too. Every load below stays inside `len`.
+    assert!(ptr1.len() >= len && ptr2.len() >= len);
     let mut acc0 = _mm256_setzero_si256();
     let mut acc1 = _mm256_setzero_si256();
     let mut i = 0;
@@ -1403,8 +1403,10 @@ unsafe fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
-    debug_assert!(x.len() >= len);
-    debug_assert!(y.len() >= len + 3);
+    // Each 8-sample load of `y` starts at `i <= len - 4`, so the last one
+    // ends at `y[len + 3]`: `y` needs `len + 4` samples, as the caller
+    // checks.
+    assert!(x.len() >= len && y.len() >= len + 4);
 
     let mut acc = _mm_setzero_si128();
     let mut i = 0;
@@ -1457,8 +1459,8 @@ unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
-    // The caller guarantees this; every load below stays inside `len`.
-    debug_assert!(x.len() >= len);
+    // The caller guarantees this; checked here too. Every load below stays inside `len`.
+    assert!(x.len() >= len);
     let mut acc = _mm256_setzero_si256();
     let mut i = 0;
 
@@ -1501,9 +1503,9 @@ unsafe fn silk_lpc_analysis_filter_avx2(
     d: usize,
 ) {
     debug_assert!(d >= 6 && (d & 1) == 0 && d <= 16);
-    // The caller guarantees this; the vector loads read `input[ix - 16..ix]`
+    // The caller guarantees this; checked here too. The vector loads read `input[ix - 16..ix]`
     // with `ix < len`.
-    debug_assert!(input.len() >= len && out.len() >= len);
+    assert!(input.len() >= len && out.len() >= len);
 
     let mut b_rev_pad = [0i16; 16];
     for k in 0..d {

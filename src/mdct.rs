@@ -767,7 +767,7 @@ unsafe fn mdct_tdac_avx(output: &mut [f32], window: &[f32], overlap: usize) {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
-    debug_assert!(output.len() >= overlap && window.len() >= overlap);
+    assert!(output.len() >= overlap && window.len() >= overlap);
     let overlap2 = overlap / 2;
     let mut i = 0usize;
 

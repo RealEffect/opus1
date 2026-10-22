@@ -774,6 +774,7 @@ fn postfilter_on(packet: &[u8]) -> bool {
 /// speech and a chirp. Low and high bit rates, constant and variable, at
 /// every frame size, mono and stereo, single losses and runs of three.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn losses_in_signals_with_pitch_clicks_and_extreme_levels() {
     let rate = 48000usize;
     let seconds = 2.0;

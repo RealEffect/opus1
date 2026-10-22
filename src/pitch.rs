@@ -1150,6 +1150,7 @@ unsafe fn inner_prod_sse(x: &[f32], y: &[f32], n: usize) -> f32 {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    assert!(x.len() >= n && y.len() >= n);
 
     let mut sum0 = _mm_setzero_ps();
     let mut sum1 = _mm_setzero_ps();
@@ -1199,6 +1200,7 @@ unsafe fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    assert!(x.len() >= n && y1.len() >= n && y2.len() >= n);
 
     let mut xy1 = _mm_setzero_ps();
     let mut xy2 = _mm_setzero_ps();
@@ -1247,6 +1249,8 @@ unsafe fn xcorr_kernel_sse(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    // The loads read `x[..len]` and `y[..len + 3]`.
+    assert!(x.len() >= len && y.len() >= len + 3);
 
     let mut xsum1 = _mm_loadu_ps(sum.as_ptr());
     let mut xsum2 = _mm_setzero_ps();
@@ -1317,6 +1321,8 @@ unsafe fn xcorr_kernel_sse(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn pitch_xcorr_sse(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
+    // Lag `i` reads `y[i..i + len + 3]` for `i + 4 <= max_pitch`.
+    assert!(x.len() >= len && y.len() + 1 >= len + max_pitch);
     let mut i = 0;
 
     while i + 4 <= max_pitch {
@@ -1345,6 +1351,8 @@ unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+
+    assert!(x.len() >= n && y.len() >= n);
 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
@@ -1396,6 +1404,8 @@ unsafe fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+
+    assert!(x.len() >= n && y1.len() >= n && y2.len() >= n);
 
     let mut acc1 = _mm256_setzero_ps();
     let mut acc2 = _mm256_setzero_ps();
@@ -1462,6 +1472,8 @@ unsafe fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
+    // Lag `i` reads `y[i..i + len + 3]` for `i + 4 <= max_pitch`.
+    assert!(x.len() >= len && y.len() + 1 >= len + max_pitch);
     let mut i = 0;
 
     while i + 4 <= max_pitch {
@@ -1491,6 +1503,9 @@ unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+
+    // The loads read `x[..len]` and `y[..len + 3]`.
+    assert!(x.len() >= len && y.len() >= len + 3);
 
     let mut xsum1 = _mm_loadu_ps(sum.as_ptr());
     let mut xsum2 = _mm_setzero_ps();

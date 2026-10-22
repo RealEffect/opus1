@@ -592,8 +592,9 @@ mod tests {
 
     /// The OSCE path, with its states on the heap as in a decoder, runs on
     /// a thread with 32 KB of stack (it needs 16 to 20 KB on 64-bit ARM
-    /// macOS). On Android the thread gets 64 KB: with 32 KB the test
-    /// overflowed its stack on Android 14 (HONOR CLK-AN00, NDK 27).
+    /// macOS). Elsewhere the thread gets 64 KB: with 32 KB the test
+    /// overflowed its stack on Android 14 (HONOR CLK-AN00, NDK 27) and on
+    /// x86-64.
     /// Debug builds need more, so the test runs only in optimized builds.
     #[cfg(all(feature = "osce-bwe", not(debug_assertions)))]
     #[test]
@@ -602,7 +603,7 @@ mod tests {
         let mut ch = std::boxed::Box::new(OsceChannel::new());
         let mut bwe = std::boxed::Box::new(OsceBweChannel::new());
         std::thread::Builder::new()
-            .stack_size(if cfg!(target_os = "android") { 64 } else { 32 } * 1024)
+            .stack_size(if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) { 32 } else { 64 } * 1024)
             .spawn(move || {
                 for method in [OsceMethod::Nolace, OsceMethod::Lace] {
                     osce_reset(&mut ch, method);

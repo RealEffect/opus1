@@ -979,7 +979,8 @@ unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
-    debug_assert!(n <= x.len());
+    // The loads below cover `x[..n]`.
+    assert!(n <= x.len());
 
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
@@ -1625,7 +1626,7 @@ unsafe fn comb_filter_const_sse(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
-    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
+    assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);
@@ -1703,7 +1704,7 @@ unsafe fn comb_filter_const_avx(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
-    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
+    assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm256_set1_ps(g10);
     let g11v = _mm256_set1_ps(g11);
@@ -1816,7 +1817,7 @@ unsafe fn comb_filter_const_sse_fma(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
-    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
+    assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);

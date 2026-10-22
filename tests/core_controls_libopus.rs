@@ -133,6 +133,7 @@ fn decode_both(
 /// the packets of opus1 equal libopus's with and without phase inversion,
 /// and disabling it changes the packets.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn phase_inversion_disabled_encodes_as_libopus() {
     let rate = 48_000;
     let pcm = anti_phase_stereo(rate, rate);
@@ -192,6 +193,7 @@ fn phase_inversion_disabled_encodes_as_libopus() {
 /// a CELT stream that uses phase inversion to libopus's samples. The
 /// defaults are libopus's: on for a mono decoder, off for a stereo one.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn phase_inversion_disabled_decodes_as_libopus() {
     let rate = 48_000;
     let frame = rate / 50;
@@ -249,6 +251,7 @@ const GAINS: [i32; 13] = [-32768, -32767, -12000, -1536, -256, -1, 0, 1, 255, 15
 /// and FEC, with float, 16-bit and 24-bit output. Out-of-range values are
 /// refused by both, and the setting stays.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn gain_matches_libopus() {
     for (rate, channels) in [(48_000, 2), (48_000, 1), (16_000, 1), (24_000, 2)] {
         let frame = rate / 50;
@@ -325,6 +328,7 @@ fn gain_matches_libopus() {
 /// losses, FEC and resets, equals libopus's `OPUS_GET_PITCH`. Both the SILK
 /// lag and the CELT post-filter period show up with nonzero values.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn pitch_matches_libopus() {
     for (rate, channels) in [(48_000, 1), (48_000, 2), (16_000, 1), (8_000, 2), (12_000, 1)] {
         let frame = rate / 50;
@@ -404,6 +408,7 @@ fn pcm24(rate: usize, channels: usize, seconds: f64) -> Vec<i32> {
 /// longer VBR packets differently on purpose). `decode24` of those packets
 /// gives libopus's samples, values beyond 24 bits included.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn encode24_and_decode24_match_libopus() {
     for (rate, channels, app) in [
         (48_000, 2, APP_AUDIO),
@@ -507,6 +512,7 @@ fn errors_of_the_24_bit_calls_follow_libopus() {
 /// a change to and from `RestrictedLowDelay`. After the first frame only
 /// the current application is accepted; after a reset any again.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn set_application_follows_libopus() {
     let apps = [
         (APP_VOIP, Application::Voip),

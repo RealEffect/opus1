@@ -269,6 +269,11 @@ fn wav_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
+        // Hidden files, such as the "._name" files that macOS writes next to
+        // copies on other file systems, are not audio.
+        if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+            continue;
+        }
         if path.is_dir() {
             wav_files(&path, out)?;
         } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")) {
@@ -301,7 +306,9 @@ pub fn corpus_index(dir: &Path, root: &Path, per_group: usize, class: Class) -> 
         for k in 0..take {
             let f = &files[k * files.len() / take];
             let shown = f.strip_prefix(root).unwrap_or(f);
-            text.push_str(&format!("{}\t{}\t0\t0\n", shown.display(), class.name()));
+            // Set files use "/" between path parts on every system.
+            let shown: Vec<String> = shown.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            text.push_str(&format!("{}\t{}\t0\t0\n", shown.join("/"), class.name()));
         }
     }
     Ok(text)

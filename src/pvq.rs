@@ -1823,12 +1823,21 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
             s
         }
     };
+    // libopus: "If X is too small, just replace it with a pulse at 0". The
+    // test also catches a sum that is not a number, and one of 64 or more.
+    // It applies only where the pulses are first placed by projection.
+    let mut sum = sum;
+    if k > (n >> 1) as i32 && !(sum > 1e-15 && sum < 64.0) {
+        abs_x[..n].fill(0.0);
+        abs_x[0] = 1.0;
+        sum = 1.0;
+    }
 
     let abs_x = &abs_x[..n];
     let y2f = &mut y2f[..n];
     let sign_x = &sign_x[..n];
 
-    if k > (n >> 1) as i32 && sum > 1e-15 {
+    if k > (n >> 1) as i32 {
         let rcp = (k as f32 + 0.8) / sum;
 
         for ((yi_out, y2), &ax) in y.iter_mut().zip(y2f.iter_mut()).zip(abs_x) {
@@ -1879,14 +1888,18 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
-    debug_assert!(n <= 31);
+    // The scratch arrays hold 32 values, and the vector loads and stores
+    // cover `x[..n]` and `y[..n]`. `pvq_search` passes at most 31 values.
+    assert!(n <= 32 && x.len() >= n && y.len() >= n);
     debug_assert!(k > 4);
+    let x = &x[..n];
+    let y = &mut y[..n];
 
     let mut k = k;
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
 
-    y[..n].fill(0);
+    y.fill(0);
 
     let mut abs_x = [0.0f32; 32];
     let mut y2f = [0.0f32; 32];
@@ -1923,7 +1936,13 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         sign_x[j] = (xi < 0.0) as i32;
     }
 
-    if k > (n >> 1) as i32 && sum > 1e-15 {
+    // The guard of libopus, as in `pvq_search_scalar`.
+    if k > (n >> 1) as i32 && !(sum > 1e-15 && sum < 64.0) {
+        abs_x[..n].fill(0.0);
+        abs_x[0] = 1.0;
+        sum = 1.0;
+    }
+    if k > (n >> 1) as i32 {
         let rcp = (k as f32 + 0.8) / sum;
         let vrcp = _mm256_set1_ps(rcp);
         let mut vyy_acc = _mm256_setzero_ps();
@@ -1978,9 +1997,6 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         }
     }
 
-    let abs_x_ptr = abs_x.as_ptr();
-    let y2f_ptr = y2f.as_mut_ptr();
-    let y_ptr = y.as_mut_ptr();
     let n8 = n & !7;
     let n_ceil8 = (n + 7) & !7;
     let mut scores = [0.0f32; 32];
@@ -1993,8 +2009,9 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         let mut vmax = _mm256_setzero_ps();
         let mut j = 0;
         while j < n8 {
-            let vabs = _mm256_loadu_ps(abs_x_ptr.add(j));
-            let vy2f = _mm256_loadu_ps(y2f_ptr.add(j));
+            // `j + 8 <= n8 <= 32`: inside the three arrays.
+            let vabs = _mm256_loadu_ps(abs_x.as_ptr().add(j));
+            let vy2f = _mm256_loadu_ps(y2f.as_ptr().add(j));
             let rxy = _mm256_add_ps(vabs, vxy);
             let ryy = _mm256_add_ps(vy2f, vyy);
             let score = _mm256_mul_ps(rxy, _mm256_rsqrt_ps(ryy));
@@ -2004,8 +2021,8 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         }
 
         while j < n {
-            let rxy = xy + *abs_x_ptr.add(j);
-            let ryy = yy + *y2f_ptr.add(j);
+            let rxy = xy + abs_x[j];
+            let ryy = yy + y2f[j];
             scores[j] = rxy * (1.0 / ryy.sqrt());
             j += 1;
         }
@@ -2031,7 +2048,13 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         let mut j = 0;
         while j < n_ceil8 {
             let vs = _mm256_loadu_ps(scores.as_ptr().add(j));
-            let mask = _mm256_movemask_ps(_mm256_cmp_ps(vs, vgmax, _CMP_EQ_OQ)) as u32;
+            let mut mask = _mm256_movemask_ps(_mm256_cmp_ps(vs, vgmax, _CMP_EQ_OQ)) as u32;
+            // Only positions below n count: the scores after them are never
+            // written and stay 0, which equals the maximum when every score
+            // is 0. Without this, a position past the end was written.
+            if j + 8 > n {
+                mask &= (1u32 << (n - j)) - 1;
+            }
             if mask != 0 {
                 // C SSE2 keeps the HIGHEST index on ties (pos = max of lanes).
                 best_id = j + (31 - mask.leading_zeros()) as usize;
@@ -2039,10 +2062,13 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
             j += 8;
         }
 
-        xy += *abs_x_ptr.add(best_id);
-        yy += *y2f_ptr.add(best_id);
-        *y2f_ptr.add(best_id) += 2.0;
-        *y_ptr.add(best_id) += 1;
+        // Checked: `best_id` comes from the scores. Only positions below
+        // `n` are chosen (see above); `y` holds exactly `n` values.
+        debug_assert!(best_id < n);
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
         k -= 1;
     }
 
@@ -2586,6 +2612,9 @@ unsafe fn alg_quant_resynth_avx2(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
+    // The vector loads and stores cover `y[..n]` and `x[..n]`.
+    assert!(y.len() >= n && x.len() >= n);
+
     let mut acc0 = _mm256_setzero_ps();
     let mut i = 0;
 
@@ -2644,6 +2673,8 @@ unsafe fn pvq_search_scalar_init_avx2(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    // `abs_x` holds 32 values; the loads cover `x[..n]`.
+    assert!(n <= 32 && x.len() >= n);
     let sign_mask = _mm256_set1_ps(-0.0f32);
     let mut acc = _mm256_setzero_ps();
     let mut i = 0;

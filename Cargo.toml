@@ -1,5 +1,8 @@
 [package]
 edition = "2024"
+# The aarch64 DotProd intrinsics of the neural network code are stable from
+# Rust 1.98 on.
+rust-version = "1.98"
 authors = ["jinti<shenjindi@fourz.cn>"]
 name = "opus1"
 version = "0.2.0"

@@ -128,6 +128,7 @@ fn differences(a: &[i16], b: &[i16]) -> (usize, i32) {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn loop_gives_the_same_output_for_opus1_and_libopus() {
     for stream in streams() {
         let mut configs = vec![(stream.rate as u32, stream.channels)];
@@ -259,8 +260,14 @@ fn a_cut_bitstream_decodes_its_prefix() {
     let stream = &streams()[2];
     let bytes = bitstream(stream, lost);
     let full = run(&mut OpusDecoder::new(16000, 1).unwrap(), &bytes);
-    // Cut in the middle of the payload of a later record.
-    let cut = &bytes[..bytes.len() / 2];
+    // Cut in the middle of the payload of a later record. Half the length
+    // can fall on a record boundary (the packet sizes depend on the
+    // target), so move the cut back until it lies inside a record.
+    let mut end = bytes.len() / 2;
+    while end > 0 && parse_bitstream(&bytes[..end]).error.is_none() {
+        end -= 1;
+    }
+    let cut = &bytes[..end];
     let parsed = parse_bitstream(cut);
     assert!(parsed.error.is_some());
     let prefix = decode_bitstream(&mut OpusDecoder::new(16000, 1).unwrap(), &parsed.packets);

@@ -1,4 +1,7 @@
-#![cfg(all(feature = "test-libopus-dnn", feature = "deep-plc"))]
+// opus1 computes the 64-bit ARM bits of the neural network code on every
+// target, and these tests compare with the bits of the linked libopus, so
+// they are compiled for 64-bit ARM only (docs/10, Platforms).
+#![cfg(all(feature = "test-libopus-dnn", feature = "deep-plc", target_arch = "aarch64"))]
 //! Deep packet loss concealment (deep PLC) inside the decoder, against
 //! libopus 1.6.1 built with it and without loop vectorization
 //! (`scripts/android/build-libopus.sh --dnn`, the "novec" build). Every

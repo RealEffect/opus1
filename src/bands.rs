@@ -262,6 +262,8 @@ unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
     let n = n0 >> 1;
+    // The loads and stores below cover `x[..2 * n]`.
+    assert!(x.len() >= 2 * n);
     let scale = _mm256_set1_ps(core::f32::consts::FRAC_1_SQRT_2);
     let fixup = _mm256_set_epi32(7, 6, 3, 2, 5, 4, 1, 0);
     let mut j = 0;
@@ -278,8 +280,11 @@ unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
         let even = _mm256_permutevar8x32_ps(_mm256_unpacklo_ps(t0, t1), fixup);
         let odd = _mm256_permutevar8x32_ps(_mm256_unpackhi_ps(t0, t1), fixup);
 
-        let sum = _mm256_mul_ps(_mm256_add_ps(even, odd), scale);
-        let diff = _mm256_mul_ps(_mm256_sub_ps(even, odd), scale);
+        // libopus: tmp1 = s*x0, tmp2 = s*x1, then tmp1 + tmp2 and tmp1 - tmp2.
+        let a = _mm256_mul_ps(even, scale);
+        let b = _mm256_mul_ps(odd, scale);
+        let sum = _mm256_add_ps(a, b);
+        let diff = _mm256_sub_ps(a, b);
 
         let r0 = _mm256_unpacklo_ps(sum, diff);
         let r1 = _mm256_unpackhi_ps(sum, diff);
@@ -2732,6 +2737,8 @@ unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    // The loads and stores below cover `src[..n]` and `dst[..n]`.
+    assert!(src.len() >= n && dst.len() >= n);
     let vscale = _mm256_set1_ps(scale);
     let mut i = 0;
 
@@ -2856,6 +2863,9 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+
+    // The loads and stores below cover `x[..n]`.
+    assert!(x.len() >= n);
 
     let mut i = 0usize;
 

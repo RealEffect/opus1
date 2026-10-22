@@ -549,6 +549,7 @@ fn rate_allocation_matches_libopus_for_random_generic_layouts() {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn rate_allocation_above_the_32_bit_range_of_libopus() {
     // One coupled stream, and many input channels that are not coded. The
     // bitrate limit of the multistream encoder counts input channels, so the

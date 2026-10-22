@@ -235,6 +235,7 @@ fn each_stream_leaves_out_the_frames_of_libopus() {
 /// samples of their last 2.5 ms (8 of 960 samples of packet 27 of the mono
 /// layout, Audio, 20 ms, complexity 9).
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn opus1_dtx_packets_decode_like_libopus() {
     let (mut packets_checked, mut dtx, mut dtx_checked, mut not_identical) = (0, 0, 0, 0);
     let mut failures = Vec::new();

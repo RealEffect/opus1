@@ -30,7 +30,7 @@
 //! Frame numbers count the frames of the packet from 0. The entries before
 //! the first separator belong to frame 0.
 //!
-//! Nothing here allocates, except [`ExtensionList`] beyond its fixed size
+//! Nothing here allocates, except `ExtensionList` beyond its fixed size
 //! with the feature `std`.
 
 /// The extension IDs 0, 1 and 2 are padding, separators and repeats. The

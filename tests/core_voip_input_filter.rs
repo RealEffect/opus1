@@ -145,6 +145,7 @@ const HYBRID_32K: Stream = Stream { mode: MODE_HYBRID, bandwidth: BW_FB, bitrate
 /// same SILK packets and shows the same frames. With the float filter no
 /// frame does.
 #[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn voip_at_48_khz_adds_no_low_frequency_energy_in_quiet_frames() {
     for (name, s, with_integer_filter) in [
         ("MD19_04", SILK_12K, 11),
