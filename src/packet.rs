@@ -41,7 +41,7 @@
 //! The decoder ignores extensions, as libopus 1.6.1 without its quality
 //! extension (QEXT) does.
 
-use crate::Error;
+use crate::{Error, SampleRate};
 use crate::extensions::{self, Extension, ExtensionIterator, ExtensionList};
 
 /// The most frames a packet can hold: 120 ms of 2.5 ms frames.
@@ -133,8 +133,8 @@ impl ExactSizeIterator for Frames<'_, '_> {}
 
 /// libopus `opus_packet_get_samples_per_frame`: the duration of one frame of
 /// a packet with this TOC byte, in samples at `sampling_rate`.
-pub fn samples_per_frame(toc: u8, sampling_rate: i32) -> usize {
-    let fs = sampling_rate.max(0) as i64;
+pub fn samples_per_frame(toc: u8, sampling_rate: SampleRate) -> usize {
+    let fs = sampling_rate.hz() as i64;
     let audiosize = if toc & 0x80 != 0 {
         // CELT-only: 2.5, 5, 10 or 20 ms.
         (fs << ((toc >> 3) & 0x3)) / 400
@@ -168,9 +168,9 @@ pub fn nb_frames(data: &[u8]) -> Result<usize, Error> {
 
 /// libopus `opus_packet_get_nb_samples`: the duration of a packet in
 /// samples per channel at `sampling_rate`. More than 120 ms is invalid.
-pub fn nb_samples(data: &[u8], sampling_rate: i32) -> Result<usize, Error> {
+pub fn nb_samples(data: &[u8], sampling_rate: SampleRate) -> Result<usize, Error> {
     let samples = nb_frames(data)? * samples_per_frame(data[0], sampling_rate);
-    if samples as i64 * 25 > sampling_rate as i64 * 3 {
+    if samples as i64 * 25 > sampling_rate.hz() as i64 * 3 {
         return Err(Error::INVALID_PACKET);
     }
     Ok(samples)
@@ -196,7 +196,7 @@ pub fn has_lbrr(data: &[u8]) -> Result<bool, Error> {
         return Ok(false);
     }
     // The SILK frames of one Opus frame: one per 20 ms.
-    let frame_size = samples_per_frame(toc, 48000);
+    let frame_size = samples_per_frame(toc, SampleRate::Hz48000);
     let nb_frames = if frame_size > 960 { frame_size / 960 } else { 1 };
     let stereo = toc & 0x4 != 0;
     let parsed = parse(data, false)?;
@@ -263,7 +263,7 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, Error> {
     let Some(&toc) = data.first() else {
         return Err(Error::INVALID_PACKET);
     };
-    let framesize = samples_per_frame(toc, 48000);
+    let framesize = samples_per_frame(toc, SampleRate::Hz48000);
 
     // `pos` is the next byte to read. `len` is the C variable of the same
     // name: the bytes left for sizes and frames. It is signed because the
@@ -420,7 +420,7 @@ pub fn parse(data: &[u8], self_delimited: bool) -> Result<ParsedPacket, Error> {
 pub fn multistream_validate(
     data: &[u8],
     nb_streams: usize,
-    sampling_rate: i32,
+    sampling_rate: SampleRate,
 ) -> Result<usize, Error> {
     if nb_streams == 0 {
         return Err(Error::BAD_ARG);
@@ -434,7 +434,7 @@ pub fn multistream_validate(
         let packet = parse(rest, s != nb_streams - 1)?;
         // opus_packet_get_nb_samples: no more than 120 ms.
         let tmp_samples = packet.count * samples_per_frame(packet.toc, sampling_rate);
-        if tmp_samples as i64 * 25 > sampling_rate as i64 * 3 {
+        if tmp_samples as i64 * 25 > sampling_rate.hz() as i64 * 3 {
             return Err(Error::INVALID_PACKET);
         }
         if s != 0 && samples != tmp_samples {
@@ -609,7 +609,10 @@ fn frame_sizes(toc: u8, frames: &[&[u8]]) -> Result<[u16; MAX_FRAMES], Error> {
     let count = frames.len();
     // The repacketizer takes no more than 120 ms of audio
     // (opus_repacketizer_cat_impl).
-    if count == 0 || count > MAX_FRAMES || count * samples_per_frame(toc, 48000) > MAX_PACKET_SAMPLES {
+    if count == 0
+        || count > MAX_FRAMES
+        || count * samples_per_frame(toc, SampleRate::Hz48000) > MAX_PACKET_SAMPLES
+    {
         return Err(Error::BAD_ARG);
     }
     let mut sizes = [0u16; MAX_FRAMES];
@@ -736,7 +739,7 @@ impl<'a> Repacketizer<'a> {
             return Err(Error::INVALID_PACKET);
         }
         // At most 120 ms: 960 samples at 8 kHz.
-        if (curr_nb_frames + self.nb_frames) * samples_per_frame(self.toc, 8000) > 960 {
+        if (curr_nb_frames + self.nb_frames) * samples_per_frame(self.toc, SampleRate::Hz8000) > 960 {
             return Err(Error::INVALID_PACKET);
         }
         let packet = parse(data, self_delimited)?;
@@ -1045,18 +1048,18 @@ mod tests {
     #[test]
     fn samples_per_frame_covers_every_configuration() {
         // SILK-only narrowband: 10, 20, 40, 60 ms.
-        assert_eq!(samples_per_frame(0x00, 48000), 480);
-        assert_eq!(samples_per_frame(0x08, 48000), 960);
-        assert_eq!(samples_per_frame(0x10, 48000), 1920);
-        assert_eq!(samples_per_frame(0x18, 48000), 2880);
+        assert_eq!(samples_per_frame(0x00, SampleRate::Hz48000), 480);
+        assert_eq!(samples_per_frame(0x08, SampleRate::Hz48000), 960);
+        assert_eq!(samples_per_frame(0x10, SampleRate::Hz48000), 1920);
+        assert_eq!(samples_per_frame(0x18, SampleRate::Hz48000), 2880);
         // Hybrid: 10 and 20 ms.
-        assert_eq!(samples_per_frame(0x60, 16000), 160);
-        assert_eq!(samples_per_frame(0x68, 16000), 320);
+        assert_eq!(samples_per_frame(0x60, SampleRate::Hz16000), 160);
+        assert_eq!(samples_per_frame(0x68, SampleRate::Hz16000), 320);
         // CELT-only: 2.5, 5, 10, 20 ms.
-        assert_eq!(samples_per_frame(0x80, 8000), 20);
-        assert_eq!(samples_per_frame(0x88, 8000), 40);
-        assert_eq!(samples_per_frame(0x90, 8000), 80);
-        assert_eq!(samples_per_frame(0x98, 8000), 160);
+        assert_eq!(samples_per_frame(0x80, SampleRate::Hz8000), 20);
+        assert_eq!(samples_per_frame(0x88, SampleRate::Hz8000), 40);
+        assert_eq!(samples_per_frame(0x90, SampleRate::Hz8000), 80);
+        assert_eq!(samples_per_frame(0x98, SampleRate::Hz8000), 160);
     }
 
     #[test]
@@ -1215,13 +1218,13 @@ mod tests {
     fn multistream_validate_wants_equal_durations() {
         // Stream 0: self-delimited 20 ms. Stream 1: 20 ms.
         let ok = [TOC_CELT_20, 1, 7, TOC_CELT_20, 8, 9];
-        assert_eq!(multistream_validate(&ok, 2, 48000), Ok(960));
+        assert_eq!(multistream_validate(&ok, 2, SampleRate::Hz48000), Ok(960));
         // Stream 1 is 2.5 ms.
         let bad = [TOC_CELT_20, 1, 7, TOC_CELT_2_5, 8, 9];
-        assert!(multistream_validate(&bad, 2, 48000).is_err());
+        assert!(multistream_validate(&bad, 2, SampleRate::Hz48000).is_err());
         // The second stream is missing.
-        assert!(multistream_validate(&[TOC_CELT_20, 1, 7], 2, 48000).is_err());
-        assert!(multistream_validate(&ok, 0, 48000).is_err());
+        assert!(multistream_validate(&[TOC_CELT_20, 1, 7], 2, SampleRate::Hz48000).is_err());
+        assert!(multistream_validate(&ok, 0, SampleRate::Hz48000).is_err());
     }
 
     #[test]
@@ -1229,6 +1232,6 @@ mod tests {
         let mut data = [TOC_CELT_20, 1, 7, TOC_CELT_20, 8, 9, 0, 0, 0];
         multistream_pad(&mut data, 6, 9, 2).unwrap();
         assert_eq!(data, [TOC_CELT_20, 1, 7, TOC_CELT_20 | 3, 0x41, 1, 8, 9, 0]);
-        assert_eq!(multistream_validate(&data, 2, 48000), Ok(960));
+        assert_eq!(multistream_validate(&data, 2, SampleRate::Hz48000), Ok(960));
     }
 }

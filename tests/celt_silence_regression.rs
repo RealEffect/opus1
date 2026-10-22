@@ -11,7 +11,7 @@
 //! - VBR shrink behavior
 //! - hybrid mode sanity
 //! - known bad pattern regression (fc 7f fe) not produced for true silence
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::process::Command;
 
 const FRAME_SIZE: usize = 960;
@@ -156,7 +156,12 @@ fn is_finite_all(v: &[f32]) -> bool {
 #[test]
 fn celt_only_zero_pcm_cross_decode() {
     // D-1: CELT-only zero PCM 48k stereo Audio 960 192k
-    let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     // Verify that at 192k it selects CELT-only (TOC should be 0xfc for 20ms stereo FB)
     let zero = vec![0.0f32; FRAME_SIZE * 2 * 5];
@@ -174,7 +179,8 @@ fn celt_only_zero_pcm_cross_decode() {
         packets.push(out[..n].to_vec());
     }
     // Self-decode sanity
-    let mut dec = OpusDecoder::new(SAMPLING_RATE, 2).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(SAMPLING_RATE).unwrap(), Channels::Stereo).unwrap();
     for p in &packets {
         let mut out_pcm = vec![0.0f32; FRAME_SIZE * 2];
         dec.decode(p, FRAME_SIZE, &mut out_pcm)
@@ -241,7 +247,12 @@ fn audio_to_silence_to_audio_transition() {
     }
     let mut packets = Vec::new();
     let mut out = vec![0u8; 1500];
-    let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     for f in 0..total {
         let chunk = &pcm[f * FRAME_SIZE * 2..(f + 1) * FRAME_SIZE * 2];
@@ -280,7 +291,8 @@ fn audio_to_silence_to_audio_transition() {
         shrunk[0]
     );
     // Decode self
-    let mut dec = OpusDecoder::new(SAMPLING_RATE, 2).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(SAMPLING_RATE).unwrap(), Channels::Stereo).unwrap();
     let mut decoded_all = Vec::new();
     for p in &packets {
         let mut out_pcm = vec![0.0f32; FRAME_SIZE * 2];
@@ -313,7 +325,12 @@ fn audio_to_silence_to_audio_transition() {
 fn repeated_silence_no_burst() {
     // D-3: 10-100 frames continuous zero
     for &n_frames in &[10, 50, 100] {
-        let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(SAMPLING_RATE).unwrap(),
+            Channels::Stereo,
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
         let zero = vec![0.0f32; FRAME_SIZE * 2];
         let mut packets = Vec::new();
@@ -324,7 +341,11 @@ fn repeated_silence_no_burst() {
             packets.push(out[..n].to_vec());
         }
         // self decode
-        let mut dec = OpusDecoder::new(SAMPLING_RATE, 2).unwrap();
+        let mut dec = OpusDecoder::new(
+            SampleRate::try_from(SAMPLING_RATE).unwrap(),
+            Channels::Stereo,
+        )
+        .unwrap();
         for p in &packets {
             let mut o = vec![0.0f32; FRAME_SIZE * 2];
             dec.decode(p, FRAME_SIZE, &mut o).unwrap();
@@ -362,7 +383,12 @@ fn repeated_silence_no_burst() {
 fn near_silence_threshold() {
     // D-4: test values around lsb_depth threshold (24 bits => 1/(1<<24) ≈5.96e-08)
     let threshold = 1.0 / ((1u32 << 24) as f32);
-    let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     let mut out = vec![0u8; 1500];
     // prime with silence to get overlap_max=0
@@ -394,7 +420,12 @@ fn near_silence_threshold() {
     );
     // Also test exact zero vs tiny: pure zero is silence, tiny below also silence, above not
     // Cross-decode both
-    let mut enc2 = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc2 = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc2.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     // encode below and decode
     let mut pkts = Vec::new();
@@ -419,7 +450,12 @@ fn vbr_shrink_and_cbr_no_shrink() {
     let zero = vec![0.0f32; FRAME_SIZE * 2];
     let mut out = vec![0u8; 1500];
     // VBR (default)
-    let mut enc_vbr = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc_vbr = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc_vbr.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     enc_vbr.set_vbr(true);
     let n_vbr = enc_vbr.encode(&zero, FRAME_SIZE, &mut out).unwrap();
@@ -429,7 +465,12 @@ fn vbr_shrink_and_cbr_no_shrink() {
         n_vbr
     );
     // CBR
-    let mut enc_cbr = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc_cbr = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc_cbr.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     enc_cbr.set_vbr(false);
     let n_cbr = enc_cbr.encode(&zero, FRAME_SIZE, &mut out).unwrap();
@@ -445,7 +486,12 @@ fn vbr_shrink_and_cbr_no_shrink() {
         out[1]
     );
     // For VBR, also check payload0 ff
-    let mut enc_vbr2 = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc_vbr2 = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc_vbr2.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     enc_vbr2.set_vbr(true);
     let n = enc_vbr2.encode(&zero, FRAME_SIZE, &mut out).unwrap();
@@ -458,7 +504,12 @@ fn vbr_shrink_and_cbr_no_shrink() {
 fn hybrid_zero_sanity() {
     // Hybrid mode: use 32k or 24k where Opus selects Hybrid for Audio?
     // At 48k 32kbps Audio should be Hybrid? Let's force hybrid by low bitrate
-    let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap(); // low enough to force Hybrid? Check encoder logic
     // Ensure mode is Hybrid by checking TOC? TOC for Hybrid has different config.
     let zero = vec![0.0f32; FRAME_SIZE * 2];
@@ -466,7 +517,8 @@ fn hybrid_zero_sanity() {
     let n = enc.encode(&zero, FRAME_SIZE, &mut out).unwrap();
     // Hybrid packets have start_band 17, silence not signaled, packet should be not minimal 3 bytes but larger
     // But should still decode to near silence without burst
-    let mut dec = OpusDecoder::new(SAMPLING_RATE, 2).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(SAMPLING_RATE).unwrap(), Channels::Stereo).unwrap();
     let mut o = vec![0.0f32; FRAME_SIZE * 2];
     dec.decode(&out[..n], FRAME_SIZE, &mut o).unwrap();
     assert!(is_finite_all(&o));
@@ -488,7 +540,12 @@ fn known_bad_pattern_not_emitted_for_true_silence() {
     // E: ensure that for true silence (overlap_max=0, zero PCM) we do NOT emit the known bad pattern
     // The bad pattern is TOC 0xfc + payload starting 7f fe (silence=false) with large size (480)
     // For VBR true silence, correct is 3 bytes ff fe
-    let mut enc = OpusEncoder::new(SAMPLING_RATE, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(SAMPLING_RATE).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(192000)).unwrap();
     enc.set_vbr(true);
     let zero = vec![0.0f32; FRAME_SIZE * 2];

@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 /// One stream to test: how the C encoder is set up and how it is decoded.
 #[derive(Clone, Copy, Debug)]
@@ -87,7 +87,11 @@ fn run(case: &Case, double: bool) -> Run {
     let ch = case.channels;
     let fates = fates(packets.len(), double);
     let mut c_dec = CDecoder::new(case.rate, ch);
-    let mut rs_dec = OpusDecoder::new(case.rate as i32, ch).unwrap();
+    let mut rs_dec = OpusDecoder::new(
+        SampleRate::try_from(case.rate as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
     let mut clean_dec = CDecoder::new(case.rate, ch);
     let mut out = Run { c: vec![], rs: vec![], clean: vec![], ranges: vec![], recovered: vec![], fec_calls: vec![] };
     let mut buf = vec![0f32; 2 * frame * ch];
@@ -178,7 +182,11 @@ fn dense_loss_run(case: &Case) -> (f64, usize, usize) {
     let (mut worst, mut range_mismatches, mut losses) = (200f64, 0, 0);
     for phase in 0..3 {
         let mut c_dec = CDecoder::new(case.rate, 1);
-        let mut rs_dec = OpusDecoder::new(case.rate as i32, 1).unwrap();
+        let mut rs_dec = OpusDecoder::new(
+            SampleRate::try_from(case.rate as i32).unwrap(),
+            Channels::Mono,
+        )
+        .unwrap();
         let mut buf = vec![0f32; frame];
         for i in 0..packets.len() - 1 {
             let reference = if i > 3 && i % 3 == phase {
@@ -239,7 +247,7 @@ fn fec_recovers_what_concealment_cannot() {
     // The same losses, concealed.
     let packets = case.packets();
     let fates = fates(packets.len(), false);
-    let mut dec = OpusDecoder::new(24000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz24000, Channels::Mono).unwrap();
     let mut concealed = Vec::new();
     let mut buf = vec![0f32; 480];
     for (i, p) in packets.iter().enumerate() {
@@ -305,8 +313,16 @@ fn celt_only_packets_are_concealed() {
         let packets = case.packets();
         let (frame, ch) = (case.frame(), case.channels);
         let fates = fates(packets.len(), false);
-        let mut with_fec_call = OpusDecoder::new(case.rate as i32, ch).unwrap();
-        let mut with_loss_call = OpusDecoder::new(case.rate as i32, ch).unwrap();
+        let mut with_fec_call = OpusDecoder::new(
+            SampleRate::try_from(case.rate as i32).unwrap(),
+            Channels::try_from(ch).unwrap(),
+        )
+        .unwrap();
+        let mut with_loss_call = OpusDecoder::new(
+            SampleRate::try_from(case.rate as i32).unwrap(),
+            Channels::try_from(ch).unwrap(),
+        )
+        .unwrap();
         let (mut a, mut b) = (vec![0f32; frame * ch], vec![0f32; frame * ch]);
         let mut recovered = 0;
         for (i, p) in packets.iter().enumerate() {
@@ -333,7 +349,8 @@ fn fec_argument_handling_follows_libopus() {
     let packets = case.packets();
     let frame = case.frame();
     let mut c_dec = CDecoder::new(case.rate, 1);
-    let mut rs_dec = OpusDecoder::new(case.rate as i32, 1).unwrap();
+    let mut rs_dec =
+        OpusDecoder::new(SampleRate::try_from(case.rate as i32).unwrap(), Channels::Mono).unwrap();
     let mut buf = vec![0f32; 4 * frame];
     for p in &packets[..20] {
         c_dec.decode(Some(p), frame, false).unwrap();
@@ -443,7 +460,11 @@ fn fec_across_a_change_of_mode_or_bandwidth_matches_libopus() {
             let n = rate / 50;
             for phase in 0..7 {
                 let mut c_dec = CDecoder::new(rate, dec_ch);
-                let mut rs_dec = OpusDecoder::new(rate as i32, dec_ch).unwrap();
+                let mut rs_dec = OpusDecoder::new(
+                    SampleRate::try_from(rate as i32).unwrap(),
+                    Channels::try_from(dec_ch).unwrap(),
+                )
+                .unwrap();
                 let mut buf = vec![0f32; n * dec_ch];
                 let (mut worst, mut worst_at, mut bad_ranges) = (200f64, 0, 0);
                 for i in 0..packets.len() {

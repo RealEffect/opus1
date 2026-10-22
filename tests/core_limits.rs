@@ -7,7 +7,10 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{chirp, to_stereo};
-use opus1::{Application, Bandwidth, Bitrate, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder, packet, pcm_soft_clip};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder,
+    SampleRate, packet, pcm_soft_clip,
+};
 
 /// Frame sizes no buffer can hold. Several are chosen so that
 /// `frame_size * 2` overflows to a small number, or so that their lowest 32
@@ -35,7 +38,8 @@ fn decoder_frame_sizes_beyond_any_buffer_are_errors() {
         let mut enc = CEncoder::new(48000, channels, APP_VOIP);
         enc.force_mode(MODE_SILK).bandwidth(BW_WB).bitrate(32000).fec(true, 20);
         let packets = enc.encode_all(&pcm, 960);
-        let mut dec = OpusDecoder::new(48000, channels).unwrap();
+        let mut dec =
+            OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(channels).unwrap()).unwrap();
         let mut out = vec![0f32; 5760 * 2];
         let mut out16 = vec![0i16; 5760 * 2];
         for (i, &frame_size) in HUGE.iter().enumerate() {
@@ -66,7 +70,12 @@ fn decoder_frame_sizes_beyond_any_buffer_are_errors() {
 #[test]
 fn encoder_frame_sizes_beyond_any_buffer_are_errors() {
     for channels in [1usize, 2] {
-        let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::Hz48000,
+            Channels::try_from(channels).unwrap(),
+            Application::Audio,
+        )
+        .unwrap();
         let pcm = vec![0.1f32; 5760 * 2];
         let pcm16 = vec![1000i16; 5760 * 2];
         let mut out = vec![0u8; 4000];
@@ -104,16 +113,9 @@ fn helper_functions_take_counts_that_do_not_fit() {
     assert!(packet::pad(&mut data, usize::MAX, usize::MAX).is_err());
     assert!(packet::pad(&mut data, 9, 9).is_err());
     assert!(packet::multistream_pad(&mut data, 4, 8, usize::MAX).is_err());
-    assert!(packet::multistream_validate(&data[..4], usize::MAX, 48000).is_err());
-    assert!(packet::multistream_validate(&data[..4], 0, 48000).is_err());
+    assert!(packet::multistream_validate(&data[..4], usize::MAX, SampleRate::Hz48000).is_err());
+    assert!(packet::multistream_validate(&data[..4], 0, SampleRate::Hz48000).is_err());
     assert_eq!(data, [0x4C, 1, 2, 3, 0, 0, 0, 0], "a rejected call leaves the packet alone");
-    // Sampling rates that are none: no duration, and no panic.
-    for rate in [0, -1, i32::MIN, i32::MAX] {
-        let _ = packet::samples_per_frame(0xFF, rate);
-        let _ = packet::nb_samples(&data[..4], rate);
-        let _ = packet::multistream_validate(&data[..4], 1, rate);
-    }
-    assert!(packet::nb_samples(&data[..4], -48000).is_err());
 }
 
 /// `opus_packet_parse` on a copy of `data`: the frame sizes, or `None` when
@@ -179,7 +181,7 @@ fn frames_longer_than_1275_bytes_are_rejected_like_libopus() {
             }
         }
         // The decoder follows: an error, or the packet's duration.
-        let mut dec = OpusDecoder::new(16000, 1).unwrap();
+        let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
         let mut out = vec![0f32; 1920];
         assert_eq!(dec.decode(data, 1920, &mut out).is_ok(), ours.is_ok());
     }
@@ -218,7 +220,12 @@ fn encoder_at_extreme_settings_writes_packets_libopus_decodes() {
                         for room in [0usize, 1, 2, 3, 9, 1276, 4000] {
                             let frame = rate / 400 * frame_2_5ms;
                             let what = format!("{rate} Hz, {channels} ch, {mode:?}, {bandwidth:?}, {} ms, {bitrate} b/s, CBR {cbr}, {room} bytes", frame_2_5ms as f32 * 2.5);
-                            let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+                            let mut enc = OpusEncoder::new(
+                                SampleRate::try_from(rate as i32).unwrap(),
+                                Channels::try_from(channels).unwrap(),
+                                Application::Audio,
+                            )
+                            .unwrap();
                             enc.set_force_mode(mode);
                             enc.set_bandwidth(bandwidth);
                             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
@@ -263,12 +270,21 @@ fn large_celt_narrowband_stereo_packets_have_the_decoders_final_range() {
     let pcm = to_stereo(&chirp(rate, rate / 2), rate);
     for bitrate in [96000, 128000, 256000, 510000] {
         for cbr in [false, true] {
-            let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Stereo,
+                Application::Audio,
+            )
+            .unwrap();
             enc.set_force_mode(Some(ForcedMode::CeltOnly));
             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             enc.set_vbr(!cbr);
             let mut c_dec = CDecoder::new(rate, 2);
-            let mut dec = OpusDecoder::new(rate as i32, 2).unwrap();
+            let mut dec = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Stereo,
+            )
+            .unwrap();
             let mut buf = vec![0u8; 1276];
             let mut out = vec![0f32; frame * 2];
             for (i, input) in pcm.chunks_exact(frame * 2).enumerate().take(20) {
@@ -381,7 +397,12 @@ fn insane_frames(application: (i32, Application), mode: Option<(i32, ForcedMode)
     }
     let mut c_enc = CEncoder::new(rate, 1, application.0);
     c_enc.bitrate(32000).complexity(5);
-    let mut enc = OpusEncoder::new(rate as i32, 1, application.1).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Mono,
+        application.1,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_complexity(5).unwrap();
     if let Some((c_mode, forced)) = mode {
@@ -479,7 +500,12 @@ fn the_limit_of_the_insane_input_test_is_that_of_libopus() {
     // Whether libopus and opus1 clear the frame (a cleared frame is coded
     // as digital silence, in a few bytes).
     fn cleared(channels: usize, frame: usize, pcm: &[f32]) -> (bool, bool) {
-        let mut rs = OpusEncoder::new(48_000, channels, Application::RestrictedLowDelay).unwrap();
+        let mut rs = OpusEncoder::new(
+            SampleRate::Hz48000,
+            Channels::try_from(channels).unwrap(),
+            Application::RestrictedLowDelay,
+        )
+        .unwrap();
         rs.set_force_mode(Some(ForcedMode::CeltOnly));
         let mut c = CEncoder::new(48_000, channels, APP_LOWDELAY);
         c.force_mode(MODE_CELT);

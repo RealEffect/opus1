@@ -18,7 +18,7 @@
 //!
 //! Decode errors are fine; panics are not.
 
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 /// xorshift64* — deterministic, dependency-free.
 struct Lcg(u64);
@@ -60,7 +60,11 @@ fn toc_frame_samples(toc: u8, rate: i32) -> usize {
 }
 
 fn run_decoder(rate: i32, channels: usize, seed: u64, iterations: usize) {
-    let mut dec = OpusDecoder::new(rate, channels).expect("decoder");
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(rate).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .expect("decoder");
     let mut rng = Lcg(seed);
     let max_frame = toc_frame_samples(0x3F, rate).max(rate as usize / 25 * 3);
     let mut pcm = vec![0.0f32; max_frame * channels + 2];
@@ -131,7 +135,7 @@ fn fuzz_toc_sequences_bandwidth_flip_flop() {
     // Deterministic adversarial pattern aimed at bandwidth-switch +
     // packet-loss interactions: alternate WB voiced-like TOCs (config 8/9)
     // with 1-byte PLC packets and NB TOCs (config 0/1).
-    let mut dec = OpusDecoder::new(16000, 1).expect("decoder");
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).expect("decoder");
     let mut rng = Lcg(0xABCD_1234);
     let mut pcm = vec![0.0f32; 1200];
     for i in 0..2000 {

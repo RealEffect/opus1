@@ -13,7 +13,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// Level of the side signal (left minus right) against the mid signal (left
 /// plus right), in dB. It goes down as a stereo image gets narrower.
@@ -49,7 +49,12 @@ fn celt_streams(rate: usize, bitrate: i32, cbr: bool, input: &[f32]) -> (Decoded
     let frame = rate / 50;
     let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
     c_enc.bitrate(bitrate).complexity(5).vbr(!cbr).force_mode(MODE_CELT);
-    let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     enc.set_complexity(5).unwrap();
     enc.set_vbr(!cbr);
@@ -129,7 +134,12 @@ fn stereo_input_at_low_bitrates_has_the_channel_count_of_libopus() {
         let input = to_stereo(&speech_fullband(rate, 6.0), rate);
         let mut c_enc = CEncoder::new(rate, 2, c_application);
         c_enc.complexity(5);
-        let mut enc = OpusEncoder::new(rate as i32, 2, application).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::Stereo,
+            application,
+        )
+        .unwrap();
         enc.set_complexity(5).unwrap();
         let mut c_dec = CDecoder::new(rate, 2);
         let mut buf = vec![0u8; 4000];

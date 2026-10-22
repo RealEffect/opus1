@@ -31,24 +31,24 @@ The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Applicati
 ## One frame through the encoder and the decoder
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-let rate = 16_000; // samples per second
+let rate = SampleRate::Hz16000;
 let frame = 320; // 20 ms at 16 kHz
 
 // A 440 Hz tone as input.
 let pcm: Vec<f32> = (0..frame)
-    .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate as f32).sin())
+    .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate.hz() as f32).sin())
     .collect();
 
-let mut encoder = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(rate, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
 
 // The length of `packet` is the largest packet the encoder may write.
 let mut packet = vec![0u8; 1276];
 let len = encoder.encode(&pcm, frame, &mut packet).unwrap();
 
-let mut decoder = OpusDecoder::new(rate, 1).unwrap();
+let mut decoder = OpusDecoder::new(rate, Channels::Mono).unwrap();
 let mut out = vec![0.0f32; frame];
 let samples = decoder.decode(&packet[..len], frame, &mut out).unwrap();
 assert_eq!(samples, frame);
@@ -117,7 +117,7 @@ The default bitrate is `Bitrate::Auto`, as in libopus (`OPUS_AUTO`). It is 60 ×
 `bitrate()` returns the rate that applies, for the duration of the last frame. The automatic rate is a speech rate at 8 and 16 kHz, so a 16 kHz VoIP encoder codes SILK. A bitrate that is set explicitly changes that. At 64 kb/s the same encoder codes CELT, and libopus 1.6.1 does the same at 64 kb/s:
 
 ```rust
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 let frame = 320; // 20 ms at 16 kHz
 let pcm: Vec<f32> = (0..frame).map(|i| 0.2 * (i as f32 * 0.07).sin()).collect();
@@ -127,13 +127,13 @@ let mut packet = vec![0u8; 1276];
 // number: 0-11 SILK, 12-15 Hybrid, 16-31 CELT.
 let config = |packet: &[u8]| packet[0] >> 3;
 
-let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 assert_eq!(encoder.bitrate_setting(), Bitrate::Auto);
 encoder.encode(&pcm, frame, &mut packet).unwrap();
 assert_eq!(encoder.bitrate(), 19_000);
 assert!(config(&packet) <= 11); // SILK
 
-let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
 encoder.encode(&pcm, frame, &mut packet).unwrap();
 assert!(config(&packet) >= 16); // CELT
@@ -181,21 +181,21 @@ Settings and the reason for each:
 - Complexity: the default, 9. SILK encoding at 16 kHz takes about 46 microseconds (µs) per 20 ms frame at complexity 10 on an Apple M4 Pro. That is a small fraction of the 20 ms the frame lasts.
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-const RATE: i32 = 16_000;
+const RATE: SampleRate = SampleRate::Hz16000;
 const FRAME: usize = 320; // 20 ms
 
-let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
 encoder.set_inband_fec(true);
 encoder.set_packet_loss_perc(10).unwrap();
 
-let mut decoder = OpusDecoder::new(RATE, 1).unwrap();
+let mut decoder = OpusDecoder::new(RATE, Channels::Mono).unwrap();
 
 // One second of 16-bit input, as a microphone delivers it.
-let mic: Vec<i16> = (0..RATE as usize)
-    .map(|i| (6000.0 * (2.0 * std::f32::consts::PI * 200.0 * i as f32 / RATE as f32).sin()) as i16)
+let mic: Vec<i16> = (0..RATE.hz() as usize)
+    .map(|i| (6000.0 * (2.0 * std::f32::consts::PI * 200.0 * i as f32 / RATE.hz() as f32).sin()) as i16)
     .collect();
 
 let mut packet = [0u8; 1276];
@@ -226,12 +226,12 @@ Settings and the reason for each:
 - `Signal::Voice`: the input is speech. From complexity 7 on (the default is 9) the encoder otherwise estimates this from the input with its speech and music analysis, and may code a voice it takes for music as CELT.
 
 ```rust
-use opus1::{Application, Bitrate, OpusEncoder, Signal};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate, Signal};
 
-const RATE: i32 = 24_000;
+const RATE: SampleRate = SampleRate::Hz24000;
 const FRAME: usize = 480; // 20 ms
 
-let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
 encoder.set_signal(Signal::Voice);
 
@@ -239,11 +239,11 @@ encoder.set_signal(Signal::Voice);
 // some noise, which reaches up to 12 kHz as speech does). It does not end
 // on a frame boundary.
 let mut seed = 1u32;
-let tts: Vec<i16> = (0..RATE as usize + 100)
+let tts: Vec<i16> = (0..RATE.hz() as usize + 100)
     .map(|i| {
         seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         let noise = (seed >> 16) as f32 / 32768.0 - 1.0;
-        let tone = (2.0 * std::f32::consts::PI * 150.0 * i as f32 / RATE as f32).sin();
+        let tone = (2.0 * std::f32::consts::PI * 150.0 * i as f32 / RATE.hz() as f32).sin();
         (5000.0 * tone + 500.0 * noise) as i16
     })
     .collect();
@@ -263,7 +263,7 @@ for chunk in tts.chunks(FRAME) {
 assert_eq!(packets.len(), 51);
 
 // An Ogg Opus file stores the encoder delay at 48 kHz as its pre-skip.
-let pre_skip = encoder.lookahead() * 48_000 / RATE as usize;
+let pre_skip = encoder.lookahead() * 48_000 / RATE.hz() as usize;
 assert_eq!(pre_skip, 312);
 ```
 
@@ -280,20 +280,20 @@ Settings and the reason for each:
 - 20 ms frames. Use 10, 5 or 2.5 ms frames when the delay must be lower. Shorter frames need more bits for the same quality.
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-const RATE: i32 = 48_000;
+const RATE: SampleRate = SampleRate::Hz48000;
 const FRAME: usize = 960; // 20 ms
 
-let mut encoder = OpusEncoder::new(RATE, 2, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(RATE, Channels::Stereo, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(128_000)).unwrap();
 encoder.set_complexity(10).unwrap();
-let mut decoder = OpusDecoder::new(RATE, 2).unwrap();
+let mut decoder = OpusDecoder::new(RATE, Channels::Stereo).unwrap();
 
 // Interleaved stereo: 440 Hz on the left, 660 Hz on the right.
 let pcm: Vec<f32> = (0..FRAME * 2)
     .map(|k| {
-        let t = (k / 2) as f32 / RATE as f32;
+        let t = (k / 2) as f32 / RATE.hz() as f32;
         let f = if k % 2 == 0 { 440.0 } else { 660.0 };
         0.25 * (2.0 * std::f32::consts::PI * f * t).sin()
     })
@@ -335,10 +335,10 @@ The encoder decides the mode, the bandwidth and the channels once for the whole 
 With VBR, libopus 1.6 limits each part of such a packet to the bytes the bitrate gives one part. `opus1` leaves that limit out, so a part can take more bytes when the signal needs them, as with frames of their own. With in-band FEC the limit costs libopus much quality. One measurement: 2.4 s of speech at 8 kHz mono, `Audio`, 64 kb/s VBR, complexity 9, FEC with 10 % expected loss, decoded by libopus. libopus's SNR falls from 29.8 dB in 60 ms frames to 10.2 dB in 80 ms frames and 8.8 dB in 120 ms frames. `opus1` gives 30.2 and 29.6 dB. [Differences from libopus](10-differences-from-libopus.md) lists this with the other deliberate differences.
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 const FRAME: usize = 5760; // 120 ms at 48 kHz
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
 let pcm: Vec<f32> = (0..FRAME).map(|i| 0.3 * (i as f32 * 0.03).sin()).collect();
 let mut packet = vec![0u8; 6 * 1276];
@@ -347,7 +347,7 @@ let len = encoder.encode(&pcm, FRAME, &mut packet).unwrap();
 assert_eq!(packet[0] & 0x03, 3);
 assert_eq!(packet[1] & 0x3f, 6);
 
-let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 let mut out = vec![0.0f32; FRAME];
 assert_eq!(decoder.decode(&packet[..len], FRAME, &mut out).unwrap(), FRAME);
 ```
@@ -363,9 +363,9 @@ assert_eq!(decoder.decode(&packet[..len], FRAME, &mut out).unwrap(), FRAME);
 The values are those of libopus: `FrameDuration::try_from(5000..=5009)` gives `Argument` (`OPUS_FRAMESIZE_ARG`, 5000) and the durations from 2.5 ms (5001) to 120 ms (5009). Any other number is refused, as libopus refuses it. The setting stays across `reset_state`.
 
 ```rust
-use opus1::{Application, FrameDuration, OpusEncoder, packet};
+use opus1::{Application, Channels, FrameDuration, OpusEncoder, SampleRate, packet};
 
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 encoder.set_expert_frame_duration(FrameDuration::Ms20);
 assert_eq!(FrameDuration::try_from(5004), Ok(FrameDuration::Ms20));
 assert!(FrameDuration::try_from(5010).is_err());
@@ -375,7 +375,7 @@ assert!(FrameDuration::try_from(5010).is_err());
 let pcm = vec![0.0f32; 2400];
 let mut out = vec![0u8; 1500];
 let len = encoder.encode(&pcm, 2400, &mut out).unwrap();
-assert_eq!(packet::nb_samples(&out[..len], 48_000).unwrap(), 960);
+assert_eq!(packet::nb_samples(&out[..len], SampleRate::Hz48000).unwrap(), 960);
 
 // Less than 20 ms is refused.
 assert!(encoder.encode(&pcm, 480, &mut out).is_err());
@@ -433,9 +433,9 @@ A packet that does not arrive in time is lost. The decoder can fill the gap in t
 Pass an empty packet. The decoder then makes up `frame_size` samples per channel that continue the signal (packet loss concealment, PLC). `frame_size` is the lost duration and must be a multiple of 2.5 ms.
 
 ```rust
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
-let mut decoder = OpusDecoder::new(48_000, 2).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
 let mut out = vec![0.0f32; 960 * 2];
 // 20 ms were lost.
 let samples = decoder.decode(&[], 960, &mut out).unwrap();
@@ -463,19 +463,19 @@ On the decoder, when packet `n` is lost and packet `n + 1` has arrived:
 When several packets in a row are lost, conceal all but the last one with empty packets, then use `decode_fec` for the last one.
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-const RATE: i32 = 16_000;
+const RATE: SampleRate = SampleRate::Hz16000;
 const FRAME: usize = 320; // 20 ms
 
-let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
 encoder.set_inband_fec(true);
 encoder.set_packet_loss_perc(10).unwrap();
 
 // 30 packets of a test signal.
 let signal: Vec<f32> = (0..FRAME * 30)
-    .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 180.0 * i as f32 / RATE as f32).sin())
+    .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 180.0 * i as f32 / RATE.hz() as f32).sin())
     .collect();
 let packets: Vec<Vec<u8>> = signal
     .chunks_exact(FRAME)
@@ -487,7 +487,7 @@ let packets: Vec<Vec<u8>> = signal
     })
     .collect();
 
-let mut decoder = OpusDecoder::new(RATE, 1).unwrap();
+let mut decoder = OpusDecoder::new(RATE, Channels::Mono).unwrap();
 let mut out = vec![0.0f32; FRAME];
 let mut decoded = 0;
 for (n, packet) in packets.iter().enumerate() {
@@ -532,9 +532,11 @@ When the jitter buffer (the queue that holds received packets until it is time t
 ```rust
 #[cfg(feature = "dred")]
 {
-    use opus1::{Application, Bitrate, OpusDecoder, OpusDred, OpusDredDecoder, OpusEncoder};
+    use opus1::{
+        Application, Bitrate, Channels, OpusDecoder, OpusDred, OpusDredDecoder, OpusEncoder, SampleRate,
+    };
 
-    const RATE: i32 = 16_000;
+    const RATE: SampleRate = SampleRate::Hz16000;
     const FRAME: usize = 320; // 20 ms
 
     /// Plays `lost` lost packets of FRAME samples, then `next`, the packet
@@ -549,7 +551,7 @@ When the jitter buffer (the queue that holds received packets until it is time t
     ) -> usize {
         let gap = (lost * FRAME) as i32;
         // Only the DRED data that covers the gap is read.
-        let reach = match dred_decoder.parse(dred, next, gap.min(RATE), RATE, false) {
+        let reach = match dred_decoder.parse(dred, next, gap.min(RATE.hz() as i32), RATE, false) {
             Ok(found) => found.samples,
             Err(_) => 0, // not a valid packet: conceal
         };
@@ -568,12 +570,12 @@ When the jitter buffer (the queue that holds received packets until it is time t
 
     // The sender: DRED of 1 s, with 20 % expected loss. Packets of a
     // libopus encoder with DRED are read the same way.
-    let mut encoder = OpusEncoder::new(RATE, 1, Application::Voip).unwrap();
+    let mut encoder = OpusEncoder::new(RATE, Channels::Mono, Application::Voip).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap();
     encoder.set_packet_loss_perc(20).unwrap();
     encoder.set_dred_duration(100).unwrap();
     let signal: Vec<f32> = (0..FRAME * 20)
-        .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 180.0 * i as f32 / RATE as f32).sin())
+        .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 180.0 * i as f32 / RATE.hz() as f32).sin())
         .collect();
     let packets: Vec<Vec<u8>> = signal
         .chunks_exact(FRAME)
@@ -585,7 +587,7 @@ When the jitter buffer (the queue that holds received packets until it is time t
         })
         .collect();
 
-    let mut decoder = OpusDecoder::new(RATE, 1).unwrap();
+    let mut decoder = OpusDecoder::new(RATE, Channels::Mono).unwrap();
     let dred_decoder = OpusDredDecoder::new();
     let mut dred = OpusDred::new();
     let mut out = vec![0.0f32; FRAME];
@@ -595,7 +597,7 @@ When the jitter buffer (the queue that holds received packets until it is time t
     }
     // Packets 10 to 14 are lost; packet 15 arrived. All its DRED data
     // (up to 1 s) reaches back over all of them.
-    let found = dred_decoder.parse(&mut dred, &packets[15], RATE, RATE, true).unwrap();
+    let found = dred_decoder.parse(&mut dred, &packets[15], RATE.hz() as i32, RATE, true).unwrap();
     assert!(found.samples >= (5 * FRAME) as i32);
     played += play_after_loss(&mut decoder, &dred_decoder, &mut dred, &packets[15], 5, &mut out);
     assert_eq!(played, 16 * FRAME);
@@ -717,9 +719,9 @@ A `DnnBlob` is made in one of three ways:
 Cloning a `DnnBlob` does not copy the bytes. A decoder keeps a clone of the blob for as long as it uses its weights. `set_dnn_blob` allocates the layer tables of each group it loads (with `heap`); decoding allocates nothing.
 
 ```rust
-use opus1::{ErrorKind, OpusDecoder};
+use opus1::{Channels, ErrorKind, OpusDecoder, SampleRate};
 
-let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 assert_eq!(decoder.complexity(), 0);
 // Deep PLC and NoLACE, in a build with those features.
 decoder.set_complexity(7).unwrap();
@@ -752,10 +754,10 @@ match decoder.set_osce_bwe(true) {
 - `decode_fec_i16` is `decode_fec` with 16-bit output.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
-let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 
 let pcm: Vec<i16> = (0..960).map(|i| ((i % 100) as i16 - 50) * 200).collect();
 let mut packet = [0u8; 1276];
@@ -765,7 +767,7 @@ let len = encoder.encode_i16(&pcm, 960, &mut packet).unwrap();
 // gives the same packet.
 let pcm_f32: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
 let mut packet_f32 = [0u8; 1276];
-let mut encoder_f32 = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut encoder_f32 = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 encoder_f32.set_lsb_depth(16).unwrap();
 let len_f32 = encoder_f32.encode(&pcm_f32, 960, &mut packet_f32).unwrap();
 assert_eq!(packet[..len], packet_f32[..len_f32]);
@@ -783,10 +785,10 @@ libopus 1.6 added calls for 24-bit samples held in 32-bit integers, with full sc
 - `MultistreamEncoder::encode24`, `MultistreamDecoder::decode24` and `decode_fec24` do the same for multistream packets.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
-let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 
 // A 24-bit tone, and the same tone as float.
 let pcm: Vec<i32> = (0..960).map(|i| ((i % 96) as i32 - 48) * 100_000).collect();
@@ -795,7 +797,7 @@ let pcm_f32: Vec<f32> = pcm.iter().map(|&s| s as f32 / 8_388_608.0).collect();
 let mut packet = [0u8; 1276];
 let len = encoder.encode24(&pcm, 960, &mut packet).unwrap();
 let mut packet_f32 = [0u8; 1276];
-let mut encoder_f32 = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut encoder_f32 = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 let len_f32 = encoder_f32.encode(&pcm_f32, 960, &mut packet_f32).unwrap();
 assert_eq!(packet[..len], packet_f32[..len_f32]);
 
@@ -810,9 +812,9 @@ assert_eq!(decoder.decode24(&packet[..len], 960, &mut out).unwrap(), 960);
 - `set_phase_inversion_disabled(true)` on `OpusEncoder` or `OpusDecoder` (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`) turns off the sign inversion in CELT's intensity stereo. On the encoder it makes a mono downmix of the decoded stereo sound better, at a small cost in stereo quality. A mono decoder has it on from the start, because it mixes stereo streams down; a stereo decoder has it off. The multistream encoder and decoder forward it to every stream.
 
 ```rust
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
-let mut decoder = OpusDecoder::new(48_000, 2).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
 decoder.set_gain(-6 * 256).unwrap(); // -6 dB
 assert_eq!(decoder.gain(), -1536);
 assert!(decoder.set_gain(40_000).is_err());
@@ -826,14 +828,14 @@ assert_eq!(decoder.pitch(), 0); // nothing decoded yet
 `OpusEncoder` and `OpusDecoder` handle 1 or 2 channels. For 3 to 255 channels, such as 5.1 surround, use `opus1::multistream::MultistreamEncoder` and `MultistreamDecoder`. A multistream packet holds one ordinary Opus packet per stream. Each stream has its own `OpusEncoder` or `OpusDecoder`. The module needs the `std` feature. [Multichannel audio](05-multichannel.md) explains the channel layouts and the settings.
 
 ```rust
-use opus1::Application;
+use opus1::{Application, SampleRate};
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
 
 // 5.1 at 48 kHz, channel mapping family 1 (Vorbis channel order).
-let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
+let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
 let layout = encoder.layout().clone();
 let mut decoder = MultistreamDecoder::with_layout(
-    48_000,
+    SampleRate::Hz48000,
     6,
     layout.streams(),
     layout.coupled_streams(),
@@ -890,14 +892,14 @@ Without `heap`, `OpusDecoder` holds all of its state inline: 59,752 bytes, and u
 
 ```rust
 use core::mem::MaybeUninit;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
 
 // Run once at start-up.
 let slot = &raw mut DECODER;
 // SAFETY: nothing else uses `DECODER` at the same time.
-let decoder: &'static mut OpusDecoder = OpusDecoder::init(unsafe { &mut *slot }, 48000, 2)?;
+let decoder: &'static mut OpusDecoder = OpusDecoder::init(unsafe { &mut *slot }, SampleRate::Hz48000, Channels::Stereo)?;
 
 let mut pcm = [0.0f32; 960 * 2];
 decoder.decode(&[], 960, &mut pcm)?; // conceals a lost frame
@@ -987,7 +989,7 @@ Without `heap`, keep the encoder and the decoder in a `static` (or in other memo
 ```rust
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 /// Room for one encoder, outside every stack.
 struct EncoderSlot(UnsafeCell<MaybeUninit<OpusEncoder>>);
@@ -1005,7 +1007,7 @@ static ENCODER: EncoderSlot = EncoderSlot(UnsafeCell::new(MaybeUninit::uninit())
 unsafe fn init_encoder() -> &'static mut OpusEncoder {
     // SAFETY: the caller guarantees that nothing else refers to the slot.
     let slot = unsafe { &mut *ENCODER.0.get() };
-    slot.write(OpusEncoder::new(16_000, 1, Application::Voip).unwrap())
+    slot.write(OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap())
 }
 
 // SAFETY: this is the first and only call.
@@ -1037,8 +1039,8 @@ What the encoder and the decoder reject:
 
 | Call | Input | Kind | Message |
 |---|---|---|---|
-| `OpusEncoder::new`, `OpusDecoder::new` | a sampling rate other than 8000, 12000, 16000, 24000, 48000 | `BadArg` | `invalid sampling rate` |
-| `OpusEncoder::new`, `OpusDecoder::new` | a channel count other than 1 or 2 | `BadArg` | `invalid number of channels` |
+| `SampleRate::try_from` | a sampling rate other than 8000, 12000, 16000, 24000, 48000 | `BadArg` | `invalid sampling rate` |
+| `Channels::try_from` | a channel count other than 1 or 2 | `BadArg` | `invalid number of channels` |
 | `encode`, `encode_i16`, `encode24` | a frame size that is not 2.5, 5, 10, 20, 40, 60, 80, 100 or 120 ms; with an expert frame duration, a frame size shorter than that duration | `BadArg` | `invalid frame size` |
 | `encode`, `encode_i16`, `encode24` | fewer than `frame_size * channels` input samples | `BadArg` | `input buffer too small for frame` |
 | `encode`, `encode_i16`, `encode24` | an empty output buffer | `BadArg` | `output buffer is empty` |
@@ -1056,8 +1058,6 @@ What the encoder and the decoder reject:
 | `set_dnn_blob` | a blob that holds no complete group of networks of this build | `BadArg` | `DNN blob holds no model of this build` |
 | `set_packet_loss_perc` | a value outside 0 to 100 | `BadArg` | `invalid packet loss percentage` |
 | `set_max_bandwidth` | `Bandwidth::Auto` | `BadArg` | `invalid maximum bandwidth` |
-| `set_force_channels` | more channels than the encoder has, or 0 | `BadArg` | `invalid forced channel count` |
-| `MultistreamEncoder::set_force_channels` | as above, for the first stream that refuses it (`Some(2)` with a mono stream); the streams before it keep the new value, as in libopus | `BadArg` | `invalid forced channel count` |
 | `OpusDecoder::set_gain`, `MultistreamDecoder::set_gain` | a value outside -32768 to 32767 | `BadArg` | `invalid gain` |
 | `OpusEncoder::set_voice_ratio` | a value outside -1 to 100 | `BadArg` | `invalid voice ratio` |
 | `OpusEncoder::set_application`, `MultistreamEncoder::set_application` | another application after the first frame (before `reset_state`) | `BadArg` | `application cannot change after the first frame` |
@@ -1069,15 +1069,15 @@ What is not rejected: a positive bitrate below 500 b/s or above 750,000 b/s per 
 The decoder checks the packet and the buffer sizes before it changes its state. After an invalid packet or a buffer that is too small, the next packet decodes normally.
 
 ```rust
-use opus1::{Application, Bitrate, ErrorKind, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ErrorKind, OpusDecoder, OpusEncoder, SampleRate};
 
 // 44.1 kHz is not an Opus sampling rate.
-let err = OpusEncoder::new(44_100, 1, Application::Audio).err().unwrap();
+let err = SampleRate::try_from(44_100u32).unwrap_err();
 assert_eq!(err.kind(), ErrorKind::BadArg);
 assert_eq!(err.to_raw(), -1); // OPUS_BAD_ARG
 assert_eq!(err.to_string(), "invalid sampling rate");
 
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
 let mut packet = [0u8; 1276];
 // 441 samples is not a valid frame duration at 48 kHz.
 let err = encoder.encode(&[0.0; 441], 441, &mut packet).unwrap_err();
@@ -1090,7 +1090,7 @@ assert_eq!(encoder.complexity(), 9);
 encoder.set_bitrate(Bitrate::BitsPerSecond(1_000_000)).unwrap();
 assert_eq!(encoder.bitrate_setting(), Bitrate::BitsPerSecond(750_000));
 
-let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 let mut out = [0.0f32; 960];
 // Frame count code 3 needs a second byte.
 let err = decoder.decode(&[0x03], 960, &mut out).unwrap_err();
@@ -1104,7 +1104,7 @@ match decoder.decode(&[], 100, &mut out) {
 
 // `?` turns an `Error` into a `Box<dyn std::error::Error>`.
 fn first_packet(pcm: &[f32]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio)?;
+    let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)?;
     let mut packet = vec![0u8; 1276];
     let len = encoder.encode(pcm, 960, &mut packet)?;
     packet.truncate(len);
@@ -1127,7 +1127,7 @@ Apart from constant tables, the crate has one global value: the CELT mode, which
 
 ```rust
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fn is_send_and_sync<T: Send + Sync>() {}
 is_send_and_sync::<OpusEncoder>();
@@ -1135,7 +1135,7 @@ is_send_and_sync::<OpusDecoder>();
 is_send_and_sync::<MultistreamEncoder>();
 is_send_and_sync::<MultistreamDecoder>();
 
-let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
 let worker = std::thread::spawn(move || {
     let mut packet = [0u8; 1276];
     encoder.encode(&[0.0f32; 1920], 960, &mut packet).unwrap()

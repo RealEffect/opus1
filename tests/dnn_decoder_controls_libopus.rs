@@ -13,7 +13,7 @@
 //! Homebrew libopus, which has none of the features.
 
 use audiopus_sys as sys;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use std::os::raw::c_int;
 
 const OPUS_GET_COMPLEXITY_REQUEST: c_int = 4011;
@@ -55,7 +55,7 @@ impl Drop for CDec {
 
 #[test]
 fn complexity_matches_a_libopus_with_the_features() {
-    let mut d = OpusDecoder::new(48000, 1).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut c = CDec::new(48000, 1);
     assert_eq!((d.complexity(), c.get(OPUS_GET_COMPLEXITY_REQUEST)), (0, (sys::OPUS_OK, 0)));
     for value in [-1, 0, 4, 5, 6, 7, 10, 11, i32::MIN, i32::MAX] {
@@ -78,7 +78,7 @@ fn complexity_matches_a_libopus_with_the_features() {
 #[cfg(feature = "osce-bwe")]
 #[test]
 fn the_bwe_switch_matches_a_libopus_with_the_extension() {
-    let mut d = OpusDecoder::new(48000, 1).unwrap();
+    let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut c = CDec::new(48000, 1);
     assert_eq!(c.get(OPUS_GET_OSCE_BWE_REQUEST), (sys::OPUS_OK, 0));
     assert_eq!(d.osce_bwe(), Ok(false));
@@ -110,7 +110,7 @@ fn libopus_with_builtin_weights_has_no_blob_request() {
     let _ = &mut c;
     #[cfg(feature = "deep-plc")]
     {
-        let mut d = OpusDecoder::new(48000, 1).unwrap();
+        let mut d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
         assert!(d.set_dnn_blob(&opus1::DnnBlob::builtin()).is_ok());
     }
 }
@@ -133,7 +133,7 @@ fn the_multistream_decoder_of_libopus_does_not_forward_the_bwe_switch() {
         coupled_count: 0,
         mapping: mapping.to_vec(),
     };
-    let mut d = opus1::multistream::MultistreamDecoder::new(48000, table).unwrap();
+    let mut d = opus1::multistream::MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap();
     d.set_complexity(7).unwrap();
     assert_eq!(d.stream_decoder(1).unwrap().complexity(), 7);
     #[cfg(feature = "osce-bwe")]

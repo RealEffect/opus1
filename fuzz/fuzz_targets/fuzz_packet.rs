@@ -29,6 +29,7 @@ mod common;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use opus1::SampleRate;
 use opus1::multistream::split_self_delimited;
 use opus1::packet::{self, ParsedPacket};
 
@@ -187,11 +188,12 @@ fn single(rest: &[u8]) -> Result<()> {
 
     // The duration fields at every rate.
     for fs in RATES {
+        let rate = SampleRate::try_from(fs).unwrap();
         if let Some(&toc) = data.first() {
             let c = unsafe { audiopus_sys::opus_packet_get_samples_per_frame(&toc, fs) };
-            assert_eq!(packet::samples_per_frame(toc, fs) as i32, c, "samples_per_frame({toc:#x}, {fs})");
+            assert_eq!(packet::samples_per_frame(toc, rate) as i32, c, "samples_per_frame({toc:#x}, {fs})");
         }
-        let rust = packet::nb_samples(data, fs);
+        let rust = packet::nb_samples(data, rate);
         let c = c_nb_samples(data, fs);
         match rust {
             Ok(n) => assert_eq!(n as i32, c, "nb_samples at {fs}"),
@@ -306,10 +308,11 @@ fn multistream(rest: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(rest);
     let nb_streams = if u.ratio(1, 16)? { u.int_in_range(1..=255)? } else { u.int_in_range(1..=6)? };
     let fs = *u.choose(&RATES)?;
+    let rate = SampleRate::try_from(fs).unwrap();
     let extra = *u.choose(&[0usize, 1, 2, 5, 255, 300])?;
     let data = u.take_rest();
 
-    let rust = packet::multistream_validate(data, nb_streams, fs);
+    let rust = packet::multistream_validate(data, nb_streams, rate);
     let c = c_ms_validate(data, nb_streams, fs);
     match rust {
         Ok(n) => assert_eq!(n as i32, c, "multistream_validate({nb_streams} streams, {fs} Hz)"),
@@ -351,8 +354,8 @@ fn multistream(rest: &[u8]) -> Result<()> {
         if c == 0 {
             assert_eq!(rust_buf, c_buf, "multistream_pad gives other bytes than libopus");
             // Padding keeps the duration of a valid packet.
-            if let Ok(n) = packet::multistream_validate(&zeroed, nb_streams, fs) {
-                assert_eq!(packet::multistream_validate(&rust_buf, nb_streams, fs), Ok(n));
+            if let Ok(n) = packet::multistream_validate(&zeroed, nb_streams, rate) {
+                assert_eq!(packet::multistream_validate(&rust_buf, nb_streams, rate), Ok(n));
             }
         }
     }

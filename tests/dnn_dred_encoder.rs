@@ -11,8 +11,8 @@
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::{
-    Application, Bitrate, DnnBlob, ErrorKind, ForcedMode, OpusDred, OpusDredDecoder, OpusEncoder,
-    packet,
+    Application, Bitrate, Channels, DnnBlob, ErrorKind, ForcedMode, OpusDred, OpusDredDecoder,
+    OpusEncoder, SampleRate, packet,
 };
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
 use std::cell::Cell;
@@ -100,7 +100,12 @@ fn dred_of(data: &[u8]) -> Option<(usize, Vec<u8>)> {
 }
 
 fn encoder(fs: i32, channels: usize, bitrate: i32, loss: i32, dred: i32) -> OpusEncoder {
-    let mut enc = OpusEncoder::new(fs, channels, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(fs).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        Application::Voip,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     enc.set_packet_loss_perc(loss).unwrap();
     enc.set_dred_duration(dred).unwrap();
@@ -109,7 +114,8 @@ fn encoder(fs: i32, channels: usize, bitrate: i32, loss: i32, dred: i32) -> Opus
 
 #[test]
 fn the_dred_duration_takes_0_to_104_and_a_reset_clears_it() {
-    let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     assert_eq!(enc.dred_duration(), 0);
     for v in [0, 1, 52, 104] {
         enc.set_dred_duration(v).unwrap();
@@ -158,7 +164,8 @@ fn dred_data_is_written_and_read_back() {
                 with_dred += 1;
                 assert_eq!(&data[..2], &[b'D', DRED_EXPERIMENTAL_VERSION]);
                 assert!(ext_frame < packet::nb_frames(p).unwrap());
-                let got = dec.parse(&mut dred, p, fs, fs, false).unwrap();
+                let got =
+                    dec.parse(&mut dred, p, fs, SampleRate::try_from(fs).unwrap(), false).unwrap();
                 assert!(got.samples > 0, "{fs} {channels} {frame_ms} {mode:?}");
                 assert!(dred.nb_latents() > 0);
                 assert!(dred.features().iter().all(|x| x.is_finite()));
@@ -264,7 +271,12 @@ fn random_settings_and_inputs_do_not_panic() {
         let fs = rates[rng.next() as usize % 5];
         let channels = 1 + rng.next() as usize % 2;
         let app = [Application::Voip, Application::Audio, Application::RestrictedLowDelay][rng.next() as usize % 3];
-        let mut enc = OpusEncoder::new(fs, channels, app).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(fs).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            app,
+        )
+        .unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(6000 + (rng.next() % 200_000) as i32)).unwrap();
         enc.set_packet_loss_perc((rng.next() % 101) as i32).unwrap();
         enc.set_dred_duration((rng.next() % 105) as i32).unwrap();

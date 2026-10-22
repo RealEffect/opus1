@@ -13,7 +13,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 /// Stereo test inputs, interleaved.
 #[derive(Clone, Copy, Debug)]
@@ -89,7 +89,12 @@ fn sweep(
     let frame = rate * frame_ms_x10 / 10000;
     let mut c_enc = CEncoder::new(rate, 2, application.0);
     c_enc.complexity(5).vbr(!cbr);
-    let mut enc = OpusEncoder::new(rate as i32, 2, application.1).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Stereo,
+        application.1,
+    )
+    .unwrap();
     enc.set_complexity(5).unwrap();
     enc.set_vbr(!cbr);
     setup(&mut enc, &mut c_enc);
@@ -234,7 +239,12 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
         let frame = rate * frame_ms / 1000;
         let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
         c_enc.complexity(5).force_mode(MODE_HYBRID).bandwidth(BW_FB);
-        let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::Stereo,
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_complexity(5).unwrap();
         enc.set_force_mode(Some(opus1::ForcedMode::Hybrid));
         enc.set_bandwidth(opus1::Bandwidth::Fullband);
@@ -249,7 +259,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
             if ms == 4800 {
                 // The caller lets the bitrate decide again.
                 c_enc.force_channels(-1000);
-                enc.set_force_channels(None).unwrap();
+                enc.set_force_channels(None);
             }
             enc.encode(pcm, frame, &mut buf).unwrap();
             let c_packet = c_enc.encode(pcm);
@@ -263,7 +273,7 @@ fn a_long_hybrid_packet_that_leads_over_to_mono_keeps_the_stream_mono_like_libop
             let expected = if !(1200..4800).contains(&ms) { 2 } else if ms >= 1200 + 2 * frame_ms { 1 } else { want };
             assert_eq!(want, expected, "{frame_ms} ms, at {ms} ms: libopus");
             if (1200 + 2 * frame_ms..4800).contains(&ms) {
-                assert_eq!(forced, Some(1), "{frame_ms} ms, at {ms} ms");
+                assert_eq!(forced, Some(Channels::Mono), "{frame_ms} ms, at {ms} ms");
             }
         }
     }
@@ -284,7 +294,12 @@ fn stereo_after_mono_with_a_new_silk_rate_codes_like_libopus() {
         let frame = rate * frame_ms / 1000;
         let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
         c_enc.complexity(5);
-        let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::Stereo,
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_complexity(5).unwrap();
         let mut dec = CDecoder::new(rate, 2);
         let mut buf = vec![0u8; 4000];
@@ -361,7 +376,12 @@ fn silk_wideband(enc: &mut OpusEncoder, c_enc: &mut CEncoder) {
 fn decode_both(rate: usize, frame: usize, bitrate: i32, input: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut c_enc = CEncoder::new(rate, 2, APP_AUDIO);
     c_enc.complexity(5).bitrate(bitrate);
-    let mut enc = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Stereo,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_complexity(5).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     silk_wideband(&mut enc, &mut c_enc);
@@ -400,7 +420,12 @@ fn forced_mono_turns_the_stereo_width_off_like_libopus() {
         let input = source(Source::Wide, rate, 6.0);
         let mut c_enc = CEncoder::new(rate, 2, application.0);
         c_enc.complexity(5);
-        let mut enc = OpusEncoder::new(rate as i32, 2, application.1).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::Stereo,
+            application.1,
+        )
+        .unwrap();
         enc.set_complexity(5).unwrap();
         let mut buf = vec![0u8; 4000];
         let packets = input.len() / (2 * frame);
@@ -412,10 +437,10 @@ fn forced_mono_turns_the_stereo_width_off_like_libopus() {
             let bitrate = low + (high - low) * half.min(phase).min(2 * half - phase).max(0) / half;
             if i == 0 {
                 c_enc.force_channels(1);
-                enc.set_force_channels(Some(1)).unwrap();
+                enc.set_force_channels(Some(Channels::Mono));
             } else if i == packets / 2 {
                 c_enc.force_channels(-1000);
-                enc.set_force_channels(None).unwrap();
+                enc.set_force_channels(None);
             }
             c_enc.bitrate(bitrate);
             enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();

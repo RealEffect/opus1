@@ -15,7 +15,7 @@ mod k24_common;
 use core_common::*;
 use k24_common::{speech, to_stereo};
 use opus1::internals::range_coder::RangeCoder;
-use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// The first flags of a CELT-only frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,7 +85,12 @@ fn celt_flags(
     let pcm = signal(rate, channels, 2.0);
     let mut c_enc = CEncoder::new(rate, channels, APP_AUDIO);
     c_enc.complexity(10).bitrate(48000 * channels as i32).force_mode(MODE_CELT);
-    let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_complexity(10).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(48000 * channels as i32)).unwrap();
     enc.set_force_mode(Some(ForcedMode::CeltOnly));
@@ -158,7 +163,12 @@ fn celt_after_silk_starts_afresh_without_prediction_like_libopus() {
         let pcm = signal(rate, channels, 2.0);
         let mut c_enc = CEncoder::new(rate, channels, APP_AUDIO);
         c_enc.complexity(10).bitrate(64000);
-        let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_complexity(10).unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
         let mut buf = vec![0u8; 1500];

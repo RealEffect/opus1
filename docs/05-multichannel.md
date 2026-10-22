@@ -248,10 +248,10 @@ The source file `src/multistream/rate_alloc.rs` holds these rules. After a frame
 
 ```rust
 use opus1::multistream::{MappingType, MultistreamEncoder};
-use opus1::{Application, Bitrate};
+use opus1::{Application, Bitrate, SampleRate};
 
 // 5.1 at 48 kHz (family 1): two coupled streams, the centre and the LFE.
-let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
+let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
 assert_eq!((encoder.mapping_type(), encoder.lfe_stream()), (MappingType::Surround, Some(3)));
 let pcm = vec![0.0f32; 960 * 6]; // 20 ms
 let mut packet = vec![0u8; 4000];
@@ -274,7 +274,7 @@ assert_eq!(encoder.bitrate(), 307_998);
 // builds it: no LFE stream, so both uncoupled streams are treated alike.
 let layout = encoder.layout().clone();
 let mut plain = MultistreamEncoder::new(
-    48_000,
+    SampleRate::Hz48000,
     6,
     layout.streams(),
     layout.coupled_streams(),
@@ -373,7 +373,7 @@ A port of libopus `OpusMSEncoder`.
 | `set_bandwidth(Bandwidth)`, `bandwidth()` | Fixes the bandwidth of every stream. No effect in surround mode. |
 | `set_max_bandwidth(Bandwidth)`, `max_bandwidth()` | Limits the automatic bandwidth choice. |
 | `set_force_mode(Option<ForcedMode>)` | Asks every stream for SILK-only, Hybrid or CELT-only. In surround mode the coupled streams stay CELT-only, and in ambisonics mode all streams do. |
-| `set_force_channels(Option<usize>)`, `force_channels()` | Forces 1 or 2 coded channels on one stream after the other (libopus `OPUS_SET_FORCE_CHANNELS`). The first stream that refuses the value stops the loop with its error: `Some(2)` is set on the coupled streams and refused by the first mono stream, as in libopus. In surround mode the coupled streams are forced to 2 on every frame. The getter reads the first stream. |
+| `set_force_channels(Option<Channels>)`, `force_channels()` | Forces mono or stereo coding on every stream (libopus `OPUS_SET_FORCE_CHANNELS`). A mono stream codes mono whatever is set, so `Some(Channels::Stereo)` acts on the coupled streams only. libopus refuses stereo at the first mono stream, after it has set the coupled streams. In surround mode the coupled streams are forced to stereo on every frame. The getter reads the first stream. |
 | `set_prediction_disabled(bool)`, `prediction_disabled()` | Prediction from earlier frames off on every stream (libopus `OPUS_SET_PREDICTION_DISABLED`). |
 | `set_phase_inversion_disabled(bool)`, `phase_inversion_disabled()` | Phase inversion off in the intensity stereo of every coupled stream (libopus `OPUS_SET_PHASE_INVERSION_DISABLED`). |
 | `set_application(Application)` | Changes the application of every stream before the first frame (libopus `OPUS_SET_APPLICATION`); afterwards only the current one is accepted. |
@@ -475,11 +475,11 @@ assert!(ChannelLayout::surround(4, 3).is_err());
 
 ```rust
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bitrate, packet};
+use opus1::{Application, Bitrate, SampleRate, packet};
 
 // 5.1 at 48 kHz in the channel order of mapping family 1:
 // front left, centre, front right, rear left, rear right, LFE.
-let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
+let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
 
 // The layout the encoder chose. An Ogg Opus header stores these numbers.
@@ -529,9 +529,9 @@ assert_eq!(len, 640);
 
 ```rust
 use opus1::multistream::{ChannelMappingTable, MultistreamDecoder, MultistreamEncoder};
-use opus1::{Application, Bitrate};
+use opus1::{Application, Bitrate, SampleRate};
 
-let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
+let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
 let layout = encoder.layout().clone();
 
@@ -556,7 +556,7 @@ assert_eq!(head.len(), 21 + 6);
 // builds its decoder from it.
 let table = ChannelMappingTable::parse(head[18], head[9], &head[19..]).unwrap();
 assert_eq!((table.stream_count, table.coupled_count), (4, 2));
-let mut decoder = MultistreamDecoder::new(48_000, table).unwrap();
+let mut decoder = MultistreamDecoder::new(SampleRate::Hz48000, table).unwrap();
 
 let pcm = vec![0.1f32; 960 * 6];
 let mut packet = vec![0u8; 4000];
@@ -585,7 +585,7 @@ assert_eq!(decoder.decode_i16(&packet[..len], 960, &mut out16).unwrap(), 960);
 ### A custom layout
 
 ```rust
-use opus1::Application;
+use opus1::{Application, SampleRate};
 use opus1::multistream::{ChannelLayout, MultistreamDecoder, MultistreamEncoder, SILENT_CHANNEL};
 
 // Four input channels: a stereo programme (inputs 0 and 1), a mono
@@ -594,7 +594,7 @@ use opus1::multistream::{ChannelLayout, MultistreamDecoder, MultistreamEncoder, 
 // (coded channel 2).
 let mapping = [0, 1, 2, SILENT_CHANNEL];
 let mut encoder =
-    MultistreamEncoder::new(48_000, 4, 2, 1, &mapping, Application::Audio).unwrap();
+    MultistreamEncoder::new(SampleRate::Hz48000, 4, 2, 1, &mapping, Application::Audio).unwrap();
 assert_eq!(encoder.lfe_stream(), None);
 
 let mut pcm = vec![0f32; 960 * 4];
@@ -612,7 +612,7 @@ let len = encoder.encode(&pcm, 960, &mut packet).unwrap();
 // both 2 and 3, and nothing on 4. Its mapping table differs from the
 // encoder's. Only the stream counts must match.
 let mut decoder =
-    MultistreamDecoder::with_layout(48_000, 5, 2, 1, &[0, 1, 2, 2, SILENT_CHANNEL]).unwrap();
+    MultistreamDecoder::with_layout(SampleRate::Hz48000, 5, 2, 1, &[0, 1, 2, 2, SILENT_CHANNEL]).unwrap();
 let mut out = vec![1f32; 960 * 5];
 assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 for frame in out.chunks_exact(5) {
@@ -622,9 +622,9 @@ for frame in out.chunks_exact(5) {
 
 // Layouts an encoder cannot use are rejected.
 // Three coded channels, but only two input channels:
-assert!(MultistreamEncoder::new(48_000, 2, 2, 1, &[0, 1], Application::Audio).is_err());
+assert!(MultistreamEncoder::new(SampleRate::Hz48000, 2, 2, 1, &[0, 1], Application::Audio).is_err());
 // No input channel feeds the uncoupled stream (coded channel 2):
-assert!(MultistreamEncoder::new(48_000, 3, 2, 1, &[0, 1, 0], Application::Audio).is_err());
+assert!(MultistreamEncoder::new(SampleRate::Hz48000, 3, 2, 1, &[0, 1, 0], Application::Audio).is_err());
 // A decoder accepts that layout. Coded channel 2 is decoded and not played.
 assert!(ChannelLayout::new(3, 2, 1, &[0, 1, 0]).is_ok());
 ```

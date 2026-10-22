@@ -10,7 +10,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::load_speech_16k;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 /// Decoded float output of one call: libopus's and opus1's.
 struct Call {
@@ -61,7 +61,11 @@ fn silk_to_celt_switch_fades_like_libopus() {
     assert_eq!(switch, Some(27), "the stream was meant to switch from SILK to CELT after packet 27");
     for out_rate in [8000usize, 12000, 16000, 24000, 48000] {
         let mut c = CDecoder::new(out_rate, 1);
-        let mut ours = OpusDecoder::new(out_rate as i32, 1).unwrap();
+        let mut ours = OpusDecoder::new(
+            SampleRate::try_from(out_rate as i32).unwrap(),
+            Channels::Mono,
+        )
+        .unwrap();
         let n = out_rate / 50;
         let mut buf = vec![0f32; n];
         for (k, p) in packets.iter().enumerate() {
@@ -108,7 +112,11 @@ fn mode_switches_decode_like_libopus() {
         from_celt += packets.windows(2).filter(|w| is_celt(&w[0]) && !is_celt(&w[1])).count();
         for out_rate in [8000usize, 12000, 16000, 24000, 48000] {
             let mut c = CDecoder::new(out_rate, channels);
-            let mut ours = OpusDecoder::new(out_rate as i32, channels).unwrap();
+            let mut ours = OpusDecoder::new(
+                SampleRate::try_from(out_rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let n = out_rate / 50;
             let mut buf = vec![0f32; n * channels];
             for (k, p) in packets.iter().enumerate() {

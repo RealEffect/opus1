@@ -9,7 +9,7 @@
 ///   - 8kHz NB, mono, VOIP, complexity 0, 10kbps CBR
 ///   - Input: 160 samples of 440Hz sine at amplitude 10000
 ///   - Run verify_silk_detail.c to regenerate reference data
-use opus1::Bitrate;
+use opus1::{Bitrate, Channels, SampleRate};
 use opus1::internals::range_coder::RangeCoder;
 use opus1::internals::silk::control_codec::*;
 use opus1::internals::silk::define::*;
@@ -254,7 +254,7 @@ fn test_silk_encode_nb_silent_frame() {
 fn test_opus_encoder_silk_nb() {
     // Test the full OpusEncoder in SILK mode
     let mut enc =
-        opus1::OpusEncoder::new(8000, 1, opus1::Application::Voip).expect("Create encoder");
+        opus1::OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, opus1::Application::Voip).expect("Create encoder");
     enc.set_bitrate(Bitrate::BitsPerSecond(10000)).unwrap();
     enc.set_complexity(0).unwrap();
     enc.set_vbr(false);

@@ -13,7 +13,7 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::{Application, Bitrate};
+use opus1::{Application, Bitrate, SampleRate};
 use opus1::multistream::MultistreamEncoder;
 
 /// The channels 0 to 253 in pairs: 127 stereo streams and no mono stream.
@@ -146,7 +146,7 @@ fn layouts_beyond_the_largest_are_rejected_like_libopus() {
         (2, 1, usize::MAX),
     ] {
         let rust = MultistreamEncoder::new(
-            48_000,
+            SampleRate::Hz48000,
             channels,
             streams,
             coupled,
@@ -181,14 +181,14 @@ fn layouts_beyond_the_largest_are_rejected_like_libopus() {
         (3, 0),
     ] {
         assert!(
-            MultistreamEncoder::new_surround(48_000, channels, family, Application::Audio).is_err(),
+            MultistreamEncoder::new_surround(SampleRate::Hz48000, channels, family, Application::Audio).is_err(),
             "{channels} channels, family {family}"
         );
     }
     // An empty mapping, and one that is a channel short.
-    assert!(MultistreamEncoder::new(48_000, 1, 1, 0, &[], Application::Audio).is_err());
+    assert!(MultistreamEncoder::new(SampleRate::Hz48000, 1, 1, 0, &[], Application::Audio).is_err());
     assert!(
-        MultistreamEncoder::new(48_000, 255, 255, 0, &full[..254], Application::Audio).is_err()
+        MultistreamEncoder::new(SampleRate::Hz48000, 255, 255, 0, &full[..254], Application::Audio).is_err()
     );
 }
 

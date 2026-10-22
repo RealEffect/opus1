@@ -18,7 +18,7 @@
 
 use opus1::multistream::MultistreamEncoder;
 use opus1::multistream::MappingType;
-use opus1::{Application, Bandwidth, Bitrate};
+use opus1::{Application, Bandwidth, Bitrate, SampleRate};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -72,10 +72,10 @@ enum Kind {
 fn encoder(kind: &Kind, fs: i32, application: Application) -> MultistreamEncoder {
     match *kind {
         Kind::Family(channels, family) => {
-            MultistreamEncoder::new_surround(fs, channels, family, application)
+            MultistreamEncoder::new_surround(SampleRate::try_from(fs).unwrap(), channels, family, application)
         }
         Kind::Generic(channels, streams, coupled, mapping) => {
-            MultistreamEncoder::new(fs, channels, streams, coupled, mapping, application)
+            MultistreamEncoder::new(SampleRate::try_from(fs).unwrap(), channels, streams, coupled, mapping, application)
         }
     }
     .unwrap()
@@ -181,7 +181,7 @@ fn encode_does_not_allocate() {
                                 let stream = enc.stream_encoder(s).unwrap();
                                 assert_eq!(
                                     stream.energy_mask().map(|m| m.len()),
-                                    Some(21 * stream.channels()),
+                                    Some(21 * stream.channels().count()),
                                     "{label}: stream {s} has no mask"
                                 );
                             }

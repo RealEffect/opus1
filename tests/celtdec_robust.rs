@@ -15,6 +15,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use celtdec_common::*;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 use opus1::internals::celt::{CeltDecoder, PcmLayout};
 use opus1::internals::modes::default_mode;
 use opus1::internals::range_coder::RangeCoder;
@@ -511,7 +512,11 @@ fn damaged_packets_and_losses_in_the_opus_decoder() {
                 let st =
                     unsafe { sys::opus_decoder_create(rate as i32, channels as i32, &mut err) };
                 assert_eq!(err, 0);
-                let mut rs = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
+                let mut rs = opus1::OpusDecoder::new(
+                    SampleRate::try_from(rate as i32).unwrap(),
+                    Channels::try_from(channels).unwrap(),
+                )
+                .unwrap();
                 let mut c_out = vec![0f32; frame * channels];
                 let mut r_out = vec![0f32; frame * channels];
                 let (mut accepted, mut rejected) = (0, 0);

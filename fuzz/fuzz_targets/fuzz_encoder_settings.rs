@@ -39,7 +39,10 @@ mod common;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, FrameDuration, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, FrameDuration, OpusDecoder, OpusEncoder,
+    SampleRate,
+};
 
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
@@ -109,10 +112,10 @@ fn change(u: &mut Unstructured, encs: [&mut OpusEncoder; 2], channels: usize) ->
             }
         }
         7 => {
-            let n = *u.choose(&[None, Some(0), Some(1), Some(2), Some(3)])?;
-            let ok = n.is_none_or(|n| (1..=channels).contains(&n));
+            let n = *u.choose(&[None, Some(Channels::Mono), Some(Channels::Stereo)])?;
             for e in encs {
-                assert_eq!(e.set_force_channels(n).is_ok(), ok, "set_force_channels({n:?})");
+                e.set_force_channels(n);
+                assert_eq!(e.force_channels(), n, "set_force_channels({n:?})");
             }
         }
         8 => {
@@ -187,13 +190,27 @@ fn run(data: &[u8]) -> Result<()> {
     let fs = *u.choose(&RATES)?;
     let channels = u.int_in_range(1..=2)?;
     let app = *u.choose(&[Application::Voip, Application::Audio, Application::RestrictedLowDelay])?;
-    let mut enc = OpusEncoder::new(fs, channels, app).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(fs).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        app,
+    )
+    .unwrap();
     // The same settings, always given `f32` samples: for 16-bit input the
     // samples `s as f32 / 32768.0`. `encode_i16` promises the packets of
     // `encode` for those samples, and both encoders must be deterministic.
-    let mut twin = OpusEncoder::new(fs, channels, app).unwrap();
+    let mut twin = OpusEncoder::new(
+        SampleRate::try_from(fs).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        app,
+    )
+    .unwrap();
     let mut c_dec = CDecoder::new(fs, channels);
-    let mut dec = OpusDecoder::new(fs, channels).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(fs).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let mut signal = Signal::new(&mut u)?;
     let sizes = encoder_frame_sizes(fs);
     let mut frame_size = *u.choose(&sizes)?;

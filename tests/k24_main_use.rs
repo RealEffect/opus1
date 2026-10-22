@@ -21,7 +21,7 @@
 
 mod k24_common;
 use k24_common::*;
-use opus1::Bitrate;
+use opus1::{Bitrate, Channels, SampleRate};
 
 /// `seconds` of the speech fixture from `start_s` on, at 24 kHz, in two
 /// versions: as it is (nothing above 8 kHz, the fixture is 16 kHz speech),
@@ -100,8 +100,18 @@ fn own_encoder_stream_decodes_like_libopus() {
         let pcm_i16: Vec<i16> = pcm.iter().map(|v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16).collect();
         let pcm_f32: Vec<f32> = pcm_i16.iter().map(|v| *v as f32 / 32768.0).collect();
         for bitrate in [16000, 24000, 32000, 40000] {
-            let mut enc_f = opus1::OpusEncoder::new(24000, 1, opus1::Application::Voip).unwrap();
-            let mut enc_i = opus1::OpusEncoder::new(24000, 1, opus1::Application::Voip).unwrap();
+            let mut enc_f = opus1::OpusEncoder::new(
+                SampleRate::Hz24000,
+                Channels::Mono,
+                opus1::Application::Voip,
+            )
+            .unwrap();
+            let mut enc_i = opus1::OpusEncoder::new(
+                SampleRate::Hz24000,
+                Channels::Mono,
+                opus1::Application::Voip,
+            )
+            .unwrap();
             enc_f.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             enc_i.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             // `encode_i16` codes at a depth of 16 bits, as libopus

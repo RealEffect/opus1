@@ -9,7 +9,7 @@
 
 use crate::ms_support::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, OpusEncoder, SampleRate};
 
 /// The bitrate a stream encoder was given, in bits per second. The
 /// multistream encoder gives every stream an explicit bitrate when it
@@ -124,10 +124,10 @@ pub fn c_application(application: Application) -> i32 {
 pub fn rust_encoder(case: &Case, fs: i32, application: Application) -> MultistreamEncoder {
     match case.kind {
         Kind::Family(family) => {
-            MultistreamEncoder::new_surround(fs, case.channels, family, application)
+            MultistreamEncoder::new_surround(SampleRate::try_from(fs).unwrap(), case.channels, family, application)
         }
         Kind::Generic(streams, coupled, mapping) => {
-            MultistreamEncoder::new(fs, case.channels, streams, coupled, mapping, application)
+            MultistreamEncoder::new(SampleRate::try_from(fs).unwrap(), case.channels, streams, coupled, mapping, application)
         }
     }
     .unwrap_or_else(|e| panic!("{}: opus1 encoder: {e}", case.name))
@@ -172,7 +172,7 @@ pub fn encoders(
 pub fn c_decoder(enc: &MultistreamEncoder) -> CMsDecoder {
     let layout = enc.layout();
     CMsDecoder::new(
-        enc.sampling_rate(),
+        enc.sampling_rate().hz() as i32,
         layout.channels(),
         layout.streams(),
         layout.coupled_streams(),

@@ -24,7 +24,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{chirp, full_scale, multitone, speech_fullband, to_stereo, toc};
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
 /// Output rates a decoder can have.
 const DEC_RATES: [usize; 5] = [8000, 12000, 16000, 24000, 48000];
@@ -48,7 +48,7 @@ impl Pair {
     fn new(rate: usize, channels: usize) -> Self {
         Self {
             c: CDecoder::new(rate, channels),
-            rs: OpusDecoder::new(rate as i32, channels).unwrap(),
+            rs: OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::try_from(channels).unwrap()).unwrap(),
             rate,
             channels,
             worst: 200.0,
@@ -507,7 +507,11 @@ fn damaged_packets_losses_and_fec_in_any_order_follow_libopus() {
         let rate = DEC_RATES[rng.below(DEC_RATES.len())];
         let channels = 1 + rng.below(2);
         let mut c_dec = CDecoder::new(rate, channels);
-        let mut rs_dec = OpusDecoder::new(rate as i32, channels).unwrap();
+        let mut rs_dec = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let room = rate * 120 / 1000;
         let mut buf = vec![0f32; room * channels];
         for step in 0..40 {
@@ -623,7 +627,11 @@ fn channel_conversion_of_hard_stereo_signals_matches_libopus() {
                     // pair of decoders.
                     for sixteen_bit in [true, false] {
                         let mut c_dec = CDecoder::new(rate, dec_ch);
-                        let mut rs_dec = OpusDecoder::new(rate as i32, dec_ch).unwrap();
+                        let mut rs_dec = OpusDecoder::new(
+                            SampleRate::try_from(rate as i32).unwrap(),
+                            Channels::try_from(dec_ch).unwrap(),
+                        )
+                        .unwrap();
                         let (mut buf, mut buf_i16) = (vec![0f32; room * dec_ch], vec![0i16; room * dec_ch]);
                         // The largest difference, and the largest one as
                         // a multiple of the limit of its call.

@@ -49,7 +49,10 @@ use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, speech_fullband, to_stereo};
 use opus1::internals::analysis::{AnalysisGate, last_analysis_info, set_analysis_gate};
-use opus1::{Application, Bitrate, ForcedMode, FrameDuration, InbandFec, OpusEncoder, Signal};
+use opus1::{
+    Application, Bitrate, Channels, ForcedMode, FrameDuration, InbandFec, OpusEncoder, SampleRate,
+    Signal,
+};
 
 /// Whether the packets must be libopus's: the analysis rounds as the
 /// libopus the tests link only on 64-bit ARM.
@@ -134,7 +137,12 @@ impl Setup {
     }
 
     fn rs_encoder(&self) -> OpusEncoder {
-        let mut enc = OpusEncoder::new(self.fs as i32, self.channels, self.app.rs).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(self.fs as i32).unwrap(),
+            Channels::try_from(self.channels).unwrap(),
+            self.app.rs,
+        )
+        .unwrap();
         enc.set_complexity(self.complexity).unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
         enc.set_vbr(self.rc != Rc::Cbr);
@@ -502,7 +510,7 @@ fn expert_frame_duration_reads_the_whole_buffer() {
                     let mut s = Setup::new(fs, channels, AUDIO, caller_ms_x2, 64_000);
                     s.force_celt = true;
                     s.expert = expert;
-                    let coded = expert.samples(fs as i32).unwrap();
+                    let coded = expert.samples(SampleRate::try_from(fs as u32).unwrap()).unwrap();
                     let step = if overlapping { coded } else { s.frame } * channels;
                     let n = s.frame * channels;
                     let mut c = s.c_encoder();
@@ -707,7 +715,8 @@ fn signal_type_and_fec_mode_2_choose_the_mode_as_libopus() {
 /// survive `reset_state` as in libopus.
 #[test]
 fn controls() {
-    let mut enc = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     assert_eq!(enc.signal(), Signal::Auto);
     assert_eq!(enc.lsb_depth(), 24);
     assert_eq!(enc.inband_fec_mode(), InbandFec::Off);
@@ -745,7 +754,8 @@ fn analysis_gate() {
         (AnalysisGate::FixedPointBuild, 10, true),
         (AnalysisGate::Off, 10, false),
     ] {
-        let mut enc = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
         enc.set_complexity(complexity).unwrap();
         set_analysis_gate(&mut enc, gate);
         let mut out = vec![0u8; MAX_PACKET];
@@ -758,7 +768,12 @@ fn analysis_gate() {
     }
     // 8 and 12 kHz input never runs it.
     for fs in [8_000, 12_000] {
-        let mut enc = OpusEncoder::new(fs, 1, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(fs).unwrap(),
+            Channels::Mono,
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_complexity(10).unwrap();
         let x = speech(fs as usize, 1.0);
         let mut out = vec![0u8; MAX_PACKET];

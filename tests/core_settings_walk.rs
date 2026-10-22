@@ -30,7 +30,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder, packet};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate, packet};
 
 /// A small deterministic generator (the 64-bit LCG of Knuth's MMIX).
 struct Rng(u64);
@@ -207,7 +207,12 @@ fn walk(
 
     // Both encoders choose between mono and stereo packets.
     let mut c_enc = RawEncoder::new(rate, channels, application.0);
-    let mut enc = OpusEncoder::new(rate as i32, channels, application.1).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        application.1,
+    )
+    .unwrap();
     let mut dec = CDecoder::new(rate, channels);
     let mut was_celt = None;
     let mut s = Settings {

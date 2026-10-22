@@ -12,7 +12,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{full_scale, speech_fullband, to_stereo};
-use opus1::{OpusDecoder, pcm_soft_clip};
+use opus1::{Channels, OpusDecoder, SampleRate, pcm_soft_clip};
 use std::f64::consts::PI;
 
 /// A signal that overshoots full scale in several ways:
@@ -68,7 +68,11 @@ fn decode_both(rate: usize, channels: usize, mode: i32, bandwidth: i32, bitrate:
     enc.force_mode(mode).bandwidth(bandwidth).bitrate(bitrate);
     let packets = enc.encode_all(pcm, frame);
     let mut c_dec = CDecoder::new(rate, channels);
-    let mut dec = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let (mut c, mut rs) = (Vec::new(), Vec::new());
     let max = rate * 120 / 1000;
     let mut buf = vec![0i16; max * channels];
@@ -150,7 +154,8 @@ fn float_output_keeps_the_overshoot() {
     enc.force_mode(MODE_CELT).bitrate(96000);
     let packets = enc.encode_all(&pcm, 960);
     let mut c_dec = CDecoder::new(rate, 1);
-    let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
     let mut buf = vec![0f32; 960];
     let (mut c, mut rs) = (Vec::new(), Vec::new());
     for p in &packets {
@@ -175,7 +180,8 @@ fn lost_packets_and_fec_decode_like_opus_decode() {
     enc.force_mode(MODE_SILK).bandwidth(BW_WB).bitrate(28000).fec(true, 20);
     let packets = enc.encode_all(&pcm, frame);
     let mut c_dec = CDecoder::new(rate, 1);
-    let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+    let mut dec =
+        OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
     let mut buf = vec![0i16; 12 * frame];
     let (mut c, mut rs) = (Vec::new(), Vec::new());
     for i in 0..packets.len() - 1 {
@@ -216,7 +222,7 @@ fn lost_packets_and_fec_decode_like_opus_decode() {
 fn bad_arguments_are_errors() {
     let mut enc = CEncoder::new(48000, 2, APP_AUDIO);
     let packet = enc.encode(&vec![0.1f32; 960 * 2]);
-    let mut dec = OpusDecoder::new(48000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut buf = vec![0i16; 960 * 2];
     assert!(dec.decode_i16(&packet, 0, &mut buf).is_err());
     assert!(dec.decode_i16(&packet, 480, &mut buf).is_err());

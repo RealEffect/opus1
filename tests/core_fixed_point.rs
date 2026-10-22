@@ -34,7 +34,7 @@ mod k24_common;
 use opus1::internals::range_coder::RangeCoder;
 use opus1::internals::silk::dec_api::SilkDecoder;
 use opus1::internals::analysis::{AnalysisGate, set_analysis_gate};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// FNV-1a, 32 bits.
 fn fnv1a(bytes: &[u8]) -> u32 {
@@ -53,7 +53,7 @@ fn speech_16k(seconds: f64) -> Vec<i16> {
 struct Packet {
     bitrate: i32,
     complexity: i32,
-    channels: Option<usize>,
+    channels: Option<Channels>,
 }
 
 /// SILK-only wideband VoIP packets of 20 ms at 16 kHz with a variable
@@ -61,7 +61,12 @@ struct Packet {
 /// packet whose hash is not `want`'s, if any.
 fn first_difference(channels: usize, pcm: &[i16], script: &[Packet], want: &[u32]) -> Option<usize> {
     let frame = 320;
-    let mut enc = OpusEncoder::new(16000, channels, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz16000,
+        Channels::try_from(channels).unwrap(),
+        Application::Voip,
+    )
+    .unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
     enc.set_bandwidth(Bandwidth::Wideband);
@@ -69,7 +74,7 @@ fn first_difference(channels: usize, pcm: &[i16], script: &[Packet], want: &[u32
     for (i, (p, input)) in script.iter().zip(pcm.chunks_exact(frame * channels)).enumerate() {
         enc.set_bitrate(Bitrate::BitsPerSecond(p.bitrate)).unwrap();
         enc.set_complexity(p.complexity).unwrap();
-        enc.set_force_channels(p.channels).unwrap();
+        enc.set_force_channels(p.channels);
         let n = enc.encode_i16(input, frame, &mut buf).unwrap();
         if fnv1a(&buf[..n]) != want[i] {
             return Some(i);
@@ -345,7 +350,7 @@ fn silk_layers(packets: &[Vec<u8>], channels: usize) -> Vec<u32> {
 #[test]
 fn hybrid_at_a_constant_bitrate_codes_the_silk_layer_of_libopus() {
     let pcm: Vec<i16> = speech_16k(3.0).iter().flat_map(|&v| [v, v, v]).collect();
-    let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     opus1::internals::silk_input::set_integer_hp_at_48k(&mut enc, true);
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
@@ -412,12 +417,13 @@ fn both_stereo_channels_make_room_for_the_redundant_frame_of_a_rate_switch() {
         .iter()
         .map(|&v| (v * 32768.0).round() as i16)
         .collect();
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
     enc.set_complexity(9).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
-    enc.set_force_channels(Some(2)).unwrap();
+    enc.set_force_channels(Some(Channels::Stereo));
     let mut buf = vec![0u8; 100];
     let packets: Vec<Vec<u8>> = pcm
         .as_chunks::<{ 2 * 320 }>()
@@ -521,7 +527,8 @@ fn stereo_that_starts_with_a_silk_rate_switch_runs_the_side_through_the_transiti
         .map(|&v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
         .collect();
     let frame = 160;
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_complexity(5).unwrap();
     let mut buf = vec![0u8; 4000];
@@ -578,7 +585,8 @@ fn prediction_disabled_codes_every_silk_packet_alone_like_libopus() {
         .map(|&v| (v * 32768.0).round() as i16)
         .collect();
     let frame = 320;
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_complexity(9).unwrap();
@@ -637,12 +645,13 @@ fn a_stereo_silk_rate_switch_gives_the_side_the_mids_low_pass_state() {
         .map(|&v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
         .collect();
     let frame = 320;
-    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip).unwrap();
     set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
     enc.set_bitrate(Bitrate::BitsPerSecond(40000)).unwrap();
     enc.set_complexity(5).unwrap();
     enc.set_force_mode(Some(ForcedMode::SilkOnly));
-    enc.set_force_channels(Some(2)).unwrap();
+    enc.set_force_channels(Some(Channels::Stereo));
     let mut buf = vec![0u8; 4000];
     let mut differ = Vec::new();
     for (i, input) in pcm.chunks_exact(2 * frame).enumerate().take(160) {
@@ -742,7 +751,12 @@ fn silk_dtx_leaves_out_the_frames_of_libopus() {
     for (name, Stream(channels, frame_ms, bitrate, complexity, vbr, want)) in streams {
         let pcm = speech_with_pauses(channels);
         let frame = 16 * frame_ms;
-        let mut enc = OpusEncoder::new(16000, channels, Application::Voip).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::Hz16000,
+            Channels::try_from(channels).unwrap(),
+            Application::Voip,
+        )
+        .unwrap();
         set_analysis_gate(&mut enc, AnalysisGate::FixedPointBuild);
         enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
         enc.set_complexity(complexity).unwrap();

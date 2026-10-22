@@ -225,10 +225,10 @@ A packet may code another channel count than the decoder outputs, and the count 
 Before every CELT call the decoder tells the CELT decoder the packet's channel count (`set_stream_channels`, libopus `CELT_SET_CHANNELS`). When the SILK stream goes from mono to stereo, the second SILK channel starts from a reset state.
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
-let mut decoder = OpusDecoder::new(48_000, 2).unwrap(); // stereo output
+let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap(); // stereo output
 let mut packet = vec![0u8; 1276];
 let mut stereo = vec![0.0f32; 960 * 2];
 for k in 0..5 {
@@ -300,18 +300,18 @@ A lost Hybrid frame is concealed by SILK below 8 kHz and by CELT noise above 8 k
 ### Example: decoding a stream with lost packets
 
 ```rust
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-let rate = 48_000;
+let rate = SampleRate::Hz48000;
 let frame = 960; // 20 ms
-let mut encoder = OpusEncoder::new(rate, 1, Application::Audio).unwrap();
-let mut decoder = OpusDecoder::new(rate, 1).unwrap();
+let mut encoder = OpusEncoder::new(rate, Channels::Mono, Application::Audio).unwrap();
+let mut decoder = OpusDecoder::new(rate, Channels::Mono).unwrap();
 
 // Encode 10 packets of a 440 Hz tone.
 let mut packets = Vec::new();
 for k in 0..10 {
     let pcm: Vec<f32> = (0..frame)
-        .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * (k * frame + i) as f32 / rate as f32).sin())
+        .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * (k * frame + i) as f32 / rate.hz() as f32).sin())
         .collect();
     let mut packet = vec![0u8; 1276];
     let len = encoder.encode(&pcm, frame, &mut packet).unwrap();
@@ -368,11 +368,11 @@ When the next packet has not arrived yet, a receiver conceals with an empty pack
 ### Example: using FEC when the next packet has arrived
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-let rate = 16_000;
+let rate = SampleRate::Hz16000;
 let frame = 320; // 20 ms
-let mut encoder = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(rate, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(24_000)).unwrap(); // SILK at 16 kHz
 encoder.set_inband_fec(true); // OPUS_SET_INBAND_FEC(1)
 encoder.set_packet_loss_perc(20).unwrap(); // OPUS_SET_PACKET_LOSS_PERC(20)
@@ -380,7 +380,7 @@ encoder.set_packet_loss_perc(20).unwrap(); // OPUS_SET_PACKET_LOSS_PERC(20)
 let mut packets = Vec::new();
 for k in 0..20 {
     let pcm: Vec<f32> = (0..frame)
-        .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 220.0 * (k * frame + i) as f32 / rate as f32).sin())
+        .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 220.0 * (k * frame + i) as f32 / rate.hz() as f32).sin())
         .collect();
     let mut packet = vec![0u8; 1276];
     let len = encoder.encode(&pcm, frame, &mut packet).unwrap();
@@ -389,7 +389,7 @@ for k in 0..20 {
 }
 
 let lost = 10;
-let mut decoder = OpusDecoder::new(rate, 1).unwrap();
+let mut decoder = OpusDecoder::new(rate, Channels::Mono).unwrap();
 let mut pcm = vec![0.0f32; frame];
 let mut output = Vec::new();
 for i in 0..packets.len() {
@@ -483,11 +483,11 @@ The range coder ends every frame in a state, a 32-bit number. An encoder and a d
 The value is for testing. Comparing it with `OpusEncoder::final_range()` for the same packet shows whether the decoder read every symbol as the encoder wrote it. libopus's test tool `opus_demo` stores the encoder's final range with each packet. It reports "Range coder state mismatch" when the decoder ends in another state. A mismatch means a corrupted packet or a bug, even when the audio sounds right.
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
-let mut encoder = OpusEncoder::new(16_000, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(20_000)).unwrap();
-let mut decoder = OpusDecoder::new(16_000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 let mut packet = vec![0u8; 1276];
 let mut pcm16 = vec![0i16; 320];
 for k in 0..10 {

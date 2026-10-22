@@ -29,12 +29,12 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 ## Quick Start
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 // Encode. Without `set_bitrate` the encoder uses libopus's automatic
 // bitrate (`Bitrate::Auto`, 19 kb/s for 16 kHz mono in 20 ms frames).
 // Each setter refuses what libopus refuses, for example a complexity of 11.
-let mut encoder = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
 encoder.set_vbr(false); // constant bitrate: every packet has 40 bytes
 assert!(encoder.set_complexity(11).is_err());
@@ -52,7 +52,7 @@ let input_i16 = vec![0i16; 320]; // 20ms frame at 16kHz
 let bytes = encoder.encode_i16(&input_i16, 320, &mut output).unwrap();
 
 // Decode. `decode` writes the samples it returns and nothing after them.
-let mut decoder = OpusDecoder::new(16000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 let mut pcm = vec![0.0f32; 320];
 let samples = decoder.decode(&output[..bytes], 320, &mut pcm).unwrap();
 assert_eq!(samples, 320);
@@ -69,11 +69,11 @@ Decoding to 16-bit PCM, and recovering a lost packet from the in-band
 forward error correction (FEC) data of the next one:
 
 ```rust
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 // Three 20 ms packets of a 180 Hz tone at 16 kHz. Each packet after the
 // first also carries a low-bitrate copy of the frame before it (in-band FEC).
-let mut encoder = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 encoder.set_inband_fec(true);
 encoder.set_packet_loss_perc(10).unwrap();
@@ -88,7 +88,7 @@ for frame in tone.chunks_exact(320) {
     packets.push(packet);
 }
 
-let mut decoder = OpusDecoder::new(16000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
 let mut pcm16 = vec![0i16; 320];
 decoder.decode_i16(&packets[0], 320, &mut pcm16).unwrap(); // soft-clipped like opus_decode
 // packets[1] is lost. packets[2] has arrived and carries a copy of it.
@@ -102,11 +102,11 @@ Float output is not clipped to [-1, 1], as in libopus's `opus_decode_float`.
 ### Multichannel
 
 ```rust
-use opus1::{Application, Bitrate};
+use opus1::{Application, Bitrate, SampleRate};
 use opus1::multistream::{MultistreamEncoder, MultistreamDecoder};
 
 // 5.1 at 48 kHz in Vorbis channel order (mapping family 1).
-let mut encoder = MultistreamEncoder::new_surround(48_000, 6, 1, Application::Audio).unwrap();
+let mut encoder = MultistreamEncoder::new_surround(SampleRate::Hz48000, 6, 1, Application::Audio).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(256_000)).unwrap();
 let layout = encoder.layout().clone(); // streams, coupled streams and mapping for the Ogg header
 
@@ -115,7 +115,7 @@ let mut packet = vec![0u8; 4000];
 let len = encoder.encode(&pcm, 960, &mut packet).unwrap();
 
 let mut decoder = MultistreamDecoder::with_layout(
-    48_000, 6, layout.streams(), layout.coupled_streams(), layout.mapping()).unwrap();
+    SampleRate::Hz48000, 6, layout.streams(), layout.coupled_streams(), layout.mapping()).unwrap();
 let mut out = vec![0.0f32; 960 * 6];
 decoder.decode(&packet[..len], 960, &mut out).unwrap();
 ```
@@ -184,13 +184,13 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 
   ```rust
   use core::mem::MaybeUninit;
-  use opus1::OpusDecoder;
+  use opus1::{Channels, OpusDecoder, SampleRate};
 
   static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
 
   let slot = &raw mut DECODER;
   // SAFETY: run once, while nothing else uses `DECODER`.
-  let decoder = OpusDecoder::init(unsafe { &mut *slot }, 48000, 2)?;
+  let decoder = OpusDecoder::init(unsafe { &mut *slot }, SampleRate::Hz48000, Channels::Stereo)?;
   # Ok::<(), opus1::Error>(())
   ```
 
@@ -363,6 +363,13 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   libopus error code (`BadArg`, `BufferTooSmall`, `InvalidPacket`, ...), and
   `message()` the text. Compare kinds, not messages. `Error` implements
   `core::error::Error`.
+- Sampling rates and channel counts have their own types, `SampleRate`
+  (`Hz8000` to `Hz48000`) and `Channels` (`Mono`, `Stereo`). The constructors
+  of `OpusEncoder` and `OpusDecoder` take them, and `sampling_rate()` and
+  `channels()` return them. `SampleRate::try_from` and `Channels::try_from`
+  check a number. `set_force_channels` takes `Option<Channels>` and no longer
+  fails. The multistream constructors, the `packet` functions with a sampling
+  rate and `OpusDredDecoder::parse` take a `SampleRate` too.
 - The settings of `OpusEncoder` are methods instead of public fields:
   `set_bitrate`, `set_complexity`, `set_vbr` (instead of `use_cbr`, with the
   opposite meaning), `set_inband_fec` and `set_packet_loss_perc`, each with its

@@ -10,7 +10,7 @@
 use crate::Error;
 use super::layout::{ChannelLayout, ChannelsByEntry, SILENT_CHANNEL};
 use super::{ChannelMappingTable, ChannelSink, Sample};
-use crate::{OpusDecoder, packet};
+use crate::{Channels, OpusDecoder, SampleRate, packet};
 
 /// Decoder for a multistream Opus stream: libopus `OpusMSDecoder`.
 ///
@@ -20,7 +20,7 @@ pub struct MultistreamDecoder {
     layout: ChannelLayout,
     /// The output channels of each decoded channel, and the silent ones.
     outputs: ChannelsByEntry,
-    sampling_rate: i32,
+    sampling_rate: SampleRate,
     /// One decoder per stream. The first `layout.coupled_streams()` of them
     /// have 2 channels, the others 1.
     decoders: Vec<OpusDecoder>,
@@ -65,7 +65,7 @@ impl MultistreamDecoder {
     /// The table is checked like the arguments of
     /// [`with_layout`](Self::with_layout). In addition, `table.mapping` must
     /// hold exactly `table.channels` entries.
-    pub fn new(sampling_rate: i32, table: ChannelMappingTable) -> Result<Self, Error> {
+    pub fn new(sampling_rate: SampleRate, table: ChannelMappingTable) -> Result<Self, Error> {
         if table.mapping.len() != table.channels as usize {
             return Err(Error::bad_arg(
                 "multistream layout: the mapping table length does not match the channel count",
@@ -82,8 +82,7 @@ impl MultistreamDecoder {
 
     /// libopus `opus_multistream_decoder_create`.
     ///
-    /// - `sampling_rate`: output rate in Hz: 8000, 12000, 16000, 24000 or
-    ///   48000.
+    /// - `sampling_rate`: output rate.
     /// - `channels`: number of output channels, 1 to 255.
     /// - `streams`: number of streams in a packet, at least 1.
     /// - `coupled_streams`: how many of the streams are stereo. They are the
@@ -95,7 +94,7 @@ impl MultistreamDecoder {
     ///   same decoded channel.
     ///   Entries after the first `channels` are ignored.
     pub fn with_layout(
-        sampling_rate: i32,
+        sampling_rate: SampleRate,
         channels: usize,
         streams: usize,
         coupled_streams: usize,
@@ -104,11 +103,11 @@ impl MultistreamDecoder {
         let layout = ChannelLayout::new(channels, streams, coupled_streams, mapping)?;
         let mut decoders = Vec::with_capacity(layout.streams());
         for s in 0..layout.streams() {
-            let stream_channels = if s < layout.coupled_streams() { 2 } else { 1 };
+            let stream_channels =
+                if s < layout.coupled_streams() { Channels::Stereo } else { Channels::Mono };
             decoders.push(OpusDecoder::new(sampling_rate, stream_channels)?);
         }
-        // `OpusDecoder::new` has checked the sampling rate.
-        let max_frame = packet::max_packet_samples(sampling_rate);
+        let max_frame = sampling_rate.max_frame_size();
         Ok(Self {
             outputs: ChannelsByEntry::new(&layout),
             layout,
@@ -123,8 +122,8 @@ impl MultistreamDecoder {
         &self.layout
     }
 
-    /// The sampling rate of the output in Hz.
-    pub fn sampling_rate(&self) -> i32 {
+    /// The sampling rate of the output.
+    pub fn sampling_rate(&self) -> SampleRate {
         self.sampling_rate
     }
 
@@ -354,7 +353,7 @@ impl MultistreamDecoder {
             return Err(Error::INVALID_FRAME_SIZE);
         }
         // C: "Limit frame_size to avoid excessive stack allocations."
-        let frame_size = frame_size.min(packet::max_packet_samples(self.sampling_rate));
+        let frame_size = frame_size.min(self.sampling_rate.max_frame_size());
         if out_len / self.layout.channels() < frame_size {
             return Err(Error::BUFFER_TOO_SMALL);
         }
@@ -452,13 +451,18 @@ mod tests {
 
     #[test]
     fn new_builds_one_decoder_per_stream() {
-        let ms = MultistreamDecoder::new(48000, table(6, 4, 2, &[0, 4, 1, 2, 3, 5])).unwrap();
+        let ms = MultistreamDecoder::new(
+            SampleRate::Hz48000,
+            table(6, 4, 2, &[0, 4, 1, 2, 3, 5]),
+        )
+        .unwrap();
         assert_eq!(ms.decoders.len(), 4);
-        let stream_channels: Vec<usize> = ms.decoders.iter().map(|d| d.channels()).collect();
-        assert_eq!(stream_channels, [2, 2, 1, 1]);
+        let stream_channels: Vec<Channels> = ms.decoders.iter().map(|d| d.channels()).collect();
+        use Channels::{Mono, Stereo};
+        assert_eq!(stream_channels, [Stereo, Stereo, Mono, Mono]);
         assert_eq!(ms.layout().channels(), 6);
         assert_eq!(ms.layout().mapping(), &[0, 4, 1, 2, 3, 5]);
-        assert_eq!(ms.sampling_rate(), 48000);
+        assert_eq!(ms.sampling_rate(), SampleRate::Hz48000);
         assert_eq!(ms.buf.len(), 2 * 5760);
         assert!(ms.stream_decoder(3).is_some());
         assert!(ms.stream_decoder(4).is_none());
@@ -467,26 +471,25 @@ mod tests {
     #[test]
     fn new_rejects_invalid_tables() {
         // More coupled streams than streams.
-        assert!(MultistreamDecoder::new(48000, table(2, 1, 2, &[0, 1])).is_err());
+        assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(2, 1, 2, &[0, 1])).is_err());
         // A mapping entry that names a decoded channel that does not exist.
         // The old decoder accepted this table and panicked while decoding.
-        assert!(MultistreamDecoder::new(48000, table(1, 1, 0, &[5])).is_err());
+        assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(1, 1, 0, &[5])).is_err());
         // No stream, no channel.
-        assert!(MultistreamDecoder::new(48000, table(1, 0, 0, &[0])).is_err());
-        assert!(MultistreamDecoder::new(48000, table(0, 1, 0, &[])).is_err());
+        assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(1, 0, 0, &[0])).is_err());
+        assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(0, 1, 0, &[])).is_err());
         // The mapping does not have one entry per channel.
-        assert!(MultistreamDecoder::new(48000, table(2, 1, 1, &[0])).is_err());
-        assert!(MultistreamDecoder::new(48000, table(2, 1, 1, &[0, 1, 0])).is_err());
-        // A sampling rate Opus does not have.
-        assert!(MultistreamDecoder::new(44100, table(2, 1, 1, &[0, 1])).is_err());
-        assert!(MultistreamDecoder::new(48000, table(2, 1, 1, &[0, 1])).is_ok());
+        assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(2, 1, 1, &[0])).is_err());
+        assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(2, 1, 1, &[0, 1, 0])).is_err());
+        assert!(MultistreamDecoder::new(SampleRate::Hz48000, table(2, 1, 1, &[0, 1])).is_ok());
     }
 
     #[test]
     fn the_buffer_holds_120_ms_of_stereo_at_every_rate() {
-        for (fs, want) in [(8000, 1920), (12000, 2880), (16000, 3840), (24000, 5760), (48000, 11520)] {
+        let wanted = [1920, 2880, 3840, 5760, 11520];
+        for (fs, want) in SampleRate::ALL.iter().copied().zip(wanted) {
             let ms = MultistreamDecoder::with_layout(fs, 1, 1, 0, &[0]).unwrap();
-            assert_eq!(ms.buf.len(), want, "{fs} Hz");
+            assert_eq!(ms.buf.len(), want, "{fs:?}");
         }
     }
 
@@ -532,7 +535,8 @@ mod tests {
 
     #[test]
     fn frame_size_and_output_length_are_checked() {
-        let mut ms = MultistreamDecoder::with_layout(48000, 2, 2, 0, &[0, 1]).unwrap();
+        let mut ms =
+            MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
         let mut out = vec![0.0f32; 2 * 5760];
         // A frame size of 0.
         assert!(ms.decode(&[], 0, &mut out).is_err());
@@ -554,7 +558,8 @@ mod tests {
     #[test]
     fn packets_shorter_than_the_stream_count_allows_are_rejected() {
         // 3 streams need at least 2 + 2 + 1 bytes.
-        let mut ms = MultistreamDecoder::with_layout(48000, 3, 3, 0, &[0, 1, 2]).unwrap();
+        let mut ms =
+            MultistreamDecoder::with_layout(SampleRate::Hz48000, 3, 3, 0, &[0, 1, 2]).unwrap();
         let mut out = vec![0.0f32; 3 * 960];
         for len in 1..5 {
             assert!(ms.decode(&[0u8; 8][..len], 960, &mut out).is_err(), "{len} bytes");

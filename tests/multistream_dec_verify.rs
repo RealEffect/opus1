@@ -34,6 +34,7 @@ mod multistream_dec_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_dec_common::*;
+use opus1::SampleRate;
 use opus1::multistream::MultistreamDecoder;
 use std::f64::consts::PI;
 
@@ -534,7 +535,14 @@ fn sixteen_bit_output_with_losses_matches_libopus() {
     let packets: Vec<Vec<u8>> = pcm.chunks_exact(960 * channels).map(|c| enc.encode_float(c, 960, max_packet_bytes(3)).unwrap()).collect();
     for fs in [8000, 16000, 48000] {
         let mut c_dec = CMsDecoder::new(fs, channels, 3, 0, &[0, 1, 2]).unwrap();
-        let mut r_dec = MultistreamDecoder::with_layout(fs, channels, 3, 0, &[0, 1, 2]).unwrap();
+        let mut r_dec = MultistreamDecoder::with_layout(
+            SampleRate::try_from(fs).unwrap(),
+            channels,
+            3,
+            0,
+            &[0, 1, 2],
+        )
+        .unwrap();
         let frame = fs as usize / 50;
         let max_frame = fs as usize / 25 * 3;
         let mut out = vec![0i16; max_frame * channels];
@@ -602,7 +610,14 @@ fn sixteen_bit_output_routes_and_silences_like_libopus() {
         let ch = mapping.len();
         for fs in [24000, 48000] {
             let mut c_dec = CMsDecoder::new(fs, ch, 2, 1, &mapping).unwrap();
-            let mut r_dec = MultistreamDecoder::with_layout(fs, ch, 2, 1, &mapping).unwrap();
+            let mut r_dec = MultistreamDecoder::with_layout(
+                SampleRate::try_from(fs).unwrap(),
+                ch,
+                2,
+                1,
+                &mapping,
+            )
+            .unwrap();
             let max_frame = fs as usize / 25 * 3;
             let mut out = vec![0i16; max_frame * ch];
             let mut loud = 0usize;
@@ -645,7 +660,14 @@ fn float_and_sixteen_bit_calls_alternate_like_libopus() {
     let packets: Vec<Vec<u8>> = pcm.as_chunks::<{ 960 * 4 }>().0.iter().map(|c| enc.encode_float(c, 960, max_packet_bytes(2)).unwrap()).collect();
     for fs in [16000, 48000] {
         let mut c_dec = CMsDecoder::new(fs, 4, 2, 2, &[0, 1, 2, 3]).unwrap();
-        let mut r_dec = MultistreamDecoder::with_layout(fs, 4, 2, 2, &[0, 1, 2, 3]).unwrap();
+        let mut r_dec = MultistreamDecoder::with_layout(
+            SampleRate::try_from(fs).unwrap(),
+            4,
+            2,
+            2,
+            &[0, 1, 2, 3],
+        )
+        .unwrap();
         let max_frame = fs as usize / 25 * 3;
         let mut out = vec![0f32; max_frame * 4];
         let mut out16 = vec![0i16; max_frame * 4];
@@ -690,9 +712,9 @@ fn layout_with_127_stereo_streams_matches_libopus() {
     assert!(CMsDecoder::new(48000, 255, 128, 127, &mapping).is_ok());
     // One stream more is one decoded channel too many.
     assert!(CMsDecoder::new(48000, 255, 129, 127, &mapping).is_err());
-    assert!(MultistreamDecoder::with_layout(48000, 255, 129, 127, &mapping).is_err());
+    assert!(MultistreamDecoder::with_layout(SampleRate::Hz48000, 255, 129, 127, &mapping).is_err());
     assert!(CMsDecoder::new(48000, 255, 128, 128, &mapping).is_err());
-    assert!(MultistreamDecoder::with_layout(48000, 255, 128, 128, &mapping).is_err());
+    assert!(MultistreamDecoder::with_layout(SampleRate::Hz48000, 255, 128, 128, &mapping).is_err());
 
     let mut enc = CMsEncoder::generic(FS, 255, 128, 127, &mapping, APP_AUDIO).unwrap();
     for s in 0..127 {
@@ -824,7 +846,14 @@ fn random_frame_data_has_the_final_range_of_libopus() {
     for (channels, streams, coupled, mapping) in layouts {
         for fs in [16000, 48000] {
             let mut c_dec = CMsDecoder::new(fs, channels, streams, coupled, mapping).unwrap();
-            let mut r_dec = MultistreamDecoder::with_layout(fs, channels, streams, coupled, mapping).unwrap();
+            let mut r_dec = MultistreamDecoder::with_layout(
+                SampleRate::try_from(fs).unwrap(),
+                channels,
+                streams,
+                coupled,
+                mapping,
+            )
+            .unwrap();
             let max_frame = fs as usize / 25 * 3;
             let mut out = vec![0f32; max_frame * channels];
             for round in 0..2000 {
@@ -874,7 +903,14 @@ fn shortest_packets_get_the_verdict_of_libopus() {
     for (channels, streams, coupled, mapping) in layouts {
         let fs = 16000;
         let mut c_dec = CMsDecoder::new(fs, channels, streams, coupled, mapping).unwrap();
-        let mut r_dec = MultistreamDecoder::with_layout(fs, channels, streams, coupled, mapping).unwrap();
+        let mut r_dec = MultistreamDecoder::with_layout(
+            SampleRate::Hz16000,
+            channels,
+            streams,
+            coupled,
+            mapping,
+        )
+        .unwrap();
         let mut out = vec![0f32; 1920 * channels];
         let mut out16 = vec![0i16; 1920 * channels];
         let mut packets: Vec<Vec<u8>> = (0..=255u8).map(|toc| vec![toc]).collect();
@@ -924,16 +960,16 @@ fn extreme_arguments_are_errors() {
     let big = [usize::MAX, usize::MAX / 2 + 1, u32::MAX as usize, 65536, 256];
     for &a in &big {
         for &b in &big {
-            assert!(MultistreamDecoder::with_layout(48000, a, b, 0, &[0; 4]).is_err());
-            assert!(MultistreamDecoder::with_layout(48000, 2, a, b, &[0, 1]).is_err());
-            assert!(MultistreamDecoder::with_layout(48000, a, 1, b, &[0, 1]).is_err());
+            assert!(MultistreamDecoder::with_layout(SampleRate::Hz48000, a, b, 0, &[0; 4]).is_err());
+            assert!(MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, a, b, &[0, 1]).is_err());
+            assert!(MultistreamDecoder::with_layout(SampleRate::Hz48000, a, 1, b, &[0, 1]).is_err());
         }
     }
     // The mapping is shorter than the channel count.
-    assert!(MultistreamDecoder::with_layout(48000, 3, 2, 1, &[0, 1]).is_err());
-    assert!(MultistreamDecoder::with_layout(48000, 1, 1, 0, &[]).is_err());
+    assert!(MultistreamDecoder::with_layout(SampleRate::Hz48000, 3, 2, 1, &[0, 1]).is_err());
+    assert!(MultistreamDecoder::with_layout(SampleRate::Hz48000, 1, 1, 0, &[]).is_err());
 
-    let mut dec = MultistreamDecoder::with_layout(8000, 3, 2, 1, &[0, 1, 2]).unwrap();
+    let mut dec = MultistreamDecoder::with_layout(SampleRate::Hz8000, 3, 2, 1, &[0, 1, 2]).unwrap();
     let mut out = vec![0f32; 960 * 3];
     let mut out16 = vec![0i16; 960 * 3];
     let packets: [&[u8]; 6] = [&[], &[0], &[0xFF], &[0xFF; 2], &[0x04, 0, 0x00], &[0xFF; 4000]];

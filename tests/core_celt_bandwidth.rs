@@ -23,7 +23,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{multitone, speech};
-use opus1::{Application, Bandwidth, Bitrate, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, OpusEncoder, SampleRate};
 
 fn energy_db(x: &[f32]) -> f64 {
     let e = x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64;
@@ -45,7 +45,12 @@ fn level_distance_after_a_narrow_packet(small: usize) -> f64 {
 
     let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
     c_enc.bitrate(56_000).vbr(false).complexity(0).max_bandwidth(BW_SWB);
-    let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Mono,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(56_000)).unwrap();
     enc.set_vbr(false);
     enc.set_complexity(0).unwrap();

@@ -51,7 +51,7 @@ use ms_support::{
     tones, voiced,
 };
 use opus1::internals::multistream::surround::SurroundProbe;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 use std::os::raw::{c_int, c_void};
 
 const NB_BANDS: usize = 21;
@@ -731,7 +731,12 @@ fn rust_stream_bytes(setup: Setup, pcm: &[f32], rates: &[i32], use_mask: bool) -
         .enumerate()
         .map(|(s, of)| {
             let stream_channels = if of.1.is_some() { 2 } else { 1 };
-            let mut enc = OpusEncoder::new(fs, stream_channels, Application::Audio).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::try_from(fs).unwrap(),
+                Channels::try_from(stream_channels).unwrap(),
+                Application::Audio,
+            )
+            .unwrap();
             enc.set_bitrate(Bitrate::BitsPerSecond(rates[s])).unwrap();
             enc.set_vbr(true);
             enc.set_bandwidth(bandwidth);

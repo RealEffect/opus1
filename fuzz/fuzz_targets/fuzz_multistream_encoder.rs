@@ -36,7 +36,7 @@ use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::multistream::{MultistreamDecoder, MultistreamEncoder};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, SampleRate};
 
 fuzz_target!(|data: &[u8]| {
     let _ = run(data);
@@ -61,7 +61,12 @@ fn build(u: &mut Unstructured, fs: i32, app: Application) -> Result<Option<Multi
     if u.arbitrary()? {
         let family = *u.choose(&[0u8, 1, 1, 1, 2, 2, 3, 255, 255])?;
         let channels = if u.ratio(1, 16)? { u.int_in_range(0..=18)? } else { u.int_in_range(1..=8)? };
-        let rust = MultistreamEncoder::new_surround(fs, channels, family, app);
+        let rust = MultistreamEncoder::new_surround(
+            SampleRate::try_from(fs).unwrap(),
+            channels,
+            family,
+            app,
+        );
         let (mut streams, mut coupled) = (0, 0);
         let mut mapping = [0u8; 256];
         let mut err = 0;
@@ -109,7 +114,14 @@ fn build(u: &mut Unstructured, fs: i32, app: Application) -> Result<Option<Multi
                 _ => u.int_in_range(0..=(streams + coupled).max(1) as u8 - 1)?,
             };
         }
-        let rust = MultistreamEncoder::new(fs, channels, streams, coupled, &mapping, app);
+        let rust = MultistreamEncoder::new(
+            SampleRate::try_from(fs).unwrap(),
+            channels,
+            streams,
+            coupled,
+            &mapping,
+            app,
+        );
         let mut err = 0;
         let st = unsafe {
             sys::opus_multistream_encoder_create(
@@ -193,11 +205,11 @@ fn change(u: &mut Unstructured, encs: [&mut MultistreamEncoder; 2]) -> Result<()
             // Settings of one stream that the multistream encoder does not
             // forward.
             let s = u.int_in_range(0..=encs[0].layout().streams() - 1)?;
-            let channels = *u.choose(&[None, Some(1), Some(2)])?;
+            let channels = *u.choose(&[None, Some(Channels::Mono), Some(Channels::Stereo)])?;
             let disabled = u.arbitrary()?;
             for e in encs {
                 if let Some(stream) = e.stream_encoder_mut(s) {
-                    let _ = stream.set_force_channels(channels);
+                    stream.set_force_channels(channels);
                     stream.set_prediction_disabled(disabled);
                 }
             }
@@ -232,8 +244,14 @@ fn run(data: &[u8]) -> Result<()> {
     let (channels, streams) = (layout.channels(), layout.streams());
     let mut c_dec = CMsDecoder::new(fs, channels, streams, layout.coupled_streams(), layout.mapping())
         .unwrap_or_else(|e| panic!("libopus refuses the decoder for the encoder's layout {layout:?}: {e}"));
-    let mut dec = MultistreamDecoder::with_layout(fs, channels, streams, layout.coupled_streams(), layout.mapping())
-        .expect("opus1 refuses the decoder for the encoder's layout");
+    let mut dec = MultistreamDecoder::with_layout(
+        SampleRate::try_from(fs).unwrap(),
+        channels,
+        streams,
+        layout.coupled_streams(),
+        layout.mapping(),
+    )
+    .expect("opus1 refuses the decoder for the encoder's layout");
 
     let mut signal = Signal::new(&mut u)?;
     let sizes = encoder_frame_sizes(fs);

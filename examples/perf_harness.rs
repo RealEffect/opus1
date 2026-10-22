@@ -62,7 +62,7 @@ use audiopus_sys as ffi;
 use opus1::internals::range_coder::RangeCoder;
 use opus1::internals::silk::dec_api::SilkDecoder;
 use opus1::internals::silk::decode_frame::{FLAG_DECODE_LBRR, FLAG_DECODE_NORMAL, FLAG_PACKET_LOST};
-use opus1::{Application, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate};
 
 /// Output buffer handed to both encoders. It is larger than any packet, so
 /// it never limits the bit rate.
@@ -1267,8 +1267,11 @@ fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
         App::Audio => Application::Audio,
         App::LowDelay => Application::RestrictedLowDelay,
     };
-    let mut encoder = OpusEncoder::new(sc.rate as i32, sc.channels, application)
-        .map_err(|e| format!("OpusEncoder::new: {e}"))?;
+    let rate = SampleRate::try_from(sc.rate).map_err(|e| format!("rate {}: {e}", sc.rate))?;
+    let channels =
+        Channels::try_from(sc.channels).map_err(|e| format!("{} channels: {e}", sc.channels))?;
+    let mut encoder =
+        OpusEncoder::new(rate, channels, application).map_err(|e| format!("OpusEncoder::new: {e}"))?;
     encoder
         .set_bitrate(Bitrate::BitsPerSecond(sc.bitrate))
         .map_err(|e| format!("set_bitrate: {e}"))?;
@@ -1288,16 +1291,17 @@ fn rust_encoder(sc: &Scenario, forced: bool) -> Result<OpusEncoder, String> {
         }));
         encoder.set_bandwidth(sc.bandwidth().rust_value());
         if sc.channels == 2 {
-            encoder
-                .set_force_channels(Some(2))
-                .map_err(|e| format!("set_force_channels: {e}"))?;
+            encoder.set_force_channels(Some(Channels::Stereo));
         }
     }
     Ok(encoder)
 }
 
 fn rust_decoder(sc: &Scenario) -> Result<OpusDecoder, String> {
-    OpusDecoder::new(sc.dec_rate as i32, sc.channels).map_err(|e| format!("OpusDecoder::new: {e}"))
+    let rate = SampleRate::try_from(sc.dec_rate).map_err(|e| format!("rate {}: {e}", sc.dec_rate))?;
+    let channels =
+        Channels::try_from(sc.channels).map_err(|e| format!("{} channels: {e}", sc.channels))?;
+    OpusDecoder::new(rate, channels).map_err(|e| format!("OpusDecoder::new: {e}"))
 }
 
 /// Encoder settings read back from libopus with its `OPUS_GET_*` requests.
@@ -3320,9 +3324,7 @@ fn rust_encode_switching(case: &SwitchCase, clip: &Clip) -> Result<Packets, Stri
     let sc = &case.sc;
     let mut encoder = rust_encoder(sc, false)?;
     if sc.channels == 2 && !case.free_channels {
-        encoder
-            .set_force_channels(Some(2))
-            .map_err(|e| format!("set_force_channels: {e}"))?;
+        encoder.set_force_channels(Some(Channels::Stereo));
     }
     let mut out = [0u8; MAX_PACKET];
     let mut packets = Packets::default();

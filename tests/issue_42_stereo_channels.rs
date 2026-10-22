@@ -22,7 +22,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
     Encoder as CEnc, Signal as CSignal,
 };
-use opus1::{Application, Bandwidth, Bitrate, OpusDecoder, OpusEncoder, Signal};
+use opus1::{Application, Bandwidth, Bitrate, OpusDecoder, OpusEncoder, SampleRate, Signal};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -183,7 +183,12 @@ fn run(cfg: &Config) -> Measured {
     let packets = SECONDS * 50;
     let input = voiced(sr, frame * packets);
 
-    let mut rs_enc = OpusEncoder::new(sr as i32, CH, Application::Voip).unwrap();
+    let mut rs_enc = OpusEncoder::new(
+        SampleRate::try_from(sr as i32).unwrap(),
+        opus1::Channels::Stereo,
+        Application::Voip,
+    )
+    .unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     rs_enc.set_vbr(!cfg.cbr);
     // opus1 runs the speech and music analysis as libopus does. It reads
@@ -211,7 +216,11 @@ fn run(cfg: &Config) -> Measured {
 
     let mut c_dec_rs = CDec::new(sr as u32, CCh::Stereo).unwrap();
     let mut c_dec_c = CDec::new(sr as u32, CCh::Stereo).unwrap();
-    let mut rs_dec = OpusDecoder::new(sr as i32, CH).unwrap();
+    let mut rs_dec = OpusDecoder::new(
+        SampleRate::try_from(sr as i32).unwrap(),
+        opus1::Channels::Stereo,
+    )
+    .unwrap();
 
     let (mut rs_by_c, mut c_by_c, mut rs_by_rs) = (Vec::new(), Vec::new(), Vec::new());
     let (mut pkt, mut buf) = (vec![0u8; 1500], vec![0f32; MAX_FRAME * CH]);

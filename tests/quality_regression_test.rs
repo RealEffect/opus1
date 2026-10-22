@@ -19,7 +19,7 @@
 ///   - voip  48 kHz (HybridFB,  32 kbps): 13.37 dB
 ///   - audio 16 kHz (SilkOnly,  24 kbps): 21.65 dB
 ///   - audio 48 kHz (HybridFB,  32 kbps): 21.31 dB
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -136,7 +136,7 @@ fn toc_mode_name(toc: u8) -> &'static str {
 /// Voip + 16 kHz → SilkOnly (SILK is the only correct codec here)
 #[test]
 fn test_mode_voip_16k_is_silk_only() {
-    let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
     enc.set_vbr(false);
 
@@ -155,7 +155,7 @@ fn test_mode_voip_16k_is_silk_only() {
 /// Voip + 48 kHz → HybridFB  (SILK speech + CELT high-band extension)
 #[test]
 fn test_mode_voip_48k_is_hybrid_fb() {
-    let mut enc = OpusEncoder::new(48000, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_vbr(false);
 
@@ -180,7 +180,8 @@ fn test_mode_voip_48k_is_hybrid_fb() {
 /// with libopus.
 #[test]
 fn test_mode_audio_16k_is_silk_only() {
-    let mut enc = OpusEncoder::new(16000, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
     enc.set_vbr(false);
 
@@ -200,7 +201,8 @@ fn test_mode_audio_16k_is_silk_only() {
 /// At higher bitrates (>= 17.6 kbps), Audio mode correctly uses CeltOnly.
 #[test]
 fn test_mode_audio_48k_is_hybrid_fb_not_celt_only() {
-    let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap(); // Below 17.6 kbps threshold → HybridFB
     enc.set_vbr(false);
 
@@ -234,11 +236,11 @@ fn test_snr_voip_16k() {
 
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
-    let mut enc = OpusEncoder::new(sample_rate, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
     enc.set_vbr(false);
 
-    let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);
 
     let snr = compute_snr(
@@ -265,11 +267,11 @@ fn test_snr_voip_48k() {
 
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
-    let mut enc = OpusEncoder::new(sample_rate, 1, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_vbr(false);
 
-    let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);
 
     let snr = compute_snr(
@@ -296,11 +298,12 @@ fn test_snr_audio_16k() {
 
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
-    let mut enc = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     enc.set_vbr(false);
 
-    let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);
 
     let snr = compute_snr(
@@ -327,11 +330,12 @@ fn test_snr_audio_48k() {
 
     let signal = make_sine(sample_rate, 440.0, n_frames * frame_size);
 
-    let mut enc = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     enc.set_vbr(false);
 
-    let mut dec = OpusDecoder::new(sample_rate, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let decoded = encode_decode(&mut enc, &mut dec, &signal, frame_size);
 
     let snr = compute_snr(

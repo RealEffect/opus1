@@ -27,7 +27,7 @@ mod core_common;
 mod ms_support;
 
 use core_common::*;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use opus1::multistream::MultistreamDecoder;
 use std::f64::consts::PI;
 
@@ -155,7 +155,11 @@ fn c_packets(mode: i32, channels: usize, seconds: f64, durations: &[usize]) -> V
 fn decode_single(label: &str, packets: &[(Vec<u8>, usize)], rate: usize, channels: usize) -> Ties {
     let mut c_float = CDecoder::new(rate, channels);
     let mut c_i16 = CDecoder::new(rate, channels);
-    let mut ours = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut ours = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let mut buf = vec![0i16; rate / 400 * 48 * channels];
     let mut ties = Ties::default();
     for (k, (p, units)) in packets.iter().enumerate() {
@@ -229,7 +233,11 @@ fn long_loss_converts_like_one_call() {
     let packets = c_packets(MODE_CELT, channels, 1.0, &[8]);
     let mut c_float = CDecoder::new(rate, channels);
     let mut c_i16 = CDecoder::new(rate, channels);
-    let mut ours = OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut ours = OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let mut buf = vec![0i16; rate / 4];
     let mut ties = Ties::default();
     for (k, (p, _)) in packets.iter().enumerate() {
@@ -286,7 +294,14 @@ fn multistream_ties_round_to_even() {
     for rate in RATES {
         let mut c_float = ms_support::CMsDecoder::new(rate as i32, channels, streams, coupled, &mapping).unwrap();
         let mut c_i16 = ms_support::CMsDecoder::new(rate as i32, channels, streams, coupled, &mapping).unwrap();
-        let mut ours = MultistreamDecoder::with_layout(rate as i32, channels, streams, coupled, &mapping).unwrap();
+        let mut ours = MultistreamDecoder::with_layout(
+            SampleRate::try_from(rate as i32).unwrap(),
+            channels,
+            streams,
+            coupled,
+            &mapping,
+        )
+        .unwrap();
         let mut buf = vec![0i16; rate / 50 * channels];
         let mut ties = Ties::default();
         for (k, (p, n48)) in packets.iter().enumerate() {

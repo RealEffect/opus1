@@ -32,7 +32,7 @@ use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
 use opus1::multistream::MappingType;
 use opus1::internals::multistream::surround::SurroundProbe;
-use opus1::{Application, Bandwidth, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// A rising sine with a little noise, different on every channel.
 fn sweeps(fs: i32, channels: usize, samples: usize) -> Vec<f32> {
@@ -140,7 +140,12 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
         .enumerate()
         .map(|(s, (_, right))| {
             let stream_channels = if right.is_some() { 2 } else { 1 };
-            let mut single = OpusEncoder::new(fs, stream_channels, application).unwrap();
+            let mut single = OpusEncoder::new(
+                SampleRate::try_from(fs).unwrap(),
+                Channels::try_from(stream_channels).unwrap(),
+                application,
+            )
+            .unwrap();
             // libopus flags the LFE stream when the encoder is made.
             single.set_lfe(Some(s) == enc.lfe_stream());
             single
@@ -229,7 +234,7 @@ fn compare(case: &Case, fs: i32, application: Application, vbr: bool) -> usize {
                             // CELT-only and two coded channels
                             // (opus_multistream_encoder.c:953-958).
                             single.set_force_mode(Some(ForcedMode::CeltOnly));
-                            single.set_force_channels(Some(2)).unwrap();
+                            single.set_force_channels(Some(Channels::Stereo));
                         }
                         // Every stream, the LFE stream too, gets the mask
                         // of its own channels.

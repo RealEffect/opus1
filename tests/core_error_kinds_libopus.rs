@@ -8,7 +8,7 @@ mod core_common;
 
 use audiopus_sys as sys;
 use core_common::*;
-use opus1::{Application, Bitrate, Error, ErrorKind, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, Error, ErrorKind, OpusDecoder, OpusEncoder, SampleRate};
 
 /// opus1's result as a libopus return code: 0 for success, else the error
 /// code.
@@ -37,7 +37,8 @@ fn every_kind_has_its_libopus_code() {
 
 #[test]
 fn encoder_errors_have_the_codes_of_libopus() {
-    let mut rust = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+    let mut rust =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     let mut c = CEncoder::new(48_000, 1, APP_AUDIO);
     let pcm = vec![0.0f32; 5760];
     let mut out = vec![0u8; 1500];
@@ -68,11 +69,12 @@ fn encoder_errors_have_the_codes_of_libopus() {
 
 #[test]
 fn decoder_errors_have_the_codes_of_libopus() {
-    let mut enc = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     let mut buf = vec![0u8; 1500];
     let len = enc.encode(&[0.0; 960], 960, &mut buf).unwrap();
     let packet = &buf[..len];
-    let mut rust = OpusDecoder::new(48_000, 1).unwrap();
+    let mut rust = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut c = CDecoder::new(48_000, 1);
     let mut out = vec![0.0f32; 5760];
     // Frame count code 3 without the byte that holds the count.

@@ -149,6 +149,172 @@ const OPUS_DELAY_BUF: usize = 480 * OPUS_MAX_CHANNELS;
 /// Worst case 60 ms stereo @ 48 kHz: (192 + 2880) * 2 = 6144.
 const OPUS_PCM_BUF: usize = (192 + OPUS_MAX_SUBFRAME) * OPUS_MAX_CHANNELS;
 
+/// A sampling rate of the audio that an encoder takes or a decoder writes.
+/// Opus supports these five rates and no others.
+///
+/// The number of each value is the rate in Hz. More rates may be added in
+/// a later release (libopus has 96 kHz behind its QEXT option), so a
+/// `match` on it needs a `_` arm.
+///
+/// ```
+/// use opus1::SampleRate;
+///
+/// assert_eq!(SampleRate::Hz48000.hz(), 48000);
+/// assert_eq!(SampleRate::try_from(16000u32)?, SampleRate::Hz16000);
+/// assert!(SampleRate::try_from(44100u32).is_err());
+/// # Ok::<(), opus1::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SampleRate {
+    /// 8 kHz, enough for narrowband audio.
+    Hz8000 = 8000,
+    /// 12 kHz, enough for mediumband audio.
+    Hz12000 = 12000,
+    /// 16 kHz, enough for wideband audio.
+    Hz16000 = 16000,
+    /// 24 kHz, enough for super-wideband audio.
+    Hz24000 = 24000,
+    /// 48 kHz, enough for fullband audio. Opus codes at this rate inside.
+    Hz48000 = 48000,
+}
+
+impl SampleRate {
+    /// Every value, from the lowest rate to the highest.
+    ///
+    /// It is a slice, not an array, so that a later release can add a rate
+    /// (the enum is `#[non_exhaustive]`) without changing its type.
+    pub const ALL: &'static [SampleRate] = &[
+        SampleRate::Hz8000,
+        SampleRate::Hz12000,
+        SampleRate::Hz16000,
+        SampleRate::Hz24000,
+        SampleRate::Hz48000,
+    ];
+
+    /// The rate in Hz, for example 48000 for [`Hz48000`](Self::Hz48000).
+    pub const fn hz(self) -> u32 {
+        self as u32
+    }
+
+    /// The number of samples per channel in 120 ms, the longest packet: the
+    /// output room that a decoder call may need. 5760 at 48 kHz.
+    pub const fn max_frame_size(self) -> usize {
+        self as usize / 25 * 3
+    }
+
+    /// The rate of a codec field that was set from a `SampleRate`, so that
+    /// it holds one of the five rates.
+    pub(crate) const fn from_valid_hz(hz: i32) -> SampleRate {
+        match hz {
+            8000 => SampleRate::Hz8000,
+            12000 => SampleRate::Hz12000,
+            16000 => SampleRate::Hz16000,
+            24000 => SampleRate::Hz24000,
+            _ => {
+                debug_assert!(hz == 48000);
+                SampleRate::Hz48000
+            }
+        }
+    }
+}
+
+impl TryFrom<u32> for SampleRate {
+    type Error = crate::Error;
+
+    /// The value for a rate of `value` Hz. Any rate that Opus does not
+    /// support is refused with [`BadArg`](crate::ErrorKind::BadArg), as
+    /// libopus `opus_encoder_create` and `opus_decoder_create` refuse it.
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        SampleRate::ALL
+            .iter()
+            .copied()
+            .find(|rate| rate.hz() == value)
+            .ok_or(Error::INVALID_SAMPLING_RATE)
+    }
+}
+
+impl TryFrom<i32> for SampleRate {
+    type Error = crate::Error;
+
+    /// The value for a rate of `value` Hz, the type libopus uses for rates
+    /// (`opus_int32`). Any rate that Opus does not support is refused with
+    /// [`BadArg`](crate::ErrorKind::BadArg).
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        u32::try_from(value)
+            .map_err(|_| Error::INVALID_SAMPLING_RATE)
+            .and_then(SampleRate::try_from)
+    }
+}
+
+impl From<SampleRate> for u32 {
+    fn from(rate: SampleRate) -> u32 {
+        rate.hz()
+    }
+}
+
+/// The number of channels of the audio that an encoder takes or a decoder
+/// writes. A single Opus stream has one or two channels. For more, use the
+/// `multistream` module, which counts channels with a `usize`.
+///
+/// ```
+/// use opus1::Channels;
+///
+/// assert_eq!(Channels::Stereo.count(), 2);
+/// assert_eq!(Channels::try_from(1)?, Channels::Mono);
+/// assert!(Channels::try_from(3).is_err());
+/// # Ok::<(), opus1::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Channels {
+    /// One channel.
+    Mono = 1,
+    /// Two channels, interleaved left then right.
+    Stereo = 2,
+}
+
+impl Channels {
+    /// Both values: [`Mono`](Self::Mono), then [`Stereo`](Self::Stereo).
+    pub const ALL: [Channels; 2] = [Channels::Mono, Channels::Stereo];
+
+    /// The number of channels: 1 or 2.
+    pub const fn count(self) -> usize {
+        self as usize
+    }
+
+    /// The channel count of a codec field that was set from a `Channels`,
+    /// so that it is 1 or 2.
+    pub(crate) const fn from_valid_count(count: usize) -> Channels {
+        if count == 1 {
+            Channels::Mono
+        } else {
+            debug_assert!(count == 2);
+            Channels::Stereo
+        }
+    }
+}
+
+impl TryFrom<usize> for Channels {
+    type Error = crate::Error;
+
+    /// The value for `value` channels. Any count other than 1 or 2 is
+    /// refused with [`BadArg`](crate::ErrorKind::BadArg), as libopus
+    /// `opus_encoder_create` and `opus_decoder_create` refuse it.
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Channels::Mono),
+            2 => Ok(Channels::Stereo),
+            _ => Err(Error::INVALID_CHANNELS),
+        }
+    }
+}
+
+impl From<Channels> for usize {
+    fn from(channels: Channels) -> usize {
+        channels.count()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Application {
     Voip = 2048,
@@ -301,8 +467,8 @@ impl FrameDuration {
     /// for [`Argument`](Self::Argument). The arithmetic is that of libopus
     /// `frame_size_select`, and gives a whole number at every sampling rate
     /// Opus has.
-    pub fn samples(self, sampling_rate: i32) -> Option<usize> {
-        let fs = sampling_rate as usize;
+    pub fn samples(self, sampling_rate: SampleRate) -> Option<usize> {
+        let fs = sampling_rate.hz() as usize;
         Some(match self {
             FrameDuration::Argument => return None,
             FrameDuration::Ms2_5 => fs / 400,
@@ -1247,16 +1413,12 @@ macro_rules! with_deep_plc {
 
 impl OpusEncoder {
     pub fn new(
-        sampling_rate: i32,
-        channels: usize,
+        sampling_rate: SampleRate,
+        channels: Channels,
         application: Application,
     ) -> Result<Self, Error> {
-        if ![8000, 12000, 16000, 24000, 48000].contains(&sampling_rate) {
-            return Err(Error::INVALID_SAMPLING_RATE);
-        }
-        if ![1, 2].contains(&channels) {
-            return Err(Error::INVALID_CHANNELS);
-        }
+        let sampling_rate = sampling_rate.hz() as i32;
+        let channels = channels.count();
 
         let mode = modes::default_mode();
         #[cfg(feature = "heap")]
@@ -2176,9 +2338,12 @@ impl OpusEncoder {
         self.variable_duration
     }
 
-    /// libopus `OPUS_SET_FORCE_CHANNELS`: code `Some(1)` or `Some(2)`
-    /// channels, or let the bitrate decide with `None`. The count may not
-    /// exceed the input's. A mono encoder codes mono whatever is set.
+    /// libopus `OPUS_SET_FORCE_CHANNELS`: code `Some(Channels::Mono)` or
+    /// `Some(Channels::Stereo)`, or let the bitrate decide with `None`.
+    ///
+    /// A mono encoder codes mono whatever is set. libopus refuses
+    /// `Some(Stereo)` on a mono encoder with `OPUS_BAD_ARG`; opus1 keeps the
+    /// value, and it has no effect.
     ///
     /// Without a forced count, stereo input is coded as mono below about
     /// 17 kb/s for music and 19 kb/s for speech, with 1 kb/s of hysteresis
@@ -2186,23 +2351,17 @@ impl OpusEncoder {
     ///
     /// As in libopus, a packet made of several frames (40 to 120 ms of
     /// CELT or Hybrid, 80 to 120 ms of SILK) that would lead over to mono
-    /// sets this to `Some(1)` itself (opus_encoder.c:1763-1765). The stream
-    /// then stays mono until the caller sets the count again.
-    pub fn set_force_channels(&mut self, channels: Option<usize>) -> Result<(), Error> {
-        match channels {
-            Some(n) if n < 1 || n > self.channels => {
-                Err(Error::bad_arg("invalid forced channel count"))
-            }
-            _ => {
-                self.force_channels = channels;
-                Ok(())
-            }
-        }
+    /// sets this to `Some(Channels::Mono)` itself (opus_encoder.c:1763-1765).
+    /// The stream then stays mono until the caller sets the count again.
+    pub fn set_force_channels(&mut self, channels: Option<Channels>) {
+        self.force_channels = channels.map(Channels::count);
     }
 
-    /// The count set with [`set_force_channels`](Self::set_force_channels).
-    pub fn force_channels(&self) -> Option<usize> {
-        self.force_channels
+    /// libopus `OPUS_GET_FORCE_CHANNELS`: the value set with
+    /// [`set_force_channels`](Self::set_force_channels), or set by the
+    /// encoder itself as that method describes.
+    pub fn force_channels(&self) -> Option<Channels> {
+        self.force_channels.map(Channels::from_valid_count)
     }
 
     /// libopus `OPUS_SET_APPLICATION`: changes the application given to
@@ -2340,7 +2499,7 @@ impl OpusEncoder {
     pub fn reset_state(&mut self) {
         // `new` accepted this sampling rate, channel count and application
         // before, so it does again.
-        let Ok(mut fresh) = Self::new(self.sampling_rate, self.channels, self.application) else {
+        let Ok(mut fresh) = Self::new(self.sampling_rate(), self.channels(), self.application) else {
             return;
         };
         fresh.user_bitrate = self.user_bitrate;
@@ -2395,14 +2554,14 @@ impl OpusEncoder {
         *self = fresh;
     }
 
-    /// The sampling rate of the input in Hz (`OPUS_GET_SAMPLE_RATE`).
-    pub fn sampling_rate(&self) -> i32 {
-        self.sampling_rate
+    /// The sampling rate of the input (`OPUS_GET_SAMPLE_RATE`).
+    pub fn sampling_rate(&self) -> SampleRate {
+        SampleRate::from_valid_hz(self.sampling_rate)
     }
 
     /// The number of input channels.
-    pub fn channels(&self) -> usize {
-        self.channels
+    pub fn channels(&self) -> Channels {
+        Channels::from_valid_count(self.channels)
     }
 
     /// libopus `OPUS_GET_LOOKAHEAD`: the delay the encoder adds, in samples
@@ -4153,7 +4312,7 @@ pub struct OpusDecoder {
 }
 
 impl OpusDecoder {
-    pub fn new(sampling_rate: i32, channels: usize) -> Result<Self, Error> {
+    pub fn new(sampling_rate: SampleRate, channels: Channels) -> Result<Self, Error> {
         let mut dec = MaybeUninit::<Self>::uninit();
         Self::init(&mut dec, sampling_rate, channels)?;
         // SAFETY: `init` succeeded, so it initialized `dec`.
@@ -4162,7 +4321,8 @@ impl OpusDecoder {
 
     /// Builds a decoder in `slot`, memory that the caller provides, and
     /// returns it. The decoder is the same as the one of
-    /// [`new`](Self::new), and the errors are the same.
+    /// [`new`](Self::new). Like `new`, it cannot fail at present: the
+    /// `Result` leaves room for checks that a later release may need.
     ///
     /// Without the `heap` feature a decoder holds all of its state inline
     /// (about 60 KB, 160 KB with the neural network features), and `new`
@@ -4178,30 +4338,24 @@ impl OpusDecoder {
     ///
     /// ```
     /// use core::mem::MaybeUninit;
-    /// use opus1::OpusDecoder;
+    /// use opus1::{Channels, OpusDecoder, SampleRate};
     ///
     /// // In a `no_std` program this would be a `static`.
     /// let mut slot = MaybeUninit::<OpusDecoder>::uninit();
-    /// let decoder = OpusDecoder::init(&mut slot, 48000, 2)?;
+    /// let decoder = OpusDecoder::init(&mut slot, SampleRate::Hz48000, Channels::Stereo)?;
     /// let mut pcm = [0.0f32; 960 * 2];
     /// decoder.decode(&[], 960, &mut pcm)?; // a lost frame
     /// # Ok::<(), opus1::Error>(())
     /// ```
     pub fn init(
         slot: &mut MaybeUninit<Self>,
-        sampling_rate: i32,
-        channels: usize,
+        sampling_rate: SampleRate,
+        channels: Channels,
     ) -> Result<&mut Self, Error> {
-        if ![8000, 12000, 16000, 24000, 48000].contains(&sampling_rate) {
-            return Err(Error::INVALID_SAMPLING_RATE);
-        }
-        if ![1, 2].contains(&channels) {
-            return Err(Error::INVALID_CHANNELS);
-        }
         // SAFETY: `slot` is valid for writes of `Self`, and `write_new`
         // initializes every field, so `slot` holds a decoder afterwards.
         unsafe {
-            Self::write_new(slot.as_mut_ptr(), sampling_rate, channels);
+            Self::write_new(slot.as_mut_ptr(), sampling_rate.hz() as i32, channels.count());
             Ok(slot.assume_init_mut())
         }
     }
@@ -4666,7 +4820,7 @@ impl OpusDecoder {
             let needed = if lost {
                 piece
             } else {
-                match packet::nb_samples(data, self.sampling_rate) {
+                match packet::nb_samples(data, self.sampling_rate()) {
                     Ok(samples) => piece.min(samples),
                     Err(e) => break Err(e),
                 }
@@ -4754,7 +4908,7 @@ impl OpusDecoder {
         let toc = data[0];
         let packet_mode = mode_from_toc(toc);
         let packet_bandwidth = bandwidth_from_toc(toc);
-        let packet_frame_size = packet::samples_per_frame(toc, self.sampling_rate);
+        let packet_frame_size = packet::samples_per_frame(toc, self.sampling_rate());
         let packet_channels = channels_from_toc(toc);
         let parsed = packet::parse(data, self_delimited)?;
 
@@ -4932,9 +5086,9 @@ impl OpusDecoder {
         self.deep_plc.reset();
     }
 
-    /// The sampling rate of the output in Hz (`OPUS_GET_SAMPLE_RATE`).
-    pub fn sampling_rate(&self) -> i32 {
-        self.sampling_rate
+    /// The sampling rate of the output (`OPUS_GET_SAMPLE_RATE`).
+    pub fn sampling_rate(&self) -> SampleRate {
+        SampleRate::from_valid_hz(self.sampling_rate)
     }
 
     /// libopus `OPUS_SET_COMPLEXITY` of the decoder: 0 to 10. The default is 0.
@@ -5128,8 +5282,8 @@ impl OpusDecoder {
     }
 
     /// The number of output channels.
-    pub fn channels(&self) -> usize {
-        self.channels
+    pub fn channels(&self) -> Channels {
+        Channels::from_valid_count(self.channels)
     }
 
     /// Decode one frame of a packet: a port of libopus `opus_decode_frame`
@@ -6019,7 +6173,7 @@ pub(crate) fn frame_size_select(
     if frame_size < sampling_rate as usize / 400 {
         return None;
     }
-    let new_size = duration.samples(sampling_rate).unwrap_or(frame_size);
+    let new_size = duration.samples(SampleRate::from_valid_hz(sampling_rate)).unwrap_or(frame_size);
     if new_size > frame_size {
         return None;
     }
@@ -6200,6 +6354,78 @@ fn smooth_fade(
 mod tests {
     use super::*;
 
+    #[test]
+    fn sample_rates_convert_to_and_from_numbers() {
+        let hz = [8000, 12000, 16000, 24000, 48000];
+        assert!(SampleRate::ALL.iter().map(|rate| rate.hz()).eq(hz));
+        for &rate in SampleRate::ALL {
+            assert_eq!(SampleRate::try_from(rate.hz()), Ok(rate));
+            assert_eq!(SampleRate::try_from(rate.hz() as i32), Ok(rate));
+            assert_eq!(u32::from(rate), rate.hz());
+            assert_eq!(SampleRate::from_valid_hz(rate.hz() as i32), rate);
+            // 120 ms, the room the decoder of libopus may need.
+            assert_eq!(rate.max_frame_size(), packet::max_packet_samples(rate.hz() as i32));
+            assert_eq!(rate.max_frame_size(), rate.hz() as usize * 120 / 1000);
+        }
+        assert!(SampleRate::ALL.windows(2).all(|w| w[0] < w[1]));
+        for hz in [0, 1, 4000, 11025, 22050, 32000, 44100, 96000, u32::MAX] {
+            let err = SampleRate::try_from(hz).unwrap_err();
+            assert_eq!((err.kind(), err.message()), (ErrorKind::BadArg, "invalid sampling rate"));
+        }
+        for hz in [-1, -48000, i32::MIN, i32::MAX] {
+            assert_eq!(SampleRate::try_from(hz), Err(Error::INVALID_SAMPLING_RATE));
+        }
+    }
+
+    #[test]
+    fn channels_convert_to_and_from_numbers() {
+        assert_eq!(Channels::ALL.map(Channels::count), [1, 2]);
+        for channels in Channels::ALL {
+            assert_eq!(Channels::try_from(channels.count()), Ok(channels));
+            assert_eq!(usize::from(channels), channels.count());
+            assert_eq!(Channels::from_valid_count(channels.count()), channels);
+        }
+        for count in [0, 3, 8, 255, usize::MAX] {
+            let err = Channels::try_from(count).unwrap_err();
+            assert_eq!((err.kind(), err.message()), (ErrorKind::BadArg, "invalid number of channels"));
+        }
+    }
+
+    #[test]
+    fn codecs_report_their_rate_and_channels() {
+        for &rate in SampleRate::ALL {
+            for channels in Channels::ALL {
+                let enc = OpusEncoder::new(rate, channels, Application::Audio).unwrap();
+                assert_eq!((enc.sampling_rate(), enc.channels()), (rate, channels));
+                let dec = OpusDecoder::new(rate, channels).unwrap();
+                assert_eq!((dec.sampling_rate(), dec.channels()), (rate, channels));
+            }
+        }
+    }
+
+    #[test]
+    fn forced_channels_are_kept_on_a_mono_encoder() {
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
+        assert_eq!(enc.force_channels(), None);
+        enc.set_force_channels(Some(Channels::Stereo));
+        assert_eq!(enc.force_channels(), Some(Channels::Stereo));
+        // A mono encoder codes mono whatever is set: the packets are those
+        // of an encoder without the setting.
+        let mut plain =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
+        let (mut out, mut plain_out) = ([0u8; 1500], [0u8; 1500]);
+        for k in 0..10 {
+            let pcm: Vec<f32> = (0..960).map(|i| (0.01 * (k * 960 + i) as f32).sin() * 0.3).collect();
+            let len = enc.encode(&pcm, 960, &mut out).unwrap();
+            let plain_len = plain.encode(&pcm, 960, &mut plain_out).unwrap();
+            assert_eq!(out[..len], plain_out[..plain_len], "packet {k}");
+            assert_eq!(channels_from_toc(out[0]), 1);
+        }
+        enc.set_force_channels(None);
+        assert_eq!(enc.force_channels(), None);
+    }
+
     fn frame_size_from_toc(toc: u8, sampling_rate: i32) -> Option<usize> {
         let mode = mode_from_toc(toc);
         match mode {
@@ -6258,7 +6484,8 @@ mod tests {
         let sampling_rate = 48000;
         let channels = 1;
 
-        let mut decoder = OpusDecoder::new(sampling_rate, channels).unwrap();
+        let mut decoder =
+            OpusDecoder::new(sampling_rate.try_into().unwrap(), channels.try_into().unwrap()).unwrap();
 
         let frame_sizes = [120, 240, 480, 960];
 
@@ -6277,7 +6504,8 @@ mod tests {
         }
 
         let channels = 2;
-        let mut decoder = OpusDecoder::new(sampling_rate, channels).unwrap();
+        let mut decoder =
+            OpusDecoder::new(sampling_rate.try_into().unwrap(), channels.try_into().unwrap()).unwrap();
 
         for frame_size in frame_sizes {
             let toc = gen_toc(
@@ -6295,9 +6523,8 @@ mod tests {
 
     #[test]
     fn test_celt_decoder_edge_case_frame_sizes() {
-        let sampling_rate = 48000;
         let channels = 1;
-        let mut decoder = OpusDecoder::new(sampling_rate, channels).unwrap();
+        let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 
         let edge_sizes = [2048, 2167, 2168, 2169, 2880, 3072];
 
@@ -6316,7 +6543,8 @@ mod tests {
     // without proper resampling, so the encoder received 48 samples instead of 480.
     #[test]
     fn test_invalid_small_frame_size_returns_error_not_panic() {
-        let mut enc = OpusEncoder::new(48000, 2, Application::Voip).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Voip).unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(64000)).unwrap();
         enc.set_complexity(5).unwrap();
         enc.set_vbr(false);
@@ -6439,9 +6667,14 @@ mod tests {
     fn decode_native_reads_self_delimited_packets() {
         // 20 ms packets hold one frame, 60 ms CELT packets three.
         for frame_size in [960usize, 2880] {
-            let mut enc = OpusEncoder::new(48000, 1, Application::RestrictedLowDelay).unwrap();
-            let mut plain = OpusDecoder::new(48000, 1).unwrap();
-            let mut delimited = OpusDecoder::new(48000, 1).unwrap();
+            let mut enc = OpusEncoder::new(
+                SampleRate::Hz48000,
+                Channels::Mono,
+                Application::RestrictedLowDelay,
+            )
+            .unwrap();
+            let mut plain = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+            let mut delimited = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             let (mut a, mut b) = (vec![0f32; frame_size], vec![0f32; frame_size]);
             for p in encode_tone(&mut enc, frame_size, 12) {
                 let parsed = packet::parse(&p, false).unwrap();
@@ -6486,7 +6719,8 @@ mod tests {
     #[test]
     fn decode_native_handles_fec_and_padding_in_self_delimited_packets() {
         let frame_size = 320usize;
-        let mut enc = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(28000)).unwrap();
         enc.set_inband_fec(true);
         enc.set_packet_loss_perc(25).unwrap();
@@ -6496,8 +6730,8 @@ mod tests {
         assert!(packets.iter().all(|p| p[0] & 0x80 == 0));
         let with_copy = packets.iter().filter(|p| p[1] & 0x40 != 0).count();
         assert!(with_copy >= 15, "{with_copy} of 40 packets carry FEC data");
-        let mut plain = OpusDecoder::new(16000, 1).unwrap();
-        let mut delimited = OpusDecoder::new(16000, 1).unwrap();
+        let mut plain = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
+        let mut delimited = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
         let (mut a, mut b) = (vec![0f32; 2 * frame_size], vec![0f32; 2 * frame_size]);
         let mut a16 = vec![0i16; frame_size];
         let mut fec_calls = 0;
@@ -6556,7 +6790,8 @@ mod tests {
     // the same bad frame size.
     #[test]
     fn test_invalid_small_frame_size_audio_application_returns_error() {
-        let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+        let mut enc =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
         let input = vec![0.0f32; 48];
         let mut output = vec![0u8; 256];
 

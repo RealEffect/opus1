@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use audiopus_sys as sys;
+use opus1::{Channels, SampleRate};
 
 /// C libopus decoder with access to the final range of the last packet.
 pub struct CDecoder {
@@ -190,7 +191,11 @@ pub fn decode_with_loss(
     frame: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let mut c_dec = CDecoder::new(rate, channels);
-    let mut rs_dec = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let (mut c, mut r) = (Vec::new(), Vec::new());
     let mut buf = vec![0f32; frame * channels];
     for (i, p) in packets.iter().enumerate() {

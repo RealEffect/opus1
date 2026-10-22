@@ -14,7 +14,7 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
-use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 /// libopus's `OPUS_AUTO` and `OPUS_BITRATE_MAX`.
 const OPUS_AUTO: i32 = -1000;
@@ -68,7 +68,12 @@ fn setters_refuse_what_libopus_refuses() {
     for rate in RATES {
         for channels in [1, 2] {
             let label = format!("{rate} Hz, {channels} channels");
-            let mut rust = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+            let mut rust = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                Application::Audio,
+            )
+            .unwrap();
             let mut c = CEncoder::new(rate, channels, APP_AUDIO);
             assert_same_settings(&rust, &mut c, &format!("{label}, new"));
             for v in bitrates {
@@ -121,7 +126,12 @@ fn bitrate_readback_follows_the_last_frame() {
                 Bitrate::Max => OPUS_BITRATE_MAX,
                 Bitrate::BitsPerSecond(bps) => bps,
             };
-            let mut rust = OpusEncoder::new(rate as i32, channels, app(c_app)).unwrap();
+            let mut rust = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                app(c_app),
+            )
+            .unwrap();
             rust.set_complexity(5).unwrap();
             rust.set_bitrate(setting).unwrap();
             let mut c = CEncoder::new(rate, channels, c_app);
@@ -152,7 +162,7 @@ fn encode_both(
     frame: usize,
     max_bytes: usize,
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    let channels = rust.channels();
+    let channels = rust.channels().count();
     let mut out = vec![0u8; max_bytes];
     let mut rust_packets = Vec::new();
     let mut c_packets = Vec::new();
@@ -188,7 +198,12 @@ fn maximum_bitrate_gives_the_packets_of_libopus() {
             for max_bytes in [60, 200, 1276, 3000, 10_000] {
                 for vbr in [false, true] {
                     let label = format!("{rate} Hz, {channels} ch, {tenths} tenths of ms, {max_bytes} bytes, VBR {vbr}");
-                    let mut rust = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+                    let mut rust = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::try_from(channels).unwrap(),
+                        Application::Audio,
+                    )
+                    .unwrap();
                     rust.set_complexity(5).unwrap();
                     rust.set_bitrate(Bitrate::Max).unwrap();
                     rust.set_vbr(vbr);
@@ -221,7 +236,12 @@ fn unconstrained_vbr_follows_libopus() {
         let mut totals = Vec::new();
         for constrained in [true, false] {
             let label = format!("{rate} Hz, {channels} ch, {bitrate} b/s, constrained {constrained}");
-            let mut rust = OpusEncoder::new(rate as i32, channels, Application::RestrictedLowDelay).unwrap();
+            let mut rust = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                Application::RestrictedLowDelay,
+            )
+            .unwrap();
             rust.set_complexity(5).unwrap();
             rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
             rust.set_vbr_constraint(constrained);
@@ -271,7 +291,12 @@ fn default_bitrate_is_that_of_libopus() {
     for (rate, channels, c_app, tenths, cbr) in cases {
         let frame = rate * tenths / 10_000;
         let label = format!("{rate} Hz, {channels} ch, application {c_app}, {tenths} tenths of ms, CBR {cbr}");
-        let mut rust = OpusEncoder::new(rate as i32, channels, app(c_app)).unwrap();
+        let mut rust = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            app(c_app),
+        )
+        .unwrap();
         assert_eq!(rust.bitrate_setting(), Bitrate::Auto, "{label}");
         rust.set_complexity(5).unwrap();
         rust.set_vbr(!cbr);

@@ -7,7 +7,9 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{aligned_snr, multitone, speech, to_stereo, toc_summary};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+};
 
 const MODES: [(&str, i32, ForcedMode); 3] = [
     ("SILK", MODE_SILK, ForcedMode::SilkOnly),
@@ -48,11 +50,17 @@ fn mode_changes_in_a_running_stream_keep_the_final_range() {
         let frame = rate / 50;
         let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
         c_enc.bitrate(bitrate).complexity(5);
-        let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::Mono,
+            Application::Audio,
+        )
+        .unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
         enc.set_complexity(5).unwrap();
         let mut c_dec = CDecoder::new(rate, 1);
-        let mut dec = OpusDecoder::new(rate as i32, 1).unwrap();
+        let mut dec =
+            OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
         let mut buf = vec![0u8; 4000];
         let mut out = vec![0f32; frame];
         let (mut packets, mut c_packets) = (Vec::new(), Vec::new());
@@ -92,7 +100,12 @@ fn bandwidth_limits_and_lfe_changed_in_a_running_stream() {
     let pcm = tones_and_speech(rate, 1, 3.6);
     let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
     c_enc.bitrate(40000).complexity(5);
-    let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Mono,
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(40000)).unwrap();
     enc.set_complexity(5).unwrap();
     let mut c_dec = CDecoder::new(rate, 1);
@@ -166,7 +179,12 @@ fn cbr_run(rate: usize, channels: usize, mode: usize, frame_2_5ms: usize, pcm: &
     let what = format!("{rate} Hz, {channels} ch, forced {name}, {} ms", frame_2_5ms as f32 * 2.5);
     let mut c_enc = CEncoder::new(rate, channels, APP_AUDIO);
     c_enc.force_mode(c_mode).bitrate(bitrate).vbr(false).complexity(5);
-    let mut enc = OpusEncoder::new(rate as i32, channels, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        Application::Audio,
+    )
+    .unwrap();
     enc.set_force_mode(Some(forced));
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     enc.set_vbr(false);
@@ -315,7 +333,12 @@ fn packets_too_small_to_code_name_the_last_coded_mode() {
                     let what = format!("{name}, {} ms, CBR {cbr}, low bitrate first {low_first}", frame_tenth_ms as f64 / 10.0);
                     let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
                     c_enc.vbr(!cbr).complexity(5).lfe(lfe);
-                    let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+                    let mut enc = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::Mono,
+                        Application::Audio,
+                    )
+                    .unwrap();
                     enc.set_vbr(!cbr);
                     enc.set_complexity(5).unwrap();
                     enc.set_lfe(lfe);
@@ -383,7 +406,12 @@ fn placeholders_in_short_frames_after_longer_coded_packets() {
                 let what = format!("{name}, then {} ms frames, CBR {cbr}", short as f64 / 48.0);
                 let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
                 c_enc.force_mode(c_mode).bandwidth(c_bw).vbr(!cbr).complexity(5);
-                let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(rate as i32).unwrap(),
+                    Channels::Mono,
+                    Application::Audio,
+                )
+                .unwrap();
                 enc.set_force_mode(Some(forced));
                 enc.set_bandwidth(bw);
                 enc.set_vbr(!cbr);

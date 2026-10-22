@@ -14,7 +14,7 @@
 //! libopus (which scores ~0.9 on the same signal).
 
 use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::f32::consts::TAU;
 
 const PRE_SKIP: usize = 312;
@@ -55,9 +55,14 @@ fn rust_roundtrip(rate: usize, ch: usize, app: Application, br: i32) -> (u8, f64
     let pad = (PRE_SKIP * 48_000 / rate) * ch;
     input.resize(input.len() + pad.div_ceil(frame * ch) * frame * ch, 0.0);
 
-    let mut enc = OpusEncoder::new(rate as i32, ch, app).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+        app,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(br)).unwrap();
-    let mut dec = OpusDecoder::new(48_000, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(ch).unwrap()).unwrap();
     let (mut out, mut pkt, mut pcm) = (Vec::new(), [0u8; 8000], vec![0f32; 5760 * ch]);
     let mut toc = 0;
     for f in input.chunks(frame * ch) {
@@ -122,7 +127,7 @@ fn libopus_enc_rust_dec(rate: usize, ch: usize, br: i32) -> f64 {
     input.resize(input.len() + pad.div_ceil(frame * ch) * frame * ch, 0.0);
     let mut enc = CEnc::new(rate as u32, c_channels(ch), CApp::Audio).unwrap();
     enc.set_bitrate(opus::Bitrate::Bits(br)).unwrap();
-    let mut dec = OpusDecoder::new(48_000, ch).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::try_from(ch).unwrap()).unwrap();
     let (mut out, mut pkt, mut pcm) = (Vec::new(), vec![0u8; 8000], vec![0f32; 5760 * ch]);
     for f in input.chunks(frame * ch) {
         let n = enc.encode_float(f, &mut pkt).unwrap();

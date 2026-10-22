@@ -146,7 +146,7 @@ pub trait DemoDecoder {
 
 impl DemoDecoder for crate::OpusDecoder {
     fn channels(&self) -> usize {
-        crate::OpusDecoder::channels(self)
+        crate::OpusDecoder::channels(self).count()
     }
 
     /// `opus_decode24` of the float build: decode to float, without the
@@ -167,7 +167,7 @@ impl DemoDecoder for crate::OpusDecoder {
         } else {
             frame_size
         };
-        let channels = crate::OpusDecoder::channels(self);
+        let channels = crate::OpusDecoder::channels(self).count();
         let mut pcm = vec![0.0f32; frame_size * channels];
         let n = if decode_fec {
             self.decode_fec(data, frame_size, &mut pcm)

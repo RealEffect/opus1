@@ -32,7 +32,7 @@ mod eval_common;
 
 use eval_common::corpus_dir;
 use eval_common::libopus_demo::LibopusDecoder;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use opus1::internals::eval::compare::{Comparison, Reference, TestSignal, opus_compare_many};
 use opus1::internals::eval::demo::{DemoDecoder, DemoOutput, decode_bitstream, parse_bitstream};
 use std::path::{Path, PathBuf};
@@ -112,7 +112,7 @@ fn run_vector(dir: &Path, nn: usize) -> Result<Vector, String> {
     for channels in [1, 2] {
         let outputs: Vec<DemoOutput> = RATES
             .iter()
-            .map(|&rate| decode_bitstream(&mut OpusDecoder::new(rate as i32, channels).unwrap(), &parsed.packets))
+            .map(|&rate| decode_bitstream(&mut OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::try_from(channels).unwrap()).unwrap(), &parsed.packets))
             .collect();
         let tests: Vec<TestSignal<'_>> =
             outputs.iter().zip(RATES).map(|(o, rate)| TestSignal { samples: &o.pcm, rate }).collect();
@@ -260,7 +260,7 @@ fn rfc8251_vectors_decode_as_libopus() {
                     let mut differences = Vec::new();
                     for channels in [1, 2] {
                         for rate in RATES {
-                            let a = decode(&mut OpusDecoder::new(rate as i32, channels).unwrap(), &bits);
+                            let a = decode(&mut OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::try_from(channels).unwrap()).unwrap(), &bits);
                             let b = decode(&mut LibopusDecoder::new(rate, channels), &bits);
                             assert_eq!(a.pcm.len(), b.pcm.len(), "{name} {channels} ch {rate} Hz: lengths");
                             let differ = a.pcm.iter().zip(&b.pcm).filter(|(x, y)| x != y).count();

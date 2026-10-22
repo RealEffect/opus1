@@ -17,7 +17,7 @@ use ms_support::Bandwidth as TocBandwidth;
 use ms_support::*;
 use multistream_enc_common::*;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bitrate, ErrorKind, ForcedMode};
+use opus1::{Application, Bitrate, ErrorKind, ForcedMode, SampleRate};
 
 /// Whether a stream of the packet is stereo and in Hybrid mode. The final
 /// range of such a packet is not compared: see the note on the fault in
@@ -318,7 +318,7 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
             c.get(sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST)
         );
         assert_eq!(
-            rust.sampling_rate(),
+            rust.sampling_rate().hz() as i32,
             c.get(sys::OPUS_GET_SAMPLE_RATE_REQUEST)
         );
         assert_eq!(rust.lookahead() as i32, c.lookahead());
@@ -357,8 +357,8 @@ fn settings_reach_every_stream_and_the_getters_report_them() {
                 enc.packet_loss_perc(),
                 c.stream_get(s, sys::OPUS_GET_PACKET_LOSS_PERC_REQUEST)
             );
-            assert_eq!(enc.channels(), if s < c.coupled { 2 } else { 1 });
-            assert_eq!(enc.sampling_rate(), 48_000);
+            assert_eq!(enc.channels().count(), if s < c.coupled { 2 } else { 1 });
+            assert_eq!(enc.sampling_rate(), SampleRate::Hz48000);
             // Only the stream of the LFE channel has the LFE flag.
             assert_eq!(
                 enc.lfe(),
@@ -460,8 +460,12 @@ fn surround_constructor_accepts_what_libopus_accepts() {
         for family in [0u8, 1, 2, 3, 4, 254, 255] {
             for channels in (0..=12).chain([16, 18, 25, 27]) {
                 let c = CMsEncoder::surround(fs, channels, family as i32, APP_AUDIO);
-                let rust =
-                    MultistreamEncoder::new_surround(fs, channels, family, Application::Audio);
+                // A rate that is no `SampleRate` cannot reach opus1.
+                let Ok(rate) = SampleRate::try_from(fs) else {
+                    assert!(c.is_err(), "{fs} Hz, {channels} channels, family {family}: libopus accepts it");
+                    continue;
+                };
+                let rust = MultistreamEncoder::new_surround(rate, channels, family, Application::Audio);
                 assert_eq!(
                     rust.is_ok(),
                     c.is_ok(),
@@ -483,7 +487,12 @@ fn surround_constructor_accepts_what_libopus_accepts() {
     // The largest layouts, once.
     for (channels, family) in [(255usize, 255u8), (256, 255), (227, 2), (228, 2)] {
         let c = CMsEncoder::surround(48_000, channels, family as i32, APP_AUDIO);
-        let rust = MultistreamEncoder::new_surround(48_000, channels, family, Application::Audio);
+        let rust = MultistreamEncoder::new_surround(
+            SampleRate::Hz48000,
+            channels,
+            family,
+            Application::Audio,
+        );
         assert_eq!(
             rust.is_ok(),
             c.is_ok(),
@@ -510,8 +519,12 @@ impl Lcg {
 fn generic_constructor_accepts_what_libopus_accepts() {
     let check = |fs: i32, channels: usize, streams: usize, coupled: usize, mapping: &[u8]| {
         let c = CMsEncoder::generic(fs, channels, streams, coupled, mapping, APP_AUDIO);
-        let rust =
-            MultistreamEncoder::new(fs, channels, streams, coupled, mapping, Application::Audio);
+        // A rate that is no `SampleRate` cannot reach opus1.
+        let Ok(rate) = SampleRate::try_from(fs) else {
+            assert!(c.is_err(), "{fs} Hz: libopus accepts it");
+            return false;
+        };
+        let rust = MultistreamEncoder::new(rate, channels, streams, coupled, mapping, Application::Audio);
         assert_eq!(
             rust.is_ok(),
             c.is_ok(),
@@ -539,7 +552,7 @@ fn generic_constructor_accepts_what_libopus_accepts() {
     assert!(check(48_000, 4, 2, 0, &[0, 1, 1, 0])); // two channels for one stream
     assert!(check(8_000, 255, 255, 0, &(0..=254).collect::<Vec<u8>>()));
     // A mapping with fewer entries than channels cannot be given to C.
-    assert!(MultistreamEncoder::new(48_000, 3, 2, 1, &[0, 2], Application::Audio).is_err());
+    assert!(MultistreamEncoder::new(SampleRate::Hz48000, 3, 2, 1, &[0, 2], Application::Audio).is_err());
 
     // Random layouts, valid and invalid.
     let mut rng = Lcg(2024);
@@ -890,7 +903,7 @@ fn surround_mode_sets_the_energy_mask_of_every_stream() {
             enc.encode(frame, frame_size, &mut out).unwrap();
             for s in 0..streams {
                 let stream = enc.stream_encoder(s).unwrap();
-                let values = 21 * stream.channels();
+                let values = 21 * stream.channels().count();
                 match stream.energy_mask() {
                     Some(mask) if surround => {
                         assert_eq!(mask.len(), values, "{}: stream {s}", case.name);

@@ -12,6 +12,7 @@
 
 mod k24_common;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 
 #[test]
 fn frame_after_a_single_loss_is_bit_exact() {
@@ -26,7 +27,11 @@ fn frame_after_a_single_loss_is_bit_exact() {
         for rate in [16000usize, 24000] {
             let frame = rate / 50;
             let mut c_dec = CDec::new(rate, 1);
-            let mut rs_dec = opus1::OpusDecoder::new(rate as i32, 1).unwrap();
+            let mut rs_dec = opus1::OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Mono,
+            )
+            .unwrap();
             let mut buf = vec![0f32; frame];
             for (i, p) in packets.iter().enumerate() {
                 let reference = if lost[i] {

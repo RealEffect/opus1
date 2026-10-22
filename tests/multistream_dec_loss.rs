@@ -27,7 +27,7 @@ mod multistream_dec_common;
 
 use ms_support::*;
 use multistream_dec_common::*;
-use opus1::{OpusDecoder, pcm_soft_clip};
+use opus1::{Channels, OpusDecoder, SampleRate, pcm_soft_clip};
 
 /// Which packets of a stream of `count` packets are lost: every 10th, a
 /// burst of 3 and a burst of 6. Nothing is lost in the last `tail` packets.
@@ -694,7 +694,7 @@ fn multistream_output_is_one_decoder_per_stream() {
             let frame_dec = frame * fs as usize / FS as usize;
             let max_frame = fs as usize / 25 * 3;
             let new_stream_decoders = || -> Vec<OpusDecoder> {
-                (0..e.streams).map(|s| OpusDecoder::new(fs, if s < e.coupled { 2 } else { 1 }).unwrap()).collect()
+                (0..e.streams).map(|s| OpusDecoder::new(SampleRate::try_from(fs).unwrap(), Channels::try_from(if s < e.coupled { 2 } else { 1 }).unwrap()).unwrap()).collect()
             };
             // Float output.
             let (_, mut ms) = e.decoders(fs);

@@ -13,7 +13,7 @@
 use crate::core_common::*;
 use crate::{dnn_plc_common, k24_common};
 use audiopus_sys as sys;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 use std::os::raw::c_int;
 use std::path::Path;
 
@@ -344,7 +344,12 @@ pub fn rs_encode(coding: &Coding, pcm: &[f32]) -> Vec<Vec<u8>> {
         APP_AUDIO => Application::Audio,
         _ => Application::RestrictedLowDelay,
     };
-    let mut enc = OpusEncoder::new(coding.rate as i32, coding.channels, application).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(coding.rate as i32).unwrap(),
+        Channels::try_from(coding.channels).unwrap(),
+        application,
+    )
+    .unwrap();
     enc.set_force_mode(coding.mode.map(|m| match m {
         MODE_SILK => ForcedMode::SilkOnly,
         MODE_HYBRID => ForcedMode::Hybrid,

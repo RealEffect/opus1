@@ -25,6 +25,38 @@ test that compares opus1 with the C library under the same settings.
   `encode` is `BadArg` (libopus `max_data_bytes <= 0`); without the `std`
   feature, more than 32 extensions or more than 1275 bytes of old padding in
   one call are `AllocFail`.
+- Sampling rates and channel counts have their own types at the crate root.
+  `SampleRate` has the values `Hz8000`, `Hz12000`, `Hz16000`, `Hz24000` and
+  `Hz48000` (`#[non_exhaustive]`), `SampleRate::ALL`, `hz()`,
+  `max_frame_size()` (the samples per channel of 120 ms), `TryFrom<u32>`,
+  `TryFrom<i32>` and `From<SampleRate> for u32`. `Channels` has the values
+  `Mono` and `Stereo`, `Channels::ALL`, `count()`, `TryFrom<usize>` and
+  `From<Channels> for usize`. `try_from` refuses other numbers with
+  `BadArg` ("invalid sampling rate", "invalid number of channels"). The
+  calls that change:
+  - `OpusEncoder::new(i32, usize, Application)` -> `new(SampleRate, Channels,
+    Application)`; `OpusDecoder::new(i32, usize)` -> `new(SampleRate,
+    Channels)`; `OpusDecoder::init(slot, i32, usize)` -> `init(slot,
+    SampleRate, Channels)`. They no longer refuse a rate or a channel count.
+  - `sampling_rate() -> i32` -> `sampling_rate() -> SampleRate` on
+    `OpusEncoder`, `OpusDecoder`, `MultistreamEncoder` and
+    `MultistreamDecoder`; `channels() -> usize` -> `channels() -> Channels` on
+    `OpusEncoder` and `OpusDecoder`.
+  - `set_force_channels(Option<usize>) -> Result<(), Error>` ->
+    `set_force_channels(Option<Channels>)` on `OpusEncoder` and
+    `MultistreamEncoder`; `force_channels() -> Option<usize>` ->
+    `force_channels() -> Option<Channels>`. Stereo on a mono encoder, or on
+    the mono streams of a multistream encoder, is kept and has no effect,
+    where libopus refuses it.
+  - The sampling rate of `MultistreamEncoder::new` and `new_surround`, and of
+    `MultistreamDecoder::new` and `with_layout`, is a `SampleRate`. Their
+    channel counts stay `usize` (1 to 255).
+  - `packet::samples_per_frame(toc, i32)`, `packet::nb_samples(data, i32)`,
+    `packet::multistream_validate(data, nb_streams, i32)` and
+    `FrameDuration::samples(self, i32)` take a `SampleRate` instead.
+  - `OpusDredDecoder::parse(dred, data, max_dred_samples, i32, defer)` takes
+    the sampling rate as a `SampleRate`; its `BadArg` for a rate that is not
+    positive is gone.
 - `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
   so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
   call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call

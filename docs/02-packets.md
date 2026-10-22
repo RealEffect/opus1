@@ -43,6 +43,7 @@ Every packet starts with one TOC byte. It has three fields:
 - `c` (bits 1 and 0) is the frame count code, 0 to 3: `toc & 0x03`. It says how the frames are laid out after the TOC byte.
 
 ```rust
+use opus1::SampleRate;
 // Split a TOC byte into its three fields.
 let toc: u8 = 0xFC; // binary 1111 1100
 let config = toc >> 3;
@@ -52,7 +53,7 @@ assert_eq!((config, stereo, code), (31, true, 0));
 
 // Configuration 31 is CELT-only fullband with 20 ms frames:
 // 960 samples per channel at 48 kHz.
-assert_eq!(opus1::packet::samples_per_frame(toc, 48_000), 960);
+assert_eq!(opus1::packet::samples_per_frame(toc, SampleRate::Hz48000), 960);
 ```
 
 ### The 32 configurations
@@ -103,6 +104,7 @@ The table shows these rules:
 The same table as code, checked against the library:
 
 ```rust
+use opus1::SampleRate;
 /// Mode, bandwidth and frame duration in tenths of a millisecond
 /// of a configuration number.
 fn describe(config: u8) -> (&'static str, &'static str, usize) {
@@ -122,7 +124,7 @@ assert_eq!(describe(28), ("CELT-only", "FB", 25));
 for config in 0..32u8 {
     let (_, _, tenths_of_ms) = describe(config);
     let samples_at_48k = tenths_of_ms * 48_000 / 10_000;
-    assert_eq!(opus1::packet::samples_per_frame(config << 3, 48_000), samples_at_48k);
+    assert_eq!(opus1::packet::samples_per_frame(config << 3, SampleRate::Hz48000), samples_at_48k);
 }
 ```
 
@@ -340,9 +342,9 @@ A packet that is only the TOC byte is called a TOC-only packet. Encoders write o
 - A multistream encoder writes a TOC-only stream when the packet leaves that stream only 1 byte (see [Multichannel audio](05-multichannel.md)).
 
 ```rust
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 
-let mut decoder = OpusDecoder::new(48_000, 1).unwrap();
+let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 let mut out = vec![0.0f32; 2 * 960];
 
 // An empty packet: the packet was lost. Conceal 20 ms.
@@ -509,16 +511,16 @@ assert_eq!(data, [0xFB, 0xC2, 0x03, 0x01, 0x09, 0x08, 0x07, 0, 0, 0]);
 These read the duration of a packet from its first two bytes. They do not check the rest of the packet; `parse` does.
 
 ```rust
-use opus1::packet;
+use opus1::{SampleRate, packet};
 
 // Configuration 1: SILK-only narrowband, 20 ms frames. Code 1: two frames.
 let p = [0x08 | 0x01, 0xAA, 0xBB];
 assert_eq!(packet::nb_frames(&p).unwrap(), 2);
-assert_eq!(packet::samples_per_frame(p[0], 16_000), 320);
-assert_eq!(packet::nb_samples(&p, 16_000).unwrap(), 640); // 40 ms at 16 kHz
+assert_eq!(packet::samples_per_frame(p[0], SampleRate::Hz16000), 320);
+assert_eq!(packet::nb_samples(&p, SampleRate::Hz16000).unwrap(), 640); // 40 ms at 16 kHz
 
 // Code 3 reads the count from the second byte: 3 frames of 20 ms.
-assert_eq!(packet::nb_samples(&[0xFB, 0x03], 48_000).unwrap(), 2880);
+assert_eq!(packet::nb_samples(&[0xFB, 0x03], SampleRate::Hz48000).unwrap(), 2880);
 ```
 
 ### `multistream_validate` and `multistream_pad`
@@ -529,21 +531,21 @@ A multistream packet holds one packet per stream. Every stream except the last i
 - `multistream_pad(data, len, new_len, nb_streams)` pads the last stream so that the whole packet has `new_len` bytes.
 
 ```rust
-use opus1::packet;
+use opus1::{SampleRate, packet};
 
 // Stream 0: self-delimited, one frame of 1 byte. Stream 1: one frame of
 // 2 bytes. Both are 20 ms long.
 let mut data = [0xF8, 0x01, 0x07, 0xF8, 0x08, 0x09, 0, 0, 0];
-assert_eq!(packet::multistream_validate(&data[..6], 2, 48_000).unwrap(), 960);
+assert_eq!(packet::multistream_validate(&data[..6], 2, SampleRate::Hz48000).unwrap(), 960);
 
 // Pad the 6-byte packet to 9 bytes. Only the last stream changes.
 packet::multistream_pad(&mut data, 6, 9, 2).unwrap();
 assert_eq!(data, [0xF8, 0x01, 0x07, 0xFB, 0x41, 0x01, 0x08, 0x09, 0x00]);
-assert_eq!(packet::multistream_validate(&data, 2, 48_000).unwrap(), 960);
+assert_eq!(packet::multistream_validate(&data, 2, SampleRate::Hz48000).unwrap(), 960);
 
 // Stream 1 lasts 2.5 ms (configuration 28): the durations differ.
 let bad = [0xF8, 0x01, 0x07, 0xE0, 0x08, 0x09];
-assert!(packet::multistream_validate(&bad, 2, 48_000).is_err());
+assert!(packet::multistream_validate(&bad, 2, SampleRate::Hz48000).is_err());
 ```
 
 `opus1::multistream::split_self_delimited` (in the `std` build) cuts the first stream out of a multistream packet. It returns that stream as an ordinary packet, which any decoder accepts, and the offset of the next stream.

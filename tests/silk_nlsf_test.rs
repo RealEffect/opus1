@@ -6,7 +6,7 @@ use opus1::internals::silk::define::*;
 use opus1::internals::silk::nlsf_decode::silk_nlsf_decode;
 use opus1::internals::silk::nlsf_encode::silk_nlsf_encode;
 use opus1::internals::silk::tables_nlsf::{SILK_NLSF_CB_NB_MB, SILK_NLSF_CB_WB};
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 #[test]
@@ -229,13 +229,13 @@ fn test_nlsf_interpolation_activated_at_complexity5() {
     let frame_size = 160;
 
     let mut encoder_interp =
-        OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
+        OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).expect("Failed to create encoder");
     encoder_interp.set_complexity(5).unwrap(); // NLSF interpolation activates at complexity >= 5
     encoder_interp.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
     encoder_interp.set_vbr(true);
 
     let mut encoder_no_interp =
-        OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
+        OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).expect("Failed to create encoder");
     encoder_no_interp.set_complexity(0).unwrap(); // No interpolation
     encoder_no_interp.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
     encoder_no_interp.set_vbr(true);
@@ -301,7 +301,7 @@ fn test_nlsf_interpolation_40ms_frames() {
     let frame_size = 320; // 40ms at 8kHz = 320 samples
 
     let mut encoder =
-        OpusEncoder::new(sample_rate, 1, Application::Voip).expect("Failed to create encoder");
+        OpusEncoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip).expect("Failed to create encoder");
     encoder.set_complexity(5).unwrap();
     encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
     encoder.set_vbr(true);

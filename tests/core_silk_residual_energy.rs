@@ -26,7 +26,7 @@ mod k24_common;
 
 use k24_common::*;
 use opus1::internals::silk_input::set_fixed_point_res_nrg;
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 /// A 2.5 s excerpt of the TSP speech database at 48 kHz (`fixtures/tsp/`).
 fn tsp_excerpt(name: &str) -> Vec<i16> {
@@ -99,7 +99,8 @@ fn decoded(packets: &[Vec<u8>], len: usize) -> Vec<f32> {
 /// Stereo `Voip` at 48 kHz with the bitrates of [`bitrate`]: opus1's
 /// packets, with SILK's gains from libopus's energies when `fixed_point`.
 fn opus1_packets(pcm: &[i16], complexity: i32, fixed_point: bool) -> Vec<Vec<u8>> {
-    let mut enc = OpusEncoder::new(48000, 2, Application::Voip).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Voip).unwrap();
     enc.set_complexity(complexity).unwrap();
     set_fixed_point_res_nrg(&mut enc, fixed_point);
     let mut buf = vec![0u8; 4000];
@@ -192,7 +193,12 @@ fn speech_at_a_constant_bitrate_codes_the_packets_of_the_fixed_point_energies() 
                 .collect();
             let frame = rate as usize / 50;
             let code = |fixed_point: bool| -> Vec<Vec<u8>> {
-                let mut enc = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
+                let mut enc = OpusEncoder::new(
+                    SampleRate::try_from(rate).unwrap(),
+                    Channels::Mono,
+                    Application::Voip,
+                )
+                .unwrap();
                 enc.set_complexity(9).unwrap();
                 enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                 set_fixed_point_res_nrg(&mut enc, fixed_point);

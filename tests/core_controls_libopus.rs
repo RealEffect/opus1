@@ -16,7 +16,9 @@ mod k24_common;
 use audiopus_sys as sys;
 use core_common::*;
 use k24_common::{multitone, speech};
-use opus1::{Application, Bitrate, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bitrate, Channels, ErrorKind, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+};
 
 /// Stereo music whose right channel is mostly the inverted left channel.
 /// CELT codes such bands as intensity stereo with phase inversion, so
@@ -147,7 +149,12 @@ fn phase_inversion_disabled_encodes_as_libopus() {
                     let mut c = CEncoder::new(rate, 2, APP_AUDIO);
                     c.bitrate(bitrate).force_mode(mode).vbr(vbr);
                     c.set(sys::OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST, disabled as i32);
-                    let mut rust = OpusEncoder::new(rate as i32, 2, Application::Audio).unwrap();
+                    let mut rust = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::Stereo,
+                        Application::Audio,
+                    )
+                    .unwrap();
                     rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                     rust.set_vbr(vbr);
                     rust.set_force_mode(Some(rust_mode(mode)));
@@ -206,7 +213,11 @@ fn phase_inversion_disabled_decodes_as_libopus() {
         let mut outputs = Vec::new();
         for setting in [None, Some(false), Some(true)] {
             let label = format!("{channels} channels, setting {setting:?}");
-            let mut rust = OpusDecoder::new(rate as i32, channels).unwrap();
+            let mut rust = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let mut c = CDecoder::new(rate, channels);
             let get = sys::OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST;
             assert_eq!(rust.phase_inversion_disabled() as i32, c.get(get), "{label}: default");
@@ -265,7 +276,11 @@ fn gain_matches_libopus() {
         let steps = steps(&packets);
         for gain in GAINS {
             let label = format!("{rate} Hz, {channels} ch, gain {gain}");
-            let mut rust = OpusDecoder::new(rate as i32, channels).unwrap();
+            let mut rust = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let mut c = CDecoder::new(rate, channels);
             rust.set_gain(gain).unwrap();
             assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, gain), 0);
@@ -280,7 +295,11 @@ fn gain_matches_libopus() {
             let mut out24 = vec![0i32; 5760 * channels];
             let mut c24 = CDecoder::new(rate, channels);
             assert_eq!(c24.try_set(sys::OPUS_SET_GAIN_REQUEST, gain), 0);
-            let mut rust24 = OpusDecoder::new(rate as i32, channels).unwrap();
+            let mut rust24 = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             rust24.set_gain(gain).unwrap();
             for (i, step) in steps.iter().enumerate() {
                 let label = format!("{label}, call {i}");
@@ -311,7 +330,7 @@ fn gain_matches_libopus() {
             }
         }
     }
-    let mut rust = OpusDecoder::new(48_000, 2).unwrap();
+    let mut rust = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut c = CDecoder::new(48_000, 2);
     rust.set_gain(1000).unwrap();
     assert_eq!(c.try_set(sys::OPUS_SET_GAIN_REQUEST, 1000), 0);
@@ -341,7 +360,11 @@ fn pitch_matches_libopus() {
         let packets = mixed_stream(rate, channels, &pcm);
         let steps = steps(&packets);
         let label = format!("{rate} Hz, {channels} ch");
-        let mut rust = OpusDecoder::new(rate as i32, channels).unwrap();
+        let mut rust = OpusDecoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let mut c = CDecoder::new(rate, channels);
         assert_eq!(rust.pitch(), c.get(sys::OPUS_GET_PITCH_REQUEST), "{label}: new");
         let mut seen = Vec::new();
@@ -366,7 +389,8 @@ fn pitch_matches_libopus() {
     let mut c_enc = CEncoder::new(rate, 1, APP_AUDIO);
     c_enc.bitrate(32_000).force_mode(MODE_CELT);
     let packets = c_enc.encode_all(&pcm, frame);
-    let mut rust = OpusDecoder::new(rate as i32, 1).unwrap();
+    let mut rust =
+        OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::Mono).unwrap();
     let mut c = CDecoder::new(rate, 1);
     let mut celt_seen = Vec::new();
     decode_both(&mut rust, &mut c, &steps(&packets), frame, "CELT", |r, c, label| {
@@ -424,7 +448,12 @@ fn encode24_and_decode24_match_libopus() {
             let label = format!("{rate} Hz, {channels} ch, app {app}, {frame} samples");
             let mut c = CEncoder::new(rate, channels, app);
             c.force_mode(MODE_CELT).vbr(vbr);
-            let mut rust = OpusEncoder::new(rate as i32, channels, application).unwrap();
+            let mut rust = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                application,
+            )
+            .unwrap();
             rust.set_force_mode(Some(ForcedMode::CeltOnly));
             rust.set_vbr(vbr);
             let mut out = vec![0u8; 1500];
@@ -435,7 +464,11 @@ fn encode24_and_decode24_match_libopus() {
                 same_bytes(&out[..n], &expected, &format!("{label}: packet {i}"));
                 packets.push(expected);
             }
-            let mut rust_dec = OpusDecoder::new(rate as i32, channels).unwrap();
+            let mut rust_dec = OpusDecoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+            )
+            .unwrap();
             let mut c_dec = CDecoder::new(rate, channels);
             let mut out24 = vec![0i32; 5760 * channels];
             let mut beyond = false;
@@ -471,8 +504,18 @@ fn encode24_codes_as_encode_of_the_scaled_samples() {
         for frame_ms10 in [100usize, 200, 400, 600] {
             let frame = rate * frame_ms10 / 10_000;
             let label = format!("{rate} Hz, {channels} ch, {application:?}, {frame} samples");
-            let mut a = OpusEncoder::new(rate as i32, channels, application).unwrap();
-            let mut b = OpusEncoder::new(rate as i32, channels, application).unwrap();
+            let mut a = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                application,
+            )
+            .unwrap();
+            let mut b = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::try_from(channels).unwrap(),
+                application,
+            )
+            .unwrap();
             let (mut out_a, mut out_b) = (vec![0u8; 1500], vec![0u8; 1500]);
             let chunks = pcm.chunks_exact(frame * channels).zip(scaled.chunks_exact(frame * channels));
             for (i, (p24, pf)) in chunks.enumerate() {
@@ -490,14 +533,15 @@ fn encode24_codes_as_encode_of_the_scaled_samples() {
 fn errors_of_the_24_bit_calls_follow_libopus() {
     let pcm = vec![1000i32; 2 * 5760];
     let mut c = CEncoder::new(48_000, 2, APP_AUDIO);
-    let mut rust = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+    let mut rust =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     let mut out = vec![0u8; 1500];
     for frame in [0usize, 1, 119, 121, 480, 959, 2880, 5760] {
         let c_ok = c.try_encode24(&pcm, frame, 1500).is_ok();
         assert_eq!(rust.encode24(&pcm, frame, &mut out).is_ok(), c_ok, "frame {frame}");
     }
     let mut c = CDecoder::new(48_000, 2);
-    let mut rust = OpusDecoder::new(48_000, 2).unwrap();
+    let mut rust = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut out24 = vec![0i32; 2 * 5760];
     assert!(c.decode24(None, 0, false).is_err());
     assert!(rust.decode24(&[], 0, &mut out24).is_err());
@@ -526,7 +570,12 @@ fn set_application_follows_libopus() {
         for (c_to, to) in apps {
             let label = format!("{from:?} to {to:?}");
             let mut c = CEncoder::new(rate, 2, c_from);
-            let mut rust = OpusEncoder::new(rate as i32, 2, from).unwrap();
+            let mut rust = OpusEncoder::new(
+                SampleRate::try_from(rate as i32).unwrap(),
+                Channels::Stereo,
+                from,
+            )
+            .unwrap();
             c.set(sys::OPUS_SET_APPLICATION_REQUEST, c_to);
             rust.set_application(to).unwrap();
             assert_eq!(rust.application() as i32, c.get(sys::OPUS_GET_APPLICATION_REQUEST), "{label}");
@@ -559,7 +608,12 @@ fn voice_ratio_follows_libopus() {
     let rate = 48_000;
     let frame = rate / 50;
     let mut c = CEncoder::new(rate, 1, APP_AUDIO);
-    let mut rust = OpusEncoder::new(rate as i32, 1, Application::Audio).unwrap();
+    let mut rust = OpusEncoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::Mono,
+        Application::Audio,
+    )
+    .unwrap();
     let get = OPUS_GET_VOICE_RATIO_REQUEST;
     assert_eq!(rust.voice_ratio(), c.get(get));
     for v in [i32::MIN, -2, -1, 0, 1, 50, 99, 100, 101, i32::MAX] {

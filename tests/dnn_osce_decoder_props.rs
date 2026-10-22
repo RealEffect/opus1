@@ -21,7 +21,9 @@
 mod dnn_plc_common;
 
 use opus1::multistream::MultistreamDecoder;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusEncoder};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
+};
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
 use std::cell::Cell;
 
@@ -107,7 +109,12 @@ enum Kind {
 /// The packets of a stream of `kind`.
 fn packets(kind: Kind, channels: usize) -> Vec<Vec<u8>> {
     let pcm = speech48(channels);
-    let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::Hz48000,
+        Channels::try_from(channels).unwrap(),
+        Application::Audio,
+    )
+    .unwrap();
     let ch = channels as i32;
     let (mode, bandwidth, bitrate, frame) = match kind {
         Kind::SilkWb | Kind::SilkCelt => (ForcedMode::SilkOnly, Bandwidth::Wideband, 16000 * ch, 960),
@@ -138,7 +145,11 @@ fn is_celt(packet: &[u8]) -> bool {
 
 /// A decoder at `rate` with `complexity` and the BWE switch.
 fn decoder(rate: i32, channels: usize, complexity: i32, bwe: bool) -> OpusDecoder {
-    let mut d = OpusDecoder::new(rate, channels).unwrap();
+    let mut d = OpusDecoder::new(
+        SampleRate::try_from(rate).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     d.set_complexity(complexity).unwrap();
     d.set_osce_bwe(bwe).unwrap();
     d
@@ -147,7 +158,7 @@ fn decoder(rate: i32, channels: usize, complexity: i32, bwe: bool) -> OpusDecode
 /// Decodes every packet, `lost(k)` packets concealed. Returns the output
 /// of each call and the final range after it.
 fn decode(d: &mut OpusDecoder, packets: &[Vec<u8>], lost: impl Fn(usize) -> bool) -> Vec<(Vec<f32>, u32)> {
-    let channels = d.channels();
+    let channels = d.channels().count();
     let rate = d.sampling_rate();
     let mut buf = vec![0f32; 960 * channels];
     packets
@@ -186,7 +197,7 @@ fn decoding_with_osce_allocates_nothing() {
             let mut buf16 = vec![0i16; 960 * channels];
             let n = allocations_of(|| {
                 for (k, p) in packets.iter().enumerate() {
-                    let n = opus1::packet::nb_samples(p, 48000).unwrap();
+                    let n = opus1::packet::nb_samples(p, SampleRate::Hz48000).unwrap();
                     match k % 11 {
                         3..=5 => d.decode(&[], n, &mut buf).map(|_| ()).unwrap(),
                         7 => d.decode_fec(p, n, &mut buf).map(|_| ()).unwrap(),
@@ -207,7 +218,7 @@ fn decoding_with_osce_allocates_nothing() {
     }
     // Two mono streams that carry the same packets.
     let ms_packets: Vec<Vec<u8>> = packets(Kind::SilkWb, 1).iter().map(|p| ms_packet(p)).collect();
-    let mut ms = MultistreamDecoder::with_layout(48000, 2, 2, 0, &[0, 1]).unwrap();
+    let mut ms = MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
     ms.set_complexity(7).unwrap();
     ms.set_osce_bwe(true).unwrap();
     let mut buf = vec![0f32; 960 * 2];
@@ -253,7 +264,7 @@ fn decoding_with_osce_fits_a_small_stack() {
             for ((channels, packets), d) in cases.iter().zip(&mut decoders) {
                 let mut buf = vec![0f32; 960 * channels];
                 for (k, p) in packets.iter().enumerate().take(50) {
-                    let n = opus1::packet::nb_samples(p, 48000).unwrap();
+                    let n = opus1::packet::nb_samples(p, SampleRate::Hz48000).unwrap();
                     let packet: &[u8] = if k % 20 >= 17 { &[] } else { p };
                     d.decode(packet, n, &mut buf).unwrap();
                 }
@@ -368,7 +379,8 @@ fn the_multistream_decoder_forwards_bwe_to_every_stream() {
     let packets = packets(Kind::SilkWb, 1);
     for (complexity, bwe) in [(7, true), (4, true), (6, false)] {
         let want = signal(&decode(&mut decoder(48000, 1, complexity, bwe), &packets, |k| k % 9 == 4));
-        let mut ms = MultistreamDecoder::with_layout(48000, 2, 2, 0, &[0, 1]).unwrap();
+        let mut ms =
+            MultistreamDecoder::with_layout(SampleRate::Hz48000, 2, 2, 0, &[0, 1]).unwrap();
         ms.set_complexity(complexity).unwrap();
         ms.set_osce_bwe(bwe).unwrap();
         let mut buf = vec![0f32; 960 * 2];

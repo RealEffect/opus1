@@ -27,13 +27,14 @@
 
 mod k24_common;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 
 /// Decode `packets` with packet `lost` missing, with both decoders. Returns
 /// the first packet whose output differs from libopus and the SNR of that
 /// packet against libopus, or `None` if every sample is equal.
 fn first_difference(packets: &[Vec<u8>], lost: usize, frame: usize) -> Option<(usize, f64)> {
     let mut c_dec = CDec::new(24000, 1);
-    let mut rs_dec = opus1::OpusDecoder::new(24000, 1).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(SampleRate::Hz24000, Channels::Mono).unwrap();
     let mut buf = vec![0f32; frame];
     for (i, p) in packets.iter().enumerate() {
         let reference = if i == lost {

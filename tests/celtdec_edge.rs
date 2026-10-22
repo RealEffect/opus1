@@ -18,6 +18,7 @@ mod celtdec_common;
 mod k24_common;
 use celtdec_common::*;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 use opus1::internals::celt::{CeltDecoder, PcmLayout};
 use opus1::internals::modes::default_mode;
 use opus1::internals::range_coder::RangeCoder;
@@ -68,7 +69,7 @@ impl Pair {
     fn new(rate: usize, channels: usize) -> Self {
         Self {
             c: CDecoder::new(rate, channels),
-            rs: opus1::OpusDecoder::new(rate as i32, channels).unwrap(),
+            rs: opus1::OpusDecoder::new(SampleRate::try_from(rate as i32).unwrap(), Channels::try_from(channels).unwrap()).unwrap(),
             channels,
             buf: vec![0.0; 5760 * channels],
         }

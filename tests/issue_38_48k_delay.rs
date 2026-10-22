@@ -43,7 +43,7 @@ use opus::{
     Application as CApp, Bitrate as CBitrate, Channels as CCh, Decoder as CDec, Encoder as CEnc,
 };
 use opus1::internals::range_coder::RangeCoder;
-use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 const SR: usize = 48000;
 const FRAME: usize = 960;
@@ -64,7 +64,8 @@ fn chirp(sr: usize, seconds: usize) -> Vec<f32> {
 /// `Audio` is forced to CELT-only, the encoder the Audio tests look at.
 fn encode_chirp(app: Application, bitrate: i32) -> (Vec<f32>, Vec<Vec<u8>>) {
     let input = chirp(SR, 13);
-    let mut enc = OpusEncoder::new(SR as i32, 1, app).unwrap();
+    let mut enc =
+        OpusEncoder::new(SampleRate::try_from(SR as i32).unwrap(), Channels::Mono, app).unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     if app == Application::Audio {
         enc.set_force_mode(Some(ForcedMode::CeltOnly));

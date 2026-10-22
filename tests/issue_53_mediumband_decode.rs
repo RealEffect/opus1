@@ -16,7 +16,7 @@ use opus::{
     Encoder as CEnc, Signal as CSignal,
 };
 use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 /// Largest Opus frame per channel: 120 ms at 48 kHz.
@@ -94,7 +94,12 @@ fn libopus_packets(ch: usize, ms: usize) -> Vec<Vec<u8>> {
 fn opus1_packets(ch: usize) -> Vec<Vec<u8>> {
     let frame = MB_RATE / 50;
     let input = voiced(MB_RATE, ch, MB_RATE);
-    let mut enc = OpusEncoder::new(MB_RATE as i32, ch, Application::Voip).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(MB_RATE as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+        Application::Voip,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
     let mut pkt = vec![0u8; 1500];
     input
@@ -112,7 +117,11 @@ fn opus1_packets(ch: usize) -> Vec<Vec<u8>> {
 /// and channels, after skipping the first packet (`ms` long) as warm-up.
 fn worst_window_snr(packets: &[Vec<u8>], ch: usize, ms: usize, api_rate: usize) -> f64 {
     let mut c_dec = CDec::new(api_rate as u32, c_channels(ch)).unwrap();
-    let mut rs_dec = OpusDecoder::new(api_rate as i32, ch).unwrap();
+    let mut rs_dec = OpusDecoder::new(
+        SampleRate::try_from(api_rate as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
     let (mut c_pcm, mut rs_pcm) = (Vec::new(), Vec::new());
     let mut c_buf = vec![0f32; MAX_FRAME * ch];
     let mut rs_buf = vec![0f32; MAX_FRAME * ch];

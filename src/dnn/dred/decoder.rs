@@ -15,7 +15,7 @@
 //! its float and 24-bit variants), which queues the features for deep PLC
 //! and conceals the lost audio with them.
 
-use crate::Error;
+use crate::{Error, SampleRate};
 use super::coding::compute_quantizer;
 use super::rdovae_dec;
 use super::{DRED_EXPERIMENTAL_BYTES, DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID, DRED_NUM_REDUNDANCY_FRAMES};
@@ -182,26 +182,22 @@ impl OpusDredDecoder {
     /// zeros and leaves `dred` unusable for decoding. Errors:
     /// [`Unimplemented`](crate::ErrorKind::Unimplemented) without a loaded
     /// model; [`InvalidPacket`](crate::ErrorKind::InvalidPacket) when the
-    /// packet or its extensions are malformed;
-    /// [`BadArg`](crate::ErrorKind::BadArg) when `sampling_rate` is not
-    /// positive (libopus divides by it). Every call with a loaded model first
-    /// marks `dred` as not parsed, as libopus does, so after an error it cannot
-    /// be decoded.
+    /// packet or its extensions are malformed. Every call with a loaded model
+    /// first marks `dred` as not parsed, as libopus does, so after an error it
+    /// cannot be decoded.
     pub fn parse(
         &self,
         dred: &mut OpusDred,
         data: &[u8],
         max_dred_samples: i32,
-        sampling_rate: i32,
+        sampling_rate: SampleRate,
         defer_processing: bool,
     ) -> Result<DredParse, Error> {
         if !self.is_loaded() {
             return Err(Error::UNIMPLEMENTED);
         }
         dred.process_stage = -1;
-        if sampling_rate <= 0 {
-            return Err(Error::BAD_ARG);
-        }
+        let sampling_rate = sampling_rate.hz() as i32;
         let Some((payload, dred_frame_offset)) = find_payload(data)? else {
             return Ok(DredParse::default());
         };
@@ -272,7 +268,7 @@ impl Default for OpusDredDecoder {
 /// 2.5 ms. The first DRED extension with the right header wins.
 fn find_payload(data: &[u8]) -> Result<Option<(&[u8], i32)>, Error> {
     let parsed = packet::parse(data, false)?;
-    let frame_size = packet::samples_per_frame(data[0], 48000);
+    let frame_size = packet::samples_per_frame(data[0], SampleRate::Hz48000);
     let mut iter = ExtensionIterator::new(parsed.padding(data), parsed.count);
     while let Some(ext) = iter.find(DRED_EXTENSION_ID)? {
         // DRED position in the packet, in units of 2.5 ms like the offset

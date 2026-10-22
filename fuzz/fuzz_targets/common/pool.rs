@@ -9,7 +9,7 @@
 
 use opus1::extensions::ExtensionIterator;
 use opus1::packet;
-use opus1::{Application, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 use std::sync::OnceLock;
 
 /// The extension ID of DRED data.
@@ -80,7 +80,12 @@ fn make() -> Pool {
     ];
     let mut packets = Vec::new();
     for (k, s) in settings.iter().enumerate() {
-        let mut enc = OpusEncoder::new(s.fs, s.channels, s.app).expect("encoder");
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(s.fs).unwrap(),
+            Channels::try_from(s.channels).unwrap(),
+            s.app,
+        )
+        .expect("encoder");
         enc.set_bitrate(Bitrate::BitsPerSecond(s.bitrate)).unwrap();
         enc.set_inband_fec(true);
         enc.set_packet_loss_perc(20).unwrap();

@@ -29,7 +29,7 @@ mod multistream_enc_common;
 
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::Application;
+use opus1::{Application, Channels};
 
 /// Bitrates of the matrix in bits per second per input channel. The lowest
 /// brings SILK and narrow bandwidths into play, the highest is CELT fullband.
@@ -87,7 +87,7 @@ fn run_case(
     if force_stereo {
         // OPUS_SET_FORCE_CHANNELS(2) on every coupled stream encoder.
         for s in 0..enc.layout().coupled_streams() {
-            enc.stream_encoder_mut(s).unwrap().set_force_channels(Some(2)).unwrap();
+            enc.stream_encoder_mut(s).unwrap().set_force_channels(Some(Channels::Stereo));
         }
     }
     let mut dec = c_decoder(&enc);

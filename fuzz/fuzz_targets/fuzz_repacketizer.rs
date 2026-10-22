@@ -31,6 +31,7 @@ use audiopus_sys as sys;
 use common::*;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use opus1::SampleRate;
 use opus1::extensions::{self, Extension};
 use opus1::packet::{self, Repacketizer};
 use std::os::raw::c_int;
@@ -80,7 +81,7 @@ fn arbitrary_packet(u: &mut Unstructured, toc: u8, pool: &[u8]) -> Result<Vec<u8
         let n = u.int_in_range(0..=300usize)?.min(u.len());
         return Ok(u.bytes(n)?.to_vec());
     }
-    let max = 48 / (packet::samples_per_frame(toc, 48000) / 120);
+    let max = 48 / (packet::samples_per_frame(toc, SampleRate::Hz48000) / 120);
     let count = if u.ratio(1, 8)? { u.int_in_range(1..=max)? } else { u.int_in_range(1..=max.min(4))? };
     let mut frames = Vec::with_capacity(count);
     for _ in 0..count {

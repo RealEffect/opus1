@@ -11,7 +11,7 @@
 //! taken from the placeholder TOC (or from `frame_size` for an empty packet).
 //! These tests pin that behaviour down, plus a randomized no-panic sweep.
 
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use proptest::prelude::*;
 use std::f32::consts::PI;
 
@@ -53,7 +53,12 @@ fn encode_stream(
     n_packets: usize,
 ) -> Vec<Vec<u8>> {
     let frame = rate as usize / 50;
-    let mut enc = OpusEncoder::new(rate, channels, app).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(rate).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        app,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     enc.set_vbr(false);
     (0..n_packets)
@@ -125,7 +130,7 @@ fn reporter_config_runs_of_losses_never_panic() {
     let frame = 320;
     for app in [Application::Voip, Application::Audio] {
         let packets = encode_stream(rate, 1, app, 24000, 120);
-        let mut dec = OpusDecoder::new(rate, 1).unwrap();
+        let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
         let mut pcm = vec![0.0f32; frame];
         let mut rng = Rng(0x15_15_15);
         let mut i = 0;
@@ -162,7 +167,11 @@ fn loss_patterns_across_matrix_never_panic() {
         let frame = rate as usize / 50;
         let packets = encode_stream(rate, channels, app, bitrate, 60);
         let label = format!("{rate} Hz {channels}ch {app:?} {bitrate} bps");
-        let mut dec = OpusDecoder::new(rate, channels).unwrap();
+        let mut dec = OpusDecoder::new(
+            SampleRate::try_from(rate).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let mut pcm = vec![0.0f32; frame * channels];
         let mut rng = Rng(rate as u64 * 31 + channels as u64 * 7 + bitrate as u64);
         for (i, pkt) in packets.iter().enumerate() {
@@ -214,7 +223,11 @@ fn decode_with_losses(
     marker: Option<u8>,
 ) -> Vec<f32> {
     let frame = rate as usize / 50;
-    let mut dec = OpusDecoder::new(rate, channels).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(rate).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let mut out = Vec::new();
     let mut pcm = vec![0.0f32; frame * channels];
     for (i, pkt) in packets.iter().enumerate() {
@@ -293,7 +306,8 @@ fn silk_concealment_extrapolates_the_signal() {
     for (rate, app) in [(16000, Application::Voip), (48000, Application::Voip)] {
         let frame = rate as usize / 50;
         let packets = encode_stream(rate, 1, app, 24000, 12);
-        let mut dec = OpusDecoder::new(rate, 1).unwrap();
+        let mut dec =
+            OpusDecoder::new(SampleRate::try_from(rate).unwrap(), Channels::Mono).unwrap();
         let mut pcm = vec![0.0f32; frame];
         for p in &packets {
             dec.decode(p, frame, &mut pcm).unwrap();
@@ -312,7 +326,7 @@ fn silk_concealment_extrapolates_the_signal() {
 #[test]
 fn stereo_decoder_accepts_mono_loss_marker() {
     let packets = encode_stream(48000, 2, Application::Audio, 64000, 3);
-    let mut dec = OpusDecoder::new(48000, 2).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; 960 * 2];
     dec.decode(&packets[0], 960, &mut pcm).unwrap();
     let n = dec
@@ -325,7 +339,7 @@ fn stereo_decoder_accepts_mono_loss_marker() {
 /// Losses before the first packet produce silence of the right length.
 #[test]
 fn loss_before_first_packet_is_silence() {
-    let mut dec = OpusDecoder::new(16000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz16000, Channels::Mono).unwrap();
     let mut pcm = vec![1.0f32; 320];
     assert_eq!(dec.decode(&[0], 320, &mut pcm), Ok(160));
     assert!(pcm[..160].iter().all(|&v| v == 0.0));
@@ -340,7 +354,7 @@ fn loss_before_first_packet_is_silence() {
 fn empty_packet_conceals_frame_size() {
     for app in [Application::Voip, Application::Audio] {
         let packets = encode_stream(48000, 1, app, 32000, 4);
-        let mut dec = OpusDecoder::new(48000, 1).unwrap();
+        let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
         let mut pcm = vec![0.0f32; 2880];
         dec.decode(&packets[0], 960, &mut pcm).unwrap();
         for fs in [120, 240, 480, 960, 1920, 2880] {
@@ -358,7 +372,7 @@ fn empty_packet_conceals_frame_size() {
 /// an output buffer that is too small, is an error rather than a panic.
 #[test]
 fn empty_packet_invalid_sizes_are_errors() {
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 960];
     assert!(dec.decode(&[], 0, &mut pcm).is_err());
     assert!(dec.decode(&[], 100, &mut pcm).is_err());
@@ -368,7 +382,7 @@ fn empty_packet_invalid_sizes_are_errors() {
 /// A 1-byte code-3 packet has no frame-count byte: invalid, as in libopus.
 #[test]
 fn one_byte_code3_is_invalid() {
-    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut dec = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut pcm = vec![0.0f32; 960];
     assert!(dec.decode(&[0x03], 960, &mut pcm).is_err());
 }
@@ -407,7 +421,11 @@ proptest! {
         let (rate, channels, app, bitrate) = matrix()[cfg];
         let frame = rate as usize / 50;
         let packets = encode_stream(rate, channels, app, bitrate, 40);
-        let mut dec = OpusDecoder::new(rate, channels).unwrap();
+        let mut dec = OpusDecoder::new(
+            SampleRate::try_from(rate).unwrap(),
+            Channels::try_from(channels).unwrap(),
+        )
+        .unwrap();
         let max = rate as usize * 120 / 1000;
         let mut pcm = vec![0.0f32; max * channels];
         for ev in &events {

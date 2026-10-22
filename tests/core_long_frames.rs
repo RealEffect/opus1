@@ -36,7 +36,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 
 const LONG_MS: [usize; 3] = [80, 100, 120];
 /// The durations of the parts: libopus codes no frame longer than 60 ms.
@@ -115,7 +115,12 @@ impl Setting {
     fn encoders(&self) -> (OpusEncoder, CEncoder) {
         let loss = if self.fec { 10 } else { 0 };
         let (vbr, constrained) = (self.rc != Rc::Cbr, self.rc == Rc::Cvbr);
-        let mut rs = OpusEncoder::new(self.fs as i32, self.channels, self.app.rs).unwrap();
+        let mut rs = OpusEncoder::new(
+            SampleRate::try_from(self.fs as i32).unwrap(),
+            Channels::try_from(self.channels).unwrap(),
+            self.app.rs,
+        )
+        .unwrap();
         rs.set_bitrate(Bitrate::BitsPerSecond(self.bitrate)).unwrap();
         rs.set_vbr(vbr);
         rs.set_vbr_constraint(constrained);
@@ -465,7 +470,12 @@ fn celt_only_cbr_packets_are_libopus_byte_for_byte() {
 /// range is libopus's. Returns the number of packets.
 fn check_celt_cbr_bytes(fs: usize, channels: usize, bitrate: i32, out_len: usize, ms: usize, input: &[f32]) -> usize {
     let frame = fs * ms / 1000;
-    let mut rs = OpusEncoder::new(fs as i32, channels, Application::RestrictedLowDelay).unwrap();
+    let mut rs = OpusEncoder::new(
+        SampleRate::try_from(fs as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+        Application::RestrictedLowDelay,
+    )
+    .unwrap();
     rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
     rs.set_vbr(false);
     rs.set_complexity(5).unwrap();
@@ -542,7 +552,12 @@ fn celt_only_cbr_with_settings_changed_between_packets_is_libopus() {
             let music = k24_common::multitone(fs, total + fs / 5);
             let music = if channels == 2 { to_stereo(&music, fs) } else { music };
             for input in [signal(fs, channels, seconds + 0.2), music] {
-                let mut rs = OpusEncoder::new(fs as i32, channels, Application::RestrictedLowDelay).unwrap();
+                let mut rs = OpusEncoder::new(
+                    SampleRate::try_from(fs as i32).unwrap(),
+                    Channels::try_from(channels).unwrap(),
+                    Application::RestrictedLowDelay,
+                )
+                .unwrap();
                 let mut c = CEncoder::new(fs, channels, APP_LOWDELAY);
                 rs.set_vbr(false);
                 rs.set_complexity(5).unwrap();
@@ -611,7 +626,12 @@ fn packets_without_audio_and_buffer_errors_are_libopus() {
                     for out_len in [1, 2, 3, 5, 9, 30] {
                         for vbr in [true, false] {
                             for bitrate in [500, 2000, 64_000] {
-                                let mut rs = OpusEncoder::new(fs as i32, channels, app.rs).unwrap();
+                                let mut rs = OpusEncoder::new(
+                                    SampleRate::try_from(fs as i32).unwrap(),
+                                    Channels::try_from(channels).unwrap(),
+                                    app.rs,
+                                )
+                                .unwrap();
                                 rs.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
                                 rs.set_vbr(vbr);
                                 let mut c = CEncoder::new(fs, channels, app.c);
@@ -647,7 +667,12 @@ fn maximum_bitrate_with_cbr_fills_the_buffer_as_libopus_does() {
                 for out_len in [200, 1000, 3000, 9000] {
                     let frame = fs * ms / 1000;
                     let pcm = &signal(fs, 1, 0.2)[..frame];
-                    let mut rs = OpusEncoder::new(fs as i32, 1, app.rs).unwrap();
+                    let mut rs = OpusEncoder::new(
+                        SampleRate::try_from(fs as i32).unwrap(),
+                        Channels::Mono,
+                        app.rs,
+                    )
+                    .unwrap();
                     rs.set_bitrate(Bitrate::Max).unwrap();
                     rs.set_vbr(false);
                     let mut c = CEncoder::new(fs, 1, app.c);
@@ -703,7 +728,12 @@ fn silence_flag_of_stereo_input_coded_as_mono_is_libopus() {
     for ms in [10, 20, 80, 100, 120] {
         for out_len in [10, 25, 50, 100] {
             let frame = fs * ms / 1000;
-            let mut rs = OpusEncoder::new(fs as i32, 2, Application::RestrictedLowDelay).unwrap();
+            let mut rs = OpusEncoder::new(
+                SampleRate::try_from(fs as i32).unwrap(),
+                Channels::Stereo,
+                Application::RestrictedLowDelay,
+            )
+            .unwrap();
             rs.set_bitrate(Bitrate::BitsPerSecond(510_000)).unwrap();
             rs.set_complexity(9).unwrap();
             let mut c = CEncoder::new(fs, 2, APP_LOWDELAY);

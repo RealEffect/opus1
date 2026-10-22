@@ -37,7 +37,7 @@ use ms_support::*;
 use multistream_enc_common::*;
 use opus1::internals::analysis::last_analysis_info;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, ForcedMode, FrameDuration, InbandFec, Signal};
+use opus1::{Application, ForcedMode, FrameDuration, InbandFec, SampleRate, Signal};
 
 /// Whether the packets must be libopus's: the analysis rounds as the
 /// libopus the tests link only on 64-bit ARM.
@@ -338,7 +338,7 @@ fn expert_frame_duration_reads_the_whole_buffer() {
             c.ctl(OPUS_SET_FORCE_MODE_REQUEST, MODE_CELT_ONLY);
             rust.set_expert_frame_duration(expert);
             c.ctl(audiopus_sys::OPUS_SET_EXPERT_FRAME_DURATION_REQUEST, c_value);
-            let coded = expert.samples(fs).unwrap();
+            let coded = expert.samples(SampleRate::Hz48000).unwrap();
             let max_bytes = max_packet_bytes(rust.layout().streams());
             let mut out = vec![0u8; max_bytes];
             let mut at = 0;

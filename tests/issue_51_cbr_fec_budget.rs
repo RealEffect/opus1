@@ -18,7 +18,7 @@ use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Encoder as CEnc,
     Signal as CSignal,
 };
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 const SR: usize = 16000;
@@ -109,7 +109,12 @@ impl Counts {
 fn measure(ch: usize, rate: i32) -> (Counts, Counts) {
     let input = voiced(ch, FRAME * PACKETS);
 
-    let mut rs_enc = OpusEncoder::new(SR as i32, ch, Application::Voip).unwrap();
+    let mut rs_enc = OpusEncoder::new(
+        SampleRate::try_from(SR as i32).unwrap(),
+        Channels::try_from(ch).unwrap(),
+        Application::Voip,
+    )
+    .unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(rate)).unwrap();
     rs_enc.set_vbr(false);
     rs_enc.set_inband_fec(true);

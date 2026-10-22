@@ -32,7 +32,10 @@ mod common;
 use audiopus_sys as sys;
 use opus1::internals::dnn::dred::DRED_EXTENSION_ID;
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusDecoder, OpusDred, OpusDredDecoder, OpusEncoder, packet};
+use opus1::{
+    Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusDred, OpusDredDecoder,
+    OpusEncoder, SampleRate, packet,
+};
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uchar, c_void};
 
@@ -194,7 +197,12 @@ impl Drop for CEnc {
 }
 
 fn opus1_encoder(cfg: &Cfg) -> OpusEncoder {
-    let mut enc = OpusEncoder::new(cfg.fs, cfg.channels, cfg.application).unwrap();
+    let mut enc = OpusEncoder::new(
+        SampleRate::try_from(cfg.fs).unwrap(),
+        Channels::try_from(cfg.channels).unwrap(),
+        cfg.application,
+    )
+    .unwrap();
     enc.set_bitrate(Bitrate::BitsPerSecond(cfg.bitrate)).unwrap();
     enc.set_vbr(cfg.vbr);
     enc.set_complexity(cfg.complexity).unwrap();
@@ -650,7 +658,15 @@ fn multistream_packets_with_dred_on_the_streams_equal_libopus() {
         )
     };
     assert_eq!(err, 0);
-    let mut r = MultistreamEncoder::new(FS, channels, streams, coupled, &mapping, Application::Audio).unwrap();
+    let mut r = MultistreamEncoder::new(
+        SampleRate::try_from(FS).unwrap(),
+        channels,
+        streams,
+        coupled,
+        &mapping,
+        Application::Audio,
+    )
+    .unwrap();
     unsafe {
         assert_eq!(sys::opus_multistream_encoder_ctl(c, OPUS_SET_BITRATE, 96000), 0);
         assert_eq!(sys::opus_multistream_encoder_ctl(c, OPUS_SET_COMPLEXITY, 5), 0);
@@ -769,11 +785,23 @@ fn recover(cfg: &Cfg, opus1_packets: bool) -> (f64, f64) {
         at += b + GAP;
     }
     let c = CDredDec::new(ch);
-    let mut r = OpusDecoder::new(FS, ch).unwrap();
+    let mut r = OpusDecoder::new(
+        SampleRate::try_from(FS).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
     let rd = OpusDredDecoder::new();
     let mut dred = OpusDred::new();
-    let mut plc = OpusDecoder::new(FS, ch).unwrap();
-    let mut clean = OpusDecoder::new(FS, ch).unwrap();
+    let mut plc = OpusDecoder::new(
+        SampleRate::try_from(FS).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
+    let mut clean = OpusDecoder::new(
+        SampleRate::try_from(FS).unwrap(),
+        Channels::try_from(ch).unwrap(),
+    )
+    .unwrap();
     let (mut out_dred, mut out_plc, mut out_clean) = (Vec::new(), Vec::new(), Vec::new());
     let mut a = vec![0f32; frame * ch];
     let mut b = vec![0f32; frame * ch];
@@ -793,7 +821,8 @@ fn recover(cfg: &Cfg, opus1_packets: bool) -> (f64, f64) {
             let max = FS.min((lost_count * frame) as i32);
             let mut end = 0;
             let ret = unsafe { opus_dred_parse(c.dec, c.dred, p.as_ptr(), p.len() as i32, max, FS, &mut end, 0) };
-            let got = rd.parse(&mut dred, p, max, FS, false).unwrap();
+            let got =
+                rd.parse(&mut dred, p, max, SampleRate::try_from(FS).unwrap(), false).unwrap();
             assert_eq!((got.samples, got.end), (ret, end), "packet {i}");
             for fr in 0..lost_count {
                 if ret > 0 {

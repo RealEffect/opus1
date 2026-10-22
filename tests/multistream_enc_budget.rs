@@ -24,7 +24,7 @@ mod multistream_enc_common;
 use audiopus_sys as sys;
 use ms_support::*;
 use multistream_enc_common::*;
-use opus1::{Application, Bitrate, ErrorKind, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, ErrorKind, OpusEncoder, SampleRate};
 
 /// What a C stream encoder reports for `OPUS_GET_BITRATE` when it was set to
 /// `rate` and its last coded frame has `coded_frame` samples: at most what
@@ -158,7 +158,12 @@ fn a_cbr_stream_of_three_bytes_is_coded_like_libopus() {
             );
             assert_eq!(sys::opus_encoder_ctl(c.0, sys::OPUS_SET_VBR_REQUEST, 0), 0);
         }
-        let mut rust = OpusEncoder::new(fs, 1, Application::RestrictedLowDelay).unwrap();
+        let mut rust = OpusEncoder::new(
+            SampleRate::Hz48000,
+            Channels::Mono,
+            Application::RestrictedLowDelay,
+        )
+        .unwrap();
         rust.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
         rust.set_vbr(false);
         let pcm = noise(1, frame_size, 0.3, 3);

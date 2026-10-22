@@ -18,7 +18,7 @@ mod core_common;
 
 use audiopus_sys as sys;
 use core_common::*;
-use opus1::{Application, Bitrate, FrameDuration, OpusEncoder, packet};
+use opus1::{Application, Bitrate, Channels, FrameDuration, OpusEncoder, SampleRate, packet};
 
 const SET: i32 = sys::OPUS_SET_EXPERT_FRAME_DURATION_REQUEST;
 const GET: i32 = sys::OPUS_GET_EXPERT_FRAME_DURATION_REQUEST;
@@ -48,7 +48,8 @@ fn values_are_those_of_libopus() {
 fn accepted_and_refused_values_match_libopus() {
     for app in [APP_VOIP, APP_AUDIO, APP_LOWDELAY] {
         let mut c = CEncoder::new(48000, 2, app);
-        let mut rs = OpusEncoder::new(48000, 2, Application::Audio).unwrap();
+        let mut rs =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         // The default.
         assert_eq!(c.get(GET), sys::OPUS_FRAMESIZE_ARG);
         assert_eq!(rs.expert_frame_duration(), FrameDuration::Argument);
@@ -100,7 +101,12 @@ fn check_calls(fs: usize, channels: usize, app: (i32, Application), cbr: bool, s
     for d in FrameDuration::ALL {
         let mut c = CEncoder::new(fs, channels, app.0);
         c.bitrate(64_000).vbr(!cbr).complexity(5).set(SET, d.to_raw());
-        let mut rs = OpusEncoder::new(fs as i32, channels, app.1).unwrap();
+        let mut rs = OpusEncoder::new(
+            SampleRate::try_from(fs as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            app.1,
+        )
+        .unwrap();
         rs.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
         rs.set_vbr(!cbr);
         rs.set_complexity(5).unwrap();
@@ -116,10 +122,11 @@ fn check_calls(fs: usize, channels: usize, app: (i32, Application), cbr: bool, s
             };
             match (rs_result, c_result) {
                 (Ok(n), Ok(c_packet)) => {
-                    let rs_samples = packet::nb_samples(&buf[..n], fs as i32).unwrap();
-                    let c_samples = packet::nb_samples(&c_packet, fs as i32).unwrap();
+                    let rate = SampleRate::try_from(fs as u32).unwrap();
+                    let rs_samples = packet::nb_samples(&buf[..n], rate).unwrap();
+                    let c_samples = packet::nb_samples(&c_packet, rate).unwrap();
                     assert_eq!(rs_samples, c_samples, "{label}");
-                    let want = d.samples(fs as i32).unwrap_or(size);
+                    let want = d.samples(rate).unwrap_or(size);
                     assert_eq!(rs_samples, want, "{label}");
                     if same_bytes {
                         assert_eq!(&buf[..n], &c_packet[..], "{label}");
@@ -158,13 +165,14 @@ fn input_must_hold_the_frame_size_passed() {
     // The caller passes `frame_size` samples per channel; libopus reads
     // them all for its analysis. opus1 asks for them too, even when it
     // codes fewer.
-    let mut rs = OpusEncoder::new(48000, 2, Application::Audio).unwrap();
+    let mut rs =
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
     rs.set_expert_frame_duration(FrameDuration::Ms20);
     let pcm = vec![0.1f32; 2 * 2880];
     let mut buf = vec![0u8; 4000];
     assert!(rs.encode(&pcm[..2 * 2880 - 1], 2880, &mut buf).is_err());
     let n = rs.encode(&pcm, 2880, &mut buf).unwrap();
-    assert_eq!(packet::nb_samples(&buf[..n], 48000), Ok(960));
+    assert_eq!(packet::nb_samples(&buf[..n], SampleRate::Hz48000), Ok(960));
     assert!(rs.encode_i16(&vec![0i16; 2 * 2880 - 1], 2880, &mut buf).is_err());
     // Less than the duration that is set is refused.
     assert!(rs.encode(&pcm, 480, &mut buf).is_err());
@@ -175,7 +183,7 @@ fn the_setting_stays_across_a_reset() {
     let mut c = CEncoder::new(16000, 1, APP_VOIP);
     c.set(SET, sys::OPUS_FRAMESIZE_100_MS);
     c.reset();
-    let mut rs = OpusEncoder::new(16000, 1, Application::Voip).unwrap();
+    let mut rs = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
     rs.set_expert_frame_duration(FrameDuration::Ms100);
     rs.reset_state();
     assert_eq!(c.get(GET), sys::OPUS_FRAMESIZE_100_MS);

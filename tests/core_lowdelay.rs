@@ -7,7 +7,7 @@ mod k24_common;
 
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo};
-use opus1::{Application, Bitrate, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusEncoder, SampleRate};
 
 fn mean(pcm: &[f32]) -> f64 {
     pcm.iter().map(|&v| v as f64).sum::<f64>() / pcm.len() as f64
@@ -29,7 +29,12 @@ fn low_delay_input_is_dc_rejected_like_libopus() {
         }
         let mut c_enc = CEncoder::new(rate, channels, APP_LOWDELAY);
         c_enc.bitrate(bitrate).complexity(5);
-        let mut enc = OpusEncoder::new(rate as i32, channels, Application::RestrictedLowDelay).unwrap();
+        let mut enc = OpusEncoder::new(
+            SampleRate::try_from(rate as i32).unwrap(),
+            Channels::try_from(channels).unwrap(),
+            Application::RestrictedLowDelay,
+        )
+        .unwrap();
         enc.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
         enc.set_complexity(5).unwrap();
         let (mut dec, mut c_dec) = (CDecoder::new(rate, channels), CDecoder::new(rate, channels));
@@ -107,7 +112,12 @@ fn the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it() {
             for &out_len in buffers {
                 for vbr in [false, true] {
                     let what = format!("{rate} Hz, {frame_ms} ms, {out_len}-byte buffer, vbr {vbr}");
-                    let mut enc = OpusEncoder::new(rate as i32, 2, Application::RestrictedLowDelay).unwrap();
+                    let mut enc = OpusEncoder::new(
+                        SampleRate::try_from(rate as i32).unwrap(),
+                        Channels::Stereo,
+                        Application::RestrictedLowDelay,
+                    )
+                    .unwrap();
                     enc.set_bitrate(Bitrate::BitsPerSecond(510_000)).unwrap();
                     enc.set_complexity(5).unwrap();
                     enc.set_vbr(vbr);

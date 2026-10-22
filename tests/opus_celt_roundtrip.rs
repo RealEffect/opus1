@@ -2,7 +2,7 @@
 // (index-based loops, grouped hex tables) — keep clippy quiet.
 #![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
 
-use opus1::{Application, OpusDecoder, OpusEncoder};
+use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 
 fn snr_with_delay(input: &[f32], output: &[f32], delay: usize) -> f32 {
     let mut signal = 0.0f64;
@@ -24,13 +24,12 @@ fn snr_with_delay(input: &[f32], output: &[f32], delay: usize) -> f32 {
 #[test]
 fn opus_celt_roundtrip_basic() {
     let sampling_rate = 48_000;
-    let channels = 1;
     let frame_size = 960;
     let num_frames = 10;
 
     let mut encoder =
-        OpusEncoder::new(sampling_rate, channels, Application::Audio).expect("encoder init");
-    let mut decoder = OpusDecoder::new(sampling_rate, channels).expect("decoder init");
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).expect("encoder init");
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).expect("decoder init");
 
     let freq = 440.0;
     let mut input = vec![0.0f32; frame_size * num_frames];

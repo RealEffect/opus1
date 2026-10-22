@@ -19,6 +19,7 @@
 
 mod k24_common;
 use k24_common::*;
+use opus1::{Channels, SampleRate};
 
 /// Decode with both decoders, `lost[i]` marking lost packets, and return
 /// the number of differing samples and the index of the first frame that
@@ -26,7 +27,11 @@ use k24_common::*;
 fn compare_with_losses(packets: &[Vec<u8>], lost: &[bool], rate: usize, channels: usize) -> (usize, Option<usize>) {
     let frame = rate / 50;
     let mut c_dec = CDec::new(rate, channels);
-    let mut rs_dec = opus1::OpusDecoder::new(rate as i32, channels).unwrap();
+    let mut rs_dec = opus1::OpusDecoder::new(
+        SampleRate::try_from(rate as i32).unwrap(),
+        Channels::try_from(channels).unwrap(),
+    )
+    .unwrap();
     let mut buf = vec![0f32; frame * channels];
     let (mut differing, mut first) = (0, None);
     for (i, p) in packets.iter().enumerate() {

@@ -4,7 +4,7 @@
 
 /// Tests for Hybrid (SILK + CELT) mode encoding and decoding.
 /// Hybrid mode uses SILK for low-frequency content and CELT for high-frequency content.
-use opus1::{Application, Bandwidth, Bitrate, ForcedMode, OpusEncoder};
+use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 /// Asks the encoder for Hybrid packets of `bandwidth`. The bandwidth keeps
@@ -22,7 +22,7 @@ fn test_hybrid_mode_encode_basic() {
     let frame_size = 960; // 20ms at 48kHz
 
     let mut encoder =
-        OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).expect("Encoder creation failed");
 
     // Ask for Hybrid fullband.
     force_hybrid(&mut encoder, Bandwidth::Fullband);
@@ -64,7 +64,7 @@ fn test_hybrid_mode_24khz_swb() {
     let frame_size = 480; // 20ms at 24kHz
 
     let mut encoder =
-        OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
+        OpusEncoder::new(SampleRate::Hz24000, Channels::Mono, Application::Audio).expect("Encoder creation failed");
 
     force_hybrid(&mut encoder, Bandwidth::Superwideband);
     encoder.set_bitrate(Bitrate::BitsPerSecond(28000)).unwrap();
@@ -97,7 +97,7 @@ fn test_hybrid_mode_bitrate_range() {
 
     for bitrate in [24000, 32000, 48000, 64000, 96000] {
         let mut encoder =
-            OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).expect("Encoder creation failed");
         force_hybrid(&mut encoder, Bandwidth::Fullband);
         encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
 
@@ -126,7 +126,7 @@ fn test_hybrid_mode_consecutive_frames() {
     let frame_size = 960;
 
     let mut encoder =
-        OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).expect("Encoder creation failed");
     force_hybrid(&mut encoder, Bandwidth::Fullband);
     encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
 
@@ -159,7 +159,7 @@ fn test_hybrid_mode_consecutive_frames() {
 fn test_forced_hybrid_at_low_sample_rates_is_silk() {
     for (sample_rate, frame_size) in [(8000, 160), (16000, 320)] {
         let mut encoder =
-            OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
+            OpusEncoder::new(SampleRate::try_from(sample_rate).unwrap(), Channels::Mono, Application::Audio).expect("Encoder creation failed");
         force_hybrid(&mut encoder, Bandwidth::Fullband);
         encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
         let input: Vec<f32> = (0..frame_size)
@@ -418,7 +418,7 @@ fn test_hybrid_downsampler_state_continuity() {
     let frame_size = 960usize;
 
     let mut encoder =
-        OpusEncoder::new(sample_rate, 1, Application::Audio).expect("Encoder creation failed");
+        OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).expect("Encoder creation failed");
     force_hybrid(&mut encoder, Bandwidth::Fullband);
     encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
     encoder.set_vbr(false); // CBR → packet sizes should be equal

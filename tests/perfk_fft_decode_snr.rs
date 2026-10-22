@@ -12,7 +12,7 @@
 //! change of their rounding does to the decoded signal.
 
 use audiopus_sys as ffi;
-use opus1::OpusDecoder;
+use opus1::{Channels, OpusDecoder, SampleRate};
 use std::os::raw::c_int;
 
 const OPUS_SET_FORCE_MODE_REQUEST: c_int = 11002;
@@ -184,7 +184,11 @@ fn decode_c(stream: &Stream, packets: &[Vec<u8>]) -> Vec<f32> {
 
 /// The samples the opus1 decoder makes of the packets.
 fn decode_rust(stream: &Stream, packets: &[Vec<u8>]) -> Vec<f32> {
-    let mut dec = OpusDecoder::new(RATE as i32, stream.channels).unwrap();
+    let mut dec = OpusDecoder::new(
+        SampleRate::try_from(RATE as i32).unwrap(),
+        Channels::try_from(stream.channels).unwrap(),
+    )
+    .unwrap();
     let mut out = Vec::new();
     let mut frame = vec![0f32; stream.frame * stream.channels];
     for p in packets {

@@ -1,5 +1,5 @@
 /// Tests for stereo encoding and decoding
-use opus1::{Application, Bitrate, OpusDecoder, OpusEncoder};
+use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use std::f32::consts::PI;
 
 /// Test basic stereo encoding and decoding
@@ -9,7 +9,7 @@ fn test_stereo_basic() {
     let channels = 2;
     let frame_size = 960; // 20ms at 48kHz
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Audio)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap();
 
@@ -33,7 +33,7 @@ fn test_stereo_basic() {
     println!("Stereo packet: {} bytes", n);
 
     // Decode
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; frame_size * channels];
     let samples = decoder
         .decode(&output[..n], frame_size, &mut pcm)
@@ -58,7 +58,8 @@ fn test_stereo_bitrate_range() {
     let frame_size = 960;
 
     for bitrate in [24000, 32000, 48000, 64000] {
-        let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Audio)
+        let mut encoder =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio)
             .expect("Failed to create encoder");
         encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate)).unwrap();
 
@@ -88,7 +89,7 @@ fn test_stereo_silk_only() {
     let channels = 2;
     let frame_size = 320; // 20ms at 16kHz
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
@@ -122,7 +123,7 @@ fn test_silk_stereo_roundtrip() {
     let channels = 2;
     let frame_size = 320; // 20ms at 16kHz
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
@@ -146,7 +147,7 @@ fn test_silk_stereo_roundtrip() {
     println!("Encoded stereo SILK: {} bytes", n);
 
     // Decode
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; frame_size * channels];
     let samples = decoder
         .decode(&output[..n], frame_size, &mut pcm)
@@ -180,8 +181,12 @@ fn test_silk_stereo_sample_rates() {
         let channels = 2;
         let frame_size = ((sample_rate / 1000) * 20) as usize; // 20ms frames
 
-        let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
-            .expect("Failed to create encoder");
+        let mut encoder = OpusEncoder::new(
+            SampleRate::try_from(sample_rate).unwrap(),
+            Channels::Stereo,
+            Application::Voip,
+        )
+        .expect("Failed to create encoder");
         encoder.set_bitrate(Bitrate::BitsPerSecond(20000)).unwrap();
 
         let mut input = vec![0.0f32; frame_size * channels];
@@ -205,7 +210,8 @@ fn test_silk_stereo_sample_rates() {
         println!("Stereo SILK at {}Hz: {} bytes", sample_rate, n);
 
         // Decode and verify
-        let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+        let mut decoder =
+            OpusDecoder::new(SampleRate::try_from(sample_rate).unwrap(), Channels::Stereo).unwrap();
         let mut pcm = vec![0.0f32; frame_size * channels];
         let samples = decoder
             .decode(&output[..n], frame_size, &mut pcm)
@@ -224,7 +230,7 @@ fn test_silk_stereo_channel_separation() {
     let channels = 2;
     let frame_size = 320;
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(32000)).unwrap(); // Higher bitrate for better quality
 
@@ -244,7 +250,7 @@ fn test_silk_stereo_channel_separation() {
     println!("Channel separation test: {} bytes", n);
 
     // Decode
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; frame_size * channels];
     decoder
         .decode(&output[..n], frame_size, &mut pcm)
@@ -276,7 +282,7 @@ fn test_silk_stereo_multiframe() {
     let frame_size = 320;
     let num_frames = 5;
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
@@ -319,7 +325,7 @@ fn test_silk_stereo_multiframe() {
     assert!(offset > 10, "Should produce significant output");
 
     // Decode all frames
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; total_samples];
     let mut decoded_offset = 0;
     for frame_data in &encoded_frames {
@@ -341,7 +347,7 @@ fn test_silk_stereo_phase_inverted() {
     let channels = 2;
     let frame_size = 320;
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
@@ -362,7 +368,7 @@ fn test_silk_stereo_phase_inverted() {
     println!("Phase-inverted stereo: {} bytes", n);
 
     // Decode
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; frame_size * channels];
     decoder
         .decode(&output[..n], frame_size, &mut pcm)
@@ -393,7 +399,7 @@ fn test_stereo_narrowband() {
     let channels = 2;
     let frame_size = 160; // 20ms at 8kHz
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz8000, Channels::Stereo, Application::Voip)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(16000)).unwrap();
 
@@ -414,7 +420,7 @@ fn test_stereo_narrowband() {
     println!("Stereo narrowband: {} bytes", n);
 
     // Decode
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz8000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; frame_size * channels];
     let samples = decoder
         .decode(&output[..n], frame_size, &mut pcm)
@@ -431,7 +437,7 @@ fn test_silk_stereo_speech() {
     let channels = 2;
     let frame_size = 320;
 
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Voip)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip)
         .expect("Failed to create encoder");
     encoder.set_bitrate(Bitrate::BitsPerSecond(24000)).unwrap();
 
@@ -459,7 +465,7 @@ fn test_silk_stereo_speech() {
     println!("Speech-like stereo: {} bytes", n);
 
     // Decode
-    let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+    let mut decoder = OpusDecoder::new(SampleRate::Hz16000, Channels::Stereo).unwrap();
     let mut pcm = vec![0.0f32; frame_size * channels];
     decoder
         .decode(&output[..n], frame_size, &mut pcm)
@@ -491,7 +497,7 @@ fn test_stereo_celt_only() {
     let frame_size = 480; // 10ms at 48kHz
 
     // Use CELT-only mode (Audio application uses CELT at high sample rates)
-    let mut encoder = OpusEncoder::new(sample_rate, channels, Application::Audio)
+    let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio)
         .expect("Failed to create encoder");
 
     let mut input = vec![0.0f32; frame_size * channels];

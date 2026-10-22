@@ -170,7 +170,7 @@ fn check_surround_packet(
     bandwidth: opus1::Bandwidth,
     frame_size: usize,
 ) -> Vec<String> {
-    let fs = enc.sampling_rate();
+    let fs = enc.sampling_rate().hz() as i32;
     let streams = enc.layout().streams();
     let coupled = enc.layout().coupled_streams();
     let mut wrong = Vec::new();
