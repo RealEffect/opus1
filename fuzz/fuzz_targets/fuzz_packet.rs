@@ -31,7 +31,7 @@ use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::SampleRate;
 use opus1::multistream::split_self_delimited;
-use opus1::packet::{self, ParsedPacket};
+use opus1::packet::{self, Framing, Padding, ParsedPacket};
 
 const OPUS_BAD_ARG: i32 = -1;
 const OPUS_INVALID_PACKET: i32 = -4;
@@ -67,19 +67,19 @@ fn frames_of(p: &ParsedPacket, data: &[u8]) -> Vec<Vec<u8>> {
 
 /// Compare `parse` with `opus_packet_parse_impl`.
 fn compare_parse(data: &[u8], self_delimited: bool) -> Option<ParsedPacket> {
-    let rust = packet::parse(data, self_delimited);
+    let rust = packet::parse(data, framing_of(self_delimited));
     let c = c_parse(data, self_delimited);
     match (&rust, &c) {
         (Ok(r), Ok(c)) => {
             let got = CParsed {
-                toc: r.toc,
-                sizes: r.sizes[..r.count].to_vec(),
-                payload_offset: r.payload_offset,
-                packet_offset: r.packet_offset,
-                padding_len: r.padding_len,
+                toc: r.toc(),
+                sizes: r.frame_sizes().to_vec(),
+                payload_offset: r.payload_offset(),
+                packet_offset: r.packet_offset(),
+                padding_len: r.padding_len(),
             };
             assert_eq!(&got, c, "parse(sd={self_delimited}) differs from libopus for {data:02x?}");
-            assert!(r.packet_offset <= data.len());
+            assert!(r.packet_offset() <= data.len());
             Some(*r)
         }
         (Err(e), Err(c)) => {
@@ -116,11 +116,11 @@ fn compare_pad(data: &[u8], extra: usize) {
         assert_eq!(rust_buf, c_buf, "pad by {extra} gives other bytes than libopus for {data:02x?}");
         if extra > 0 {
             // The padded packet holds the same frames.
-            let before = packet::parse(data, false).expect("padded a packet that does not parse");
-            let after = packet::parse(&rust_buf, false).expect("the padded packet does not parse");
+            let before = packet::parse(data, Framing::Normal).expect("padded a packet that does not parse");
+            let after = packet::parse(&rust_buf, Framing::Normal).expect("the padded packet does not parse");
             assert_eq!(frames_of(&before, data), frames_of(&after, &rust_buf));
-            assert_eq!(before.toc & 0xFC, after.toc & 0xFC);
-            assert_eq!(after.packet_offset, new_len);
+            assert_eq!(before.toc() & 0xFC, after.toc() & 0xFC);
+            assert_eq!(after.packet_offset(), new_len);
         }
     }
 }
@@ -129,7 +129,7 @@ fn compare_pad(data: &[u8], extra: usize) {
 /// buffer of `maxlen` bytes.
 fn compare_write(toc: u8, frames: &[&[u8]], maxlen: usize, self_delimited: bool, pad: bool) {
     let mut out = vec![0x5Au8; maxlen];
-    let rust = packet::write(toc, frames, &mut out, self_delimited, pad);
+    let rust = packet::write(toc, frames, &mut out, framing_of(self_delimited), padding_of(pad));
 
     // libopus: one code-0 packet per frame into the repacketizer.
     let singles: Vec<Vec<u8>> = frames
@@ -168,9 +168,9 @@ fn compare_write(toc: u8, frames: &[&[u8]], maxlen: usize, self_delimited: bool,
                 assert_eq!(n, maxlen);
             }
             // The packet parses to the frames it was made of.
-            let p = packet::parse(&out[..n], self_delimited).expect("a written packet does not parse");
-            assert_eq!(p.packet_offset, n);
-            assert_eq!(p.toc & 0xFC, toc & 0xFC);
+            let p = packet::parse(&out[..n], framing_of(self_delimited)).expect("a written packet does not parse");
+            assert_eq!(p.packet_offset(), n);
+            assert_eq!(p.toc() & 0xFC, toc & 0xFC);
             let got: Vec<&[u8]> = p.frames(&out[..n]).collect();
             assert_eq!(got, frames);
         }
@@ -215,12 +215,12 @@ fn single(rest: &[u8]) -> Result<()> {
         let Some(p) = p else { continue };
         let frames = frames_of(&p, data);
         let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
-        let mut out = vec![0u8; p.packet_offset];
-        let n = packet::write(p.toc, &refs, &mut out, sd, false)
+        let mut out = vec![0u8; p.packet_offset()];
+        let n = packet::write(p.toc(), &refs, &mut out, framing_of(sd), Padding::Shortest)
             .expect("the frames of a parsed packet do not fit in its length");
-        let again = packet::parse(&out[..n], sd).expect("a written packet does not parse");
+        let again = packet::parse(&out[..n], framing_of(sd)).expect("a written packet does not parse");
         assert_eq!(frames_of(&again, &out[..n]), frames);
-        assert_eq!(again.toc & 0xFC, p.toc & 0xFC);
+        assert_eq!(again.toc() & 0xFC, p.toc() & 0xFC);
     }
 
     // Padding: opus1 alone on the packet as it is, then against libopus on
@@ -229,8 +229,8 @@ fn single(rest: &[u8]) -> Result<()> {
         let mut buf = data.to_vec();
         buf.resize(data.len() + extra, 0);
         if packet::pad(&mut buf, data.len(), data.len() + extra).is_ok() && extra > 0 {
-            let p = packet::parse(&buf, false).expect("a padded packet does not parse");
-            assert_eq!(p.packet_offset, data.len() + extra);
+            let p = packet::parse(&buf, Framing::Normal).expect("a padded packet does not parse");
+            assert_eq!(p.packet_offset(), data.len() + extra);
         }
     }
     let mut zeroed = data.to_vec();
@@ -245,11 +245,11 @@ fn single(rest: &[u8]) -> Result<()> {
     }
 
     // The parsed frames written by opus1 and by the libopus repacketizer.
-    if let Some(p) = packet::parse(&zeroed, false).ok() {
+    if let Some(p) = packet::parse(&zeroed, Framing::Normal).ok() {
         let frames = frames_of(&p, &zeroed);
         let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
-        let maxlen = (p.packet_offset + maxlen_extra).saturating_sub(shrink);
-        compare_write(p.toc, &refs, maxlen, modes & 1 != 0, modes & 2 != 0);
+        let maxlen = (p.packet_offset() + maxlen_extra).saturating_sub(shrink);
+        compare_write(p.toc(), &refs, maxlen, modes & 1 != 0, modes & 2 != 0);
     }
     Ok(())
 }
@@ -321,16 +321,16 @@ fn multistream(rest: &[u8]) -> Result<()> {
 
     // The first stream cut out as a plain packet.
     let mut scratch = Vec::new();
-    match (split_self_delimited(data, &mut scratch), packet::parse(data, true)) {
+    match (split_self_delimited(data, &mut scratch), packet::parse(data, Framing::SelfDelimited)) {
         (Ok((plain, used)), Ok(p)) => {
-            assert_eq!(used, p.packet_offset);
-            let q = packet::parse(plain, false).expect("a cut-out stream does not parse");
+            assert_eq!(used, p.packet_offset());
+            let q = packet::parse(plain, Framing::Normal).expect("a cut-out stream does not parse");
             assert_eq!(frames_of(&q, plain), frames_of(&p, data));
-            assert_eq!(q.toc, p.toc);
-            assert_eq!(q.padding_len, p.padding_len);
+            assert_eq!(q.toc(), p.toc());
+            assert_eq!(q.padding_len(), p.padding_len());
         }
         (Err(_), Err(_)) => {}
-        (a, b) => panic!("split_self_delimited {:?} but parse {:?}", a.map(|x| x.1), b.map(|p| p.count)),
+        (a, b) => panic!("split_self_delimited {:?} but parse {:?}", a.map(|x| x.1), b.map(|p| p.nb_frames())),
     }
 
     // Padding the last stream, against libopus.

@@ -27,6 +27,7 @@ use ms_support::*;
 use multistream_dec_common::*;
 use opus1::SampleRate;
 use opus1::multistream::{ChannelMappingTable, MultistreamDecoder};
+use opus1::packet::{Framing, Padding};
 
 /// Checks one set of constructor arguments against the C constructor.
 /// Returns whether both accepted them.
@@ -480,14 +481,14 @@ fn join_packets(e: &Encoded, group: &[Vec<u8>], padding: usize) -> Option<Vec<u8
         let mut frames: Vec<&[u8]> = Vec::new();
         for parts in &split {
             let stream = &parts[s].packet;
-            let parsed = opus1::packet::parse(stream, false).unwrap();
+            let parsed = opus1::packet::parse(stream, Framing::Normal).unwrap();
             frames.extend(parsed.frames(stream));
         }
-        let self_delimited = s + 1 != e.streams;
+        let framing = if s + 1 != e.streams { Framing::SelfDelimited } else { Framing::Normal };
         let mut buf = vec![0u8; 48 * 1277 + 8];
-        let len = opus1::packet::write(toc_byte, &frames, &mut buf, self_delimited, false).unwrap();
+        let len = opus1::packet::write(toc_byte, &frames, &mut buf, framing, Padding::Shortest).unwrap();
         let len = if padding > 0 {
-            opus1::packet::write(toc_byte, &frames, &mut buf[..len + padding], self_delimited, true).unwrap()
+            opus1::packet::write(toc_byte, &frames, &mut buf[..len + padding], framing, Padding::FillBuffer).unwrap()
         } else {
             len
         };

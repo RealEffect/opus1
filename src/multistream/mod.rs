@@ -343,22 +343,24 @@ pub fn split_self_delimited<'a>(
     scratch: &'a mut Vec<u8>,
 ) -> Result<(&'a [u8], usize), Error> {
     const INVALID: Error = Error::INVALID_PACKET;
-    let parsed = packet::parse(data, true)?;
+    let parsed = packet::parse(data, packet::Framing::SelfDelimited)?;
     // The extra field is the last thing before the first frame. It holds the
     // size of the last frame.
-    let field_len = packet::size_field_len(parsed.sizes[parsed.count - 1]);
-    let header_end = parsed.payload_offset.checked_sub(field_len).ok_or(INVALID)?;
+    let last_size = parsed.frame_sizes().last().copied().ok_or(INVALID)?;
+    let field_len = packet::size_field_len(last_size);
+    let header_end = parsed.payload_offset().checked_sub(field_len).ok_or(INVALID)?;
     let header = data.get(..header_end).ok_or(INVALID)?;
-    let frames_and_padding = data.get(parsed.payload_offset..parsed.packet_offset).ok_or(INVALID)?;
+    let frames_and_padding = data.get(parsed.payload_offset()..parsed.packet_offset()).ok_or(INVALID)?;
     scratch.clear();
     scratch.extend_from_slice(header);
     scratch.extend_from_slice(frames_and_padding);
-    Ok((scratch.as_slice(), parsed.packet_offset))
+    Ok((scratch.as_slice(), parsed.packet_offset()))
 }
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use crate::packet::{Framing, Padding};
 
     fn toc_byte(config: u8, stereo: bool, code: u8) -> u8 {
         (config << 3) | ((stereo as u8) << 2) | (code & 0x03)
@@ -557,42 +559,42 @@ mod tests {
         // Write the same frames as a self-delimited and as an ordinary
         // packet. Splitting the first must give the second.
         let big = [0x5Au8; 600];
-        let cases: [(&[&[u8]], bool); 9] = [
-            (&[&big[..0]], false),
-            (&[&big[..1]], false),
-            (&[&big[..251]], false),
-            (&[&big[..252]], false),
-            (&[&big[..600]], false),
-            (&[&big[..300], &big[..300]], false),
-            (&[&big[..7], &big[..300]], false),
-            (&[&big[..3], &big[..3], &big[..3]], true),
-            (&[&big[..10], &big[..253], &big[..0], &big[..40]], true),
+        let cases: [(&[&[u8]], Padding); 9] = [
+            (&[&big[..0]], Padding::Shortest),
+            (&[&big[..1]], Padding::Shortest),
+            (&[&big[..251]], Padding::Shortest),
+            (&[&big[..252]], Padding::Shortest),
+            (&[&big[..600]], Padding::Shortest),
+            (&[&big[..300], &big[..300]], Padding::Shortest),
+            (&[&big[..7], &big[..300]], Padding::Shortest),
+            (&[&big[..3], &big[..3], &big[..3]], Padding::FillBuffer),
+            (&[&big[..10], &big[..253], &big[..0], &big[..40]], Padding::FillBuffer),
         ];
         // SILK narrowband 10 ms, so that 4 frames stay below 120 ms.
         let toc = toc_byte(0, false, 0);
         for (frames, pad) in cases {
             let mut delimited = [0u8; 2000];
             let mut ordinary = [0u8; 2000];
-            let (len_d, len_o) = if pad {
+            let (len_d, len_o) = if pad == Padding::FillBuffer {
                 // Padding fills the whole buffer that is given.
                 let total: usize = frames.iter().map(|f| f.len()).sum();
                 (total + 40, total + 37)
             } else {
                 (2000, 2000)
             };
-            let n_d = packet::write(toc, frames, &mut delimited[..len_d], true, pad).unwrap();
-            let n_o = packet::write(toc, frames, &mut ordinary[..len_o], false, pad).unwrap();
+            let n_d = packet::write(toc, frames, &mut delimited[..len_d], Framing::SelfDelimited, pad).unwrap();
+            let n_o = packet::write(toc, frames, &mut ordinary[..len_o], Framing::Normal, pad).unwrap();
             // Bytes of another stream follow the self-delimited packet.
             delimited[n_d..n_d + 3].copy_from_slice(&[0xEE; 3]);
             let mut scratch = vec![1, 2, 3];
             let (pkt, consumed) = split_self_delimited(&delimited[..n_d + 3], &mut scratch).unwrap();
             assert_eq!(consumed, n_d, "{} frames", frames.len());
-            let parsed = packet::parse(pkt, false).unwrap();
-            assert_eq!(parsed.count, frames.len());
+            let parsed = packet::parse(pkt, Framing::Normal).unwrap();
+            assert_eq!(parsed.nb_frames(), frames.len());
             for (i, frame) in frames.iter().enumerate() {
                 assert_eq!(parsed.frame(pkt, i), *frame, "frame {i}");
             }
-            if !pad {
+            if pad == Padding::Shortest {
                 assert_eq!(pkt, &ordinary[..n_o], "{} frames", frames.len());
             }
         }

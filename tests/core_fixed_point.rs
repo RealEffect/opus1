@@ -35,6 +35,7 @@ use opus1::internals::range_coder::RangeCoder;
 use opus1::internals::silk::dec_api::SilkDecoder;
 use opus1::internals::analysis::{AnalysisGate, set_analysis_gate};
 use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::packet::Framing;
 
 /// FNV-1a, 32 bits.
 fn fnv1a(bytes: &[u8]) -> u32 {
@@ -768,7 +769,7 @@ fn silk_dtx_leaves_out_the_frames_of_libopus() {
         for (i, input) in pcm.chunks_exact(frame * channels).enumerate() {
             let n = enc.encode_i16(input, frame, &mut buf).unwrap();
             let packet = &buf[..n];
-            let parsed = opus1::packet::parse(packet, false).unwrap();
+            let parsed = opus1::packet::parse(packet, Framing::Normal).unwrap();
             left_out += parsed.frames(packet).filter(|f| f.is_empty()).count();
             if fnv1a(&[packet, &[enc.in_dtx() as u8]].concat()) != want[i] {
                 differ.push(i);

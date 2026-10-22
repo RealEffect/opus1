@@ -25,7 +25,8 @@
 use audiopus_sys as sys;
 use opus1::extensions::Extension;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
-use opus1::{Channels, ErrorKind, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate, packet};
+use opus1::{Channels, DredProcessing, ErrorKind, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate, packet};
+use opus1::packet::{Framing, Padding};
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uchar, c_void};
 
@@ -235,6 +236,11 @@ const PARSE_ARGS: [(i32, SampleRate); 8] = [
     (7, SampleRate::Hz24000),
 ];
 
+/// opus1's processing choice for libopus's `defer_processing` flag.
+fn processing(defer: bool) -> DredProcessing {
+    if defer { DredProcessing::Deferred } else { DredProcessing::Now }
+}
+
 /// Parses one packet with both libopus and opus1, with and without
 /// deferred processing, and compares everything.
 fn compare_parse(
@@ -249,7 +255,7 @@ fn compare_parse(
     for defer in [false, true] {
         let what = format!("{what} max {max} rate {rate:?} defer {defer}");
         let (ret, end) = c.parse(data, max, rate.hz() as i32, defer);
-        let got = r.parse(dred, data, max, rate, defer);
+        let got = r.parse(dred, data, max, rate, processing(defer));
         match got {
             Ok(p) => {
                 assert_eq!((p.samples, p.end), (ret, end), "{what}");
@@ -311,9 +317,9 @@ fn parse_and_process_equal_libopus() {
 /// Splits a packet with DRED into its plain form and its DRED payload
 /// (without the 2-byte header) and the frame that carried it.
 fn split_dred(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>, usize)> {
-    let parsed = packet::parse(data, false).ok()?;
-    let mut it = opus1::extensions::ExtensionIterator::new(parsed.padding(data), parsed.count);
-    let ext = it.find(DRED_EXTENSION_ID).ok()??;
+    let parsed = packet::parse(data, Framing::Normal).ok()?;
+    let mut it = opus1::extensions::ExtensionIterator::new(parsed.padding(data), parsed.nb_frames());
+    let ext = it.find_id(DRED_EXTENSION_ID).ok()??;
     let payload = ext.data[2..].to_vec();
     let mut plain = data.to_vec();
     let len = packet::unpad(&mut plain, data.len()).unwrap();
@@ -328,9 +334,9 @@ fn with_dred(plain: &[u8], payload: &[u8], frame: usize) -> Vec<u8> {
     data.extend_from_slice(payload);
     let mut buf = plain.to_vec();
     buf.resize(plain.len() + data.len() + 64, 0);
-    let ext = [Extension { id: DRED_EXTENSION_ID, frame, data: &data }];
+    let ext = [Extension::new(DRED_EXTENSION_ID, frame, &data)];
     let new_len = buf.len();
-    let n = packet::pad_with_extensions(&mut buf, plain.len(), new_len, false, &ext).unwrap();
+    let n = packet::pad_with_extensions(&mut buf, plain.len(), new_len, Padding::Shortest, &ext).unwrap();
     buf.truncate(n);
     buf
 }
@@ -523,7 +529,7 @@ fn dred_losses(cfg: &EncCfg, fs: i32, channels: usize, complexity: i32, out: Out
             let dred_input = (lost_count * frame) as i32;
             let max = fs.min(dred_input.max(0));
             let (ret, end) = c.parse(p, max, fs, false);
-            let got = r.parse(&mut dred, p, max, SampleRate::try_from(fs).unwrap(), false).unwrap();
+            let got = r.parse(&mut dred, p, max, SampleRate::try_from(fs).unwrap(), DredProcessing::Now).unwrap();
             assert_eq!((got.samples, got.end), (ret, end), "{tag} packet {i}: parse");
             same_parse(c.dred(), &dred, &format!("{tag} packet {i}"));
             for fr in 0..lost_count {
@@ -589,7 +595,7 @@ fn dred_decode_at_other_positions_equals_libopus() {
             }
             let defer = i % 3 == 0;
             let (ret, _) = c.parse(p, fs, fs, defer);
-            r.parse(&mut dred, p, fs, SampleRate::try_from(fs).unwrap(), defer).unwrap();
+            r.parse(&mut dred, p, fs, SampleRate::try_from(fs).unwrap(), processing(defer)).unwrap();
             assert!(ret > 0);
             for call in 0..4 {
                 // The last call is longer than 120 ms, which the integer
@@ -622,7 +628,7 @@ fn dred_decode_checks_its_arguments_as_libopus() {
     let mut dred = OpusDred::new();
     let p = &packets[15];
     assert!(c.parse(p, 16000, 16000, false).0 > 0);
-    r.parse(&mut dred, p, 16000, SampleRate::Hz16000, false).unwrap();
+    r.parse(&mut dred, p, 16000, SampleRate::Hz16000, DredProcessing::Now).unwrap();
     let mut pair = Pair::new(16000, 1, 10);
     for q in &packets[..15] {
         pair.decode(q, 320, Out::I16, "lead");
@@ -647,7 +653,7 @@ fn dred_decode_checks_its_arguments_as_libopus() {
     // A packet without DRED: zeros, and the state is not usable.
     let plain = split_dred(p).unwrap().0;
     let (ret, end) = c.parse(&plain, 16000, 16000, false);
-    let got = r.parse(&mut dred, &plain, 16000, SampleRate::Hz16000, false).unwrap();
+    let got = r.parse(&mut dred, &plain, 16000, SampleRate::Hz16000, DredProcessing::Now).unwrap();
     assert_eq!((got.samples, got.end), (ret, end));
     assert_eq!((ret, end), (0, 0));
     assert!(!dred.is_parsed());

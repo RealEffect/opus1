@@ -38,8 +38,8 @@ use common::pool::pool;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::multistream::MultistreamDecoder;
-use opus1::packet::{self, Repacketizer};
-use opus1::{Channels, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate};
+use opus1::packet::{self, Framing, Padding, Repacketizer};
+use opus1::{Channels, DredProcessing, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate};
 use std::sync::OnceLock;
 
 /// A NaN with a payload no decoder writes: marks samples not written.
@@ -119,7 +119,8 @@ fn pool_packet(u: &mut Unstructured, streams: Option<usize>) -> Result<Vec<u8>> 
         let mut rp = Repacketizer::new();
         rp.cat(p).unwrap();
         let mut buf = vec![0u8; 2 * p.len() + 64];
-        let n = rp.out_range_ext(0, rp.nb_frames(), &mut buf, s + 1 < streams, false, &[]).unwrap();
+        let framing = if s + 1 < streams { Framing::SelfDelimited } else { Framing::Normal };
+        let n = rp.out_range_ext(0, rp.nb_frames(), &mut buf, framing, Padding::Shortest, &[]).unwrap();
         out.extend_from_slice(&buf[..n]);
     }
     Ok(out)
@@ -247,7 +248,8 @@ fn run(u: &mut Unstructured) -> Result<()> {
                 let p = &dred_packets[u.choose_index(dred_packets.len())?];
                 let mut dred = OpusDred::new();
                 let max = u.int_in_range(0..=fs)?;
-                let Ok(found) = dred_decoder().parse(&mut dred, p, max, rate, u.arbitrary()?) else { continue };
+                let processing = if u.arbitrary()? { DredProcessing::Deferred } else { DredProcessing::Now };
+                let Ok(found) = dred_decoder().parse(&mut dred, p, max, rate, processing) else { continue };
                 if !dred.is_processed() && u.arbitrary()? {
                     let _ = dred_decoder().process_in_place(&mut dred);
                 }

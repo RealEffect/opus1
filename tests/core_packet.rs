@@ -11,6 +11,7 @@
 
 use audiopus_sys as sys;
 use opus1::{SampleRate, packet};
+use opus1::packet::{Framing, Padding};
 
 /// Frame sizes around the points where the size field changes: one byte up
 /// to 251, two bytes from 252, and the largest frame, 1275 bytes.
@@ -229,18 +230,18 @@ fn as_slices(frames: &[Vec<u8>]) -> Vec<&[u8]> {
 }
 
 /// `packet::write` into a buffer of `room` bytes.
-fn rs_write(toc: u8, frames: &[Vec<u8>], room: usize, self_delimited: bool, pad: bool) -> Vec<u8> {
+fn rs_write(toc: u8, frames: &[Vec<u8>], room: usize, framing: Framing, padding: Padding) -> Vec<u8> {
     let mut out = vec![0xEEu8; room];
-    let n = packet::write(toc, &as_slices(frames), &mut out, self_delimited, pad).expect("write");
+    let n = packet::write(toc, &as_slices(frames), &mut out, framing, padding).expect("write");
     out.truncate(n);
     out
 }
 
 /// Check that `data` parses back into `frames`.
-fn assert_parses_to(data: &[u8], self_delimited: bool, toc: u8, frames: &[Vec<u8>], what: &str) {
-    let parsed = packet::parse(data, self_delimited).unwrap_or_else(|e| panic!("{what}: {e}"));
-    assert_eq!(parsed.toc & 0xFC, toc & 0xFC, "{what}: TOC");
-    assert_eq!(parsed.count, frames.len(), "{what}: frame count");
+fn assert_parses_to(data: &[u8], framing: Framing, toc: u8, frames: &[Vec<u8>], what: &str) {
+    let parsed = packet::parse(data, framing).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(parsed.toc() & 0xFC, toc & 0xFC, "{what}: TOC");
+    assert_eq!(parsed.nb_frames(), frames.len(), "{what}: frame count");
     for (i, (got, want)) in parsed.frames(data).zip(frames).enumerate() {
         assert_eq!(got, want.as_slice(), "{what}: frame {i}");
     }
@@ -265,42 +266,42 @@ fn write_then_parse_round_trips() {
         let room = sizes.iter().sum::<usize>() + 2 * sizes.len() + 4;
 
         // Normal framing.
-        let plain = rs_write(*toc, &frames, room, false, false);
+        let plain = rs_write(*toc, &frames, room, Framing::Normal, Padding::Shortest);
         codes[(plain[0] & 3) as usize] += 1;
-        assert_parses_to(&plain, false, *toc, &frames, &what);
+        assert_parses_to(&plain, Framing::Normal, *toc, &frames, &what);
         assert_eq!(plain, c_repacketize(*toc, &as_slices(&frames)).unwrap(), "{what}: C repacketizer");
         let (c_toc, c_sizes, c_offset) = c_parse(&plain).unwrap();
-        let parsed = packet::parse(&plain, false).unwrap();
-        assert_eq!(c_toc, parsed.toc, "{what}");
+        let parsed = packet::parse(&plain, Framing::Normal).unwrap();
+        assert_eq!(c_toc, parsed.toc(), "{what}");
         assert_eq!(c_sizes, *sizes, "{what}: C sizes");
-        assert_eq!(c_offset, parsed.payload_offset, "{what}: payload offset");
-        assert_eq!(parsed.packet_offset, plain.len(), "{what}: packet offset");
-        assert_eq!(parsed.padding_len, 0, "{what}");
+        assert_eq!(c_offset, parsed.payload_offset(), "{what}: payload offset");
+        assert_eq!(parsed.packet_offset(), plain.len(), "{what}: packet offset");
+        assert_eq!(parsed.padding_len(), 0, "{what}");
 
         // Self-delimited framing, followed by bytes of another stream.
-        let mut delimited = rs_write(*toc, &frames, room, true, false);
+        let mut delimited = rs_write(*toc, &frames, room, Framing::SelfDelimited, Padding::Shortest);
         let own_len = delimited.len();
         delimited.extend_from_slice(&[0xAB; 7]);
-        assert_parses_to(&delimited, true, *toc, &frames, &what);
-        assert_eq!(packet::parse(&delimited, true).unwrap().packet_offset, own_len, "{what}");
+        assert_parses_to(&delimited, Framing::SelfDelimited, *toc, &frames, &what);
+        assert_eq!(packet::parse(&delimited, Framing::SelfDelimited).unwrap().packet_offset(), own_len, "{what}");
 
         // Padding to several exact lengths, in both framings.
         for extra in [0usize, 1, 2, 3, 100, 254, 255, 256, 257, 511, 700] {
-            for self_delimited in [false, true] {
-                let base = if self_delimited { own_len } else { plain.len() };
-                let padded = rs_write(*toc, &frames, base + extra, self_delimited, true);
+            for framing in [Framing::Normal, Framing::SelfDelimited] {
+                let base = if framing == Framing::SelfDelimited { own_len } else { plain.len() };
+                let padded = rs_write(*toc, &frames, base + extra, framing, Padding::FillBuffer);
                 assert_eq!(padded.len(), base + extra, "{what}: padded length");
-                assert_parses_to(&padded, self_delimited, *toc, &frames, &what);
-                let parsed = packet::parse(&padded, self_delimited).unwrap();
-                assert_eq!(parsed.packet_offset, padded.len(), "{what}: padded packet offset");
-                let padding = &padded[padded.len() - parsed.padding_len..];
+                assert_parses_to(&padded, framing, *toc, &frames, &what);
+                let parsed = packet::parse(&padded, framing).unwrap();
+                assert_eq!(parsed.packet_offset(), padded.len(), "{what}: padded packet offset");
+                let padding = &padded[padded.len() - parsed.padding_len()..];
                 assert!(padding.iter().all(|&b| b == 0), "{what}: padding is zeros");
             }
         }
 
         // A buffer one byte too small is an error, not a panic.
         let mut small = vec![0u8; plain.len() - 1];
-        assert!(packet::write(*toc, &as_slices(&frames), &mut small, false, false).is_err(), "{what}");
+        assert!(packet::write(*toc, &as_slices(&frames), &mut small, Framing::Normal, Padding::Shortest).is_err(), "{what}");
     }
     assert!(codes.iter().all(|&n| n > 0), "every frame-count code was written: {codes:?}");
 }
@@ -314,7 +315,7 @@ fn pad_gives_the_bytes_of_opus_packet_pad() {
     for (toc, sizes) in &frame_layouts() {
         let frames = make_frames(&mut rng, sizes);
         let room = sizes.iter().sum::<usize>() + 2 * sizes.len() + 4;
-        let plain = rs_write(*toc, &frames, room, false, false);
+        let plain = rs_write(*toc, &frames, room, Framing::Normal, Padding::Shortest);
         for extra in [0usize, 1, 2, 3, 4, 100, 253, 254, 255, 256, 257, 258, 509, 510, 511, 512, 1000] {
             let new_len = plain.len() + extra;
             let what = format!("TOC {toc:#04x}, sizes {sizes:?}, +{extra}");
@@ -323,7 +324,7 @@ fn pad_gives_the_bytes_of_opus_packet_pad() {
             ours.resize(new_len, 0xEE);
             packet::pad(&mut ours, plain.len(), new_len).unwrap_or_else(|e| panic!("{what}: {e}"));
             assert_eq!(ours, expected, "{what}");
-            assert_parses_to(&ours, false, *toc, &frames, &what);
+            assert_parses_to(&ours, Framing::Normal, *toc, &frames, &what);
 
             // Pad the padded packet again.
             let again_len = new_len + 1 + extra / 3;
@@ -366,7 +367,8 @@ fn multistream_packet(rng: &mut Rng, streams: usize, layouts: &[(u8, Vec<usize>)
         let sizes = same[rng.below(same.len())];
         let frames = make_frames(rng, sizes);
         let room = sizes.iter().sum::<usize>() + 2 * sizes.len() + 4;
-        data.extend(rs_write(*toc, &frames, room, s != streams - 1, false));
+        let framing = if s != streams - 1 { Framing::SelfDelimited } else { Framing::Normal };
+        data.extend(rs_write(*toc, &frames, room, framing, Padding::Shortest));
         all_frames.push(frames);
     }
     (data, all_frames)
@@ -390,10 +392,10 @@ fn multistream_pad_gives_the_bytes_of_the_c_function() {
         // Every stream parses back, the last one with normal framing.
         let mut rest = &data[..];
         for (s, stream_frames) in frames.iter().enumerate() {
-            let self_delimited = s != streams - 1;
+            let framing = if s != streams - 1 { Framing::SelfDelimited } else { Framing::Normal };
             let toc = rest[0];
-            assert_parses_to(rest, self_delimited, toc, stream_frames, &what);
-            rest = &rest[packet::parse(rest, self_delimited).unwrap().packet_offset..];
+            assert_parses_to(rest, framing, toc, stream_frames, &what);
+            rest = &rest[packet::parse(rest, framing).unwrap().packet_offset()..];
         }
         assert!(rest.is_empty(), "{what}");
 
@@ -465,10 +467,11 @@ fn mutated_packets_parse_like_libopus() {
         let (toc, sizes) = &layouts[rng.below(layouts.len())];
         let frames = make_frames(&mut rng, sizes);
         let room = sizes.iter().sum::<usize>() + 2 * sizes.len() + 4 + rng.below(300);
-        let mut data = rs_write(*toc, &frames, room, false, round % 3 == 0);
+        let padding = if round % 3 == 0 { Padding::FillBuffer } else { Padding::Shortest };
+        let mut data = rs_write(*toc, &frames, room, Framing::Normal, padding);
         mutate(&mut rng, &mut data);
 
-        let ours = packet::parse(&data, false);
+        let ours = packet::parse(&data, Framing::Normal);
         if data.is_empty() {
             // C takes a null pointer for an empty packet; both reject it.
             assert!(ours.is_err());
@@ -481,10 +484,10 @@ fn mutated_packets_parse_like_libopus() {
             }
             Ok((c_toc, c_sizes, c_offset)) => {
                 let p = ours.unwrap_or_else(|e| panic!("round {round}: C accepts, opus1: {e}: {data:02x?}"));
-                let sizes: Vec<usize> = p.sizes[..p.count].iter().map(|&s| s as usize).collect();
-                assert_eq!((p.toc, sizes, p.payload_offset), (c_toc, c_sizes, c_offset), "round {round}: {data:02x?}");
-                assert!(p.packet_offset <= data.len() && p.padding_len <= p.packet_offset);
-                assert_eq!(p.frames(&data).map(|f| f.len()).sum::<usize>() + p.payload_offset + p.padding_len, p.packet_offset);
+                let sizes: Vec<usize> = p.frame_sizes().iter().map(|&s| s as usize).collect();
+                assert_eq!((p.toc(), sizes, p.payload_offset()), (c_toc, c_sizes, c_offset), "round {round}: {data:02x?}");
+                assert!(p.packet_offset() <= data.len() && p.padding_len() <= p.packet_offset());
+                assert_eq!(p.frames(&data).map(|f| f.len()).sum::<usize>() + p.payload_offset() + p.padding_len(), p.packet_offset());
                 accepted += 1;
             }
         }
@@ -498,7 +501,7 @@ fn mutated_packets_parse_like_libopus() {
         padded.resize(new_len, 0xEE);
         let result = packet::pad(&mut padded, data.len(), new_len);
         if let Ok(p) = ours {
-            let padding = &data[p.packet_offset - p.padding_len..p.packet_offset];
+            let padding = &data[p.packet_offset() - p.padding_len()..p.packet_offset()];
             if padding.iter().all(|&b| b == 0) {
                 assert_eq!(result.map(|()| padded).map_err(|_| ()), c_pad(&data, new_len).map_err(|_| ()), "round {round}: pad of {data:02x?}");
             }

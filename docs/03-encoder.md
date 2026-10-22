@@ -375,11 +375,11 @@ let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Applicat
 let pcm = vec![0.0f32; 2880]; // 60 ms at 48 kHz
 let mut packet = vec![0u8; 1276];
 let len = encoder.encode(&pcm, 2880, &mut packet).unwrap();
-let parsed = opus1::packet::parse(&packet[..len], false).unwrap();
+let parsed = opus1::packet::parse(&packet[..len], opus1::packet::Framing::Normal).unwrap();
 assert!(packet[0] >> 3 >= 16); // CELT-only at the automatic 49 kb/s
 assert_eq!(encoder.bitrate(), 48_000 + 60 * 48_000 / 960); // of the last 20 ms frame
 assert_eq!(packet[0] & 0x03, 3); // frame count code 3
-assert_eq!(parsed.count, 3); // three 20 ms frames
+assert_eq!(parsed.nb_frames(), 3); // three 20 ms frames
 ```
 
 ### 1.7 Discontinuous transmission (DTX)

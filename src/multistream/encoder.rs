@@ -594,7 +594,9 @@ impl MultistreamEncoder {
             let room = output
                 .get_mut(tot_size..max_data_bytes)
                 .ok_or(Error::BUFFER_TOO_SMALL)?;
-            let written = rp.out_range_ext(0, rp.nb_frames(), room, !last, !vbr && last, &[])?;
+            let framing = packet::Framing::from_flag(!last);
+            let padding = packet::Padding::from_flag(!vbr && last);
+            let written = rp.out_range_ext(0, rp.nb_frames(), room, framing, padding, &[])?;
             tot_size += written;
         }
         Ok(tot_size)

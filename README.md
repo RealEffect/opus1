@@ -370,6 +370,13 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   check a number. `set_force_channels` takes `Option<Channels>` and no longer
   fails. The multistream constructors, the `packet` functions with a sampling
   rate and `OpusDredDecoder::parse` take a `SampleRate` too.
+- `packet` and `extensions`: the flags `self_delimited` and `pad` are the
+  enums `Framing` and `Padding`; `ParsedPacket` has read-only methods instead
+  of public fields; `Extension::new` makes an extension; `ExtensionIterator`
+  is an `Iterator`; `extensions::count` and `count_ext` return a `Result`.
+  Bad arguments such as more than 48 frames are errors instead of panics.
+  `Repacketizer` is no longer `Copy`. `OpusDredDecoder::parse` takes a
+  `DredProcessing` instead of a bool.
 - The settings of `OpusEncoder` are methods instead of public fields:
   `set_bitrate`, `set_complexity`, `set_vbr` (instead of `use_cbr`, with the
   opposite meaning), `set_inband_fec` and `set_packet_loss_perc`, each with its
@@ -409,7 +416,8 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   decoder side.
 - Packet extensions of libopus 1.5 and later: the module `extensions`,
   `packet::Repacketizer`, `packet::pad_with_extensions`, `packet::unpad` and
-  `packet::multistream_unpad`.
+  `packet::multistream_unpad`. `packet::bandwidth` and `packet::nb_channels`
+  read the TOC byte.
 - New controls of libopus. Decoder: `decode_i16`, `decode_fec`, `final_range`,
   `reset_state`, `last_packet_duration`, `set_gain`, `pitch` and
   `set_phase_inversion_disabled`. Encoder: `set_force_mode`, `set_bandwidth`,

@@ -10,6 +10,7 @@ use k24_common::{aligned_snr, multitone, speech, to_stereo, toc_summary};
 use opus1::{
     Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusDecoder, OpusEncoder, SampleRate,
 };
+use opus1::packet::Framing;
 
 const MODES: [(&str, i32, ForcedMode); 3] = [
     ("SILK", MODE_SILK, ForcedMode::SilkOnly),
@@ -362,8 +363,8 @@ fn packets_too_small_to_code_name_the_last_coded_mode() {
                         let c_packet = c_enc.encode(input);
                         let n = enc.encode(input, frame, &mut buf).unwrap_or_else(|e| panic!("{what}, packet {i}: {e}"));
                         let packet = &buf[..n];
-                        let parsed = opus1::packet::parse(&c_packet, false).unwrap();
-                        if parsed.sizes[..parsed.count].iter().all(|&size| size == 0) {
+                        let parsed = opus1::packet::parse(&c_packet, Framing::Normal).unwrap();
+                        if parsed.frame_sizes().iter().all(|&size| size == 0) {
                             assert!(low, "{what}, packet {i}: a placeholder at 32 kb/s");
                             assert_eq!(packet, &c_packet[..], "{what}, packet {i}: placeholder");
                             assert_eq!(enc.final_range(), 0, "{what}, packet {i}");

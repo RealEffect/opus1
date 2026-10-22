@@ -12,6 +12,7 @@ mod k24_common;
 use core_common::*;
 use k24_common::{speech_fullband, to_stereo, toc};
 use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate};
+use opus1::packet::Framing;
 
 /// What an LFE channel carries: tones at 38 and 71 Hz that swell twice a
 /// second, and a little noise.
@@ -76,8 +77,8 @@ fn total_bytes(packets: &[Vec<u8>]) -> usize {
 
 /// Whether a packet codes nothing: every frame in it is empty.
 fn is_placeholder(packet: &[u8]) -> bool {
-    let parsed = opus1::packet::parse(packet, false).expect("a valid packet");
-    parsed.sizes[..parsed.count].iter().all(|&size| size == 0)
+    let parsed = opus1::packet::parse(packet, Framing::Normal).expect("a valid packet");
+    parsed.frame_sizes().iter().all(|&size| size == 0)
 }
 
 // ---------------------------------------------------------------------------

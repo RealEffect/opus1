@@ -57,6 +57,42 @@ test that compares opus1 with the C library under the same settings.
   - `OpusDredDecoder::parse(dred, data, max_dred_samples, i32, defer)` takes
     the sampling rate as a `SampleRate`; its `BadArg` for a rate that is not
     positive is gone.
+- Packets and packet extensions (modules `packet` and `extensions`):
+  - New `packet::bandwidth(toc) -> Bandwidth` and
+    `packet::nb_channels(toc) -> Channels` (libopus
+    `opus_packet_get_bandwidth`, `opus_packet_get_nb_channels`).
+  - The flags `self_delimited: bool` and `pad: bool` are the enums
+    `packet::Framing` (`Normal`, `SelfDelimited`) and `packet::Padding`
+    (`Shortest`, `FillBuffer`): `packet::parse(data, Framing)`,
+    `packet::write(toc, frames, out, Framing, Padding)`,
+    `Repacketizer::out_range_ext(begin, end, out, Framing, Padding,
+    extensions)`, `packet::pad_with_extensions(data, len, new_len, Padding,
+    extensions)` and `extensions::generate(out, extensions, nb_frames,
+    Padding)`.
+  - `ParsedPacket` has private fields and read-only methods: `toc()`,
+    `nb_frames()` (was the field `count`), `frame_sizes()` (was
+    `sizes[..count]`), `payload_offset()`, `packet_offset()` and
+    `padding_len()`. Only `parse` makes one, so `frames()` and `padding()`
+    cannot panic.
+  - `Repacketizer` is `Clone` but no longer `Copy` (it holds about 1.6 KB).
+  - `extensions::Extension` is `#[non_exhaustive]`; `Extension::new(id,
+    frame, data)` makes one. Its fields stay public for reading.
+  - `ExtensionIterator` implements `Iterator<Item = Result<Extension,
+    Error>>`. After an error it returns `None` (libopus returns the error
+    again). The inherent `next() -> Result<Option<Extension>, Error>` is
+    gone, and `find(id)` is renamed `find_id(id)` so that `Iterator::find`
+    stays callable.
+  - No panics on bad arguments: `nb_frames` above 48 is `BadArg` in
+    `ExtensionIterator` (on the first `next`), `extensions::count`,
+    `count_ext`, `parse` and `parse_ext`, and an `nb_frame_exts` slice shorter
+    than `nb_frames` is `BadArg` in `count_ext` and `parse_ext`.
+    `extensions::count` and `count_ext` therefore return `Result<usize,
+    Error>` instead of `usize`. Counts that do not match the padding no
+    longer overflow in `parse_ext`.
+- DRED (feature `dred`): `OpusDredDecoder::parse(dred, data,
+  max_dred_samples, SampleRate, defer_processing: bool)` takes a
+  `DredProcessing` (`Now`, `Deferred`, exported at the crate root) instead of
+  the bool. `DredParse` is `#[non_exhaustive]`.
 - `OpusEncoder::enable_hybrid_mode` is removed. It only set the audio bandwidth,
   so at higher bitrates the encoder still chose CELT. To ask for Hybrid packets,
   call `set_force_mode(Some(ForcedMode::Hybrid))`. Also call
@@ -87,8 +123,9 @@ test that compares opus1 with the C library under the same settings.
   an unconstrained variable bitrate.
 - The internal modules are private. The public API is the crate root
   (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`,
-  `ForcedMode`, `pcm_soft_clip`) and the modules `packet` and `multistream`. The
-  modules `bands`, `celt`, `celt_lpc`, `hp_cutoff`, `kiss_fft`, `mdct`, `modes`,
+  `ForcedMode`, `pcm_soft_clip`) and the modules `packet`, `extensions` and
+  `multistream`. The modules `bands`, `celt`, `celt_lpc`, `hp_cutoff`,
+  `kiss_fft`, `mdct`, `modes`,
   `pitch`, `pvq`, `quant_bands`, `range_coder`, `rate` and `silk`, the types
   `CeltEncoder`, `CeltDecoder`, `SilkResampler`, `SilkResamplerDown1_3` and
   `SilkResamplerDown1_6` at the crate root, and the macro `tell_frac_inline!`

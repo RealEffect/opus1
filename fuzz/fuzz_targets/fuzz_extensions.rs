@@ -5,7 +5,7 @@
 //!
 //! 1. The data is the padding of a packet of 1 to 48 frames. `count`,
 //!    `count_ext`, `parse` (into a list with room for all and into one that
-//!    is too short), `parse_ext` and the iterator (`next`, `find`,
+//!    is too short), `parse_ext` and the iterator (`next`, `find_id`,
 //!    `set_frame_max`, `reset`) must give libopus's results: the same
 //!    extensions (ID, frame, payload) or the same error. When the padding
 //!    is valid, `generate` of its extensions must give libopus's bytes,
@@ -43,7 +43,7 @@ fn parse_in_frame_order<'a>(data: &'a [u8], nb_frames: usize, what: &str) -> Res
     let mut c_counts = [0i32; 48];
     let c_total = unsafe { opus_packet_extensions_count_ext(data.as_ptr(), len, c_counts.as_mut_ptr(), nf) };
     let mut counts = [0usize; 48];
-    let total = extensions::count_ext(data, &mut counts, nb_frames);
+    let total = extensions::count_ext(data, &mut counts, nb_frames).unwrap_or_else(|e| panic!("{what}: count_ext: {e}"));
     assert_eq!(total, c_total as usize, "{what}: count_ext");
     for f in 0..nb_frames {
         assert_eq!(counts[f], c_counts[f] as usize, "{what}: count_ext of frame {f}");
@@ -86,7 +86,7 @@ fn read_padding(u: &mut Unstructured) -> Result<()> {
 
     // count
     let c_count = unsafe { opus_packet_extensions_count(data.as_ptr(), len, nf) };
-    let count = extensions::count(data, nb_frames);
+    let count = extensions::count(data, nb_frames).unwrap_or_else(|e| panic!("{what}: count: {e}"));
     assert_eq!(count, c_count as usize, "{what}: count");
 
     // parse, into a list with room for one more
@@ -119,10 +119,13 @@ fn read_padding(u: &mut Unstructured) -> Result<()> {
     let ordered = parse_in_frame_order(data, nb_frames, &what);
     assert_eq!(ordered.is_ok(), parsed.is_ok(), "{what}: parse and parse_ext disagree");
 
-    // The iterator, with a frame limit, find and reset.
+    // The iterator, with a frame limit, find and reset. After an error
+    // libopus returns it again on every call, while opus1's iterator ends:
+    // `None` from `next`, `Ok(None)` from `find_id`.
     let mut c_iter: CIter = unsafe { std::mem::zeroed() };
     unsafe { opus_extension_iterator_init(&mut c_iter, data.as_ptr(), len, nf) };
     let mut iter = ExtensionIterator::new(data, nb_frames);
+    let mut failed: Option<i32> = None;
     for step in 0..2 * count + 8 {
         if step == frame_max_step {
             unsafe { opus_extension_iterator_set_frame_max(&mut c_iter, frame_max as c_int) };
@@ -131,13 +134,14 @@ fn read_padding(u: &mut Unstructured) -> Result<()> {
         if step == reset_step {
             unsafe { opus_extension_iterator_reset(&mut c_iter) };
             iter.reset();
+            failed = None;
         }
         let mut c_ext = C_EXT_EMPTY;
         let (c_ret, ret) = match find_id {
             Some(id) if step % 2 == 1 => {
-                (unsafe { opus_extension_iterator_find(&mut c_iter, &mut c_ext, id as c_int) }, iter.find(id))
+                (unsafe { opus_extension_iterator_find(&mut c_iter, &mut c_ext, id as c_int) }, iter.find_id(id))
             }
-            _ => (unsafe { opus_extension_iterator_next(&mut c_iter, &mut c_ext) }, iter.next()),
+            _ => (unsafe { opus_extension_iterator_next(&mut c_iter, &mut c_ext) }, iter.next().transpose()),
         };
         match ret {
             Ok(Some(e)) => {
@@ -145,8 +149,11 @@ fn read_padding(u: &mut Unstructured) -> Result<()> {
                 assert_eq!(plain(&e), c_plain(&c_ext), "{what}: iterator step {step}");
                 assert!(e.frame < nb_frames, "{what}: frame {} of {nb_frames}", e.frame);
             }
-            Ok(None) => assert_eq!(c_ret, 0, "{what}: iterator step {step}"),
-            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: iterator step {step}"),
+            Ok(None) => assert_eq!(c_ret, failed.unwrap_or(0), "{what}: iterator step {step}"),
+            Err(e) => {
+                assert_eq!(e.to_raw(), c_ret, "{what}: iterator step {step}");
+                failed = Some(c_ret);
+            }
         }
     }
 
@@ -193,7 +200,7 @@ fn compare_generate(exts: &[Extension], nb_frames: usize, len: usize, pad: bool,
         Err(e) => assert_eq!(e.to_raw(), c_len, "{what}: generated_len error"),
     }
     let mut out = vec![0xEEu8; len];
-    match extensions::generate(&mut out, exts, nb_frames, pad) {
+    match extensions::generate(&mut out, exts, nb_frames, padding_of(pad)) {
         Ok(n) => {
             assert_eq!(n as i32, c_ret, "{what}: generate");
             assert!(n <= len, "{what}: wrote {n} bytes into {len}");

@@ -475,7 +475,8 @@ assert!(ChannelLayout::surround(4, 3).is_err());
 
 ```rust
 use opus1::multistream::MultistreamEncoder;
-use opus1::{Application, Bitrate, SampleRate, packet};
+use opus1::packet::{self, Framing};
+use opus1::{Application, Bitrate, SampleRate};
 
 // 5.1 at 48 kHz in the channel order of mapping family 1:
 // front left, centre, front right, rear left, rear right, LFE.
@@ -506,9 +507,10 @@ assert_eq!(encoder.bitrate(), 95_120 + 95_120 + 57_560 + 8_195);
 let mut rest = &packet[..len];
 let mut tocs = Vec::new();
 for stream in 0..4 {
-    let parsed = packet::parse(rest, stream < 3).unwrap();
-    tocs.push(parsed.toc);
-    rest = &rest[parsed.packet_offset..];
+    let framing = if stream < 3 { Framing::SelfDelimited } else { Framing::Normal };
+    let parsed = packet::parse(rest, framing).unwrap();
+    tocs.push(parsed.toc());
+    rest = &rest[parsed.packet_offset()..];
 }
 assert!(rest.is_empty());
 // The coupled streams are CELT-only (bit 7 set) and stereo (bit 2 set).

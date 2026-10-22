@@ -53,6 +53,7 @@ use opus1::{
     Application, Bitrate, Channels, ForcedMode, FrameDuration, InbandFec, OpusEncoder, SampleRate,
     Signal,
 };
+use opus1::packet::Framing;
 
 /// Whether the packets must be libopus's: the analysis rounds as the
 /// libopus the tests link only on 64-bit ARM.
@@ -274,7 +275,7 @@ fn first_bytes(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// A packet that holds no audio: libopus's answer to a budget too small to
 /// code anything. Its frames are empty.
 fn holds_no_audio(packet: &[u8]) -> bool {
-    match opus1::packet::parse(packet, false) {
+    match opus1::packet::parse(packet, Framing::Normal) {
         Ok(parsed) => parsed.frames(packet).all(|f| f.is_empty()),
         Err(_) => false,
     }

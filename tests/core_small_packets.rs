@@ -13,6 +13,7 @@ mod k24_common;
 use core_common::*;
 use k24_common::{multitone, speech, to_stereo};
 use opus1::{Application, Bitrate, Channels, ForcedMode, OpusEncoder, SampleRate, packet};
+use opus1::packet::Framing;
 
 fn signal(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
     let voice = speech(rate, seconds);
@@ -23,8 +24,8 @@ fn signal(rate: usize, channels: usize, seconds: f64) -> Vec<f32> {
 
 /// A packet that codes nothing: every frame is empty.
 fn is_placeholder(data: &[u8]) -> bool {
-    let parsed = packet::parse(data, false).unwrap();
-    parsed.sizes[..parsed.count].iter().all(|&size| size == 0)
+    let parsed = packet::parse(data, Framing::Normal).unwrap();
+    parsed.frame_sizes().iter().all(|&size| size == 0)
 }
 
 const MODES: [(&str, Option<(i32, ForcedMode)>); 4] = [
@@ -198,9 +199,9 @@ fn constant_bitrate_above_one_frame_pads_like_libopus() {
             assert_eq!(n, c_packet.len(), "{what}: size");
             assert!(n > 1276, "{what}: {n} bytes");
             assert_eq!(buf[0], c_packet[0], "{what}: first byte");
-            let c_parsed = packet::parse(&c_packet, false).unwrap();
-            let parsed = packet::parse(&buf[..n], false).unwrap();
-            assert_eq!(parsed.sizes[..parsed.count], c_parsed.sizes[..c_parsed.count], "{what}: frame sizes");
+            let c_parsed = packet::parse(&c_packet, Framing::Normal).unwrap();
+            let parsed = packet::parse(&buf[..n], Framing::Normal).unwrap();
+            assert_eq!(parsed.frame_sizes(), c_parsed.frame_sizes(), "{what}: frame sizes");
             c_dec.decode(Some(&buf[..n]), frame, false).unwrap_or_else(|e| panic!("{what}: C decoder: {e}"));
             assert_eq!(enc.final_range(), c_dec.final_range(), "{what}: final range");
         }

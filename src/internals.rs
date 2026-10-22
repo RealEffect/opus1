@@ -4,7 +4,7 @@
 //! This module is not part of the stable API. It is hidden from the
 //! documentation, and any release may change or remove what it holds
 //! without notice. Applications use the items at the crate root and the
-//! modules `packet` and `multistream`.
+//! modules `packet`, `extensions` and `multistream`.
 //!
 //! Each module here has the name and the place of the internal module whose
 //! items it re-exports, and only the items that code outside the crate

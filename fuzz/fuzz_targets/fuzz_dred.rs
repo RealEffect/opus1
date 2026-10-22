@@ -37,8 +37,8 @@ use common::RATES;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use opus1::extensions::{self, Extension};
-use opus1::packet;
-use opus1::{Channels, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate};
+use opus1::packet::{self, Framing, Padding};
+use opus1::{Channels, DredProcessing, OpusDecoder, OpusDred, OpusDredDecoder, SampleRate};
 use std::sync::OnceLock;
 
 /// The DRED header: "D" and the experimental version.
@@ -61,11 +61,11 @@ fn dred_decoder() -> &'static OpusDredDecoder {
 /// `toc` and `frames` as a packet whose padding holds `exts`.
 fn build(toc: u8, frames: &[&[u8]], exts: &[Extension]) -> Option<Vec<u8>> {
     let mut out = vec![0u8; 48 * 1277 + 8];
-    let n = packet::write(toc, frames, &mut out, false, false).ok()?;
+    let n = packet::write(toc, frames, &mut out, Framing::Normal, Padding::Shortest).ok()?;
     let ext_len = extensions::generated_len(1 << 20, exts, frames.len()).ok()?;
     let new_len = n + ext_len + 2 * 48 + 16 + ext_len / 254;
     out.resize(new_len.max(n), 0);
-    let m = packet::pad_with_extensions(&mut out, n, new_len, false, exts).ok()?;
+    let m = packet::pad_with_extensions(&mut out, n, new_len, Padding::Shortest, exts).ok()?;
     out.truncate(if m == 0 { n } else { m });
     Some(out)
 }
@@ -74,11 +74,11 @@ fn build(toc: u8, frames: &[&[u8]], exts: &[Extension]) -> Option<Vec<u8>> {
 fn changed_pool_packet(u: &mut Unstructured) -> Result<Vec<u8>> {
     let pool = &pool().dred;
     let src = &pool[u.choose_index(pool.len())?];
-    let p = packet::parse(src, false).unwrap();
+    let p = packet::parse(src, Framing::Normal).unwrap();
     let frames: Vec<&[u8]> = p.frames(src).collect();
     let padding = p.padding(src);
-    let mut exts = vec![Extension::default(); extensions::count(padding, p.count)];
-    let n = extensions::parse(padding, &mut exts, p.count).unwrap();
+    let mut exts = vec![Extension::default(); extensions::count(padding, p.nb_frames()).unwrap()];
+    let n = extensions::parse(padding, &mut exts, p.nb_frames()).unwrap();
     exts.truncate(n);
     let at = exts.iter().position(|e| e.id == DRED_ID).unwrap();
     let mut payload = exts[at].data.to_vec();
@@ -103,9 +103,9 @@ fn changed_pool_packet(u: &mut Unstructured) -> Result<Vec<u8>> {
             _ => {}
         }
     }
-    let frame = if u.ratio(1, 4)? { u.int_in_range(0..=p.count - 1)? } else { exts[at].frame };
-    exts[at] = Extension { id: DRED_ID, frame, data: &payload };
-    Ok(build(p.toc, &frames, &exts).unwrap_or_else(|| src.clone()))
+    let frame = if u.ratio(1, 4)? { u.int_in_range(0..=p.nb_frames() - 1)? } else { exts[at].frame };
+    exts[at] = Extension::new(DRED_ID, frame, &payload);
+    Ok(build(p.toc(), &frames, &exts).unwrap_or_else(|| src.clone()))
 }
 
 /// A packet from the input with a DRED extension.
@@ -125,7 +125,7 @@ fn made_packet(u: &mut Unstructured) -> Result<Vec<u8>> {
         payload.extend_from_slice(u.bytes(n)?);
         payloads.push((u.int_in_range(0..=count - 1)?, payload));
     }
-    let exts: Vec<Extension> = payloads.iter().map(|(f, d)| Extension { id: DRED_ID, frame: *f, data: d }).collect();
+    let exts: Vec<Extension> = payloads.iter().map(|(f, d)| Extension::new(DRED_ID, *f, d)).collect();
     Ok(build(toc, &frames, &exts).unwrap_or_default())
 }
 
@@ -152,11 +152,12 @@ fn run(mode: u8, u: &mut Unstructured) -> Result<()> {
         0 => u.arbitrary()?,
         _ => u.int_in_range(0..=parse_fs)?,
     };
-    let defer = u.arbitrary()?;
+    let defer: bool = u.arbitrary()?;
+    let processing = if defer { DredProcessing::Deferred } else { DredProcessing::Now };
     let dec = dred_decoder();
     let mut dred = OpusDred::new();
     let what = format!("parse of {} bytes, max {max_samples} at {parse_fs} Hz, defer {defer}", data.len());
-    let found = match dec.parse(&mut dred, &data, max_samples, parse_rate, defer) {
+    let found = match dec.parse(&mut dred, &data, max_samples, parse_rate, processing) {
         Ok(r) => {
             assert!(r.samples >= 0 && r.end >= 0, "{what}: {r:?}");
             if dred.is_parsed() && !defer {

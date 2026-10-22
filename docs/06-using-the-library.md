@@ -26,7 +26,7 @@ opus1 = "0.2"
 
 The crate was published as `opus-rs` up to version 0.1.37. Code that used `opus_rs::` now uses `opus1::`.
 
-The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`, and with a neural network feature also `DnnBlob` and `DnnModels`) and the modules `packet` and `multistream`. The crate also has a module `internals` for the tests of its repository. That module is hidden from the documentation, and any release may change it.
+The public interface is the crate root (`OpusEncoder`, `OpusDecoder`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode` and `pcm_soft_clip`, and with a neural network feature also `DnnBlob` and `DnnModels`) and the modules `packet`, `extensions` and `multistream`. The crate also has a module `internals` for the tests of its repository. That module is hidden from the documentation, and any release may change it.
 
 ## One frame through the encoder and the decoder
 
@@ -533,7 +533,8 @@ When the jitter buffer (the queue that holds received packets until it is time t
 #[cfg(feature = "dred")]
 {
     use opus1::{
-        Application, Bitrate, Channels, OpusDecoder, OpusDred, OpusDredDecoder, OpusEncoder, SampleRate,
+        Application, Bitrate, Channels, DredProcessing, OpusDecoder, OpusDred, OpusDredDecoder,
+        OpusEncoder, SampleRate,
     };
 
     const RATE: SampleRate = SampleRate::Hz16000;
@@ -551,7 +552,7 @@ When the jitter buffer (the queue that holds received packets until it is time t
     ) -> usize {
         let gap = (lost * FRAME) as i32;
         // Only the DRED data that covers the gap is read.
-        let reach = match dred_decoder.parse(dred, next, gap.min(RATE.hz() as i32), RATE, false) {
+        let reach = match dred_decoder.parse(dred, next, gap.min(RATE.hz() as i32), RATE, DredProcessing::Now) {
             Ok(found) => found.samples,
             Err(_) => 0, // not a valid packet: conceal
         };
@@ -597,7 +598,7 @@ When the jitter buffer (the queue that holds received packets until it is time t
     }
     // Packets 10 to 14 are lost; packet 15 arrived. All its DRED data
     // (up to 1 s) reaches back over all of them.
-    let found = dred_decoder.parse(&mut dred, &packets[15], RATE.hz() as i32, RATE, true).unwrap();
+    let found = dred_decoder.parse(&mut dred, &packets[15], RATE.hz() as i32, RATE, DredProcessing::Deferred).unwrap();
     assert!(found.samples >= (5 * FRAME) as i32);
     played += play_after_loss(&mut decoder, &dred_decoder, &mut dred, &packets[15], 5, &mut out);
     assert_eq!(played, 16 * FRAME);
@@ -608,7 +609,7 @@ Points for the jitter buffer:
 
 - DRED helps only when the packet after the gap arrives before the lost audio must be played. A buffer that holds packets for a short delay often has it after a short burst. When it has not arrived, conceal with an empty packet.
 - One parsed `OpusDred` serves every lost packet of the burst, because decoding does not change it. A new packet needs a new parse.
-- `parse` with `defer_processing` set only reads the bits, which is cheap. `process_in_place` then runs the network, the costly step. A receiver can parse each packet as it arrives, to know how far back it reaches, and process only the one it uses.
+- `parse` with `DredProcessing::Deferred` only reads the bits, which is cheap. `process_in_place` then runs the network, the costly step. A receiver can parse each packet as it arrives, to know how far back it reaches, and process only the one it uses.
 - `dred_offset` need not fall on the start of a packet. Only `frame_size` must be a multiple of 2.5 ms.
 - In-band FEC and DRED combine. libopus's test program `opus_demo` uses `decode_fec` for the last lost packet when `packet::has_lbrr` says the next packet carries a copy, and DRED for the others.
 - DRED works at every decoder complexity. It needs the deep PLC models, which are built in. [The decoder](04-decoder.md#10-deep-redundancy-dred-dred_decode) explains what the calls do.

@@ -19,11 +19,22 @@ pub mod pool;
 
 use audiopus_sys as sys;
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
+use opus1::packet::{Framing, Padding};
 use opus1::{Bitrate, FrameDuration};
 use std::os::raw::{c_int, c_uchar};
 
 /// The sampling rates Opus supports.
 pub const RATES: [i32; 5] = [8000, 12000, 16000, 24000, 48000];
+
+/// opus1's framing for libopus's `self_delimited` flag.
+pub fn framing_of(self_delimited: bool) -> Framing {
+    if self_delimited { Framing::SelfDelimited } else { Framing::Normal }
+}
+
+/// opus1's padding for libopus's `pad` flag.
+pub fn padding_of(pad: bool) -> Padding {
+    if pad { Padding::FillBuffer } else { Padding::Shortest }
+}
 
 /// Requests that `audiopus_sys` does not name (opus_private.h).
 pub const OPUS_SET_FORCE_MODE_REQUEST: i32 = 11002;
@@ -894,7 +905,7 @@ pub fn arbitrary_extensions<'a>(
         for f in first..nb_frames {
             for &(id, data) in &pattern {
                 if exts.len() < max {
-                    exts.push(Extension { id, frame: f, data });
+                    exts.push(Extension::new(id, f, data));
                 }
             }
         }
@@ -904,7 +915,7 @@ pub fn arbitrary_extensions<'a>(
         let i = id(u)?;
         let data = payload(u, i)?;
         let at = u.int_in_range(0..=exts.len())?;
-        exts.insert(at, Extension { id: i, frame: frame(u)?, data });
+        exts.insert(at, Extension::new(i, frame(u)?, data));
     }
     Ok(exts)
 }

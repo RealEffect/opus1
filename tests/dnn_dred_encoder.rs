@@ -11,9 +11,10 @@
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::dred::{DRED_EXPERIMENTAL_VERSION, DRED_EXTENSION_ID};
 use opus1::{
-    Application, Bitrate, Channels, DnnBlob, ErrorKind, ForcedMode, OpusDred, OpusDredDecoder,
-    OpusEncoder, SampleRate, packet,
+    Application, Bitrate, Channels, DnnBlob, DredProcessing, ErrorKind, ForcedMode, OpusDred,
+    OpusDredDecoder, OpusEncoder, SampleRate, packet,
 };
+use opus1::packet::Framing;
 use std::alloc::{GlobalAlloc, Layout as MemoryLayout, System};
 use std::cell::Cell;
 
@@ -93,9 +94,9 @@ fn signal(fs: i32, channels: usize, n: usize) -> Vec<f32> {
 
 /// The DRED extension of a packet: its frame and its data.
 fn dred_of(data: &[u8]) -> Option<(usize, Vec<u8>)> {
-    let parsed = packet::parse(data, false).unwrap();
-    let mut it = opus1::extensions::ExtensionIterator::new(parsed.padding(data), parsed.count);
-    let ext = it.find(DRED_EXTENSION_ID).unwrap()?;
+    let parsed = packet::parse(data, Framing::Normal).unwrap();
+    let mut it = opus1::extensions::ExtensionIterator::new(parsed.padding(data), parsed.nb_frames());
+    let ext = it.find_id(DRED_EXTENSION_ID).unwrap()?;
     Some((ext.frame, ext.data.to_vec()))
 }
 
@@ -165,7 +166,7 @@ fn dred_data_is_written_and_read_back() {
                 assert_eq!(&data[..2], &[b'D', DRED_EXPERIMENTAL_VERSION]);
                 assert!(ext_frame < packet::nb_frames(p).unwrap());
                 let got =
-                    dec.parse(&mut dred, p, fs, SampleRate::try_from(fs).unwrap(), false).unwrap();
+                    dec.parse(&mut dred, p, fs, SampleRate::try_from(fs).unwrap(), DredProcessing::Now).unwrap();
                 assert!(got.samples > 0, "{fs} {channels} {frame_ms} {mode:?}");
                 assert!(dred.nb_latents() > 0);
                 assert!(dred.features().iter().all(|x| x.is_finite()));
@@ -300,7 +301,7 @@ fn random_settings_and_inputs_do_not_panic() {
                 .collect();
             match enc.encode(&pcm, frame, &mut out[..buf_len]) {
                 Ok(n) => {
-                    packet::parse(&out[..n], false).unwrap_or_else(|e| panic!("round {round}: {e}"));
+                    packet::parse(&out[..n], Framing::Normal).unwrap_or_else(|e| panic!("round {round}: {e}"));
                     let _ = dred_of(&out[..n]);
                 }
                 Err(e) => assert!(buf_len < 1500 || frame * 400 / fs as usize > 48, "round {round}: {e}"),
