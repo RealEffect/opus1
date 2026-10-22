@@ -1,5 +1,6 @@
 use crate::compat::OnceCell;
 
+use crate::in_place::write_fields;
 use crate::mdct::MdctLookup;
 
 pub const BAND_ALLOCATION: [u8; 11 * 21] = [
@@ -92,34 +93,51 @@ pub const EBAND_5MS: [i16; 22] = [
 
 impl CeltMode {
     pub fn new_48000_960_120() -> Self {
+        let mut mode = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_48000_960_120` initializes every field of `mode`.
+        unsafe {
+            Self::write_48000_960_120(mode.as_mut_ptr());
+            mode.assume_init()
+        }
+    }
+
+    /// Writes the mode of [`new_48000_960_120`](Self::new_48000_960_120)
+    /// to `this`, which may be uninitialized memory, without building its
+    /// 30 KB of transform tables on the stack first (see `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_48000_960_120(this: *mut Self) {
         let short_mdct_size = 120;
         let nb_short_mdcts = 8;
 
         let max_lm = 3usize;
-        let mdct = MdctLookup::new(2 * short_mdct_size * nb_short_mdcts, max_lm);
-        Self {
-            fs: 48000,
-            overlap: 120,
-            nb_ebands: 21,
-            eff_ebands: 21,
-            preemph: [0.850_006_1, 0.100_006_1, 1.512_834_7, 0.661_010_7],
-            e_bands: &EBAND_5MS,
-            max_lm,
-            nb_short_mdcts,
-            short_mdct_size,
-            nb_alloc_vectors: 11,
-            alloc_vectors: &BAND_ALLOCATION,
-            alloc_stride: 21,
-            log_n: &LOG_N_400,
-            window: &WINDOW_120,
-            mdct,
-            cache: PulseCache {
-                size: 392,
-                index: &CACHE_INDEX50,
-                bits: &CACHE_BITS50,
-                caps: &CACHE_CAPS50,
-            },
-            e_means: &E_MEANS,
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                fs: 48000,
+                overlap: 120,
+                nb_ebands: 21,
+                eff_ebands: 21,
+                preemph: [0.850_006_1, 0.100_006_1, 1.512_834_7, 0.661_010_7],
+                e_bands: &EBAND_5MS,
+                max_lm: max_lm,
+                nb_short_mdcts: nb_short_mdcts,
+                short_mdct_size: short_mdct_size,
+                nb_alloc_vectors: 11,
+                alloc_vectors: &BAND_ALLOCATION,
+                alloc_stride: 21,
+                log_n: &LOG_N_400,
+                window: &WINDOW_120,
+                mdct = |p| MdctLookup::write_new(p, 2 * short_mdct_size * nb_short_mdcts, max_lm),
+                cache: PulseCache {
+                    size: 392,
+                    index: &CACHE_INDEX50,
+                    bits: &CACHE_BITS50,
+                    caps: &CACHE_CAPS50,
+                },
+                e_means: &E_MEANS,
+            });
         }
     }
 
@@ -138,7 +156,8 @@ pub const E_MEANS: [f32; 25] = [
 ];
 
 pub fn default_mode() -> &'static CeltMode {
-    MODE_48000_960_120.get(CeltMode::new_48000_960_120)
+    // SAFETY: `write_48000_960_120` initializes the whole mode.
+    unsafe { MODE_48000_960_120.get_or_write(|p| CeltMode::write_48000_960_120(p)) }
 }
 
 static MODE_48000_960_120: OnceCell<CeltMode> = OnceCell::new();

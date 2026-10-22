@@ -56,16 +56,32 @@ impl<T: Sync> OnceCell<T> {
     /// panic would leave the cell in the `initializing` (1) state and subsequent
     /// callers would spin indefinitely. In practice the only initializer used by
     /// this crate (`CeltMode::new_48000_960_120`) is infallible.
+    #[cfg_attr(not(feature = "dnn"), allow(dead_code))]
     pub fn get(&self, init: impl FnOnce() -> T) -> &T {
+        // SAFETY: the closure writes a whole value.
+        unsafe { self.get_or_write(|p| p.write(init())) }
+    }
+
+    /// Like [`get`](Self::get), but `write` builds the value directly in
+    /// the cell, through a pointer to its storage, so that a large value is
+    /// not built on the stack first (see `crate::in_place`). The same rules
+    /// apply: it runs at most once and must not panic.
+    ///
+    /// # Safety
+    /// `write` must initialize the whole value its pointer points to.
+    pub unsafe fn get_or_write(&self, write: impl FnOnce(*mut T)) -> &T {
         if self.state.load(Ordering::Acquire) == 2 {
             // SAFETY: initialization is complete; storage holds a valid `T`.
             return unsafe { (*self.storage.get()).assume_init_ref() };
         }
-        self.get_slow(init)
+        // SAFETY: the caller's guarantee is passed on.
+        unsafe { self.get_slow(write) }
     }
 
+    /// # Safety
+    /// As for `get_or_write`.
     #[cold]
-    fn get_slow(&self, init: impl FnOnce() -> T) -> &T {
+    unsafe fn get_slow(&self, write: impl FnOnce(*mut T)) -> &T {
         // Spin until we either claim the initializer slot (0 -> 1) or observe a
         // finished initialization.
         while self
@@ -83,9 +99,8 @@ impl<T: Sync> OnceCell<T> {
         // We claimed the slot; construct into the inline storage and publish.
         // SAFETY: we are the sole writer (state == 1); no reader can observe the
         // storage until we publish state == 2 with Release ordering.
-        unsafe {
-            (*self.storage.get()).write(init());
-        }
+        // The caller guarantees that `write` initializes the whole value.
+        write(unsafe { (*self.storage.get()).as_mut_ptr() });
         self.state.store(2, Ordering::Release);
         // SAFETY: initialization is complete and published.
         unsafe { (*self.storage.get()).assume_init_ref() }

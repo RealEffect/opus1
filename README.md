@@ -177,8 +177,25 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   about 154 KB with the `analysis` feature and 128 KB without it, and the
   decoder about 60 KB. Place them in a
   `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather
-  than on the stack. The test suite of this build needs big test-thread stacks:
-  `scripts/check_no_std.sh` sets `RUST_MIN_STACK=33554432` (32 MiB).
+  than on the stack. `OpusDecoder::new` returns the decoder through the stack;
+  `OpusDecoder::init` builds it directly in memory you provide, with less than
+  16 KB of stack (see [docs/06](docs/06-using-the-library.md#building-a-decoder-in-place)):
+
+  ```rust
+  use core::mem::MaybeUninit;
+  use opus1::OpusDecoder;
+
+  static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
+
+  let slot = &raw mut DECODER;
+  // SAFETY: run once, while nothing else uses `DECODER`.
+  let decoder = OpusDecoder::init(unsafe { &mut *slot }, 48000, 2)?;
+  # Ok::<(), &'static str>(())
+  ```
+
+  The encoder has no `init` yet. The test suite of this build needs big
+  test-thread stacks: `scripts/check_no_std.sh` sets `RUST_MIN_STACK=33554432`
+  (32 MiB).
 - **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
 - **Frames are capped** at the RFC 6716 maximum of 1275 bytes (the heap-free range-coder buffer is sized accordingly). A packet of 40 to 120 ms holds up to six such frames.
 - **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target. Check with `scripts/check_no_std.sh`.
@@ -389,6 +406,8 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
   multistream encoder and decoder forward the controls that libopus's forward.
 - The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,
   `OpusDecoder::decode24` and `decode_fec24`, and their multistream versions.
+- `OpusDecoder::init` builds a decoder in memory the caller provides, such as
+  a `static`, with little stack, as upstream opus-rs PR #65 does.
 
 **Quality fixes**
 - 48 kHz `Voip`: SILK now reads the float high-pass filter's output, as the

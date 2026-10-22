@@ -2,6 +2,7 @@
 use crate::dnn::osce::OsceBweChannel;
 #[cfg(feature = "osce")]
 use crate::dnn::osce::OsceChannel;
+use crate::in_place::{write_fields, write_zero};
 use crate::silk::define::*;
 use crate::silk::resampler::SilkResampler;
 use crate::silk::structs::{NLSFCodebook, SideInfoIndices};
@@ -16,13 +17,25 @@ pub type OsceHeld<T> = Box<T>;
 #[cfg(all(feature = "osce", not(feature = "heap")))]
 pub type OsceHeld<T> = T;
 
+/// Writes an OSCE state to `p` with `init`, in place (see
+/// `crate::in_place`).
+///
+/// # Safety
+/// `p` must be valid for writes, and `init` must initialize the whole
+/// state its pointer points to.
 #[cfg(all(feature = "osce", feature = "heap"))]
-fn osce_held<T>(value: T) -> OsceHeld<T> {
-    Box::new(value)
+unsafe fn write_osce_held<T>(p: *mut OsceHeld<T>, init: unsafe fn(*mut T)) {
+    // SAFETY: the caller's guarantees.
+    unsafe { p.write(crate::in_place::boxed(|q| init(q))) }
 }
+/// Writes an OSCE state to `p` with `init`, in place.
+///
+/// # Safety
+/// As for the version with `heap`.
 #[cfg(all(feature = "osce", not(feature = "heap")))]
-fn osce_held<T>(value: T) -> OsceHeld<T> {
-    value
+unsafe fn write_osce_held<T>(p: *mut OsceHeld<T>, init: unsafe fn(*mut T)) {
+    // SAFETY: the caller's guarantees.
+    unsafe { init(p) }
 }
 
 #[derive(Clone)]
@@ -122,46 +135,67 @@ pub struct SilkDecoderState {
 
 impl Default for SilkDecoderState {
     fn default() -> Self {
-        Self {
-            prev_gain_q16: 65536,
-            exc_q14: [0; MAX_FRAME_LENGTH],
-            s_lpc_q14_buf: [0; MAX_LPC_ORDER],
-            out_buf: [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
-            lag_prev: 100,
-            last_gain_index: 10,
-            fs_khz: 0,
-            fs_api_hz: 0,
-            nb_subfr: 0,
-            frame_length: 0,
-            subfr_length: 0,
-            ltp_mem_length: 0,
-            lpc_order: 0,
-            prev_nlsf_q15: [0; MAX_LPC_ORDER],
-            first_frame_after_reset: 1,
-            pitch_lag_low_bits_icdf: &crate::silk::tables::SILK_UNIFORM4_ICDF,
-            pitch_contour_icdf: &crate::silk::tables::SILK_PITCH_CONTOUR_ICDF,
-            n_frames_decoded: 0,
-            n_frames_per_packet: 0,
-            ec_prev_signal_type: 0,
-            ec_prev_lag_index: 0,
-            vad_flags: [0; MAX_FRAMES_PER_PACKET],
-            lbrr_flag: 0,
-            lbrr_flags: [0; MAX_FRAMES_PER_PACKET],
-            resampler_state: SilkResampler::default(),
-            resampler_api_hz: 0,
-            // Default to the WB codebook so that decoding before an explicit
-            // `silk_decoder_set_fs` cannot panic on `unwrap`. `set_fs` always
-            // overrides this on the normal path.
-            ps_nlsf_cb: Some(&crate::silk::tables_nlsf::SILK_NLSF_CB_WB),
-            indices: SideInfoIndices::default(),
-            s_cng: SilkCNGState::default(),
-            loss_cnt: 0,
-            prev_signal_type: TYPE_NO_VOICE_ACTIVITY,
-            s_plc: SilkPLCState::default(),
-            #[cfg(feature = "osce")]
-            osce: osce_held(OsceChannel::new()),
-            #[cfg(feature = "osce-bwe")]
-            osce_bwe: osce_held(OsceBweChannel::new()),
+        let mut st = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_default` initializes every field of `st`.
+        unsafe {
+            Self::write_default(st.as_mut_ptr());
+            st.assume_init()
+        }
+    }
+}
+
+impl SilkDecoderState {
+    /// Writes the state of `default` to `this`, which may be uninitialized
+    /// memory, without building it on the stack first (see
+    /// `crate::in_place`). With `osce-bwe` and without `heap` a state is
+    /// 27 KB.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_default(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                prev_gain_q16: 65536,
+                exc_q14 = write_zero,
+                s_lpc_q14_buf: [0; MAX_LPC_ORDER],
+                out_buf = write_zero,
+                lag_prev: 100,
+                last_gain_index: 10,
+                fs_khz: 0,
+                fs_api_hz: 0,
+                nb_subfr: 0,
+                frame_length: 0,
+                subfr_length: 0,
+                ltp_mem_length: 0,
+                lpc_order: 0,
+                prev_nlsf_q15: [0; MAX_LPC_ORDER],
+                first_frame_after_reset: 1,
+                pitch_lag_low_bits_icdf: &crate::silk::tables::SILK_UNIFORM4_ICDF,
+                pitch_contour_icdf: &crate::silk::tables::SILK_PITCH_CONTOUR_ICDF,
+                n_frames_decoded: 0,
+                n_frames_per_packet: 0,
+                ec_prev_signal_type: 0,
+                ec_prev_lag_index: 0,
+                vad_flags: [0; MAX_FRAMES_PER_PACKET],
+                lbrr_flag: 0,
+                lbrr_flags: [0; MAX_FRAMES_PER_PACKET],
+                resampler_state: SilkResampler::default(),
+                resampler_api_hz: 0,
+                // Default to the WB codebook so that decoding before an explicit
+                // `silk_decoder_set_fs` cannot panic on `unwrap`. `set_fs` always
+                // overrides this on the normal path.
+                ps_nlsf_cb: Some(&crate::silk::tables_nlsf::SILK_NLSF_CB_WB),
+                indices: SideInfoIndices::default(),
+                s_cng: SilkCNGState::default(),
+                loss_cnt: 0,
+                prev_signal_type: TYPE_NO_VOICE_ACTIVITY,
+                s_plc: SilkPLCState::default(),
+                #[cfg(feature = "osce")]
+                osce = |p| write_osce_held(p, OsceChannel::write_new),
+                #[cfg(feature = "osce-bwe")]
+                osce_bwe = |p| write_osce_held(p, OsceBweChannel::write_new),
+            });
         }
     }
 }

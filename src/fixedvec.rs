@@ -98,6 +98,22 @@ impl<T, const N: usize> FixedVec<T, N> {
         unsafe { (&raw mut (*this).len).write(len) };
     }
 
+    /// Writes `len` clones of `value` to `this`, which may be uninitialized
+    /// memory: `from_value` for a struct that is built in place (see
+    /// `crate::in_place`). Panics if `len > N`, before anything is written.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    #[inline]
+    pub(crate) unsafe fn write_from_value(this: *mut Self, value: T, len: usize)
+    where
+        T: Clone,
+    {
+        assert!(len <= N, "FixedVec capacity exceeded");
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe { Self::init_from_value(this, value, len) }
+    }
+
     /// Copy a slice into a fresh buffer.
     #[inline]
     pub fn from_slice(src: &[T]) -> Self

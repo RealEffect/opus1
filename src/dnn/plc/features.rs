@@ -103,6 +103,9 @@ pub struct LpcnetEncState {
     features: [f32; NB_TOTAL_FEATURES],
 }
 
+// `DeepPlc::write_new` writes the state in place as zero bytes.
+crate::in_place::zeroable_new!(LpcnetEncState);
+
 impl Default for LpcnetEncState {
     fn default() -> Self {
         Self::new()

@@ -253,6 +253,29 @@ impl<'w> ModelSet<'w> {
         }
     }
 
+    /// Writes the set of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            crate::in_place::write_fields!(this, {
+                #[cfg(feature = "deep-plc")]
+                deep_plc: None,
+                #[cfg(feature = "osce")]
+                lace: None,
+                #[cfg(feature = "osce")]
+                nolace: None,
+                #[cfg(feature = "osce-bwe")]
+                bbwenet: None,
+                _weights: core::marker::PhantomData,
+            });
+        }
+    }
+
     /// The groups that are loaded.
     pub fn models(&self) -> DnnModels {
         #[allow(unused_mut)]

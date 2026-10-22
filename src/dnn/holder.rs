@@ -21,6 +21,7 @@
 
 use super::arch::{self, DnnArch};
 use super::weights::WeightList;
+use crate::in_place::write_fields;
 #[cfg(feature = "deep-plc")]
 use super::{builtin, models};
 
@@ -312,18 +313,37 @@ impl DecoderDnn {
     /// this build (none in a build with only `dnn`), as a new libopus
     /// decoder has.
     pub fn new() -> DecoderDnn {
+        let mut d = core::mem::MaybeUninit::<DecoderDnn>::uninit();
+        // SAFETY: `write_new` initializes every field of `d`.
+        unsafe {
+            DecoderDnn::write_new(d.as_mut_ptr());
+            d.assume_init()
+        }
+    }
+
+    /// Writes the holder of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`). Without `heap` a holder has room for models
+    /// loaded from a blob, 12 KB with every feature.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut DecoderDnn) {
         #[cfg(feature = "deep-plc")]
         let set = builtin::models();
-        DecoderDnn {
-            arch: arch::detect(),
-            #[cfg(feature = "deep-plc")]
-            deep_plc: Slot::builtin(set.deep_plc.as_ref()),
-            #[cfg(feature = "osce")]
-            lace: Slot::builtin(set.lace.as_ref()),
-            #[cfg(feature = "osce")]
-            nolace: Slot::builtin(set.nolace.as_ref()),
-            #[cfg(feature = "osce-bwe")]
-            bbwenet: Slot::builtin(set.bbwenet.as_ref()),
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                arch: arch::detect(),
+                #[cfg(feature = "deep-plc")]
+                deep_plc: Slot::builtin(set.deep_plc.as_ref()),
+                #[cfg(feature = "osce")]
+                lace: Slot::builtin(set.lace.as_ref()),
+                #[cfg(feature = "osce")]
+                nolace: Slot::builtin(set.nolace.as_ref()),
+                #[cfg(feature = "osce-bwe")]
+                bbwenet: Slot::builtin(set.bbwenet.as_ref()),
+            });
         }
     }
 

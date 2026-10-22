@@ -159,15 +159,19 @@ pub fn weights() -> &'static WeightList<'static> {
 /// audio callback) does not take page faults.
 pub fn models() -> &'static ModelSet<'static> {
     static MODELS: OnceCell<ModelSet<'static>> = OnceCell::new();
-    MODELS.get(|| {
-        let mut set = ModelSet::new();
-        // A group that fails stays unloaded; the tests check that all load.
-        let _ = set.load(weights());
-        for &(_, blob) in blobs() {
-            super::holder::prefault(blob);
-        }
-        set
-    })
+    // The set is built in place (see `crate::in_place`): it holds the
+    // layers of every model, 12 KB with every feature.
+    // SAFETY: the closure writes a whole set before it loads the models.
+    unsafe {
+        MODELS.get_or_write(|p| {
+            ModelSet::write_new(p);
+            // A group that fails stays unloaded; the tests check that all load.
+            let _ = (*p).load(weights());
+            for &(_, blob) in blobs() {
+                super::holder::prefault(blob);
+            }
+        })
+    }
 }
 
 /// The layers of the built-in RDOVAE decoder of DRED, built on the first

@@ -18,6 +18,7 @@ use crate::rate::{BITRES, clt_compute_allocation};
 use crate::compat::Math;
 use crate::deep_plc::DeepPlcArgs;
 use crate::fixedvec::FixedVec;
+use crate::in_place::write_fields;
 use crate::{OPUS_BITRATE_MAX, bitrate_to_bits};
 
 // --- Heap-free buffer capacity constants (all sized for the worst case:
@@ -7605,6 +7606,26 @@ impl CeltDecoder {
     /// (8000–48000); the decoder always operates at 48 kHz internally and
     /// decimates by `resampling_factor(sampling_rate)` on output.
     pub fn new(mode: &'static CeltMode, channels: usize, sampling_rate: i32) -> Self {
+        let mut dec = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_new` initializes every field of `dec`.
+        unsafe {
+            Self::write_new(dec.as_mut_ptr(), mode, channels, sampling_rate);
+            dec.assume_init()
+        }
+    }
+
+    /// Writes the decoder of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(
+        this: *mut Self,
+        mode: &'static CeltMode,
+        channels: usize,
+        sampling_rate: i32,
+    ) {
         // All internal buffers are sized for at most 2 channels.
         assert!(
             (1..=2).contains(&channels),
@@ -7620,58 +7641,62 @@ impl CeltDecoder {
         // The energy arrays and the scratch buffers always have room for two
         // channels: a stereo packet can arrive in a mono decoder.
         let nb_x_ch = nb_ebands * CELT_MAX_CHANNELS;
-        Self {
-            mode,
-            channels,
-            stream_channels: channels,
-            downsample: resampling_factor(sampling_rate).unwrap_or(1),
-            start_band: 0,
-            end_band: mode.eff_ebands,
-            complexity: 0,
-            disable_inv: channels == 1,
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below fills the whole buffer it is given.
+        unsafe {
+            write_fields!(this, {
+                mode: mode,
+                channels: channels,
+                stream_channels: channels,
+                downsample: resampling_factor(sampling_rate).unwrap_or(1),
+                start_band: 0,
+                end_band: mode.eff_ebands,
+                complexity: 0,
+                disable_inv: channels == 1,
 
-            rng: 0,
-            last_pitch_index: 0,
-            loss_duration: 0,
-            plc_duration: 0,
-            last_frame_type: FrameType::None,
-            skip_plc: true,
-            prefilter_period: 0,
-            prefilter_period_old: 0,
-            prefilter_gain: 0.0,
-            prefilter_gain_old: 0.0,
-            prefilter_tapset: 0,
-            prefilter_tapset_old: 0,
-            prefilter_and_fold: false,
-            preemph_mem: FixedVec::from_value(0.0, channels),
-            hist_pos: 0,
-            decode_mem: FixedVec::from_value(0.0, channels * CELT_HIST_STRIDE),
-            old_band_e: FixedVec::from_value(0.0, nb_x_ch),
-            // libopus `oldLogE` / `oldLogE2`: the band energies of the two
-            // previous frames. They start at -28 (silence), not 0: the
-            // anti-collapse step compares a band against them, and 0 makes
-            // it inject noise into the first transient frame.
-            old_band_e2: FixedVec::from_value(OLD_LOG_E_RESET, nb_x_ch),
-            old_band_e3: FixedVec::from_value(OLD_LOG_E_RESET, nb_x_ch),
-            background_log_e: FixedVec::from_value(0.0, nb_x_ch),
-            plc_lpc: [0.0; CELT_MAX_CHANNELS * PLC_LPC_ORDER],
-            #[cfg(feature = "deep-plc")]
-            plc_pcm: [0; PLC_UPDATE_SAMPLES],
-            #[cfg(feature = "deep-plc")]
-            plc_fill: 0,
-            #[cfg(feature = "deep-plc")]
-            plc_preemphasis_mem: 0.0,
+                rng: 0,
+                last_pitch_index: 0,
+                loss_duration: 0,
+                plc_duration: 0,
+                last_frame_type: FrameType::None,
+                skip_plc: true,
+                prefilter_period: 0,
+                prefilter_period_old: 0,
+                prefilter_gain: 0.0,
+                prefilter_gain_old: 0.0,
+                prefilter_tapset: 0,
+                prefilter_tapset_old: 0,
+                prefilter_and_fold: false,
+                preemph_mem = |p| FixedVec::write_from_value(p, 0.0, channels),
+                hist_pos: 0,
+                decode_mem = |p| FixedVec::write_from_value(p, 0.0, channels * CELT_HIST_STRIDE),
+                old_band_e = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                // libopus `oldLogE` / `oldLogE2`: the band energies of the two
+                // previous frames. They start at -28 (silence), not 0: the
+                // anti-collapse step compares a band against them, and 0 makes
+                // it inject noise into the first transient frame.
+                old_band_e2 = |p| FixedVec::write_from_value(p, OLD_LOG_E_RESET, nb_x_ch),
+                old_band_e3 = |p| FixedVec::write_from_value(p, OLD_LOG_E_RESET, nb_x_ch),
+                background_log_e = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+                plc_lpc: [0.0; CELT_MAX_CHANNELS * PLC_LPC_ORDER],
+                #[cfg(feature = "deep-plc")]
+                plc_pcm: [0; PLC_UPDATE_SAMPLES],
+                #[cfg(feature = "deep-plc")]
+                plc_fill: 0,
+                #[cfg(feature = "deep-plc")]
+                plc_preemphasis_mem: 0.0,
 
-            w_tf_res: FixedVec::from_value(0, nb_ebands),
-            w_cap: FixedVec::from_value(0, nb_ebands),
-            w_offsets: FixedVec::from_value(0, nb_ebands),
-            w_pulses: FixedVec::from_value(0, nb_ebands),
-            w_ebits: FixedVec::from_value(0, nb_x_ch),
-            w_fine_priority: FixedVec::from_value(0, nb_x_ch),
+                w_tf_res = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_cap = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_offsets = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_pulses = |p| FixedVec::write_from_value(p, 0, nb_ebands),
+                w_ebits = |p| FixedVec::write_from_value(p, 0, nb_x_ch),
+                w_fine_priority = |p| FixedVec::write_from_value(p, 0, nb_x_ch),
 
-            w_x: FixedVec::from_value(0.0, CELT_W_X_DEC),
-            w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
-            w_band_amp: FixedVec::from_value(0.0, nb_x_ch),
+                w_x = |p| FixedVec::write_from_value(p, 0.0, CELT_W_X_DEC),
+                w_collapse_masks = |p| FixedVec::write_from_value(p, 0, nb_x_ch),
+                w_band_amp = |p| FixedVec::write_from_value(p, 0.0, nb_x_ch),
+            });
         }
     }
 

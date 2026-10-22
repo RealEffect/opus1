@@ -7,6 +7,7 @@ use core::mem::MaybeUninit;
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
+use crate::in_place::write_fields;
 
 const MAX_N2: usize = 960;
 const MAX_N4: usize = 480;
@@ -46,9 +47,34 @@ fn holds_strided(len: usize, stride: usize, n2: usize) -> bool {
 
 impl MdctLookup {
     pub fn new(n: usize, max_lm: usize) -> Self {
+        let mut lookup = MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_new` initializes every field of `lookup`.
+        unsafe {
+            Self::write_new(lookup.as_mut_ptr(), n, max_lm);
+            lookup.assume_init()
+        }
+    }
+
+    /// Writes the tables of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building them on the stack first (see
+    /// `crate::in_place`): they take 28 KB.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut Self, n: usize, max_lm: usize) {
         debug_assert!(max_lm <= MDCT_MAX_LM);
-        let mut kfft: FixedVec<Option<KissFftState>, { MDCT_MAX_LM + 1 }> = FixedVec::new();
-        let mut trig: FixedVec<f32, MDCT_TRIG_MAX> = FixedVec::new();
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Once the fields are written, `*this` is a valid (empty) lookup,
+        // and the tables are filled through it.
+        let (kfft, trig) = unsafe {
+            write_fields!(this, {
+                n: n,
+                max_lm: max_lm,
+                kfft: FixedVec::new(),
+                trig: FixedVec::new(),
+            });
+            (&mut (*this).kfft, &mut (*this).trig)
+        };
         let mut curr_n = n;
         // The transform sizes of the 48 kHz mode take their rotation factors
         // from the table of libopus. The table holds the sizes 1920, 960, 480
@@ -85,13 +111,6 @@ impl MdctLookup {
             }
 
             curr_n >>= 1;
-        }
-
-        Self {
-            n,
-            max_lm,
-            kfft,
-            trig,
         }
     }
 

@@ -26,6 +26,7 @@ use crate::dnn::models::bbwenet::BbwenetLayers;
 use crate::dnn::osce::{OsceExtMode, osce_bwe, osce_bwe_cross_fade_10ms, osce_bwe_reset};
 #[cfg(feature = "osce")]
 use crate::dnn::osce::{OsceMethod, osce_reset};
+use crate::in_place::{write_fields, write_zero};
 use crate::osce_args::OsceArgs;
 use crate::range_coder::RangeCoder;
 use crate::silk::decode_frame::{
@@ -96,20 +97,44 @@ struct DecodedFrame {
 
 impl SilkDecoder {
     pub fn new() -> Self {
-        let mut dec = Self {
-            channel_state: [SilkDecoderState::default(), SilkDecoderState::default()],
-            n_channels_api: 1,
-            n_channels_internal: 1,
-            prev_decode_only_middle: 0,
-            s_stereo: StereoDecState::default(),
-            w_silk_buf: [[0; MAX_FRAME_LENGTH + 2]; 2],
-            w_resample_buf: [0; MAX_API_FRAME_LENGTH],
-            #[cfg(feature = "osce-bwe")]
-            prev_osce_extended_mode: OsceExtMode::Unset,
-        };
-        silk_init_decoder(&mut dec.channel_state[0]);
-        silk_init_decoder(&mut dec.channel_state[1]);
-        dec
+        let mut dec = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_new` initializes every field of `dec`.
+        unsafe {
+            Self::write_new(dec.as_mut_ptr());
+            dec.assume_init()
+        }
+    }
+
+    /// Writes the decoder of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`). With `osce-bwe` and without `heap` it is 57 KB.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes;
+        // once the fields are written, `*this` is a valid decoder.
+        unsafe {
+            write_fields!(this, {
+                channel_state = |p: *mut [SilkDecoderState; 2]| {
+                    let first = p.cast::<SilkDecoderState>();
+                    SilkDecoderState::write_default(first);
+                    SilkDecoderState::write_default(first.add(1));
+                },
+                n_channels_api: 1,
+                n_channels_internal: 1,
+                prev_decode_only_middle: 0,
+                s_stereo: StereoDecState::default(),
+                w_silk_buf = write_zero,
+                w_resample_buf = write_zero,
+                #[cfg(feature = "osce-bwe")]
+                prev_osce_extended_mode: OsceExtMode::Unset,
+            });
+            // C `silk_init_decoder`, without clearing the bandwidth
+            // extension state again: `write_default` wrote it cleared.
+            silk_reset_decoder(&mut (*this).channel_state[0]);
+            silk_reset_decoder(&mut (*this).channel_state[1]);
+        }
     }
 
     /// Set the rate and the channel count for [`SilkDecoder::decode`].

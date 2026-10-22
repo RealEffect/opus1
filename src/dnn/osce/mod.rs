@@ -61,6 +61,7 @@ use self::lace::{LaceState, lace_process_20ms_frame};
 use self::math::float2int;
 use self::nolace::{NolaceState, nolace_process_20ms_frame};
 use super::DnnArch;
+use crate::in_place::write_fields;
 use super::holder::DecoderDnn;
 use super::models::lace::LaceLayers;
 use super::models::nolace::NolaceLayers;
@@ -223,9 +224,31 @@ impl OsceChannel {
     /// The state of a new SILK channel: `silk_init_decoder` clears it, then
     /// `silk_reset_decoder` resets it to `OSCE_DEFAULT_METHOD`.
     pub fn new() -> OsceChannel {
-        let mut ch = OsceChannel { method: OsceMethod::None, features: OsceFeatureState::default(), state: ModelState::None };
-        osce_reset(&mut ch, OSCE_DEFAULT_METHOD);
-        ch
+        let mut ch = core::mem::MaybeUninit::<OsceChannel>::uninit();
+        // SAFETY: `write_new` initializes every field of `ch`.
+        unsafe {
+            OsceChannel::write_new(ch.as_mut_ptr());
+            ch.assume_init()
+        }
+    }
+
+    /// Writes the state of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut OsceChannel) {
+        // SAFETY: the caller guarantees that `this` is valid for writes;
+        // once the fields are written, `*this` is a valid channel.
+        unsafe {
+            write_fields!(this, {
+                method: OsceMethod::None,
+                features: OsceFeatureState::default(),
+                state: ModelState::None,
+            });
+            osce_reset(&mut *this, OSCE_DEFAULT_METHOD);
+        }
     }
 
     /// The method of the channel.
@@ -361,6 +384,22 @@ impl OsceBweChannel {
     /// leaves it (not the state of `osce_bwe_reset`).
     pub fn new() -> OsceBweChannel {
         OsceBweChannel::default()
+    }
+
+    /// Writes the state of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut OsceBweChannel) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                features: OsceBweFeatureState::default(),
+                state: BbwenetState::default(),
+            });
+        }
     }
 }
 

@@ -880,6 +880,37 @@ Leave out `analysis` to save its code and tables and the 26 KB of its state, for
 
 Without `std`, the x86-64 code uses AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"`. NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M) and `wasm32-unknown-unknown` when those targets are installed, then runs the tests without `std`.
 
+### Building a decoder in place
+
+Without `heap`, `OpusDecoder` holds all of its state inline: 59,752 bytes, and up to 160,752 bytes with the neural network features (see below). `OpusDecoder::new` returns the decoder by value, so it builds it on the stack and copies it out. In a release build for aarch64 that takes about 192 KB of stack, or 512 KB with `osce-bwe` and `dred`.
+
+`OpusDecoder::init` builds the decoder directly in memory that the caller provides, a `MaybeUninit<OpusDecoder>`, for example in a `static`. It writes every field in place, so no large value is put on the stack. It returns a reference to the decoder, which is the same as the one of `new`. Upstream opus-rs added the same function in its PR #65.
+
+```rust
+use core::mem::MaybeUninit;
+use opus1::OpusDecoder;
+
+static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
+
+// Run once at start-up.
+let slot = &raw mut DECODER;
+// SAFETY: nothing else uses `DECODER` at the same time.
+let decoder: &'static mut OpusDecoder = OpusDecoder::init(unsafe { &mut *slot }, 48000, 2)?;
+
+let mut pcm = [0.0f32; 960 * 2];
+decoder.decode(&[], 960, &mut pcm)?; // conceals a lost frame
+# Ok::<(), &'static str>(())
+```
+
+Measured in a release build for aarch64 without `heap`, with and without the neural network features:
+
+- `init` needs less than 16 KB of stack. This includes the first call of a program, which also builds the tables that every decoder shares: the CELT mode and, with the neural network features, the built-in models.
+- Decoding 48 kHz stereo music, with one packet in seven lost, needed less than 16 KB of stack, or 24 KB with the neural network features at complexity 10. Other signals and modes were not measured.
+
+`init` overwrites what the slot holds without dropping it. A decoder without `heap` owns no other memory, so there is nothing to drop. With `heap`, `init` also works: it writes the boxed parts straight into their heap memory. Drop such a decoder with `MaybeUninit::assume_init_drop`.
+
+The encoder and the multistream decoder have no `init` yet.
+
 ### Size of the encoder and the decoder
 
 The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of the speech and music analysis), the decoder sizes on the branch that connects deep PLC and OSCE (`next-wave2`). Both use `size_of` and a counting allocator, a release build, and Rust 1.98 on aarch64-apple-darwin. The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.

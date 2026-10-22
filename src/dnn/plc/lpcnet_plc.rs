@@ -33,6 +33,7 @@
 use crate::compat::Math;
 use crate::dnn::Activation;
 use crate::dnn::arch::DnnArch;
+use crate::in_place::{write_fields, write_zero};
 use crate::dnn::freq::{self, FRAME_SIZE, NB_BANDS, fmaf};
 use crate::dnn::models::DeepPlcModels;
 use crate::dnn::models::plc::{PLC_DENSE_IN_OUT_SIZE, PLC_GRU1_STATE_SIZE, PLC_GRU2_STATE_SIZE, PlcModel};
@@ -176,6 +177,9 @@ pub struct DeepPlc {
     plc_bak: [PlcNetState; 2],
 }
 
+// `DeepPlc::write_new` writes these states in place as zero bytes.
+crate::in_place::zeroable_new!(PlcNetState);
+
 impl Default for DeepPlc {
     fn default() -> Self {
         Self::new()
@@ -185,24 +189,42 @@ impl Default for DeepPlc {
 impl DeepPlc {
     /// A new state (libopus `lpcnet_plc_init`: FARGAN and the feature
     /// analysis cleared, then `lpcnet_plc_reset`).
-    pub const fn new() -> Self {
-        DeepPlc {
-            fargan: FarganState::new(),
-            enc: LpcnetEncState::new(),
-            fec: [[0.0; NB_FEATURES]; PLC_MAX_FEC],
-            analysis_gap: true,
-            fec_read_pos: 0,
-            fec_fill_pos: 0,
-            fec_skip: 0,
-            analysis_pos: PLC_BUF_SIZE as i32,
-            predict_pos: PLC_BUF_SIZE as i32,
-            pcm: [0.0; PLC_BUF_SIZE],
-            blend: false,
-            features: [0.0; NB_TOTAL_FEATURES],
-            cont_features: [0.0; CONT_VECTORS * NB_FEATURES],
-            loss_count: 0,
-            plc_net: PlcNetState::new(),
-            plc_bak: [PlcNetState::new(); 2],
+    pub fn new() -> Self {
+        let mut st = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `write_new` initializes every field of `st`.
+        unsafe {
+            Self::write_new(st.as_mut_ptr());
+            st.assume_init()
+        }
+    }
+
+    /// Writes the state of [`new`](Self::new) to `this`, which may be
+    /// uninitialized memory, without building it on the stack first (see
+    /// `crate::in_place`): the state is 42 KB.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    pub(crate) unsafe fn write_new(this: *mut Self) {
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        unsafe {
+            write_fields!(this, {
+                fargan: FarganState::new(),
+                enc = write_zero,
+                fec = write_zero,
+                analysis_gap: true,
+                fec_read_pos: 0,
+                fec_fill_pos: 0,
+                fec_skip: 0,
+                analysis_pos: PLC_BUF_SIZE as i32,
+                predict_pos: PLC_BUF_SIZE as i32,
+                pcm = write_zero,
+                blend: false,
+                features = write_zero,
+                cont_features = write_zero,
+                loss_count: 0,
+                plc_net = write_zero,
+                plc_bak = write_zero,
+            });
         }
     }
 

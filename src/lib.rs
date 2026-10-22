@@ -15,6 +15,7 @@ extern crate std;
 
 mod compat;
 mod fixedvec;
+mod in_place;
 mod mathops;
 
 /// Tools that measure decoded audio: a port of libopus `opus_compare`, the
@@ -100,6 +101,8 @@ mod doc_examples {
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
+use crate::in_place::write_fields;
+use core::mem::MaybeUninit;
 use analysis::{AnalysisGate, AnalysisInfo, AnalysisPcm, PcmRef, SecondChannel, is_digital_silence};
 use celt::{CeltDecoder, CeltEncoder};
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float};
@@ -4143,71 +4146,131 @@ const ERR_UNIMPLEMENTED: &str = "Request not implemented";
 
 impl OpusDecoder {
     pub fn new(sampling_rate: i32, channels: usize) -> Result<Self, &'static str> {
+        let mut dec = MaybeUninit::<Self>::uninit();
+        Self::init(&mut dec, sampling_rate, channels)?;
+        // SAFETY: `init` succeeded, so it initialized `dec`.
+        Ok(unsafe { dec.assume_init() })
+    }
+
+    /// Builds a decoder in `slot`, memory that the caller provides, and
+    /// returns it. The decoder is the same as the one of
+    /// [`new`](Self::new), and the errors are the same.
+    ///
+    /// Without the `heap` feature a decoder holds all of its state inline
+    /// (about 60 KB, 160 KB with the neural network features), and `new`
+    /// returns it through the stack, which needs about twice that. `init`
+    /// writes the decoder straight into `slot`, for example a `static`, so
+    /// building it needs only a little stack. With `heap` it writes the
+    /// boxed parts straight into their heap memory.
+    ///
+    /// A decoder that `slot` already holds is overwritten without being
+    /// dropped: with `heap` its memory leaks. To drop a decoder built with
+    /// `init` (which matters only with `heap`), call
+    /// [`MaybeUninit::assume_init_drop`] on `slot`.
+    ///
+    /// ```
+    /// use core::mem::MaybeUninit;
+    /// use opus1::OpusDecoder;
+    ///
+    /// // In a `no_std` program this would be a `static`.
+    /// let mut slot = MaybeUninit::<OpusDecoder>::uninit();
+    /// let decoder = OpusDecoder::init(&mut slot, 48000, 2)?;
+    /// let mut pcm = [0.0f32; 960 * 2];
+    /// decoder.decode(&[], 960, &mut pcm)?; // a lost frame
+    /// # Ok::<(), &'static str>(())
+    /// ```
+    pub fn init(
+        slot: &mut MaybeUninit<Self>,
+        sampling_rate: i32,
+        channels: usize,
+    ) -> Result<&mut Self, &'static str> {
         if ![8000, 12000, 16000, 24000, 48000].contains(&sampling_rate) {
             return Err("Invalid sampling rate");
         }
         if ![1, 2].contains(&channels) {
             return Err("Invalid number of channels");
         }
+        // SAFETY: `slot` is valid for writes of `Self`, and `write_new`
+        // initializes every field, so `slot` holds a decoder afterwards.
+        unsafe {
+            Self::write_new(slot.as_mut_ptr(), sampling_rate, channels);
+            Ok(slot.assume_init_mut())
+        }
+    }
 
+    /// Writes a new decoder to `this` field by field (see
+    /// `crate::in_place`). The arguments must be valid.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes of `Self`.
+    unsafe fn write_new(this: *mut Self, sampling_rate: i32, channels: usize) {
         let mode = modes::default_mode();
-        #[cfg(feature = "heap")]
-        let celt_dec = Box::new(CeltDecoder::new(mode, channels, sampling_rate));
-        #[cfg(not(feature = "heap"))]
-        let celt_dec = CeltDecoder::new(mode, channels, sampling_rate);
+        // SAFETY: the caller guarantees that `this` is valid for writes.
+        // Each closure below writes the whole field it is given.
+        unsafe {
+            write_fields!(this, {
+                #[cfg(not(feature = "heap"))]
+                celt_dec = |p| CeltDecoder::write_new(p, mode, channels, sampling_rate),
+                #[cfg(feature = "heap")]
+                celt_dec = |p: *mut Box<CeltDecoder>| {
+                    let celt = |q| CeltDecoder::write_new(q, mode, channels, sampling_rate);
+                    p.write(in_place::boxed(celt))
+                },
+                // C `silk_InitDecoder`. The SILK decoder learns its rates and
+                // channel counts with every frame (`SilkDecControl`).
+                #[cfg(not(feature = "heap"))]
+                silk_dec = |p| silk::dec_api::SilkDecoder::write_new(p),
+                #[cfg(feature = "heap")]
+                silk_dec = |p: *mut Box<silk::dec_api::SilkDecoder>| {
+                    p.write(in_place::boxed(|q| silk::dec_api::SilkDecoder::write_new(q)))
+                },
+                sampling_rate: sampling_rate,
+                channels: channels,
+                mode: None,
+                prev_mode: None,
+                prev_redundancy: false,
+                // C `opus_decoder_init`: `st->frame_size = Fs/400`.
+                frame_size: sampling_rate as usize / 400,
+                stream_channels: channels,
+                range_final: 0,
+                last_packet_duration: 0,
+                softclip_mem: [0.0; OPUS_MAX_CHANNELS],
+                silk_channels_internal: 0,
+                silk_internal_rate: 0,
 
-        // C `silk_InitDecoder`. The SILK decoder learns its rates and
-        // channel counts with every frame (`SilkDecControl`).
-        #[cfg(feature = "heap")]
-        let silk_dec = Box::new(silk::dec_api::SilkDecoder::new());
-        #[cfg(not(feature = "heap"))]
-        let silk_dec = silk::dec_api::SilkDecoder::new();
+                #[cfg(not(feature = "heap"))]
+                w_pcm_i16 = |p| FixedVec::write_from_value(p, 0i16, 960 * channels),
+                #[cfg(feature = "heap")]
+                w_pcm_i16: Box::new(FixedVec::from_value(0i16, 960 * channels)),
 
-        Ok(Self {
-            celt_dec,
-            silk_dec,
-            sampling_rate,
-            channels,
-            mode: None,
-            prev_mode: None,
-            prev_redundancy: false,
-            // C `opus_decoder_init`: `st->frame_size = Fs/400`.
-            frame_size: sampling_rate as usize / 400,
-            stream_channels: channels,
-            range_final: 0,
-            last_packet_duration: 0,
-            softclip_mem: [0.0; OPUS_MAX_CHANNELS],
-            silk_channels_internal: 0,
-            silk_internal_rate: 0,
+                #[cfg(not(feature = "heap"))]
+                w_silk_out = |p| FixedVec::write_from_value(p, 0.0f32, 960 * channels),
+                #[cfg(feature = "heap")]
+                w_silk_out: Box::new(FixedVec::from_value(0.0f32, 960 * channels)),
+                #[cfg(feature = "heap")]
+                w_pcm_float: Some(Box::default()),
 
-            #[cfg(not(feature = "heap"))]
-            w_pcm_i16: FixedVec::from_value(0i16, 960 * channels),
-            #[cfg(feature = "heap")]
-            w_pcm_i16: Box::new(FixedVec::from_value(0i16, 960 * channels)),
-
-            #[cfg(not(feature = "heap"))]
-            w_silk_out: FixedVec::from_value(0.0f32, 960 * channels),
-            #[cfg(feature = "heap")]
-            w_silk_out: Box::new(FixedVec::from_value(0.0f32, 960 * channels)),
-            #[cfg(feature = "heap")]
-            w_pcm_float: Some(Box::default()),
-
-            // C `opus_decoder_init`: `st->complexity = 0`.
-            complexity: 0,
-            decode_gain: 0,
-            silk_prev_pitch_lag: 0,
-            #[cfg(feature = "osce-bwe")]
-            osce_bwe: false,
-            #[cfg(all(feature = "dnn", feature = "heap"))]
-            dnn: Box::new(dnn::DecoderDnn::new()),
-            #[cfg(all(feature = "dnn", not(feature = "heap")))]
-            dnn: dnn::DecoderDnn::new(),
-            // C `lpcnet_plc_init`.
-            #[cfg(all(feature = "deep-plc", feature = "heap"))]
-            deep_plc: Box::new(dnn::plc::DeepPlc::new()),
-            #[cfg(all(feature = "deep-plc", not(feature = "heap")))]
-            deep_plc: dnn::plc::DeepPlc::new(),
-        })
+                // C `opus_decoder_init`: `st->complexity = 0`.
+                complexity: 0,
+                decode_gain: 0,
+                silk_prev_pitch_lag: 0,
+                #[cfg(feature = "osce-bwe")]
+                osce_bwe: false,
+                #[cfg(all(feature = "dnn", not(feature = "heap")))]
+                dnn = |p| dnn::DecoderDnn::write_new(p),
+                #[cfg(all(feature = "dnn", feature = "heap"))]
+                dnn = |p: *mut Box<dnn::DecoderDnn>| {
+                    p.write(in_place::boxed(|q| dnn::DecoderDnn::write_new(q)))
+                },
+                // C `lpcnet_plc_init`.
+                #[cfg(all(feature = "deep-plc", not(feature = "heap")))]
+                deep_plc = |p| dnn::plc::DeepPlc::write_new(p),
+                #[cfg(all(feature = "deep-plc", feature = "heap"))]
+                deep_plc = |p: *mut Box<dnn::plc::DeepPlc>| {
+                    p.write(in_place::boxed(|q| dnn::plc::DeepPlc::write_new(q)))
+                },
+            });
+        }
     }
 
     /// Decode one Opus packet into interleaved `f32` PCM, returning the
