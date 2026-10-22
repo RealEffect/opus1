@@ -98,6 +98,13 @@ test that compares opus1 with the C library under the same settings.
   - `Application`, `ForcedMode`, `Signal`, `InbandFec` and
     `multistream::MappingType` are `#[non_exhaustive]`, like `ErrorKind` and
     `SampleRate`. A `match` on them needs a `_` arm.
+  - New `Application::RestrictedSilk` (2052) and
+    `Application::RestrictedCelt` (2053), the applications
+    `OPUS_APPLICATION_RESTRICTED_SILK` and `OPUS_APPLICATION_RESTRICTED_CELT`
+    of libopus 1.6, with their behaviour, also in `MultistreamEncoder`:
+    SILK-only at most wideband in frames of 10 ms or more, and CELT-only
+    with the packets of `RestrictedLowDelay`. `set_application` refuses to
+    change to them or from them, as libopus does.
   - Every small enum derives `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq` and
     `Hash`. `Application`, `Bandwidth`, `Signal`, `ForcedMode`, `InbandFec`
     and `FrameDuration` have `const fn to_raw(self) -> i32` (the libopus

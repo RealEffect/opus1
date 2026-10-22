@@ -18,6 +18,8 @@ fuzz_target!(|data: &[u8]| {
                 Application::Voip,
                 Application::Audio,
                 Application::RestrictedLowDelay,
+                Application::RestrictedSilk,
+                Application::RestrictedCelt,
             ] {
                 let mut encoder = match OpusEncoder::new(SampleRate::try_from(sampling_rate).unwrap(), Channels::try_from(channels).unwrap(), application) {
                     Ok(e) => e,

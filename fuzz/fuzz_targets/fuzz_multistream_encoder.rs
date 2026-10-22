@@ -14,7 +14,9 @@
 //! (DTX), settings of single streams, the frame size, the output buffer,
 //! the signal and its format, or resets the encoder. What must hold for every frame:
 //!
-//! - With an output buffer of 4000 bytes per stream the frame is encoded.
+//! - With an output buffer of 4000 bytes per stream the frame is encoded,
+//!   unless the application is `RestrictedSilk` and the frame is shorter
+//!   than 10 ms, which libopus refuses too.
 //! - Every packet is accepted by libopus's multistream decoder, which
 //!   decodes exactly one frame and ends in the encoder's final range.
 //! - With a constant bitrate and an explicit or the maximum bitrate, the
@@ -236,7 +238,13 @@ fn change(u: &mut Unstructured, encs: [&mut MultistreamEncoder; 2]) -> Result<()
 fn run(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let fs = *u.choose(&RATES)?;
-    let app = *u.choose(&[Application::Voip, Application::Audio, Application::RestrictedLowDelay])?;
+    let app = *u.choose(&[
+        Application::Voip,
+        Application::Audio,
+        Application::RestrictedLowDelay,
+        Application::RestrictedSilk,
+        Application::RestrictedCelt,
+    ])?;
     // The twin is built from the same bytes as the encoder, so it gets the
     // same layout.
     let mut twin_u = Unstructured::new(u.peek_bytes(u.len()).unwrap_or(&[]));
@@ -328,7 +336,11 @@ fn run(data: &[u8]) -> Result<()> {
         let len = match r {
             Ok(len) => len,
             Err(e) => {
-                assert!(out_len < big, "frame {n}: encode of {frame_size} samples into {out_len} bytes failed: {e}");
+                let refused = app == Application::RestrictedSilk && frame_size < fs as usize / 100;
+                assert!(
+                    out_len < big || refused,
+                    "frame {n}: encode of {frame_size} samples into {out_len} bytes failed: {e}"
+                );
                 continue;
             }
         };

@@ -96,12 +96,12 @@ input audio --+                                                 +--> range coder
 The encoder chooses the mode again for every packet. It looks at:
 
 - the bitrate;
-- the application: `Application::Voip` (speech), `Application::Audio` (music and general audio) or `Application::RestrictedLowDelay`;
+- the application: `Application::Voip` (speech), `Application::Audio` (music and general audio), or one of the restricted applications `Application::RestrictedLowDelay`, `Application::RestrictedSilk` and `Application::RestrictedCelt`;
 - the frame duration: frames shorter than 10 ms are always CELT-only;
 - packet loss and in-band forward error correction (FEC): they favour SILK, because only SILK carries FEC;
 - the mode of the previous packet, so that the choice does not flip back and forth.
 
-A `RestrictedLowDelay` encoder always codes CELT-only. `OpusEncoder::set_force_mode` asks for a mode instead of the automatic choice.
+A `RestrictedLowDelay` or `RestrictedCelt` encoder always codes CELT-only. A `RestrictedSilk` encoder always codes SILK-only, at most wideband, in frames of 10 ms or more. These two came with libopus 1.6, for decoders that have only one of the two codecs. The limit holds for every packet that carries audio. When the bitrate or the output buffer is too small to code a frame, the encoder writes a packet without audio, as libopus does, and its TOC byte names the mode of the last coded frame. Before the first coded frame, and after `reset_state`, that is Hybrid, libopus's initial mode, also for a restricted encoder (see [Opus packets](02-packets.md#packets-without-audio)). `OpusEncoder::set_force_mode` asks for a mode instead of the automatic choice.
 
 The floating-point build of libopus also runs a speech and music analysis on the input. It runs at complexity 7 and above, for input at 16 kHz or more. It estimates for every packet how likely the input is speech or music, and which bandwidth it really uses. opus1 runs the same analysis and gets the same results. Below complexity 7, and at 8 and 12 kHz, both use fixed estimates instead: `Voip` input counts as mostly speech, and `Audio` input as mostly music.
 
@@ -270,12 +270,13 @@ The algorithmic delay is the delay that the codec itself adds. It does not count
 The lookahead has two parts:
 
 - 2.5 ms for the overlap of CELT's MDCT windows.
-- 4 ms that libopus adds so that SILK and CELT line up: 2.5 ms of SILK lookahead, and 1.5 ms for SILK's resamplers and stereo prediction. `RestrictedLowDelay` leaves these 4 ms out.
+- 4 ms that libopus adds so that SILK and CELT line up: 2.5 ms of SILK lookahead, and 1.5 ms for SILK's resamplers and stereo prediction. `RestrictedLowDelay` and `RestrictedCelt` leave these 4 ms out.
 
 | Application | Lookahead | Delay with 20 ms frames | Delay with 2.5 ms frames |
 |---|---|---|---|
 | `Voip`, `Audio` | 6.5 ms | 26.5 ms | 9 ms |
-| `RestrictedLowDelay` | 2.5 ms | 22.5 ms | 5 ms |
+| `RestrictedSilk` | 6.5 ms | 26.5 ms | (no frames under 10 ms) |
+| `RestrictedLowDelay`, `RestrictedCelt` | 2.5 ms | 22.5 ms | 5 ms |
 
 `OpusEncoder::lookahead` returns the lookahead in samples per channel, at the input sampling rate:
 
