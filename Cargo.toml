@@ -48,6 +48,17 @@ heap = ["std"]
 # needed when `std` is enabled. Enable with:
 #   opus1 = { version = "...", default-features = false, features = ["libm"] }
 libm = ["dep:libm"]
+# For targets without atomic compare-and-swap (CAS) instructions, such as
+# `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf`
+# (ESP32-C3): the lazily built shared tables (the CELT mode, the built-in
+# neural network models) then use the atomics of the `portable-atomic`
+# crate. On those targets portable-atomic needs one more setting from the
+# application: its `critical-section` feature (with a `critical-section`
+# implementation) or, on a single-core chip,
+# `RUSTFLAGS="--cfg portable_atomic_unsafe_assume_single_core"`. Targets
+# with CAS do not need this feature. The same idea as upstream opus-rs PR
+# #64 by Alix ANNERAUD.
+portable-atomic = ["dep:portable-atomic"]
 # The speech and music analysis of the encoder (libopus `src/analysis.c` and
 # `src/mlp.c`), which libopus runs from complexity 7 on. It adds about 28 KB
 # of code, 24 KB of tables (mostly the network weights) and 26 KB of state
@@ -100,6 +111,7 @@ test-libopus-dnn = []
 
 [dependencies]
 libm = { version = "0.2", optional = true, default-features = false }
+portable-atomic = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

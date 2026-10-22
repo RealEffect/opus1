@@ -1,4 +1,5 @@
-//! no_std / std compatibility shims — zero external dependencies.
+//! no_std / std compatibility shims, without external dependencies (except
+//! the optional `portable-atomic`, for targets without compare-and-swap).
 //!
 //! Provides:
 //! * [`OnceCell`] — a dependency-free, **heap-free** lazy cell backed by a 3-state
@@ -13,7 +14,14 @@
 use core::cell::UnsafeCell;
 use core::hint;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, Ordering};
+// The cell's state is the only atomic of the crate, and `get_slow` its only
+// compare-and-swap (CAS). On targets without CAS instructions the feature
+// `portable-atomic` supplies it (see Cargo.toml).
+use core::sync::atomic::Ordering;
+#[cfg(not(feature = "portable-atomic"))]
+use core::sync::atomic::AtomicU8;
+#[cfg(feature = "portable-atomic")]
+use portable_atomic::AtomicU8;
 
 // ---------------------------------------------------------------------------
 // OnceCell (heap-free lazy initialization)

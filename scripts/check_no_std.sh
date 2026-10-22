@@ -42,4 +42,21 @@ for features in "${FEATURE_SETS[@]}"; do
     RUST_MIN_STACK=${RUST_MIN_STACK:-33554432} cargo test --no-default-features --features "$features" || fail=1
 done
 
+# A target without compare-and-swap (CAS) instructions: ARM Cortex-M0/M0+.
+# It needs the feature `portable-atomic`, and portable-atomic needs one
+# setting from the application; this build assumes a single-core chip.
+t="thumbv6m-none-eabi"
+if rustup target list --installed 2>/dev/null | grep -q "$t"; then
+    for features in "libm,portable-atomic" "libm,portable-atomic,analysis"; do
+        echo ":: building opus1 (no_std, features $features) for $t"
+        if ! RUSTFLAGS="--cfg portable_atomic_unsafe_assume_single_core" \
+            cargo build --no-default-features --features "$features" --target "$t"; then
+            echo "!! FAILED: $t ($features)"
+            fail=1
+        fi
+    done
+else
+    echo "-- skip $t (not installed; run: rustup target add $t)"
+fi
+
 exit $fail

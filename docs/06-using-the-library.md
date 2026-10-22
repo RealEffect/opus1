@@ -857,6 +857,7 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 | `heap` | on | Keeps the large codec state behind `Box`, so `OpusEncoder` and `OpusDecoder` themselves are small. Requires `std`. |
 | `analysis` | on | The speech and music analysis of the encoder. It adds about 28 KB of machine code and 24 KB of tables, most of them the weights of its network as `f32` (measured in a release build for aarch64-apple-darwin that encodes one frame). Without it the encoder decides at every complexity as at complexity 6, and `OpusEncoder` is 25,968 bytes smaller without `heap` (see below). It works with and without `std`. |
 | `libm` | off | Provides `sin`, `cos`, `sqrt` and the other float functions through the `libm` crate, a pure-Rust port of the musl C library's math functions. A build without `std` needs it. |
+| `portable-atomic` | off | For targets without atomic compare-and-swap (CAS) instructions, such as `thumbv6m-none-eabi` (Cortex-M0 and M0+). The shared tables are then built with the atomics of the `portable-atomic` crate. See [Targets without compare-and-swap](#targets-without-compare-and-swap). |
 | `deep-plc`, `osce`, `osce-bwe`, `dred` | off | The neural network features of the decoder (`dred` also of the encoder), with the weights of libopus 1.6.1 (see [Neural network features of the decoder](#neural-network-features-of-the-decoder)). `osce` turns on `deep-plc`, `osce-bwe` turns on `osce`, and `dred` turns on `deep-plc`. Each turns on `dnn`. |
 | `dnn` | off | The code that the neural network features share. The features above turn it on. |
 | `test-libopus-dnn` | off | For the tests of this repository only. It adds nothing to the library. It compiles the tests that call a libopus built with its neural network code. `cargo test --all-features` fails to link against a libopus without that code, such as the Homebrew build. |
@@ -865,7 +866,7 @@ Three builds are possible:
 
 - Default (`std`, `heap` and `analysis`): no dependencies at run time.
 - `std` without `heap` (`default-features = false, features = ["std", "analysis"]`): the codec state is stored inline, and the `multistream` module is available.
-- `#![no_std]` without `alloc` (`default-features = false, features = ["libm", "analysis"]`): no allocator is needed at all. One dependency, `libm`. The `multistream` module is not available. A build with neither `std` nor `libm` stops with a compile error that names the missing feature.
+- `#![no_std]` without `alloc` (`default-features = false, features = ["libm", "analysis"]`): no allocator is needed at all. One dependency, `libm` (two with `portable-atomic`). The `multistream` module is not available. A build with neither `std` nor `libm` stops with a compile error that names the missing feature.
 
 ```toml
 [dependencies.opus1]
@@ -878,7 +879,7 @@ The neural network features work in all three builds. Without `heap`, `DnnBlob::
 
 Leave out `analysis` to save its code and tables and the 26 KB of its state, for example on a small processor that encodes at complexity 6 or below anyway.
 
-Without `std`, the x86-64 code uses AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"`. NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M) and `wasm32-unknown-unknown` when those targets are installed, then runs the tests without `std`.
+Without `std`, the x86-64 code uses AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"`. NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown` and `thumbv6m-none-eabi` (Cortex-M0, with `portable-atomic`) when those targets are installed, then runs the tests without `std`.
 
 ### Building a decoder in place
 
@@ -910,6 +911,26 @@ Measured in a release build for aarch64 without `heap`, with and without the neu
 `init` overwrites what the slot holds without dropping it. A decoder without `heap` owns no other memory, so there is nothing to drop. With `heap`, `init` also works: it writes the boxed parts straight into their heap memory. Drop such a decoder with `MaybeUninit::assume_init_drop`.
 
 The encoder and the multistream decoder have no `init` yet.
+
+### Targets without compare-and-swap
+
+The tables that all encoders and decoders share (the CELT mode and the built-in neural network models) are built on first use. A small atomic state guards each of them, and the first caller claims it with an atomic compare-and-swap (CAS). Some processors have no CAS instruction, for example the ARM Cortex-M0 and M0+ (`thumbv6m-none-eabi`) and the RISC-V cores without the atomic extension, such as the ESP32-C3 (`riscv32imc-unknown-none-elf`). For them, turn on the feature `portable-atomic`. It takes the atomics from the [`portable-atomic`](https://crates.io/crates/portable-atomic) crate, an idea of upstream opus-rs PR #64 by Alix ANNERAUD.
+
+```toml
+[dependencies.opus1]
+version = "0.2"
+default-features = false
+features = ["libm", "portable-atomic"]
+```
+
+On such a target portable-atomic needs one more setting from the application:
+
+- On a single-core chip, build with `RUSTFLAGS="--cfg portable_atomic_unsafe_assume_single_core"`. portable-atomic then makes the compare-and-swap safe by turning interrupts off around it.
+- Otherwise, turn on portable-atomic's `critical-section` feature, and provide an implementation of the [`critical-section`](https://crates.io/crates/critical-section) crate (most hardware support crates have one).
+
+Without one of these, portable-atomic stops the build with an error that says so. Targets that have CAS do not need the feature; with it, they use their own atomic instructions. The `heap` feature needs `std`, and with `std` the crate uses `Arc` for a weight blob loaded at run time; targets without CAS have no `std`, so this does not concern them.
+
+`scripts/check_no_std.sh` builds the crate for `thumbv6m-none-eabi` with `portable-atomic` when that target is installed. The neural network features build there as well.
 
 ### Size of the encoder and the decoder
 

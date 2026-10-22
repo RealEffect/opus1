@@ -167,8 +167,9 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 | `dnn`    | no      | The code that the neural network features share (layer kernels, weight blob parser). Not meant to be selected alone: `deep-plc`, `osce`, `osce-bwe` and `dred` turn it on. |
 | `test-libopus-dnn` | no | Test only: compiles the tests that compare with a libopus built with its neural network code (see [docs/09](docs/09-testing.md#tests-of-the-neural-network-code)). |
 | `libm`   | no      | Required for `#![no_std]` builds — provides float math via a pure-Rust port of musl `libm`. Not needed when `std` is on. |
+| `portable-atomic` | no | For targets without atomic compare-and-swap, such as `thumbv6m-none-eabi` (Cortex-M0/M0+) or `riscv32imc-unknown-none-elf` (ESP32-C3): the shared tables are built with the atomics of the [`portable-atomic`](https://crates.io/crates/portable-atomic) crate. There portable-atomic also needs its `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip (see [docs/06](docs/06-using-the-library.md#targets-without-compare-and-swap)). |
 
-> Runtime dependency footprint: `std` build → **0 deps**; `no_std` build → **1 dep** (`libm`, pure Rust).
+> Runtime dependency footprint: `std` build → **0 deps**; `no_std` build → **1 dep** (`libm`, pure Rust), 2 with `portable-atomic`.
 
 ### Notes for `no_std` users
 
@@ -198,7 +199,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   (32 MiB).
 - **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
 - **Frames are capped** at the RFC 6716 maximum of 1275 bytes (the heap-free range-coder buffer is sized accordingly). A packet of 40 to 120 ms holds up to six such frames.
-- **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target. Check with `scripts/check_no_std.sh`.
+- **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target; with `portable-atomic`, also `thumbv6m-none-eabi` (Cortex-M0/M0+). Check with `scripts/check_no_std.sh`.
 
 ## Performance
 
@@ -407,7 +408,9 @@ fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
 - The 24-bit integer calls of libopus 1.6: `OpusEncoder::encode24`,
   `OpusDecoder::decode24` and `decode_fec24`, and their multistream versions.
 - `OpusDecoder::init` builds a decoder in memory the caller provides, such as
-  a `static`, with little stack, as upstream opus-rs PR #65 does.
+  a `static`, with little stack, as upstream opus-rs PR #65 does. The feature
+  `portable-atomic` lets the crate build for targets without atomic
+  compare-and-swap, as upstream opus-rs PR #64 (by Alix ANNERAUD) does.
 
 **Quality fixes**
 - 48 kHz `Voip`: SILK now reads the float high-pass filter's output, as the
