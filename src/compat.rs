@@ -6,8 +6,8 @@
 //!   atomic and inline `UnsafeCell<MaybeUninit<T>>` storage. The value is
 //!   constructed exactly once into the inline storage, so no global allocator is
 //!   required. Replaces `std::sync::LazyLock`.
-//! * [`x86_has_avx`] / [`x86_has_avx2`] / [`x86_has_avx_fma`] / [`x86_has_avx2_fma`]
-//!   — x86 SIMD availability probes. Under the
+//! * [`x86_has_sse41`] / [`x86_has_avx`] / [`x86_has_avx2`] / [`x86_has_avx_fma`] /
+//!   [`x86_has_avx2_fma`] — x86 SIMD availability probes. Under the
 //!   `std` feature these use the OS-backed `is_x86_feature_detected!`; without `std`
 //!   they fall back to compile-time `cfg!(target_feature = ...)`.
 
@@ -142,6 +142,19 @@ pub fn sort_by<T>(slice: &mut [T], mut cmp: impl FnMut(&T, &T) -> core::cmp::Ord
 // ---------------------------------------------------------------------------
 // x86 SIMD feature detection
 // ---------------------------------------------------------------------------
+
+/// Whether the `sse4.1` x86 feature is usable (it implies SSSE3). Every Intel
+/// processor since 2008 and every AMD processor since 2011 has it. See
+/// [`x86_has_avx`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub fn x86_has_sse41() -> bool {
+    std::arch::is_x86_feature_detected!("sse4.1")
+}
+#[cfg(not(all(feature = "std", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn x86_has_sse41() -> bool {
+    cfg!(target_feature = "sse4.1")
+}
 
 /// Whether the `avx` x86 feature is usable.
 ///
@@ -462,5 +475,13 @@ mod tests {
         let fma = std::arch::is_x86_feature_detected!("fma");
         assert_eq!(x86_has_avx_fma(), x86_has_avx() && fma);
         assert_eq!(x86_has_avx2_fma(), x86_has_avx2() && fma);
+    }
+
+    #[test]
+    fn sse41_probe_agrees_with_the_other_probes() {
+        // Every processor with AVX has SSE4.1, and a build that enables
+        // SSE4.1 runs only on processors that have it.
+        assert!(!x86_has_avx() || x86_has_sse41());
+        assert!(!cfg!(target_feature = "sse4.1") || x86_has_sse41());
     }
 }

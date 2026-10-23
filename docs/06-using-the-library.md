@@ -871,7 +871,7 @@ assert_eq!(decoder.decode(&packet[..len], 960, &mut out).unwrap(), 960);
 
 | Feature | Default | What it does |
 |---|---|---|
-| `std` | on | Links the standard library. On x86-64 it detects the vector instructions AVX and AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add) at run time. On aarch64 it detects FEAT_FCMA (the complex-number instructions of ARMv8.3) at run time where the target does not include them already. Without `std` the crate is `#![no_std]`. It turns on `alloc`. |
+| `std` | on | Links the standard library. On x86-64 it detects the vector instructions SSE4.1 (Streaming SIMD Extensions 4.1), AVX and AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add) at run time. On aarch64 it detects FEAT_FCMA (the complex-number instructions of ARMv8.3) at run time where the target does not include them already. Without `std` the crate is `#![no_std]`. It turns on `alloc`. |
 | `alloc` | on (through `std`) | Uses a global allocator, without the rest of the standard library. It adds the `multistream` module. It also lets the `packet` functions keep more than 32 extensions and copy more than 1275 bytes of old padding in one call; without it they return an error of kind `AllocFail` there. |
 | `heap` | on | Keeps the large codec state behind `Box`, so `OpusEncoder` and `OpusDecoder` themselves are small. It turns on `alloc`, so it also works without `std` when the program has a global allocator. |
 | `analysis` | on | The speech and music analysis of the encoder. It adds about 28 KB of machine code and 24 KB of tables, most of them the weights of its network as `f32` (measured in a release build for aarch64-apple-darwin that encodes one frame). Without it the encoder decides at every complexity as at complexity 6, and `OpusEncoder` is 25,968 bytes smaller without `heap` (see below). It works with and without `std`. |
@@ -901,7 +901,7 @@ The neural network features work in all five builds. Without `heap`, `DnnBlob::f
 
 Leave out `analysis` to save its code and tables and the 26 KB of its state, for example on a small processor that encodes at complexity 6 or below anyway.
 
-Without `std`, the x86-64 code uses AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"`. NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown` and `thumbv6m-none-eabi` (Cortex-M0, with `portable-atomic`) when those targets are installed, then runs the tests without `std`.
+Without `std`, the x86-64 code uses SSE4.1, AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"` (AVX2 includes SSE4.1). NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown` and `thumbv6m-none-eabi` (Cortex-M0, with `portable-atomic`) when those targets are installed, then runs the tests without `std`.
 
 ### Building the encoder and the decoder in place
 

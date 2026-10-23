@@ -985,6 +985,126 @@ fn quantize_subframe<const N: usize>(
     }
 }
 
+/// What the long-term terms of `long_term_terms` need, prepared once per
+/// subframe so that the sample loop computes them without branches.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+struct LongTerm {
+    /// The five LTP coefficients.
+    b_q14: [i32; LTP_ORDER],
+    /// The subframe is voiced: it has long-term prediction.
+    voiced: bool,
+    /// Index into `s_ltp_q15` of the newest LTP tap of sample 0.
+    pred_base: i32,
+    /// The subframe has a lag: it has harmonic noise shaping.
+    has_lag: bool,
+    /// Index into `s_ltp_shp_q14` of the newest shaping tap of sample 0.
+    shp_base: i32,
+    harm_shape_fir_packed_q14: i32,
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl LongTerm {
+    fn new(p: &SubframeParams, setup: &SubframeSetup) -> Self {
+        let mut b_q14 = [0i32; LTP_ORDER];
+        let voiced = p.signal_type == TYPE_VOICED;
+        if voiced {
+            for (dst, &b) in b_q14.iter_mut().zip(&p.b_q14[..LTP_ORDER]) {
+                *dst = b as i32;
+            }
+        }
+        Self {
+            b_q14,
+            voiced,
+            pred_base: setup.pred_lag_ptr_base,
+            has_lag: p.lag > 0,
+            shp_base: setup.shp_lag_ptr_base,
+            harm_shape_fir_packed_q14: p.harm_shape_fir_packed_q14,
+        }
+    }
+
+    /// `long_term_terms` of sample `i`, without branches. Both buffers
+    /// must be longer than `LTP_ORDER`. An index out of range gives a
+    /// zero term, as in `long_term_terms`; the values are then read at
+    /// index `LTP_ORDER` and not used.
+    #[inline(always)]
+    fn at(&self, s_ltp_q15: &[i32], s_ltp_shp_q14: &[i32], i: i32) -> (i32, i32) {
+        debug_assert!(s_ltp_q15.len() > LTP_ORDER && s_ltp_shp_q14.len() > LTP_ORDER);
+        let pred_idx = self.pred_base.wrapping_add(i);
+        let pred_ok =
+            self.voiced & (pred_idx >= LTP_ORDER as i32) & (pred_idx < s_ltp_q15.len() as i32);
+        let j = select(pred_ok, pred_idx as usize, LTP_ORDER);
+        // SAFETY: with `pred_ok`, `LTP_ORDER <= j < s_ltp_q15.len()`;
+        // otherwise `j == LTP_ORDER < s_ltp_q15.len()`. The 5 entries
+        // up to `j` are inside the slice.
+        let taps = unsafe {
+            &*s_ltp_q15
+                .as_ptr()
+                .add(j - (LTP_ORDER - 1))
+                .cast::<[i32; LTP_ORDER]>()
+        };
+        let mut ltp_pred_q14 = 2;
+        for (&s, &b) in taps.iter().rev().zip(&self.b_q14) {
+            ltp_pred_q14 = silk_smlawb(ltp_pred_q14, s, b);
+        }
+        let ltp_pred_q14 = select(pred_ok, silk_lshift(ltp_pred_q14, 1), 0);
+
+        let shp_idx = self.shp_base.wrapping_add(i);
+        let shp_ok = self.has_lag
+            & (shp_idx >= HARM_SHAPE_FIR_TAPS as i32)
+            & (shp_idx < s_ltp_shp_q14.len() as i32);
+        let j = select(shp_ok, shp_idx as usize, HARM_SHAPE_FIR_TAPS);
+        // SAFETY: as above, with `HARM_SHAPE_FIR_TAPS < LTP_ORDER`.
+        let shp = unsafe {
+            &*s_ltp_shp_q14
+                .as_ptr()
+                .add(j - (HARM_SHAPE_FIR_TAPS - 1))
+                .cast::<[i32; HARM_SHAPE_FIR_TAPS]>()
+        };
+        let harm = self.harm_shape_fir_packed_q14;
+        let n_ltp_q14 = silk_smulwb(silk_add_sat32(shp[2], shp[0]), harm);
+        let n_ltp_q14 = silk_smlawt(n_ltp_q14, shp[1], harm);
+        let n_ltp_q14 = select(shp_ok, silk_sub_lshift32(ltp_pred_q14, n_ltp_q14, 2), 0);
+        (ltp_pred_q14, n_ltp_q14)
+    }
+}
+
+/// Whether the vector sample loops (`neon::quantize_subframe_neon` and
+/// `x86::quantize_subframe_x86`) can run a subframe: they rely on these
+/// ranges. The encoder stays inside them; other values take the portable
+/// loop, which handles them as the code before did.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn vector_loop_applies(
+    smpl_buf_idx: i32,
+    s_ltp_q15: &[i32],
+    delayed_ga_q10: &[i32],
+    p: &SubframeParams,
+) -> bool {
+    (0..DECISION_DELAY as i32).contains(&smpl_buf_idx)
+        && (0..=DECISION_DELAY as i32).contains(&p.decision_delay)
+        && s_ltp_q15.len() > LTP_ORDER
+        && delayed_ga_q10.len() >= DECISION_DELAY
+        && (p.signal_type != TYPE_VOICED || p.b_q14.len() >= LTP_ORDER)
+}
+
+/// Stores `value` at `buf[idx]` when `ok` is true and `idx` is inside
+/// `buf`; otherwise stores it in `spare`, which nothing reads. A branch
+/// here would split the sample loop into pieces that the compiler orders
+/// separately.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn store_if<T: Copy>(buf: &mut [T], idx: isize, ok: bool, spare: &mut T, value: T) {
+    let in_range = ok & (idx >= 0) & ((idx as usize) < buf.len());
+    let dst = select(
+        in_range,
+        buf.as_mut_ptr().wrapping_offset(idx),
+        spare as *mut T,
+    );
+    // SAFETY: with `in_range`, `dst` is element `idx` of `buf`;
+    // otherwise it is `spare`.
+    unsafe { dst.write(value) };
+}
+
 /// The sample loop with the values of all states in the lanes of NEON
 /// registers: lane `k` belongs to state `k`.
 #[cfg(target_arch = "aarch64")]
@@ -1709,104 +1829,6 @@ mod neon {
         }
     }
 
-    /// What the long-term terms of `long_term_terms` need, prepared once per
-    /// subframe so that the sample loop computes them without branches.
-    struct LongTerm {
-        /// The five LTP coefficients.
-        b_q14: [i32; LTP_ORDER],
-        /// The subframe is voiced: it has long-term prediction.
-        voiced: bool,
-        /// Index into `s_ltp_q15` of the newest LTP tap of sample 0.
-        pred_base: i32,
-        /// The subframe has a lag: it has harmonic noise shaping.
-        has_lag: bool,
-        /// Index into `s_ltp_shp_q14` of the newest shaping tap of sample 0.
-        shp_base: i32,
-        harm_shape_fir_packed_q14: i32,
-    }
-
-    impl LongTerm {
-        fn new(p: &SubframeParams, setup: &SubframeSetup) -> Self {
-            let mut b_q14 = [0i32; LTP_ORDER];
-            let voiced = p.signal_type == TYPE_VOICED;
-            if voiced {
-                for (dst, &b) in b_q14.iter_mut().zip(&p.b_q14[..LTP_ORDER]) {
-                    *dst = b as i32;
-                }
-            }
-            Self {
-                b_q14,
-                voiced,
-                pred_base: setup.pred_lag_ptr_base,
-                has_lag: p.lag > 0,
-                shp_base: setup.shp_lag_ptr_base,
-                harm_shape_fir_packed_q14: p.harm_shape_fir_packed_q14,
-            }
-        }
-
-        /// `long_term_terms` of sample `i`, without branches. Both buffers
-        /// must be longer than `LTP_ORDER`. An index out of range gives a
-        /// zero term, as in `long_term_terms`; the values are then read at
-        /// index `LTP_ORDER` and not used.
-        #[inline(always)]
-        fn at(&self, s_ltp_q15: &[i32], s_ltp_shp_q14: &[i32], i: i32) -> (i32, i32) {
-            debug_assert!(s_ltp_q15.len() > LTP_ORDER && s_ltp_shp_q14.len() > LTP_ORDER);
-            let pred_idx = self.pred_base.wrapping_add(i);
-            let pred_ok =
-                self.voiced & (pred_idx >= LTP_ORDER as i32) & (pred_idx < s_ltp_q15.len() as i32);
-            let j = select(pred_ok, pred_idx as usize, LTP_ORDER);
-            // SAFETY: with `pred_ok`, `LTP_ORDER <= j < s_ltp_q15.len()`;
-            // otherwise `j == LTP_ORDER < s_ltp_q15.len()`. The 5 entries
-            // up to `j` are inside the slice.
-            let taps = unsafe {
-                &*s_ltp_q15
-                    .as_ptr()
-                    .add(j - (LTP_ORDER - 1))
-                    .cast::<[i32; LTP_ORDER]>()
-            };
-            let mut ltp_pred_q14 = 2;
-            for (&s, &b) in taps.iter().rev().zip(&self.b_q14) {
-                ltp_pred_q14 = silk_smlawb(ltp_pred_q14, s, b);
-            }
-            let ltp_pred_q14 = select(pred_ok, silk_lshift(ltp_pred_q14, 1), 0);
-
-            let shp_idx = self.shp_base.wrapping_add(i);
-            let shp_ok = self.has_lag
-                & (shp_idx >= HARM_SHAPE_FIR_TAPS as i32)
-                & (shp_idx < s_ltp_shp_q14.len() as i32);
-            let j = select(shp_ok, shp_idx as usize, HARM_SHAPE_FIR_TAPS);
-            // SAFETY: as above, with `HARM_SHAPE_FIR_TAPS < LTP_ORDER`.
-            let shp = unsafe {
-                &*s_ltp_shp_q14
-                    .as_ptr()
-                    .add(j - (HARM_SHAPE_FIR_TAPS - 1))
-                    .cast::<[i32; HARM_SHAPE_FIR_TAPS]>()
-            };
-            let harm = self.harm_shape_fir_packed_q14;
-            let n_ltp_q14 = silk_smulwb(silk_add_sat32(shp[2], shp[0]), harm);
-            let n_ltp_q14 = silk_smlawt(n_ltp_q14, shp[1], harm);
-            let n_ltp_q14 = select(shp_ok, silk_sub_lshift32(ltp_pred_q14, n_ltp_q14, 2), 0);
-            (ltp_pred_q14, n_ltp_q14)
-        }
-    }
-
-    /// Stores `value` at `buf[idx]` when `ok` is true and `idx` is inside
-    /// `buf`; otherwise stores it in `spare`, which nothing reads. A branch
-    /// here would split the sample loop into pieces that the compiler orders
-    /// separately.
-    #[inline(always)]
-    fn store_if<T: Copy>(buf: &mut [T], idx: isize, ok: bool, spare: &mut T, value: T) {
-        let in_range = ok & (idx >= 0) & ((idx as usize) < buf.len());
-        let dst = select(
-            in_range,
-            buf.as_mut_ptr().wrapping_offset(idx),
-            spare as *mut T,
-        );
-        // SAFETY: with `in_range`, `dst` is element `idx` of `buf`;
-        // otherwise it is `spare`.
-        unsafe { dst.write(value) };
-    }
-
     /// Short-term prediction of all states at once, state `k` in lane `k`,
     /// with the newest sample of every state taken from a register instead
     /// of from memory.
@@ -1900,16 +1922,8 @@ mod neon {
         p: &SubframeParams,
     ) {
         debug_assert!((2..=4).contains(&N));
-        // The sample loop relies on these ranges. The encoder stays inside
-        // them; other values take the portable loop, which handles them as
-        // the code before did.
         let dd = p.decision_delay;
-        if !(0..DECISION_DELAY as i32).contains(smpl_buf_idx)
-            || !(0..=DECISION_DELAY as i32).contains(&dd)
-            || s_ltp_q15.len() <= LTP_ORDER
-            || delayed_ga_q10.len() < DECISION_DELAY
-            || (p.signal_type == TYPE_VOICED && p.b_q14.len() < LTP_ORDER)
-        {
+        if !vector_loop_applies(*smpl_buf_idx, s_ltp_q15, delayed_ga_q10, p) {
             quantize_subframe::<N>(
                 nsq,
                 states,
@@ -2181,6 +2195,1680 @@ mod neon {
     }
 }
 
+/// The sample loop with the values of all states in the lanes of SSE
+/// registers, for x86-64: lane `k` belongs to state `k`. It follows
+/// `mod neon` step by step. The comments there explain the steps; the
+/// comments here say where and why this module differs.
+///
+/// The loop is compiled twice: `quantize_subframe_sse41` for processors with
+/// SSE4.1, and `quantize_subframe_avx2` for processors with AVX2. The AVX2
+/// copy runs the shaping filter of 3 and 4 states in 256-bit registers
+/// (`wide`) and the short-term prediction with 256-bit loads.
+///
+/// x86 has no instruction like NEON's `vqdmulhq_s32`, which multiplies the
+/// 32-bit values of 4 lanes by 16-bit factors and keeps bits 16 to 47 of each
+/// product (`silk_smulwb`). `_mm_mul_epi32` multiplies lanes 0 and 2 only,
+/// into two 64-bit products. It is used in two ways:
+///
+/// - `mulw` gives the 4 products of 4 lanes: one multiplication for lanes 0
+///   and 2, one for lanes 1 and 3 after a shift, and a blend.
+/// - The shaping filter is the longest chain of dependent steps of a sample.
+///   There each register holds two states, in lanes 0 and 2 (see `pair`).
+///   One multiplication then gives the products of both states, and nothing
+///   has to be merged: a filter tap is a subtraction, a multiplication, a
+///   shift and an addition.
+///
+/// The large functions that run once per sample are `#[inline(always)]`,
+/// which rules out target features of their own. Both copies of the loop
+/// use them, and the compiler does not inline a large function that has two
+/// callers; a call per sample would cost more than the function saves. They
+/// are `unsafe` because they need the target features of the loop that
+/// inlines them.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    /// `LANE_MASK[k]` has all bits of lane `k` set. Entry 4 selects no lane.
+    static LANE_MASK: [[i32; 4]; 5] = [
+        [-1, 0, 0, 0],
+        [0, -1, 0, 0],
+        [0, 0, -1, 0],
+        [0, 0, 0, -1],
+        [0, 0, 0, 0],
+    ];
+
+    /// `BROADCAST[k]` is the byte table for `_mm_shuffle_epi8` that copies
+    /// lane `k` into all four lanes.
+    static BROADCAST: [[u8; 16]; 4] = [
+        [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3],
+        [4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7],
+        [8, 9, 10, 11, 8, 9, 10, 11, 8, 9, 10, 11, 8, 9, 10, 11],
+        [
+            12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15,
+        ],
+    ];
+
+    /// `PERM[r][b]` is the byte table for `_mm_shuffle_epi8` that copies lane
+    /// `b` into lane `r` and keeps the other lanes in place. `PERM[4][b]`
+    /// keeps every lane.
+    static PERM: [[[u8; 16]; 4]; 5] = perm_tables();
+
+    /// `PAIRS[r][b][p]` reads a row through `PERM[r][b]` and puts its lanes
+    /// `2 * p` and `2 * p + 1` into lanes 0 and 2, as `pair::<p>` does.
+    static PAIRS: [[[[u8; 16]; 2]; 4]; 5] = pair_tables();
+
+    const fn perm_tables() -> [[[u8; 16]; 4]; 5] {
+        let mut tables = [[[0u8; 16]; 4]; 5];
+        let mut r = 0;
+        while r < 5 {
+            let mut b = 0;
+            while b < 4 {
+                let mut byte = 0;
+                while byte < 16 {
+                    let lane = byte / 4;
+                    let from = if lane == r { b } else { lane };
+                    tables[r][b][byte] = (4 * from + byte % 4) as u8;
+                    byte += 1;
+                }
+                b += 1;
+            }
+            r += 1;
+        }
+        tables
+    }
+
+    const fn pair_tables() -> [[[[u8; 16]; 2]; 4]; 5] {
+        let perm = perm_tables();
+        let mut tables = [[[[0u8; 16]; 2]; 4]; 5];
+        let mut r = 0;
+        while r < 5 {
+            let mut b = 0;
+            while b < 4 {
+                let mut p = 0;
+                while p < 2 {
+                    let mut byte = 0;
+                    while byte < 16 {
+                        // Lanes 0 and 1 take lane `2 * p`, lanes 2 and 3
+                        // lane `2 * p + 1`, of the permuted row.
+                        let lane = 2 * p + byte / 8;
+                        tables[r][b][p][byte] = perm[r][b][4 * lane + byte % 4];
+                        byte += 1;
+                    }
+                    p += 1;
+                }
+                b += 1;
+            }
+            r += 1;
+        }
+        tables
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn load(row: &[i32; 4]) -> __m128i {
+        // SAFETY: reads the 16 bytes of the array; the load needs no
+        // alignment.
+        unsafe { _mm_loadu_si128(row.as_ptr().cast()) }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn load_table(table: &[u8; 16]) -> __m128i {
+        // SAFETY: reads the 16 bytes of the array; the load needs no
+        // alignment.
+        unsafe { _mm_loadu_si128(table.as_ptr().cast()) }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn store(row: &mut [i32; 4], v: __m128i) {
+        // SAFETY: writes the 16 bytes of the array; the store needs no
+        // alignment.
+        unsafe { _mm_storeu_si128(row.as_mut_ptr().cast(), v) }
+    }
+
+    /// The first `N` lanes of `v`.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn to_lanes<const N: usize>(v: __m128i) -> [i32; N] {
+        const { assert!(N <= 4) };
+        let mut all = [0i32; 4];
+        store(&mut all, v);
+        core::array::from_fn(|k| all[k])
+    }
+
+    /// A vector with `a[k]` in lane `k`. Lanes from `N` on are zero.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn from_lanes<const N: usize>(a: [i32; N]) -> __m128i {
+        const { assert!(N <= 4) };
+        let mut all = [0i32; 4];
+        all[..N].copy_from_slice(&a);
+        load(&all)
+    }
+
+    /// The factor `f` for which `mulw(x, f)` is `silk_smulwb(x, c)`:
+    /// `c << 16` in every lane.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn mulw_factor(c: i16) -> __m128i {
+        _mm_set1_epi32((c as i32) << 16)
+    }
+
+    /// `(x * c) >> 16` per lane, as `silk_smulwb(x, c)` and NEON's
+    /// `vqdmulhq_s32(x, smulwb_operand(c))`, for `f = mulw_factor(c)`.
+    ///
+    /// `_mm_mul_epi32` gives the 64-bit products `x * c << 16` of lanes 0 and
+    /// 2. Their upper halves, in lanes 1 and 3, are the results. The second
+    /// multiplication does the same for lanes 1 and 3 moved down.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn mulw(x: __m128i, f: __m128i) -> __m128i {
+        let even = _mm_mul_epi32(x, f);
+        let odd = _mm_mul_epi32(_mm_srli_epi64::<32>(x), f);
+        _mm_blend_epi16::<0b1100_1100>(_mm_srli_epi64::<32>(even), odd)
+    }
+
+    /// Saturating `a + b` per lane, as `vqaddq_s32` and `silk_add_sat32`.
+    ///
+    /// `a` is first clamped to the range in which `a + b` does not overflow.
+    /// The bounds depend on `b` only: when `b` is known early, the result
+    /// follows `a` after three steps.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn adds(a: __m128i, b: __m128i) -> __m128i {
+        let zero = _mm_setzero_si128();
+        // Overflow needs b > 0 and a > MAX - b; underflow b < 0 and a < MIN - b.
+        let high = _mm_sub_epi32(_mm_set1_epi32(i32::MAX), _mm_max_epi32(b, zero));
+        let low = _mm_sub_epi32(_mm_set1_epi32(i32::MIN), _mm_min_epi32(b, zero));
+        _mm_add_epi32(_mm_min_epi32(_mm_max_epi32(a, low), high), b)
+    }
+
+    /// Saturating `a - b` per lane, as `vqsubq_s32` and `silk_sub_sat32`.
+    ///
+    /// `b` is first clamped to the range in which `a - b` does not overflow.
+    /// The bounds depend on `a` only: when `a` is known early, the result
+    /// follows `b` after three steps.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn subs(a: __m128i, b: __m128i) -> __m128i {
+        let minus_one = _mm_set1_epi32(-1);
+        // a >= 0: overflow needs b < a - MAX. a < 0: underflow needs
+        // b > a - MIN. With m = max(a, -1), m - MAX is a - MAX for a >= 0
+        // and MIN for a < 0; with m = min(a, -1), m - MIN is MAX for a >= 0
+        // and a - MIN for a < 0.
+        let low = _mm_sub_epi32(_mm_max_epi32(a, minus_one), _mm_set1_epi32(i32::MAX));
+        let high = _mm_sub_epi32(_mm_min_epi32(a, minus_one), _mm_set1_epi32(i32::MIN));
+        _mm_sub_epi32(a, _mm_min_epi32(_mm_max_epi32(b, low), high))
+    }
+
+    /// `silk_rshift_round(v, PRE + 1)` per lane, as `vrshrq_n_s32`:
+    /// `((v >> PRE) + 1) >> 1`, which cannot overflow. `PRE` is at least 1.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn round_shift<const PRE: i32>(v: __m128i) -> __m128i {
+        _mm_srai_epi32::<1>(_mm_add_epi32(_mm_srai_epi32::<PRE>(v), _mm_set1_epi32(1)))
+    }
+
+    /// `v` in the lanes where `s >= 0`, `-v` where `s < 0`. The lowest bit
+    /// of `s` is set first, so that `_mm_sign_epi32` never sees a zero (it
+    /// would give zero).
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn apply_sign(v: __m128i, s: __m128i) -> __m128i {
+        _mm_sign_epi32(v, _mm_or_si128(s, _mm_set1_epi32(1)))
+    }
+
+    /// `a` in the lanes where `mask` is all ones, `b` where it is zero, as
+    /// `vbslq_s32`.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn bsl(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+        _mm_blendv_epi8(b, a, mask)
+    }
+
+    /// `(a as i16 as i32) * (b as i16 as i32)` per lane, as `silk_smulbb`,
+    /// for `b_low` holding `b as i16` in the low half of every lane and zero
+    /// in the high half.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn smulbb(a: __m128i, b_low: __m128i) -> __m128i {
+        _mm_madd_epi16(a, b_low)
+    }
+
+    /// `acc + (a as i16 as i32) * (a as i16 as i32)` per lane, as
+    /// `silk_smlabb(acc, a, a)`.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn add_square(acc: __m128i, a: __m128i) -> __m128i {
+        let a_low = _mm_and_si128(a, _mm_set1_epi32(0xFFFF));
+        _mm_add_epi32(acc, _mm_madd_epi16(a, a_low))
+    }
+
+    /// The two candidates of every state for one sample, the cheaper one
+    /// first. The costs are returned as the amounts to add to the cost so far.
+    struct Candidates {
+        q_q10: [__m128i; 2],
+        rd_added_q10: [__m128i; 2],
+        xq_q14: [__m128i; 2],
+        lf_ar_q14: [__m128i; 2],
+        diff_q14: [__m128i; 2],
+        s_ltp_shp_q14: [__m128i; 2],
+        lpc_exc_q14: [__m128i; 2],
+    }
+
+    /// Constants of one subframe for `quantize_sample_x86`.
+    struct LevelVectors {
+        tilt: __m128i,
+        lf_shp_low: __m128i,
+        lf_shp_high: __m128i,
+        /// `lambda_q10 as i16` in the low half of every lane, zero in the
+        /// high half: the operand of `smulbb`.
+        lambda: __m128i,
+        offset_q10: __m128i,
+        rdo_offset: __m128i,
+        minus_rdo_offset: __m128i,
+    }
+
+    impl LevelVectors {
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        fn new(lv: &LevelParams) -> Self {
+            // `quantize_sample_x86` relies on it; `SubframeSetup::new` makes
+            // it so.
+            debug_assert!(lv.rdo_offset >= 0);
+            Self {
+                tilt: mulw_factor(lv.tilt_q14 as i16),
+                lf_shp_low: mulw_factor(lv.lf_shp_q14 as i16),
+                lf_shp_high: mulw_factor((lv.lf_shp_q14 >> 16) as i16),
+                lambda: _mm_set1_epi32(lv.lambda_q10 & 0xFFFF),
+                offset_q10: _mm_set1_epi32(lv.offset_q10),
+                rdo_offset: _mm_set1_epi32(lv.rdo_offset),
+                minus_rdo_offset: _mm_set1_epi32(-lv.rdo_offset),
+            }
+        }
+    }
+
+    /// `quantize_sample` for four states at once, as `quantize_sample_neon`.
+    ///
+    /// The value of the shaping filter, `n_ar`, comes last: everything up to
+    /// the next sample waits for this function. Some steps are therefore
+    /// written with fewer dependent instructions than in the NEON version;
+    /// each such place says what it computes.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[inline(always)]
+    unsafe fn quantize_sample_x86(
+        lv: &LevelVectors,
+        x_q10: i32,
+        ltp_pred_q14: i32,
+        n_ltp_q14: i32,
+        n_ar: __m128i,
+        lpc_pred_q14: __m128i,
+        lf_ar_q14: __m128i,
+        shape_q14: __m128i,
+        seed: __m128i,
+    ) -> Candidates {
+        let zero = _mm_setzero_si128();
+        let minus_one = _mm_set1_epi32(-1);
+        let n_ar_q14 = _mm_slli_epi32::<2>(_mm_add_epi32(
+            _mm_slli_epi32::<1>(n_ar),
+            mulw(lf_ar_q14, lv.tilt),
+        ));
+        let n_lf_q14 = _mm_slli_epi32::<2>(_mm_add_epi32(
+            mulw(shape_q14, lv.lf_shp_low),
+            mulw(lf_ar_q14, lv.lf_shp_high),
+        ));
+
+        // `adds` and `subs` are fast in the operand that comes from `n_ar`.
+        let tmp1 = subs(
+            _mm_add_epi32(_mm_set1_epi32(n_ltp_q14), lpc_pred_q14),
+            adds(n_ar_q14, n_lf_q14),
+        );
+        let r_q10 = _mm_sub_epi32(_mm_set1_epi32(x_q10), round_shift::<3>(tmp1));
+
+        // The dither flips the sign where the seed is negative.
+        let r_q10 = apply_sign(r_q10, seed);
+        let r_q10 = _mm_min_epi32(
+            _mm_max_epi32(r_q10, _mm_set1_epi32(-(31 << 10))),
+            _mm_set1_epi32(30 << 10),
+        );
+
+        // NEON chooses between `(q1_q10_in - rdo) >> 10` above `rdo`,
+        // `(q1_q10_in + rdo) >> 10` below `-rdo` and `q1_q10_in >> 31`
+        // between them. With `rdo >= 0` that is
+        // `(q1_q10_in - clamp(q1_q10_in, -rdo, rdo) - m) >> 10`, where `m`
+        // is 1 for `-rdo <= q1_q10_in < 0` and 0 otherwise.
+        let q1_q10_in = _mm_sub_epi32(r_q10, lv.offset_q10);
+        let middle_negative = _mm_andnot_si128(
+            _mm_cmplt_epi32(q1_q10_in, lv.minus_rdo_offset),
+            _mm_cmplt_epi32(q1_q10_in, zero),
+        );
+        let clamped = _mm_min_epi32(
+            _mm_max_epi32(q1_q10_in, lv.minus_rdo_offset),
+            lv.rdo_offset,
+        );
+        // `middle_negative` is -1 where `m` is 1.
+        let q1_q0 = _mm_srai_epi32::<10>(_mm_add_epi32(
+            _mm_sub_epi32(q1_q10_in, clamped),
+            middle_negative,
+        ));
+        let base_q10 = _mm_add_epi32(_mm_slli_epi32::<10>(q1_q0), lv.offset_q10);
+        // `base - adjust` for q1_q0 > 0, `base` for 0 and `base + adjust`
+        // below: `adjust` takes the sign of `q1_q0`, and 0 for 0.
+        let adjust = _mm_set1_epi32(QUANT_LEVEL_ADJUST_Q10);
+        let q1_q10 = _mm_sub_epi32(base_q10, _mm_sign_epi32(adjust, q1_q0));
+        let near_zero = _mm_or_si128(
+            _mm_cmpeq_epi32(q1_q0, zero),
+            _mm_cmpeq_epi32(q1_q0, minus_one),
+        );
+        let q2_q10 = _mm_sub_epi32(
+            _mm_add_epi32(q1_q10, _mm_set1_epi32(1024)),
+            _mm_and_si128(near_zero, adjust),
+        );
+        // The rate term uses the magnitude of the level: negate q1 when
+        // q1_q0 < 0 and q2 when q1_q0 < -1, that is when q1_q0 + 1 < 0.
+        let one = _mm_set1_epi32(1);
+        let rd1_q10 = smulbb(apply_sign(q1_q10, q1_q0), lv.lambda);
+        let rd2_q10 = smulbb(
+            apply_sign(q2_q10, _mm_add_epi32(q1_q0, one)),
+            lv.lambda,
+        );
+        let rd1_q10 = _mm_srai_epi32::<10>(add_square(rd1_q10, _mm_sub_epi32(r_q10, q1_q10)));
+        let rd2_q10 = _mm_srai_epi32::<10>(add_square(rd2_q10, _mm_sub_epi32(r_q10, q2_q10)));
+
+        let first_is_cheaper = _mm_cmplt_epi32(rd1_q10, rd2_q10);
+        let q = [
+            bsl(first_is_cheaper, q1_q10, q2_q10),
+            bsl(first_is_cheaper, q2_q10, q1_q10),
+        ];
+
+        let x_q14 = _mm_set1_epi32(silk_lshift(x_q10, 4));
+        let ltp_pred_q14 = _mm_set1_epi32(ltp_pred_q14);
+        let lpc_exc = [
+            _mm_add_epi32(apply_sign(_mm_slli_epi32::<4>(q[0]), seed), ltp_pred_q14),
+            _mm_add_epi32(apply_sign(_mm_slli_epi32::<4>(q[1]), seed), ltp_pred_q14),
+        ];
+        let xq = [
+            _mm_add_epi32(lpc_exc[0], lpc_pred_q14),
+            _mm_add_epi32(lpc_exc[1], lpc_pred_q14),
+        ];
+        let diff = [_mm_sub_epi32(xq[0], x_q14), _mm_sub_epi32(xq[1], x_q14)];
+        let lf_ar = [
+            _mm_sub_epi32(diff[0], n_ar_q14),
+            _mm_sub_epi32(diff[1], n_ar_q14),
+        ];
+        Candidates {
+            q_q10: q,
+            rd_added_q10: [
+                _mm_min_epi32(rd1_q10, rd2_q10),
+                _mm_max_epi32(rd1_q10, rd2_q10),
+            ],
+            xq_q14: xq,
+            lf_ar_q14: lf_ar,
+            diff_q14: diff,
+            s_ltp_shp_q14: [subs(lf_ar[0], n_lf_q14), subs(lf_ar[1], n_lf_q14)],
+            lpc_exc_q14: lpc_exc,
+        }
+    }
+
+    /// The candidates of `quantize_sample_x86` as arrays, for the tests.
+    #[cfg(test)]
+    pub(super) struct CandidateLanes {
+        pub(super) q_q10: [i32; 4],
+        /// The amount added to the cost so far.
+        pub(super) rd_q10: [i32; 4],
+        pub(super) xq_q14: [i32; 4],
+        pub(super) lf_ar_q14: [i32; 4],
+        pub(super) diff_q14: [i32; 4],
+        pub(super) s_ltp_shp_q14: [i32; 4],
+        pub(super) lpc_exc_q14: [i32; 4],
+    }
+
+    /// `quantize_sample_x86` on arrays, for the tests. Panics when the
+    /// processor does not have SSE4.1.
+    #[cfg(test)]
+    pub(super) fn level_decision_lanes(
+        lv: &LevelParams,
+        x_q10: i32,
+        ltp_pred_q14: i32,
+        n_ltp_q14: i32,
+        n_ar: [i32; 4],
+        lpc_pred_q14: [i32; 4],
+        lf_ar_q14: [i32; 4],
+        shape_q14: [i32; 4],
+        seed: [i32; 4],
+    ) -> [CandidateLanes; 2] {
+        assert!(crate::compat::x86_has_sse41());
+        // SAFETY: the processor has SSE4.1 (checked above).
+        unsafe {
+            let c = quantize_sample_x86(
+                &LevelVectors::new(lv),
+                x_q10,
+                ltp_pred_q14,
+                n_ltp_q14,
+                load(&n_ar),
+                load(&lpc_pred_q14),
+                load(&lf_ar_q14),
+                load(&shape_q14),
+                load(&seed),
+            );
+            core::array::from_fn(|j| CandidateLanes {
+                q_q10: to_lanes(c.q_q10[j]),
+                rd_q10: to_lanes(c.rd_added_q10[j]),
+                xq_q14: to_lanes(c.xq_q14[j]),
+                lf_ar_q14: to_lanes(c.lf_ar_q14[j]),
+                diff_q14: to_lanes(c.diff_q14[j]),
+                s_ltp_shp_q14: to_lanes(c.s_ltp_shp_q14[j]),
+                lpc_exc_q14: to_lanes(c.lpc_exc_q14[j]),
+            })
+        }
+    }
+
+    /// The vector helpers on arrays, for the tests: `[mulw, adds, subs,
+    /// round_shift::<3>, round_shift::<9>, apply_sign]` of `a` and `b`, with
+    /// `mulw` by `b as i16`. Panics when the processor does not have SSE4.1.
+    #[cfg(test)]
+    pub(super) fn helpers_lanes(a: [i32; 4], b: [i32; 4]) -> [[i32; 4]; 6] {
+        assert!(crate::compat::x86_has_sse41());
+        // SAFETY: the processor has SSE4.1 (checked above).
+        unsafe {
+            let (va, vb) = (load(&a), load(&b));
+            let products: [i32; 4] =
+                core::array::from_fn(|k| to_lanes::<4>(mulw(va, mulw_factor(b[k] as i16)))[k]);
+            [
+                products,
+                to_lanes(adds(va, vb)),
+                to_lanes(subs(va, vb)),
+                to_lanes(round_shift::<3>(va)),
+                to_lanes(round_shift::<9>(va)),
+                to_lanes(apply_sign(va, vb)),
+            ]
+        }
+    }
+
+    /// The shaping filter states of all delayed-decision states, one row per
+    /// tap: lane `k` of row `m` is tap `m` of state `k`.
+    pub(super) type ShapingRows = [[i32; 4]; MAX_SHAPE_LPC_ORDER];
+
+    /// The number of registers that hold the shaping filter of `n` states,
+    /// two states in each (see `pair`).
+    const fn pair_count(n: usize) -> usize {
+        if n > 2 { 2 } else { 1 }
+    }
+
+    /// States `2 * P` and `2 * P + 1` of `v` (one state per lane) in lanes
+    /// 0 and 2, the lanes that `_mm_mul_epi32` multiplies. Lanes 1 and 3
+    /// hold copies.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn pair<const P: usize>(v: __m128i) -> __m128i {
+        if P == 0 {
+            _mm_shuffle_epi32::<0b01_01_00_00>(v)
+        } else {
+            _mm_shuffle_epi32::<0b11_11_10_10>(v)
+        }
+    }
+
+    /// Both pairs of `v`.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn pairs(v: __m128i) -> [__m128i; 2] {
+        [pair::<0>(v), pair::<1>(v)]
+    }
+
+    /// The values in lanes 0 and 2 of the pairs of `N` states, one state per
+    /// lane. For `N <= 2` lanes 2 and 3 hold copies.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn unpair<const N: usize>(p: [__m128i; 2]) -> __m128i {
+        if N > 2 {
+            let (a, b) = (_mm_castsi128_ps(p[0]), _mm_castsi128_ps(p[1]));
+            _mm_castps_si128(_mm_shuffle_ps::<0b10_00_10_00>(a, b))
+        } else {
+            _mm_shuffle_epi32::<0b10_00_10_00>(p[0])
+        }
+    }
+
+    /// The values in lanes 1 and 3 of the pairs of `N` states (the sums of
+    /// `tap`), one state per lane.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn unpair_sums<const N: usize>(p: [__m128i; 2]) -> __m128i {
+        if N > 2 {
+            let (a, b) = (_mm_castsi128_ps(p[0]), _mm_castsi128_ps(p[1]));
+            _mm_castps_si128(_mm_shuffle_ps::<0b11_01_11_01>(a, b))
+        } else {
+            _mm_shuffle_epi32::<0b11_01_11_01>(p[0])
+        }
+    }
+
+    /// Constants of the shaping filter of one subframe.
+    pub(super) struct ShapingCoefs {
+        /// `warping_q16 as i16` in every lane: `_mm_mul_epi32` by it and a
+        /// shift right by 16 give `silk_smulwb(x, warping_q16)` in lanes 0
+        /// and 2.
+        warping: __m128i,
+        /// Row `m` is `ar_shp_q13[m] << 16` in every lane: `_mm_mul_epi32`
+        /// by it gives `silk_smulwb(t, ar_shp_q13[m])` in lanes 1 and 3. The
+        /// rows from the order on are zero.
+        coef: [[i32; 4]; MAX_SHAPE_LPC_ORDER],
+        /// `order / 2` in every lane: the start of the feedback sum.
+        bias: __m128i,
+        /// The shaping order: the length of `ar_shp_q13`.
+        order: usize,
+    }
+
+    impl ShapingCoefs {
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        pub(super) fn new(ar_shp_q13: &[i16], warping_q16: i32) -> Self {
+            let order = ar_shp_q13.len().min(MAX_SHAPE_LPC_ORDER);
+            let mut coef = [[0i32; 4]; MAX_SHAPE_LPC_ORDER];
+            for (row, &c) in coef.iter_mut().zip(&ar_shp_q13[..order]) {
+                *row = [(c as i32) << 16; 4];
+            }
+            Self {
+                warping: _mm_set1_epi32(warping_q16 as i16 as i32),
+                coef,
+                bias: _mm_set1_epi32((order as i32) >> 1),
+                order,
+            }
+        }
+    }
+
+    /// The rows of the shaping filter for the filter states of `states`.
+    /// Lanes from `N` on are zero.
+    pub(super) fn load_shaping_rows<const N: usize>(states: &[PathState; N]) -> ShapingRows {
+        let mut rows = [[0i32; 4]; MAX_SHAPE_LPC_ORDER];
+        for (m, row) in rows.iter_mut().enumerate() {
+            for k in 0..N {
+                row[k] = states[k].s_ar2_q14[m];
+            }
+        }
+        rows
+    }
+
+    /// Writes the rows back to the filter states of `states`, every row read
+    /// through the byte table `perm` (see `neon::store_shaping_rows`).
+    #[target_feature(enable = "sse4.1")]
+    pub(super) fn store_shaping_rows<const N: usize>(
+        states: &mut [PathState; N],
+        rows: &ShapingRows,
+        perm: __m128i,
+    ) {
+        for (m, row) in rows.iter().enumerate() {
+            let row: [i32; N] = to_lanes(_mm_shuffle_epi8(load(row), perm));
+            for k in 0..N {
+                states[k].s_ar2_q14[m] = row[k];
+            }
+        }
+    }
+
+    /// The two candidates of every state for the last sample, and which
+    /// state continues as a copy of which (see `neon::LastChoice`).
+    #[derive(Copy, Clone)]
+    pub(super) struct LastChoice {
+        /// `diff_q14` of the first candidate of every state.
+        pub(super) diff_first: __m128i,
+        /// `diff_q14` of the second candidate of every state.
+        pub(super) diff_second: __m128i,
+        /// All bits set in the lane of the state that continues as a copy
+        /// of the best state, with that state's second candidate. No bit is
+        /// set when no state is replaced.
+        pub(super) replaced: __m128i,
+        /// The byte table for `_mm_shuffle_epi8` that copies the lane of the
+        /// best state into all lanes.
+        pub(super) from_best: __m128i,
+        /// The byte tables that read a row through `PERM[replaced_lane][best]`
+        /// (which moves the lane of the best state to the replaced lane and
+        /// keeps the other lanes in place) into the layout of `pair::<0>` and
+        /// `pair::<1>`.
+        pub(super) pairs: [__m128i; 2],
+        /// The lane of the replaced state, 4 when no state is replaced, and
+        /// the lane of the best state: the indices of the tables, for
+        /// `wide`.
+        pub(super) replaced_lane: usize,
+        pub(super) best: usize,
+    }
+
+    impl LastChoice {
+        /// `replaced_lane` is the lane of the state that continues as a copy
+        /// of state `best`, or 4 when no state is replaced.
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        pub(super) fn new(
+            diff_first: __m128i,
+            diff_second: __m128i,
+            replaced_lane: usize,
+            best: usize,
+        ) -> Self {
+            // Out-of-range values cannot occur; the limits let the compiler
+            // drop the bounds checks.
+            let replaced_lane = replaced_lane.min(4);
+            let best = best.min(3);
+            let pairs = &PAIRS[replaced_lane][best];
+            Self {
+                diff_first,
+                diff_second,
+                replaced: load(&LANE_MASK[replaced_lane]),
+                from_best: load_table(&BROADCAST[best]),
+                pairs: [load_table(&pairs[0]), load_table(&pairs[1])],
+                replaced_lane,
+                best,
+            }
+        }
+
+        /// For the first sample of a subframe: every state keeps its own
+        /// `diff_q14` and filter state.
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        pub(super) fn keep(diff_q14: __m128i) -> Self {
+            Self::new(diff_q14, diff_q14, 4, 0)
+        }
+
+        /// The chosen value of every state from the values `first` and
+        /// `second` of the two candidates of every state.
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        pub(super) fn take(&self, first: __m128i, second: __m128i) -> __m128i {
+            let second = _mm_shuffle_epi8(second, self.from_best);
+            bsl(self.replaced, second, first)
+        }
+    }
+
+    /// How many taps of the shaping filter `shaping_filter_both` computes for
+    /// both candidates of every state (see `neon::FIRST_TAPS`).
+    ///
+    /// Like the Apple cores, for which NEON uses 5, recent x86 cores execute
+    /// far ahead of an instruction that waits. The choice of the survivors
+    /// takes an estimated 25 to 35 cycles, and a tap 8 (the multiplication
+    /// alone takes 5), so 4 taps cover it. The value is an estimate, not a
+    /// measurement: compare 0, 2, 4 and 6 on the target processor with
+    /// `perf_harness pairs`.
+    pub(super) const FIRST_TAPS: usize = 4;
+
+    /// Tap `m` of the shaping filter for `N` states in the layout of `pair`:
+    /// `old` is row `m` read through the byte tables `tables`, then
+    /// `t = prev + ((old - t) * warping) >> 16`, the new row is `t`, `sum`
+    /// gets `(t * ar_shp_q13[m]) >> 16` in lanes 1 and 3, and `prev = old`.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[inline(always)]
+    unsafe fn tap<const N: usize>(
+        rows: &mut ShapingRows,
+        m: usize,
+        tables: &[__m128i; 2],
+        c: &ShapingCoefs,
+        prev: &mut [__m128i; 2],
+        t: &mut [__m128i; 2],
+        sum: &mut [__m128i; 2],
+    ) {
+        let row = load(&rows[m]);
+        let coef = load(&c.coef[m]);
+        for p in 0..pair_count(N) {
+            let old = _mm_shuffle_epi8(row, tables[p]);
+            let product = _mm_mul_epi32(_mm_sub_epi32(old, t[p]), c.warping);
+            t[p] = _mm_add_epi32(prev[p], _mm_srli_epi64::<16>(product));
+            sum[p] = _mm_add_epi32(sum[p], _mm_mul_epi32(t[p], coef));
+            prev[p] = old;
+        }
+        store(&mut rows[m], unpair::<N>(*t));
+    }
+
+    /// Taps `start` to the order minus 1 of the shaping filter, every row
+    /// read through `tables`. `prev` is `s[start - 1]` and `t` is
+    /// `t[start - 1]`, both in the layout of `pair`. Returns the sum of the
+    /// products of these taps, one state per lane, without `order / 2`.
+    ///
+    /// `ORDER` is the shaping order when it is known at compile time; every
+    /// tap is then written out. With `ORDER == 0` the order is `c.order`.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[inline(always)]
+    unsafe fn later_taps<const N: usize, const ORDER: usize>(
+        rows: &mut ShapingRows,
+        tables: &[__m128i; 2],
+        c: &ShapingCoefs,
+        start: usize,
+        mut prev: [__m128i; 2],
+        mut t: [__m128i; 2],
+    ) -> __m128i {
+        let mut sum = [_mm_setzero_si128(); 2];
+        if ORDER == 0 {
+            for m in start..c.order.min(MAX_SHAPE_LPC_ORDER) {
+                tap::<N>(rows, m, tables, c, &mut prev, &mut t, &mut sum);
+            }
+        } else {
+            macro_rules! taps {
+                ($($m:literal)*) => {$(
+                    if $m >= start && $m < ORDER && $m < MAX_SHAPE_LPC_ORDER {
+                        tap::<N>(rows, $m, tables, c, &mut prev, &mut t, &mut sum);
+                    }
+                )*};
+            }
+            taps!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23);
+        }
+        unpair_sums::<N>(sum)
+    }
+
+    /// Warped noise-shaping filter of one sample for all states at once,
+    /// state `k` in lane `k` of `diff_q14` and of the result. Same results as
+    /// `warped_shaping_filter` and `neon::shaping_filter_rows`. Each row is
+    /// read through the byte tables `tables` (`LastChoice::pairs`).
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[inline(always)]
+    pub(super) unsafe fn shaping_filter_rows<const N: usize, const ORDER: usize>(
+        rows: &mut ShapingRows,
+        tables: &[__m128i; 2],
+        diff_q14: __m128i,
+        c: &ShapingCoefs,
+    ) -> __m128i {
+        debug_assert!(ORDER == 0 || ORDER == c.order);
+        let zero = _mm_setzero_si128();
+        let sum = later_taps::<N, ORDER>(rows, tables, c, 0, pairs(diff_q14), [zero; 2]);
+        _mm_add_epi32(sum, c.bias)
+    }
+
+    /// `shaping_filter_rows` for the next sample, started before the choice
+    /// of the survivors of the last sample is known, as
+    /// `neon::shaping_filter_both`. The first `FIRST` taps are computed for
+    /// both candidates of every state on the state's own rows; the chosen
+    /// values are stored, and the later taps continue from them.
+    ///
+    /// The products of the first taps are summed for each candidate apart.
+    /// `take` chooses lane by lane, so taking the sum is the same as summing
+    /// the taken products.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[inline(always)]
+    pub(super) unsafe fn shaping_filter_both<
+        const N: usize,
+        const ORDER: usize,
+        const FIRST: usize,
+    >(
+        rows: &mut ShapingRows,
+        last: &LastChoice,
+        c: &ShapingCoefs,
+    ) -> __m128i {
+        let first_taps = FIRST.min(ORDER).min(MAX_SHAPE_LPC_ORDER);
+        if first_taps == 0 {
+            let diff_q14 = last.take(last.diff_first, last.diff_second);
+            return shaping_filter_rows::<N, ORDER>(rows, &last.pairs, diff_q14, c);
+        }
+        debug_assert!(ORDER == c.order);
+        let zero = _mm_setzero_si128();
+        // `t` of the two candidates, and their sums.
+        let mut first = [zero; 2];
+        let mut second = [zero; 2];
+        let mut sum_first = [zero; 2];
+        let mut sum_second = [zero; 2];
+        // Row `m - 1` of the states' own rows, and the chosen `t` of tap
+        // `m - 1`, one state per lane.
+        let mut own_prev = zero;
+        let mut t = zero;
+        macro_rules! first_taps {
+            ($($m:literal)*) => {$(
+                if $m < first_taps {
+                    let row = load(&rows[$m]);
+                    let coef = load(&c.coef[$m]);
+                    let old = pairs(row);
+                    // `s[-1]` is `diff`.
+                    let (prev_first, prev_second) = if $m == 0 {
+                        (pairs(last.diff_first), pairs(last.diff_second))
+                    } else {
+                        (pairs(own_prev), pairs(own_prev))
+                    };
+                    for p in 0..pair_count(N) {
+                        let product = _mm_mul_epi32(_mm_sub_epi32(old[p], first[p]), c.warping);
+                        first[p] = _mm_add_epi32(prev_first[p], _mm_srli_epi64::<16>(product));
+                        let product = _mm_mul_epi32(_mm_sub_epi32(old[p], second[p]), c.warping);
+                        second[p] = _mm_add_epi32(prev_second[p], _mm_srli_epi64::<16>(product));
+                        let product = _mm_mul_epi32(first[p], coef);
+                        sum_first[p] = _mm_add_epi32(sum_first[p], product);
+                        let product = _mm_mul_epi32(second[p], coef);
+                        sum_second[p] = _mm_add_epi32(sum_second[p], product);
+                    }
+                    t = last.take(unpair::<N>(first), unpair::<N>(second));
+                    store(&mut rows[$m], t);
+                    own_prev = row;
+                }
+            )*};
+        }
+        const { assert!(FIRST <= 8) };
+        first_taps!(0 1 2 3 4 5 6 7);
+        // The later taps read `s[first_taps - 1]` through the last choice.
+        let prev = [
+            _mm_shuffle_epi8(own_prev, last.pairs[0]),
+            _mm_shuffle_epi8(own_prev, last.pairs[1]),
+        ];
+        let later = later_taps::<N, ORDER>(rows, &last.pairs, c, first_taps, prev, pairs(t));
+        let first_sums = last.take(unpair_sums::<N>(sum_first), unpair_sums::<N>(sum_second));
+        _mm_add_epi32(_mm_add_epi32(first_sums, later), c.bias)
+    }
+
+    /// `shaping_filter_rows` on arrays, for the tests, as
+    /// `neon::shaping_filter_rows_lanes`. With `wide`, the functions tested
+    /// are those of `wide`. Panics when the processor does not have SSE4.1,
+    /// or AVX2 for `wide`.
+    #[cfg(test)]
+    pub(super) fn shaping_filter_rows_lanes<
+        const N: usize,
+        const ORDER: usize,
+        const FIRST: usize,
+    >(
+        states: &mut ShapingStates<N>,
+        source: [u8; N],
+        diff_q14: [i32; N],
+        ar_shp_q13: &[i16],
+        warping_q16: i32,
+        both: bool,
+        wide: bool,
+    ) -> [i32; N] {
+        assert!(crate::compat::x86_has_sse41());
+        assert!(!wide || crate::compat::x86_has_avx2());
+        // SAFETY: the processor has SSE4.1, and AVX2 for `wide` (checked
+        // above).
+        unsafe {
+            let c = ShapingCoefs::new(ar_shp_q13, warping_q16);
+            let mut rows = [[0i32; 4]; MAX_SHAPE_LPC_ORDER];
+            for (m, row) in rows.iter_mut().enumerate() {
+                for k in 0..N {
+                    row[k] = states[k][m];
+                }
+            }
+            // At most one state reads another state's filter state: that is
+            // the replaced state, and the state it reads is the best one.
+            let replaced = (0..N).find(|&k| source[k] as usize != k);
+            assert!((0..N).all(|k| Some(k) == replaced || source[k] as usize == k));
+            // The second candidates of the other states must not matter.
+            let mut second: [i32; 4] = core::array::from_fn(|k| (k as i32 + 1) * 0x0123_4567);
+            let (replaced_lane, best) = match replaced {
+                Some(dst) => {
+                    let best = source[dst] as usize;
+                    second[best] = diff_q14[dst];
+                    (dst, best)
+                }
+                None => (4, 0),
+            };
+            let last = LastChoice::new(from_lanes(diff_q14), load(&second), replaced_lane, best);
+            let n_ar = match (wide, both) {
+                (false, true) => shaping_filter_both::<N, ORDER, FIRST>(&mut rows, &last, &c),
+                (false, false) => shaping_filter_rows::<N, ORDER>(
+                    &mut rows,
+                    &last.pairs,
+                    from_lanes(diff_q14),
+                    &c,
+                ),
+                (true, true) => wide::shaping_filter_both::<ORDER, FIRST>(&mut rows, &last, &c),
+                (true, false) => {
+                    wide::shaping_filter_rows::<ORDER>(&mut rows, &last, from_lanes(diff_q14), &c)
+                }
+            };
+            // Only the taps below the order change.
+            for (m, row) in rows.iter().enumerate().take(c.order) {
+                for k in 0..N {
+                    states[k][m] = row[k];
+                }
+            }
+            to_lanes(n_ar)
+        }
+    }
+
+    /// The shaping filter of up to 4 states in one 256-bit register, for
+    /// `quantize_subframe_avx2`: state `k` in the 64-bit lane `k`, its value
+    /// in the lower half (32-bit lane `2 * k`), as libopus's AVX2 quantizer
+    /// keeps its states. One `_mm256_mul_epi32` then multiplies all states.
+    /// The steps are those of `tap` and `shaping_filter_both` above, and the
+    /// rows keep their layout, one state per 32-bit lane.
+    mod wide {
+        use super::*;
+
+        /// `WIDEN[r][b]` is the index table for `_mm256_permutevar8x32_epi32`
+        /// that reads a row through `PERM[r][b]` into the layout of this
+        /// module: the 32-bit lanes `2 * k` and `2 * k + 1` take lane `k` of
+        /// the permuted row.
+        static WIDEN: [[[i32; 8]; 4]; 5] = widen_tables();
+
+        /// The index tables that take the 32-bit lanes 0, 2, 4 and 6 (the
+        /// values) and 1, 3, 5 and 7 (the sums of `tap`) into lanes 0 to 3.
+        static NARROW: [i32; 8] = [0, 2, 4, 6, 0, 2, 4, 6];
+        static NARROW_SUMS: [i32; 8] = [1, 3, 5, 7, 1, 3, 5, 7];
+
+        const fn widen_tables() -> [[[i32; 8]; 4]; 5] {
+            let mut tables = [[[0i32; 8]; 4]; 5];
+            let mut r = 0;
+            while r < 5 {
+                let mut b = 0;
+                while b < 4 {
+                    let mut lane = 0;
+                    while lane < 8 {
+                        let state = lane / 2;
+                        tables[r][b][lane] = if state == r { b as i32 } else { state as i32 };
+                        lane += 1;
+                    }
+                    b += 1;
+                }
+                r += 1;
+            }
+            tables
+        }
+
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn load8(table: &[i32; 8]) -> __m256i {
+            // SAFETY: reads the 32 bytes of the array; the load needs no
+            // alignment.
+            unsafe { _mm256_loadu_si256(table.as_ptr().cast()) }
+        }
+
+        /// `row`, one state per 32-bit lane, in the layout of this module,
+        /// read through the index table `index`.
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn widen(row: __m128i, index: __m256i) -> __m256i {
+            // The indices are below 4: only the lower half is read.
+            _mm256_permutevar8x32_epi32(_mm256_castsi128_si256(row), index)
+        }
+
+        /// The lanes of `v` that the first 4 entries of `index` name.
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn narrow(v: __m256i, index: __m256i) -> __m128i {
+            _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(v, index))
+        }
+
+        /// `super::tap` for all states in one register: `index` is the
+        /// `WIDEN` table of the last choice.
+        ///
+        /// # Safety
+        ///
+        /// The processor must have AVX2.
+        #[inline(always)]
+        unsafe fn tap(
+            rows: &mut ShapingRows,
+            m: usize,
+            index: __m256i,
+            c: &ShapingCoefs,
+            prev: &mut __m256i,
+            t: &mut __m256i,
+            sum: &mut __m256i,
+        ) {
+            let old = widen(load(&rows[m]), index);
+            let coef = _mm256_broadcastsi128_si256(load(&c.coef[m]));
+            let warping = _mm256_broadcastsi128_si256(c.warping);
+            let product = _mm256_mul_epi32(_mm256_sub_epi32(old, *t), warping);
+            *t = _mm256_add_epi32(*prev, _mm256_srli_epi64::<16>(product));
+            *sum = _mm256_add_epi32(*sum, _mm256_mul_epi32(*t, coef));
+            *prev = old;
+            store(&mut rows[m], narrow(*t, load8(&NARROW)));
+        }
+
+        /// `super::later_taps` for all states in one register.
+        ///
+        /// # Safety
+        ///
+        /// The processor must have AVX2.
+        #[inline(always)]
+        unsafe fn later_taps<const ORDER: usize>(
+            rows: &mut ShapingRows,
+            index: __m256i,
+            c: &ShapingCoefs,
+            start: usize,
+            mut prev: __m256i,
+            mut t: __m256i,
+        ) -> __m128i {
+            let mut sum = _mm256_setzero_si256();
+            if ORDER == 0 {
+                for m in start..c.order.min(MAX_SHAPE_LPC_ORDER) {
+                    tap(rows, m, index, c, &mut prev, &mut t, &mut sum);
+                }
+            } else {
+                macro_rules! taps {
+                    ($($m:literal)*) => {$(
+                        if $m >= start && $m < ORDER && $m < MAX_SHAPE_LPC_ORDER {
+                            tap(rows, $m, index, c, &mut prev, &mut t, &mut sum);
+                        }
+                    )*};
+                }
+                taps!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23);
+            }
+            narrow(sum, load8(&NARROW_SUMS))
+        }
+
+        /// `super::shaping_filter_rows` for all states in one register, with
+        /// every row read through the tables of `last`.
+        ///
+        /// # Safety
+        ///
+        /// The processor must have AVX2.
+        #[inline(always)]
+        pub(super) unsafe fn shaping_filter_rows<const ORDER: usize>(
+            rows: &mut ShapingRows,
+            last: &LastChoice,
+            diff_q14: __m128i,
+            c: &ShapingCoefs,
+        ) -> __m128i {
+            debug_assert!(ORDER == 0 || ORDER == c.order);
+            let index = load8(&WIDEN[last.replaced_lane.min(4)][last.best.min(3)]);
+            let diff_q14 = widen(diff_q14, load8(&WIDEN[4][0]));
+            let sum = later_taps::<ORDER>(rows, index, c, 0, diff_q14, _mm256_setzero_si256());
+            _mm_add_epi32(sum, c.bias)
+        }
+
+        /// `super::shaping_filter_both` for all states in one register.
+        ///
+        /// # Safety
+        ///
+        /// The processor must have AVX2.
+        #[inline(always)]
+        pub(super) unsafe fn shaping_filter_both<const ORDER: usize, const FIRST: usize>(
+            rows: &mut ShapingRows,
+            last: &LastChoice,
+            c: &ShapingCoefs,
+        ) -> __m128i {
+            let first_taps = FIRST.min(ORDER).min(MAX_SHAPE_LPC_ORDER);
+            if first_taps == 0 {
+                let diff_q14 = last.take(last.diff_first, last.diff_second);
+                return shaping_filter_rows::<ORDER>(rows, last, diff_q14, c);
+            }
+            debug_assert!(ORDER == c.order);
+            // The states' own rows, and the rows through the last choice.
+            let identity = load8(&WIDEN[4][0]);
+            let index = load8(&WIDEN[last.replaced_lane.min(4)][last.best.min(3)]);
+            let narrow_values = load8(&NARROW);
+            let narrow_sums = load8(&NARROW_SUMS);
+            let warping = _mm256_broadcastsi128_si256(c.warping);
+            let zero = _mm256_setzero_si256();
+            // `t` of the two candidates, and their sums.
+            let (mut first, mut second) = (zero, zero);
+            let (mut sum_first, mut sum_second) = (zero, zero);
+            // Row `m - 1` of the states' own rows, and the chosen `t` of tap
+            // `m - 1`, one state per lane.
+            let mut own_prev = _mm_setzero_si128();
+            let mut t = _mm_setzero_si128();
+            macro_rules! first_taps {
+                ($($m:literal)*) => {$(
+                    if $m < first_taps {
+                        let row = load(&rows[$m]);
+                        let coef = _mm256_broadcastsi128_si256(load(&c.coef[$m]));
+                        let old = widen(row, identity);
+                        // `s[-1]` is `diff`.
+                        let (prev_first, prev_second) = if $m == 0 {
+                            (widen(last.diff_first, identity), widen(last.diff_second, identity))
+                        } else {
+                            (widen(own_prev, identity), widen(own_prev, identity))
+                        };
+                        let product = _mm256_mul_epi32(_mm256_sub_epi32(old, first), warping);
+                        first = _mm256_add_epi32(prev_first, _mm256_srli_epi64::<16>(product));
+                        let product = _mm256_mul_epi32(_mm256_sub_epi32(old, second), warping);
+                        second = _mm256_add_epi32(prev_second, _mm256_srli_epi64::<16>(product));
+                        sum_first = _mm256_add_epi32(sum_first, _mm256_mul_epi32(first, coef));
+                        sum_second = _mm256_add_epi32(sum_second, _mm256_mul_epi32(second, coef));
+                        t = last.take(narrow(first, narrow_values), narrow(second, narrow_values));
+                        store(&mut rows[$m], t);
+                        own_prev = row;
+                    }
+                )*};
+            }
+            const { assert!(FIRST <= 8) };
+            first_taps!(0 1 2 3 4 5 6 7);
+            // The later taps read `s[first_taps - 1]` through the last choice.
+            let prev = widen(own_prev, index);
+            let later = later_taps::<ORDER>(rows, index, c, first_taps, prev, widen(t, identity));
+            let first_sums = last.take(
+                narrow(sum_first, narrow_sums),
+                narrow(sum_second, narrow_sums),
+            );
+            _mm_add_epi32(_mm_add_epi32(first_sums, later), c.bias)
+        }
+
+        /// `ShortPrediction::predict` with 256-bit loads: 4 products per
+        /// multiplication instead of 2.
+        ///
+        /// # Safety
+        ///
+        /// The processor must have AVX2.
+        #[inline(always)]
+        pub(super) unsafe fn predict<const N: usize>(
+            lpc: &ShortPrediction,
+            windows: [&[i32; NSQ_LPC_BUF_LENGTH]; N],
+            newest: __m128i,
+            second: __m128i,
+        ) -> __m128i {
+            const { assert!(N <= 4) };
+            let zero = _mm256_setzero_si256();
+            // The odd 32-bit lanes of `partial[k]` hold four partial sums of
+            // state k.
+            let mut partial = [zero; 4];
+            for k in 0..N {
+                let w = windows[k];
+                let mut sum = zero;
+                for (row, &offset) in lpc.older_wide.iter().zip(&WIDE_OFFSETS) {
+                    let v = load8(w[offset..offset + 8].try_into().unwrap());
+                    sum = _mm256_add_epi32(sum, _mm256_mul_epi32(v, load8(row)));
+                }
+                partial[k] = sum;
+            }
+            // As in `ShortPrediction::predict`, in both 128-bit halves; then
+            // the halves are added.
+            let moved = [
+                _mm256_srli_epi64::<32>(partial[0]),
+                _mm256_srli_epi64::<32>(partial[2]),
+            ];
+            let low = _mm256_blend_epi32::<0b1010_1010>(moved[0], partial[1]);
+            let high = _mm256_blend_epi32::<0b1010_1010>(moved[1], partial[3]);
+            let sum = _mm256_add_epi32(
+                _mm256_unpacklo_epi64(low, high),
+                _mm256_unpackhi_epi64(low, high),
+            );
+            let halves = (_mm256_castsi256_si128(sum), _mm256_extracti128_si256::<1>(sum));
+            lpc.finish(_mm_add_epi32(halves.0, halves.1), newest, second)
+        }
+    }
+
+    /// Window positions of the loads of `ShortPrediction`. The load at
+    /// position `o` puts positions `o` and `o + 2` into lanes 0 and 2.
+    /// Positions 10 and 11 are in two loads each.
+    const OLDER_OFFSETS: [usize; 8] = [0, 1, 4, 5, 8, 9, 10, 11];
+
+    /// The same for the 256-bit loads of `wide::predict`: the load at
+    /// position `o` puts positions `o`, `o + 2`, `o + 4` and `o + 6` into
+    /// the 32-bit lanes 0, 2, 4 and 6. Positions 6 and 7 are in two loads
+    /// each.
+    const WIDE_OFFSETS: [usize; 4] = [0, 1, 6, 7];
+
+    /// Short-term prediction of all states at once, state `k` in lane `k`.
+    ///
+    /// The two newest samples of every state come from registers. The
+    /// older ones were stored at least two samples before: an x86 core
+    /// forwards a recent store to a load only when the load reads no other
+    /// bytes, and a 16-byte load over the newest samples would wait until
+    /// those stores are written to the cache.
+    struct ShortPrediction {
+        /// Lanes 0 and 2 of row `i`: the factors (coefficient `<< 16`) of
+        /// the window positions `OLDER_OFFSETS[i]` and `OLDER_OFFSETS[i] + 2`,
+        /// so that `_mm_mul_epi32` puts the products into lanes 1 and 3. The
+        /// second load of positions 10 and 11 has the factor 0.
+        older: [[i32; 4]; 8],
+        /// The same for the loads at `WIDE_OFFSETS`: lanes `2 * j` and
+        /// `2 * j + 1` of row `i` hold the factor of position
+        /// `WIDE_OFFSETS[i] + 2 * j`. The second load of positions 6 and 7
+        /// has the factor 0.
+        older_wide: [[i32; 8]; 4],
+        /// `mulw_factor` of the coefficients of window positions 15 (the
+        /// newest sample) and 14.
+        newest: __m128i,
+        second: __m128i,
+        /// Half the order, the constant of the sum, in every lane.
+        bias: __m128i,
+    }
+
+    impl ShortPrediction {
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        fn new(coefs: &ShortPredictionCoefs) -> Self {
+            let a = coefs.a_q12;
+            // Window position 15 is the newest sample: `a_q12[0]`.
+            let factor = |position: usize| match a.get(NSQ_LPC_BUF_LENGTH - 1 - position) {
+                Some(&c) => (c as i32) << 16,
+                None => 0,
+            };
+            let mut older = [[0i32; 4]; 8];
+            for (i, (row, &offset)) in older.iter_mut().zip(&OLDER_OFFSETS).enumerate() {
+                let low = if i < 6 { factor(offset) } else { 0 };
+                let high = factor(offset + 2);
+                *row = [low, low, high, high];
+            }
+            let mut older_wide = [[0i32; 8]; 4];
+            for (i, (row, &offset)) in older_wide.iter_mut().zip(&WIDE_OFFSETS).enumerate() {
+                for (j, pair) in row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let f = if i >= 2 && j == 0 { 0 } else { factor(offset + 2 * j) };
+                    *pair = [f; 2];
+                }
+            }
+            Self {
+                older,
+                older_wide,
+                newest: _mm_set1_epi32(factor(NSQ_LPC_BUF_LENGTH - 1)),
+                second: _mm_set1_epi32(factor(NSQ_LPC_BUF_LENGTH - 2)),
+                bias: _mm_set1_epi32(coefs.bias()),
+            }
+        }
+
+        /// The prediction of every state, shifted to Q14 as the quantizer
+        /// uses it. `windows[k]` holds the 16 newest samples of state `k`;
+        /// its last two entries are not read: lane `k` of `newest` and of
+        /// `second` hold them.
+        ///
+        /// # Safety
+        ///
+        /// The processor must have SSE4.1.
+        #[inline(always)]
+        unsafe fn predict<const N: usize>(
+            &self,
+            windows: [&[i32; NSQ_LPC_BUF_LENGTH]; N],
+            newest: __m128i,
+            second: __m128i,
+        ) -> __m128i {
+            const { assert!(N <= 4) };
+            let zero = _mm_setzero_si128();
+            // Lanes 1 and 3 of `partial[k]` hold two partial sums of state k.
+            let mut partial = [zero; 4];
+            for k in 0..N {
+                let w = windows[k];
+                let mut sum = zero;
+                for (row, &offset) in self.older.iter().zip(&OLDER_OFFSETS) {
+                    let v = load(w[offset..offset + 4].try_into().unwrap());
+                    sum = _mm_add_epi32(sum, _mm_mul_epi32(v, load(row)));
+                }
+                partial[k] = sum;
+            }
+            // Lanes 1 and 3 of states 0 and 1, then of states 2 and 3:
+            // [s0 lane 1, s1 lane 1, s0 lane 3, s1 lane 3].
+            let low = _mm_blend_epi16::<0b1100_1100>(_mm_srli_epi64::<32>(partial[0]), partial[1]);
+            let high = _mm_blend_epi16::<0b1100_1100>(_mm_srli_epi64::<32>(partial[2]), partial[3]);
+            let sum = _mm_add_epi32(_mm_unpacklo_epi64(low, high), _mm_unpackhi_epi64(low, high));
+            self.finish(sum, newest, second)
+        }
+
+        /// The prediction from `older`, the sum of the products of the 14
+        /// older samples of every state: adds half the order and the
+        /// products of the two newest samples, and shifts to Q14.
+        ///
+        /// # Safety
+        ///
+        /// The processor must have SSE4.1.
+        #[inline(always)]
+        unsafe fn finish(&self, older: __m128i, newest: __m128i, second: __m128i) -> __m128i {
+            let two_newest = _mm_add_epi32(mulw(newest, self.newest), mulw(second, self.second));
+            _mm_slli_epi32::<4>(_mm_add_epi32(_mm_add_epi32(older, self.bias), two_newest))
+        }
+    }
+
+    /// `ShortPrediction::predict`, or with `wide` `wide::predict`, on
+    /// arrays, for the tests: the prediction of every state from its whole
+    /// window. Panics when the processor does not have SSE4.1, or AVX2 for
+    /// `wide`.
+    #[cfg(test)]
+    pub(super) fn short_prediction_lanes<const N: usize>(
+        windows: &[[i32; NSQ_LPC_BUF_LENGTH]; N],
+        a_q12: &[i16],
+        order: usize,
+        wide: bool,
+    ) -> [i32; N] {
+        assert!(crate::compat::x86_has_sse41());
+        assert!(!wide || crate::compat::x86_has_avx2());
+        // SAFETY: the processor has SSE4.1, and AVX2 for `wide` (checked
+        // above).
+        unsafe {
+            let lpc = ShortPrediction::new(&ShortPredictionCoefs::new(a_q12, order));
+            // The last two entries come from the registers only.
+            let mut stale = *windows;
+            for w in stale.iter_mut() {
+                w[NSQ_LPC_BUF_LENGTH - 2..].copy_from_slice(&[0x0bad_f00d, -0x0bad_f00d]);
+            }
+            let newest = from_lanes::<N>(core::array::from_fn(|k| {
+                windows[k][NSQ_LPC_BUF_LENGTH - 1]
+            }));
+            let second = from_lanes::<N>(core::array::from_fn(|k| {
+                windows[k][NSQ_LPC_BUF_LENGTH - 2]
+            }));
+            let stale = core::array::from_fn(|k| &stale[k]);
+            to_lanes(if wide {
+                wide::predict::<N>(&lpc, stale, newest, second)
+            } else {
+                lpc.predict::<N>(stale, newest, second)
+            })
+        }
+    }
+
+    /// One subframe of the delayed-decision quantizer for `N` states, 2 to 4,
+    /// on x86-64 with SSE4.1. Same results as `quantize_subframe`.
+    ///
+    /// `ORDER` is the shaping order when it is known at compile time, or 0.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn quantize_subframe_sse41<const N: usize, const ORDER: usize>(
+        nsq: &mut SilkNSQState,
+        states: &mut [PathState; N],
+        delay_lines: &mut DelayLines,
+        x_q10: &[i32],
+        pulses: &mut [i8],
+        s_ltp_q15: &mut [i32],
+        delayed_ga_q10: &mut [i32],
+        smpl_buf_idx: &mut i32,
+        p: &SubframeParams,
+    ) {
+        // SAFETY: the caller guarantees SSE4.1, all that `WIDE == false`
+        // needs.
+        unsafe {
+            quantize_subframe_x86::<N, ORDER, false>(
+                nsq,
+                states,
+                delay_lines,
+                x_q10,
+                pulses,
+                s_ltp_q15,
+                delayed_ga_q10,
+                smpl_buf_idx,
+                p,
+            )
+        }
+    }
+
+    /// `quantize_subframe_sse41` for processors with AVX2. The shaping filter
+    /// of 3 and 4 states and the short-term prediction run in 256-bit
+    /// registers (`wide`). Every other step uses the same instructions in the
+    /// VEX encoding, which has a separate destination register and so needs
+    /// fewer copies between registers.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn quantize_subframe_avx2<const N: usize, const ORDER: usize>(
+        nsq: &mut SilkNSQState,
+        states: &mut [PathState; N],
+        delay_lines: &mut DelayLines,
+        x_q10: &[i32],
+        pulses: &mut [i8],
+        s_ltp_q15: &mut [i32],
+        delayed_ga_q10: &mut [i32],
+        smpl_buf_idx: &mut i32,
+        p: &SubframeParams,
+    ) {
+        // SAFETY: the caller guarantees AVX2, which includes SSE4.1.
+        unsafe {
+            quantize_subframe_x86::<N, ORDER, true>(
+                nsq,
+                states,
+                delay_lines,
+                x_q10,
+                pulses,
+                s_ltp_q15,
+                delayed_ga_q10,
+                smpl_buf_idx,
+                p,
+            )
+        }
+    }
+
+    /// The sample loop of `quantize_subframe_sse41` and, with `WIDE`, of
+    /// `quantize_subframe_avx2`. The steps are those of
+    /// `neon::quantize_subframe_neon`.
+    ///
+    /// It is inlined into both, so that it is compiled once with the target
+    /// features of each.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1, and AVX2 when `WIDE` is true.
+    #[inline(always)]
+    unsafe fn quantize_subframe_x86<const N: usize, const ORDER: usize, const WIDE: bool>(
+        nsq: &mut SilkNSQState,
+        states: &mut [PathState; N],
+        delay_lines: &mut DelayLines,
+        x_q10: &[i32],
+        pulses: &mut [i8],
+        s_ltp_q15: &mut [i32],
+        delayed_ga_q10: &mut [i32],
+        smpl_buf_idx: &mut i32,
+        p: &SubframeParams,
+    ) {
+        debug_assert!((2..=4).contains(&N));
+        let dd = p.decision_delay;
+        if !vector_loop_applies(*smpl_buf_idx, s_ltp_q15, delayed_ga_q10, p) {
+            quantize_subframe::<N>(
+                nsq,
+                states,
+                delay_lines,
+                x_q10,
+                pulses,
+                s_ltp_q15,
+                delayed_ga_q10,
+                smpl_buf_idx,
+                p,
+            );
+            return;
+        }
+        let Some(setup) = SubframeSetup::new(nsq, x_q10, p) else {
+            return;
+        };
+        assert!(ORDER == 0 || ORDER == setup.ar_shp_q13.len());
+        let delayed_ga_q10: &mut [i32; DECISION_DELAY] =
+            (&mut delayed_ga_q10[..DECISION_DELAY]).try_into().unwrap();
+        let length = setup.x_q10.len().min(MAX_SUB_FRAME_LENGTH);
+        let levels = LevelVectors::new(&setup.levels);
+        let long_term = LongTerm::new(p, &setup);
+        let lpc = ShortPrediction::new(&setup.lpc);
+        // The two newest samples of every state, for `ShortPrediction`.
+        let mut newest_xq_q14 = from_lanes::<N>(core::array::from_fn(|k| {
+            states[k].s_lpc_q14[NSQ_LPC_BUF_LENGTH - 1]
+        }));
+        let mut second_xq_q14 = from_lanes::<N>(core::array::from_fn(|k| {
+            states[k].s_lpc_q14[NSQ_LPC_BUF_LENGTH - 2]
+        }));
+        let rand_multiplier = _mm_set1_epi32(196314165);
+        let rand_increment = _mm_set1_epi32(907633515);
+        let shp_buf_start = nsq.s_ltp_shp_buf_idx;
+        let ltp_buf_start = nsq.s_ltp_buf_idx;
+
+        let shaping_coefs = ShapingCoefs::new(setup.ar_shp_q13, p.warping_q16);
+        let mut shaping_rows = load_shaping_rows(states);
+
+        // A store that has no place to go goes to one of these (see
+        // `neon::quantize_subframe_neon`).
+        let mut spare_lpc = [0i32; NSQ_LPC_BUF_LENGTH];
+        let (mut spare_i8, mut spare_i16, mut spare_i32) = (0i8, 0i16, 0i32);
+        core::hint::black_box((
+            &mut spare_lpc,
+            &mut spare_i8,
+            &mut spare_i16,
+            &mut spare_i32,
+        ));
+
+        // The per-state values that change with every sample.
+        let mut seed = from_lanes::<N>(core::array::from_fn(|k| states[k].seed));
+        let mut seed_init = from_lanes::<N>(core::array::from_fn(|k| states[k].seed_init));
+        let mut lf_ar_q14 = from_lanes::<N>(core::array::from_fn(|k| states[k].lf_ar_q14));
+        let diff_q14 = from_lanes::<N>(core::array::from_fn(|k| states[k].diff_q14));
+        // What the shaping filter needs from the last sample. `diff_q14` of
+        // every state is `last.take(last.diff_first, last.diff_second)`.
+        let mut last = LastChoice::keep(diff_q14);
+        let mut rd_q10: [i32; N] = core::array::from_fn(|k| states[k].rd_q10);
+        // The slot of the newest sample of the delay lines, and its
+        // `shape_q14` row.
+        let mut newest = (*smpl_buf_idx as usize).min(DECISION_DELAY - 1);
+        debug_assert!((0..N).all(|k| delay_lines.column(k, newest) == k));
+        let mut shape_q14 = load(&delay_lines.shape_q14[newest]);
+
+        for idx in 0..length {
+            let i = idx as i32;
+            let x = setup.x_q10[idx];
+
+            // Noise shaping feedback of every state. With 2 states, one
+            // 128-bit register holds the filter of both.
+            let n_ar = if WIDE && N > 2 {
+                wide::shaping_filter_both::<ORDER, FIRST_TAPS>(
+                    &mut shaping_rows,
+                    &last,
+                    &shaping_coefs,
+                )
+            } else {
+                shaping_filter_both::<N, ORDER, FIRST_TAPS>(
+                    &mut shaping_rows,
+                    &last,
+                    &shaping_coefs,
+                )
+            };
+
+            let (ltp_pred_q14, n_ltp_q14) = long_term.at(s_ltp_q15, &nsq.s_ltp_shp_q14, i);
+
+            // Dither: `silk_rand`.
+            seed = _mm_add_epi32(_mm_mullo_epi32(seed, rand_multiplier), rand_increment);
+
+            // Short-term prediction.
+            let windows: [&[i32; NSQ_LPC_BUF_LENGTH]; N] = core::array::from_fn(|k| {
+                states[k].s_lpc_q14[idx..idx + NSQ_LPC_BUF_LENGTH]
+                    .try_into()
+                    .unwrap()
+            });
+            let lpc_pred_q14 = if WIDE {
+                wide::predict::<N>(&lpc, windows, newest_xq_q14, second_xq_q14)
+            } else {
+                lpc.predict::<N>(windows, newest_xq_q14, second_xq_q14)
+            };
+
+            let c = quantize_sample_x86(
+                &levels,
+                x,
+                ltp_pred_q14,
+                n_ltp_q14,
+                n_ar,
+                lpc_pred_q14,
+                lf_ar_q14,
+                shape_q14,
+                seed,
+            );
+
+            // The slot of this sample, and the slot of the sample that is
+            // `dd` samples older.
+            newest = select(newest == 0, DECISION_DELAY - 1, newest.wrapping_sub(1))
+                .min(DECISION_DELAY - 1);
+            let oldest = newest + dd as usize;
+            let oldest = select(
+                oldest >= DECISION_DELAY,
+                oldest.wrapping_sub(DECISION_DELAY),
+                oldest,
+            )
+            .min(DECISION_DELAY - 1);
+
+            // The survivors are chosen on scalars, as in the portable loop.
+            let added0: [i32; N] = to_lanes(c.rd_added_q10[0]);
+            let added1: [i32; N] = to_lanes(c.rd_added_q10[1]);
+            let mut rd0: [i32; N] = core::array::from_fn(|k| rd_q10[k].wrapping_add(added0[k]));
+            let mut rd1: [i32; N] = core::array::from_fn(|k| rd_q10[k].wrapping_add(added1[k]));
+            let rand_state: [i32; N] = core::array::from_fn(|k| {
+                delay_lines.rand_state[oldest][delay_lines.column(k, oldest)]
+            });
+            let sv = select_survivors(&mut rd0, &mut rd1, &rand_state);
+
+            // Replace the worst state by a copy of the best one that takes
+            // the second candidate.
+            copy_history(states, delay_lines, &mut spare_lpc, &sv, idx);
+            let replaced_lane = select(sv.replace, sv.rd_max_ind, 4);
+            last = LastChoice::new(c.diff_q14[0], c.diff_q14[1], replaced_lane, sv.rd_min_ind);
+            seed = last.take(seed, seed);
+            seed_init = last.take(seed_init, seed_init);
+            let q_q10 = last.take(c.q_q10[0], c.q_q10[1]);
+            let xq_q14 = last.take(c.xq_q14[0], c.xq_q14[1]);
+            // The replaced state continues the history of the best state.
+            second_xq_q14 = last.take(newest_xq_q14, newest_xq_q14);
+            newest_xq_q14 = xq_q14;
+            let lpc_exc_q14 = last.take(c.lpc_exc_q14[0], c.lpc_exc_q14[1]);
+            shape_q14 = last.take(c.s_ltp_shp_q14[0], c.s_ltp_shp_q14[1]);
+            lf_ar_q14 = last.take(c.lf_ar_q14[0], c.lf_ar_q14[1]);
+            for k in 0..N {
+                let replaced = sv.replace && k == sv.rd_max_ind;
+                rd_q10[k] = select(replaced, sv.rd_min_q10, rd0[k]);
+            }
+
+            // The outputs that are `dd` samples old, from the state with the
+            // lowest cost. The first `dd` samples of a frame have none.
+            let active = p.subfr > 0 || i >= dd;
+            let column = delay_lines.column(sv.winner_ind, oldest);
+            store_if(
+                pulses,
+                (p.pulses_offset + i - dd) as isize,
+                active,
+                &mut spare_i8,
+                silk_rshift_round(delay_lines.q_q10[oldest][column], 10) as i8,
+            );
+            store_if(
+                &mut nsq.xq,
+                (p.xq_ptr + i - dd) as isize,
+                active,
+                &mut spare_i16,
+                silk_sat16(silk_rshift_round(
+                    silk_smulww(delay_lines.xq_q14[oldest][column], delayed_ga_q10[oldest]),
+                    8,
+                )) as i16,
+            );
+            store_if(
+                &mut nsq.s_ltp_shp_q14,
+                (shp_buf_start + i - dd) as isize,
+                active,
+                &mut spare_i32,
+                delay_lines.shape_q14[oldest][column],
+            );
+            store_if(
+                s_ltp_q15,
+                (ltp_buf_start + i - dd) as isize,
+                active,
+                &mut spare_i32,
+                delay_lines.pred_q15[oldest][column],
+            );
+
+            // Append the chosen candidate to every state: one row per delay
+            // line. The lanes from `N` on of a row are never read.
+            seed = _mm_add_epi32(seed, round_shift::<9>(q_q10));
+            store(&mut delay_lines.xq_q14[newest], xq_q14);
+            store(&mut delay_lines.q_q10[newest], q_q10);
+            store(
+                &mut delay_lines.pred_q15[newest],
+                _mm_slli_epi32::<1>(lpc_exc_q14),
+            );
+            store(&mut delay_lines.shape_q14[newest], shape_q14);
+            store(&mut delay_lines.rand_state[newest], seed);
+            let xq: [i32; N] = to_lanes(xq_q14);
+            for k in 0..N {
+                states[k].s_lpc_q14[NSQ_LPC_BUF_LENGTH + idx] = xq[k];
+                delay_lines.column[k][newest] = k as u8;
+            }
+            delayed_ga_q10[newest] = setup.gain_q10;
+        }
+        *smpl_buf_idx = newest as i32;
+        nsq.s_ltp_shp_buf_idx = shp_buf_start + length as i32;
+        nsq.s_ltp_buf_idx = ltp_buf_start + length as i32;
+
+        let perm = load_table(&PERM[last.replaced_lane][last.best]);
+        store_shaping_rows(states, &shaping_rows, perm);
+        let seed: [i32; N] = to_lanes(seed);
+        let seed_init: [i32; N] = to_lanes(seed_init);
+        let lf_ar_q14: [i32; N] = to_lanes(lf_ar_q14);
+        let diff_q14: [i32; N] = to_lanes(last.take(last.diff_first, last.diff_second));
+        for k in 0..N {
+            let state = &mut states[k];
+            state.seed = seed[k];
+            state.seed_init = seed_init[k];
+            state.lf_ar_q14 = lf_ar_q14[k];
+            state.diff_q14 = diff_q14[k];
+            state.rd_q10 = rd_q10[k];
+            // The newest samples become the prediction history of the next
+            // subframe.
+            state
+                .s_lpc_q14
+                .copy_within(length..length + NSQ_LPC_BUF_LENGTH, 0);
+        }
+    }
+}
+
 /// One subframe with no state at all. This is not a setting the encoder
 /// uses; it only keeps what the function did before for a state count of 0:
 /// the delayed outputs are taken from state 0, which nothing updates.
@@ -2218,9 +3906,10 @@ fn quantize_subframe_without_states(
 }
 
 /// Runs one subframe with the sample loop for `n_states` states. The sample
-/// loops are compiled once per state count, and on aarch64 also once per
-/// shaping order the encoder uses with that count; this is the only place
-/// that chooses between them.
+/// loops are compiled once per state count, and on aarch64 and x86-64 also
+/// once per shaping order the encoder uses with that count; this is the only
+/// place that chooses between them. On x86-64 the vector loop needs SSE4.1,
+/// checked once per subframe; without it the portable loop runs.
 fn quantize_subframe_dispatch(
     nsq: &mut SilkNSQState,
     states: &mut [PathState; NSQ_MAX_STATES_OPERATING],
@@ -2269,7 +3958,42 @@ fn quantize_subframe_dispatch(
             }
         };
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    let (avx2, sse41) = (
+        crate::compat::x86_has_avx2(),
+        crate::compat::x86_has_sse41(),
+    );
+    #[cfg(target_arch = "x86_64")]
+    macro_rules! x86_loop {
+        ($loop:ident, $n:literal, $order:literal) => {
+            x86::$loop::<$n, $order>(
+                nsq,
+                states.first_chunk_mut::<$n>().unwrap(),
+                delay_lines,
+                x_q10,
+                pulses,
+                s_ltp_q15,
+                delayed_ga_q10,
+                smpl_buf_idx,
+                p,
+            )
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    macro_rules! fastest {
+        ($n:literal, $order:literal) => {
+            if avx2 {
+                // SAFETY: the processor has AVX2 (detected above).
+                unsafe { x86_loop!(quantize_subframe_avx2, $n, $order) }
+            } else if sse41 {
+                // SAFETY: the processor has SSE4.1 (detected above).
+                unsafe { x86_loop!(quantize_subframe_sse41, $n, $order) }
+            } else {
+                portable!($n)
+            }
+        };
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     macro_rules! fastest {
         ($n:literal, $order:literal) => {
             portable!($n)
@@ -2849,8 +4573,8 @@ mod tests {
                 want_states[k] = s;
             }
 
-            // Only the NEON checks below read it.
-            #[cfg(target_arch = "aarch64")]
+            // Only the vector checks below read it.
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             let start_states = states;
             let n_ar = warped_shaping_filter(
                 &mut states,
@@ -2913,6 +4637,60 @@ mod tests {
                     _ => {}
                 }
             }
+
+            // The same for the x86 filters.
+            #[cfg(target_arch = "x86_64")]
+            if crate::compat::x86_has_sse41() {
+                // The 128-bit filter, and the 256-bit one where the
+                // processor has AVX2.
+                let widths: &[bool] = if crate::compat::x86_has_avx2() {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
+                macro_rules! check_x86_with {
+                    ($order:literal, $first:literal, $both:literal) => {{
+                        for &wide in widths {
+                            let mut states = start_states;
+                            let n_ar = x86::shaping_filter_rows_lanes::<N, $order, $first>(
+                                &mut states,
+                                source,
+                                diff,
+                                &coefs[..order],
+                                warping_q16,
+                                $both,
+                                wide,
+                            );
+                            let what = format!(
+                                "x86 {}, both {} {}, wide {wide}, {N} states, order {order}, case {case}",
+                                $order, $both, $first
+                            );
+                            assert_eq!(n_ar, want_n_ar, "{what}");
+                            assert_eq!(states, want_states, "{what}");
+                        }
+                    }};
+                }
+                macro_rules! check_x86 {
+                    ($order:literal) => {{
+                        check_x86_with!($order, 0, false);
+                        check_x86_with!($order, 0, true);
+                        check_x86_with!($order, 1, true);
+                        check_x86_with!($order, 2, true);
+                        check_x86_with!($order, 4, true);
+                        check_x86_with!($order, 5, true);
+                        check_x86_with!($order, 8, true);
+                    }};
+                }
+                check_x86!(0);
+                match order {
+                    12 => check_x86!(12),
+                    14 => check_x86!(14),
+                    16 => check_x86!(16),
+                    20 => check_x86!(20),
+                    24 => check_x86!(24),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -2957,14 +4735,27 @@ mod tests {
         assert_eq!((rd0[1], rd1[1]), (i32::MAX, i32::MAX));
     }
 
-    #[cfg(target_arch = "aarch64")]
-    mod neon_tests {
+    /// The tests of the vector sample loops: `mod neon` on aarch64, `mod x86`
+    /// on x86-64. On an x86-64 processor without SSE4.1 they check nothing.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    mod simd_tests {
+        #[cfg(target_arch = "aarch64")]
         use super::super::neon::*;
+        #[cfg(target_arch = "x86_64")]
+        use super::super::x86::*;
         use super::super::*;
         use super::Rng;
 
+        /// Whether the processor runs the vector loop of this target.
+        fn simd_available() -> bool {
+            cfg!(target_arch = "aarch64") || crate::compat::x86_has_sse41()
+        }
+
         #[test]
         fn level_decision_matches_scalar() {
+            if !simd_available() {
+                return;
+            }
             let mut rng = Rng(4);
             for case in 0..20000 {
                 // Small values exercise the levels around zero, large ones the
@@ -3219,7 +5010,10 @@ mod tests {
                     a_q12: &a_q12,
                     b_q14: &b_q14,
                     ar_shp_q13: &ar_shp_q13,
-                    lag: if voiced {
+                    // An unvoiced subframe keeps the lag of the last voiced
+                    // one for the harmonic noise shaping (libopus
+                    // `lagPrev`), so half of them have a lag.
+                    lag: if voiced || case % 2 == 0 {
                         rng.range(decision_delay as i64 + 3, 288) as i32
                     } else {
                         0
@@ -3238,13 +5032,17 @@ mod tests {
                     decision_delay,
                 };
 
+                let start = neon.clone();
                 let mut runtime_order = neon.clone();
-                let world = |w: &mut World, order: usize| {
-                    macro_rules! run {
-                        ($order:literal) => {
-                            // SAFETY: NEON is part of the aarch64 baseline.
+                // `wide` selects the AVX2 loop on x86-64.
+                let world = |w: &mut World, order: usize, wide: bool| {
+                    macro_rules! call {
+                        ($loop:ident, $order:literal) => {
+                            // SAFETY: NEON is part of the aarch64 baseline;
+                            // on x86-64 the test runs only with SSE4.1, and
+                            // with `wide` only with AVX2.
                             unsafe {
-                                quantize_subframe_neon::<N, $order>(
+                                $loop::<N, $order>(
                                     &mut w.nsq,
                                     w.states.first_chunk_mut::<N>().unwrap(),
                                     &mut w.delay_lines,
@@ -3258,6 +5056,21 @@ mod tests {
                             }
                         };
                     }
+                    macro_rules! run {
+                        ($order:literal) => {{
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                assert!(!wide);
+                                call!(quantize_subframe_neon, $order)
+                            }
+                            #[cfg(target_arch = "x86_64")]
+                            if wide {
+                                call!(quantize_subframe_avx2, $order)
+                            } else {
+                                call!(quantize_subframe_sse41, $order)
+                            }
+                        }};
+                    }
                     // The instances `quantize_subframe_dispatch` uses.
                     match (N, order) {
                         (2, 12) => run!(12),
@@ -3268,8 +5081,8 @@ mod tests {
                         _ => run!(0),
                     }
                 };
-                world(&mut neon, p.shaping_lpc_order as usize);
-                world(&mut runtime_order, 0);
+                world(&mut neon, p.shaping_lpc_order as usize, false);
+                world(&mut runtime_order, 0, false);
                 quantize_subframe::<N>(
                     &mut portable.nsq,
                     portable.states.first_chunk_mut::<N>().unwrap(),
@@ -3285,15 +5098,116 @@ mod tests {
                 assert_same_world(&neon, &portable, N, length, &what);
                 let what = format!("{what}, order at run time");
                 assert_same_world(&runtime_order, &portable, N, length, &what);
+
+                // The AVX2 loop, where the processor has it.
+                if cfg!(target_arch = "x86_64") && crate::compat::x86_has_avx2() {
+                    for order in [p.shaping_lpc_order as usize, 0] {
+                        let mut wide = start.clone();
+                        world(&mut wide, order, true);
+                        let what = format!("{what}, AVX2, order {order}");
+                        assert_same_world(&wide, &portable, N, length, &what);
+                    }
+                }
             }
         }
 
         #[test]
         fn subframe_matches_portable_loop() {
+            if !simd_available() {
+                return;
+            }
             let mut rng = Rng(5);
             check_subframes::<2>(&mut rng);
             check_subframes::<3>(&mut rng);
             check_subframes::<4>(&mut rng);
+        }
+
+        /// The x86 forms of `vqdmulhq_s32`, of the saturating and rounding
+        /// steps and of the sign flip, against the scalar macros, at the
+        /// edges of `i32` and on random values.
+        #[cfg(target_arch = "x86_64")]
+        #[test]
+        fn x86_helpers_match_scalar() {
+            if !simd_available() {
+                return;
+            }
+            const EDGES: [i32; 12] = [
+                i32::MIN,
+                i32::MIN + 1,
+                i32::MIN / 2,
+                -65536,
+                -32768,
+                -1,
+                0,
+                1,
+                32767,
+                65535,
+                i32::MAX - 1,
+                i32::MAX,
+            ];
+            let mut rng = Rng(6);
+            // Every pair of edges, then random pairs, four at a time.
+            let edge_pairs = EDGES.len() * EDGES.len();
+            for group in 0..(edge_pairs + 20000) / 4 {
+                let mut a = [0i32; 4];
+                let mut b = [0i32; 4];
+                for k in 0..4 {
+                    let n = 4 * group + k;
+                    (a[k], b[k]) = if n < edge_pairs {
+                        (EDGES[n / EDGES.len()], EDGES[n % EDGES.len()])
+                    } else {
+                        (rng.value(30), rng.value(30))
+                    };
+                }
+                let [products, sums, differences, round4, round10, signed] = helpers_lanes(a, b);
+                for k in 0..4 {
+                    let what = format!("a {}, b {}", a[k], b[k]);
+                    assert_eq!(products[k], silk_smulwb(a[k], b[k]), "mulw, {what}");
+                    assert_eq!(sums[k], silk_add_sat32(a[k], b[k]), "adds, {what}");
+                    assert_eq!(differences[k], silk_sub_sat32(a[k], b[k]), "subs, {what}");
+                    assert_eq!(round4[k], silk_rshift_round(a[k], 4), "round 4, {what}");
+                    assert_eq!(round10[k], silk_rshift_round(a[k], 10), "round 10, {what}");
+                    let want = if b[k] < 0 { a[k].wrapping_neg() } else { a[k] };
+                    assert_eq!(signed[k], want, "sign, {what}");
+                }
+            }
+        }
+
+        /// The short-term prediction of the x86 loop, two samples of it
+        /// from registers, against the definition: every order, 2 to 4
+        /// states.
+        #[cfg(target_arch = "x86_64")]
+        #[test]
+        fn x86_short_prediction_matches_the_definition() {
+            if !simd_available() {
+                return;
+            }
+            fn check<const N: usize>(rng: &mut Rng) {
+                for case in 0..2000 {
+                    let order = case % (MAX_LPC_ORDER + 1);
+                    let windows: [[i32; MAX_LPC_ORDER]; N] =
+                        core::array::from_fn(|_| core::array::from_fn(|_| rng.value(30)));
+                    let a_q12: [i16; MAX_LPC_ORDER] = core::array::from_fn(|_| rng.coef());
+                    for wide in [false, true] {
+                        if wide && !crate::compat::x86_has_avx2() {
+                            continue;
+                        }
+                        let got = short_prediction_lanes::<N>(&windows, &a_q12, order, wide);
+                        for k in 0..N {
+                            let want = silk_lshift(
+                                super::prediction_by_definition(&windows[k], &a_q12, order),
+                                4,
+                            );
+                            let what = format!("{N} states, order {order}, state {k}, wide {wide}");
+                            assert_eq!(got[k], want, "{what}");
+                        }
+                    }
+                }
+            }
+            let mut rng = Rng(7);
+            check::<2>(&mut rng);
+            check::<3>(&mut rng);
+            check::<4>(&mut rng);
         }
     }
 }
