@@ -6496,20 +6496,39 @@ mod deemph_segments_tests {
 
     #[test]
     fn segments_match_one_sample_at_a_time() {
-        let coef = crate::modes::default_mode().preemph[0];
+        let standard = crate::modes::default_mode().preemph[0];
         let mut seed = 21u32;
+        // With the settings the decoder uses and a noise or a constant
+        // signal, the segments after the first of each channel, and how
+        // many of them the check computed again. The comparison above must
+        // cover the vector kernel's own output, not only recomputed
+        // segments. (After silence or with values near the smallest `f32`,
+        // the check computes most segments again, by design.)
+        let (mut later_segments, mut recomputed) = (0usize, 0usize);
         for kind in 0..8 {
             for n in [0usize, 32, 64, 96, 160, 480, 960] {
                 // Without a run-in, and with a short one, most segments
                 // are computed again. With the long one, few are.
                 for warmup in [0usize, 4, 32, 96, 160] {
-                    for coef in [coef, 0.0, 0.5, 0.99] {
+                    for coef in [standard, 0.0, 0.5, 0.99] {
+                        let before = DEEMPH_RECOMPUTED.with(|count| count.get());
                         check::<1>(kind, n, warmup, coef, &mut seed);
                         check::<2>(kind, n, warmup, coef, &mut seed);
+                        let steady = matches!(kind, 0 | 6 | 7);
+                        if steady && warmup == DEEMPH_WARMUP && n >= DEEMPH_SEGMENTS_MIN && coef == standard {
+                            // Planar and interleaved: 7 later segments of one
+                            // channel, 3 of each of two.
+                            later_segments += 2 * (7 + 2 * 3);
+                            recomputed += DEEMPH_RECOMPUTED.with(|count| count.get()) - before;
+                        }
                     }
                 }
             }
         }
+        assert!(
+            recomputed * 4 < later_segments,
+            "{recomputed} of {later_segments} segments computed again"
+        );
     }
 
     /// Frames of digital silence after a signal must be computed once.

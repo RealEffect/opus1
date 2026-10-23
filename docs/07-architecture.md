@@ -402,16 +402,17 @@ The loops that take most of the run time have several versions. The rule is the 
 
 1. A safe function is the only entry point, for example `pitch::inner_prod`. It checks the slice lengths, usually by slicing to the exact length (`&x[..n]`), so a short slice panics before any vector code runs.
 2. On aarch64 it calls the NEON version. NEON is part of every aarch64 target, so there is no run-time check. These functions use `core::arch::aarch64` intrinsics; some carry `#[target_feature(enable = "neon")]`.
-3. On x86 and x86-64 it checks for AVX or AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add):
-   - It asks `crate::compat::x86_has_avx()`, `x86_has_avx2()`, `x86_has_avx_fma()` or `x86_has_avx2_fma()`.
-   - When the answer is yes, it calls an `unsafe fn` marked `#[target_feature(enable = "avx,fma")]` (or `"avx"`, `"avx2"`, `"avx2,fma"`).
+3. On x86 and x86-64 it checks for SSE4.1, AVX or AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add):
+   - It asks `crate::compat::x86_has_sse41()`, `x86_has_avx()`, `x86_has_avx2()`, `x86_has_avx_fma()` or `x86_has_avx2_fma()`.
+   - When the answer is yes, it calls an `unsafe fn` marked `#[target_feature(enable = "avx,fma")]` (or `"sse4.1"`, `"avx"`, `"avx2"`, `"avx2,fma"`).
+   - The SILK noise-shaping quantizers (`silk/nsq.rs` and `silk/nsq_del_dec.rs`) need SSE4.1. The delayed-decision quantizer has a second copy of its sample loop for AVX2. Both check once per subframe.
    - Kernels that use FMA instructions run only when AVX and FMA are both present, because some processors have AVX without FMA.
    - Some kernels in `pitch.rs` and `celt.rs` also have an SSE version. SSE (Streaming SIMD Extensions, where SIMD means single instruction, multiple data) is the older set of x86 vector instructions, and every x86-64 processor has it.
 4. Otherwise it runs the portable Rust version.
 
 The check happens inside the function that the rest of the codec calls, at every call. With `std` the probes use `std::arch::is_x86_feature_detected!`, which stores its answer after the first call. Without `std` they use `cfg!(target_feature = "...")`, which the compiler decides from the build flags.
 
-Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `silk/sigproc_fix.rs`. Files with aarch64 versions: those, plus `src/analysis/mod.rs` (the search for the largest sample of the digital silence test), `src/analysis/neon.rs` and, under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs`, `nlsf.rs`, `nsq_del_dec.rs`, `pitch_analysis.rs`, `resampler.rs` and `vq_wmat_ec.rs`. The analysis has no x86 vector code: on x86 it runs its scalar code.
+Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `silk/nsq.rs`, `silk/nsq_del_dec.rs`, `silk/sigproc_fix.rs`. Files with aarch64 versions: those, plus `src/analysis/mod.rs` (the search for the largest sample of the digital silence test), `src/analysis/neon.rs` and, under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs`, `nlsf.rs`, `pitch_analysis.rs`, `resampler.rs` and `vq_wmat_ec.rs`. The analysis has no x86 vector code: on x86 it runs its scalar code.
 
 `src/mathops.rs` also depends on the processor, for rounding rather than speed. On aarch64, `mac` and `mac_f64` compute `acc + a * b` with one fused multiply-add, which rounds once. The arm64 build of libopus does the same, because clang fuses such C expressions there. On other targets the product is rounded first.
 
@@ -449,9 +450,9 @@ The library uses `unsafe` code where safe Rust would cost speed or stack memory.
 
 1. **Vector kernels.** Most of the `unsafe` code is here. These functions use the vector instructions of the processor: the intrinsics of `core::arch`, and on aarch64 also inline assembly for FEAT_FCMA in `kiss_fft.rs`. Some are portable code compiled for an extra instruction set with `#[target_feature]`. Many kernels load and store through raw pointers, without index checks.
    - A safe entry point checks the slice lengths before a kernel runs (see [Code for specific processors](#code-for-specific-processors)).
-   - A kernel runs only on a processor that has its instructions. NEON is part of every aarch64 target, so it needs no check. SSE is part of every x86-64 target. On x86 the functions of `crate::compat` check for AVX, AVX2 and FMA: at run time with `std`, and from the build flags without `std`. `has_fcma()` in `kiss_fft.rs` checks for FEAT_FCMA, and `src/dnn/arch.rs` checks for the DotProd extension that some neural network kernels use.
+   - A kernel runs only on a processor that has its instructions. NEON is part of every aarch64 target, so it needs no check. SSE is part of every x86-64 target. On x86 the functions of `crate::compat` check for SSE4.1, AVX, AVX2 and FMA: at run time with `std`, and from the build flags without `std`. `has_fcma()` in `kiss_fft.rs` checks for FEAT_FCMA, and `src/dnn/arch.rs` checks for the DotProd extension that some neural network kernels use.
    - Files with aarch64 kernels: `src/lib.rs` (the conversion of decoded samples to 16 bits), `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mathops.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs` and `rate.rs`; `src/analysis/` (`mod.rs`, `neon.rs`, `tonality.rs`); `src/eval/compare.rs` (test-only, see item 6); under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs`, `nlsf.rs`, `nsq.rs`, `nsq_del_dec.rs`, `pitch_analysis.rs`, `resampler.rs`, `sigproc_fix.rs` and `vq_wmat_ec.rs`; and `src/dnn/vec_neon.rs` and `src/dnn/vec_portable.rs`.
-   - Files with x86 kernels: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `src/silk/sigproc_fix.rs` and `src/dnn/vec_x86.rs`.
+   - Files with x86 kernels: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `src/silk/nsq.rs`, `src/silk/nsq_del_dec.rs`, `src/silk/sigproc_fix.rs` and `src/dnn/vec_x86.rs`.
    - In `src/dnn/`, `nnet.rs` calls the kernels of `vec_neon.rs` and `vec_x86.rs` only after it has checked the slices and the index tables of sparse layers.
 2. **Building large states in place.** Without `heap` an `OpusEncoder` holds about 150 KB inline and an `OpusDecoder` about 60 KB. A constructor that returns such a value builds it on the stack and copies it out. So the constructors write every field through a raw pointer into the final memory, which may be uninitialized.
    - `src/in_place.rs` holds the tools. The macro `write_fields!` writes the fields and checks at compile time that it writes all of them. `write_zero` fills a field with zero bytes, for the types of the trait `Zeroable`, whose all-zero bytes are a valid value. `boxed` and `write_box` fill the boxes of `heap` in place.
