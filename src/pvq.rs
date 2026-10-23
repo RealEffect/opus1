@@ -156,6 +156,18 @@ pub const MAX_PVQ_K: usize = 128;
 const MAX_PVQ_U: usize = MAX_PVQ_K + 2;
 pub const MAX_PVQ_N: usize = 352;
 
+/// Sets every value of `buf` to `value` and returns `buf` as values. It is
+/// the slice method `write_filled` of the standard library, which is not
+/// stable yet.
+#[inline(always)]
+pub(crate) fn write_filled<T: Copy>(buf: &mut [MaybeUninit<T>], value: T) -> &mut [T] {
+    for v in buf.iter_mut() {
+        v.write(value);
+    }
+    // SAFETY: the loop above wrote every value of `buf`.
+    unsafe { buf.assume_init_mut() }
+}
+
 /// `saturating_add(a, b, c)`, clamped to `u32::MAX` so an out-of-domain
 /// `(n, k)` can never silently wrap to a plausible-but-wrong codebook size.
 #[inline(always)]
@@ -340,15 +352,51 @@ unsafe fn pvq_v_unchecked(n: u32, k: u32) -> u64 {
     }
 }
 
+/// A value of a pulse vector: an `i32`, or memory that holds no value yet.
+/// The pulse decoder (`cwrsi_table`) writes every value, and the pulse
+/// search sets every value to 0 before it places pulses. So both can start
+/// from memory without values, and the codec needs no fill of its own
+/// before them.
+trait PulseSlot: Sized {
+    /// Writes `v`.
+    fn put(&mut self, v: i32);
+    /// Sets every value of `y` to 0 and returns `y` as values.
+    fn zeroed(y: &mut [Self]) -> &mut [i32];
+}
+
+impl PulseSlot for i32 {
+    #[inline(always)]
+    fn put(&mut self, v: i32) {
+        *self = v;
+    }
+    #[inline(always)]
+    fn zeroed(y: &mut [i32]) -> &mut [i32] {
+        y.fill(0);
+        y
+    }
+}
+
+impl PulseSlot for MaybeUninit<i32> {
+    #[inline(always)]
+    fn put(&mut self, v: i32) {
+        self.write(v);
+    }
+    #[inline(always)]
+    fn zeroed(y: &mut [MaybeUninit<i32>]) -> &mut [i32] {
+        write_filled(y, 0)
+    }
+}
+
 /// `cwrsi` as a port of the libopus loop: one table read and one compare per
-/// search step.
+/// search step. Writes every value of `y`: one in each pass of the loop over
+/// `head`, then the two values of `tail`.
 ///
 /// # Safety
 /// `pvq_table_covers(n, k)` must hold and `i` must be below `V(n, k)`, the
 /// number of pulse vectors. Then `k` never drops below 0 and every read is
 /// one of the entries named at `pvq_table_covers`.
 #[inline(always)]
-unsafe fn cwrsi_table(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) {
+unsafe fn cwrsi_table<Y: PulseSlot>(mut n: usize, mut k: usize, mut i: u32, y: &mut [Y]) {
     use core::hint::select_unpredictable as select;
 
     debug_assert!(n >= 2 && y.len() == n);
@@ -432,7 +480,7 @@ unsafe fn cwrsi_table(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) {
                 }
             }
             i -= p;
-            *yj = ((k0 - k) as i32 + s) ^ s;
+            yj.put(((k0 - k) as i32 + s) ^ s);
             n -= 1;
         }
     }
@@ -445,10 +493,10 @@ unsafe fn cwrsi_table(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) {
     if k != 0 {
         i -= 2 * k as u32 - 1;
     }
-    tail[0] = ((k0 - k) as i32 + s) ^ s;
+    tail[0].put(((k0 - k) as i32 + s) ^ s);
     // n == 1
     let s = -(i as i32);
-    tail[1] = (k as i32 + s) ^ s;
+    tail[1].put((k as i32 + s) ^ s);
 }
 
 /// `cwrsi` with a range check on every table lookup. It runs when `(n, k)`
@@ -587,6 +635,46 @@ pub fn decode_pulses(y: &mut [i32], n: u32, k: u32, rc: &mut RangeCoder) {
     let ft = celt_pvq_v(n, k);
     let fl = rc.dec_uint(ft).min(ft.saturating_sub(1));
     cwrsi(n, k, fl, y);
+}
+
+/// `decode_pulses` into memory that holds no values yet. Returns the
+/// decoded pulse vector: the first `n` values of `y`, all written. Panics
+/// when `y` holds fewer than `n` values.
+#[inline(always)]
+fn decode_pulses_uninit<'a>(
+    y: &'a mut [MaybeUninit<i32>],
+    n: u32,
+    k: u32,
+    rc: &mut RangeCoder,
+) -> &'a mut [i32] {
+    let y = &mut y[..n as usize];
+    // The common case, as `decode_pulses` codes it.
+    if k != 0 && n >= 2 && pvq_table_covers(n, k) {
+        // SAFETY: the table covers `(n, k)`.
+        let ft = unsafe { pvq_v_unchecked(n, k) }.min(u32::MAX as u64) as u32;
+        let fl = rc.dec_uint(ft).min(ft - 1);
+        // SAFETY: the table covers `(n, k)` and `fl < ft <= V(n, k)`.
+        unsafe { cwrsi_table(n as usize, k as usize, fl, y) };
+        // SAFETY: `cwrsi_table` wrote every value of `y`.
+        return unsafe { y.assume_init_mut() };
+    }
+    decode_pulses_rare(y, n, k, rc)
+}
+
+/// `decode_pulses_uninit` for the cases outside the table, and for `k = 0`.
+/// They are rare, so the values are simply set to 0 first, and
+/// `decode_pulses` gets them as a `&mut [i32]`.
+#[cold]
+#[inline(never)]
+fn decode_pulses_rare<'a>(
+    y: &'a mut [MaybeUninit<i32>],
+    n: u32,
+    k: u32,
+    rc: &mut RangeCoder,
+) -> &'a mut [i32] {
+    let y = write_filled(y, 0);
+    decode_pulses(y, n, k, rc);
+    y
 }
 
 /// Pulse search on x86-64 for bands of four values.
@@ -758,9 +846,16 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 /// `pvq_search` that also returns `Ryy`, the energy of `y`, where the
 /// search computes it as libopus does (every target but x86-64). It is the
 /// `yy` that libopus passes from `op_pvq_search` to `normalise_residual`.
-/// `None` on x86-64, whose kernels do not return it.
+/// `None` on x86-64, whose kernels do not return it. `y` may be memory
+/// without values (see `PulseSlot`); the first returned value is the pulse
+/// vector, the first `n` values of `y`.
 #[inline(always)]
-fn pvq_search_energy(x: &[f32], y: &mut [i32], k: i32, n: usize) -> Option<f32> {
+fn pvq_search_energy<'a, Y: PulseSlot>(
+    x: &[f32],
+    y: &'a mut [Y],
+    k: i32,
+    n: usize,
+) -> (&'a mut [i32], Option<f32>) {
     #[cfg(not(target_arch = "x86_64"))]
     {
         assert!(
@@ -770,14 +865,17 @@ fn pvq_search_energy(x: &[f32], y: &mut [i32], k: i32, n: usize) -> Option<f32> 
             MAX_PVQ_N
         );
         if n == 0 {
-            return Some(0.0);
+            return (&mut [], Some(0.0));
         }
-        Some(pvq_search_libopus(x, y, k, n))
+        let (y, yy) = pvq_search_libopus(x, y, k, n);
+        (y, Some(yy))
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // The x86-64 kernels take values; they set them to 0 again.
+        let y = Y::zeroed(&mut y[..n]);
         pvq_search(x, y, k, n);
-        None
+        (y, None)
     }
 }
 
@@ -1580,16 +1678,23 @@ fn pvq_best_position<const SQUARE: bool>(abs_x: &[f32], y2f: &[f32], xy: f32, yy
 /// On aarch64, bands of 8 to 64 values place their pulses with
 /// `pvq_place_pulses`, the others with `pvq_best_position`.
 ///
-/// Returns `Ryy`, the energy of `y`, as libopus does.
+/// Returns the pulse vector, the first `n` values of `y`, and `Ryy`, its
+/// energy, as libopus does. `y` may be memory without values (see
+/// `PulseSlot`).
 ///
 /// Panics when `n` is 0 or above `MAX_PVQ_N`, or when `x` or `y` holds
 /// fewer than `n` values.
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline]
-fn pvq_search_libopus(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32 {
+fn pvq_search_libopus<'a, Y: PulseSlot>(
+    x: &[f32],
+    y: &'a mut [Y],
+    k: i32,
+    n: usize,
+) -> (&'a mut [i32], f32) {
     #[cfg(target_arch = "aarch64")]
     {
-        pvq_search_libopus_form::<PULSE_IN_ADVANCE>(x, y, k, n)
+        pvq_search_libopus_form::<PULSE_IN_ADVANCE, Y>(x, y, k, n)
     }
     #[cfg(not(target_arch = "aarch64"))]
     pvq_search_libopus_with(x, y, k, n, pvq_best_position::<true>)
@@ -1599,12 +1704,12 @@ fn pvq_search_libopus(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32 {
 /// `pvq_place_pulses`, so that the tests can run both forms.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn pvq_search_libopus_form<const IN_ADVANCE: bool>(
+fn pvq_search_libopus_form<'a, const IN_ADVANCE: bool, Y: PulseSlot>(
     x: &[f32],
-    y: &mut [i32],
+    y: &'a mut [Y],
     k: i32,
     n: usize,
-) -> f32 {
+) -> (&'a mut [i32], f32) {
     pvq_search_libopus_place(x, y, k, n, |abs_x, y2f, y, xy, yy, pulses| {
         if (8..=64).contains(&abs_x.len()) {
             // SAFETY: NEON is part of the baseline of every aarch64 target.
@@ -1645,13 +1750,13 @@ fn place_pulses_one_by_one(
 /// x86-64 and aarch64 only the tests use it.
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
-fn pvq_search_libopus_with(
+fn pvq_search_libopus_with<'a, Y: PulseSlot>(
     x: &[f32],
-    y: &mut [i32],
+    y: &'a mut [Y],
     k: i32,
     n: usize,
     position: impl Fn(&[f32], &[f32], f32, f32) -> usize,
-) -> f32 {
+) -> (&'a mut [i32], f32) {
     pvq_search_libopus_place(x, y, k, n, |abs_x, y2f, y, xy, yy, pulses| {
         place_pulses_one_by_one(abs_x, y2f, y, xy, yy, pulses, &position)
     })
@@ -1663,16 +1768,18 @@ fn pvq_search_libopus_with(
 /// number of pulses, and returns the new `yy`.
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline(always)]
-fn pvq_search_libopus_place(
+fn pvq_search_libopus_place<'a, Y: PulseSlot>(
     x: &[f32],
-    y: &mut [i32],
+    y: &'a mut [Y],
     k: i32,
     n: usize,
     place: impl Fn(&[f32], &mut [f32], &mut [i32], f32, f32, i32) -> f32,
-) -> f32 {
+) -> (&'a mut [i32], f32) {
     assert!((1..=MAX_PVQ_N).contains(&n) && x.len() >= n && y.len() >= n);
     let x = &x[..n];
-    let y = &mut y[..n];
+    // Both paths below start from a vector without pulses (libopus sets
+    // `iy` to 0 in each).
+    let y = Y::zeroed(&mut y[..n]);
 
     // One pulse and two or more values: no projection (1 <= n / 2), and the
     // loop below runs once with `xy = 0` and `yy = 1`. Each position then
@@ -1689,9 +1796,8 @@ fn pvq_search_libopus_place(
                 best_id = i;
             }
         }
-        y.fill(0);
         y[best_id] = if x[best_id] < 0.0 { -1 } else { 1 };
-        return 1.0;
+        return (y, 1.0);
     }
 
     // "Get rid of the sign." The signs are taken from `x` again at the end.
@@ -1708,7 +1814,6 @@ fn pvq_search_libopus_place(
     }
     // SAFETY: the loop above wrote the first `n` values.
     let y2f = unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, n) };
-    y.fill(0);
 
     let mut xy = 0.0f32;
     let mut yy = 0.0f32;
@@ -1769,7 +1874,7 @@ fn pvq_search_libopus_place(
         let sg = (xi < 0.0) as i32;
         *yi = (*yi ^ -sg) + sg;
     }
-    yy
+    (y, yy)
 }
 
 /// Pulse search on x86-64 for bands of up to 32 values without AVX2, with
@@ -2900,14 +3005,11 @@ pub(crate) fn alg_quant_with(
     resynth: bool,
     rotations: Option<&mut RotationCache>,
 ) -> u32 {
-    // A band never has more than MAX_PVQ_N values. Checked in release
-    // builds too, because the slice below must fit in the buffer.
+    // A band never has more than MAX_PVQ_N values, the size of the buffer
+    // below.
     assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
+    // Memory for the pulse vector, which the search writes.
     let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-    // SAFETY: `n` values fit in the buffer (checked above). `pvq_search`
-    // writes all `n` values before anything reads them (it panics if `x` is
-    // shorter than `n`).
-    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
 
     // The rotation before the search and the one after the resynthesis use
     // the same angle, so its cosine and sine are found once.
@@ -2918,7 +3020,7 @@ pub(crate) fn alg_quant_with(
     if let Some((c, s)) = rotation {
         exp_rotation_with(x, n, 1, stride, c, s);
     }
-    let energy = pvq_search_energy(x, y, k, n);
+    let (y, energy) = pvq_search_energy(x, &mut y_mu[..n], k, n);
     // The gain of the resynthesis comes from the search's energy, as in
     // libopus. It is computed before the pulses are coded: a Cortex-A55
     // then runs the square root and the division while `encode_pulses`
@@ -2952,14 +3054,11 @@ pub fn alg_unquant(
     rc: &mut RangeCoder,
     gain: f32,
 ) -> u32 {
-    // A band never has more than MAX_PVQ_N values. Checked in release
-    // builds too, because the slice below must fit in the buffer.
+    // A band never has more than MAX_PVQ_N values, the size of the buffer
+    // below.
     assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
     let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-    // SAFETY: `n` values fit in the buffer (checked above). `decode_pulses`
-    // writes all `n` values before anything reads them.
-    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
-    decode_pulses(y, n as u32, k as u32, rc);
+    let y = decode_pulses_uninit(&mut y_mu[..n], n as u32, k as u32, rc);
 
     let mask = extract_collapse_mask(y, n, stride);
 
@@ -3270,16 +3369,16 @@ mod tests {
                 }
                 for k in [1, 2, 3, 5, 9, 17, (n as i32) / 2 + 1, n as i32 + 2] {
                     let mut want = vec![0i32; n];
-                    let want_yy = pvq_search_libopus_with(&x, &mut want, k, n, |a, b, xy, yy| {
+                    let (_, want_yy) = pvq_search_libopus_with(&x, &mut want, k, n, |a, b, xy, yy| {
                         pvq_best_position_scalar::<true>(a, b, xy, yy)
                     });
                     // Both forms of `pvq_place_pulses`, and the one the
                     // search uses on this target.
                     type Search = fn(&[f32], &mut [i32], i32, usize) -> f32;
                     let searches: [Search; 3] = [
-                        pvq_search_libopus,
-                        pvq_search_libopus_form::<true>,
-                        pvq_search_libopus_form::<false>,
+                        |x, y, k, n| pvq_search_libopus(x, y, k, n).1,
+                        |x, y, k, n| pvq_search_libopus_form::<true, i32>(x, y, k, n).1,
+                        |x, y, k, n| pvq_search_libopus_form::<false, i32>(x, y, k, n).1,
                     ];
                     for search in searches {
                         let mut got = vec![0i32; n];
@@ -3626,7 +3725,8 @@ mod tests {
                 }
                 let k = 1 + (rng.next_u32() % (2 * n as u32 + 4)) as i32;
                 let mut y = vec![0i32; n];
-                let Some(energy) = pvq_search_energy(&x, &mut y, k, n) else {
+                let (_, energy) = pvq_search_energy(&x, &mut y, k, n);
+                let Some(energy) = energy else {
                     return;
                 };
                 let sum: i64 = y.iter().map(|&v| v as i64 * v as i64).sum();

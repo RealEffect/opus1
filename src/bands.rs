@@ -5,6 +5,7 @@ use crate::pvq::*;
 use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, bits2pulses, get_pulses, pulses2bits};
 use crate::range_coder::tell_frac_inline;
+use core::mem::MaybeUninit;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -1644,15 +1645,20 @@ fn special_hybrid_folding(m: &CeltMode, norm: &mut [f32], start: usize, m_val: u
     }
 }
 
-fn prepare_lowband_views(
-    norm: &mut [f32],
-    lowband_scratch_ptr: *mut f32,
+/// For the band of `n` values at `norm_pos`: the lowband it folds from,
+/// which starts at `effective_lowband` (no lowband when that is negative),
+/// and, with `want_out`, the part of `norm` the band writes. With
+/// `allow_lowband_scratch` the lowband is a copy in `lowband_scratch`, so
+/// it may overlap the part the band writes.
+fn prepare_lowband_views<'a>(
+    norm: &'a mut [f32],
+    lowband_scratch: &'a mut [MaybeUninit<f32>],
     allow_lowband_scratch: bool,
     effective_lowband: i32,
     norm_pos: usize,
     n: usize,
     want_out: bool,
-) -> (Option<&mut [f32]>, Option<&mut [f32]>) {
+) -> (Option<&'a mut [f32]>, Option<&'a mut [f32]>) {
     let len = norm.len();
     let out_range = if want_out && norm_pos + n <= len {
         Some((norm_pos, norm_pos + n))
@@ -1675,20 +1681,11 @@ fn prepare_lowband_views(
     }
 
     if allow_lowband_scratch {
-        // The scratch buffer of quant_all_bands holds MAX_PVQ_N values.
-        // Checked in release builds too, because the copy below is unchecked.
-        assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
-        // SAFETY: the source is `norm[lb_start..lb_end]`, in bounds because
-        // `lb_end <= len` was checked above. The destination is the scratch
-        // buffer, which holds `n` values (checked above) and is a separate
-        // local array, so the two do not overlap. The slice built from it is
-        // used for one band only, before the buffer is used again.
-        unsafe {
-            core::ptr::copy_nonoverlapping(norm.as_ptr().add(lb_start), lowband_scratch_ptr, n)
-        };
-        let lb = Some(unsafe { core::slice::from_raw_parts_mut(lowband_scratch_ptr, n) });
+        // The scratch buffer of quant_all_bands holds MAX_PVQ_N values; a
+        // longer band panics here.
+        let lb = lowband_scratch[..n].write_copy_of_slice(&norm[lb_start..lb_end]);
         let lb_out = out_range.map(|(s, e)| &mut norm[s..e]);
-        return (lb, lb_out);
+        return (Some(lb), lb_out);
     }
 
     if let Some((out_start, out_end)) = out_range {
@@ -1979,27 +1976,22 @@ fn quant_band_stereo_rdo(
     lm: i32,
     fill: u32,
     norm: &mut [f32],
-    lowband_scratch_ptr: *mut f32,
+    lowband_scratch: &mut [MaybeUninit<f32>],
     allow_lowband_scratch: bool,
     effective_lowband: i32,
     norm_pos: usize,
     last: bool,
     hybrid_fold: Option<(usize, usize)>,
 ) -> u32 {
-    use core::mem::MaybeUninit;
-    // A band never has more than MAX_PVQ_N values. Checked in release builds
-    // too, because the copies below go to buffers of that size.
+    // A band never has more than MAX_PVQ_N values; the copies below go to
+    // buffers of that size.
     assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
     let x = &mut x[..n];
     let y = &mut y[..n];
     let mut x_save_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
     let mut y_save_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    // SAFETY (both): `n <= MAX_PVQ_N` values fit in each buffer, and each
-    // slice is written by `copy_from_slice` before it is read.
-    let x_save = unsafe { core::slice::from_raw_parts_mut(x_save_mu.as_mut_ptr() as *mut f32, n) };
-    let y_save = unsafe { core::slice::from_raw_parts_mut(y_save_mu.as_mut_ptr() as *mut f32, n) };
-    x_save.copy_from_slice(x);
-    y_save.copy_from_slice(y);
+    let x_save: &[f32] = x_save_mu[..n].write_copy_of_slice(x);
+    let y_save: &[f32] = y_save_mu[..n].write_copy_of_slice(y);
 
     let w = compute_channel_weights(ctx.band_e[ctx.i], ctx.band_e[ctx.i + ctx.m.nb_ebands]);
     // C: `MULT16_32_Q15(w[0], ip(X_save, X)) + MULT16_32_Q15(w[1], ip(Y_save,
@@ -2016,7 +2008,7 @@ fn quant_band_stereo_rdo(
     ctx.theta_round = -1;
     let (lb, lb_out) = prepare_lowband_views(
         norm,
-        lowband_scratch_ptr,
+        lowband_scratch,
         allow_lowband_scratch,
         effective_lowband,
         norm_pos,
@@ -2030,30 +2022,22 @@ fn quant_band_stereo_rdo(
     let state_down = ctx.rc.save_state();
     let (seed_down, remaining_down) = (ctx.seed, ctx.remaining_bits);
     let mut norm_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    // SAFETY: as above. `norm_down` is written and read only when
-    // `keep_norm` holds.
-    let norm_down =
-        unsafe { core::slice::from_raw_parts_mut(norm_down_mu.as_mut_ptr() as *mut f32, n) };
-    let keep_norm = !last && norm_pos + n <= norm.len();
-    if keep_norm {
-        norm_down.copy_from_slice(&norm[norm_pos..norm_pos + n]);
-    }
+    let norm_down: Option<&[f32]> = if !last && norm_pos + n <= norm.len() {
+        Some(norm_down_mu[..n].write_copy_of_slice(&norm[norm_pos..norm_pos + n]))
+    } else {
+        None
+    };
     // The bytes the first pass wrote: range coder bytes from `offs0` up, raw
-    // bits from the end down.
+    // bits from the end down. Both ranges lie inside the coder's buffer of
+    // `storage` bytes and do not overlap, so together they hold at most
+    // RANGE_BUF_MAX bytes.
     let storage = ctx.rc.storage as usize;
     let front = offs0..(ctx.rc.offs as usize).max(offs0);
     let back = storage - (ctx.rc.end_offs as usize).max(end_offs0)..storage - end_offs0;
     let mut bytes_mu = [MaybeUninit::<u8>::uninit(); crate::range_coder::RANGE_BUF_MAX];
-    // Both ranges lie inside the coder's buffer of `storage` bytes and do not
-    // overlap, so together they hold at most RANGE_BUF_MAX bytes. Checked in
-    // release builds too, because the slice below must fit in the buffer.
-    let saved = front.len() + back.len();
-    assert!(saved <= crate::range_coder::RANGE_BUF_MAX);
-    // SAFETY: `saved` bytes fit in the buffer (checked above), and both
-    // copies below write all of them before anything reads them.
-    let bytes = unsafe { core::slice::from_raw_parts_mut(bytes_mu.as_mut_ptr() as *mut u8, saved) };
-    bytes[..front.len()].copy_from_slice(&ctx.rc.buf[front.clone()]);
-    bytes[front.len()..].copy_from_slice(&ctx.rc.buf[back.clone()]);
+    let (front_mu, back_mu) = bytes_mu[..front.len() + back.len()].split_at_mut(front.len());
+    let front_bytes: &[u8] = front_mu.write_copy_of_slice(&ctx.rc.buf[front.clone()]);
+    let back_bytes: &[u8] = back_mu.write_copy_of_slice(&ctx.rc.buf[back.clone()]);
 
     // Back to the coder state before the first pass.
     ctx.rc.restore_state(&state0);
@@ -2066,15 +2050,12 @@ fn quant_band_stereo_rdo(
     // Encode and round up, on a copy of the input.
     let mut x_up_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
     let mut y_up_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    // SAFETY (both): as for `x_save`.
-    let x_up = unsafe { core::slice::from_raw_parts_mut(x_up_mu.as_mut_ptr() as *mut f32, n) };
-    let y_up = unsafe { core::slice::from_raw_parts_mut(y_up_mu.as_mut_ptr() as *mut f32, n) };
-    x_up.copy_from_slice(x_save);
-    y_up.copy_from_slice(y_save);
+    let x_up = x_up_mu[..n].write_copy_of_slice(x_save);
+    let y_up = y_up_mu[..n].write_copy_of_slice(y_save);
     ctx.theta_round = 1;
     let (lb, lb_out) = prepare_lowband_views(
         norm,
-        lowband_scratch_ptr,
+        lowband_scratch,
         allow_lowband_scratch,
         effective_lowband,
         norm_pos,
@@ -2087,13 +2068,13 @@ fn quant_band_stereo_rdo(
     if dist_down >= dist_up {
         // The first pass wins. Its band is still in `x` and `y`.
         ctx.rc.restore_state(&state_down);
-        ctx.rc.buf[front.clone()].copy_from_slice(&bytes[..front.len()]);
-        ctx.rc.buf[back].copy_from_slice(&bytes[front.len()..]);
+        ctx.rc.buf[front].copy_from_slice(front_bytes);
+        ctx.rc.buf[back].copy_from_slice(back_bytes);
         ctx.seed = seed_down;
         ctx.remaining_bits = remaining_down;
         ctx.theta_round = -1;
-        if keep_norm {
-            norm[norm_pos..norm_pos + n].copy_from_slice(norm_down);
+        if let Some(band) = norm_down {
+            norm[norm_pos..norm_pos + n].copy_from_slice(band);
         }
         cm_down
     } else {
@@ -2318,20 +2299,22 @@ fn quant_all_bands_impl(
     assert!(norm_size <= MAX_NORM_SIZE, "norm buffer too small for this mode");
 
     // `norm` and `norm2` hold the decoded bands of the frame so far, for
-    // folding. They start without values. A band is written (as
-    // `lowband_out`) before a later band reads it as its `lowband`: the
-    // read range always ends at or before the start of the current band.
-    let mut norm_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
-    // SAFETY: `norm_size` values fit in the buffer (checked above).
-    let norm =
-        unsafe { core::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, norm_size) };
-    let mut norm2_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
-    // SAFETY: as for `norm`.
-    let norm2 =
-        unsafe { core::slice::from_raw_parts_mut(norm2_buf.as_mut_ptr() as *mut f32, norm_size) };
+    // folding. A band is written (as `lowband_out`) before a later band
+    // reads it as its `lowband`: the read range ends at or before the start
+    // of the current band, or within the values that
+    // `special_hybrid_folding` copied there. The values are set to 0 first
+    // only because Rust needs memory to hold values before it can be a
+    // `&mut [f32]`; a fill once per frame costs less than tracking which
+    // values the bands wrote. Without resynthesis no band folds, so `norm`
+    // stays empty. `norm2` stays empty unless the frame starts in dual
+    // stereo, the only case that uses it.
+    let mut norm_buf = [MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+    let norm = write_filled(&mut norm_buf[..if resynth { norm_size } else { 0 }], 0.0);
+    let mut norm2_buf = [MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+    let norm2_size = if resynth && *dual_stereo { norm_size } else { 0 };
+    let norm2 = write_filled(&mut norm2_buf[..norm2_size], 0.0);
 
-    let mut lowband_scratch_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let lowband_scratch_ptr = lowband_scratch_buf.as_mut_ptr() as *mut f32;
+    let mut lowband_scratch = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
 
     let mut lowband_offset: usize = 0;
     let mut update_lowband = true;
@@ -2458,7 +2441,7 @@ fn quant_all_bands_impl(
 
             let (lb_x, lb_out_x) = prepare_lowband_views(
                 norm,
-                lowband_scratch_ptr,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
@@ -2480,7 +2463,7 @@ fn quant_all_bands_impl(
 
             let (lb_y, lb_out_y) = prepare_lowband_views(
                 norm2,
-                lowband_scratch_ptr,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
@@ -2512,7 +2495,7 @@ fn quant_all_bands_impl(
                     lm,
                     x_cm | y_cm,
                     norm,
-                    lowband_scratch_ptr,
+                    &mut lowband_scratch,
                     allow_lowband_scratch,
                     effective_lowband,
                     norm_pos,
@@ -2522,7 +2505,7 @@ fn quant_all_bands_impl(
             } else {
                 let (lb, lb_out) = prepare_lowband_views(
                     norm,
-                    lowband_scratch_ptr,
+                    &mut lowband_scratch,
                     allow_lowband_scratch,
                     effective_lowband,
                     norm_pos,
@@ -2546,7 +2529,7 @@ fn quant_all_bands_impl(
         } else {
             let (lb, lb_out) = prepare_lowband_views(
                 norm,
-                lowband_scratch_ptr,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
