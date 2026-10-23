@@ -406,13 +406,14 @@ The loops that take most of the run time have several versions. The rule is the 
    - It asks `crate::compat::x86_has_sse41()`, `x86_has_avx()`, `x86_has_avx2()`, `x86_has_avx_fma()` or `x86_has_avx2_fma()`.
    - When the answer is yes, it calls an `unsafe fn` marked `#[target_feature(enable = "avx,fma")]` (or `"sse4.1"`, `"avx"`, `"avx2"`, `"avx2,fma"`).
    - The SILK noise-shaping quantizers (`silk/nsq.rs` and `silk/nsq_del_dec.rs`) need SSE4.1. The delayed-decision quantizer has a second copy of its sample loop for AVX2. Both check once per subframe.
+   - The SILK analysis kernels check once per call: the warped autocorrelation (`silk/sigproc_fix.rs`) and the A2NLSF polynomial evaluation (`silk/nlsf.rs`) have an SSE4.1 and an AVX2 version, the LTP codebook search (`silk/vq_wmat_ec.rs`) an SSE4.1 version, and the batch division of the pitch analysis (`silk/pitch_analysis.rs`) an AVX2 version.
    - Kernels that use FMA instructions run only when AVX and FMA are both present, because some processors have AVX without FMA.
    - Some kernels in `pitch.rs` and `celt.rs` also have an SSE version. SSE (Streaming SIMD Extensions, where SIMD means single instruction, multiple data) is the older set of x86 vector instructions, and every x86-64 processor has it.
 4. Otherwise it runs the portable Rust version.
 
 The check happens inside the function that the rest of the codec calls, at every call. With `std` the probes use `std::arch::is_x86_feature_detected!`, which stores its answer after the first call. Without `std` they use `cfg!(target_feature = "...")`, which the compiler decides from the build flags.
 
-Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `silk/nsq.rs`, `silk/nsq_del_dec.rs`, `silk/sigproc_fix.rs`. Files with aarch64 versions: those, plus `src/analysis/mod.rs` (the search for the largest sample of the digital silence test), `src/analysis/neon.rs` and, under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs`, `nlsf.rs`, `pitch_analysis.rs`, `resampler.rs` and `vq_wmat_ec.rs`. The analysis has no x86 vector code: on x86 it runs its scalar code.
+Files with x86 versions: `bands.rs`, `celt.rs`, `kiss_fft.rs`, `mdct.rs`, `pitch.rs`, `pvq.rs`, `silk/nlsf.rs`, `silk/nsq.rs`, `silk/nsq_del_dec.rs`, `silk/pitch_analysis.rs`, `silk/sigproc_fix.rs`, `silk/vq_wmat_ec.rs`. Files with aarch64 versions: those, plus `src/analysis/mod.rs` (the search for the largest sample of the digital silence test), `src/analysis/neon.rs` and, under `src/silk/`, `decode_core.rs`, `lpc_analysis.rs` and `resampler.rs`. The analysis has no x86 vector code: on x86 it runs its scalar code.
 
 `src/mathops.rs` also depends on the processor, for rounding rather than speed. On aarch64, `mac` and `mac_f64` compute `acc + a * b` with one fused multiply-add, which rounds once. The arm64 build of libopus does the same, because clang fuses such C expressions there. On other targets the product is rounded first.
 

@@ -952,6 +952,38 @@ pub fn silk_warped_autocorrelation_fix(
         return;
     }
 
+    // The x86 kernels take warping factors up to 2^15 - 1 only; the encoder
+    // uses 0 to 16383.
+    #[cfg(target_arch = "x86_64")]
+    if (order & 1) == 0
+        && order <= MAX_SHAPE_LPC_ORDER
+        && length <= input.len()
+        && (0..=i16::MAX as i32).contains(&warping_q16)
+    {
+        let input = &input[..length];
+        if crate::compat::x86_has_avx2() {
+            // SAFETY: the processor has AVX2.
+            unsafe {
+                match order.div_ceil(8) {
+                    0..=2 => warped_autocorr_avx2::<2>(corr, scale, input, warping_q16, order),
+                    _ => warped_autocorr_avx2::<3>(corr, scale, input, warping_q16, order),
+                }
+            }
+            return;
+        }
+        if crate::compat::x86_has_sse41() {
+            // SAFETY: the processor has SSE4.1.
+            unsafe {
+                match order.div_ceil(4) {
+                    0..=4 => warped_autocorr_sse41::<4>(corr, scale, input, warping_q16, order),
+                    5 => warped_autocorr_sse41::<5>(corr, scale, input, warping_q16, order),
+                    _ => warped_autocorr_sse41::<6>(corr, scale, input, warping_q16, order),
+                }
+            }
+            return;
+        }
+    }
+
     silk_warped_autocorrelation_scalar(corr, scale, input, warping_q16, length, order);
 }
 
@@ -1060,11 +1092,6 @@ fn warped_autocorr_neon<const K: usize>(
         step(m, zero);
     }
 
-    // Section 0 is the input itself: ((x << 13) * (x << 13)) >> 16 = (x * x) << 10.
-    let mut energy = 0i64;
-    for &sample in input {
-        energy += (sample as i32 * sample as i32) as i64;
-    }
     let mut sums = [[0i64; 4]; K];
     for r in 0..K {
         sums[r] = [
@@ -1074,15 +1101,259 @@ fn warped_autocorr_neon<const K: usize>(
             vgetq_lane_s64::<1>(sum_hi[r]),
         ];
     }
+    warped_autocorr_finish(corr, scale, input, order, &sums, 0);
+}
+
+/// Last part of the vector kernels: `sums[r][l]` is the sum of lane `l` of
+/// register `r`, with `excess_per_step` too much per step (0 for NEON,
+/// `2^47` for the x86 kernels, see the comment above `WARPED_RING`).
+#[cfg(any(all(target_arch = "aarch64", target_feature = "neon"), target_arch = "x86_64"))]
+#[inline]
+fn warped_autocorr_finish<const L: usize, const K: usize>(
+    corr: &mut [i32],
+    scale: &mut i32,
+    input: &[i16],
+    order: usize,
+    sums: &[[i64; L]; K],
+    excess_per_step: i64,
+) {
+    let steps = (input.len() + order) as i64;
+    let excess = steps.wrapping_mul(excess_per_step);
+
+    // Section 0 is the input itself: ((x << 13) * (x << 13)) >> 16 = (x * x) << 10.
+    let mut energy = 0i64;
+    for &sample in input {
+        energy += (sample as i32 * sample as i32) as i64;
+    }
     let mut corr_qc = [0i64; MAX_SHAPE_LPC_ORDER + 1];
     corr_qc[0] = energy << WARPED_QC;
     for i in 1..=order {
         // Section `i` is in lane `d / K` of register `d % K`.
-        let d = 4 * K - i;
-        corr_qc[i] = sums[d % K][d / K];
+        let d = L * K - i;
+        corr_qc[i] = sums[d % K][d / K].wrapping_sub(excess);
     }
 
     warped_autocorr_output(corr, scale, &corr_qc[..=order]);
+}
+
+// The x86 kernels of `silk_warped_autocorrelation_fix` follow the steps of
+// `warped_autocorr_neon`, with `L` sections per register (4 for SSE4.1, 8
+// for AVX2) and `K` registers. Lane `l` of register `r` holds section
+// `L * K - K * l - r`, and vector `j` of samples holds the samples
+// `j - (L - 1) * K`, ..., `j - K`, `j`.
+//
+// x86 has neither `vqdmulhq_s32` nor a 64-bit arithmetic shift, so two steps
+// are done differently:
+//
+// - The filter update `(d * warping_q16) >> 16`: see `warped_mulw_sse41`.
+// - The sums. `_mm_mul_epi32` multiplies lanes 0 and 2 into two 64-bit
+//   products, and lanes 1 and 3 after a shuffle. Each product `p` must be
+//   added as `p >> 16`, rounded down. `p ^ 2^63` is `p + 2^63` in 64 bits, so
+//   a logical shift of it gives `(p >> 16) + 2^47`. The kernels add this
+//   value, and at the end subtract `2^47` once for every step. The sums wrap
+//   around in 64 bits, so the result is exact.
+
+/// Number of sample vectors the x86 kernels keep. A power of two above `K`.
+#[cfg(target_arch = "x86_64")]
+const WARPED_RING: usize = 8;
+
+/// `(d * w) >> 16` per 32-bit lane, rounded down, for `0 <= w < 2^15`.
+/// `w_low` holds `w` in the low 16 bits of every lane, `w_high` in the high
+/// 16 bits.
+///
+/// With `d = h * 2^16 + l`, `h = d >> 16` and `l` the low 16 bits taken as
+/// unsigned: `(d * w) >> 16 = h * w + ((l * w) >> 16)`. `_mm_madd_epi16`
+/// with `w_high` gives `l * 0 + h * w`; `_mm_mulhi_epu16` with `w_low` gives
+/// `(l * w) >> 16` in the low half and `0` in the high half. Neither part
+/// overflows, so the sum is the exact result.
+///
+/// The kernels pass `w_low` through `black_box` in every step.
+/// `_mm_mulhi_epu16` is written in Rust as a product of zero-extended
+/// values. Without the barrier the compiler moves the zero extension of the
+/// constant `w_low` out of the loop and no longer recognizes the
+/// instruction: with AVX2 it emitted 10 instructions in place of
+/// `vpmulhuw`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[inline]
+fn warped_mulw_sse41(d: __m128i, w_low: __m128i, w_high: __m128i) -> __m128i {
+    _mm_add_epi32(_mm_madd_epi16(d, w_high), _mm_mulhi_epu16(d, w_low))
+}
+
+/// [`warped_mulw_sse41`] for 8 lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn warped_mulw_avx2(d: __m256i, w_low: __m256i, w_high: __m256i) -> __m256i {
+    _mm256_add_epi32(_mm256_madd_epi16(d, w_high), _mm256_mulhi_epu16(d, w_low))
+}
+
+/// SSE4.1 kernel of [`silk_warped_autocorrelation_fix`], 4 sections per
+/// register, for up to `4 * K` sections, and warping factors from 0 to
+/// `2^15 - 1`. See the comment above [`WARPED_RING`].
+///
+/// # Safety
+///
+/// The processor must have SSE4.1.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[inline(never)]
+unsafe fn warped_autocorr_sse41<const K: usize>(
+    corr: &mut [i32],
+    scale: &mut i32,
+    input: &[i16],
+    warping_q16: i32,
+    order: usize,
+) {
+    assert!(K >= 1 && K < WARPED_RING && 4 * K <= MAX_SHAPE_LPC_ORDER && order <= 4 * K);
+    assert!((0..=i16::MAX as i32).contains(&warping_q16));
+
+    let w_low = _mm_set1_epi32(warping_q16);
+    let w_high = _mm_set1_epi32(warping_q16 << 16);
+    let bias = _mm_set1_epi64x(i64::MIN);
+    let zero = _mm_setzero_si128();
+    // Sections of the current step.
+    let mut cur = [zero; K];
+    // For each lane of `cur`: the section below it, one step earlier.
+    let mut below_before = [zero; K];
+    // Sums of the sections in lanes 0 and 2 (`even`) and 1 and 3 (`odd`).
+    let mut sum_even = [zero; K];
+    let mut sum_odd = [zero; K];
+    // `samples[j % WARPED_RING]` holds vector `j`, shifted left by 13, and
+    // the same vector with lanes 1 and 3 moved to lanes 0 and 2. Samples
+    // outside the input are zero.
+    let mut samples = [[zero; 2]; WARPED_RING];
+
+    // `newest` has sample `m`, shifted left by 13, in lane 0.
+    let mut step = |m: usize, newest: __m128i| {
+        let oldest = m.wrapping_sub(K);
+        // See `warped_mulw_sse41`.
+        let w_low = core::hint::black_box(w_low);
+        // Register 0 moved down by one lane, with section 0 on top; the
+        // same move turns vector `m - K` into vector `m`.
+        let below_last = _mm_alignr_epi8::<4>(newest, cur[0]);
+        let x_new = _mm_alignr_epi8::<4>(newest, samples[oldest % WARPED_RING][0]);
+        for r in 0..K {
+            let below = if r + 1 < K { cur[r + 1] } else { below_last };
+            let [x, x_odd] = samples[oldest.wrapping_add(r) % WARPED_RING];
+            let even = _mm_mul_epi32(cur[r], x);
+            let odd = _mm_mul_epi32(_mm_shuffle_epi32::<0xF5>(cur[r]), x_odd);
+            sum_even[r] =
+                _mm_add_epi64(sum_even[r], _mm_srli_epi64::<16>(_mm_xor_si128(even, bias)));
+            sum_odd[r] = _mm_add_epi64(sum_odd[r], _mm_srli_epi64::<16>(_mm_xor_si128(odd, bias)));
+            let d = _mm_sub_epi32(cur[r], below);
+            cur[r] = _mm_add_epi32(below_before[r], warped_mulw_sse41(d, w_low, w_high));
+            below_before[r] = below;
+        }
+        samples[m % WARPED_RING] = [x_new, _mm_shuffle_epi32::<0xF5>(x_new)];
+    };
+    for (m, &sample) in input.iter().enumerate() {
+        step(m, _mm_cvtsi32_si128((sample as i32) << WARPED_QS));
+    }
+    // The last sample reaches section `order` after `order` more steps.
+    for m in input.len()..input.len() + order {
+        step(m, zero);
+    }
+
+    let mut sums = [[0i64; 4]; K];
+    for r in 0..K {
+        sums[r] = [
+            _mm_cvtsi128_si64(sum_even[r]),
+            _mm_cvtsi128_si64(sum_odd[r]),
+            _mm_extract_epi64::<1>(sum_even[r]),
+            _mm_extract_epi64::<1>(sum_odd[r]),
+        ];
+    }
+    warped_autocorr_finish(corr, scale, input, order, &sums, 1 << 47);
+}
+
+/// AVX2 kernel of [`silk_warped_autocorrelation_fix`], 8 sections per
+/// register, for up to `8 * K` sections. The same steps as
+/// [`warped_autocorr_sse41`]; only the move by one lane crosses the two
+/// 128-bit halves.
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn warped_autocorr_avx2<const K: usize>(
+    corr: &mut [i32],
+    scale: &mut i32,
+    input: &[i16],
+    warping_q16: i32,
+    order: usize,
+) {
+    assert!(K >= 1 && K < WARPED_RING && 8 * K <= MAX_SHAPE_LPC_ORDER && order <= 8 * K);
+    assert!((0..=i16::MAX as i32).contains(&warping_q16));
+
+    /// Lanes 1 to 7 of `v` in lanes 0 to 6, and lane 0 of `newest` in
+    /// lane 7.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn shift_in(v: __m256i, newest: __m256i) -> __m256i {
+        // The upper half of `v` and the lower half of `newest`.
+        let upper = _mm256_permute2x128_si256::<0x21>(v, newest);
+        _mm256_alignr_epi8::<4>(upper, v)
+    }
+
+    let w_low = _mm256_set1_epi32(warping_q16);
+    let w_high = _mm256_set1_epi32(warping_q16 << 16);
+    let bias = _mm256_set1_epi64x(i64::MIN);
+    let zero = _mm256_setzero_si256();
+    let mut cur = [zero; K];
+    let mut below_before = [zero; K];
+    // Sums of the sections in lanes 0, 2, 4 and 6 (`even`) and 1, 3, 5 and
+    // 7 (`odd`).
+    let mut sum_even = [zero; K];
+    let mut sum_odd = [zero; K];
+    let mut samples = [[zero; 2]; WARPED_RING];
+
+    let mut step = |m: usize, newest: __m256i| {
+        let oldest = m.wrapping_sub(K);
+        // See `warped_mulw_sse41`.
+        let w_low = core::hint::black_box(w_low);
+        let below_last = shift_in(cur[0], newest);
+        let x_new = shift_in(samples[oldest % WARPED_RING][0], newest);
+        for r in 0..K {
+            let below = if r + 1 < K { cur[r + 1] } else { below_last };
+            let [x, x_odd] = samples[oldest.wrapping_add(r) % WARPED_RING];
+            let even = _mm256_mul_epi32(cur[r], x);
+            let odd = _mm256_mul_epi32(_mm256_shuffle_epi32::<0xF5>(cur[r]), x_odd);
+            sum_even[r] = _mm256_add_epi64(
+                sum_even[r],
+                _mm256_srli_epi64::<16>(_mm256_xor_si256(even, bias)),
+            );
+            sum_odd[r] =
+                _mm256_add_epi64(sum_odd[r], _mm256_srli_epi64::<16>(_mm256_xor_si256(odd, bias)));
+            let d = _mm256_sub_epi32(cur[r], below);
+            cur[r] = _mm256_add_epi32(below_before[r], warped_mulw_avx2(d, w_low, w_high));
+            below_before[r] = below;
+        }
+        samples[m % WARPED_RING] = [x_new, _mm256_shuffle_epi32::<0xF5>(x_new)];
+    };
+    for (m, &sample) in input.iter().enumerate() {
+        step(m, _mm256_castsi128_si256(_mm_cvtsi32_si128((sample as i32) << WARPED_QS)));
+    }
+    for m in input.len()..input.len() + order {
+        step(m, zero);
+    }
+
+    let mut sums = [[0i64; 8]; K];
+    for r in 0..K {
+        sums[r] = [
+            _mm256_extract_epi64::<0>(sum_even[r]),
+            _mm256_extract_epi64::<0>(sum_odd[r]),
+            _mm256_extract_epi64::<1>(sum_even[r]),
+            _mm256_extract_epi64::<1>(sum_odd[r]),
+            _mm256_extract_epi64::<2>(sum_even[r]),
+            _mm256_extract_epi64::<2>(sum_odd[r]),
+            _mm256_extract_epi64::<3>(sum_even[r]),
+            _mm256_extract_epi64::<3>(sum_odd[r]),
+        ];
+    }
+    warped_autocorr_finish(corr, scale, input, order, &sums, 1 << 47);
 }
 
 /// Portable form of [`silk_warped_autocorrelation_fix`].
@@ -1893,6 +2164,98 @@ mod tests {
     #[test]
     fn warped_autocorrelation_matches_reference() {
         check_warped_all("dispatch", silk_warped_autocorrelation_fix);
+    }
+
+    /// An x86 kernel of the warped autocorrelation: `(corr, scale, input,
+    /// warping_q16, order)`.
+    #[cfg(target_arch = "x86_64")]
+    type WarpedKernel = dyn Fn(&mut [i32], &mut i32, &[i16], i32, usize);
+
+    /// One x86 kernel against the portable code, for every even order up to
+    /// `max_order`, lengths 0 to 40, the window lengths of the encoder (120,
+    /// 180 and 240 samples) and random lengths up to 480, with the warping
+    /// factors of the encoder, the limits 0 and 2^15 - 1 and random ones in
+    /// between.
+    #[cfg(target_arch = "x86_64")]
+    fn check_warped_x86(name: &str, max_order: usize, run: &WarpedKernel) {
+        let check = |input: &[i16], warping_q16: i32, order: usize| {
+            let mut corr = [0i32; MAX_SHAPE_LPC_ORDER + 1];
+            let mut corr_ref = [0i32; MAX_SHAPE_LPC_ORDER + 1];
+            let (mut scale, mut scale_ref) = (0i32, 0i32);
+            run(&mut corr, &mut scale, input, warping_q16, order);
+            silk_warped_autocorrelation_scalar(
+                &mut corr_ref,
+                &mut scale_ref,
+                input,
+                warping_q16,
+                input.len(),
+                order,
+            );
+            assert_eq!(
+                (&corr[..=order], scale),
+                (&corr_ref[..=order], scale_ref),
+                "{name}: order={order} length={} warping_q16={warping_q16}",
+                input.len()
+            );
+        };
+        let warping = |rng: &mut TestRng, case: usize| match case % 6 {
+            0 => 15728,
+            1 => 16383,
+            2 => 0,
+            3 => i16::MAX as i32,
+            4 => 1,
+            _ => rng.below(1 << 15) as i32,
+        };
+        let mut rng = TestRng(0x3c6e_f372_fe94_f82b);
+        for order in (0..=max_order).step_by(2) {
+            for length in (0..=40).chain([120, 180, 240]) {
+                let input = test_signal(&mut rng, length, (order + length) as u32 % 6);
+                check(&input, warping(&mut rng, order / 2 + length), order);
+            }
+        }
+        for case in 0..2000 {
+            let order = 2 * rng.below(max_order as u32 / 2 + 1) as usize;
+            let length = rng.below(481) as usize;
+            let input = test_signal(&mut rng, length, case as u32 % 6);
+            check(&input, warping(&mut rng, case / 6), order);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn warped_autocorrelation_sse41_matches_scalar() {
+        if !crate::compat::x86_has_sse41() {
+            return;
+        }
+        // Every register count, also with fewer sections than it holds.
+        check_warped_x86("sse4.1 K=4", 16, &|corr, scale, input, warping_q16, order| {
+            // SAFETY: the processor has SSE4.1 (checked above).
+            unsafe { warped_autocorr_sse41::<4>(corr, scale, input, warping_q16, order) }
+        });
+        check_warped_x86("sse4.1 K=5", 20, &|corr, scale, input, warping_q16, order| {
+            // SAFETY: the processor has SSE4.1 (checked above).
+            unsafe { warped_autocorr_sse41::<5>(corr, scale, input, warping_q16, order) }
+        });
+        check_warped_x86("sse4.1 K=6", 24, &|corr, scale, input, warping_q16, order| {
+            // SAFETY: the processor has SSE4.1 (checked above).
+            unsafe { warped_autocorr_sse41::<6>(corr, scale, input, warping_q16, order) }
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn warped_autocorrelation_avx2_matches_scalar() {
+        if !crate::compat::x86_has_avx2() {
+            return;
+        }
+        check_warped_x86("avx2 K=2", 16, &|corr, scale, input, warping_q16, order| {
+            // SAFETY: the processor has AVX2 (checked above).
+            unsafe { warped_autocorr_avx2::<2>(corr, scale, input, warping_q16, order) }
+        });
+        check_warped_x86("avx2 K=3", 24, &|corr, scale, input, warping_q16, order| {
+            // SAFETY: the processor has AVX2 (checked above).
+            unsafe { warped_autocorr_avx2::<3>(corr, scale, input, warping_q16, order) }
+        });
     }
 
     /// The loop of libopus `silk_apply_sine_window`, statement by statement.

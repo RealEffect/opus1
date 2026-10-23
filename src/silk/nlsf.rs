@@ -101,8 +101,111 @@ fn silk_a2nlsf_eval_table(
         // whole build (`cfg(target_feature = "neon")`).
         unsafe { a2nlsf_neon::eval_table(y, p, dd) }
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::compat::x86_has_avx2() {
+            // SAFETY: the processor has AVX2.
+            unsafe { a2nlsf_x86::eval_table_avx2(y, p, dd) };
+            return;
+        }
+        if crate::compat::x86_has_sse41() {
+            // SAFETY: the processor has SSE4.1.
+            unsafe { a2nlsf_x86::eval_table_sse41(y, p, dd) };
+            return;
+        }
+    }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     silk_a2nlsf_eval_table_scalar(y, p, dd);
+}
+
+/// x86 forms of `silk_a2nlsf_eval_table_scalar`: 8 table points per AVX2
+/// vector, 4 per SSE4.1 vector.
+///
+/// A step of Horner's rule is `c + ((y * x) >> 16)` per lane, as
+/// `silk_smlaww`. `_mm_mul_epi32` multiplies lanes 0 and 2 into 64-bit
+/// products, and lanes 1 and 3 after a shift. Bits 16 to 47 of each product
+/// are the 32 bits of the result.
+///
+/// The loop over the coefficients is the outer one, and the inner loop
+/// reads the table points again in every step. With the points in registers
+/// for all steps, the compiler moves a part of `_mm_mul_epi32` out of the
+/// loop and then no longer recognizes it: it emits a full 64-bit
+/// multiplication of several instructions.
+#[cfg(target_arch = "x86_64")]
+mod a2nlsf_x86 {
+    use super::{A2NLSF_COS_Q16, A2NLSF_TABLE_LEN};
+    use crate::silk::define::MAX_LPC_ORDER;
+    use core::arch::x86_64::*;
+
+    /// Same result as `silk_a2nlsf_eval_table_scalar`, with AVX2.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn eval_table_avx2(
+        y: &mut [i32; A2NLSF_TABLE_LEN],
+        p: &[i32; MAX_LPC_ORDER / 2 + 1],
+        dd: usize,
+    ) {
+        let (y_blocks, _) = y.as_chunks_mut::<8>();
+        let (x_blocks, _) = A2NLSF_COS_Q16.as_chunks::<8>();
+        y_blocks.fill([p[dd]; 8]);
+        for &coefficient in p[..dd].iter().rev() {
+            let c = _mm256_set1_epi32(coefficient);
+            for (y_block, x_block) in y_blocks.iter_mut().zip(x_blocks) {
+                // SAFETY: both arrays have 8 elements, the 32 bytes that
+                // the loads read and the store writes; they need no
+                // alignment.
+                unsafe {
+                    let y = _mm256_loadu_si256(y_block.as_ptr().cast());
+                    let x = _mm256_loadu_si256(x_block.as_ptr().cast());
+                    let even = _mm256_srli_epi64::<16>(_mm256_mul_epi32(y, x));
+                    let odd = _mm256_slli_epi64::<16>(_mm256_mul_epi32(
+                        _mm256_srli_epi64::<32>(y),
+                        _mm256_srli_epi64::<32>(x),
+                    ));
+                    let product = _mm256_blend_epi32::<0b1010_1010>(even, odd);
+                    _mm256_storeu_si256(y_block.as_mut_ptr().cast(), _mm256_add_epi32(c, product));
+                }
+            }
+        }
+    }
+
+    /// Same result as `silk_a2nlsf_eval_table_scalar`, with SSE4.1.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn eval_table_sse41(
+        y: &mut [i32; A2NLSF_TABLE_LEN],
+        p: &[i32; MAX_LPC_ORDER / 2 + 1],
+        dd: usize,
+    ) {
+        let (y_blocks, _) = y.as_chunks_mut::<4>();
+        let (x_blocks, _) = A2NLSF_COS_Q16.as_chunks::<4>();
+        y_blocks.fill([p[dd]; 4]);
+        for &coefficient in p[..dd].iter().rev() {
+            let c = _mm_set1_epi32(coefficient);
+            for (y_block, x_block) in y_blocks.iter_mut().zip(x_blocks) {
+                // SAFETY: both arrays have 4 elements, the 16 bytes that
+                // the loads read and the store writes; they need no
+                // alignment.
+                unsafe {
+                    let y = _mm_loadu_si128(y_block.as_ptr().cast());
+                    let x = _mm_loadu_si128(x_block.as_ptr().cast());
+                    let even = _mm_srli_epi64::<16>(_mm_mul_epi32(y, x));
+                    let odd = _mm_slli_epi64::<16>(_mm_mul_epi32(
+                        _mm_srli_epi64::<32>(y),
+                        _mm_srli_epi64::<32>(x),
+                    ));
+                    let product = _mm_blend_epi16::<0b1100_1100>(even, odd);
+                    _mm_storeu_si128(y_block.as_mut_ptr().cast(), _mm_add_epi32(c, product));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -741,6 +844,31 @@ mod a2nlsf_tests {
                 for k in 0..=LSF_COS_TAB_SZ_FIX {
                     let expected = eval_poly_reference(&p, SILK_LSF_COS_TAB_FIX_Q12[k] as i32, dd);
                     assert_eq!(table[k], expected, "degree {dd}, point {k}, {p:?}");
+                }
+            }
+        }
+    }
+
+    /// Both x86 kernels against the portable code, whatever the dispatch
+    /// chooses.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_tables_match_scalar() {
+        for p in polynomials() {
+            for dd in 0..=MAX_LPC_ORDER / 2 {
+                let mut portable = [0x5a5a_5a5ai32; A2NLSF_TABLE_LEN];
+                silk_a2nlsf_eval_table_scalar(&mut portable, &p, dd);
+                if crate::compat::x86_has_sse41() {
+                    let mut table = [0x5a5a_5a5ai32; A2NLSF_TABLE_LEN];
+                    // SAFETY: the processor has SSE4.1 (checked above).
+                    unsafe { a2nlsf_x86::eval_table_sse41(&mut table, &p, dd) };
+                    assert_eq!(table, portable, "sse4.1, degree {dd}, {p:?}");
+                }
+                if crate::compat::x86_has_avx2() {
+                    let mut table = [0x5a5a_5a5ai32; A2NLSF_TABLE_LEN];
+                    // SAFETY: the processor has AVX2 (checked above).
+                    unsafe { a2nlsf_x86::eval_table_avx2(&mut table, &p, dd) };
+                    assert_eq!(table, portable, "avx2, degree {dd}, {p:?}");
                 }
             }
         }

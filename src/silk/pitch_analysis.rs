@@ -26,8 +26,9 @@ const D_COMP_STRIDE: usize = (D_COMP_MAX - D_COMP_MIN) as usize;
 /// The three slices have the same length. No element of `b` may be zero
 /// (`silk_div32_varq` divides by it). `qres` is at most 24.
 ///
-/// On aarch64 four quotients are computed at a time; the result is the same
-/// (see `div_neon::div32_varq_x4`).
+/// On aarch64 four quotients are computed at a time, on x86-64 with AVX2
+/// eight; the result is the same (see `div_neon::div32_varq_x4` and
+/// `div_x86::div32_varq_x8`).
 pub(crate) fn silk_div32_varq_batch(out: &mut [i32], a: &[i32], b: &[i32], qres: i32) {
     debug_assert!(out.len() == a.len() && a.len() == b.len());
     debug_assert!((0..=24).contains(&qres));
@@ -51,7 +52,30 @@ pub(crate) fn silk_div32_varq_batch(out: &mut [i32], a: &[i32], b: &[i32], qres:
         }
         4 * out4.len()
     };
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    #[cfg(target_arch = "x86_64")]
+    let done = if crate::compat::x86_has_avx2() {
+        let (out8, _) = out.as_chunks_mut::<8>();
+        let (a8, _) = a.as_chunks::<8>();
+        let (b8, _) = b.as_chunks::<8>();
+        for ((out, a), b) in out8.iter_mut().zip(a8).zip(b8) {
+            if b.contains(&0) {
+                // Leave the division by zero to the scalar function.
+                for i in 0..8 {
+                    out[i] = silk_div32_varq(a[i], b[i], qres);
+                }
+            } else {
+                // SAFETY: the processor has AVX2.
+                *out = unsafe { div_x86::div32_varq_x8(a, b, qres) };
+            }
+        }
+        8 * out8.len()
+    } else {
+        0
+    };
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "neon"),
+        target_arch = "x86_64"
+    )))]
     let done = 0;
 
     for ((out, &a), &b) in out[done..].iter_mut().zip(&a[done..]).zip(&b[done..]) {
@@ -138,6 +162,140 @@ mod div_neon {
         let mut out = [0i32; 4];
         // SAFETY: see above.
         unsafe { vst1q_s32(out.as_mut_ptr(), shifted) };
+        out
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod div_x86 {
+    use core::arch::x86_64::*;
+
+    /// The number of leading zeros in each lane of `v`, which holds absolute
+    /// values from `_mm256_abs_epi32`: 0 to `i32::MAX`, or `i32::MIN` for
+    /// the absolute value of `i32::MIN`.
+    ///
+    /// x86 has no vector instruction for it. The position `k` of the leading
+    /// one is the exponent of the value converted to `f32`. Before the
+    /// conversion each bit is cleared that has a set bit 8 positions above
+    /// it. This keeps the leading one and clears bit `k - 8`, so the rounding
+    /// of the conversion cannot carry into bit `k + 1`. Zero converts to
+    /// `0.0`, which gives `k = -127`, and `i32::MIN` to a negative number,
+    /// which gives `k = 287` because the sign bit lies above the exponent.
+    /// Limited to -1 and 31, they count 32 and 0 leading zeros.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn leading_zeros(v: __m256i) -> __m256i {
+        let kept = _mm256_andnot_si256(_mm256_srli_epi32::<8>(v), v);
+        let exponent = _mm256_srli_epi32::<23>(_mm256_castps_si256(_mm256_cvtepi32_ps(kept)));
+        let k = _mm256_sub_epi32(exponent, _mm256_set1_epi32(127));
+        let k = _mm256_min_epi32(_mm256_max_epi32(k, _mm256_set1_epi32(-1)), _mm256_set1_epi32(31));
+        _mm256_sub_epi32(_mm256_set1_epi32(31), k)
+    }
+
+    /// `v` shifted left by `count` (0 to 31), or right by one where `count`
+    /// is -1.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn shift_by_headroom(v: __m256i, count: __m256i) -> __m256i {
+        // A count of -1 shifts all bits out; that lane is replaced.
+        let left = _mm256_sllv_epi32(v, count);
+        _mm256_blendv_epi8(left, _mm256_srai_epi32::<1>(v), count)
+    }
+
+    /// `(x * y) >> 32` per lane, with 64-bit products (`silk_smmul`). With
+    /// `y = c << 16` it is `(x * c) >> 16` (`silk_smulwb` for a 16-bit `c`).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn mul_high(x: __m256i, y: __m256i) -> __m256i {
+        let even = _mm256_mul_epi32(x, y);
+        let odd = _mm256_mul_epi32(_mm256_srli_epi64::<32>(x), _mm256_srli_epi64::<32>(y));
+        _mm256_blend_epi32::<0b1010_1010>(_mm256_srli_epi64::<32>(even), odd)
+    }
+
+    /// `(2^29 - 1) / d` per lane, rounded towards zero as an integer
+    /// division does it, for divisors with `2^14 <= |d| <= 2^15`.
+    ///
+    /// The quotient is computed in double precision. It is exact: a quotient
+    /// of these numbers that is not a whole number is at least 2^-15 away
+    /// from the next one, far more than the rounding error of the division
+    /// (below 2^-37).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn reciprocal(d: __m256i) -> __m256i {
+        let numerator = _mm256_set1_pd((i32::MAX >> 2) as f64);
+        let quotient = |d: __m128i| {
+            _mm256_cvttpd_epi32(_mm256_div_pd(numerator, _mm256_cvtepi32_pd(d)))
+        };
+        let low = quotient(_mm256_castsi256_si128(d));
+        let high = quotient(_mm256_extracti128_si256::<1>(d));
+        _mm256_set_m128i(high, low)
+    }
+
+    /// `silk_div32_varq(a[i], b[i], qres)` in the eight lanes of a vector.
+    /// No `b[i]` is zero and `qres` is at most 24. The steps are those of
+    /// `div_neon::div32_varq_x4`.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn div32_varq_x8(a: &[i32; 8], b: &[i32; 8], qres: i32) -> [i32; 8] {
+        // SAFETY: both arrays are 32 bytes long, what the loads read; they
+        // need no alignment.
+        let (a32, b32) = unsafe {
+            (
+                _mm256_loadu_si256(a.as_ptr().cast()),
+                _mm256_loadu_si256(b.as_ptr().cast()),
+            )
+        };
+
+        // Shift both numbers so that the highest bit below the sign is
+        // used. The count is -1 for the most negative number.
+        let one = _mm256_set1_epi32(1);
+        let a_headrm = _mm256_sub_epi32(leading_zeros(_mm256_abs_epi32(a32)), one);
+        let b_headrm = _mm256_sub_epi32(leading_zeros(_mm256_abs_epi32(b32)), one);
+        let a32_nrm = shift_by_headroom(a32, a_headrm);
+        let b32_nrm = shift_by_headroom(b32, b_headrm);
+
+        // Reciprocal of the upper 16 bits of the divisor. It fits in 16
+        // bits, so `b32_inv << 16` is the factor of `silk_smulwb`.
+        let b32_inv = reciprocal(_mm256_srai_epi32::<16>(b32_nrm));
+        let factor = _mm256_slli_epi32::<16>(b32_inv);
+
+        // First estimate, then one correction with the remainder.
+        let result = mul_high(a32_nrm, factor);
+        let product = mul_high(b32_nrm, result);
+        let a32_nrm = _mm256_sub_epi32(a32_nrm, _mm256_slli_epi32::<3>(product));
+        let result = _mm256_add_epi32(result, mul_high(a32_nrm, factor));
+
+        // Into the result format. A negative `lshift` is a left shift that
+        // saturates (`silk_lshift_sat32`: limit first, then shift), from 0
+        // to 31 a right shift, and from 32 on the result is zero.
+        let zero = _mm256_setzero_si256();
+        let lshift = _mm256_sub_epi32(
+            _mm256_add_epi32(_mm256_set1_epi32(29 - qres), a_headrm),
+            b_headrm,
+        );
+        let left = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_sub_epi32(zero, lshift), zero),
+            _mm256_set1_epi32(31),
+        );
+        let low = _mm256_srav_epi32(_mm256_set1_epi32(i32::MIN), left);
+        let high = _mm256_srav_epi32(_mm256_set1_epi32(i32::MAX), left);
+        let limited = _mm256_min_epi32(_mm256_max_epi32(result, low), high);
+        let shifted_left = _mm256_sllv_epi32(limited, left);
+        let right = _mm256_min_epi32(lshift, _mm256_set1_epi32(31));
+        let shifted_right = _mm256_andnot_si256(
+            _mm256_cmpgt_epi32(lshift, _mm256_set1_epi32(31)),
+            _mm256_srav_epi32(result, right),
+        );
+        let negative = _mm256_srai_epi32::<31>(lshift);
+        let shifted = _mm256_blendv_epi8(shifted_right, shifted_left, negative);
+
+        let mut out = [0i32; 8];
+        // SAFETY: `out` is 32 bytes long, what the store writes; it needs
+        // no alignment.
+        unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), shifted) };
         out
     }
 }
@@ -1150,5 +1308,50 @@ mod div_tests {
     fn zero_divisor_panics_like_scalar() {
         let mut out = [0i32; 4];
         silk_div32_varq_batch(&mut out, &[1, 2, 3, 4], &[5, 0, 7, 8], 14);
+    }
+
+    /// The same in a group of eight, the size of the x86 vector code.
+    #[test]
+    #[should_panic]
+    fn zero_divisor_among_eight_panics_like_scalar() {
+        let mut out = [0i32; 9];
+        silk_div32_varq_batch(&mut out, &[1; 9], &[5, 6, 7, 8, 9, 10, 0, 12, 13], 14);
+    }
+
+    /// The x86 kernel against the scalar function, whatever the dispatch
+    /// chooses: every special value as dividend and divisor, and random
+    /// values of any magnitude, for every `qres`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_kernel_matches_scalar() {
+        if !crate::compat::x86_has_avx2() {
+            return;
+        }
+        let check8 = |a: [i32; 8], b: [i32; 8], qres: i32| {
+            // SAFETY: the processor has AVX2 (checked above).
+            let got = unsafe { super::div_x86::div32_varq_x8(&a, &b, qres) };
+            let want: [i32; 8] = core::array::from_fn(|i| silk_div32_varq(a[i], b[i], qres));
+            assert_eq!(got, want, "qres {qres}, a {a:?}, b {b:?}");
+        };
+        let values = special_values();
+        let divisors: Vec<i32> = values.iter().copied().filter(|&v| v != 0).collect();
+        for qres in 0..=24 {
+            for &divisor in &divisors {
+                for a in values.chunks(8) {
+                    let a: [i32; 8] = core::array::from_fn(|i| a.get(i).copied().unwrap_or(0));
+                    check8(a, [divisor; 8], qres);
+                }
+            }
+        }
+        let mut rng = XorShift(0x7F4A_7C15_9E37_79B9);
+        let any = |rng: &mut XorShift| (rng.next() as i32) >> (rng.next() % 32);
+        for round in 0..200_000 {
+            let a: [i32; 8] = core::array::from_fn(|_| any(&mut rng));
+            let b: [i32; 8] = core::array::from_fn(|_| match any(&mut rng) {
+                0 => -1,
+                value => value,
+            });
+            check8(a, b, round % 25);
+        }
     }
 }
