@@ -5,6 +5,8 @@ use crate::pvq::*;
 use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, bits2pulses, get_pulses, pulses2bits};
 use crate::range_coder::tell_frac_inline;
+use core::mem::MaybeUninit;
+use core::ops::Range;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -33,6 +35,9 @@ pub struct BandCtx<'a> {
     /// The encoder's cache of rotation angles (see `RotationCache`). `None`
     /// computes each angle.
     pub rotations: Option<&'a mut RotationCache>,
+    /// Memory for the pulse vector of a band, shared by the bands of the
+    /// frame.
+    pub pulse_scratch: &'a mut PulseScratch,
 }
 
 #[inline]
@@ -1155,9 +1160,19 @@ fn quant_partition_leaf<const ENCODE_ONLY: bool>(
                 gain,
                 resynth,
                 ctx.rotations.as_deref_mut(),
+                ctx.pulse_scratch,
             )
         } else {
-            alg_unquant(x, n, k, ctx.spread, b_blocks as usize, ctx.rc, gain)
+            alg_unquant_with(
+                x,
+                n,
+                k,
+                ctx.spread,
+                b_blocks as usize,
+                ctx.rc,
+                gain,
+                ctx.pulse_scratch,
+            )
         };
     }
     // Without resynthesis the part is not filled and its collapse mask
@@ -1372,7 +1387,7 @@ fn quant_band_n1(
     ctx: &mut BandCtx,
     x: &mut [f32],
     y: Option<&mut [f32]>,
-    lowband_out: Option<&mut [f32]>,
+    lowband_out: Option<FoldOut<'_>>,
 ) -> u32 {
     let mut sign = 0;
     if ctx.remaining_bits >= 1 << BITRES {
@@ -1407,7 +1422,7 @@ fn quant_band_n1(
         // the fixed-point build; in the floating-point build, which this
         // port follows, it leaves the value alone. Dividing by 16 here gave
         // one-bin bands 1/16 of their weight as folding source material.
-        l_out[0] = x[0];
+        l_out.write_from(&x[..1], |v| v);
     }
     1
 }
@@ -1422,7 +1437,7 @@ pub fn quant_band(
     b_blocks: i32,
     lowband: Option<&mut [f32]>,
     lm: i32,
-    lowband_out: Option<&mut [f32]>,
+    lowband_out: Option<FoldOut<'_>>,
     gain: f32,
     fill: u32,
 ) -> u32 {
@@ -1538,9 +1553,7 @@ pub fn quant_band(
 
         if let Some(lb_out) = lowband_out {
             let scale = (n0 as f32).sqrt();
-            for (out, &xv) in lb_out[..n0].iter_mut().zip(&x[..n0]) {
-                *out = scale * xv;
-            }
+            lb_out.write_from(&x[..n0], |xv| scale * xv);
         }
         cm &= (1u32 << b_final) - 1;
         return cm;
@@ -1627,8 +1640,130 @@ fn intensity_stereo(
     }
 }
 
+/// The decoded bands of a frame, kept for folding: `norm` (and `norm2`) of
+/// libopus `quant_all_bands`.
+///
+/// The buffer starts without values. The bands write it one after the
+/// other, from the start, and a band reads only values that earlier bands
+/// (or `special_hybrid_folding`) wrote. `written` counts the values at the
+/// start of the buffer that have been written. Only those are turned into
+/// `&mut [f32]`, so the buffer needs no fill with zeros first.
+struct FoldBuf<'a> {
+    buf: &'a mut [MaybeUninit<f32>],
+    /// `buf[..written]` holds values.
+    written: usize,
+}
+
+impl<'a> FoldBuf<'a> {
+    fn new(buf: &'a mut [MaybeUninit<f32>]) -> Self {
+        FoldBuf { buf, written: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Makes sure that `buf[..end]` holds values. The codec reads only
+    /// values it wrote, so in practice this writes nothing. If a read ever
+    /// reached further, the values not yet written would be set to 0 here
+    /// instead of being read uninitialized.
+    #[inline(always)]
+    fn make_written(&mut self, end: usize) {
+        if end > self.written {
+            self.fill_zero(end);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_zero(&mut self, end: usize) {
+        for v in &mut self.buf[self.written..end] {
+            v.write(0.0);
+        }
+        self.written = end;
+    }
+
+    /// The first `end` values.
+    #[inline(always)]
+    fn values_mut(&mut self, end: usize) -> &mut [f32] {
+        self.make_written(end);
+        // SAFETY: `make_written` made sure that `buf[..end]` holds values.
+        unsafe { self.buf[..end].assume_init_mut() }
+    }
+
+    /// The values of `lowband`, and `out` for a band to write. The two
+    /// ranges must not overlap; the function panics if they do.
+    #[inline(always)]
+    fn lowband_and_out(
+        &mut self,
+        lowband: Range<usize>,
+        out: Range<usize>,
+    ) -> (&mut [f32], FoldOut<'_>) {
+        self.make_written(lowband.end);
+        let start = out.start;
+        let (lb, values) = if lowband.end <= out.start {
+            let (front, back) = self.buf.split_at_mut(out.start);
+            (&mut front[lowband], &mut back[..out.len()])
+        } else {
+            let (front, back) = self.buf.split_at_mut(lowband.start);
+            (&mut back[..lowband.len()], &mut front[out])
+        };
+        // SAFETY: `lb` lies in `buf[..lowband.end]`, which holds values
+        // (`make_written` above).
+        let lb = unsafe { lb.assume_init_mut() };
+        (lb, FoldOut { values, start, written: &mut self.written })
+    }
+
+    /// `out` for a band to write, if there is one.
+    #[inline(always)]
+    fn out(&mut self, out: Option<Range<usize>>) -> Option<FoldOut<'_>> {
+        let out = out?;
+        let start = out.start;
+        Some(FoldOut { values: &mut self.buf[out], start, written: &mut self.written })
+    }
+
+    /// Copies `buf[src]` to `buf[dest..]`, as `slice::copy_within` does.
+    fn copy_within(&mut self, src: Range<usize>, dest: usize) {
+        let end = dest + src.len();
+        self.buf.copy_within(src.clone(), dest);
+        // The copies hold values if the source did. They add to the values
+        // at the start of the buffer if they begin within them.
+        if src.end <= self.written && dest <= self.written {
+            self.written = self.written.max(end);
+        }
+    }
+}
+
+/// The part of a `FoldBuf` that one band writes: `lowband_out` of libopus
+/// `quant_band`. `write_from` writes all of it and records that in the
+/// `FoldBuf`.
+pub(crate) struct FoldOut<'a> {
+    values: &'a mut [MaybeUninit<f32>],
+    /// The index of `values[0]` in the `FoldBuf`.
+    start: usize,
+    /// `written` of the `FoldBuf`.
+    written: &'a mut usize,
+}
+
+impl FoldOut<'_> {
+    /// Writes `f(src[j])` to value `j`, for every value. Panics before
+    /// writing anything when `src` holds fewer values.
+    #[inline(always)]
+    fn write_from(self, src: &[f32], f: impl Fn(f32) -> f32) {
+        let src = &src[..self.values.len()];
+        for (d, &v) in self.values.iter_mut().zip(src) {
+            d.write(f(v));
+        }
+        // All values are written now. They add to the values at the start
+        // of the buffer if they begin within them.
+        if self.start <= *self.written {
+            *self.written = (*self.written).max(self.start + self.values.len());
+        }
+    }
+}
+
 #[inline(always)]
-fn special_hybrid_folding(m: &CeltMode, norm: &mut [f32], start: usize, m_val: usize) {
+fn special_hybrid_folding(m: &CeltMode, norm: &mut FoldBuf<'_>, start: usize, m_val: usize) {
     if start + 2 >= m.e_bands.len() {
         return;
     }
@@ -1644,18 +1779,23 @@ fn special_hybrid_folding(m: &CeltMode, norm: &mut [f32], start: usize, m_val: u
     }
 }
 
-fn prepare_lowband_views(
-    norm: &mut [f32],
-    lowband_scratch_ptr: *mut f32,
+/// For the band of `n` values at `norm_pos`: the lowband it folds from,
+/// which starts at `effective_lowband` (no lowband when that is negative),
+/// and, with `want_out`, the part of `norm` the band writes. With
+/// `allow_lowband_scratch` the lowband is a copy in `lowband_scratch`, so
+/// it may overlap the part the band writes.
+fn prepare_lowband_views<'a>(
+    norm: &'a mut FoldBuf<'_>,
+    lowband_scratch: &'a mut [MaybeUninit<f32>],
     allow_lowband_scratch: bool,
     effective_lowband: i32,
     norm_pos: usize,
     n: usize,
     want_out: bool,
-) -> (Option<&mut [f32]>, Option<&mut [f32]>) {
+) -> (Option<&'a mut [f32]>, Option<FoldOut<'a>>) {
     let len = norm.len();
     let out_range = if want_out && norm_pos + n <= len {
-        Some((norm_pos, norm_pos + n))
+        Some(norm_pos..norm_pos + n)
     } else {
         None
     };
@@ -1665,49 +1805,27 @@ fn prepare_lowband_views(
     } else {
         None
     }) else {
-        let lb_out = out_range.map(|(s, e)| &mut norm[s..e]);
-        return (None, lb_out);
+        return (None, norm.out(out_range));
     };
     let lb_end = lb_start + n;
     if lb_end > len {
-        let lb_out = out_range.map(|(s, e)| &mut norm[s..e]);
-        return (None, lb_out);
+        return (None, norm.out(out_range));
     }
 
     if allow_lowband_scratch {
-        // The scratch buffer of quant_all_bands holds MAX_PVQ_N values.
-        // Checked in release builds too, because the copy below is unchecked.
-        assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
-        // SAFETY: the source is `norm[lb_start..lb_end]`, in bounds because
-        // `lb_end <= len` was checked above. The destination is the scratch
-        // buffer, which holds `n` values (checked above) and is a separate
-        // local array, so the two do not overlap. The slice built from it is
-        // used for one band only, before the buffer is used again.
-        unsafe {
-            core::ptr::copy_nonoverlapping(norm.as_ptr().add(lb_start), lowband_scratch_ptr, n)
-        };
-        let lb = Some(unsafe { core::slice::from_raw_parts_mut(lowband_scratch_ptr, n) });
-        let lb_out = out_range.map(|(s, e)| &mut norm[s..e]);
-        return (lb, lb_out);
+        // The scratch buffer of quant_all_bands holds MAX_PVQ_N values; a
+        // longer band panics here.
+        let lb = lowband_scratch[..n].write_copy_of_slice(&norm.values_mut(lb_end)[lb_start..]);
+        return (Some(lb), norm.out(out_range));
     }
 
-    if let Some((out_start, out_end)) = out_range {
-        if lb_end <= out_start {
-            let (left, right) = norm.split_at_mut(out_start);
-            let lb = Some(&mut left[lb_start..lb_end]);
-            let lb_out = Some(&mut right[..(out_end - out_start)]);
-            return (lb, lb_out);
-        }
-        if out_end <= lb_start {
-            let (left, right) = norm.split_at_mut(lb_start);
-            let lb_out = Some(&mut left[out_start..out_end]);
-            let lb = Some(&mut right[..n]);
-            return (lb, lb_out);
-        }
-        return (Some(&mut norm[lb_start..lb_end]), None);
+    if let Some(out) = out_range
+        && (lb_end <= out.start || out.end <= lb_start)
+    {
+        let (lb, lb_out) = norm.lowband_and_out(lb_start..lb_end, out);
+        return (Some(lb), Some(lb_out));
     }
-
-    (Some(&mut norm[lb_start..lb_end]), None)
+    (Some(&mut norm.values_mut(lb_end)[lb_start..]), None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1721,7 +1839,7 @@ pub fn quant_band_stereo(
     b_blocks: i32,
     lowband: Option<&mut [f32]>,
     lm: i32,
-    lowband_out: Option<&mut [f32]>,
+    lowband_out: Option<FoldOut<'_>>,
     fill: u32,
 ) -> u32 {
     if n == 1 {
@@ -1978,28 +2096,23 @@ fn quant_band_stereo_rdo(
     b_blocks: i32,
     lm: i32,
     fill: u32,
-    norm: &mut [f32],
-    lowband_scratch_ptr: *mut f32,
+    norm: &mut FoldBuf<'_>,
+    lowband_scratch: &mut [MaybeUninit<f32>],
     allow_lowband_scratch: bool,
     effective_lowband: i32,
     norm_pos: usize,
     last: bool,
     hybrid_fold: Option<(usize, usize)>,
 ) -> u32 {
-    use core::mem::MaybeUninit;
-    // A band never has more than MAX_PVQ_N values. Checked in release builds
-    // too, because the copies below go to buffers of that size.
+    // A band never has more than MAX_PVQ_N values; the copies below go to
+    // buffers of that size.
     assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
     let x = &mut x[..n];
     let y = &mut y[..n];
     let mut x_save_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
     let mut y_save_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    // SAFETY (both): `n <= MAX_PVQ_N` values fit in each buffer, and each
-    // slice is written by `copy_from_slice` before it is read.
-    let x_save = unsafe { core::slice::from_raw_parts_mut(x_save_mu.as_mut_ptr() as *mut f32, n) };
-    let y_save = unsafe { core::slice::from_raw_parts_mut(y_save_mu.as_mut_ptr() as *mut f32, n) };
-    x_save.copy_from_slice(x);
-    y_save.copy_from_slice(y);
+    let x_save: &[f32] = x_save_mu[..n].write_copy_of_slice(x);
+    let y_save: &[f32] = y_save_mu[..n].write_copy_of_slice(y);
 
     let w = compute_channel_weights(ctx.band_e[ctx.i], ctx.band_e[ctx.i + ctx.m.nb_ebands]);
     // C: `MULT16_32_Q15(w[0], ip(X_save, X)) + MULT16_32_Q15(w[1], ip(Y_save,
@@ -2016,7 +2129,7 @@ fn quant_band_stereo_rdo(
     ctx.theta_round = -1;
     let (lb, lb_out) = prepare_lowband_views(
         norm,
-        lowband_scratch_ptr,
+        lowband_scratch,
         allow_lowband_scratch,
         effective_lowband,
         norm_pos,
@@ -2030,30 +2143,23 @@ fn quant_band_stereo_rdo(
     let state_down = ctx.rc.save_state();
     let (seed_down, remaining_down) = (ctx.seed, ctx.remaining_bits);
     let mut norm_down_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    // SAFETY: as above. `norm_down` is written and read only when
-    // `keep_norm` holds.
-    let norm_down =
-        unsafe { core::slice::from_raw_parts_mut(norm_down_mu.as_mut_ptr() as *mut f32, n) };
-    let keep_norm = !last && norm_pos + n <= norm.len();
-    if keep_norm {
-        norm_down.copy_from_slice(&norm[norm_pos..norm_pos + n]);
-    }
+    let norm_down: Option<&[f32]> = if !last && norm_pos + n <= norm.len() {
+        let band = &norm.values_mut(norm_pos + n)[norm_pos..];
+        Some(norm_down_mu[..n].write_copy_of_slice(band))
+    } else {
+        None
+    };
     // The bytes the first pass wrote: range coder bytes from `offs0` up, raw
-    // bits from the end down.
+    // bits from the end down. Both ranges lie inside the coder's buffer of
+    // `storage` bytes and do not overlap, so together they hold at most
+    // RANGE_BUF_MAX bytes.
     let storage = ctx.rc.storage as usize;
     let front = offs0..(ctx.rc.offs as usize).max(offs0);
     let back = storage - (ctx.rc.end_offs as usize).max(end_offs0)..storage - end_offs0;
     let mut bytes_mu = [MaybeUninit::<u8>::uninit(); crate::range_coder::RANGE_BUF_MAX];
-    // Both ranges lie inside the coder's buffer of `storage` bytes and do not
-    // overlap, so together they hold at most RANGE_BUF_MAX bytes. Checked in
-    // release builds too, because the slice below must fit in the buffer.
-    let saved = front.len() + back.len();
-    assert!(saved <= crate::range_coder::RANGE_BUF_MAX);
-    // SAFETY: `saved` bytes fit in the buffer (checked above), and both
-    // copies below write all of them before anything reads them.
-    let bytes = unsafe { core::slice::from_raw_parts_mut(bytes_mu.as_mut_ptr() as *mut u8, saved) };
-    bytes[..front.len()].copy_from_slice(&ctx.rc.buf[front.clone()]);
-    bytes[front.len()..].copy_from_slice(&ctx.rc.buf[back.clone()]);
+    let (front_mu, back_mu) = bytes_mu[..front.len() + back.len()].split_at_mut(front.len());
+    let front_bytes: &[u8] = front_mu.write_copy_of_slice(&ctx.rc.buf[front.clone()]);
+    let back_bytes: &[u8] = back_mu.write_copy_of_slice(&ctx.rc.buf[back.clone()]);
 
     // Back to the coder state before the first pass.
     ctx.rc.restore_state(&state0);
@@ -2066,15 +2172,12 @@ fn quant_band_stereo_rdo(
     // Encode and round up, on a copy of the input.
     let mut x_up_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
     let mut y_up_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    // SAFETY (both): as for `x_save`.
-    let x_up = unsafe { core::slice::from_raw_parts_mut(x_up_mu.as_mut_ptr() as *mut f32, n) };
-    let y_up = unsafe { core::slice::from_raw_parts_mut(y_up_mu.as_mut_ptr() as *mut f32, n) };
-    x_up.copy_from_slice(x_save);
-    y_up.copy_from_slice(y_save);
+    let x_up = x_up_mu[..n].write_copy_of_slice(x_save);
+    let y_up = y_up_mu[..n].write_copy_of_slice(y_save);
     ctx.theta_round = 1;
     let (lb, lb_out) = prepare_lowband_views(
         norm,
-        lowband_scratch_ptr,
+        lowband_scratch,
         allow_lowband_scratch,
         effective_lowband,
         norm_pos,
@@ -2087,13 +2190,13 @@ fn quant_band_stereo_rdo(
     if dist_down >= dist_up {
         // The first pass wins. Its band is still in `x` and `y`.
         ctx.rc.restore_state(&state_down);
-        ctx.rc.buf[front.clone()].copy_from_slice(&bytes[..front.len()]);
-        ctx.rc.buf[back].copy_from_slice(&bytes[front.len()..]);
+        ctx.rc.buf[front].copy_from_slice(front_bytes);
+        ctx.rc.buf[back].copy_from_slice(back_bytes);
         ctx.seed = seed_down;
         ctx.remaining_bits = remaining_down;
         ctx.theta_round = -1;
-        if keep_norm {
-            norm[norm_pos..norm_pos + n].copy_from_slice(norm_down);
+        if let Some(band) = norm_down {
+            norm.values_mut(norm_pos + n)[norm_pos..].copy_from_slice(band);
         }
         cm_down
     } else {
@@ -2320,18 +2423,15 @@ fn quant_all_bands_impl(
     // `norm` and `norm2` hold the decoded bands of the frame so far, for
     // folding. They start without values. A band is written (as
     // `lowband_out`) before a later band reads it as its `lowband`: the
-    // read range always ends at or before the start of the current band.
-    let mut norm_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
-    // SAFETY: `norm_size` values fit in the buffer (checked above).
-    let norm =
-        unsafe { core::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, norm_size) };
-    let mut norm2_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
-    // SAFETY: as for `norm`.
-    let norm2 =
-        unsafe { core::slice::from_raw_parts_mut(norm2_buf.as_mut_ptr() as *mut f32, norm_size) };
+    // read range ends at or before the start of the current band, or within
+    // the values that `special_hybrid_folding` copied there.
+    let mut norm_buf = [MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+    let mut norm = FoldBuf::new(&mut norm_buf[..norm_size]);
+    let mut norm2_buf = [MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+    let mut norm2 = FoldBuf::new(&mut norm2_buf[..norm_size]);
 
-    let mut lowband_scratch_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let lowband_scratch_ptr = lowband_scratch_buf.as_mut_ptr() as *mut f32;
+    let mut lowband_scratch = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let mut pulse_scratch = PulseScratch::new();
 
     let mut lowband_offset: usize = 0;
     let mut update_lowband = true;
@@ -2376,9 +2476,9 @@ fn quant_all_bands_impl(
         }
 
         if resynth && i == start + 1 {
-            special_hybrid_folding(m, norm, start, m_val);
+            special_hybrid_folding(m, &mut norm, start, m_val);
             if *dual_stereo {
-                special_hybrid_folding(m, norm2, start, m_val);
+                special_hybrid_folding(m, &mut norm2, start, m_val);
             }
         }
 
@@ -2437,6 +2537,7 @@ fn quant_all_bands_impl(
             seed: ctx_seed,
             stereo_angle: None,
             rotations: rotations.as_deref_mut(),
+            pulse_scratch: &mut pulse_scratch,
         };
 
         let x_slice = &mut x[offset..offset + n];
@@ -2447,6 +2548,7 @@ fn quant_all_bands_impl(
         if *dual_stereo && i == intensity {
             *dual_stereo = false;
             if resynth {
+                let (norm, norm2) = (norm.values_mut(norm_pos), norm2.values_mut(norm_pos));
                 for j in 0..norm_pos {
                     norm[j] = 0.5 * (norm[j] + norm2[j]);
                 }
@@ -2457,8 +2559,8 @@ fn quant_all_bands_impl(
             let y_slice = &mut y.as_mut().unwrap()[offset..offset + n];
 
             let (lb_x, lb_out_x) = prepare_lowband_views(
-                norm,
-                lowband_scratch_ptr,
+                &mut norm,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
@@ -2479,8 +2581,8 @@ fn quant_all_bands_impl(
             );
 
             let (lb_y, lb_out_y) = prepare_lowband_views(
-                norm2,
-                lowband_scratch_ptr,
+                &mut norm2,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
@@ -2511,8 +2613,8 @@ fn quant_all_bands_impl(
                     b_blocks,
                     lm,
                     x_cm | y_cm,
-                    norm,
-                    lowband_scratch_ptr,
+                    &mut norm,
+                    &mut lowband_scratch,
                     allow_lowband_scratch,
                     effective_lowband,
                     norm_pos,
@@ -2521,8 +2623,8 @@ fn quant_all_bands_impl(
                 );
             } else {
                 let (lb, lb_out) = prepare_lowband_views(
-                    norm,
-                    lowband_scratch_ptr,
+                    &mut norm,
+                    &mut lowband_scratch,
                     allow_lowband_scratch,
                     effective_lowband,
                     norm_pos,
@@ -2545,8 +2647,8 @@ fn quant_all_bands_impl(
             y_cm = x_cm;
         } else {
             let (lb, lb_out) = prepare_lowband_views(
-                norm,
-                lowband_scratch_ptr,
+                &mut norm,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,

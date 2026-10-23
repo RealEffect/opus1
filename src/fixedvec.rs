@@ -268,14 +268,13 @@ impl<T, const N: usize> FixedVec<T, N> {
 
     /// Set the logical length without initializing/deinitializing elements.
     ///
-    /// Mirrors `Vec::set_len`. The caller is responsible for ensuring elements in
-    /// `..new_len` are initialized (or treated as raw bytes). Used by the range
-    /// coder which manages its own byte-level writes.
+    /// Mirrors `Vec::set_len`.
     ///
     /// # Safety
     /// After this call, `as_slice()` will expose `new_len` elements. The caller
-    /// must guarantee that the `..new_len` range holds valid `T`s (or that they are
-    /// only ever read as raw bytes / overwritten before being read as `T`).
+    /// must guarantee that every element of the `..new_len` range holds a valid
+    /// `T` before the call: a slice must not cover memory that was not written,
+    /// even if it is written before it is read.
     #[inline]
     pub unsafe fn set_len(&mut self, new_len: usize) {
         assert!(new_len <= N, "FixedVec capacity exceeded");

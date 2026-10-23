@@ -174,15 +174,14 @@ pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
     // The vector kernels read `n` samples through pointers without a check,
     // so the lengths are checked here.
     let (x, y) = (&x[..n], &y[..n]);
-    // SAFETY (both blocks): `x` and `y` hold exactly `n` samples. The AVX
-    // kernel runs only when the CPU has AVX and FMA; SSE is part of the
-    // baseline of x86-64.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        if crate::compat::x86_has_avx_fma() {
-            return inner_prod_avx(x, y, n);
-        }
+    if crate::compat::x86_has_avx_fma() {
+        // SAFETY: `x` and `y` hold exactly `n` samples, and the CPU has AVX
+        // and FMA (checked just above).
+        return unsafe { inner_prod_avx(x, y, n) };
     }
+    // SAFETY: `x` and `y` hold exactly `n` samples, and SSE is part of the
+    // baseline of x86-64.
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         inner_prod_sse(x, y, n)
@@ -201,15 +200,14 @@ pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
 pub fn dual_inner_prod(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
     // As in `inner_prod`: the kernels read `n` samples without a check.
     let (x, y1, y2) = (&x[..n], &y1[..n], &y2[..n]);
-    // SAFETY (both blocks): the three slices hold exactly `n` samples. The
-    // AVX kernel runs only when the CPU has AVX and FMA; SSE is part of the
-    // baseline of x86-64.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        if crate::compat::x86_has_avx_fma() {
-            return dual_inner_prod_avx(x, y1, y2, n);
-        }
+    if crate::compat::x86_has_avx_fma() {
+        // SAFETY: the three slices hold exactly `n` samples, and the CPU has
+        // AVX and FMA (checked just above).
+        return unsafe { dual_inner_prod_avx(x, y1, y2, n) };
     }
+    // SAFETY: the three slices hold exactly `n` samples, and SSE is part of
+    // the baseline of x86-64.
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         dual_inner_prod_sse(x, y1, y2, n)
@@ -244,18 +242,20 @@ pub fn pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitc
     // The vector kernels read `len` samples of `x` through pointers without
     // a check, so its length is checked here.
     let x = &x[..len];
-    // SAFETY (both blocks): `x` holds exactly `len` samples and `y` at least
-    // `len + max_pitch - 1` (`max_pitch` was limited to that above). `xcorr`
-    // is written with index checks. The AVX kernel runs only when the CPU
-    // has AVX and FMA.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        if crate::compat::x86_has_avx_fma() {
-            return pitch_xcorr_avx(x, y, xcorr, len, max_pitch);
-        }
+    if crate::compat::x86_has_avx_fma() {
+        // SAFETY: `x` holds exactly `len` samples and `y` at least
+        // `len + max_pitch - 1` (`max_pitch` was limited to that above).
+        // `xcorr` is written with index checks. The CPU has AVX and FMA
+        // (checked just above).
+        return unsafe { pitch_xcorr_avx(x, y, xcorr, len, max_pitch) };
     }
     #[cfg(target_arch = "aarch64")]
     pitch_xcorr_neon(x, y, &mut xcorr[..max_pitch]);
+    // SAFETY: `x` holds exactly `len` samples and `y` at least
+    // `len + max_pitch - 1` (`max_pitch` was limited to that above).
+    // `xcorr` is written with index checks. SSE is part of the baseline of
+    // x86-64.
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         pitch_xcorr_sse(x, y, xcorr, len, max_pitch)
@@ -2323,8 +2323,11 @@ impl<'a> WindowEnergies<'a> {
         let (fa, fb) = (a.syy, b.syy);
         a.increments(ia + count);
         b.increments(ib + count);
-        // SAFETY: `increments` wrote these entries of both tables.
+        // SAFETY: `a.increments(ia + count)` above wrote these entries of
+        // the table of `a`.
         let ta = unsafe { assume_written_mut(&mut a.table[ia..ia + count]) };
+        // SAFETY: `b.increments(ib + count)` above wrote these entries of
+        // the table of `b`.
         let tb = unsafe { assume_written_mut(&mut b.table[ib..ib + count]) };
         let (mut sa, mut sb) = (fa, fb);
         for (pa, pb) in ta.chunks_mut(B::EVERY).zip(tb.chunks_mut(B::EVERY)) {
