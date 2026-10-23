@@ -22,6 +22,9 @@ const PITCH_BUF_MAX: usize = 1024;
 //   (celt/arm/pitch_neon_intr.c). Four running sums take the samples 4m,
 //   4m + 1, 4m + 2 and 4m + 3. They are added as (s0 + s2) + (s1 + s3), and
 //   the last `n % 4` products are added one by one after that.
+// * `celt_inner_prod` on x86-64 is libopus `celt_inner_prod_sse`
+//   (celt/x86/pitch_sse.c): the same order as on 64-bit ARM, with each
+//   product rounded before its addition.
 // * `pitch_xcorr` on 64-bit ARM is libopus `celt_pitch_xcorr_float_neon`
 //   (celt/arm/celt_neon_intr.c). The lags below the largest multiple of four
 //   add their products one sample after the other ("by sample"). The one to
@@ -33,9 +36,10 @@ const PITCH_BUF_MAX: usize = 1024;
 // explains why), and its NEON kernels ask for the fused instruction. Every
 // product here is therefore added with one rounding on 64-bit ARM. On other
 // processors `mac` rounds the product first, as libopus's C code does
-// there. The x86 kernels of this file are separate: they are what this
-// crate has used on x86 so far, and they do not follow libopus's x86
-// kernels in every detail.
+// there. The other x86 kernels of this file (`inner_prod`, `pitch_xcorr`
+// and the ones they call) are separate: they are what this crate has used
+// on x86 so far, and they do not follow libopus's x86 kernels in every
+// detail.
 //
 // Several sums can be computed in the same pass without changing any
 // result, as long as every sum keeps its own order. The kernels below do
@@ -105,6 +109,12 @@ fn xcorr_by_sample_scalar(x: &[f32], y: &[f32], out: &mut [f32], len: usize) {
 /// (s0 + s2) + (s1 + s3). The last one to three values are added one at a
 /// time with fused multiply-adds.
 ///
+/// On x86-64 this is `celt_inner_prod_sse` (celt/x86/pitch_sse.c), which
+/// libopus's x86-64 builds call without a run-time check. It has the steps
+/// of the NEON kernel, with each product rounded before its addition: one
+/// accumulator of four lanes, the lanes added as (s0 + s2) + (s1 + s3), and
+/// the last one to three values added one at a time.
+///
 /// Elsewhere this is `celt_inner_prod_c` (celt/pitch.h): one value at a time
 /// from 0, with `mac`.
 ///
@@ -141,7 +151,33 @@ pub(crate) fn celt_inner_prod(x: &[f32], y: &[f32]) -> f32 {
             xy
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        use core::arch::x86_64::*;
+        // SAFETY: SSE is part of this target (see the `cfg`). Every load
+        // reads `x[i..i + 4]` or `y[i..i + 4]` with `i + 4 <= n`; both
+        // slices hold exactly `n` values.
+        unsafe {
+            let xp = x.as_ptr();
+            let yp = y.as_ptr();
+            let mut sum = _mm_setzero_ps();
+            let mut i = 0;
+            while i + 4 <= n {
+                sum = _mm_add_ps(sum, _mm_mul_ps(_mm_loadu_ps(xp.add(i)), _mm_loadu_ps(yp.add(i))));
+                i += 4;
+            }
+            // (s0 + s2) + (s1 + s3), as libopus adds the lanes.
+            let sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            let sum = _mm_add_ss(sum, _mm_shuffle_ps::<0x55>(sum, sum));
+            let mut xy = _mm_cvtss_f32(sum);
+            while i < n {
+                xy = mac(xy, *xp.add(i), *yp.add(i));
+                i += 1;
+            }
+            xy
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     {
         let mut xy = 0.0f32;
         for (&a, &b) in x.iter().zip(y) {
@@ -3488,12 +3524,12 @@ pub(crate) mod tests {
         acc
     }
 
-    /// `celt_inner_prod` written as plainly as possible: on aarch64 four
-    /// lanes, then (s0 + s2) + (s1 + s3), then the last `n % 4` products;
-    /// elsewhere one running sum.
+    /// `celt_inner_prod` written as plainly as possible: on aarch64 and
+    /// x86-64 four lanes, then (s0 + s2) + (s1 + s3), then the last `n % 4`
+    /// products; elsewhere one running sum.
     fn inner_prod_model(x: &[f32], y: &[f32]) -> f32 {
         let n = x.len();
-        if cfg!(target_arch = "aarch64") {
+        if cfg!(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))) {
             let whole = n / 4 * 4;
             let mut s = [0.0f32; 4];
             for j in 0..whole {
@@ -3518,6 +3554,32 @@ pub(crate) mod tests {
                 let y = samples(&mut rng, n + 3, kind);
                 let got = celt_inner_prod(&x, &y);
                 let want = inner_prod_model(&x, &y[..n]);
+                assert_same(&[got], &[want], &format!("{kind:?} n {n}"));
+            }
+        }
+    }
+
+    /// On x86-64, `celt_inner_prod` against `celt_inner_prod_sse` of the
+    /// libopus these tests link (celt/x86/pitch_sse.c, exported by the
+    /// static library of an x86-64 build), on the same values.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn celt_inner_prod_matches_libopus_sse() {
+        use audiopus_sys as _;
+        unsafe extern "C" {
+            /// `opus_val32 celt_inner_prod_sse(const opus_val16 *x,
+            /// const opus_val16 *y, int N)`, float build.
+            #[link_name = "celt_inner_prod_sse"]
+            fn c_celt_inner_prod_sse(x: *const f32, y: *const f32, n: i32) -> f32;
+        }
+        let mut rng = Rng::new(31);
+        for kind in KINDS {
+            for n in (0..=40).chain([63, 64, 65, 240, 481]) {
+                let x = samples(&mut rng, n, kind);
+                let y = samples(&mut rng, n, kind);
+                // SAFETY: `x` and `y` hold `n` values each.
+                let want = unsafe { c_celt_inner_prod_sse(x.as_ptr(), y.as_ptr(), n as i32) };
+                let got = celt_inner_prod(&x, &y);
                 assert_same(&[got], &[want], &format!("{kind:?} n {n}"));
             }
         }

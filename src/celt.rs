@@ -5640,7 +5640,9 @@ fn comb_inplace_const<const C: usize>(
     } else {
         comb_inplace_const_neon::<C, COMB_VECTORS>(bufs, at, t, n, g);
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    comb_inplace_const_sse::<C, COMB_VECTORS_SSE>(bufs, at, t, n, g);
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     for buf in bufs.iter_mut() {
         comb_inplace_const_scalar(buf, at, t, n, g);
     }
@@ -5890,7 +5892,9 @@ fn comb_inplace_fade<const C: usize>(
 ) {
     #[cfg(target_arch = "aarch64")]
     comb_inplace_fade_neon::<C, COMB_VECTORS>(bufs, at, t0, t1, n, g0, g1, window);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    comb_inplace_fade_sse::<C, COMB_VECTORS_SSE>(bufs, at, t0, t1, n, g0, g1, window);
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     for buf in bufs.iter_mut() {
         comb_inplace_fade_scalar(buf, at, t0, t1, n, g0, g1, window);
     }
@@ -6039,6 +6043,178 @@ fn comb_inplace_fade_neon<const C: usize, const V: usize>(
             for c in 0..C {
                 for v in 0..V {
                     vst1q_f32(ptr[c].add(at + k + 4 * v), acc[c][v]);
+                }
+            }
+            k += step;
+        }
+    }
+    for buf in bufs.iter_mut() {
+        comb_inplace_fade_scalar(buf, at + main, t0, t1, n - main, g0, g1, &window[main..]);
+    }
+}
+
+/// Vectors of four samples that `comb_inplace_const_sse` and
+/// `comb_inplace_fade_sse` compute per channel in one step: 3, the most
+/// that `4 * V + 2 <= COMBFILTER_MINPERIOD` allows. Not measured; an x86
+/// core runs instructions out of order, so the number matters less than on
+/// the Cortex-A55.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+const COMB_VECTORS_SSE: usize = 3;
+
+/// `comb_inplace_const` for x86-64 with SSE, the steps of
+/// `comb_inplace_const_neon`. One step filters `V` vectors of four samples
+/// of every channel. See `comb_inplace_const_neon` for why the samples of a
+/// step do not depend on each other.
+///
+/// Unlike the NEON kernel, this one finishes each vector before it starts
+/// the next: x86-64 has 16 vector registers, too few to hold the inputs of
+/// a whole step, and the processor overlaps the vectors by itself. That is
+/// correct because no vector reads what another vector of the same step
+/// writes.
+///
+/// Each sample takes the steps of `comb_tap3` in its order. x86-64 builds
+/// round each product before the addition (see `mac`), and so does this
+/// kernel: the result is the same as the portable version's, bit for bit.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+fn comb_inplace_const_sse<const C: usize, const V: usize>(
+    bufs: &mut [&mut [f32]; C],
+    at: usize,
+    t: usize,
+    n: usize,
+    g: [f32; 3],
+) {
+    use core::arch::x86_64::*;
+    const { assert!(V >= 1 && 4 * V + 2 <= COMBFILTER_MINPERIOD) };
+    // `t` comes from the packet, so this is checked in every build.
+    assert!(t >= COMBFILTER_MINPERIOD && at >= t + 2);
+    for buf in bufs.iter() {
+        assert!(at + n <= buf.len());
+    }
+    let step = 4 * V;
+    let main = n - n % step;
+    let ptr: [*mut f32; C] = core::array::from_fn(|c| bufs[c].as_mut_ptr());
+    // SAFETY: SSE and SSE2 are part of this target (see the `cfg`). For
+    // channel `c`, every step reads `buf[i - t - 2..i - t + 4 * V + 2]` and
+    // reads and writes `buf[i..i + 4 * V]`, for `i` from `at` in steps of
+    // `4 * V` while `i + 4 * V <= at + main`. The checks above give
+    // `i - t - 2 >= 0` and `i + 4 * V <= buf.len()`, and `4 * V + 2 <= t`
+    // puts the range that is read below the one that is written. Each
+    // channel is accessed only through the pointer taken from its own
+    // `&mut` slice, and two `&mut` slices do not overlap.
+    unsafe {
+        let gv = [_mm_set1_ps(g[0]), _mm_set1_ps(g[1]), _mm_set1_ps(g[2])];
+        let mut i = at;
+        while i < at + main {
+            for c in 0..C {
+                for v in 0..V {
+                    let y = ptr[c].add(i + 4 * v);
+                    let r = y.sub(t);
+                    let near = _mm_add_ps(_mm_loadu_ps(r.add(1)), _mm_loadu_ps(r.sub(1)));
+                    let far = _mm_add_ps(_mm_loadu_ps(r.add(2)), _mm_loadu_ps(r.sub(2)));
+                    let mut acc = _mm_add_ps(_mm_loadu_ps(y), _mm_mul_ps(gv[0], _mm_loadu_ps(r)));
+                    acc = _mm_add_ps(acc, _mm_mul_ps(gv[1], near));
+                    acc = _mm_add_ps(acc, _mm_mul_ps(gv[2], far));
+                    _mm_storeu_ps(y, acc);
+                }
+            }
+            i += step;
+        }
+    }
+    for buf in bufs.iter_mut() {
+        comb_inplace_const_scalar(buf, at + main, t, n - main, g);
+    }
+}
+
+/// `comb_inplace_fade` for x86-64 with SSE, the steps of
+/// `comb_inplace_fade_neon`. One step filters `V` vectors of four samples
+/// of every channel. As in `comb_inplace_const_sse`, each vector is
+/// finished before the next one starts; the weights of a vector serve all
+/// channels.
+///
+/// Each sample takes the steps of `comb_fade_tap6` in its order, each
+/// product rounded before its addition as on every x86-64 build, so the
+/// result is the same as the portable version's.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[allow(clippy::too_many_arguments)]
+fn comb_inplace_fade_sse<const C: usize, const V: usize>(
+    bufs: &mut [&mut [f32]; C],
+    at: usize,
+    t0: usize,
+    t1: usize,
+    n: usize,
+    g0: [f32; 3],
+    g1: [f32; 3],
+    window: &[f32],
+) {
+    use core::arch::x86_64::*;
+    const { assert!(V >= 1 && 4 * V + 2 <= COMBFILTER_MINPERIOD) };
+    // The periods come from the packet, so this is checked in every build.
+    assert!(t0 >= COMBFILTER_MINPERIOD && t1 >= COMBFILTER_MINPERIOD);
+    assert!(at >= t0 + 2 && at >= t1 + 2 && n <= window.len());
+    for buf in bufs.iter() {
+        assert!(at + n <= buf.len());
+    }
+    let step = 4 * V;
+    let main = n - n % step;
+    let ptr: [*mut f32; C] = core::array::from_fn(|c| bufs[c].as_mut_ptr());
+
+    /// The three taps of one filter around `r`: `r[0]`, `r[1] + r[-1]` and
+    /// `r[2] + r[-2]`.
+    ///
+    /// SAFETY: the caller guarantees that `r.sub(2)..r.add(6)` is readable.
+    #[inline(always)]
+    unsafe fn taps(r: *const f32) -> [__m128; 3] {
+        // SAFETY: see the function's contract. SSE is part of this target.
+        unsafe {
+            [
+                _mm_loadu_ps(r),
+                _mm_add_ps(_mm_loadu_ps(r.add(1)), _mm_loadu_ps(r.sub(1))),
+                _mm_add_ps(_mm_loadu_ps(r.add(2)), _mm_loadu_ps(r.sub(2))),
+            ]
+        }
+    }
+
+    // SAFETY: SSE and SSE2 are part of this target (see the `cfg`). Every
+    // step reads `window[k..k + 4 * V]` with `k + 4 * V <= main <=
+    // window.len()`. For channel `c` it reads `buf[i - t - 2..i - t + 4 * V
+    // + 2]` for both periods and reads and writes `buf[i..i + 4 * V]`, with
+    // `i = at + k`, while `k + 4 * V <= main`. The checks above give
+    // `i - t - 2 >= 0` and `i + 4 * V <= buf.len()`, and `4 * V + 2 <= t`
+    // puts the ranges that are read below the one that is written. Each
+    // channel is accessed only through the pointer taken from its own
+    // `&mut` slice.
+    unsafe {
+        let w = window.as_ptr();
+        let old = [_mm_set1_ps(g0[0]), _mm_set1_ps(g0[1]), _mm_set1_ps(g0[2])];
+        let new = [_mm_set1_ps(g1[0]), _mm_set1_ps(g1[1]), _mm_set1_ps(g1[2])];
+        let one = _mm_set1_ps(1.0);
+        let mut k = 0;
+        while k < main {
+            for v in 0..V {
+                // The weights of `comb_fade_tap6`: `(1 - f) * g0[j]` and
+                // `f * g1[j]`, with `f = w * w`.
+                let wk = _mm_loadu_ps(w.add(k + 4 * v));
+                let f = _mm_mul_ps(wk, wk);
+                let one_minus_f = _mm_sub_ps(one, f);
+                let w_old = [
+                    _mm_mul_ps(one_minus_f, old[0]),
+                    _mm_mul_ps(one_minus_f, old[1]),
+                    _mm_mul_ps(one_minus_f, old[2]),
+                ];
+                let w_new = [_mm_mul_ps(f, new[0]), _mm_mul_ps(f, new[1]), _mm_mul_ps(f, new[2])];
+                for c in 0..C {
+                    let y = ptr[c].add(at + k + 4 * v);
+                    let old_taps = taps(y.sub(t0));
+                    let new_taps = taps(y.sub(t1));
+                    // The order of `comb_fade_tap6`.
+                    let mut acc = _mm_loadu_ps(y);
+                    for j in 0..3 {
+                        acc = _mm_add_ps(acc, _mm_mul_ps(w_old[j], old_taps[j]));
+                    }
+                    for j in 0..3 {
+                        acc = _mm_add_ps(acc, _mm_mul_ps(w_new[j], new_taps[j]));
+                    }
+                    _mm_storeu_ps(y, acc);
                 }
             }
             k += step;
@@ -6215,7 +6391,7 @@ mod comb_inplace_tests {
 
     /// Runs `kernel` on `C` channels of random signal and compares each
     /// channel with `portable` on that channel alone.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
     fn check_channels<const C: usize>(
         len: usize,
         seed: &mut u32,
@@ -6238,10 +6414,10 @@ mod comb_inplace_tests {
     }
 
     /// A vector version of `comb_inplace_const`.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
     type ConstKernel<const C: usize> = fn(&mut [&mut [f32]; C], usize, usize, usize, [f32; 3]);
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
     fn check_const_part<const C: usize>(seed: &mut u32, name: &str, kernel: ConstKernel<C>) {
         for extreme in [false, true] {
             for &n in &LENGTHS {
@@ -6288,8 +6464,13 @@ mod comb_inplace_tests {
         check_const_part::<2>(&mut seed, "window, 2 vectors", comb_inplace_const_window_neon::<2, 2>);
     }
 
-    #[cfg(target_arch = "aarch64")]
-    fn check_fade_part<const C: usize, const V: usize>(seed: &mut u32) {
+    /// A vector version of `comb_inplace_fade`.
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
+    type FadeKernel<const C: usize> =
+        fn(&mut [&mut [f32]; C], usize, usize, usize, usize, [f32; 3], [f32; 3], &[f32]);
+
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
+    fn check_fade_part<const C: usize>(seed: &mut u32, name: &str, kernel: FadeKernel<C>) {
         let window = crate::modes::default_mode().window;
         for extreme in [false, true] {
             for &n in LENGTHS.iter().filter(|&&n| n <= window.len()) {
@@ -6302,10 +6483,8 @@ mod comb_inplace_tests {
                                 at + n + 5,
                                 seed,
                                 extreme,
-                                &format!("{V} vectors, n {n} t0 {t0} t1 {t1} at {at}"),
-                                |bufs| {
-                                    comb_inplace_fade_neon::<C, V>(bufs, at, t0, t1, n, g0, g1, window)
-                                },
+                                &format!("{name}, n {n} t0 {t0} t1 {t1} at {at}"),
+                                |bufs| kernel(bufs, at, t0, t1, n, g0, g1, window),
                                 |buf| comb_inplace_fade_scalar(buf, at, t0, t1, n, g0, g1, window),
                             );
                         }
@@ -6319,12 +6498,74 @@ mod comb_inplace_tests {
     #[test]
     fn fade_part_neon_matches_portable_version() {
         let mut seed = 11u32;
-        check_fade_part::<1, 1>(&mut seed);
-        check_fade_part::<1, 2>(&mut seed);
-        check_fade_part::<1, 3>(&mut seed);
-        check_fade_part::<2, 1>(&mut seed);
-        check_fade_part::<2, 2>(&mut seed);
-        check_fade_part::<2, 3>(&mut seed);
+        check_fade_part::<1>(&mut seed, "1 vector", comb_inplace_fade_neon::<1, 1>);
+        check_fade_part::<1>(&mut seed, "2 vectors", comb_inplace_fade_neon::<1, 2>);
+        check_fade_part::<1>(&mut seed, "3 vectors", comb_inplace_fade_neon::<1, 3>);
+        check_fade_part::<2>(&mut seed, "1 vector", comb_inplace_fade_neon::<2, 1>);
+        check_fade_part::<2>(&mut seed, "2 vectors", comb_inplace_fade_neon::<2, 2>);
+        check_fade_part::<2>(&mut seed, "3 vectors", comb_inplace_fade_neon::<2, 3>);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[test]
+    fn const_part_sse_matches_portable_version() {
+        let mut seed = 17u32;
+        check_const_part::<1>(&mut seed, "SSE, 1 vector", comb_inplace_const_sse::<1, 1>);
+        check_const_part::<1>(&mut seed, "SSE, 2 vectors", comb_inplace_const_sse::<1, 2>);
+        check_const_part::<1>(&mut seed, "SSE, 3 vectors", comb_inplace_const_sse::<1, 3>);
+        check_const_part::<2>(&mut seed, "SSE, 1 vector", comb_inplace_const_sse::<2, 1>);
+        check_const_part::<2>(&mut seed, "SSE, 2 vectors", comb_inplace_const_sse::<2, 2>);
+        check_const_part::<2>(&mut seed, "SSE, 3 vectors", comb_inplace_const_sse::<2, 3>);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[test]
+    fn fade_part_sse_matches_portable_version() {
+        let mut seed = 19u32;
+        check_fade_part::<1>(&mut seed, "SSE, 1 vector", comb_inplace_fade_sse::<1, 1>);
+        check_fade_part::<1>(&mut seed, "SSE, 2 vectors", comb_inplace_fade_sse::<1, 2>);
+        check_fade_part::<1>(&mut seed, "SSE, 3 vectors", comb_inplace_fade_sse::<1, 3>);
+        check_fade_part::<2>(&mut seed, "SSE, 1 vector", comb_inplace_fade_sse::<2, 1>);
+        check_fade_part::<2>(&mut seed, "SSE, 2 vectors", comb_inplace_fade_sse::<2, 2>);
+        check_fade_part::<2>(&mut seed, "SSE, 3 vectors", comb_inplace_fade_sse::<2, 3>);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[test]
+    #[should_panic]
+    fn const_part_sse_rejects_a_period_longer_than_the_history() {
+        let mut buf = vec![0.0f32; 64];
+        comb_inplace_const_sse::<1, COMB_VECTORS_SSE>(&mut [&mut buf[..]], 20, 19, 8, [0.1, 0.1, 0.1]);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[test]
+    #[should_panic]
+    fn const_part_sse_rejects_a_second_channel_past_the_end() {
+        let (mut buf0, mut buf1) = (vec![0.0f32; 64], vec![0.0f32; 60]);
+        let bufs = &mut [&mut buf0[..], &mut buf1[..]];
+        comb_inplace_const_sse::<2, COMB_VECTORS_SSE>(bufs, 40, 15, 24, [0.1, 0.1, 0.1]);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[test]
+    #[should_panic]
+    fn fade_part_sse_rejects_a_second_channel_past_the_end() {
+        let window = crate::modes::default_mode().window;
+        let (mut buf0, mut buf1) = (vec![0.0f32; 64], vec![0.0f32; 60]);
+        let (g0, g1) = ([0.1; 3], [0.2; 3]);
+        let bufs = &mut [&mut buf0[..], &mut buf1[..]];
+        comb_inplace_fade_sse::<2, COMB_VECTORS_SSE>(bufs, 40, 15, 16, 24, g0, g1, window);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[test]
+    #[should_panic]
+    fn fade_part_sse_rejects_a_window_shorter_than_the_frame() {
+        let window = [0.5f32; 8];
+        let mut buf = vec![0.0f32; 64];
+        let (g0, g1) = ([0.1; 3], [0.2; 3]);
+        comb_inplace_fade_sse::<1, COMB_VECTORS_SSE>(&mut [&mut buf[..]], 40, 15, 16, 12, g0, g1, &window);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -6381,7 +6622,11 @@ mod comb_inplace_tests {
     }
 }
 
-#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))
+))]
 mod deemph_segments_tests {
     use super::comb_inplace_tests::{assert_same, next, signal};
     use super::*;
@@ -6417,10 +6662,10 @@ mod deemph_segments_tests {
         let mut m1 = [0.0f32];
         let mut m2 = [0.0f32; 2];
         time("segments mono", &mut || {
-            m1 = deemph_segments_neon::<1, false>([&hist[0]], at, &mut out, n, warmup, coef, m1);
+            m1 = deemph_segments::<1, false>([&hist[0]], at, &mut out, n, warmup, coef, m1);
         });
         time("segments stereo interleaved", &mut || {
-            m2 = deemph_segments_neon::<2, true>([&hist[0], &hist[1]], at, &mut out, n, warmup, coef, m2);
+            m2 = deemph_segments::<2, true>([&hist[0], &hist[1]], at, &mut out, n, warmup, coef, m2);
         });
         time("one sample mono", &mut || {
             let x = &hist[0][at..at + n];
@@ -6471,9 +6716,9 @@ mod deemph_segments_tests {
         // Three more values than the frame: they must stay as they are.
         let mut planar = vec![7.0f32; C * n + 3];
         let mut interleaved = vec![7.0f32; C * n + 3];
-        let planar_mem = deemph_segments_neon::<C, false>(h, at, &mut planar, n, warmup, coef, mem);
+        let planar_mem = deemph_segments::<C, false>(h, at, &mut planar, n, warmup, coef, mem);
         let inter_mem =
-            deemph_segments_neon::<C, true>(h, at, &mut interleaved, n, warmup, coef, mem);
+            deemph_segments::<C, true>(h, at, &mut interleaved, n, warmup, coef, mem);
         for c in 0..C {
             let mut want = vec![7.0f32; n];
             let want_mem = deemph_mono(
@@ -6565,8 +6810,8 @@ mod deemph_segments_tests {
                     }
                     DEEMPH_RECOMPUTED.with(|count| count.set(0));
                     let h = [&hist[0][..], &hist[1][..]];
-                    mem2 = deemph_segments_neon::<2, false>(h, at, &mut y, n, warmup, coef, mem2);
-                    mem1 = deemph_segments_neon::<1, false>([h[0]], at, &mut y, n, warmup, coef, mem1);
+                    mem2 = deemph_segments::<2, false>(h, at, &mut y, n, warmup, coef, mem2);
+                    mem1 = deemph_segments::<1, false>([h[0]], at, &mut y, n, warmup, coef, mem1);
                     // The memory takes about 570 samples to stop. Later
                     // frames are all silence, their run-in included.
                     if frame >= 4 {
@@ -6588,7 +6833,7 @@ mod deemph_segments_tests {
     fn segments_reject_a_frame_that_is_not_a_multiple_of_32() {
         let hist = [0.0f32; 400];
         let mut y = [0.0f32; 48];
-        deemph_segments_neon::<1, false>([&hist[..]], 200, &mut y, 48, 160, 0.85, [0.0]);
+        deemph_segments::<1, false>([&hist[..]], 200, &mut y, 48, 160, 0.85, [0.0]);
     }
 
     #[test]
@@ -6596,7 +6841,7 @@ mod deemph_segments_tests {
     fn segments_reject_a_history_shorter_than_the_run_in() {
         let hist = [0.0f32; 400];
         let mut y = [0.0f32; 64];
-        deemph_segments_neon::<1, false>([&hist[..]], 100, &mut y, 64, 160, 0.85, [0.0]);
+        deemph_segments::<1, false>([&hist[..]], 100, &mut y, 64, 160, 0.85, [0.0]);
     }
 
     #[test]
@@ -6604,7 +6849,7 @@ mod deemph_segments_tests {
     fn segments_reject_a_frame_past_the_end_of_the_history() {
         let hist = [0.0f32; 220];
         let mut y = [0.0f32; 64];
-        deemph_segments_neon::<1, false>([&hist[..]], 160, &mut y, 64, 160, 0.85, [0.0]);
+        deemph_segments::<1, false>([&hist[..]], 160, &mut y, 64, 160, 0.85, [0.0]);
     }
 
     #[test]
@@ -6612,7 +6857,7 @@ mod deemph_segments_tests {
     fn segments_reject_an_output_shorter_than_the_frames() {
         let hist = [0.0f32; 400];
         let mut y = [0.0f32; 127];
-        deemph_segments_neon::<2, true>([&hist[..], &hist[..]], 200, &mut y, 64, 160, 0.85, [0.0; 2]);
+        deemph_segments::<2, true>([&hist[..], &hist[..]], 200, &mut y, 64, 160, 0.85, [0.0; 2]);
     }
 }
 
@@ -7102,12 +7347,12 @@ fn deemph_stereo<'a>(
 }
 
 /// Shortest frame, in samples at 48 kHz, whose de-emphasis is computed in
-/// segments (`deemph_segments_neon`). Below it the segments are too short
+/// segments (`deemph_segments`). Below it the segments are too short
 /// for the run-in to pay off.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
 const DEEMPH_SEGMENTS_MIN: usize = 480;
 /// Samples that the de-emphasis filter of a segment runs over before its
-/// segment starts (`deemph_segments_neon`).
+/// segment starts (`deemph_segments`).
 ///
 /// A filter that starts from a wrong memory comes closer to the right
 /// values by the factor `coef` (0.85) per sample. After about 100 samples
@@ -7119,12 +7364,16 @@ const DEEMPH_SEGMENTS_MIN: usize = 480;
 /// scenarios computed no segment again, 2 computed one, one computed 1 in
 /// 3600 and one 1 in 2100. With 128 samples it was 1 segment in 50 to 230
 /// (6 scenarios), and with 96 samples about 3 in 4.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
 const DEEMPH_WARMUP: usize = 160;
 
-#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))
+))]
 std::thread_local! {
-    /// Segments that `deemph_segments_neon` computed a second time on this
+    /// Segments that `deemph_segments` computed a second time on this
     /// thread. Only tests count them.
     static DEEMPH_RECOMPUTED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
@@ -7387,6 +7636,263 @@ fn deemph_segments_neon<const C: usize, const INTERLEAVED: bool>(
         (start_mem, end_mem)
     };
 
+    deemph_check_segments::<C, INTERLEAVED>(hist, at, out, n, coef, mem, &start_mem, &end_mem)
+}
+
+/// The de-emphasis of one frame in segments, with the vector kernel of this
+/// target: `deemph_segments_neon` or `deemph_segments_sse`. Both give the
+/// bits of `deemph_mono` on each channel. See `deemph_segments_neon` for
+/// the arguments.
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
+#[inline(always)]
+fn deemph_segments<const C: usize, const INTERLEAVED: bool>(
+    hist: [&[f32]; C],
+    at: usize,
+    out: &mut [f32],
+    n: usize,
+    warmup: usize,
+    coef: f32,
+    mem: [f32; C],
+) -> [f32; C] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        deemph_segments_neon::<C, INTERLEAVED>(hist, at, out, n, warmup, coef, mem)
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        deemph_segments_sse::<C, INTERLEAVED>(hist, at, out, n, warmup, coef, mem)
+    }
+}
+
+/// `transpose4` for SSE: lane `j` of the result's vector `k` is lane `k`
+/// of `rows[j]`.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline(always)]
+fn transpose4_sse(rows: [core::arch::x86_64::__m128; 4]) -> [core::arch::x86_64::__m128; 4] {
+    use core::arch::x86_64::*;
+    // `_MM_TRANSPOSE4_PS` of the C headers.
+    // SAFETY: SSE is part of this target (see the `cfg`), and these
+    // instructions only rearrange values held in registers.
+    unsafe {
+        let t0 = _mm_unpacklo_ps(rows[0], rows[1]);
+        let t1 = _mm_unpackhi_ps(rows[0], rows[1]);
+        let t2 = _mm_unpacklo_ps(rows[2], rows[3]);
+        let t3 = _mm_unpackhi_ps(rows[2], rows[3]);
+        [
+            _mm_movelh_ps(t0, t2),
+            _mm_movehl_ps(t2, t0),
+            _mm_movelh_ps(t1, t3),
+            _mm_movehl_ps(t3, t1),
+        ]
+    }
+}
+
+/// `deemph_segments_neon` for x86-64 with SSE: the same segments, run-in,
+/// check and recomputation, with the eight filters in two vectors of four.
+/// Per sample a filter adds the offset, adds the memory and multiplies, in
+/// the order of `deemph_step`, so the result is the same as that of
+/// `deemph_mono` on each channel, bit for bit.
+///
+/// An x86 core runs instructions out of order. Unlike the NEON kernel,
+/// this one therefore does not load the input of the next step by hand
+/// before it filters the current one; that would also need more than the 16
+/// vector registers of x86-64.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+fn deemph_segments_sse<const C: usize, const INTERLEAVED: bool>(
+    hist: [&[f32]; C],
+    at: usize,
+    out: &mut [f32],
+    n: usize,
+    warmup: usize,
+    coef: f32,
+    mem: [f32; C],
+) -> [f32; C] {
+    use core::arch::x86_64::*;
+    /// Filters that run at the same time: two vectors of four.
+    const LANES: usize = 8;
+    assert!(C == 1 || C == 2);
+    let per_ch = LANES / C;
+    let seg = n / per_ch;
+    assert!(n.is_multiple_of(32) && warmup.is_multiple_of(4) && at >= warmup);
+    assert!(out.len() >= C * n);
+    for c in 0..C {
+        assert!(at + n <= hist[c].len());
+    }
+    // An empty frame leaves the memories as they are. The steps below need
+    // segments of at least 4 samples.
+    if n == 0 {
+        return mem;
+    }
+    // The place in `out` of sample `i` of channel `c`. With one channel
+    // the two layouts are the same.
+    let place = |c: usize, i: usize| if INTERLEAVED { i * C + c } else { c * n + i };
+
+    // Filter `s` handles segment `s % per_ch` of channel `s / per_ch`.
+    // `x_ptr[s]` is where its run-in starts.
+    let mut x_ptr = [core::ptr::null::<f32>(); LANES];
+    for c in 0..C {
+        let x_base = hist[c].as_ptr();
+        for q in 0..per_ch {
+            // SAFETY: `at - warmup + q * seg <= at + n <= hist[c].len()`
+            // (checked above), so the pointer stays inside the slice.
+            unsafe {
+                x_ptr[c * per_ch + q] = x_base.add(at - warmup + q * seg);
+            }
+        }
+    }
+    let o = out.as_mut_ptr();
+
+    // SAFETY: SSE and SSE2 are part of this target (see the `cfg`). `n > 0`,
+    // so `seg` is a positive multiple of 4. Filter `s` reads
+    // `x_ptr[s][t..t + 4]` for `t` in steps of 4 below `warmup + seg`. The
+    // last value read is at `at + (q + 1) * seg - 1 < at + n` in `hist[c]`.
+    // At step `t` it writes samples `k..k + 4` of its segment, with
+    // `k = t - warmup` below `seg`: the places `place(c, q * seg + k)` to
+    // `place(c, q * seg + k + 3)`. They are below `C * n <= out.len()`.
+    // With `INTERLEAVED` and two channels the two channels' samples
+    // `k..k + 4` of segment `q` are the eight values from
+    // `2 * (q * seg + k)`. The filters write different places. `hist` and
+    // `out` cannot overlap: one is borrowed shared and the other mutably.
+    // `warmup` and `seg` are multiples of 4.
+    let (start_mem, end_mem) = unsafe {
+        let very_small = _mm_set1_ps(DEEMPH_VERY_SMALL);
+        let coef_v = _mm_set1_ps(coef);
+        let scale = _mm_set1_ps(DEEMPH_SCALE);
+        // Four samples of each of the eight filters at step `t`: per group
+        // `g`, one vector per sample, the four filters `4 * g..4 * g + 4`
+        // in its lanes.
+        let load = |t: usize| {
+            let group = |g: usize| {
+                transpose4_sse([
+                    _mm_loadu_ps(x_ptr[4 * g].add(t)),
+                    _mm_loadu_ps(x_ptr[4 * g + 1].add(t)),
+                    _mm_loadu_ps(x_ptr[4 * g + 2].add(t)),
+                    _mm_loadu_ps(x_ptr[4 * g + 3].add(t)),
+                ])
+            };
+            [group(0), group(1)]
+        };
+
+        // The filters of both groups for four samples. Returns the outputs
+        // scaled to the output range, one vector per sample. The two groups
+        // do not depend on each other, so the processor runs them at the
+        // same time.
+        let filter = |m: &mut [__m128; 2], x: [[__m128; 4]; 2]| {
+            let mut scaled = [[very_small; 4]; 2];
+            for s in 0..4 {
+                let a0 = _mm_add_ps(x[0][s], very_small);
+                let a1 = _mm_add_ps(x[1][s], very_small);
+                let y0 = _mm_add_ps(a0, m[0]);
+                let y1 = _mm_add_ps(a1, m[1]);
+                m[0] = _mm_mul_ps(y0, coef_v);
+                m[1] = _mm_mul_ps(y1, coef_v);
+                scaled[0][s] = _mm_mul_ps(y0, scale);
+                scaled[1][s] = _mm_mul_ps(y1, scale);
+            }
+            scaled
+        };
+
+        // Run-in: memories only, no output. Every filter starts from the
+        // memory of its channel at the start of the frame. With two
+        // channels the second group holds the filters of channel 1.
+        let end = warmup + seg;
+        let mut m = [_mm_set1_ps(mem[0]), _mm_set1_ps(mem[C - 1])];
+        let mut t = 0;
+        while t < warmup {
+            filter(&mut m, load(t));
+            t += 4;
+        }
+
+        // The first segment of each channel continues from the frame
+        // before, with the exact memory.
+        let mut start_mem = [0.0f32; LANES];
+        _mm_storeu_ps(start_mem.as_mut_ptr(), m[0]);
+        _mm_storeu_ps(start_mem.as_mut_ptr().add(4), m[1]);
+        for c in 0..C {
+            start_mem[c * per_ch] = mem[c];
+        }
+        m[0] = _mm_loadu_ps(start_mem.as_ptr());
+        m[1] = _mm_loadu_ps(start_mem.as_ptr().add(4));
+
+        // Store samples `k..k + 4` of every filter, from `scaled` (one
+        // vector per sample).
+        let store = |scaled: [[__m128; 4]; 2], k: usize| {
+            if INTERLEAVED && C == 2 {
+                // Group `c` holds the four segments of channel `c`. The
+                // 64-bit lane `q % 2` of `pairs[q / 2][s]` is (left, right)
+                // of sample `k + s` of segment `q`.
+                let pairs: [[__m128d; 4]; 2] = [
+                    core::array::from_fn(|s| {
+                        _mm_castps_pd(_mm_unpacklo_ps(scaled[0][s], scaled[1][s]))
+                    }),
+                    core::array::from_fn(|s| {
+                        _mm_castps_pd(_mm_unpackhi_ps(scaled[0][s], scaled[1][s]))
+                    }),
+                ];
+                for q in 0..4 {
+                    let h = &pairs[q / 2];
+                    let (lo, hi) = if q % 2 == 0 {
+                        (_mm_unpacklo_pd(h[0], h[1]), _mm_unpacklo_pd(h[2], h[3]))
+                    } else {
+                        (_mm_unpackhi_pd(h[0], h[1]), _mm_unpackhi_pd(h[2], h[3]))
+                    };
+                    let p = o.add(2 * (q * seg + k));
+                    _mm_storeu_ps(p, _mm_castpd_ps(lo));
+                    _mm_storeu_ps(p.add(4), _mm_castpd_ps(hi));
+                }
+            } else {
+                for (g, group) in scaled.into_iter().enumerate() {
+                    // Back to one vector of four samples per filter.
+                    for (j, row) in transpose4_sse(group).into_iter().enumerate() {
+                        let s = 4 * g + j;
+                        _mm_storeu_ps(o.add(place(s / per_ch, (s % per_ch) * seg + k)), row);
+                    }
+                }
+            }
+        };
+
+        // The segments. The loads of the next step do not depend on the
+        // filters, so the processor starts them while the filters of this
+        // step still run; the NEON kernel interleaves them by hand.
+        while t < end {
+            let done = filter(&mut m, load(t));
+            store(done, t - warmup);
+            t += 4;
+        }
+
+        let mut end_mem = [0.0f32; LANES];
+        _mm_storeu_ps(end_mem.as_mut_ptr(), m[0]);
+        _mm_storeu_ps(end_mem.as_mut_ptr().add(4), m[1]);
+        (start_mem, end_mem)
+    };
+
+    deemph_check_segments::<C, INTERLEAVED>(hist, at, out, n, coef, mem, &start_mem, &end_mem)
+}
+
+/// The last step of `deemph_segments_neon` and `deemph_segments_sse`:
+/// checks the segments of each channel in order, and filters again, one
+/// sample at a time, every segment whose run-in did not end on the exact
+/// memory. `start_mem` and `end_mem` hold the memories of the eight
+/// filters at the start and at the end of their segments (filter `s`
+/// handles segment `s % (8 / C)` of channel `s / (8 / C)`). Returns the
+/// memories at the end of the frame.
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn deemph_check_segments<const C: usize, const INTERLEAVED: bool>(
+    hist: [&[f32]; C],
+    at: usize,
+    out: &mut [f32],
+    n: usize,
+    coef: f32,
+    mem: [f32; C],
+    start_mem: &[f32; 8],
+    end_mem: &[f32; 8],
+) -> [f32; C] {
+    let per_ch = 8 / C;
+    let seg = n / per_ch;
+    // The place in `out` of sample `i` of channel `c`.
+    let place = |c: usize, i: usize| if INTERLEAVED { i * C + c } else { c * n + i };
     // Check the segments of each channel in order. `exact` is the memory
     // that the one-sample-at-a-time filter has at the start of segment `q`.
     let mut next_mem = mem;
@@ -7413,7 +7919,7 @@ fn deemph_segments_neon<const C: usize, const INTERLEAVED: bool>(
 }
 
 /// Store every `ds`-th value of `y` in `out`, or add it, as `put` decides.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
 #[inline(always)]
 fn emit_mono(y: &[f32], out: &mut [f32], ds: usize, put: impl Fn(&mut f32, f32)) {
     if ds == 1 {
@@ -7429,7 +7935,7 @@ fn emit_mono(y: &[f32], out: &mut [f32], ds: usize, put: impl Fn(&mut f32, f32))
 
 /// Store every `ds`-th value of `y0` and `y1` at the places `out` yields,
 /// or add it, as `put` decides.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
 #[inline(always)]
 fn emit_stereo<'a>(
     y0: &[f32],
@@ -8521,7 +9027,7 @@ impl CeltDecoder {
         // needs a frame length that is a multiple of 32. The standard mode
         // has one for 10 and 20 ms (480 and 960). A mode with another frame
         // length takes the portable filter below.
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
         if n >= DEEMPH_SEGMENTS_MIN && n.is_multiple_of(32) {
             self.deemphasis_in_segments(pcm, n, api_frame_size, layout);
             return;
@@ -8566,14 +9072,14 @@ impl CeltDecoder {
     }
 
     /// `deemphasis` for frames of 10 and 20 ms, with the filter computed in
-    /// segments (`deemph_segments_neon`). The output is the same.
+    /// segments (`deemph_segments`). The output is the same.
     ///
     /// The filter writes straight into `pcm` when the output rate is 48 kHz
     /// and the frame replaces what `pcm` holds. When the frame is added to
     /// `pcm`, or the output rate is lower, it writes into `w_x`, which is
     /// free once the frame is synthesised, and a second pass puts the
     /// samples in their places.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
     fn deemphasis_in_segments(
         &mut self,
         pcm: &mut [f32],
@@ -8593,10 +9099,10 @@ impl CeltDecoder {
         if self.channels == 1 {
             let m = [self.preemph_mem[0]];
             let m = if ds == 1 && layout != PcmLayout::InterleavedAdd {
-                deemph_segments_neon::<1, false>([hist0], at, pcm, n, warmup, coef, m)
+                deemph_segments::<1, false>([hist0], at, pcm, n, warmup, coef, m)
             } else {
                 let y = &mut self.w_x[..n];
-                let m = deemph_segments_neon::<1, false>([hist0], at, y, n, warmup, coef, m);
+                let m = deemph_segments::<1, false>([hist0], at, y, n, warmup, coef, m);
                 let out = &mut pcm[..api_frame_size];
                 if layout == PcmLayout::InterleavedAdd {
                     emit_mono(y, out, ds, add);
@@ -8610,12 +9116,12 @@ impl CeltDecoder {
             let hist = [hist0, &self.decode_mem[h1..h1 + chan_mem]];
             let m = [self.preemph_mem[0], self.preemph_mem[1]];
             let m = if ds == 1 && layout == PcmLayout::Planar {
-                deemph_segments_neon::<2, false>(hist, at, pcm, n, warmup, coef, m)
+                deemph_segments::<2, false>(hist, at, pcm, n, warmup, coef, m)
             } else if ds == 1 && layout == PcmLayout::Interleaved {
-                deemph_segments_neon::<2, true>(hist, at, pcm, n, warmup, coef, m)
+                deemph_segments::<2, true>(hist, at, pcm, n, warmup, coef, m)
             } else {
                 let y = &mut self.w_x[..2 * n];
-                let m = deemph_segments_neon::<2, false>(hist, at, y, n, warmup, coef, m);
+                let m = deemph_segments::<2, false>(hist, at, y, n, warmup, coef, m);
                 let (y0, y1) = y.split_at(n);
                 let out = &mut pcm[..2 * api_frame_size];
                 match layout {

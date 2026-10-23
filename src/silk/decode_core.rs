@@ -309,6 +309,12 @@ fn rewhiten<const ORDER: usize>(
 ) {
     #[cfg(target_arch = "aarch64")]
     rewhiten_neon::<ORDER>(out, input, a_q12, inv_gain_q31);
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_sse41() {
+        // SAFETY: the processor has SSE4.1.
+        unsafe { x86::rewhiten_sse41::<ORDER>(out, input, a_q12, inv_gain_q31) };
+        return;
+    }
     #[cfg(not(target_arch = "aarch64"))]
     rewhiten_scalar::<ORDER>(out, input, a_q12, inv_gain_q31);
 }
@@ -413,6 +419,9 @@ unsafe fn ltp_synthesis(
     // The lag is at least 2 ms, which is 16 samples or more.
     debug_assert!(lag > LTP_ORDER / 2);
     let block = lag.saturating_sub(LTP_ORDER / 2).max(1);
+    // One check for the whole subframe.
+    #[cfg(target_arch = "x86_64")]
+    let sse41 = crate::compat::x86_has_sse41();
 
     let mut done = 0;
     while done < n {
@@ -429,7 +438,14 @@ unsafe fn ltp_synthesis(
 
         #[cfg(target_arch = "aarch64")]
         ltp_block_neon(taps, b_q14, exc, res, new_state);
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        if sse41 {
+            // SAFETY: the processor has SSE4.1.
+            unsafe { x86::ltp_block_sse41(taps, b_q14, exc, res, new_state) };
+        } else {
+            ltp_block_scalar(taps, b_q14, exc, res, new_state);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         ltp_block_scalar(taps, b_q14, exc, res, new_state);
 
         done += len;
@@ -552,6 +568,12 @@ fn lpc_synthesis<const ORDER: usize>(
 ) {
     #[cfg(target_arch = "aarch64")]
     lpc_synthesis_neon::<ORDER>(s_lpc_q14, res_q14, a_q12, bias);
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_sse41() {
+        // SAFETY: the processor has SSE4.1.
+        unsafe { x86::lpc_synthesis_sse41::<ORDER>(s_lpc_q14, res_q14, a_q12, bias) };
+        return;
+    }
     #[cfg(not(target_arch = "aarch64"))]
     lpc_synthesis_scalar::<ORDER>(s_lpc_q14, res_q14, a_q12, bias);
 }
@@ -720,6 +742,315 @@ fn lpc_synthesis_neon<const ORDER: usize>(
     }
 }
 
+/// The x86-64 kernels of the decoder synthesis, for processors with
+/// SSE4.1. Each computes what the NEON kernel of the same name computes,
+/// with the same integer arithmetic, so the results are the bits of the
+/// portable code.
+///
+/// `silk_smulwb(x, c)`, `(x * c) >> 16` for a 16-bit `c`, is the upper half
+/// of the 64-bit product of `x` and `c << 16`. `_mm_mul_epi32` gives that
+/// product for lanes 0 and 2, so the results land in lanes 1 and 3.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    /// The sums of `silk_smulwb(x, c)` over several pairs, as two vectors:
+    /// `even` collects the products of lanes 0 and 2 of each `x`, `odd`
+    /// those of lanes 1 and 3. The results are in lanes 1 and 3 of both;
+    /// the 32-bit additions of the other lanes are not used.
+    #[derive(Clone, Copy)]
+    struct Sums {
+        even: __m128i,
+        odd: __m128i,
+    }
+
+    /// Lanes 1 and 3 of `x` in lanes 0 and 2, where `_mm_mul_epi32` reads
+    /// them (and also in lanes 1 and 3).
+    ///
+    /// A shuffle, not `_mm_srli_epi64::<32>`: after the shift LLVM sees a
+    /// 64-bit arithmetic shift in the operands of the multiplication and
+    /// emits an emulated 64-bit multiplication, three `pmuludq` with
+    /// shifts, instead of one `pmuldq`.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn odd_lanes(x: __m128i) -> __m128i {
+        _mm_shuffle_epi32::<0b11_11_01_01>(x)
+    }
+
+    impl Sums {
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        fn new() -> Self {
+            Sums { even: _mm_setzero_si128(), odd: _mm_setzero_si128() }
+        }
+
+        /// Adds `silk_smulwb(x[l], c[l])` for each lane `l`, with
+        /// `c[l] << 16` in lanes 0 and 2 of `f_even` for lanes 0 and 2, and
+        /// in lanes 0 and 2 of `f_odd` for lanes 1 and 3 (`odd_lanes`).
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        fn add(&mut self, x: __m128i, f_even: __m128i, f_odd: __m128i) {
+            self.even = _mm_add_epi32(self.even, _mm_mul_epi32(x, f_even));
+            self.odd = _mm_add_epi32(self.odd, _mm_mul_epi32(odd_lanes(x), f_odd));
+        }
+
+        /// The four sums, one per lane.
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        fn lanes(self) -> __m128i {
+            _mm_blend_epi16::<0b1100_1100>(_mm_srli_epi64::<32>(self.even), self.odd)
+        }
+
+        /// The sum of all four lanes.
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        fn total(self) -> i32 {
+            let both = _mm_add_epi32(self.even, self.odd);
+            _mm_extract_epi32::<1>(_mm_add_epi32(both, _mm_unpackhi_epi64(both, both)))
+        }
+    }
+
+    /// `rewhiten_scalar` with four outputs per step, as `rewhiten_neon`.
+    ///
+    /// The prediction of one output is a sum of `ORDER` products of 16-bit
+    /// samples and coefficients: two `_mm_madd_epi16` of 8 products each,
+    /// the second one at sample `ORDER - 8` with the taps that the first
+    /// one covered set to zero. The products and their sums wrap at 32 bits
+    /// as in the scalar code, so their order does not matter.
+    ///
+    /// # Safety
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn rewhiten_sse41<const ORDER: usize>(
+        out: &mut [MaybeUninit<i32>],
+        input: &[i16],
+        a_q12: &[i16; MAX_LPC_ORDER],
+        inv_gain_q31: i32,
+    ) {
+        const { assert!(ORDER >= 8 && ORDER <= MAX_LPC_ORDER) };
+        let n = out.len();
+        assert!(input.len() == n + ORDER);
+        let n4 = n & !3;
+
+        // Coefficients in the order of the input samples: oldest first.
+        let mut a_rev = [0i16; 16];
+        for j in 0..ORDER {
+            a_rev[j] = a_q12[ORDER - 1 - j];
+        }
+        let mut second = [0i16; 8];
+        for k in 8 - (ORDER - 8)..8 {
+            second[k] = a_rev[ORDER - 8 + k];
+        }
+
+        // SAFETY: the processor has SSE4.1 (the caller's contract). A step
+        // at `m` has `m + 4 <= n`. For output `m + l` it reads
+        // `input[m + l..m + l + 8]`, `input[m + l + ORDER - 8..m + l +
+        // ORDER]` and `input[m + l + ORDER]`; the last index is
+        // `m + 3 + ORDER < n + ORDER`, the length of `input` (checked
+        // above). It writes `out[m..m + 4]`. The coefficient arrays hold 16
+        // and 8 values.
+        unsafe {
+            let taps0 = _mm_loadu_si128(a_rev.as_ptr().cast());
+            let taps1 = _mm_loadu_si128(second.as_ptr().cast());
+            let gain = _mm_set1_epi32(inv_gain_q31);
+            let one = _mm_set1_epi32(1);
+            let mut m = 0;
+            while m < n4 {
+                let x = input.as_ptr().add(m);
+                // The prediction of output `m + l`, in four lanes.
+                let pred = |l: usize| {
+                    let first = _mm_madd_epi16(_mm_loadu_si128(x.add(l).cast()), taps0);
+                    let second = _mm_madd_epi16(_mm_loadu_si128(x.add(l + ORDER - 8).cast()), taps1);
+                    _mm_add_epi32(first, second)
+                };
+                let (p0, p1, p2, p3) = (pred(0), pred(1), pred(2), pred(3));
+                let t01 = _mm_add_epi32(_mm_unpacklo_epi32(p0, p1), _mm_unpackhi_epi32(p0, p1));
+                let t23 = _mm_add_epi32(_mm_unpacklo_epi32(p2, p3), _mm_unpackhi_epi32(p2, p3));
+                let pred_q12 = _mm_add_epi32(_mm_unpacklo_epi64(t01, t23), _mm_unpackhi_epi64(t01, t23));
+
+                let newest = _mm_cvtepi16_epi32(_mm_loadl_epi64(x.add(ORDER).cast()));
+                let res_q12 = _mm_sub_epi32(_mm_slli_epi32::<12>(newest), pred_q12);
+                // Round to Q0, ((x >> 11) + 1) >> 1 as silk_rshift_round,
+                // and saturate to 16 bits.
+                let rounded = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_srai_epi32::<11>(res_q12), one));
+                let res = _mm_packs_epi32(rounded, rounded);
+                // silk_smulwb(gain, res) per lane: the factor `res << 16` is
+                // `res` in the upper half of each 32-bit lane.
+                let factor = _mm_unpacklo_epi16(_mm_setzero_si128(), res);
+                let mut sums = Sums::new();
+                sums.add(gain, factor, odd_lanes(factor));
+                _mm_storeu_si128(out.as_mut_ptr().add(m).cast(), sums.lanes());
+                m += 4;
+            }
+        }
+        rewhiten_scalar::<ORDER>(&mut out[n4..], &input[n4..], a_q12, inv_gain_q31);
+    }
+
+    /// `ltp_block_scalar` with four samples per step, as `ltp_block_neon`.
+    ///
+    /// # Safety
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn ltp_block_sse41(
+        taps: &[i32],
+        b_q14: &[i16; LTP_ORDER],
+        exc_q14: &[i32],
+        res_q14: &mut [i32],
+        new_state: &mut [MaybeUninit<i32>],
+    ) {
+        let n = exc_q14.len();
+        assert!(taps.len() == n + LTP_ORDER - 1 && res_q14.len() == n && new_state.len() == n);
+        let n4 = n & !3;
+
+        // SAFETY: the processor has SSE4.1 (the caller's contract). A step
+        // at `i` has `i + 4 <= n`. It reads `taps[i + k..i + k + 4]` for
+        // `k <= 4`; the last index is `i + 7 < n + 4`, the length of `taps`
+        // (checked above). It reads `exc_q14[i..i + 4]` and writes
+        // `res_q14[i..i + 4]` and `new_state[i..i + 4]`, which all have `n`
+        // elements.
+        unsafe {
+            // `b_q14[k] << 16` in every lane: the factor of the sample
+            // `4 - k` places into the five.
+            let f = |k: usize| _mm_set1_epi32((b_q14[k] as i32) << 16);
+            let f = [f(0), f(1), f(2), f(3), f(4)];
+            // The 2 avoids a bias: silk_smlawb always rounds down.
+            let bias = _mm_set1_epi32(2);
+            let mut i = 0;
+            while i < n4 {
+                let x = taps.as_ptr().add(i);
+                let mut sums = Sums::new();
+                for (k, &f) in f.iter().enumerate() {
+                    sums.add(_mm_loadu_si128(x.add(LTP_ORDER - 1 - k).cast()), f, f);
+                }
+                let pred_q13 = _mm_add_epi32(bias, sums.lanes());
+
+                let exc = _mm_loadu_si128(exc_q14.as_ptr().add(i).cast());
+                let res = _mm_add_epi32(exc, _mm_slli_epi32::<1>(pred_q13));
+                _mm_storeu_si128(res_q14.as_mut_ptr().add(i).cast(), res);
+                _mm_storeu_si128(new_state.as_mut_ptr().add(i).cast(), _mm_slli_epi32::<1>(res));
+                i += 4;
+            }
+        }
+        ltp_block_scalar(
+            &taps[n4..],
+            b_q14,
+            &exc_q14[n4..],
+            &mut res_q14[n4..],
+            &mut new_state[n4..],
+        );
+    }
+
+    /// `lpc_synthesis` for x86-64 with SSE4.1, in the way of
+    /// `lpc_synthesis_neon`: the whole filter state in registers.
+    ///
+    /// The four newest samples are in general registers, as 64-bit
+    /// integers. The older ones are in vector registers that take in one
+    /// sample per step; their products are vector multiplications that do
+    /// not wait for the newest sample. The path from one output sample to
+    /// the next is one multiplication, one shift and one addition.
+    ///
+    /// In 64 bits neither the sum nor the shift can overflow, so the test
+    /// for saturation is a test whether the results fit: the prediction in
+    /// 28 bits, the sample in 32 bits. Where they do not, the sample is
+    /// computed the slow way from the prediction wrapped to 32 bits, as the
+    /// scalar code does; that gives the scalar code's result also when it
+    /// would not have saturated.
+    ///
+    /// # Safety
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn lpc_synthesis_sse41<const ORDER: usize>(
+        s_lpc_q14: &mut [i32],
+        res_q14: &[i32],
+        a_q12: &[i16; MAX_LPC_ORDER],
+        bias: i32,
+    ) {
+        // The first vector register (taps 13 to 16) is used only for the
+        // full order. Below it, the order must leave those taps out.
+        const { assert!(ORDER > 4 && (ORDER <= MAX_LPC_ORDER - 4 || ORDER == MAX_LPC_ORDER)) };
+        let n = res_q14.len();
+        assert!(s_lpc_q14.len() == MAX_LPC_ORDER + n);
+        let (state, out) = s_lpc_q14.split_at_mut(MAX_LPC_ORDER);
+        let state: &[i32; MAX_LPC_ORDER] = (&*state).try_into().unwrap();
+
+        // Number of the newest samples that are kept in general registers.
+        const NEWEST: usize = 4;
+        // Number of samples in the vector registers: 5 to 16 steps back.
+        const IN_VECTORS: usize = MAX_LPC_ORDER - NEWEST;
+
+        let c_newest: [i64; NEWEST] = core::array::from_fn(|k| a_q12[k] as i64);
+        // Lane `k` of the vector registers holds the sample `16 - k` steps
+        // back, and lane `k` of `c_vec` its coefficient. Order 10 has no
+        // taps 11 to 16; their coefficients stay zero, and the first vector
+        // is not used at all.
+        let mut c_vec = [0i32; IN_VECTORS];
+        for k in MAX_LPC_ORDER - ORDER..IN_VECTORS {
+            c_vec[k] = (a_q12[MAX_LPC_ORDER - 1 - k] as i32) << 16;
+        }
+        // SAFETY: each load reads 4 elements; `c_vec` has 12 and `state`
+        // has 16. The processor has SSE4.1 (the caller's contract).
+        let (f, mut h0, mut h1, mut h2) = unsafe {
+            let c0 = _mm_loadu_si128(c_vec.as_ptr().cast());
+            let c1 = _mm_loadu_si128(c_vec.as_ptr().add(4).cast());
+            let c2 = _mm_loadu_si128(c_vec.as_ptr().add(8).cast());
+            (
+                [(c0, odd_lanes(c0)), (c1, odd_lanes(c1)), (c2, odd_lanes(c2))],
+                _mm_loadu_si128(state.as_ptr().cast()),
+                _mm_loadu_si128(state.as_ptr().add(4).cast()),
+                _mm_loadu_si128(state.as_ptr().add(8).cast()),
+            )
+        };
+
+        // q[k] is the sample k + 1 steps back.
+        let mut q: [i64; NEWEST] = core::array::from_fn(|k| state[MAX_LPC_ORDER - 1 - k] as i64);
+        // `bias` and all products but the one with the newest sample, for
+        // the first output sample.
+        let mut partial = bias;
+        for k in 1..ORDER {
+            partial = silk_smlawb(partial, state[MAX_LPC_ORDER - 1 - k], a_q12[k] as i32);
+        }
+        // The output sample without the product with the newest sample.
+        let mut base = match res_q14.first() {
+            Some(&res) => res as i64 + ((partial as i64) << 4),
+            None => 0,
+        };
+
+        for i in 0..n {
+            let tap1 = (q[0] * c_newest[0]) >> 16;
+            let mut sample = base + (tap1 << 4);
+            let pred_q10 = partial as i64 + tap1;
+            if ((pred_q10 + (1 << 27)) as u64) >> 28 != 0 || sample != sample as i32 as i64 {
+                sample = lpc_synthesis_saturated(res_q14[i], pred_q10 as i32) as i64;
+            }
+
+            // Prepare the next step. Nothing here depends on `sample`.
+            // The oldest sample leaves, `q[NEWEST - 1]` enters.
+            if ORDER == MAX_LPC_ORDER {
+                h0 = _mm_alignr_epi8::<4>(h1, h0);
+            }
+            h1 = _mm_alignr_epi8::<4>(h2, h1);
+            h2 = _mm_alignr_epi8::<4>(_mm_cvtsi32_si128(q[NEWEST - 1] as i32), h2);
+            let mut sums = Sums::new();
+            if ORDER == MAX_LPC_ORDER {
+                sums.add(h0, f[0].0, f[0].1);
+            }
+            sums.add(h1, f[1].0, f[1].1);
+            sums.add(h2, f[2].0, f[2].1);
+            let mut sum = bias as i64 + sums.total() as i64;
+            for k in 1..NEWEST {
+                sum += (q[k - 1] * c_newest[k]) >> 16;
+            }
+            partial = sum as i32;
+            let res_next = if i + 1 < n { res_q14[i + 1] } else { 0 };
+            base = res_next as i64 + ((partial as i64) << 4);
+
+            q = [sample, q[0], q[1], q[2]];
+            out[i] = sample as i32;
+        }
+    }
+}
+
 /// The saturating form of the last step of `lpc_synthesis`. It is kept out
 /// of line so that the compiler leaves the test in front of it as a branch.
 #[cold]
@@ -885,6 +1216,13 @@ mod tests {
                     rewhiten_neon::<ORDER>(uninit(&mut neon), &input, &a_q12, inv_gain_q31);
                     assert_eq!(neon, expect, "NEON: order={ORDER} n={n} trial={trial}");
                 }
+                #[cfg(target_arch = "x86_64")]
+                if crate::compat::x86_has_sse41() {
+                    let mut sse = vec![0x5555_5555i32; n];
+                    // SAFETY: the processor has SSE4.1.
+                    unsafe { x86::rewhiten_sse41::<ORDER>(uninit(&mut sse), &input, &a_q12, inv_gain_q31) };
+                    assert_eq!(sse, expect, "SSE4.1: order={ORDER} n={n} trial={trial}");
+                }
                 let mut dispatched = vec![0x5555_5555i32; n];
                 rewhiten::<ORDER>(uninit(&mut dispatched), &input, &a_q12, inv_gain_q31);
                 assert_eq!(dispatched, expect, "dispatch: order={ORDER} n={n} trial={trial}");
@@ -958,6 +1296,14 @@ mod tests {
                     let mut new_state = vec![0x5555_5555i32; n];
                     ltp_block_neon(&taps, &b_q14, &exc, &mut res, uninit(&mut new_state));
                     assert_eq!((&res, &new_state), (&expect_res, &expect_state), "NEON: n={n} trial={trial}");
+                }
+                #[cfg(target_arch = "x86_64")]
+                if crate::compat::x86_has_sse41() {
+                    let mut res = vec![0x5555_5555i32; n];
+                    let mut new_state = vec![0x5555_5555i32; n];
+                    // SAFETY: the processor has SSE4.1.
+                    unsafe { x86::ltp_block_sse41(&taps, &b_q14, &exc, &mut res, uninit(&mut new_state)) };
+                    assert_eq!((&res, &new_state), (&expect_res, &expect_state), "SSE4.1: n={n} trial={trial}");
                 }
             }
         }
@@ -1068,6 +1414,13 @@ mod tests {
                     let mut neon = state.clone();
                     lpc_synthesis_neon::<ORDER>(&mut neon, &res, &a_q12, bias);
                     assert_eq!(neon, expect, "NEON: order={ORDER} n={n} trial={trial}");
+                }
+                #[cfg(target_arch = "x86_64")]
+                if crate::compat::x86_has_sse41() {
+                    let mut sse = state.clone();
+                    // SAFETY: the processor has SSE4.1.
+                    unsafe { x86::lpc_synthesis_sse41::<ORDER>(&mut sse, &res, &a_q12, bias) };
+                    assert_eq!(sse, expect, "SSE4.1: order={ORDER} n={n} trial={trial}");
                 }
                 let mut dispatched = state.clone();
                 lpc_synthesis::<ORDER>(&mut dispatched, &res, &a_q12, bias);

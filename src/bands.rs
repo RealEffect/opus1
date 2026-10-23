@@ -807,7 +807,7 @@ fn band_should_split(m: &CeltMode, band: usize, lm: i32, n: usize, b: i32) -> bo
 ///
 /// One step waits for the step before it. With these constants eight
 /// values are computed from the same seed at once.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))), allow(dead_code))]
 const LCG_AHEAD: [(u32, u32); 8] = {
     let mut table = [(0u32, 0u32); 8];
     let (mut mul, mut add) = (1u32, 0u32);
@@ -823,7 +823,7 @@ const LCG_AHEAD: [(u32, u32); 8] = {
 };
 
 /// Portable form of `fold_with_noise`; `x` and `lb` have the same length.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")), allow(dead_code))]
 #[inline(always)]
 fn fold_with_noise_scalar(x: &mut [f32], lb: &[f32], mut seed: u32) -> u32 {
     debug_assert_eq!(x.len(), lb.len());
@@ -839,7 +839,7 @@ fn fold_with_noise_scalar(x: &mut [f32], lb: &[f32], mut seed: u32) -> u32 {
 }
 
 /// Portable form of `fill_with_noise`.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")), allow(dead_code))]
 #[inline(always)]
 fn fill_with_noise_scalar(x: &mut [f32], mut seed: u32) -> u32 {
     for xv in x.iter_mut() {
@@ -950,6 +950,102 @@ fn fill_with_noise_neon(x: &mut [f32], seed: u32) -> u32 {
     fill_with_noise_scalar(x_tail, seed)
 }
 
+/// The seeds of the next eight values after `seed`, as two vectors, for
+/// SSE2. `_mm_mul_epu32` multiplies lanes 0 and 2 into 64-bit products;
+/// the lower halves of those, for the even and the odd steps, are the
+/// wrapping products of the scalar code.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline(always)]
+fn lcg_next8_sse2(seed: u32) -> (core::arch::x86_64::__m128i, core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    const fn lanes(first: usize, field: usize) -> [i32; 4] {
+        let mut v = [0i32; 4];
+        let mut k = 0;
+        while k < 4 {
+            let (mul, add) = LCG_AHEAD[first + k];
+            v[k] = if field == 0 { mul as i32 } else { add as i32 };
+            k += 1;
+        }
+        v
+    }
+    /// `seed * mul[k] + add[k]` for the four lanes `k`, wrapping.
+    #[inline(always)]
+    fn four(s: __m128i, mul: [i32; 4], add: [i32; 4]) -> __m128i {
+        // SAFETY: SSE2 is part of this target (see the `cfg` of the outer
+        // function); these instructions only compute in registers.
+        unsafe {
+            // Steps 0 and 2 in the 64-bit lanes of `even`, 1 and 3 in `odd`.
+            let even = _mm_mul_epu32(s, _mm_setr_epi32(mul[0], 0, mul[2], 0));
+            let odd = _mm_mul_epu32(s, _mm_setr_epi32(mul[1], 0, mul[3], 0));
+            let low = _mm_unpacklo_epi32(
+                _mm_shuffle_epi32::<0b11_11_10_00>(even),
+                _mm_shuffle_epi32::<0b11_11_10_00>(odd),
+            );
+            _mm_add_epi32(low, _mm_setr_epi32(add[0], add[1], add[2], add[3]))
+        }
+    }
+    // SAFETY: SSE2 is part of this target (see the `cfg`).
+    let s = unsafe { _mm_set1_epi32(seed as i32) };
+    (four(s, lanes(0, 0), lanes(0, 1)), four(s, lanes(4, 0), lanes(4, 1)))
+}
+
+/// SSE2 form of `fold_with_noise`: eight values per pass, with the seed
+/// eight steps ahead computed in a general register. `lb` must be at least
+/// as long as `x`.
+///
+/// The noise is -1/256 with its sign bit flipped where bit 15 of the seed
+/// is set: bit 15 shifted to bit 31 and added with an exclusive or. The
+/// sum is the scalar code's.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline(always)]
+fn fold_with_noise_sse2(x: &mut [f32], lb: &[f32], mut seed: u32) -> u32 {
+    use core::arch::x86_64::*;
+
+    let lb = &lb[..x.len()];
+    let (x8, x_tail) = x.as_chunks_mut::<8>();
+    let (lb8, lb_tail) = lb.as_chunks::<8>();
+    let (mul8, add8) = LCG_AHEAD[7];
+    // SAFETY: SSE2 is part of this target (see the `cfg`). Each load and
+    // store covers one half of a `[f32; 8]`.
+    unsafe {
+        let minus = _mm_set1_epi32((-1.0f32 / 256.0).to_bits() as i32);
+        let bit = _mm_set1_epi32(0x8000);
+        let noise = |s: __m128i| _mm_castsi128_ps(_mm_xor_si128(minus, _mm_slli_epi32::<16>(_mm_and_si128(s, bit))));
+        for (xo, l) in x8.iter_mut().zip(lb8) {
+            let (s_lo, s_hi) = lcg_next8_sse2(seed);
+            seed = seed.wrapping_mul(mul8).wrapping_add(add8);
+            _mm_storeu_ps(xo.as_mut_ptr(), _mm_add_ps(_mm_loadu_ps(l.as_ptr()), noise(s_lo)));
+            _mm_storeu_ps(xo.as_mut_ptr().add(4), _mm_add_ps(_mm_loadu_ps(l.as_ptr().add(4)), noise(s_hi)));
+        }
+    }
+    fold_with_noise_scalar(x_tail, lb_tail, seed)
+}
+
+/// SSE2 form of `fill_with_noise`: eight values per pass. The top 12 bits
+/// as a signed number, converted to `f32` (exact) and multiplied by 2^-14,
+/// which is exact as the division by 16384 of the scalar code.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline(always)]
+fn fill_with_noise_sse2(x: &mut [f32], mut seed: u32) -> u32 {
+    use core::arch::x86_64::*;
+
+    let (x8, x_tail) = x.as_chunks_mut::<8>();
+    let (mul8, add8) = LCG_AHEAD[7];
+    // SAFETY: SSE2 is part of this target (see the `cfg`). Each store
+    // covers one half of a `[f32; 8]`.
+    unsafe {
+        let scale = _mm_set1_ps(1.0 / 16384.0);
+        let value = |s: __m128i| _mm_mul_ps(_mm_cvtepi32_ps(_mm_srai_epi32::<20>(s)), scale);
+        for xo in x8.iter_mut() {
+            let (s_lo, s_hi) = lcg_next8_sse2(seed);
+            seed = seed.wrapping_mul(mul8).wrapping_add(add8);
+            _mm_storeu_ps(xo.as_mut_ptr(), value(s_lo));
+            _mm_storeu_ps(xo.as_mut_ptr().add(4), value(s_hi));
+        }
+    }
+    fill_with_noise_scalar(x_tail, seed)
+}
+
 /// Fills a band that got no pulses with the folded band `lb` plus noise:
 /// `x[j] = lb[j] + 1/256` or `lb[j] - 1/256`, by bit 15 of one step of the
 /// noise generator per value (libopus: quant_partition, the `lowband`
@@ -961,7 +1057,11 @@ fn fold_with_noise(x: &mut [f32], lb: &[f32], seed: u32) -> u32 {
     {
         fold_with_noise_neon(x, lb, seed)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        fold_with_noise_sse2(x, lb, seed)
+    }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     {
         fold_with_noise_scalar(x, lb, seed)
     }
@@ -977,7 +1077,11 @@ fn fill_with_noise(x: &mut [f32], seed: u32) -> u32 {
     {
         fill_with_noise_neon(x, seed)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        fill_with_noise_sse2(x, seed)
+    }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     {
         fill_with_noise_scalar(x, seed)
     }
@@ -3226,12 +3330,13 @@ mod tests {
         }
     }
 
-    /// Scalar model of `celt_inner_prod`. On aarch64: four lanes over the
-    /// complete groups of four, lanes added as (0 + 2) + (1 + 3), then the
-    /// rest one value at a time. Elsewhere one value at a time from 0.
+    /// Scalar model of `celt_inner_prod`. On aarch64 and x86-64: four lanes
+    /// over the complete groups of four, lanes added as (0 + 2) + (1 + 3),
+    /// then the rest one value at a time. Elsewhere one value at a time
+    /// from 0.
     fn inner_prod_model(x: &[f32], y: &[f32]) -> f32 {
         let n = x.len();
-        if !cfg!(target_arch = "aarch64") {
+        if !cfg!(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))) {
             return (0..n).fold(0.0, |acc, i| mac_model(acc, x[i], y[i]));
         }
         let mut lanes = [0.0f32; 4];
@@ -3332,7 +3437,9 @@ mod tests {
                         let lo = c * n + ((mode.e_bands[i] as usize) << lm);
                         let hi = c * n + ((mode.e_bands[i + 1] as usize) << lm);
                         let band = &x[lo..hi];
-                        if cfg!(target_arch = "x86_64") && band.len() >= 8 {
+                        // The AVX2 and FMA kernel of x86-64 sums in another
+                        // order; without it, `celt_inner_prod` runs.
+                        if band.len() >= 8 && crate::compat::x86_has_avx2_fma() {
                             continue;
                         }
                         let want = (1e-27f32 + inner_prod_model(band, band)).sqrt();
@@ -3363,7 +3470,8 @@ mod tests {
                     }
                     let mut got = input.clone();
                     renormalise_vector(&mut got, n, gain);
-                    if cfg!(target_arch = "x86_64") && n >= 16 {
+                    // As above: only the AVX2 and FMA kernel sums otherwise.
+                    if n >= 16 && crate::compat::x86_has_avx2_fma() {
                         continue;
                     }
                     assert_same_bits(&got, &want, &what);
@@ -3543,6 +3651,15 @@ mod tests {
                     assert_eq!(fold_with_noise_neon(&mut got, &lb_long, seed), s, "neon seed, {what}");
                     assert_same_bits(&got, &want, &format!("fold neon, {what}"));
                 }
+                #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                {
+                    // A longer `lb`: only the first `n` values count.
+                    let mut lb_long = lb.clone();
+                    lb_long.extend([9.0, 9.0, 9.0]);
+                    let mut got = vec![7.0f32; n];
+                    assert_eq!(fold_with_noise_sse2(&mut got, &lb_long, seed), s, "sse2 seed, {what}");
+                    assert_same_bits(&got, &want, &format!("fold sse2, {what}"));
+                }
 
                 // Noise alone.
                 let mut want = vec![0.0f32; n];
@@ -3557,6 +3674,12 @@ mod tests {
                 let mut got = vec![7.0f32; n];
                 assert_eq!(fill_with_noise(&mut got, seed), s, "seed, {what}");
                 assert_same_bits(&got, &want, &format!("fill, {what}"));
+                #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                {
+                    let mut got = vec![7.0f32; n];
+                    assert_eq!(fill_with_noise_sse2(&mut got, seed), s, "sse2 seed, {what}");
+                    assert_same_bits(&got, &want, &format!("fill sse2, {what}"));
+                }
             }
         }
     }

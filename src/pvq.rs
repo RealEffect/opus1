@@ -2217,16 +2217,21 @@ fn exp_rotation1(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
             unsafe {
                 exp_rotation1_neon(x, len, stride, c, s);
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+            exp_rotation1_sse(x, len, stride, c, s);
+            #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
             exp_rotation1_scalar(x, len, stride, c, s);
         }
     }
 }
 
 /// The plain form of the rotation pass. It is the reference for the other
-/// two forms, and it runs for strides of 4 and more on targets other than
-/// aarch64. Like the C code it does nothing when `len <= stride`.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// forms, and it runs for strides of 4 and more on targets without a vector
+/// form. Like the C code it does nothing when `len <= stride`.
+#[cfg_attr(
+    any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")),
+    allow(dead_code)
+)]
 #[inline]
 fn exp_rotation1_scalar(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
     let x = &mut x[..len];
@@ -2378,6 +2383,72 @@ fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) 
             let vy1 = vfmaq_f32(vmulq_f32(vms, vx2), vc, vx1);
             vst1q_f32(p.add(j + stride), vy2);
             vst1q_f32(p.add(j), vy1);
+        }
+    }
+    for j in (0..j).rev() {
+        (x[j], x[j + stride]) = rotate_pair(x[j], x[j + stride], c, s);
+    }
+}
+
+/// The rotation pass for a stride of 4 or more on x86-64, four elements at
+/// a time, as `exp_rotation1_neon`. Each lane computes what `rotate_pair`
+/// computes. x86-64 rounds the products with `c` before the additions (see
+/// `mac`), and so does this function, so the result is the same as that of
+/// `exp_rotation1_scalar`, bit for bit.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline]
+fn exp_rotation1_sse(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
+    use core::arch::x86_64::*;
+
+    debug_assert!(stride >= 4);
+    let x = &mut x[..len];
+    if len <= stride {
+        return;
+    }
+    let p = x.as_mut_ptr();
+    // SAFETY: SSE is part of this target (see the `cfg`); these only set
+    // registers.
+    let (vc, vs, vms) = unsafe { (_mm_set1_ps(c), _mm_set1_ps(s), _mm_set1_ps(-s)) };
+
+    // Forward sweep.
+    let steps = len - stride;
+    let mut i = 0;
+    while i + 4 <= steps {
+        // SAFETY: `i + 4 <= steps = len - stride`, so both `p[i..i + 4]` and
+        // `p[i + stride..i + stride + 4]` are inside `x[..len]`. SSE is part
+        // of this target.
+        unsafe {
+            let vx1 = _mm_loadu_ps(p.add(i));
+            let vx2 = _mm_loadu_ps(p.add(i + stride));
+            // x[i] = (ms*x2) + c*x1 and x[i + stride] = (s*x1) + c*x2.
+            let vy1 = _mm_add_ps(_mm_mul_ps(vms, vx2), _mm_mul_ps(vc, vx1));
+            let vy2 = _mm_add_ps(_mm_mul_ps(vs, vx1), _mm_mul_ps(vc, vx2));
+            _mm_storeu_ps(p.add(i), vy1);
+            _mm_storeu_ps(p.add(i + stride), vy2);
+        }
+        i += 4;
+    }
+    for j in i..steps {
+        (x[j], x[j + stride]) = rotate_pair(x[j], x[j + stride], c, s);
+    }
+
+    // Backward sweep, groups of four from the top down.
+    if len < 2 * stride {
+        return;
+    }
+    let mut j = len - 2 * stride;
+    while j >= 4 {
+        j -= 4;
+        // SAFETY: `j + 4 <= len - 2 * stride`, so both `p[j..j + 4]` and
+        // `p[j + stride..j + stride + 4]` are inside `x[..len]`. SSE is part
+        // of this target.
+        unsafe {
+            let vx1 = _mm_loadu_ps(p.add(j));
+            let vx2 = _mm_loadu_ps(p.add(j + stride));
+            let vy2 = _mm_add_ps(_mm_mul_ps(vs, vx1), _mm_mul_ps(vc, vx2));
+            let vy1 = _mm_add_ps(_mm_mul_ps(vms, vx2), _mm_mul_ps(vc, vx1));
+            _mm_storeu_ps(p.add(j + stride), vy2);
+            _mm_storeu_ps(p.add(j), vy1);
         }
     }
     for j in (0..j).rev() {
@@ -2629,8 +2700,11 @@ fn exp_rotation_with(x: &mut [f32], length: usize, dir: i32, stride: usize, c: f
 }
 
 /// Portable form of `extract_collapse_mask` for `b >= 2`. It is the
-/// reference for the NEON form in the tests.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// reference for the vector forms in the tests.
+#[cfg_attr(
+    any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")),
+    allow(dead_code)
+)]
 #[inline(always)]
 fn extract_collapse_mask_scalar(iy: &[i32], n: usize, b: usize) -> u32 {
     let n0 = n / b;
@@ -2685,6 +2759,46 @@ fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
     collapse_mask
 }
 
+/// SSE2 form of `extract_collapse_mask` for `b >= 2`, as the NEON form:
+/// four values per test, and a block is left at its first pulse.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline(always)]
+fn extract_collapse_mask_sse2(iy: &[i32], n: usize, b: usize) -> u32 {
+    use core::arch::x86_64::*;
+
+    let n0 = n / b;
+    let mut collapse_mask = 0u32;
+
+    for i in 0..b {
+        let base = i * n0;
+        let slice = &iy[base..base + n0];
+
+        let mut any_nonzero = false;
+        let (quads, tail) = slice.as_chunks::<4>();
+        for q in quads {
+            // SAFETY: SSE2 is part of this target (see the `cfg`). The load
+            // reads one `[i32; 4]`.
+            let all_zero = unsafe {
+                let v = _mm_loadu_si128(q.as_ptr().cast());
+                _mm_movemask_epi8(_mm_cmpeq_epi32(v, _mm_setzero_si128())) == 0xFFFF
+            };
+            if !all_zero {
+                any_nonzero = true;
+                break;
+            }
+        }
+
+        if !any_nonzero {
+            any_nonzero = tail.iter().any(|&v| v != 0);
+        }
+
+        if any_nonzero {
+            collapse_mask |= 1 << i;
+        }
+    }
+    collapse_mask
+}
+
 /// Which of the `b` blocks of the pulse vector `iy[..n]` have a pulse: bit
 /// `i` is set when one of the `n / b` values of block `i` is not zero. A
 /// single block (`b <= 1`) always counts as filled.
@@ -2698,7 +2812,11 @@ pub fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
     {
         extract_collapse_mask_neon(iy, n, b)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        extract_collapse_mask_sse2(iy, n, b)
+    }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     {
         extract_collapse_mask_scalar(iy, n, b)
     }
@@ -3749,6 +3867,36 @@ mod tests {
         }
     }
 
+    /// The SSE pass computes each value as the plain form does.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[test]
+    fn exp_rotation1_sse_matches_plain_form() {
+        let mut rng = Lcg(5);
+        for stride in (4..=13usize).chain([22, 44]) {
+            // Up to `4 * stride + 7` covers every tail length of both sweeps.
+            for len in (0..=(4 * stride + 7)).chain([MAX_PVQ_N]) {
+                for input in rotation_inputs(&mut rng, len + 3) {
+                    for (c, s) in ROTATION_CS {
+                        let mut want = input.clone();
+                        exp_rotation1_scalar(&mut want, len, stride, c, s);
+                        let mut got = input.clone();
+                        exp_rotation1_sse(&mut got, len, stride, c, s);
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "len {len} stride {stride} c {c} s {s}"
+                        );
+                        assert_eq!(bits(&got[len..]), bits(&input[len..]));
+                        // The dispatching function gives the same result.
+                        let mut via = input.clone();
+                        exp_rotation1(&mut via, len, stride, c, s);
+                        assert_eq!(bits(&via), bits(&want));
+                    }
+                }
+            }
+        }
+    }
+
     /// Lengths that cover every tail of the 16, 8 and 4 wide loops, and the
     /// largest band.
     fn kernel_lengths() -> impl Iterator<Item = usize> {
@@ -3921,6 +4069,8 @@ mod tests {
                     assert_eq!(extract_collapse_mask_scalar(y, n, b), want, "scalar n {n} b {b}");
                     #[cfg(target_arch = "aarch64")]
                     assert_eq!(extract_collapse_mask_neon(y, n, b), want, "neon n {n} b {b}");
+                    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                    assert_eq!(extract_collapse_mask_sse2(y, n, b), want, "sse2 n {n} b {b}");
                     assert_eq!(extract_collapse_mask(y, n, b), want, "dispatch n {n} b {b}");
                 }
             }
