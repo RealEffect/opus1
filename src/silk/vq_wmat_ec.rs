@@ -3,11 +3,12 @@
 //!
 //! For every codebook vector the search computes the prediction error that
 //! the vector leaves, turns it into a number of bits and keeps the vector
-//! with the lowest total. There are two versions with the same result:
+//! with the lowest total. There are three versions with the same result:
 //!
 //! - `search_scalar` handles one vector at a time. It is the portable code
 //!   and the reference in the tests.
 //! - `neon::search` (aarch64) handles four vectors at a time.
+//! - `x86::search` (x86-64 with SSE4.1) does the same as `neon::search`.
 
 use crate::silk::define::*;
 use crate::silk::macros::*;
@@ -155,8 +156,6 @@ pub(crate) fn silk_vq_wmat_ec_codebook(
 ) -> LtpVqChoice {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        let cb_q7 = SILK_LTP_VQ_PTRS_Q7[codebook];
-        let cb_gain_q7 = SILK_LTP_VQ_GAIN_PTRS_Q7[codebook];
         let neg_xx_q24 = negate_to_q24(xx_in_q17);
         let found = neon::search(
             xx_q17,
@@ -165,21 +164,16 @@ pub(crate) fn silk_vq_wmat_ec_codebook(
             subfr_len,
             max_gain_q7,
         );
-        match found {
-            None => LtpVqChoice::NONE,
-            Some((k, rate_dist_q7)) => {
-                // The vector code leaves out the residual energy of the
-                // winner. Compute it again for this one vector.
-                let gain_q7 = cb_gain_q7[k] as i32;
-                let sum1_q15 = ltp_vq_error_q15(xx_q17, &neg_xx_q24, &cb_q7[k]);
-                LtpVqChoice {
-                    ind: k as i8,
-                    res_nrg_q15: sum1_q15.wrapping_add(gain_penalty_q15(gain_q7, max_gain_q7)),
-                    rate_dist_q7,
-                    gain_q7: Some(gain_q7),
-                }
-            }
-        }
+        vector_choice(codebook, xx_q17, &neg_xx_q24, max_gain_q7, found)
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_sse41() {
+        let neg_xx_q24 = negate_to_q24(xx_in_q17);
+        // SAFETY: the processor has SSE4.1.
+        let found = unsafe {
+            x86::search(xx_q17, &neg_xx_q24, x86::CODEBOOKS[codebook], subfr_len, max_gain_q7)
+        };
+        return vector_choice(codebook, xx_q17, &neg_xx_q24, max_gain_q7, found);
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
@@ -192,6 +186,32 @@ pub(crate) fn silk_vq_wmat_ec_codebook(
             subfr_len,
             max_gain_q7,
         )
+    }
+}
+
+/// The result of a vector search (`neon::search` or `x86::search`): the
+/// number of the best vector of `codebook` and its total bits, or `None`.
+/// The vector code leaves out the residual energy of the winner, so it is
+/// computed again for this one vector.
+#[cfg(any(all(target_arch = "aarch64", target_feature = "neon"), target_arch = "x86_64"))]
+#[inline(always)]
+fn vector_choice(
+    codebook: usize,
+    xx_q17: &CorrMatrix,
+    neg_xx_q24: &[i32; LTP_ORDER],
+    max_gain_q7: i32,
+    found: Option<(usize, i32)>,
+) -> LtpVqChoice {
+    let Some((k, rate_dist_q7)) = found else {
+        return LtpVqChoice::NONE;
+    };
+    let gain_q7 = SILK_LTP_VQ_GAIN_PTRS_Q7[codebook][k] as i32;
+    let sum1_q15 = ltp_vq_error_q15(xx_q17, neg_xx_q24, &SILK_LTP_VQ_PTRS_Q7[codebook][k]);
+    LtpVqChoice {
+        ind: k as i8,
+        res_nrg_q15: sum1_q15.wrapping_add(gain_penalty_q15(gain_q7, max_gain_q7)),
+        rate_dist_q7,
+        gain_q7: Some(gain_q7),
     }
 }
 
@@ -376,6 +396,305 @@ mod neon {
             vst1q_s32(bits_q8.as_mut_ptr(), best_bits);
             vst1q_s32(number.as_mut_ptr(), best_number);
         }
+
+        // The best of the four lanes; of equal ones the later vector.
+        let mut best: Option<(usize, i32)> = None;
+        for lane in 0..4 {
+            if number[lane] < 0 {
+                continue;
+            }
+            let candidate = (number[lane] as usize, bits_q8[lane]);
+            let better = match best {
+                None => true,
+                Some((k, bits)) => candidate.1 < bits || (candidate.1 == bits && candidate.0 > k),
+            };
+            if better {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+}
+
+/// The search of `neon::search` for x86-64 processors with SSE4.1: four
+/// codebook vectors at a time, one per 32-bit lane. libopus's
+/// `silk_VQ_WMat_EC_sse4_1` handles one vector at a time and only puts the
+/// first row of the matrix into vectors.
+///
+/// Two NEON operations have no x86 instruction:
+///
+/// - `silk_smulwb(row, cb)`, `vqdmulhq_s32` on NEON, is `mulw`: two
+///   `_mm_mul_epi32` with `cb << 16`, as in the SILK quantizers.
+/// - `silk_lin2log` needs the number of leading zeros (`vclzq_s32`). `lin2log`
+///   reads the position of the leading one and the 7 bits below it from the
+///   conversion to `f32`.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::CorrMatrix;
+    use crate::silk::define::LTP_ORDER;
+    use crate::silk::tables::{
+        SILK_LTP_GAIN_BITS_Q5_0, SILK_LTP_GAIN_BITS_Q5_1, SILK_LTP_GAIN_BITS_Q5_2,
+        SILK_LTP_GAIN_VQ_0_GAIN, SILK_LTP_GAIN_VQ_1_GAIN, SILK_LTP_GAIN_VQ_2_GAIN,
+        SILK_LTP_VQ_0_Q7, SILK_LTP_VQ_1_Q7, SILK_LTP_VQ_2_Q7,
+    };
+    use core::arch::x86_64::*;
+
+    /// Four codebook vectors side by side: lane `n` of every field belongs
+    /// to vector number `4 * group + n` of the codebook.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    pub(super) struct Group {
+        /// `cb_q7[c]` holds coefficient `c` of the four vectors.
+        cb_q7: [[i32; 4]; LTP_ORDER],
+        /// The same values shifted left by 16, the factors of `mulw`.
+        cb_q23: [[i32; 4]; LTP_ORDER],
+        /// Lanes 1 and 3 of `cb_q23` in lanes 0 and 2.
+        cb_q23_odd: [[i32; 4]; LTP_ORDER],
+        /// Sum of the absolute coefficients of each vector.
+        gain_q7: [i32; 4],
+        /// Half of the code length of each vector, in Q8.
+        half_cl_q8: [i32; 4],
+    }
+
+    /// A codebook of `N` vectors in `G = N / 4` groups.
+    const fn groups<const N: usize, const G: usize>(
+        cb_q7: &[[i8; LTP_ORDER]; N],
+        cb_gain_q7: &[u8; N],
+        cl_q5: &[u8; N],
+    ) -> [Group; G] {
+        assert!(N == 4 * G);
+        let mut out = [Group {
+            cb_q7: [[0; 4]; LTP_ORDER],
+            cb_q23: [[0; 4]; LTP_ORDER],
+            cb_q23_odd: [[0; 4]; LTP_ORDER],
+            gain_q7: [0; 4],
+            half_cl_q8: [0; 4],
+        }; G];
+        let mut k = 0;
+        while k < N {
+            let (group, lane) = (k / 4, k % 4);
+            let mut c = 0;
+            while c < LTP_ORDER {
+                let cb = cb_q7[k][c] as i32;
+                out[group].cb_q7[c][lane] = cb;
+                out[group].cb_q23[c][lane] = cb << 16;
+                if lane % 2 == 1 {
+                    out[group].cb_q23_odd[c][lane - 1] = cb << 16;
+                }
+                c += 1;
+            }
+            out[group].gain_q7[lane] = cb_gain_q7[k] as i32;
+            out[group].half_cl_q8[lane] = (cl_q5[k] as i32) << (3 - 1);
+            k += 1;
+        }
+        out
+    }
+
+    static CODEBOOK_0: [Group; 2] = groups(
+        &SILK_LTP_VQ_0_Q7,
+        &SILK_LTP_GAIN_VQ_0_GAIN,
+        &SILK_LTP_GAIN_BITS_Q5_0,
+    );
+    static CODEBOOK_1: [Group; 4] = groups(
+        &SILK_LTP_VQ_1_Q7,
+        &SILK_LTP_GAIN_VQ_1_GAIN,
+        &SILK_LTP_GAIN_BITS_Q5_1,
+    );
+    static CODEBOOK_2: [Group; 8] = groups(
+        &SILK_LTP_VQ_2_Q7,
+        &SILK_LTP_GAIN_VQ_2_GAIN,
+        &SILK_LTP_GAIN_BITS_Q5_2,
+    );
+    /// The three LTP codebooks, in the order of `SILK_LTP_VQ_PTRS_Q7`.
+    pub(super) static CODEBOOKS: [&[Group]; 3] = [&CODEBOOK_0, &CODEBOOK_1, &CODEBOOK_2];
+
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn load(lanes: &[i32; 4]) -> __m128i {
+        // SAFETY: reads the 16 bytes of the array; the load needs no
+        // alignment.
+        unsafe { _mm_loadu_si128(lanes.as_ptr().cast()) }
+    }
+
+    /// `(x * c) >> 16` per lane, as `silk_smulwb(x, c)`, with `c << 16` in
+    /// `factor` and the factors of lanes 1 and 3 in lanes 0 and 2 of
+    /// `factor_odd`.
+    ///
+    /// `_mm_mul_epi32` gives the 64-bit products `x * c << 16` of lanes 0
+    /// and 2. Their upper halves, in lanes 1 and 3, are the results. The
+    /// second multiplication does the same for lanes 1 and 3 moved down.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn mulw(x: __m128i, factor: __m128i, factor_odd: __m128i) -> __m128i {
+        let even = _mm_mul_epi32(x, factor);
+        let odd = _mm_mul_epi32(_mm_srli_epi64::<32>(x), factor_odd);
+        _mm_blend_epi16::<0b1100_1100>(_mm_srli_epi64::<32>(even), odd)
+    }
+
+    /// `silk_lin2log(v)` per lane, for every value of `v`.
+    ///
+    /// For `v > 0` let `k` be the position of the leading one. The function
+    /// needs `k` and the 7 bits below the leading one. Both are read from
+    /// `v` converted to `f32`: the exponent is `k`, and the upper 7 bits of
+    /// the mantissa are those bits. Before the conversion each bit is
+    /// cleared that has a set bit 8 positions above it. This keeps the
+    /// leading one and the 7 bits below it, and clears bit `k - 8`. The
+    /// rounding of the conversion can then carry at most into bit `k - 8`,
+    /// so the 8 bits that are read are exact.
+    ///
+    /// `v = 0` converts to `0.0`, whose exponent field gives `k = -127`;
+    /// libopus counts 32 leading zeros there, which is `k = -1`. A negative
+    /// `v` has no leading zero: `k = 31`, and the fraction is bits 24 to 30.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn lin2log(v: __m128i) -> __m128i {
+        let kept = _mm_andnot_si128(_mm_srli_epi32::<8>(v), v);
+        let bits = _mm_castps_si128(_mm_cvtepi32_ps(kept));
+        let k = _mm_sub_epi32(_mm_srli_epi32::<23>(bits), _mm_set1_epi32(127));
+        let k = _mm_max_epi32(k, _mm_set1_epi32(-1));
+        let frac = _mm_and_si128(_mm_srli_epi32::<16>(bits), _mm_set1_epi32(0x7f));
+
+        let negative = _mm_srai_epi32::<31>(v);
+        let k = _mm_blendv_epi8(k, _mm_set1_epi32(31), negative);
+        let frac_negative = _mm_and_si128(_mm_srli_epi32::<24>(v), _mm_set1_epi32(0x7f));
+        let frac = _mm_blendv_epi8(frac, frac_negative, negative);
+
+        // frac + ((frac * (128 - frac) * 179) >> 16) + (k << 7). The product
+        // is at most 4096 and fits in the low 16 bits of the lane.
+        let curve = _mm_mullo_epi16(frac, _mm_sub_epi32(_mm_set1_epi32(128), frac));
+        let curve = _mm_srai_epi32::<16>(_mm_madd_epi16(curve, _mm_set1_epi32(179)));
+        _mm_add_epi32(_mm_add_epi32(frac, curve), _mm_slli_epi32::<7>(k))
+    }
+
+    /// `lin2log` of four values, for the tests.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[cfg(test)]
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn lin2log_lanes(v: [i32; 4]) -> [i32; 4] {
+        let out = lin2log(_mm_setr_epi32(v[0], v[1], v[2], v[3]));
+        [
+            _mm_extract_epi32::<0>(out),
+            _mm_extract_epi32::<1>(out),
+            _mm_extract_epi32::<2>(out),
+            _mm_extract_epi32::<3>(out),
+        ]
+    }
+
+    /// The search of `super::search_scalar`, four codebook vectors at a
+    /// time. Returns the number of the best vector and its total bits (Q8),
+    /// or `None` when no vector qualified.
+    ///
+    /// Every sum of the scalar code wraps around, so the order of the
+    /// additions is free here.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn search(
+        xx_q17: &CorrMatrix,
+        neg_xx_q24: &[i32; LTP_ORDER],
+        codebook: &[Group],
+        subfr_len: i32,
+        max_gain_q7: i32,
+    ) -> Option<(usize, i32)> {
+        // Entry (row, column) of the matrix in all four lanes.
+        let xx = |row: usize, column: usize| _mm_set1_epi32(xx_q17[LTP_ORDER * row + column]);
+        let (xx00, xx01, xx02, xx03, xx04) = (xx(0, 0), xx(0, 1), xx(0, 2), xx(0, 3), xx(0, 4));
+        let (xx11, xx12, xx13, xx14) = (xx(1, 1), xx(1, 2), xx(1, 3), xx(1, 4));
+        let (xx22, xx23, xx24) = (xx(2, 2), xx(2, 3), xx(2, 4));
+        let (xx33, xx34) = (xx(3, 3), xx(3, 4));
+        let xx44 = xx(4, 4);
+        let neg0 = _mm_set1_epi32(neg_xx_q24[0]);
+        let neg1 = _mm_set1_epi32(neg_xx_q24[1]);
+        let neg2 = _mm_set1_epi32(neg_xx_q24[2]);
+        let neg3 = _mm_set1_epi32(neg_xx_q24[3]);
+        let neg4_twice = _mm_set1_epi32(neg_xx_q24[4] << 1);
+        let max_gain = _mm_set1_epi32(max_gain_q7);
+        // `silk_smulbb` uses the low 16 bits of both values: the subframe
+        // length in the low half of every lane, zero in the high half.
+        let subfr_len = _mm_set1_epi32(subfr_len as u16 as i32);
+        let zero = _mm_setzero_si128();
+        // a + b * c per lane, wrapping, as `silk_mla`.
+        let mla = |a: __m128i, b: __m128i, c: __m128i| _mm_add_epi32(a, _mm_mullo_epi32(b, c));
+
+        let mut best_bits = _mm_set1_epi32(i32::MAX);
+        let mut best_number = _mm_set1_epi32(-1);
+        let mut numbers = _mm_setr_epi32(0, 1, 2, 3);
+
+        for group in codebook {
+            let cb0 = load(&group.cb_q7[0]);
+            let cb1 = load(&group.cb_q7[1]);
+            let cb2 = load(&group.cb_q7[2]);
+            let cb3 = load(&group.cb_q7[3]);
+            let cb4 = load(&group.cb_q7[4]);
+            let factor = |c: usize| (load(&group.cb_q23[c]), load(&group.cb_q23_odd[c]));
+
+            // Prediction error, row by row as in `ltp_vq_error_q15`.
+            let mut row = mla(neg0, xx01, cb1);
+            row = mla(row, xx02, cb2);
+            row = mla(row, xx03, cb3);
+            row = mla(row, xx04, cb4);
+            row = mla(_mm_slli_epi32::<1>(row), xx00, cb0);
+            let (f, f_odd) = factor(0);
+            let mut sum1 = mulw(row, f, f_odd);
+
+            row = mla(neg1, xx12, cb2);
+            row = mla(row, xx13, cb3);
+            row = mla(row, xx14, cb4);
+            row = mla(_mm_slli_epi32::<1>(row), xx11, cb1);
+            let (f, f_odd) = factor(1);
+            sum1 = _mm_add_epi32(sum1, mulw(row, f, f_odd));
+
+            row = mla(neg2, xx23, cb3);
+            row = mla(row, xx24, cb4);
+            row = mla(_mm_slli_epi32::<1>(row), xx22, cb2);
+            let (f, f_odd) = factor(2);
+            sum1 = _mm_add_epi32(sum1, mulw(row, f, f_odd));
+
+            row = mla(neg3, xx34, cb4);
+            row = mla(_mm_slli_epi32::<1>(row), xx33, cb3);
+            let (f, f_odd) = factor(3);
+            sum1 = _mm_add_epi32(sum1, mulw(row, f, f_odd));
+
+            row = mla(neg4_twice, xx44, cb4);
+            let (f, f_odd) = factor(4);
+            sum1 = _mm_add_epi32(sum1, mulw(row, f, f_odd));
+            sum1 = _mm_add_epi32(sum1, _mm_set1_epi32(32801));
+
+            // Residual energy with the penalty for too large a gain.
+            let gain = load(&group.gain_q7);
+            let penalty = _mm_slli_epi32::<11>(_mm_max_epi32(_mm_sub_epi32(gain, max_gain), zero));
+            let res_nrg = _mm_add_epi32(sum1, penalty);
+
+            // silk_smulbb(subfr_len, log - (15 << 7)): the difference lies
+            // between -2048 and 2175 and keeps its value in 16 bits.
+            let log = _mm_sub_epi32(lin2log(res_nrg), _mm_set1_epi32(15 << 7));
+            let bits = _mm_madd_epi16(log, subfr_len);
+            let bits = _mm_add_epi32(bits, load(&group.half_cl_q8));
+
+            // A vector qualifies when its error is not negative. In each
+            // lane the later of two equal vectors wins, as in the scalar
+            // code.
+            let qualifies = _mm_cmpgt_epi32(sum1, _mm_set1_epi32(-1));
+            let take = _mm_andnot_si128(_mm_cmpgt_epi32(bits, best_bits), qualifies);
+            best_bits = _mm_blendv_epi8(best_bits, bits, take);
+            best_number = _mm_blendv_epi8(best_number, numbers, take);
+            numbers = _mm_add_epi32(numbers, _mm_set1_epi32(4));
+        }
+
+        let lanes = |v: __m128i| {
+            [
+                _mm_extract_epi32::<0>(v),
+                _mm_extract_epi32::<1>(v),
+                _mm_extract_epi32::<2>(v),
+                _mm_extract_epi32::<3>(v),
+            ]
+        };
+        let (bits_q8, number) = (lanes(best_bits), lanes(best_number));
 
         // The best of the four lanes; of equal ones the later vector.
         let mut best: Option<(usize, i32)> = None;
@@ -755,6 +1074,151 @@ mod tests {
         }
         // The rule for equal vectors must have decided some searches.
         assert!(ties > 100, "only {ties} searches with a tie for the best");
+    }
+
+    /// `silk_vq_wmat_ec_codebook`, with the search of this processor (NEON,
+    /// SSE4.1 or the portable loop), against `silk_VQ_WMat_EC_c` of the
+    /// libopus these tests link (silk/VQ_WMat_EC.c, which the float build
+    /// shares with the fixed-point one). The wrapping cases are left out:
+    /// there the C code overflows signed integers, which C leaves undefined.
+    #[cfg(feature = "std")]
+    #[test]
+    fn codebook_search_matches_libopus() {
+        use audiopus_sys as _;
+        unsafe extern "C" {
+            /// `void silk_VQ_WMat_EC_c(opus_int8 *ind, opus_int32
+            /// *res_nrg_Q15, opus_int32 *rate_dist_Q8, opus_int *gain_Q7,
+            /// const opus_int32 *XX_Q17, const opus_int32 *xX_Q17, const
+            /// opus_int8 *cb_Q7, const opus_uint8 *cb_gain_Q7, const
+            /// opus_uint8 *cl_Q5, const opus_int subfr_len, const opus_int32
+            /// max_gain_Q7, const opus_int L)`.
+            #[link_name = "silk_VQ_WMat_EC_c"]
+            fn c_vq_wmat_ec(
+                ind: *mut i8,
+                res_nrg_q15: *mut i32,
+                rate_dist_q8: *mut i32,
+                gain_q7: *mut i32,
+                xx_q17: *const i32,
+                x_x_q17: *const i32,
+                cb_q7: *const i8,
+                cb_gain_q7: *const u8,
+                cl_q5: *const u8,
+                subfr_len: i32,
+                max_gain_q7: i32,
+                l: i32,
+            );
+        }
+        let mut rng = XorShift(0x3C6E_F372_FE94_F82B);
+        let mut found = 0;
+        for round in 0..20_000 {
+            let case = if round % 2 == 0 { correlation_case(&mut rng) } else { coarse_case(&mut rng) };
+            for codebook in 0..3 {
+                let cb = SILK_LTP_VQ_PTRS_Q7[codebook];
+                // libopus leaves `gain_Q7` unwritten when no vector qualifies.
+                let (mut ind, mut res_nrg, mut rate_dist, mut gain) = (0i8, 0i32, 0i32, -1i32);
+                // SAFETY: the matrix holds 25 values, the vector 5, the
+                // codebook `cb.len()` rows of 5 and the two tables one value
+                // per row; the outputs are single values.
+                unsafe {
+                    c_vq_wmat_ec(
+                        &mut ind,
+                        &mut res_nrg,
+                        &mut rate_dist,
+                        &mut gain,
+                        case.xx_q17.as_ptr(),
+                        case.xx_in_q17.as_ptr(),
+                        cb.as_ptr().cast(),
+                        SILK_LTP_VQ_GAIN_PTRS_Q7[codebook].as_ptr(),
+                        SILK_LTP_GAIN_BITS_Q5_PTRS[codebook].as_ptr(),
+                        case.subfr_len,
+                        case.max_gain_q7,
+                        cb.len() as i32,
+                    )
+                };
+                let want = (ind, res_nrg, rate_dist, (gain >= 0).then_some(gain));
+                found += usize::from(gain >= 0);
+                let got = silk_vq_wmat_ec_codebook(
+                    codebook,
+                    &case.xx_q17,
+                    &case.xx_in_q17,
+                    case.subfr_len,
+                    case.max_gain_q7,
+                );
+                let got = (got.ind, got.res_nrg_q15, got.rate_dist_q7, got.gain_q7);
+                assert_eq!(got, want, "round {round}, codebook {codebook}");
+            }
+        }
+        assert!(found > 30_000, "only {found} searches found a vector");
+    }
+
+    /// The x86 search against the portable search on all kinds of cases,
+    /// whatever the dispatch chooses.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_search_matches_scalar() {
+        if !crate::compat::x86_has_sse41() {
+            return;
+        }
+        let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+        for round in 0..30_000 {
+            let case = match round % 3 {
+                0 => correlation_case(&mut rng),
+                1 => wrapping_case(&mut rng),
+                _ => coarse_case(&mut rng),
+            };
+            for codebook in 0..3 {
+                let want = search_scalar(
+                    &case.xx_q17,
+                    &case.xx_in_q17,
+                    SILK_LTP_VQ_PTRS_Q7[codebook],
+                    SILK_LTP_VQ_GAIN_PTRS_Q7[codebook],
+                    SILK_LTP_GAIN_BITS_Q5_PTRS[codebook],
+                    case.subfr_len,
+                    case.max_gain_q7,
+                );
+                let neg_xx_q24 = negate_to_q24(&case.xx_in_q17);
+                // SAFETY: the processor has SSE4.1 (checked above).
+                let got = unsafe {
+                    x86::search(
+                        &case.xx_q17,
+                        &neg_xx_q24,
+                        x86::CODEBOOKS[codebook],
+                        case.subfr_len,
+                        case.max_gain_q7,
+                    )
+                };
+                // The whole choice, the residual energy of the winner too.
+                let got = vector_choice(codebook, &case.xx_q17, &neg_xx_q24, case.max_gain_q7, got);
+                let fields = |c: &LtpVqChoice| (c.ind, c.res_nrg_q15, c.rate_dist_q7, c.gain_q7);
+                assert_eq!(fields(&got), fields(&want), "round {round}, codebook {codebook}");
+            }
+        }
+    }
+
+    /// The `silk_lin2log` of the x86 search against the scalar function, on
+    /// every power of two, its neighbours and random values of both signs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_lin2log_matches_scalar() {
+        if !crate::compat::x86_has_sse41() {
+            return;
+        }
+        let mut values = vec![0, 1, -1, i32::MAX, i32::MIN, i32::MIN + 1];
+        for k in 0..31 {
+            let p = 1i32 << k;
+            values.extend([p - 1, p, p + 1, -p, -p - 1, -p + 1, p | (p >> 1)]);
+            // A run of ones below the leading one that rounds up in `f32`.
+            values.push(i32::MAX >> (30 - k));
+        }
+        let mut rng = XorShift(0x1F83_D9AB_FB41_BD6B);
+        values.extend((0..100_000).map(|_| (rng.next() as i32) >> (rng.next() % 32)));
+        for chunk in values.chunks(4) {
+            let mut v = [0i32; 4];
+            v[..chunk.len()].copy_from_slice(chunk);
+            // SAFETY: the processor has SSE4.1 (checked above).
+            let got = unsafe { x86::lin2log_lanes(v) };
+            assert_eq!(got, v.map(silk_lin2log), "{v:?}");
+        }
     }
 
     #[test]
