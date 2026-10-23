@@ -133,6 +133,85 @@ pub fn silk_ltp_analysis_filter_fix(
     nb_subfr: usize,
     pre_length: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        unsafe {
+            ltp_analysis_filter_avx2(
+                ltp_res,
+                x,
+                x_base_idx,
+                b_q14,
+                pitch_l,
+                inv_gain_q16,
+                subfr_length,
+                nb_subfr,
+                pre_length,
+            )
+        };
+        return;
+    }
+    ltp_analysis_filter_portable(
+        ltp_res,
+        x,
+        x_base_idx,
+        b_q14,
+        pitch_l,
+        inv_gain_q16,
+        subfr_length,
+        nb_subfr,
+        pre_length,
+    );
+}
+
+/// [`silk_ltp_analysis_filter_fix`] compiled with AVX2 enabled.
+///
+/// AVX2 only changes how the compiler encodes and vectorizes the code. The
+/// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
+/// multiplication, which fixed-point code needs; AVX2 has both. The results
+/// are the same bits.
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn ltp_analysis_filter_avx2(
+    ltp_res: &mut [i16],
+    x: &[i16],
+    x_base_idx: usize,
+    b_q14: &[i16],
+    pitch_l: &[i32],
+    inv_gain_q16: &[i32],
+    subfr_length: usize,
+    nb_subfr: usize,
+    pre_length: usize,
+) {
+    ltp_analysis_filter_portable(
+        ltp_res,
+        x,
+        x_base_idx,
+        b_q14,
+        pitch_l,
+        inv_gain_q16,
+        subfr_length,
+        nb_subfr,
+        pre_length,
+    );
+}
+
+#[inline(always)]
+fn ltp_analysis_filter_portable(
+    ltp_res: &mut [i16],
+    x: &[i16],
+    x_base_idx: usize,
+    b_q14: &[i16],
+    pitch_l: &[i32],
+    inv_gain_q16: &[i32],
+    subfr_length: usize,
+    nb_subfr: usize,
+    pre_length: usize,
+) {
     let n = subfr_length + pre_length;
     let mut x_ptr_idx = x_base_idx;
     let mut ltp_res_ptr_idx = 0;
@@ -198,5 +277,71 @@ pub fn silk_ltp_analysis_filter_fix(
 
         ltp_res_ptr_idx += n;
         x_ptr_idx += subfr_length;
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    /// The AVX2 copy of `silk_ltp_analysis_filter_fix` against the portable
+    /// body, whatever the dispatch chooses: 2 and 4 subframes at 8 to
+    /// 16 kHz, lags from 2 to beyond the start of the input (the loop that
+    /// checks every sample), random coefficients and inverse gains.
+    #[test]
+    fn avx2_copy_matches_portable() {
+        if !crate::compat::x86_has_avx2() {
+            return;
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..2000 {
+            let fs_khz = [8usize, 12, 16][round % 3];
+            let nb_subfr = if round % 2 == 0 { 4 } else { 2 };
+            let subfr_length = 5 * fs_khz;
+            let pre_length = [10usize, 16][round % 2];
+            let x_base_idx = 18 * fs_khz + pre_length;
+            let len = x_base_idx + nb_subfr * subfr_length + pre_length;
+            let x: Vec<i16> = (0..len).map(|_| next() as i16 >> (next() % 8)).collect();
+            let b_q14: Vec<i16> = (0..nb_subfr * LTP_ORDER).map(|_| next() as i16).collect();
+            let pitch_l: Vec<i32> = (0..nb_subfr)
+                .map(|_| (next() % (x_base_idx as u64 + 40)) as i32)
+                .collect();
+            let inv_gain_q16: Vec<i32> = (0..nb_subfr).map(|_| (next() >> 33) as i32).collect();
+            let out_len = nb_subfr * (subfr_length + pre_length);
+            let mut want = vec![0x5a5ai16; out_len];
+            let mut got = want.clone();
+            ltp_analysis_filter_portable(
+                &mut want,
+                &x,
+                x_base_idx,
+                &b_q14,
+                &pitch_l,
+                &inv_gain_q16,
+                subfr_length,
+                nb_subfr,
+                pre_length,
+            );
+            // SAFETY: the processor has AVX2 (checked above).
+            unsafe {
+                ltp_analysis_filter_avx2(
+                    &mut got,
+                    &x,
+                    x_base_idx,
+                    &b_q14,
+                    &pitch_l,
+                    &inv_gain_q16,
+                    subfr_length,
+                    nb_subfr,
+                    pre_length,
+                )
+            };
+            assert_eq!(got, want, "round {round}, lags {pitch_l:?}");
+        }
     }
 }
