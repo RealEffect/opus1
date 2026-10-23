@@ -16,13 +16,23 @@
 #      the CPU has with the portable code, then the tests that compare with
 #      the libopus built with its neural network code.
 #   5. Checks the golden file of 64-bit ARM (x86 is expected to differ in
-#      some streams; the number is recorded).
+#      some streams; the number is recorded). Then compares opus1 with
+#      libopus live, scenario by scenario (perf_harness modes): both
+#      encoders and both decoders on the same input, as modes.md.
 #   6. Times encoding and decoding against the default libopus build
 #      (skipped with -Quick).
+#      With -AbBaseline DIR it times this tree against the baseline tree
+#      instead: scripts\x86\ab.ps1 builds perf_harness in both, runs the
+#      bench set of each in turns (A B B A A B ...) and writes ab\ with a
+#      report of time of this tree / time of the baseline (see ab.ps1). With
+#      -Quick it only builds the two programs.
 #   7. Writes x86-windows-results-<date>.zip in the repository root.
 #
 # Usage, from the repository root, in PowerShell:
 #   powershell -ExecutionPolicy Bypass -File scripts\x86\test.ps1 [-Quick] [-NoDnn]
+#       [-AbBaseline DIR [-Passes N]]
+#
+#   -Passes N  runs of each build in the A/B timing (default 5)
 #
 # Settings (environment variables):
 #   OPUS_TARBALL           A local copy of opus-1.6.1.tar.gz.
@@ -31,11 +41,17 @@
 #
 # Needs: Visual Studio 2022 Build Tools with "Desktop development with C++",
 # CMake 3.16 or newer, and Rust (rustup-init.exe; host x86_64-pc-windows-msvc).
-param([switch]$Quick, [switch]$NoDnn)
+param([switch]$Quick, [switch]$NoDnn, [string]$AbBaseline = '', [int]$Passes = 5)
 
 $ErrorActionPreference = 'Continue'
 $OpusUrl = 'https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz'
 $OpusSha256 = '6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1'
+
+if ($AbBaseline) {
+    $resolved = Resolve-Path -LiteralPath $AbBaseline -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Host "error: -AbBaseline: no folder $AbBaseline"; exit 2 }
+    $AbBaseline = $resolved.Path
+}
 
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $Repo
@@ -220,7 +236,35 @@ if (Test-Path $golden) {
     Note 'golden: no scripts\x86\golden_r10.txt in this copy; skipped'
 }
 
-if (-not $Quick) {
+# The golden file holds the output of an earlier run, so on x86 it can only
+# show that the output changed. This step runs opus1 and libopus on the
+# same input instead: decoder agreement in dB, and the coding error of each
+# encoder with libopus decoding (see the legend of modes.md).
+Step 'live comparison with libopus (perf_harness modes)'
+$mmd = Join-Path $Out 'modes.md'; $mlog = Join-Path $Out 'modes.log'
+cmd /c "cargo run --release --example perf_harness -- modes --md `"$mmd`" > `"$mlog`" 2>&1"
+$mcode = $LASTEXITCODE
+$attention = 0
+if (Test-Path $mmd) {
+    $tail = (Get-Content $mmd) -join "`n"
+    $at = $tail.IndexOf('need attention')
+    if ($at -ge 0) { $attention = ([regex]::Matches($tail.Substring($at), '(?m)^- ')).Count }
+}
+Note "modes: exit status $mcode, $attention scenarios need attention (see modes.md)"
+
+if ($AbBaseline) {
+    $abArgs = @{ Baseline = $AbBaseline; Out = (Join-Path $Out 'ab'); Passes = $Passes }
+    if ($Quick) {
+        Step "A/B: building perf_harness of the baseline ($AbBaseline) and of this tree (no timing with -Quick)"
+        $abArgs.BuildOnly = $true
+    } else {
+        Step "A/B timing: the baseline ($AbBaseline) against this tree, $Passes runs of each, about $($Passes * 6 + 5) minutes; keep the computer idle"
+    }
+    & (Join-Path $PSScriptRoot 'ab.ps1') @abArgs
+    Note "ab: exit status $LASTEXITCODE"
+    $abSummary = Join-Path $Out 'ab\ab-summary.txt'
+    if (Test-Path $abSummary) { Get-Content $abSummary | ForEach-Object { Note $_ } }
+} elseif (-not $Quick) {
     Step 'timing against libopus (default build), a few minutes; keep the computer idle'
     $md = Join-Path $Out 'bench.md'; $json = Join-Path $Out 'bench.json'; $blog = Join-Path $Out 'bench.log'
     cmd /c "cargo run --release --example perf_harness -- bench --md `"$md`" --json `"$json`" > `"$blog`" 2>&1"
