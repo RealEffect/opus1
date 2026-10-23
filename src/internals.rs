@@ -159,7 +159,7 @@ pub mod pvq {
 pub mod quant_bands {
     pub use crate::quant_bands::{
         E_PROB_MODEL, quant_coarse_energy, quant_coarse_energy_advanced, quant_energy_finalise,
-        quant_fine_energy, unquant_coarse_energy,
+        quant_fine_energy, unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy,
     };
 }
 pub mod range_coder {
