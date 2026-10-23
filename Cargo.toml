@@ -17,8 +17,10 @@ documentation = "https://docs.rs/opus1"
 # Left out of the published crate: repository-only files. The tests compare
 # with a linked libopus and read corpora that are not packaged, and the scripts
 # build libopus and run the phone and x86 checks. `docs/` and `README.md` stay:
-# src/lib.rs includes them for the documentation tests. `dnn-weights/` stays:
-# the neural network features embed it with `include_bytes!`.
+# src/lib.rs includes them for the documentation tests, except
+# `docs/opus-explained/`, a web page with its own audio data that the crate
+# does not use. `dnn-weights/` stays: the neural network features embed it
+# with `include_bytes!`.
 exclude = [
     "opus-1.6.1/",
     "fuzz/",
@@ -27,6 +29,7 @@ exclude = [
     "/tests/",
     "/scripts/",
     "/bench_quick.sh",
+    "/docs/opus-explained/",
 ]
 
 [features]
@@ -181,6 +184,9 @@ harness = false
 required-features = ["deep-plc", "__internals"]
 [[example]]
 name = "eval"
+required-features = ["__internals"]
+[[example]]
+name = "opus_demo_data"
 required-features = ["__internals"]
 [[example]]
 name = "opus_compare"
