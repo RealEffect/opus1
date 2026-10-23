@@ -40,6 +40,10 @@
 // needs a cargo feature with that feature. Other builds ignore this line.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(unsafe_op_in_unsafe_fn)]
+// Every `unsafe` block of the library needs a `// SAFETY:` comment that
+// says why it is sound (docs/07-architecture.md, "Unsafe code"). The unit
+// tests are left out: they call kernels directly, on inputs they build.
+#![cfg_attr(not(test), warn(clippy::undocumented_unsafe_blocks))]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
 

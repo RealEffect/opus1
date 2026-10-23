@@ -2881,12 +2881,49 @@ pub fn alg_quant(
     gain: f32,
     resynth: bool,
 ) -> u32 {
-    alg_quant_with(x, n, k, spread, stride, rc, gain, resynth, None)
+    alg_quant_with(x, n, k, spread, stride, rc, gain, resynth, None, &mut PulseScratch::new())
+}
+
+/// Memory for the pulse vector of one band (`iy` of libopus `alg_quant`
+/// and `alg_unquant`), shared by the bands of a frame.
+///
+/// The pulse search and the pulse decoder write all `n` values of a band
+/// before they read any. Rust still needs the memory to hold values before
+/// it can be used as `&mut [i32]`. So the first time a band needs more
+/// values than earlier bands, the new ones are set to 0. A frame sets each
+/// value at most once, and only up to the size of its largest band.
+pub(crate) struct PulseScratch {
+    buf: [MaybeUninit<i32>; MAX_PVQ_N],
+    /// `buf[..written]` holds values.
+    written: usize,
+}
+
+impl PulseScratch {
+    pub(crate) fn new() -> Self {
+        PulseScratch {
+            buf: [MaybeUninit::uninit(); MAX_PVQ_N],
+            written: 0,
+        }
+    }
+
+    /// The first `n` values. Panics when `n` exceeds `MAX_PVQ_N`.
+    #[inline(always)]
+    fn values(&mut self, n: usize) -> &mut [i32] {
+        if n > self.written {
+            for v in &mut self.buf[self.written..n] {
+                v.write(0);
+            }
+            self.written = n;
+        }
+        // SAFETY: `buf[..written]` holds values, and `n <= written`.
+        unsafe { self.buf[..n].assume_init_mut() }
+    }
 }
 
 /// `alg_quant` that takes the cosine and the sine of the rotation from
 /// `rotations` when the cache holds them. Without a cache it computes them.
-/// Either way the results are those of `alg_quant`.
+/// Either way the results are those of `alg_quant`. The pulse vector is
+/// kept in `pulse_scratch`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn alg_quant_with(
@@ -2899,15 +2936,13 @@ pub(crate) fn alg_quant_with(
     gain: f32,
     resynth: bool,
     rotations: Option<&mut RotationCache>,
+    pulse_scratch: &mut PulseScratch,
 ) -> u32 {
-    // A band never has more than MAX_PVQ_N values. Checked in release
-    // builds too, because the slice below must fit in the buffer.
+    // A band never has more than MAX_PVQ_N values, the size of the scratch
+    // memory.
     assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
-    let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-    // SAFETY: `n` values fit in the buffer (checked above). `pvq_search`
-    // writes all `n` values before anything reads them (it panics if `x` is
-    // shorter than `n`).
-    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
+    // `pvq_search` writes all `n` values (it panics if `x` is shorter).
+    let y = pulse_scratch.values(n);
 
     // The rotation before the search and the one after the resynthesis use
     // the same angle, so its cosine and sine are found once.
@@ -2952,13 +2987,26 @@ pub fn alg_unquant(
     rc: &mut RangeCoder,
     gain: f32,
 ) -> u32 {
-    // A band never has more than MAX_PVQ_N values. Checked in release
-    // builds too, because the slice below must fit in the buffer.
+    alg_unquant_with(x, n, k, spread, stride, rc, gain, &mut PulseScratch::new())
+}
+
+/// `alg_unquant` that keeps the pulse vector in `pulse_scratch`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn alg_unquant_with(
+    x: &mut [f32],
+    n: usize,
+    k: i32,
+    spread: i32,
+    stride: usize,
+    rc: &mut RangeCoder,
+    gain: f32,
+    pulse_scratch: &mut PulseScratch,
+) -> u32 {
+    // A band never has more than MAX_PVQ_N values, the size of the scratch
+    // memory.
     assert!(n <= MAX_PVQ_N, "band of {n} values exceeds MAX_PVQ_N");
-    let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-    // SAFETY: `n` values fit in the buffer (checked above). `decode_pulses`
-    // writes all `n` values before anything reads them.
-    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, n) };
+    let y = pulse_scratch.values(n);
     decode_pulses(y, n as u32, k as u32, rc);
 
     let mask = extract_collapse_mask(y, n, stride);
@@ -3451,11 +3499,13 @@ mod tests {
     }
 
     /// `alg_quant` with a cache that already holds angles, and without one,
-    /// writes the same bytes and leaves the same band.
+    /// writes the same bytes and leaves the same band. The pulse memory is
+    /// shared by all calls, as by the bands of a frame.
     #[test]
     fn alg_quant_with_a_cache_matches_alg_quant() {
         let mut rng = Lcg(11);
         let mut cache = RotationCache::new();
+        let mut pulse_scratch = PulseScratch::new();
         for &n in &[2usize, 4, 8, 12, 16, 18, 24, 36, 48, 72, 96, 144, 176] {
             for &stride in &[1usize, 2, 4] {
                 if n % stride != 0 {
@@ -3480,6 +3530,7 @@ mod tests {
                                 0.9,
                                 resynth,
                                 Some(&mut cache),
+                                &mut pulse_scratch,
                             );
                             ra.done();
                             rb.done();
