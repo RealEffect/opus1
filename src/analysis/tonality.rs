@@ -675,7 +675,9 @@ impl TonalityAnalysisState {
         let fft = fft_state();
         #[cfg(target_arch = "aarch64")]
         super::neon::window_for_fft(&self.inmem, fft, &mut sc.fft);
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        super::x86::window_for_fft(&self.inmem, fft, &mut sc.fft);
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
         window_for_fft_scalar(&self.inmem, fft, &mut sc.fft);
         self.inmem.copy_within(ANALYSIS_BUF_SIZE - 240.., 0);
         let remaining = len - (buf - mem_fill);
@@ -708,7 +710,9 @@ impl TonalityAnalysisState {
         let mut phase = Phase { angle: &mut self.angle, d_angle: &mut self.d_angle, d2_angle: &mut self.d2_angle };
         #[cfg(target_arch = "aarch64")]
         let first_scalar_bin = super::neon::tonality_bins(out, &mut phase, &mut sc.bins);
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        let first_scalar_bin = super::x86::tonality_bins(out, &mut phase, &mut sc.bins);
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
         let first_scalar_bin = 1;
         tonality_bins_scalar(out, first_scalar_bin, &mut phase, &mut sc.bins);
         let BinScratch { tonality, tonality2, noisiness, energy: bin_energy } = &mut sc.bins;
@@ -1070,8 +1074,12 @@ impl TonalityAnalysisState {
 ///
 /// The two real blocks of the analysis share one complex FFT: the older
 /// one is the real part, the newer one the imaginary part. 64-bit ARM uses
-/// the NEON version in `neon.rs`; this one is its reference in the tests.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// the NEON version in `neon.rs` and x86-64 the SSE version in `x86.rs`;
+/// this one is their reference in the tests.
+#[cfg_attr(
+    any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")),
+    allow(dead_code)
+)]
 pub(super) fn window_for_fft_scalar(inmem: &[f32; ANALYSIS_BUF_SIZE], st: &KissFftState, fout: &mut [KissCpx; N]) {
     let scale = st.scale();
     let bitrev = &st.bitrev[..N];
@@ -1107,8 +1115,8 @@ pub(super) struct BinScratch {
 }
 
 impl BinScratch {
-    /// Cleared buffers, for the tests of the NEON version.
-    #[cfg(all(test, target_arch = "aarch64"))]
+    /// Cleared buffers, for the tests of the NEON and SSE versions.
+    #[cfg(all(test, any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     pub(super) fn new() -> Self {
         Self { tonality: [0.0; N2], tonality2: [0.0; N2], noisiness: [0.0; N2], energy: [0.0; N2] }
     }
@@ -1132,7 +1140,8 @@ impl BinScratch {
 
 /// The phase-based tonality of FFT bins `first..240` (C 570-608) and
 /// their energies (C 639-640, 653-654 and 793-794), one bin at a time.
-/// The NEON version in `neon.rs` does the same four bins at a time.
+/// The NEON version in `neon.rs` and the SSE version in `x86.rs` do the same
+/// four bins at a time.
 pub(super) fn tonality_bins_scalar(out: &[KissCpx; N], first: usize, phase: &mut Phase<'_>, r: &mut BinScratch) {
     for i in first..N2 {
         let x1r = out[i].r + out[N - i].r;
@@ -1316,11 +1325,15 @@ fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) {
     if super::neon::downmix(pcm, y, offset) {
         return;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    if super::x86::downmix(pcm, y, offset) {
+        return;
+    }
     downmix_scalar(pcm, y, offset);
 }
 
 /// `downmix` for every layout, one sample at a time. It is also the
-/// reference of the NEON version in the tests.
+/// reference of the NEON and SSE versions in the tests.
 // The limits are written as in C, followed by the NaN test.
 #[allow(clippy::manual_clamp)]
 pub(super) fn downmix_scalar(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) {

@@ -25,6 +25,10 @@
 //! the same order. The results are then the same bits in every field. On
 //! other processors the products are rounded separately, as libopus builds
 //! without fused multiply-add round them.
+//!
+//! The busiest loops have vector versions: NEON on 64-bit ARM (`neon.rs`),
+//! SSE2 on x86-64 (`x86.rs`). Both give the bits of the scalar code of
+//! their processor.
 
 #[cfg(feature = "analysis")]
 pub mod mlp;
@@ -36,6 +40,8 @@ mod neon;
 mod tables;
 #[cfg(feature = "analysis")]
 mod tonality;
+#[cfg(all(feature = "analysis", target_arch = "x86_64", target_feature = "sse2"))]
+mod x86;
 
 #[cfg(feature = "analysis")]
 pub use tonality::{
@@ -180,11 +186,12 @@ impl AnalysisGate {
 /// give another answer there.
 ///
 /// Without a NaN, the answer depends only on the largest magnitude, which a
-/// vector search finds faster. So on 64-bit ARM a vector search runs first,
-/// and the loop of libopus runs only when the input holds a NaN.
+/// vector search finds faster. So on 64-bit ARM and x86-64 a vector search
+/// runs first, and the loop of libopus runs only when the input holds a
+/// NaN.
 pub fn is_digital_silence(pcm: &[f32], lsb_depth: i32) -> bool {
     let threshold = 1.0 / (1i32 << lsb_depth) as f32;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")))]
     if let Some(max_abs) = max_abs_without_nan(pcm) {
         return max_abs <= threshold;
     }
@@ -236,7 +243,45 @@ fn max_abs_without_nan(pcm: &[f32]) -> Option<f32> {
     Some(if max > -min { max } else { -min })
 }
 
-#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
+/// The largest magnitude in `pcm` (at least 0), or `None` when `pcm` holds a
+/// NaN. The SSE version of the function above: it keeps the largest
+/// magnitude instead of the largest and the smallest value, which gives the
+/// same answer, and a mask of the lanes that saw a NaN.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+fn max_abs_without_nan(pcm: &[f32]) -> Option<f32> {
+    use core::arch::x86_64::*;
+    let (blocks, tail) = pcm.as_chunks::<8>();
+    // SAFETY: SSE is part of this target (see the `cfg`); each block holds
+    // 8 values, read as two vectors of 4.
+    let (max, nan) = unsafe {
+        let sign = _mm_set1_ps(-0.0);
+        let zero = _mm_setzero_ps();
+        let (mut max0, mut max1, mut nan0, mut nan1) = (zero, zero, zero, zero);
+        for b in blocks {
+            let a = _mm_loadu_ps(b.as_ptr());
+            let c = _mm_loadu_ps(b.as_ptr().add(4));
+            // `_mm_max_ps` skips a NaN in its first operand, so the NaN
+            // test is separate: a NaN is unordered with itself.
+            max0 = _mm_max_ps(_mm_andnot_ps(sign, a), max0);
+            max1 = _mm_max_ps(_mm_andnot_ps(sign, c), max1);
+            nan0 = _mm_or_ps(nan0, _mm_cmpunord_ps(a, a));
+            nan1 = _mm_or_ps(nan1, _mm_cmpunord_ps(c, c));
+        }
+        let max = core::mem::transmute::<__m128, [f32; 4]>(_mm_max_ps(max0, max1));
+        (max, _mm_movemask_ps(_mm_or_ps(nan0, nan1)) != 0)
+    };
+    if nan || tail.iter().any(|x| x.is_nan()) {
+        return None;
+    }
+    let max = max.into_iter().chain(tail.iter().map(|x| x.abs())).fold(0.0f32, f32::max);
+    Some(max)
+}
+
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))
+))]
 mod tests {
     use super::*;
 
