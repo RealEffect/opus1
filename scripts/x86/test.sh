@@ -16,13 +16,22 @@
 #      code, and then the tests that compare with the libopus built with
 #      its neural network code.
 #   5. Checks the golden file of 64-bit ARM (x86 is expected to differ in
-#      some streams; the number is recorded).
+#      some streams; the number is recorded). Then compares opus1 with
+#      libopus live, scenario by scenario (perf_harness modes): both
+#      encoders and both decoders on the same input, as modes.md.
 #   6. Times encoding and decoding against the default libopus build
 #      (skipped with --quick).
+#      With --ab BASELINE_DIR it times this tree against the baseline tree
+#      instead: scripts/x86/ab.sh builds perf_harness in both, runs the
+#      bench set of each in turns (A B B A A B ...) and writes ab/ with a
+#      report of time of this tree / time of the baseline (see ab.sh). With
+#      --quick it only builds the two programs.
 #   7. Writes x86-results-<date>.tar.gz in the repository root.
 #
 # Usage, from the repository root:
-#   scripts/x86/test.sh [--quick] [--no-dnn]
+#   scripts/x86/test.sh [--quick] [--no-dnn] [--ab BASELINE_DIR [--passes N]]
+#
+#   --passes N  runs of each build in the A/B timing (default 5)
 #
 # Settings (environment variables):
 #   OPUS_TARBALL  A local copy of opus-1.6.1.tar.gz. Default: download it
@@ -42,13 +51,27 @@ OPUS_SHA256=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
 
 QUICK=0
 DNN=1
-for arg in "$@"; do
-    case "$arg" in
+AB=""
+PASSES=5
+while [ $# -gt 0 ]; do
+    case "$1" in
         --quick) QUICK=1 ;;
         --no-dnn) DNN=0 ;;
-        *) echo "unknown option: $arg" >&2; exit 2 ;;
+        --ab | --passes)
+            [ $# -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 2; }
+            if [ "$1" = --ab ]; then AB=$2; else PASSES=$2; fi
+            shift ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
+    shift
 done
+# Checked here, before the step message of the A/B timing computes with it.
+case "$PASSES" in
+    '' | *[!0-9]* | 0) echo "error: --passes needs a whole number of at least 1" >&2; exit 2 ;;
+esac
+if [ -n "$AB" ]; then
+    AB=$(cd "$AB" 2>/dev/null && pwd) || { echo "error: --ab: no folder ${AB}" >&2; exit 2; }
+fi
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$REPO"
@@ -198,7 +221,28 @@ else
     echo "no scripts/x86/golden_r10.txt in this copy; skipped" | tee -a "$OUT/summary.txt"
 fi
 
-if [ "$QUICK" = 0 ]; then
+# The golden file holds the output of an earlier run, so on x86 it can only
+# show that the output changed. This step runs opus1 and libopus on the
+# same input instead: decoder agreement in dB, and the coding error of each
+# encoder with libopus decoding (see the legend of modes.md).
+step "live comparison with libopus (perf_harness modes)"
+LIBOPUS_LIB_DIR="$WORK/libopus-default" CARGO_TARGET_DIR="$REPO/target/x86-default" \
+    cargo run --release --example perf_harness -- modes --md "$OUT/modes.md" > "$OUT/modes.log" 2>&1
+echo "modes: exit status $?, $(sed -n '/need attention/,$p' "$OUT/modes.md" 2>/dev/null | grep -c '^- ') scenarios need attention (see modes.md)" \
+    | tee -a "$OUT/summary.txt"
+
+if [ -n "$AB" ]; then
+    if [ "$QUICK" = 1 ]; then
+        step "A/B: building perf_harness of the baseline ($AB) and of this tree (no timing with --quick)"
+        ab_args=(--build-only)
+    else
+        step "A/B timing: the baseline ($AB) against this tree, $PASSES runs of each, about $((PASSES * 6 + 5)) minutes; keep the computer idle"
+        ab_args=(--passes "$PASSES")
+    fi
+    LIBOPUS_LIB_DIR="$WORK/libopus-default" bash "$REPO/scripts/x86/ab.sh" --out "$OUT/ab" "${ab_args[@]}" "$AB"
+    echo "ab: exit status $?" | tee -a "$OUT/summary.txt"
+    [ -f "$OUT/ab/ab-summary.txt" ] && cat "$OUT/ab/ab-summary.txt" >> "$OUT/summary.txt"
+elif [ "$QUICK" = 0 ]; then
     step "timing against libopus (default build), a few minutes; keep the computer idle"
     LIBOPUS_LIB_DIR="$WORK/libopus-default" CARGO_TARGET_DIR="$REPO/target/x86-default" \
         cargo run --release --example perf_harness -- bench --md "$OUT/bench.md" --json "$OUT/bench.json" \
