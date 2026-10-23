@@ -211,7 +211,10 @@ const BURG_MAX_SUBFR_LENGTH: usize = MAX_SUB_FRAME_LENGTH + MAX_LPC_ORDER;
 ///
 /// This is the code for every target and the reference for
 /// `burg_neon::add_subframes`. `BurgSignal::add_step` picks between them.
+/// On x86-64 it is inlined, so that the AVX2 copy of
+/// `silk_burg_modified_fix` compiles it with AVX2 too.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn burg_add_subframes_scalar(
     c_first_row: &mut [i32; MAX_LPC_ORDER],
     c_last_row: &mut [i32; MAX_LPC_ORDER],
@@ -590,6 +593,80 @@ impl<'a> BurgSignal<'a> {
 }
 
 pub fn silk_burg_modified_fix(
+    res_nrg: &mut i32,
+    res_nrg_q: &mut i32,
+    a_q16: &mut [i32],
+    x: &[i16],
+    min_inv_gain_q30: i32,
+    subfr_length: usize,
+    nb_subfr: usize,
+    d: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        unsafe {
+            burg_modified_avx2(
+                res_nrg,
+                res_nrg_q,
+                a_q16,
+                x,
+                min_inv_gain_q30,
+                subfr_length,
+                nb_subfr,
+                d,
+            )
+        };
+        return;
+    }
+    burg_modified_portable(
+        res_nrg,
+        res_nrg_q,
+        a_q16,
+        x,
+        min_inv_gain_q30,
+        subfr_length,
+        nb_subfr,
+        d,
+    );
+}
+
+/// [`silk_burg_modified_fix`] compiled with AVX2 enabled.
+///
+/// AVX2 only changes how the compiler encodes and vectorizes the code. The
+/// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
+/// multiplication, which fixed-point code needs; AVX2 has both. The results
+/// are the same bits.
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn burg_modified_avx2(
+    res_nrg: &mut i32,
+    res_nrg_q: &mut i32,
+    a_q16: &mut [i32],
+    x: &[i16],
+    min_inv_gain_q30: i32,
+    subfr_length: usize,
+    nb_subfr: usize,
+    d: usize,
+) {
+    burg_modified_portable(
+        res_nrg,
+        res_nrg_q,
+        a_q16,
+        x,
+        min_inv_gain_q30,
+        subfr_length,
+        nb_subfr,
+        d,
+    );
+}
+
+#[inline(always)]
+fn burg_modified_portable(
     res_nrg: &mut i32,
     res_nrg_q: &mut i32,
     a_q16: &mut [i32],
@@ -1257,6 +1334,61 @@ mod burg_tests {
                                 nb_subfr,
                                 d,
                                 "encoder frame",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The AVX2 copy against the portable body, whatever the dispatch
+    /// chooses: every order, 1 to 4 subframes, short and long subframes,
+    /// every signal level and both limits of the inverse gain.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_copy_matches_portable() {
+        if !crate::compat::x86_has_avx2() {
+            return;
+        }
+        let mut rng = XorShift(0x3c6e_f372_fe94_f82b);
+        for d in 1..=MAX_LPC_ORDER {
+            for nb_subfr in 1..=4usize {
+                for subfr_length in [d + 1, 25, 56, 96, 130] {
+                    if subfr_length <= d {
+                        continue;
+                    }
+                    for level_bits in [2u32, 9, 15] {
+                        let x = signal(&mut rng, subfr_length * nb_subfr, level_bits);
+                        for min_inv_gain_q30 in [107_374, 10_737_418] {
+                            let mut want = ([0x5a5a_5a5ai32; MAX_LPC_ORDER], 0i32, 0i32);
+                            let mut got = want;
+                            burg_modified_portable(
+                                &mut want.1,
+                                &mut want.2,
+                                &mut want.0,
+                                &x,
+                                min_inv_gain_q30,
+                                subfr_length,
+                                nb_subfr,
+                                d,
+                            );
+                            // SAFETY: the processor has AVX2 (checked above).
+                            unsafe {
+                                burg_modified_avx2(
+                                    &mut got.1,
+                                    &mut got.2,
+                                    &mut got.0,
+                                    &x,
+                                    min_inv_gain_q30,
+                                    subfr_length,
+                                    nb_subfr,
+                                    d,
+                                )
+                            };
+                            assert_eq!(
+                                got, want,
+                                "subframe {subfr_length}, {nb_subfr} subframes, order {d}"
                             );
                         }
                     }

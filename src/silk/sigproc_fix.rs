@@ -341,6 +341,33 @@ fn mac16_16(a: i32, b: i16, c: i16) -> i32 {
 /// most `x.len() + 1` elements.
 #[inline]
 fn autocorr_sums(results: &mut [i32], x: &[i16]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        unsafe { autocorr_sums_avx2(results, x) };
+        return;
+    }
+    autocorr_sums_portable(results, x);
+}
+
+/// [`autocorr_sums`] compiled with AVX2 enabled.
+///
+/// AVX2 only changes how the compiler encodes and vectorizes the code. The
+/// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
+/// multiplication, which fixed-point code needs; AVX2 has both. The results
+/// are the same bits.
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn autocorr_sums_avx2(results: &mut [i32], x: &[i16]) {
+    autocorr_sums_portable(results, x);
+}
+
+#[inline(always)]
+fn autocorr_sums_portable(results: &mut [i32], x: &[i16]) {
     let n = x.len();
     let count = results.len();
     let mut k = 0;
@@ -631,6 +658,43 @@ pub fn silk_corr_vector_fix(
     xt: &mut [i32],
     rshifts: i32,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        unsafe { corr_vector_avx2(x, t, l, order, xt, rshifts) };
+        return;
+    }
+    corr_vector_portable(x, t, l, order, xt, rshifts);
+}
+
+/// [`silk_corr_vector_fix`] compiled with AVX2 enabled. The results are the
+/// same bits; see [`autocorr_sums_avx2`].
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn corr_vector_avx2(
+    x: &[i16],
+    t: &[i16],
+    l: usize,
+    order: usize,
+    xt: &mut [i32],
+    rshifts: i32,
+) {
+    corr_vector_portable(x, t, l, order, xt, rshifts);
+}
+
+#[inline(always)]
+fn corr_vector_portable(
+    x: &[i16],
+    t: &[i16],
+    l: usize,
+    order: usize,
+    xt: &mut [i32],
+    rshifts: i32,
+) {
     let mut ptr1_idx = order - 1;
     if rshifts > 0 {
         for xt_val in xt[..order].iter_mut() {
@@ -654,6 +718,43 @@ pub fn silk_corr_vector_fix(
 }
 
 pub fn silk_corr_matrix_fix(
+    x: &[i16],
+    l: usize,
+    order: usize,
+    xx: &mut [i32],
+    nrg: &mut i32,
+    rshifts: &mut i32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        unsafe { corr_matrix_avx2(x, l, order, xx, nrg, rshifts) };
+        return;
+    }
+    corr_matrix_portable(x, l, order, xx, nrg, rshifts);
+}
+
+/// [`silk_corr_matrix_fix`] compiled with AVX2 enabled. The results are the
+/// same bits; see [`autocorr_sums_avx2`].
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn corr_matrix_avx2(
+    x: &[i16],
+    l: usize,
+    order: usize,
+    xx: &mut [i32],
+    nrg: &mut i32,
+    rshifts: &mut i32,
+) {
+    corr_matrix_portable(x, l, order, xx, nrg, rshifts);
+}
+
+#[inline(always)]
+fn corr_matrix_portable(
     x: &[i16],
     l: usize,
     order: usize,
@@ -2374,6 +2475,57 @@ mod tests {
                         "n={n} count={count} kind={kind}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The AVX2 copies of `autocorr_sums`, `silk_corr_vector_fix` and
+    /// `silk_corr_matrix_fix` against the portable bodies, whatever the
+    /// dispatch chooses: lengths 0 to 40, the subframe lengths of the
+    /// encoder and random ones, orders 1 to 16, every signal kind and right
+    /// shifts of the correlation vector from 0 to 6.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_copies_match_portable() {
+        if !crate::compat::x86_has_avx2() {
+            return;
+        }
+        let mut rng = TestRng(0x6a09_e667_f3bc_c908);
+        let lengths: Vec<usize> = (0..=40)
+            .chain([80, 120, 160, 240, 640])
+            .chain((0..60).map(|_| rng.below(700) as usize))
+            .collect();
+        for (case, &n) in lengths.iter().enumerate() {
+            for kind in 0..6 {
+                let x = test_signal(&mut rng, n + 16, kind);
+                let t = test_signal(&mut rng, n, (kind + 1) % 6);
+
+                let count = (rng.below(25) as usize + 1).min(n + 1);
+                let mut want = [0x0bad_beefi32; 25];
+                let mut got = [0x0bad_beefi32; 25];
+                autocorr_sums_portable(&mut want[..count], &x[..n]);
+                // SAFETY: the processor has AVX2 (checked above).
+                unsafe { autocorr_sums_avx2(&mut got[..count], &x[..n]) };
+                assert_eq!(got, want, "autocorr_sums n={n} count={count} kind={kind}");
+
+                if n == 0 {
+                    continue;
+                }
+                let order = 1 + (case + kind as usize) % 16;
+                let rshifts = rng.below(7) as i32;
+                let mut want = [0x0bad_beefi32; 16];
+                let mut got = [0x0bad_beefi32; 16];
+                corr_vector_portable(&x, &t, n, order, &mut want, rshifts);
+                // SAFETY: the processor has AVX2 (checked above).
+                unsafe { corr_vector_avx2(&x, &t, n, order, &mut got, rshifts) };
+                assert_eq!(got, want, "corr_vector n={n} order={order} rshifts={rshifts}");
+
+                let mut want = ([0x0bad_beefi32; 256], 0i32, 0i32);
+                let mut got = ([0x0bad_beefi32; 256], 0i32, 0i32);
+                corr_matrix_portable(&x, n, order, &mut want.0, &mut want.1, &mut want.2);
+                // SAFETY: the processor has AVX2 (checked above).
+                unsafe { corr_matrix_avx2(&x, n, order, &mut got.0, &mut got.1, &mut got.2) };
+                assert_eq!(got, want, "corr_matrix n={n} order={order} kind={kind}");
             }
         }
     }

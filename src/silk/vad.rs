@@ -55,7 +55,33 @@ fn silk_vad_get_noise_levels(p_x: &[i32; VAD_N_BANDS], ps_silk_vad: &mut SilkVAD
     }
 }
 
-pub fn silk_vad_get_sa_q8(ps_enc: &mut SilkEncoderState, p_in: &[i16], _n_in: usize) -> i32 {
+pub fn silk_vad_get_sa_q8(ps_enc: &mut SilkEncoderState, p_in: &[i16], n_in: usize) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        return unsafe { vad_get_sa_q8_avx2(ps_enc, p_in, n_in) };
+    }
+    vad_get_sa_q8_portable(ps_enc, p_in, n_in)
+}
+
+/// [`silk_vad_get_sa_q8`] compiled with AVX2 enabled.
+///
+/// AVX2 only changes how the compiler encodes and vectorizes the code. The
+/// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
+/// multiplication, which fixed-point code needs; AVX2 has both. The results
+/// are the same bits.
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vad_get_sa_q8_avx2(ps_enc: &mut SilkEncoderState, p_in: &[i16], n_in: usize) -> i32 {
+    vad_get_sa_q8_portable(ps_enc, p_in, n_in)
+}
+
+#[inline(always)]
+fn vad_get_sa_q8_portable(ps_enc: &mut SilkEncoderState, p_in: &[i16], _n_in: usize) -> i32 {
     let ps_silk_vad = &mut ps_enc.s_cmn.s_vad;
 
     let mut x_nrg = [0i32; VAD_N_BANDS];

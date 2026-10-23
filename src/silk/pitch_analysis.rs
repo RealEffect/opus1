@@ -436,6 +436,94 @@ pub fn silk_pitch_analysis_core(
     complexity: usize,
     nb_subfr: usize,
 ) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        return unsafe {
+            pitch_analysis_core_avx2(
+                frame_unscaled,
+                pitch_out,
+                lag_index,
+                contour_index,
+                ltp_corr_q15,
+                prev_lag,
+                search_thres1_q16,
+                search_thres2_q13,
+                fs_khz,
+                complexity,
+                nb_subfr,
+            )
+        };
+    }
+    pitch_analysis_core_portable(
+        frame_unscaled,
+        pitch_out,
+        lag_index,
+        contour_index,
+        ltp_corr_q15,
+        prev_lag,
+        search_thres1_q16,
+        search_thres2_q13,
+        fs_khz,
+        complexity,
+        nb_subfr,
+    )
+}
+
+/// [`silk_pitch_analysis_core`] compiled with AVX2 enabled.
+///
+/// AVX2 only changes how the compiler encodes and vectorizes the code. The
+/// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
+/// multiplication, which fixed-point code needs; AVX2 has both. The results
+/// are the same bits.
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pitch_analysis_core_avx2(
+    frame_unscaled: &[i16],
+    pitch_out: &mut [i32],
+    lag_index: &mut i16,
+    contour_index: &mut i8,
+    ltp_corr_q15: &mut i32,
+    prev_lag: i32,
+    search_thres1_q16: i32,
+    search_thres2_q13: i32,
+    fs_khz: i32,
+    complexity: usize,
+    nb_subfr: usize,
+) -> i32 {
+    pitch_analysis_core_portable(
+        frame_unscaled,
+        pitch_out,
+        lag_index,
+        contour_index,
+        ltp_corr_q15,
+        prev_lag,
+        search_thres1_q16,
+        search_thres2_q13,
+        fs_khz,
+        complexity,
+        nb_subfr,
+    )
+}
+
+#[inline(always)]
+fn pitch_analysis_core_portable(
+    frame_unscaled: &[i16],
+    pitch_out: &mut [i32],
+    lag_index: &mut i16,
+    contour_index: &mut i8,
+    ltp_corr_q15: &mut i32,
+    prev_lag: i32,
+    search_thres1_q16: i32,
+    search_thres2_q13: i32,
+    fs_khz: i32,
+    complexity: usize,
+    nb_subfr: usize,
+) -> i32 {
     let mut filt_state = [0i32; 6];
     let mut frame_8khz_buf =
         [0i16; (PE_LTP_MEM_LENGTH_MS + PE_MAX_NB_SUBFR * PE_SUBFR_LENGTH_MS) * 8];
@@ -1007,6 +1095,10 @@ fn stage3_tables(
 /// each lag of the search range of the subframe: `cross_corr_st3[k][i]`
 /// belongs to the lag `start_lag` plus the lowest offset of subframe `k`
 /// plus `i`.
+///
+/// On x86-64 it is inlined, so that the AVX2 copy of
+/// `silk_pitch_analysis_core` compiles it with AVX2 too.
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn silk_p_ana_calc_corr_st3(
     cross_corr_st3: &mut [[i32; SCRATCH_SIZE]; PE_MAX_NB_SUBFR],
     frame: &[i16],
@@ -1045,7 +1137,8 @@ fn silk_p_ana_calc_corr_st3(
 
 /// Energy of the signal that every subframe is compared with, for each lag
 /// of the search range of the subframe, in the layout of
-/// `silk_p_ana_calc_corr_st3`.
+/// `silk_p_ana_calc_corr_st3`. On x86-64 it is inlined, as that one.
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn silk_p_ana_calc_energy_st3(
     energies_st3: &mut [[i32; SCRATCH_SIZE]; PE_MAX_NB_SUBFR],
     frame: &[i16],

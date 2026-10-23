@@ -21,6 +21,117 @@ pub fn silk_nsq(
     lambda_q10: i32,
     ltp_scale_q14: i32,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_avx2() {
+        // SAFETY: the processor has AVX2.
+        unsafe {
+            nsq_avx2(
+                ps_enc_c,
+                nsq,
+                ps_indices,
+                x16,
+                pulses,
+                pred_coef_q12,
+                ltp_coef_q14,
+                ar_q13,
+                harm_shape_gain_q14,
+                tilt_q14,
+                lf_shp_q14,
+                gains_q16,
+                pitch_l,
+                lambda_q10,
+                ltp_scale_q14,
+            )
+        };
+        return;
+    }
+    nsq_portable(
+        ps_enc_c,
+        nsq,
+        ps_indices,
+        x16,
+        pulses,
+        pred_coef_q12,
+        ltp_coef_q14,
+        ar_q13,
+        harm_shape_gain_q14,
+        tilt_q14,
+        lf_shp_q14,
+        gains_q16,
+        pitch_l,
+        lambda_q10,
+        ltp_scale_q14,
+    );
+}
+
+/// [`silk_nsq`] compiled with AVX2 enabled, for the scaling of the states
+/// and the setup of each subframe. The sample loop has its own SSE4.1
+/// version (`x86::quantize_subframe_sse41`).
+///
+/// AVX2 only changes how the compiler encodes and vectorizes the code. The
+/// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
+/// multiplication, which fixed-point code needs; AVX2 has both. The results
+/// are the same bits.
+///
+/// # Safety
+///
+/// The processor must have AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn nsq_avx2(
+    ps_enc_c: &SilkEncoderStateCommon,
+    nsq: &mut SilkNSQState,
+    ps_indices: &SideInfoIndices,
+    x16: &[i16],
+    pulses: &mut [i8],
+    pred_coef_q12: &[i16],
+    ltp_coef_q14: &[i16],
+    ar_q13: &[i16],
+    harm_shape_gain_q14: &[i32],
+    tilt_q14: &[i32],
+    lf_shp_q14: &[i32],
+    gains_q16: &[i32],
+    pitch_l: &[i32],
+    lambda_q10: i32,
+    ltp_scale_q14: i32,
+) {
+    nsq_portable(
+        ps_enc_c,
+        nsq,
+        ps_indices,
+        x16,
+        pulses,
+        pred_coef_q12,
+        ltp_coef_q14,
+        ar_q13,
+        harm_shape_gain_q14,
+        tilt_q14,
+        lf_shp_q14,
+        gains_q16,
+        pitch_l,
+        lambda_q10,
+        ltp_scale_q14,
+    );
+}
+
+#[inline(always)]
+fn nsq_portable(
+    ps_enc_c: &SilkEncoderStateCommon,
+    nsq: &mut SilkNSQState,
+    ps_indices: &SideInfoIndices,
+    x16: &[i16],
+    pulses: &mut [i8],
+    pred_coef_q12: &[i16],
+    ltp_coef_q14: &[i16],
+    ar_q13: &[i16],
+    harm_shape_gain_q14: &[i32],
+    tilt_q14: &[i32],
+    lf_shp_q14: &[i32],
+    gains_q16: &[i32],
+    pitch_l: &[i32],
+    lambda_q10: i32,
+    ltp_scale_q14: i32,
+) {
     let mut lag: usize;
     let mut start_idx: usize;
     let mut a_q12: &[i16];
@@ -135,6 +246,11 @@ pub fn silk_nsq(
         .copy_within(frame_length..frame_length + ltp_mem_length, 0);
 }
 
+/// Scales the input of subframe `k` by the inverse of its gain, and the
+/// states of the quantizer by the change of the gain (libopus
+/// `silk_nsq_scale_states`). On x86-64 it is inlined, so that the AVX2 copy
+/// of `silk_nsq` compiles it with AVX2 too.
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 pub fn silk_nsq_scale_states(
     ps_enc_c: &SilkEncoderStateCommon,
     nsq: &mut SilkNSQState,
