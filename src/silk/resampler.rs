@@ -676,6 +676,12 @@ fn down_fir_interpolated(
 ) {
     #[cfg(target_arch = "aarch64")]
     down_fir_interpolated_neon(out, buf, index_increment_q16, fracs, taps);
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_sse41() {
+        // SAFETY: the processor has SSE4.1.
+        unsafe { x86::down_fir_interpolated_sse41(out, buf, index_increment_q16, fracs, taps) };
+        return;
+    }
     #[cfg(not(target_arch = "aarch64"))]
     down_fir_interpolated_scalar(out, buf, 0, index_increment_q16, fracs, taps);
 }
@@ -768,7 +774,7 @@ fn down_fir_interpolated_neon(
 /// `buf_len` samples of the buffer. With valid arguments this is `n_out`
 /// rounded down to a multiple of four; the scalar kernel computes the rest
 /// (and panics on an argument that is not valid).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn down_fir_vector_len(
     n_out: usize,
@@ -822,6 +828,12 @@ fn down_fir_symmetric<const HALF: usize>(
 ) {
     #[cfg(target_arch = "aarch64")]
     down_fir_symmetric_neon(out, buf, index_increment_q16, coefs);
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_sse41() {
+        // SAFETY: the processor has SSE4.1.
+        unsafe { x86::down_fir_symmetric_sse41(out, buf, index_increment_q16, coefs) };
+        return;
+    }
     #[cfg(not(target_arch = "aarch64"))]
     down_fir_symmetric_scalar(out, buf, 0, index_increment_q16, coefs);
 }
@@ -971,7 +983,9 @@ fn iir_fir_interpol(
 
     #[cfg(target_arch = "aarch64")]
     iir_fir_interpol_neon(&mut out[..n], buf, 0, index_increment_q16);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    x86::iir_fir_interpol_sse2(&mut out[..n], buf, 0, index_increment_q16);
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     iir_fir_interpol_scalar(&mut out[..n], buf, 0, index_increment_q16);
     n
 }
@@ -1121,6 +1135,12 @@ pub fn silk_resampler_private_up2_hq(s: &mut [i32], out: &mut [i16], input: &[i1
 fn up2_hq(s: &mut [i32; 6], out: &mut [MaybeUninit<i16>], input: &[i16]) {
     #[cfg(target_arch = "aarch64")]
     up2_hq_neon(s, out, input);
+    #[cfg(target_arch = "x86_64")]
+    if crate::compat::x86_has_sse41() {
+        // SAFETY: the processor has SSE4.1.
+        unsafe { x86::up2_hq_sse41(s, out, input) };
+        return;
+    }
     #[cfg(not(target_arch = "aarch64"))]
     up2_hq_scalar(s, out, input);
 }
@@ -1356,6 +1376,332 @@ pub fn silk_resampler_down2_3(s: &mut [i32], out: &mut [i16], input: &[i16], in_
     }
 }
 
+/// The x86-64 kernels of the resampler. Each computes what the NEON kernel
+/// of the same name computes, with the same integer arithmetic, so the
+/// results are the bits of the portable code.
+///
+/// `silk_smulwb(x, c)`, `(x * c) >> 16` for a 16-bit `c`, is the upper half
+/// of the 64-bit product of `x` and `c << 16`. `_mm_mul_epi32` (SSE4.1)
+/// gives that product for lanes 0 and 2, so the results land in lanes 1
+/// and 3. The kernels that sum such products for one output sample add the
+/// whole 64-bit lanes with 32-bit additions: lanes 1 and 3 then hold the
+/// sums of the upper halves, exactly as the scalar code adds them, and
+/// lanes 0 and 2 are not used.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    /// One output sample of `down_fir_interpolated` or
+    /// `down_fir_symmetric` per vector: the sum of each of `p0` to `p3`,
+    /// whose lanes 1 and 3 hold the two halves of the sum, rounded from Q6
+    /// to Q0 and saturated to 16 bits, as `silk_sat16(silk_rshift_round(
+    /// res_q6, 6))`. Stores the four samples at `out`.
+    ///
+    /// # Safety
+    /// The processor must have SSE4.1, and `out` must be valid for writing
+    /// four samples.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn store4_q6(out: *mut i16, p0: __m128i, p1: __m128i, p2: __m128i, p3: __m128i) {
+        // `[p0[1], p1[1], p0[3], p1[3]]` and the same for `p2` and `p3`.
+        let q01 = _mm_blend_epi16::<0b1100_1100>(_mm_srli_epi64::<32>(p0), p1);
+        let q23 = _mm_blend_epi16::<0b1100_1100>(_mm_srli_epi64::<32>(p2), p3);
+        let res_q6 = _mm_add_epi32(_mm_unpacklo_epi64(q01, q23), _mm_unpackhi_epi64(q01, q23));
+        // silk_rshift_round(x, 6) = ((x >> 5) + 1) >> 1, without overflow.
+        let rounded = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_srai_epi32::<5>(res_q6), _mm_set1_epi32(1)));
+        // SAFETY: see the function's contract.
+        unsafe { _mm_storel_epi64(out.cast(), _mm_packs_epi32(rounded, rounded)) };
+    }
+
+    /// The factors for `_mm_mul_epi32` of up to 20 taps in four-lane
+    /// vectors: `even[v]` has `taps[4 * v] << 16` and `taps[4 * v + 2] << 16`
+    /// in lanes 0 and 2, `odd[v]` the factors of taps `4 * v + 1` and
+    /// `4 * v + 3` there. Lanes 1 and 3 are not read.
+    #[derive(Clone, Copy)]
+    struct Factors<const V: usize> {
+        even: [__m128i; V],
+        odd: [__m128i; V],
+    }
+
+    impl<const V: usize> Factors<V> {
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        fn new(taps: &[i16; 20]) -> Self {
+            let f = |k: usize| (taps[k] as i32) << 16;
+            Factors {
+                even: core::array::from_fn(|v| _mm_setr_epi32(f(4 * v), 0, f(4 * v + 2), 0)),
+                odd: core::array::from_fn(|v| _mm_setr_epi32(f(4 * v + 1), 0, f(4 * v + 3), 0)),
+            }
+        }
+    }
+
+    /// The products of the four lanes of `x` with the taps of `even` and
+    /// `odd`, added to `acc` (see the module documentation).
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    fn mul_add(acc: __m128i, x: __m128i, even: __m128i, odd: __m128i) -> __m128i {
+        let acc = _mm_add_epi32(acc, _mm_mul_epi32(x, even));
+        _mm_add_epi32(acc, _mm_mul_epi32(_mm_srli_epi64::<32>(x), odd))
+    }
+
+    /// `down_fir_interpolated_scalar` with four output samples per step,
+    /// as `down_fir_interpolated_neon`.
+    ///
+    /// # Safety
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn down_fir_interpolated_sse41(
+        out: &mut [i16],
+        buf: &[i32],
+        index_increment_q16: i32,
+        fracs: i32,
+        taps: &DownFirTaps,
+    ) {
+        let mut index_q16 = 0i32;
+        let n4 = down_fir_vector_len(
+            out.len(),
+            buf.len(),
+            RESAMPLER_DOWN_ORDER_FIR0,
+            index_increment_q16,
+        );
+        // The taps of each phase in the layout of `DownFirTaps::wide`: taps
+        // 0 to 15, then taps 14 to 17 with the first two set to zero. The
+        // fifth vector, loaded at sample 14, then covers the last two taps
+        // without reading past the 18 samples.
+        let factors: [Factors<5>; 4] = core::array::from_fn(|phase| {
+            let t = &taps.taps[phase];
+            let mut wide = [0i16; 20];
+            wide[..16].copy_from_slice(&t[..16]);
+            wide[18] = t[16];
+            wide[19] = t[17];
+            Factors::new(&wide)
+        });
+
+        // SAFETY: the processor has SSE4.1 (the caller's contract).
+        // `down_fir_vector_len` has checked that every one of the `n4`
+        // samples reads 18 samples of `buf` that lie inside it; the loads
+        // below read `x[0..16]` and `x[14..18]` of those. A step at `i` has
+        // `i + 4 <= n4 <= out.len()` and writes `out[i..i + 4]`.
+        unsafe {
+            let products = |index_q16: i32| -> __m128i {
+                let x = buf.as_ptr().add((index_q16 >> 16) as usize);
+                let f = &factors[down_fir_phase(index_q16, fracs)];
+                let load = |k: usize| _mm_loadu_si128(x.add(k).cast());
+                let mut acc = _mm_setzero_si128();
+                acc = mul_add(acc, load(0), f.even[0], f.odd[0]);
+                acc = mul_add(acc, load(4), f.even[1], f.odd[1]);
+                acc = mul_add(acc, load(8), f.even[2], f.odd[2]);
+                acc = mul_add(acc, load(12), f.even[3], f.odd[3]);
+                mul_add(acc, load(14), f.even[4], f.odd[4])
+            };
+            let mut i = 0;
+            while i < n4 {
+                let p0 = products(index_q16);
+                let p1 = products(index_q16.wrapping_add(index_increment_q16));
+                let p2 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(2)));
+                let p3 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(3)));
+                store4_q6(out.as_mut_ptr().add(i), p0, p1, p2, p3);
+                index_q16 = index_q16.wrapping_add(index_increment_q16.wrapping_mul(4));
+                i += 4;
+            }
+        }
+        down_fir_interpolated_scalar(&mut out[n4..], buf, index_q16, index_increment_q16, fracs, taps);
+    }
+
+    /// `down_fir_symmetric_scalar` with four output samples per step, as
+    /// `down_fir_symmetric_neon`.
+    ///
+    /// # Safety
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn down_fir_symmetric_sse41<const HALF: usize>(
+        out: &mut [i16],
+        buf: &[i32],
+        index_increment_q16: i32,
+        coefs: &[i16; HALF],
+    ) {
+        // Four pairs per vector. With 18 pairs the fifth vector starts at
+        // pair 16; its last two coefficients are zero.
+        const MAX_VECTORS: usize = 5;
+        let vectors = HALF.div_ceil(4);
+        assert!(vectors <= MAX_VECTORS && 4 * vectors <= 2 * HALF);
+        let mut wide = [0i16; 4 * MAX_VECTORS];
+        wide[..HALF].copy_from_slice(coefs);
+        let f = Factors::<MAX_VECTORS>::new(&wide);
+
+        let mut index_q16 = 0i32;
+        let n4 = down_fir_vector_len(out.len(), buf.len(), 2 * HALF, index_increment_q16);
+
+        // SAFETY: the processor has SSE4.1 (the caller's contract).
+        // `down_fir_vector_len` has checked that every one of the `n4`
+        // samples reads `2 * HALF` samples of `buf` that lie inside it.
+        // Vector `v` reads `x[4 * v..4 * v + 4]` and
+        // `x[2 * HALF - 4 - 4 * v..2 * HALF - 4 * v]` of those; both are
+        // inside because `4 * vectors <= 2 * HALF` (checked above). A step
+        // at `i` has `i + 4 <= n4 <= out.len()` and writes `out[i..i + 4]`.
+        unsafe {
+            let products = |index_q16: i32| -> __m128i {
+                let x = buf.as_ptr().add((index_q16 >> 16) as usize);
+                let mut acc = _mm_setzero_si128();
+                for v in 0..vectors {
+                    let first = _mm_loadu_si128(x.add(4 * v).cast());
+                    // The mirrored samples, in reverse order.
+                    let second = _mm_loadu_si128(x.add(2 * HALF - 4 - 4 * v).cast());
+                    let second = _mm_shuffle_epi32::<0b00_01_10_11>(second);
+                    let pairs = _mm_add_epi32(first, second);
+                    acc = mul_add(acc, pairs, f.even[v], f.odd[v]);
+                }
+                acc
+            };
+            let mut i = 0;
+            while i < n4 {
+                let p0 = products(index_q16);
+                let p1 = products(index_q16.wrapping_add(index_increment_q16));
+                let p2 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(2)));
+                let p3 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(3)));
+                store4_q6(out.as_mut_ptr().add(i), p0, p1, p2, p3);
+                index_q16 = index_q16.wrapping_add(index_increment_q16.wrapping_mul(4));
+                i += 4;
+            }
+        }
+        down_fir_symmetric_scalar(&mut out[n4..], buf, index_q16, index_increment_q16, coefs);
+    }
+
+    /// `iir_fir_interpol_scalar` with four output samples per step, as
+    /// `iir_fir_interpol_neon`. SSE2 is enough: `_mm_madd_epi16` multiplies
+    /// the 8 samples by the 8 taps and adds the products in pairs. The sums
+    /// wrap at 32 bits as the scalar code's do (`silk_smlabb`), so the order
+    /// of the additions does not change them.
+    #[cfg(target_feature = "sse2")]
+    pub(super) fn iir_fir_interpol_sse2(
+        out: &mut [i16],
+        buf: &[i16],
+        mut index_q16: i32,
+        index_increment_q16: i32,
+    ) {
+        let n = out.len();
+        let n4 = n & !3;
+        if n4 > 0 {
+            // The position in `buf` never decreases, so the last sample of
+            // the vector part has the largest one.
+            let last_index_q16 = index_q16 as i64 + (n4 as i64 - 1) * index_increment_q16 as i64;
+            assert!(
+                index_q16 >= 0
+                    && index_increment_q16 > 0
+                    && (last_index_q16 >> 16) as usize + RESAMPLER_ORDER_FIR_12 <= buf.len()
+            );
+
+            // SAFETY: SSE2 is part of this target (see the `cfg`). Every
+            // load from `buf` reads 8 samples at a position from 0 to that
+            // of the last sample, which ends inside `buf` (checked above).
+            // The taps are 8-element arrays. A step at `i` has `i + 4 <= n`
+            // and writes `out[i..i + 4]`.
+            unsafe {
+                // The 8 products of one output sample, added in pairs.
+                let products = |index_q16: i32| -> __m128i {
+                    let x = _mm_loadu_si128(buf.as_ptr().add((index_q16 >> 16) as usize).cast());
+                    let taps = _mm_loadu_si128(iir_fir_taps(index_q16).as_ptr().cast());
+                    _mm_madd_epi16(x, taps)
+                };
+                let mut i = 0;
+                while i < n4 {
+                    let p0 = products(index_q16);
+                    let p1 = products(index_q16.wrapping_add(index_increment_q16));
+                    let p2 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(2)));
+                    let p3 = products(index_q16.wrapping_add(index_increment_q16.wrapping_mul(3)));
+                    // One sum per output sample in each lane.
+                    let t01 = _mm_add_epi32(_mm_unpacklo_epi32(p0, p1), _mm_unpackhi_epi32(p0, p1));
+                    let t23 = _mm_add_epi32(_mm_unpacklo_epi32(p2, p3), _mm_unpackhi_epi32(p2, p3));
+                    let res_q15 = _mm_add_epi32(_mm_unpacklo_epi64(t01, t23), _mm_unpackhi_epi64(t01, t23));
+                    // Round to Q0, ((x >> 14) + 1) >> 1 as silk_rshift_round,
+                    // and saturate to 16 bits.
+                    let one = _mm_set1_epi32(1);
+                    let rounded = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_srai_epi32::<14>(res_q15), one));
+                    _mm_storel_epi64(out.as_mut_ptr().add(i).cast(), _mm_packs_epi32(rounded, rounded));
+                    index_q16 = index_q16.wrapping_add(index_increment_q16.wrapping_mul(4));
+                    i += 4;
+                }
+            }
+        }
+        iir_fir_interpol_scalar(&mut out[n4..], buf, index_q16, index_increment_q16);
+    }
+
+    /// The two chains of the 2x up-sampler side by side, as `up2_hq_neon`:
+    /// lane 0 of each vector belongs to the even output sample, lane 2 to
+    /// the odd one, so that one `_mm_mul_epi32` serves both chains. Lanes 1
+    /// and 3 are not used.
+    ///
+    /// The coefficients are positive and below 2^16, so `_mm_mul_epi32`
+    /// gives the whole product `y * c`, and bits 16 to 47 of it, the lower
+    /// half of the product shifted right by 16, are `(y * c) >> 16`.
+    ///
+    /// # Safety
+    /// The processor must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn up2_hq_sse41(s: &mut [i32; 6], out: &mut [MaybeUninit<i16>], input: &[i16]) {
+        assert!(out.len() == 2 * input.len());
+        // Two input samples per step, so that a step stores four output
+        // samples.
+        let (in_pairs, in_rest) = input.as_chunks::<2>();
+        let (out_quads, out_rest) = out.as_chunks_mut::<4>();
+
+        let pair = |a: i32, b: i32| _mm_setr_epi32(a, 0, b, 0);
+        let c0 = pair(UP2_HQ_COEFS[0][0], UP2_HQ_COEFS[0][1]);
+        let c1 = pair(UP2_HQ_COEFS[1][0], UP2_HQ_COEFS[1][1]);
+        let c2 = pair(UP2_HQ_COEFS[2][0], UP2_HQ_COEFS[2][1]);
+        let mut st0 = pair(s[0], s[3]);
+        let mut st1 = pair(s[1], s[4]);
+        let mut st2 = pair(s[2], s[5]);
+
+        // The three all-pass sections for one input sample.
+        let mut step = |x: i16| -> __m128i {
+            let in32 = _mm_set1_epi32((x as i32) << 10);
+
+            let x0 = _mm_srli_epi64::<16>(_mm_mul_epi32(_mm_sub_epi32(in32, st0), c0));
+            let out0 = _mm_add_epi32(st0, x0);
+            st0 = _mm_add_epi32(in32, x0);
+
+            let x1 = _mm_srli_epi64::<16>(_mm_mul_epi32(_mm_sub_epi32(out0, st1), c1));
+            let out1 = _mm_add_epi32(st1, x1);
+            st1 = _mm_add_epi32(out0, x1);
+
+            let x2 = _mm_srli_epi64::<16>(_mm_mul_epi32(_mm_sub_epi32(out1, st2), c2));
+            let out2 = _mm_add_epi32(st2, x2);
+            st2 = _mm_add_epi32(out1, x2);
+            out2
+        };
+
+        let one = _mm_set1_epi32(1);
+        for (o, x) in out_quads.iter_mut().zip(in_pairs) {
+            let first = step(x[0]);
+            let second = step(x[1]);
+            // Lanes 0 and 2 of both: even and odd sample of the first input
+            // sample, then of the second.
+            let both = _mm_castps_si128(_mm_shuffle_ps::<0b10_00_10_00>(
+                _mm_castsi128_ps(first),
+                _mm_castsi128_ps(second),
+            ));
+            // Round to Q0, ((x >> 9) + 1) >> 1 as silk_rshift_round, and
+            // saturate to 16 bits.
+            let rounded = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_srai_epi32::<9>(both), one));
+            // SAFETY: `o` is an array of 4 samples, the 8 bytes stored.
+            unsafe { _mm_storel_epi64(o.as_mut_ptr().cast(), _mm_packs_epi32(rounded, rounded)) };
+        }
+
+        *s = [
+            _mm_cvtsi128_si32(st0),
+            _mm_cvtsi128_si32(st1),
+            _mm_cvtsi128_si32(st2),
+            _mm_extract_epi32::<2>(st0),
+            _mm_extract_epi32::<2>(st1),
+            _mm_extract_epi32::<2>(st2),
+        ];
+        // The last sample of an odd number of input samples.
+        up2_hq_scalar(s, out_rest, in_rest);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(feature = "std"))]
@@ -1503,6 +1849,14 @@ mod tests {
                     up2_hq_neon(&mut s, uninit(&mut out), &input);
                     assert_eq!((&out, s), (&expect, expect_state), "NEON: n={n} trial={trial}");
                 }
+                #[cfg(target_arch = "x86_64")]
+                if crate::compat::x86_has_sse41() {
+                    let mut s = state;
+                    let mut out = vec![0x5555i16; 2 * n];
+                    // SAFETY: the processor has SSE4.1.
+                    unsafe { x86::up2_hq_sse41(&mut s, uninit(&mut out), &input) };
+                    assert_eq!((&out, s), (&expect, expect_state), "SSE4.1: n={n} trial={trial}");
+                }
                 // The public function, with slices longer than it needs.
                 let mut s = state;
                 let mut out = vec![0x5555i16; 2 * n + 3];
@@ -1558,6 +1912,12 @@ mod tests {
                         let mut out = vec![0x5555i16; n];
                         iir_fir_interpol_neon(&mut out, &buf, 0, inc);
                         assert_eq!(out, expect, "NEON: inc={inc} n={n} trial={trial}");
+                    }
+                    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                    {
+                        let mut out = vec![0x5555i16; n];
+                        x86::iir_fir_interpol_sse2(&mut out, &buf, 0, inc);
+                        assert_eq!(out, expect, "SSE2: inc={inc} n={n} trial={trial}");
                     }
                     // The dispatching function: it stops at `max_index_q16`
                     // or at the end of `out`, whichever comes first.
@@ -1690,6 +2050,13 @@ mod tests {
                             down_fir_interpolated_neon(&mut out, &buf, inc, fracs, taps);
                             assert_eq!(out, expect, "NEON: fracs={fracs} inc={inc} n={n} trial={trial}");
                         }
+                        #[cfg(target_arch = "x86_64")]
+                        if crate::compat::x86_has_sse41() {
+                            let mut out = vec![0x5555i16; n];
+                            // SAFETY: the processor has SSE4.1.
+                            unsafe { x86::down_fir_interpolated_sse41(&mut out, &buf, inc, fracs, taps) };
+                            assert_eq!(out, expect, "SSE4.1: fracs={fracs} inc={inc} n={n} trial={trial}");
+                        }
                         let mut out = vec![0x5555i16; n];
                         down_fir_interpolated(&mut out, &buf, inc, fracs, taps);
                         assert_eq!(out, expect, "dispatch: fracs={fracs} inc={inc} n={n} trial={trial}");
@@ -1716,6 +2083,13 @@ mod tests {
                         let mut out = vec![0x5555i16; n];
                         down_fir_symmetric_neon(&mut out, &buf, inc, half);
                         assert_eq!(out, expect, "NEON: taps={} inc={inc} n={n} trial={trial}", 2 * HALF);
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if crate::compat::x86_has_sse41() {
+                        let mut out = vec![0x5555i16; n];
+                        // SAFETY: the processor has SSE4.1.
+                        unsafe { x86::down_fir_symmetric_sse41(&mut out, &buf, inc, half) };
+                        assert_eq!(out, expect, "SSE4.1: taps={} inc={inc} n={n} trial={trial}", 2 * HALF);
                     }
                     let mut out = vec![0x5555i16; n];
                     down_fir_symmetric(&mut out, &buf, inc, half);
@@ -1789,7 +2163,12 @@ mod tests {
                             let mut out = vec![0i16; n];
                             #[cfg(target_arch = "aarch64")]
                             iir_fir_interpol_neon(&mut out, &buf, 0, inc);
-                            #[cfg(not(target_arch = "aarch64"))]
+                            #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                            x86::iir_fir_interpol_sse2(&mut out, &buf, 0, inc);
+                            #[cfg(not(any(
+                                target_arch = "aarch64",
+                                all(target_arch = "x86_64", target_feature = "sse2")
+                            )))]
                             iir_fir_interpol_scalar(&mut out, &buf, 0, inc);
                         }),
                         "up-sampler: n={n} missing={missing} inc={inc}"

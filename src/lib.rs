@@ -6693,7 +6693,11 @@ pub(crate) fn float2int24(x: f32) -> i32 {
 ///   check otherwise. This crate assumes a processor with NEON.
 /// - **x86 and every other target:** [`float2int16`] for each value. On
 ///   x86 it is `_mm_cvt_ss2si`, elsewhere `lrintf`; both round halfway
-///   values to the even integer.
+///   values to the even integer. On x86-64 this crate converts blocks of 8
+///   values with SSE2 instead: scale, limit to the 16-bit range with
+///   `_mm_max_ps` and `_mm_min_ps` (a NaN becomes -32768, as in C), round
+///   with `_mm_cvtps_epi32` and narrow with `_mm_packs_epi32`. That is the
+///   result of [`float2int16`] for every value.
 ///
 /// `input` and `output` should have the same length; the shorter one sets
 /// how many values are converted. libopus converts all the samples of one
@@ -6704,7 +6708,13 @@ pub(crate) fn celt_float2int16(input: &[f32], output: &mut [i16]) {
     let (input, output) = (&input[..n], &mut output[..n]);
     #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
     let blocks = n / 16 * 16;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    let blocks = n / 8 * 8;
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        all(target_arch = "x86_64", target_feature = "sse2")
+    )))]
     let blocks = 0;
     #[cfg(target_arch = "aarch64")]
     for (src, dst) in input[..blocks].as_chunks::<4>().0.iter().zip(output[..blocks].as_chunks_mut::<4>().0) {
@@ -6720,6 +6730,28 @@ pub(crate) fn celt_float2int16(input: &[f32], output: &mut [i16]) {
     #[cfg(target_arch = "arm")]
     for (dst, &src) in output[..blocks].iter_mut().zip(&input[..blocks]) {
         *dst = float2int16_neon_arm32(src);
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    for (src, dst) in input[..blocks].as_chunks::<8>().0.iter().zip(output[..blocks].as_chunks_mut::<8>().0) {
+        use core::arch::x86_64::*;
+        // SAFETY: `src` and `dst` hold exactly 8 values each: two loads of
+        // 4 floats and one store of 8 samples. SSE and SSE2 are part of this
+        // target (see the `cfg`). The values are limited to the 16-bit range
+        // before the conversion, so it cannot overflow; it rounds as the
+        // processor's rounding mode says, to nearest with halfway values to
+        // the even integer unless a caller changed it, as `_mm_cvt_ss2si`
+        // in libopus.
+        unsafe {
+            let scale = _mm_set1_ps(32768.0);
+            let low = _mm_set1_ps(-32768.0);
+            let high = _mm_set1_ps(32767.0);
+            // `_mm_max_ps` returns its second operand when the first is NaN.
+            let limit = |x: __m128| _mm_min_ps(_mm_max_ps(_mm_mul_ps(x, scale), low), high);
+            let a = limit(_mm_loadu_ps(src.as_ptr()));
+            let b = limit(_mm_loadu_ps(src.as_ptr().add(4)));
+            let packed = _mm_packs_epi32(_mm_cvtps_epi32(a), _mm_cvtps_epi32(b));
+            _mm_storeu_si128(dst.as_mut_ptr().cast(), packed);
+        }
     }
     for (dst, &src) in output[blocks..].iter_mut().zip(&input[blocks..]) {
         *dst = float2int16(src);
@@ -7431,6 +7463,120 @@ mod tests {
         let mut output = [5i16; 3];
         celt_float2int16(&[0.5 * lsb, 1.5 * lsb], &mut output);
         assert_eq!(output, [0, 2, 5]);
+    }
+
+    /// On x86-64 the SSE2 blocks of `celt_float2int16` give the result of
+    /// `float2int16` for every value: random values, halfway values, the
+    /// limits, values beyond them, infinities, NaN and the special zeros, at
+    /// every position of a block and with every tail length.
+    #[test]
+    fn celt_float2int16_blocks_match_float2int16_off_arm() {
+        if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
+            return;
+        }
+        let lsb = 1.0 / 32768.0;
+        let special = [
+            0.0f32,
+            -0.0,
+            0.5 * lsb,
+            -0.5 * lsb,
+            1.5 * lsb,
+            -2.5 * lsb,
+            32766.5 * lsb,
+            32767.5 * lsb,
+            -32767.5 * lsb,
+            -32768.5 * lsb,
+            1.0,
+            -1.0,
+            1e30,
+            -1e30,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::MIN_POSITIVE,
+            1e-40,
+        ];
+        let mut seed = 0x0f12_1600u32;
+        let mut values: Vec<f32> = Vec::new();
+        for i in 0..400 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            values.push(if i % 3 == 0 {
+                special[(seed >> 8) as usize % special.len()]
+            } else {
+                ((seed >> 8) as f32 / 8_388_608.0 - 1.0) * 1.2
+            });
+        }
+        for n in (0..=33).chain([399, 400]) {
+            let mut output = vec![0x5555i16; n + 2];
+            celt_float2int16(&values[..n], &mut output);
+            for (i, &x) in values[..n].iter().enumerate() {
+                assert_eq!(output[i], float2int16(x), "n {n} value {i}: {x:e}");
+            }
+            assert_eq!(output[n..], [0x5555; 2], "n {n}: wrote past the input");
+        }
+    }
+
+    /// `celt_float2int16` against the function that libopus's
+    /// `celt_float2int16` runs on this processor, from the libopus these
+    /// tests link (exported by the static library): `celt_float2int16_neon`
+    /// (celt/arm/celt_neon_intr.c) on aarch64, where it always replaces the
+    /// C function, and `celt_float2int16_c` (celt/mathops.c) on x86-64. The
+    /// values: random ones, halfway values, the limits, values beyond them,
+    /// infinities, NaN and the special zeros, with every tail length.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn celt_float2int16_matches_libopus() {
+        use audiopus_sys as _;
+        unsafe extern "C" {
+            /// `void celt_float2int16_neon(const float *in, short *out,
+            /// int cnt)` on aarch64, `celt_float2int16_c` with the same
+            /// arguments elsewhere.
+            #[cfg_attr(target_arch = "aarch64", link_name = "celt_float2int16_neon")]
+            #[cfg_attr(not(target_arch = "aarch64"), link_name = "celt_float2int16_c")]
+            fn c_celt_float2int16(input: *const f32, output: *mut i16, cnt: i32);
+        }
+        let lsb = 1.0 / 32768.0;
+        let special = [
+            0.0f32,
+            -0.0,
+            0.5 * lsb,
+            -0.5 * lsb,
+            1.5 * lsb,
+            -2.5 * lsb,
+            32766.5 * lsb,
+            32767.5 * lsb,
+            -32767.5 * lsb,
+            -32768.5 * lsb,
+            1.0,
+            -1.0,
+            1e30,
+            -1e30,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::MIN_POSITIVE,
+            1e-40,
+        ];
+        let mut seed = 0x0f12_1601u32;
+        let mut values: Vec<f32> = Vec::new();
+        for i in 0..1000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            values.push(if i % 4 == 0 {
+                special[(seed >> 8) as usize % special.len()]
+            } else {
+                ((seed >> 8) as f32 / 8_388_608.0 - 1.0) * 1.2
+            });
+        }
+        for n in (0..=40).chain([999, 1000]) {
+            let mut want = vec![0x5555i16; n];
+            // SAFETY: `values` holds at least `n` values and `want` `n`.
+            unsafe { c_celt_float2int16(values.as_ptr(), want.as_mut_ptr(), n as i32) };
+            let mut got = vec![0x5555i16; n];
+            celt_float2int16(&values[..n], &mut got);
+            assert_eq!(got, want, "n {n}");
+        }
     }
 
     /// The ARMv7 rounding of `celt_float2int16_neon`: add 0.5 with the sign
