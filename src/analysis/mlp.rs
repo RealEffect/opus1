@@ -191,6 +191,8 @@ pub fn compute_dense(layer: &DenseLayer, output: &mut [f32], input: &[f32]) {
     gemm_accum(output, layer.input_weights, n, &input[..m]);
     #[cfg(target_arch = "aarch64")]
     let output = super::neon::scale_and_activate(output, layer.sigmoid);
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    let output = super::x86::scale_and_activate(output, layer.sigmoid);
     for o in output.iter_mut() {
         *o *= WEIGHTS_SCALE;
     }
@@ -214,12 +216,17 @@ pub fn compute_gru(gru: &GruLayer, state: &mut [f32], input: &[f32]) {
         super::neon::gru(gru, (&mut state[..super::neon::GRU_NEURONS]).try_into().expect("24 values"), input);
         return;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    if gru.nb_inputs == super::x86::GRU_INPUTS && gru.nb_neurons == super::x86::GRU_NEURONS {
+        super::x86::gru(gru, (&mut state[..super::x86::GRU_NEURONS]).try_into().expect("24 values"), input);
+        return;
+    }
     compute_gru_scalar(gru, state, input);
 }
 
-/// `compute_gru` one output at a time. 64-bit ARM runs a NEON version for
-/// the size of the layer of libopus; this one is its reference in the
-/// tests.
+/// `compute_gru` one output at a time. 64-bit ARM runs a NEON version and
+/// x86-64 an SSE version for the size of the layer of libopus; this one is
+/// their reference in the tests.
 pub fn compute_gru_scalar(gru: &GruLayer, state: &mut [f32], input: &[f32]) {
     let n = gru.nb_neurons;
     let m = gru.nb_inputs;

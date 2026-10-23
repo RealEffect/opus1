@@ -215,8 +215,8 @@ fn sum_abs(x: &[f32]) -> f32 {
 ///
 /// A sample that is not a number never becomes the maximum, because the
 /// test `v > max` is false for it. This is the portable version, and the
-/// reference the vector version is tested against.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// reference the vector versions are tested against.
+#[cfg_attr(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")), allow(dead_code))]
 #[inline]
 fn max_abs_scalar(x: &[f32], init: f32) -> f32 {
     let mut m = init;
@@ -285,6 +285,64 @@ fn max_abs_neon(x: &[f32], init: f32) -> f32 {
     m
 }
 
+/// `max_abs_neon` for x86-64 with SSE: 16 samples per pass in four
+/// vectors, each lane with its own maximum.
+///
+/// `_mm_max_ps(v, m)` is `v > m ? v : m`, the test of the scalar loop, and
+/// it gives `m` where `v` is not a number. So the result has the same bits
+/// as the scalar one.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline]
+fn max_abs_sse(x: &[f32], init: f32) -> f32 {
+    use core::arch::x86_64::*;
+    let n = x.len();
+    let p = x.as_ptr();
+    let mut i = 0;
+    // SAFETY: SSE is part of this target (see the `cfg`). Every load reads
+    // the 4 values at `p + i .. p + i + 4`, and the loop conditions keep
+    // `i + 4 <= n` (`i + 16 <= n` for the four loads of the first loop).
+    let lanes: [f32; 4] = unsafe {
+        let sign = _mm_set1_ps(-0.0);
+        let mut m0 = _mm_set1_ps(init);
+        let mut m1 = m0;
+        let mut m2 = m0;
+        let mut m3 = m0;
+        while i + 16 <= n {
+            let v0 = _mm_andnot_ps(sign, _mm_loadu_ps(p.add(i)));
+            let v1 = _mm_andnot_ps(sign, _mm_loadu_ps(p.add(i + 4)));
+            let v2 = _mm_andnot_ps(sign, _mm_loadu_ps(p.add(i + 8)));
+            let v3 = _mm_andnot_ps(sign, _mm_loadu_ps(p.add(i + 12)));
+            m0 = _mm_max_ps(v0, m0);
+            m1 = _mm_max_ps(v1, m1);
+            m2 = _mm_max_ps(v2, m2);
+            m3 = _mm_max_ps(v3, m3);
+            i += 16;
+        }
+        while i + 4 <= n {
+            let v0 = _mm_andnot_ps(sign, _mm_loadu_ps(p.add(i)));
+            m0 = _mm_max_ps(v0, m0);
+            i += 4;
+        }
+        m0 = _mm_max_ps(m1, m0);
+        m2 = _mm_max_ps(m3, m2);
+        m0 = _mm_max_ps(m2, m0);
+        core::mem::transmute::<__m128, [f32; 4]>(m0)
+    };
+    let mut m = lanes[0];
+    for &v in &lanes[1..] {
+        if v > m {
+            m = v;
+        }
+    }
+    for &v in &x[i..] {
+        let v = v.abs();
+        if v > m {
+            m = v;
+        }
+    }
+    m
+}
+
 /// Largest of `init` and every `|x[i]|`; see `max_abs_scalar`.
 #[inline]
 pub(crate) fn max_abs(x: &[f32], init: f32) -> f32 {
@@ -292,7 +350,11 @@ pub(crate) fn max_abs(x: &[f32], init: f32) -> f32 {
     {
         max_abs_neon(x, init)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        max_abs_sse(x, init)
+    }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
     {
         max_abs_scalar(x, init)
     }
@@ -317,7 +379,11 @@ pub(crate) fn celt_preemphasis(pcm: &[f32], out: &mut [f32], upsample: usize, co
             {
                 m = preemphasis_neon(pcm, out, coef, m);
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+            {
+                m = preemphasis_sse(pcm, out, coef, m);
+            }
+            #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
             {
                 m = preemphasis_scalar(pcm, out, coef, m);
             }
@@ -335,8 +401,9 @@ pub(crate) fn celt_preemphasis(pcm: &[f32], out: &mut [f32], upsample: usize, co
 }
 
 /// `celt_preemphasis` for 48 kHz input (no stuffed zeros). This is the
-/// portable version, and the reference the vector version is tested against.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// portable version, and the reference the vector versions are tested
+/// against.
+#[cfg_attr(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")), allow(dead_code))]
 #[inline]
 fn preemphasis_scalar(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
     let mut m = mem;
@@ -390,6 +457,60 @@ fn preemphasis_neon(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
             let x_a = vmulq_f32(vld1q_f32(p.add(i)), scale);
             let prev_a = vmulq_f32(vld1q_f32(p.add(i - 1)), scale);
             vst1q_f32(o.add(i), vsubq_f32(x_a, vmulq_f32(prev_a, coefv)));
+            i += 4;
+        }
+    }
+    // The filter memory after sample `i - 1`, then the last samples.
+    let mut m = pcm[i - 1] * SCALE * coef;
+    for (d, &p) in out[i..n].iter_mut().zip(&pcm[i..]) {
+        let x = p * SCALE;
+        *d = x - m;
+        m = x * coef;
+    }
+    m
+}
+
+/// `preemphasis_neon` for x86-64 with SSE: 8 samples per pass, in two
+/// vectors of 4. The product and the difference are two operations with a
+/// rounding each, as in the scalar loop, so the result has the same bits.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline]
+fn preemphasis_sse(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
+    use core::arch::x86_64::*;
+    const SCALE: f32 = 32768.0;
+    let n = pcm.len();
+    // The stores below rely on this. A caller that passes a shorter `out`
+    // gets a panic, not a write past its end.
+    assert!(out.len() >= n, "celt_preemphasis: output shorter than input");
+    if n == 0 {
+        return mem;
+    }
+    out[0] = pcm[0] * SCALE - mem;
+    let mut i = 1;
+    // SAFETY: SSE is part of this target (see the `cfg`). `1 <= i` and
+    // `i + 4 <= n` at every group of four (`i + 8 <= n` in the first loop,
+    // which handles two groups). A group loads `pcm[i - 1 .. i + 3]` and
+    // `pcm[i .. i + 4]` and stores `out[i .. i + 4]`. All of these are
+    // inside the slices, because `pcm.len() == n` and `out.len() >= n`.
+    unsafe {
+        let p = pcm.as_ptr();
+        let o = out.as_mut_ptr();
+        let scale = _mm_set1_ps(SCALE);
+        let coefv = _mm_set1_ps(coef);
+        // `pcm[j] * SCALE - (pcm[j - 1] * SCALE) * coef` for the 4 samples
+        // from `j = k` on.
+        let group = |k: usize| {
+            let x = _mm_mul_ps(_mm_loadu_ps(p.add(k)), scale);
+            let prev = _mm_mul_ps(_mm_loadu_ps(p.add(k - 1)), scale);
+            _mm_storeu_ps(o.add(k), _mm_sub_ps(x, _mm_mul_ps(prev, coefv)));
+        };
+        while i + 8 <= n {
+            group(i);
+            group(i + 4);
+            i += 8;
+        }
+        while i + 4 <= n {
+            group(i);
             i += 4;
         }
     }
@@ -460,7 +581,9 @@ fn preemphasis_input(
     let m = match upsample {
         #[cfg(target_arch = "aarch64")]
         1 => preemphasis_stereo_neon(pairs, left, right, coef, m),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        1 => preemphasis_stereo_sse(pairs, left, right, coef, m),
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
         1 => preemphasis_stereo_scalar(pairs, left, right, coef, m),
         // 24 kHz input, with a block length the compiler knows.
         2 => preemphasis_stereo_blocks(
@@ -484,8 +607,8 @@ fn preemphasis_input(
 /// `preemphasis_scalar` for interleaved stereo: the left channel of each
 /// pair goes to `left`, the right channel to `right`. `mem` and the result
 /// hold the memories of the two channels. This is the portable version,
-/// and the reference the vector version is tested against.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// and the reference the vector versions are tested against.
+#[cfg_attr(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2")), allow(dead_code))]
 #[inline]
 fn preemphasis_stereo_scalar(
     pairs: &[[f32; 2]],
@@ -552,6 +675,80 @@ fn preemphasis_stereo_neon(
             let (prev_l, prev_r) = (vmulq_f32(prev.0, scale), vmulq_f32(prev.1, scale));
             vst1q_f32(l.add(i), vsubq_f32(x_l, vmulq_f32(prev_l, coefv)));
             vst1q_f32(r.add(i), vsubq_f32(x_r, vmulq_f32(prev_r, coefv)));
+            i += 4;
+        }
+    }
+    // The filter memories after pair `i - 1`, then the last pairs.
+    let [l, r] = pairs[i - 1];
+    let mut m = [l * SCALE * coef, r * SCALE * coef];
+    for ((&[l, r], dl), dr) in pairs[i..].iter().zip(&mut left[i..n]).zip(&mut right[i..n]) {
+        let x = l * SCALE;
+        *dl = x - m[0];
+        m[0] = x * coef;
+        let x = r * SCALE;
+        *dr = x - m[1];
+        m[1] = x * coef;
+    }
+    m
+}
+
+/// `preemphasis_stereo_neon` for x86-64 with SSE: 4 samples of each
+/// channel per pass.
+///
+/// Two loads take 4 pairs, and `_mm_shuffle_ps` splits them into the 4 left
+/// and the 4 right samples. Each output is `x[i] - coef * x[i - 1]` with
+/// the product and the difference rounded on their own, as in the scalar
+/// loop, so the result has the same bits.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline]
+fn preemphasis_stereo_sse(
+    pairs: &[[f32; 2]],
+    left: &mut [f32],
+    right: &mut [f32],
+    coef: f32,
+    mem: [f32; 2],
+) -> [f32; 2] {
+    use core::arch::x86_64::*;
+    const SCALE: f32 = 32768.0;
+    let n = pairs.len();
+    // The stores below rely on this. A caller that passes a shorter output
+    // gets a panic, not a write past its end.
+    assert!(
+        left.len() >= n && right.len() >= n,
+        "celt_preemphasis: output shorter than input"
+    );
+    if n == 0 {
+        return mem;
+    }
+    left[0] = pairs[0][0] * SCALE - mem[0];
+    right[0] = pairs[0][1] * SCALE - mem[1];
+    let mut i = 1;
+    // SAFETY: SSE is part of this target (see the `cfg`). `1 <= i` and
+    // `i + 4 <= n` at every pass. A pass loads the pairs `i - 1 .. i + 3`
+    // and `i .. i + 4`, 8 values each, and stores `left[i .. i + 4]` and
+    // `right[i .. i + 4]`. All of these are inside the slices, because
+    // `pairs.len() == n` and both outputs hold at least `n` values.
+    unsafe {
+        let p = pairs.as_ptr() as *const f32;
+        let (l, r) = (left.as_mut_ptr(), right.as_mut_ptr());
+        let scale = _mm_set1_ps(SCALE);
+        let coefv = _mm_set1_ps(coef);
+        // The 4 pairs from pair `k` on, as the 4 left and the 4 right
+        // samples (`_MM_SHUFFLE(2, 0, 2, 0)` and `_MM_SHUFFLE(3, 1, 3, 1)`),
+        // times `SCALE`.
+        let split = |k: usize| {
+            let a = _mm_loadu_ps(p.add(2 * k));
+            let b = _mm_loadu_ps(p.add(2 * k + 4));
+            (
+                _mm_mul_ps(_mm_shuffle_ps::<0x88>(a, b), scale),
+                _mm_mul_ps(_mm_shuffle_ps::<0xDD>(a, b), scale),
+            )
+        };
+        while i + 4 <= n {
+            let (x_l, x_r) = split(i);
+            let (prev_l, prev_r) = split(i - 1);
+            _mm_storeu_ps(l.add(i), _mm_sub_ps(x_l, _mm_mul_ps(prev_l, coefv)));
+            _mm_storeu_ps(r.add(i), _mm_sub_ps(x_r, _mm_mul_ps(prev_r, coefv)));
             i += 4;
         }
     }
@@ -3465,8 +3662,10 @@ mod enc_kernel_tests {
                 for bad in not_numbers {
                     let mut x = vec![0.125f32; n];
                     x[pos] = -0.75;
-                    assert_eq!(max_abs(&x, 0.0), 0.75, "n={n} pos={pos}");
-                    assert_eq!(max_abs(&x, 0.875), 0.875, "n={n} pos={pos}");
+                    for init in [0.0, 0.875] {
+                        let want = max_abs_scalar(&x, init);
+                        assert!(same_bits(max_abs(&x, init), want), "n={n} pos={pos} init={init}");
+                    }
                     // A not-a-number next to the peak, then one in its place.
                     x[(pos + 1) % n] = bad;
                     let want = max_abs_scalar(&x, 0.0);
@@ -3479,8 +3678,10 @@ mod enc_kernel_tests {
             }
         }
         // An empty slice and a slice of only not-a-number values give `init`.
-        assert_eq!(max_abs(&[], 0.5), 0.5);
-        assert_eq!(max_abs(&[f32::NAN; 40], 0.5), 0.5);
+        for x in [&[][..], &[f32::NAN; 40][..]] {
+            assert!(same_bits(max_abs(x, 0.5), max_abs_scalar(x, 0.5)));
+            assert_eq!(max_abs(x, 0.5), 0.5);
+        }
     }
 
     /// The pre-emphasis loop as it was written before `celt_preemphasis`:
@@ -4185,6 +4386,84 @@ mod enc_kernel_tests {
                         assert_same(&want[0], &left, &what);
                         assert_same(&want[1], &right, &what);
                         assert!(same_bits(m[0], got_mem[0]) && same_bits(m[1], got_mem[1]));
+                    }
+                }
+            }
+        }
+    }
+
+    /// `celt_preemphasis` and the interleaved stereo form
+    /// `preemphasis_input` against `celt_preemphasis` of the libopus these
+    /// tests link (celt/celt_encoder.c, exported by the static library), on
+    /// the same samples and memories: every rate, every kind of signal and
+    /// the lengths of every tail. The vector kernels round the product and
+    /// the difference on their own, as the C code, so the bits are the same
+    /// on 64-bit ARM and on x86-64.
+    #[cfg(all(feature = "std", any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[test]
+    fn preemphasis_matches_libopus() {
+        use audiopus_sys as _;
+        unsafe extern "C" {
+            /// `void celt_preemphasis(const opus_res *pcmp, celt_sig *inp,
+            /// int N, int CC, int upsample, const opus_val16 *coef,
+            /// celt_sig *mem, int clip)`, float build.
+            #[link_name = "celt_preemphasis"]
+            fn c_celt_preemphasis(
+                pcmp: *const f32,
+                inp: *mut f32,
+                n: i32,
+                cc: i32,
+                upsample: i32,
+                coef: *const f32,
+                mem: *mut f32,
+                clip: i32,
+            );
+        }
+        // The coefficients of the standard mode; libopus reads `coef[1]`.
+        let coef = [0.85f32, 0.0, 0.0, 0.0];
+        let mut rng = Rng::new(23);
+        let overlap = 5;
+        for upsample in [1usize, 2, 3, 4, 6] {
+            for kind in KINDS {
+                for n in (1..=19).chain([20, 40, 120, 160, 240, 480, 960]) {
+                    let nu = n * upsample;
+                    let channels = [samples(&mut rng, n, kind), samples(&mut rng, n, kind)];
+                    let mem = [samples(&mut rng, 1, kind)[0], samples(&mut rng, 1, kind)[0]];
+                    let pcm: Vec<f32> = (0..2 * n).map(|i| channels[i % 2][i / 2]).collect();
+                    let mut want = [vec![f32::NAN; nu], vec![f32::NAN; nu]];
+                    let mut want_mem = mem;
+                    for c in 0..2 {
+                        // SAFETY: `pcm` holds `n` samples of 2 channels from
+                        // index `c` on, `want[c]` holds `nu` samples, and
+                        // `coef` the 4 values libopus may read.
+                        unsafe {
+                            c_celt_preemphasis(
+                                pcm.as_ptr().add(c),
+                                want[c].as_mut_ptr(),
+                                nu as i32,
+                                2,
+                                upsample as i32,
+                                coef.as_ptr(),
+                                &mut want_mem[c],
+                                0,
+                            )
+                        };
+                    }
+                    let what = format!("{kind:?} n={n} upsample={upsample}");
+                    // One channel.
+                    let mut got = vec![f32::NAN; nu];
+                    let got_mem = celt_preemphasis(&channels[0], &mut got, upsample, coef[0], mem[0]);
+                    assert_same(&got, &want[0], &format!("{what}, mono"));
+                    assert!(same_bits(got_mem, want_mem[0]), "{what}, mono: filter memory");
+                    // Both channels from interleaved input.
+                    let buf_stride = overlap + nu;
+                    let mut in_buf = vec![f32::NAN; 2 * buf_stride];
+                    let mut got_mem = mem;
+                    preemphasis_input(&pcm, 2, &mut in_buf, buf_stride, overlap, upsample, coef[0], &mut got_mem);
+                    for c in 0..2 {
+                        let got = &in_buf[c * buf_stride + overlap..(c + 1) * buf_stride];
+                        assert_same(got, &want[c], &format!("{what}, stereo channel {c}"));
+                        assert!(same_bits(got_mem[c], want_mem[c]), "{what}, stereo channel {c}: filter memory");
                     }
                 }
             }
