@@ -2,16 +2,17 @@
 //! `silk_NSQ_c` (silk/NSQ.c).
 //!
 //! The C function takes the encoder state, whose layout depends on how
-//! libopus was built, so it is not called through the linked library. The
-//! reference values in `perfk_silk_nsq_plain.expected` were computed once by
-//! the C function itself (the libopus 1.6.1 source, compiled) on the frames
-//! that `Generator` below produces: 60 streams of 20 frames, the quantizer
-//! state carried from frame to frame. The generator uses integers only, so
-//! the C program and this test produce the same frames; each row carries a
-//! checksum of its input signal to make sure of that.
+//! libopus was built, so it is not called in the float build the tests
+//! link. The test calls it in the fixed-point build of the official libopus
+//! 1.6.1 release that the dev-dependency `libopus-fixed` compiles
+//! (tools/libopus-fixed), on the frames that `Generator` below produces: 60
+//! streams of 20 frames, each side carrying its quantizer state from frame
+//! to frame.
 //!
 //! The quantizer is fixed-point: the pulses and the whole state after every
 //! frame must be identical.
+
+mod silk_nsq_common;
 
 use opus1::internals::silk::nsq::silk_nsq;
 use opus1::internals::silk::structs::{SideInfoIndices, SilkEncoderStateCommon, SilkNSQState};
@@ -23,13 +24,7 @@ const MAX_NB_SUBFR: usize = 4;
 const STREAMS: usize = 60;
 const FRAMES: usize = 20;
 
-/// (checksum of the input signal, checksum of pulses and state, sum of the
-/// absolute pulses, signal type).
-type Expected = (u64, u64, i32, i32);
-
-static EXPECTED: [Expected; STREAMS * FRAMES] = include!("perfk_silk_nsq_plain.expected");
-
-/// The generator of the C program that produced `EXPECTED`.
+/// Small deterministic generator: integers only.
 struct Generator(u32);
 
 impl Generator {
@@ -41,14 +36,6 @@ impl Generator {
     /// `low + rnd() % span`.
     fn range(&mut self, low: i32, span: u32) -> i32 {
         low + (self.rnd() % span) as i32
-    }
-}
-
-struct Checksum(u64);
-
-impl Checksum {
-    fn add(&mut self, v: i64) {
-        self.0 = self.0.wrapping_mul(1000003).wrapping_add(v as u64);
     }
 }
 
@@ -72,13 +59,12 @@ fn plain_quantizer_matches_libopus() {
         enc.shaping_lpc_order = shp_order as i32;
         enc.n_states_delayed_decision = 1;
         let frame_length = enc.frame_length as usize;
-        let ltp_mem_length = enc.ltp_mem_length as usize;
         let (min_lag, max_lag) = (2 * fs_khz, 18 * fs_khz);
         let mut nsq = Box::new(SilkNSQState::default());
         nsq.prev_gain_q16 = 65536;
+        let mut c_nsq = silk_nsq_common::state_of(&nsq);
 
         for frame in 0..FRAMES {
-            let expected = &EXPECTED[stream * FRAMES + frame];
             let mut ind = SideInfoIndices::default();
             let kind = g.rnd() % 5;
             let voiced = kind < 2;
@@ -95,7 +81,6 @@ fn plain_quantizer_matches_libopus() {
             // resonator.
             let (mut y1, mut y2, mut phase) = (0i64, 0i64, 0i64);
             let mut x16 = [0i16; 320];
-            let mut input_checksum = 0u64;
             for x in x16[..frame_length].iter_mut() {
                 let noise = (g.rnd() & 0xffff) as i64 - 32768;
                 let mut e = noise >> noise_shift;
@@ -110,13 +95,7 @@ fn plain_quantizer_matches_libopus() {
                 y2 = y1;
                 y1 = y;
                 *x = (y >> amp_shift) as i16;
-                input_checksum = input_checksum.wrapping_mul(31).wrapping_add(*x as i64 as u64);
             }
-            assert_eq!(
-                input_checksum & 0xffff_ffff_ffff,
-                expected.0,
-                "stream {stream}, frame {frame}: the input differs from the C program's"
-            );
 
             // The parameters of the frame, in the ranges the encoder gives
             // them. Both filters are stable.
@@ -169,42 +148,38 @@ fn plain_quantizer_matches_libopus() {
                 unvoiced_with_lag_and_shaping += 1;
             }
 
+            let mut c_frame = silk_nsq_common::frame_of(&enc, &ind);
+            let mut c_pulses = [0i8; 320];
+            let params = libopus_fixed::NsqParams {
+                pred_coef_q12: &pred,
+                ltp_coef_q14: &ltp,
+                ar_q13: &ar,
+                harm_shape_gain_q14: &harm,
+                tilt_q14: &tilt,
+                lf_shp_q14: &lf,
+                gains_q16: &gains,
+                pitch_l: &pitch,
+                lambda_q10: lambda,
+                ltp_scale_q14: ltp_scale,
+            };
+            libopus_fixed::nsq(false, &mut c_frame, &mut c_nsq, &x16, &mut c_pulses, &params);
+
             let mut pulses = [0i8; 320];
             silk_nsq(
                 &enc, &mut nsq, &ind, &x16, &mut pulses, &pred, &ltp, &ar, &harm, &tilt, &lf, &gains, &pitch, lambda,
                 ltp_scale,
             );
 
-            let mut h = Checksum(0);
-            let mut sum_abs = 0i32;
-            for &p in &pulses[..frame_length] {
-                h.add(p as i64);
-                sum_abs += (p as i32).abs();
+            let mut differ = silk_nsq_common::differences(&nsq, &c_nsq);
+            if pulses[..frame_length] != c_pulses[..frame_length] {
+                differ.insert(0, "pulses");
             }
-            nsq.xq[..ltp_mem_length].iter().for_each(|&v| h.add(v as i64));
-            nsq.s_ltp_shp_q14[..ltp_mem_length].iter().for_each(|&v| h.add(v as i64));
-            nsq.s_lpc_q14[..16].iter().for_each(|&v| h.add(v as i64));
-            nsq.s_ar2_q14.iter().for_each(|&v| h.add(v as i64));
-            for v in [
-                nsq.s_lf_ar_q14,
-                nsq.s_diff_shp_q14,
-                nsq.lag_prev,
-                nsq.s_ltp_buf_idx,
-                nsq.s_ltp_shp_buf_idx,
-                nsq.rand_seed,
-                nsq.prev_gain_q16,
-                nsq.rewhite_flag,
-            ] {
-                h.add(v as i64);
-            }
-            let got: Expected = (expected.0, h.0 & 0xffff_ffff_ffff, sum_abs, ind.signal_type as i32);
-            if got != *expected {
+            if !differ.is_empty() {
                 failures.push(format!(
-                    "stream {stream} ({fs_khz} kHz, {nb_subfr} subframes, shaping order {shp_order}), frame {frame}: opus1 {:?}, libopus {:?}",
-                    got, expected
+                    "stream {stream} ({fs_khz} kHz, {nb_subfr} subframes, shaping order {shp_order}), frame {frame}: {} differ",
+                    differ.join(", ")
                 ));
-                // The state has left libopus's and the generator would get
-                // out of step: stop at the first difference.
+                // The states have parted: stop at the first difference.
                 break 'streams;
             }
         }

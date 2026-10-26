@@ -2,29 +2,24 @@
 //! (silk/process_NLSFs.c).
 //!
 //! The C function takes the whole encoder state, whose layout depends on how
-//! libopus was built, so it is not called through the linked library. The
-//! reference values in `perfk_silk_process_nlsfs.expected` were computed
-//! once by the C function itself (the libopus 1.6.1 source, compiled) on the
-//! vectors that `Generator` below produces. The generator uses integers
-//! only, so the C program and this test produce the same vectors; each row
-//! carries a checksum of its input to make sure of that.
+//! libopus was built, so it is not called in the float build the tests
+//! link. The test calls it in the fixed-point build of the official libopus
+//! 1.6.1 release that the dev-dependency `libopus-fixed` compiles
+//! (tools/libopus-fixed), on the vectors that `Generator` below produces.
 //!
 //! The function is fixed-point: the indices, the quantized vector and both
 //! sets of prediction coefficients must be identical.
 
-// The generator repeats the index-based loops of the C program.
+// The generator uses index-based loops.
 #![allow(clippy::needless_range_loop)]
 
 use opus1::internals::silk::nlsf::silk_process_nlsfs;
 use opus1::internals::silk::structs::{SilkEncoderControl, SilkEncoderState};
 
-/// (checksum of the input, checksum of all outputs, first index, first
-/// quantized value, first prediction coefficient).
-type Expected = (u64, u64, [i32; 3]);
+/// Number of cases.
+const CASES: usize = 1200;
 
-static EXPECTED: [Expected; 1200] = include!("perfk_silk_process_nlsfs.expected");
-
-/// The generator of the C program that produced `EXPECTED`.
+/// Small deterministic generator: integers only.
 struct Generator(u32);
 
 impl Generator {
@@ -65,16 +60,12 @@ impl Generator {
     }
 }
 
-fn checksum(sum: u64, values: impl IntoIterator<Item = i64>, factor: u64) -> u64 {
-    values.into_iter().fold(sum, |s, v| s.wrapping_mul(factor).wrapping_add(v as u64))
-}
-
 #[test]
 fn process_nlsfs_matches_libopus() {
     let mut g = Generator(0x0f1e_2d3c);
     let mut failures = Vec::new();
     let mut close_pairs = 0;
-    for (number, expected) in EXPECTED.iter().enumerate() {
+    for number in 0..CASES {
         let mut enc = Box::new(SilkEncoderState::default());
         let mut ctrl = SilkEncoderControl::default();
         let wideband = g.rnd() % 2 == 1;
@@ -99,27 +90,40 @@ fn process_nlsfs_matches_libopus() {
         if nlsf[..order].windows(2).any(|w| w[1] - w[0] < 9) {
             close_pairs += 1;
         }
-
-        let input = checksum(0, nlsf[..order].iter().map(|&v| v as i64), 31);
-        let input = checksum(input, prev[..order].iter().map(|&v| v as i64), 31) & 0xffff_ffff_ffff;
-        assert_eq!(input, expected.0, "case {number}: the input differs from the C program's");
+        let s = &enc.s_cmn;
+        let input = libopus_fixed::NlsfInput {
+            fs_khz: s.fs_khz,
+            predict_lpc_order: s.predict_lpc_order,
+            nb_subfr: s.nb_subfr,
+            speech_activity_q8: s.speech_activity_q8,
+            n_survivors: s.n_nlsf_survivors,
+            signal_type: s.indices.signal_type as i32,
+            use_interpolated_nlsfs: s.use_interpolated_nlsfs,
+            nlsf_interp_coef_q2: s.indices.nlsf_interp_coef_q2 as i32,
+        };
+        let c = libopus_fixed::process_nlsfs(&input, &nlsf, &prev);
 
         silk_process_nlsfs(&mut enc, &mut ctrl, &mut nlsf);
 
-        let indices = enc.s_cmn.indices.nlsf_indices;
-        let mut out = checksum(0, ctrl.pred_coef_q12[0][..order].iter().map(|&v| v as i64), 1000003);
-        out = checksum(out, ctrl.pred_coef_q12[1][..order].iter().map(|&v| v as i64), 1000003);
-        out = checksum(out, nlsf[..order].iter().map(|&v| v as i64), 1000003);
-        out = checksum(out, indices[..=order].iter().map(|&v| v as i64), 1000003) & 0xffff_ffff_ffff;
-        let got: Expected = (
-            input,
-            out,
-            [indices[0] as i32, nlsf[0] as i32, ctrl.pred_coef_q12[1][0] as i32],
+        let s = &enc.s_cmn;
+        let got = (
+            &ctrl.pred_coef_q12[0][..order],
+            &ctrl.pred_coef_q12[1][..order],
+            &nlsf[..order],
+            &s.indices.nlsf_indices[..=order],
+            s.indices.nlsf_interp_coef_q2 as i32,
         );
-        if got != *expected {
+        let want = (
+            &c.pred_coef_q12[0][..order],
+            &c.pred_coef_q12[1][..order],
+            &c.nlsf_q15[..order],
+            &c.nlsf_indices[..=order],
+            c.nlsf_interp_coef_q2,
+        );
+        if got != want {
             failures.push(format!(
                 "case {number} (order {order}, kind {kind}, {} subframes, interpolation {}): opus1 {:?}, libopus {:?}",
-                enc.s_cmn.nb_subfr, enc.s_cmn.indices.nlsf_interp_coef_q2, got, expected
+                s.nb_subfr, input.nlsf_interp_coef_q2, got, want
             ));
         }
     }
@@ -127,9 +131,8 @@ fn process_nlsfs_matches_libopus() {
     assert!(close_pairs > 300, "{close_pairs}");
     assert!(
         failures.is_empty(),
-        "{} of {} cases differ from libopus:\n{}",
+        "{} of {CASES} cases differ from libopus:\n{}",
         failures.len(),
-        EXPECTED.len(),
         failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
     );
 }

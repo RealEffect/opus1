@@ -84,6 +84,19 @@ fn opus1_packets(pcm: &[i16], rate: i32, s: Stream, integer_hp: bool) -> Vec<Vec
         .collect()
 }
 
+/// The packets of the fixed-point build of libopus 1.6.1, which the
+/// dev-dependency `libopus-fixed` compiles (tools/libopus-fixed), for the
+/// same 16-bit input and settings, at 48 kHz.
+fn fixed_point_packets(pcm: &[i16], s: Stream) -> Vec<Vec<u8>> {
+    use libopus_fixed::consts::*;
+    let mut enc = libopus_fixed::Encoder::new(48000, 1, OPUS_APPLICATION_VOIP);
+    enc.set(OPUS_SET_BITRATE_REQUEST, s.bitrate);
+    enc.set(OPUS_SET_COMPLEXITY_REQUEST, 5);
+    enc.set(OPUS_SET_FORCE_MODE_REQUEST, s.mode);
+    enc.set(OPUS_SET_BANDWIDTH_REQUEST, s.bandwidth);
+    pcm.as_chunks::<FRAME>().0.iter().map(|x| enc.encode(x, FRAME, 1500).unwrap()).collect()
+}
+
 fn libopus_packets(pcm: &[i16], s: Stream) -> Vec<Vec<u8>> {
     let mut enc = CEnc::voip(48000, 1);
     enc.bitrate(s.bitrate).complexity(5).force_mode(s.mode).bandwidth(s.bandwidth);
@@ -130,38 +143,45 @@ fn low_band_db(x: &[f32]) -> Vec<f64> {
         .collect()
 }
 
-/// The frames where opus1's output holds more than 10 dB more energy at
-/// 0 to 200 Hz than both the original and libopus's output.
-fn low_band_bursts(original: &[i16], s: Stream, integer_hp: bool) -> usize {
-    let lookahead = 312; // 2.5 ms + 4 ms at 48 kHz, for both encoders
-    let pcm = padded(original, lookahead);
-    let a = decoded(&opus1_packets(&pcm, 48000, s, integer_hp), lookahead, original.len());
-    let b = decoded(&libopus_packets(&pcm, s), lookahead, original.len());
+/// The 10 ms frames where `decoded` holds more than 10 dB more energy at
+/// 0 to 200 Hz than both the original and `reference`.
+fn low_band_bursts(original: &[i16], decoded: &[f32], reference: &[f32]) -> Vec<usize> {
     let x: Vec<f32> = original.iter().map(|&v| v as f32).collect();
-    let (ex, ea, eb) = (low_band_db(&x), low_band_db(&a), low_band_db(&b));
-    (0..ex.len()).filter(|&i| ea[i] > ex[i] + 10.0 && ea[i] > eb[i] + 10.0).count()
+    let (ex, ea, eb) = (low_band_db(&x), low_band_db(decoded), low_band_db(reference));
+    (0..ex.len()).filter(|&i| ea[i] > ex[i] + 10.0 && ea[i] > eb[i] + 10.0).collect()
 }
 
 const SILK_12K: Stream = Stream { mode: MODE_SILK, bandwidth: BW_WB, bitrate: 12000 };
 const HYBRID_32K: Stream = Stream { mode: MODE_HYBRID, bandwidth: BW_FB, bitrate: 32000 };
 
-/// With the integer filter, 11 (`MD19_04`) and 18 (`MH43_04`) of the 250
-/// frames of SILK at 12 kb/s, and 11 and 23 frames of Hybrid at 32 kb/s,
-/// hold such energy; the fixed-point build of libopus 1.6.1 writes the
-/// same SILK packets and shows the same frames. With the float filter no
-/// frame does.
+/// With the float filter no frame of opus1's output holds such energy
+/// (more than the original and than the output of the linked float
+/// libopus). With the integer filter opus1 writes the SILK-only packets of
+/// the fixed-point build of libopus 1.6.1 (`fixed_point_packets`), and its
+/// output shows such energy in the same frames as that build's, also in
+/// Hybrid: when measured, 11 (`MD19_04`) and 18 (`MH43_04`) of the 250
+/// frames of SILK at 12 kb/s, 11 and 23 of Hybrid at 32 kb/s.
 #[test]
 #[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn voip_at_48_khz_adds_no_low_frequency_energy_in_quiet_frames() {
-    for (name, s, with_integer_filter) in [
-        ("MD19_04", SILK_12K, 11),
-        ("MD19_04", HYBRID_32K, 11),
-        ("MH43_04", SILK_12K, 18),
-        ("MH43_04", HYBRID_32K, 23),
-    ] {
+    let lookahead = 312; // 2.5 ms + 4 ms at 48 kHz, for every encoder
+    for (name, s) in [("MD19_04", SILK_12K), ("MD19_04", HYBRID_32K), ("MH43_04", SILK_12K), ("MH43_04", HYBRID_32K)] {
+        let what = format!("{name}, {} b/s", s.bitrate);
         let x = tsp_excerpt(name);
-        assert_eq!(low_band_bursts(&x, s, false), 0, "{name}, {} b/s", s.bitrate);
-        assert_eq!(low_band_bursts(&x, s, true), with_integer_filter, "{name}, {} b/s, integer filter", s.bitrate);
+        let pcm = padded(&x, lookahead);
+        let float_build = decoded(&libopus_packets(&pcm, s), lookahead, x.len());
+        let bursts = |packets: &[Vec<u8>]| low_band_bursts(&x, &decoded(packets, lookahead, x.len()), &float_build);
+        assert_eq!(bursts(&opus1_packets(&pcm, 48000, s, false)), Vec::<usize>::new(), "{what}");
+
+        let integer_filter = opus1_packets(&pcm, 48000, s, true);
+        let fixed_point = fixed_point_packets(&pcm, s);
+        if s.mode == MODE_SILK {
+            assert!(integer_filter == fixed_point, "{what}: the packets are not those of the fixed-point build");
+        }
+        let want = bursts(&fixed_point);
+        println!("{what}: {} frames with the integer filter", want.len());
+        assert!(!want.is_empty(), "{what}: the fixed-point build adds no energy");
+        assert_eq!(bursts(&integer_filter), want, "{what}, integer filter");
     }
 }
 

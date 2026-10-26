@@ -166,6 +166,14 @@ opus = { version = "0.3", default-features = false }
 # above already links it; examples/perf_harness.rs and the k24_* tests need
 # controls that crate does not expose, such as forcing the coding mode.
 audiopus_sys = "0.2"
+# The fixed-point build of libopus 1.6.1, compiled from its source by
+# tools/libopus-fixed, with every symbol renamed so that it links next to
+# the float build above. opus1's SILK encoder is a port of the fixed-point
+# one, so the tests compare its packets and functions with this build.
+# The source comes from `LIBOPUS_SRC_1_6_1` or `opus-1.6.1/` (see
+# tools/libopus-fixed/src/lib.rs). Test-only, like the other
+# dev-dependencies.
+libopus-fixed = { path = "tools/libopus-fixed" }
 # The benchmarks and these examples use `opus1::internals`, so they need
 # `__internals`. In this repository the dev-dependency on opus1 itself turns
 # it on. In the published crate, which has no such dev-dependency, cargo
