@@ -235,16 +235,18 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     // The only bounds check. Every kernel below works on this slice, whose
     // length is a multiple of `2 * stride`.
     let x = &mut x[..2 * (n0 >> 1) * stride];
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    haar1_neon(x, stride);
-    // SAFETY: `x` holds exactly `2 * (n0 / 2) * stride` values and the kernel
-    // runs for `stride == 1` only, on a CPU with AVX2.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
+        haar1_neon(x, stride);
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
         // The kernel needs a 64-bit lane permute, which only AVX2 has.
         // Processors without AVX2 use the portable code.
         if stride == 1 && n0 >= 16 && crate::compat::x86_has_avx2() {
-            haar1_avx2(x, n0);
+            // SAFETY: the CPU has AVX2, the feature of the kernel.
+            unsafe { haar1_avx2(x, n0) };
             return;
         }
     }
@@ -252,26 +254,29 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     haar1_scalar(x, stride);
 }
 
-/// # Safety
+/// Haar step of `haar1` for rows of one value (`stride == 1`), with AVX2.
 ///
-/// `x` must hold at least `2 * (n0 / 2)` values, and the CPU must have AVX2.
+/// Panics when `x` holds fewer than `2 * (n0 / 2)` values.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
+fn haar1_avx2(x: &mut [f32], n0: usize) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::{load_f32x8, store_f32x8};
     let n = n0 >> 1;
     // The loads and stores below cover `x[..2 * n]`.
     assert!(x.len() >= 2 * n);
+    let x = &mut x[..2 * n];
     let scale = _mm256_set1_ps(core::f32::consts::FRAC_1_SQRT_2);
     let fixup = _mm256_set_epi32(7, 6, 3, 2, 5, 4, 1, 0);
-    let mut j = 0;
-    while j + 8 <= n {
-        let ptr = x.as_mut_ptr().add(2 * j);
-        let a = _mm256_loadu_ps(ptr);
-        let b = _mm256_loadu_ps(ptr.add(8));
+    // Eight pairs per pass, in two vectors of eight values.
+    let (octets, _) = x.as_chunks_mut::<8>();
+    let (blocks, _) = octets.as_chunks_mut::<2>();
+    for [lo, hi] in blocks {
+        let a = load_f32x8(lo);
+        let b = load_f32x8(hi);
 
         let t0 = _mm256_unpacklo_ps(a, b);
         let t1 = _mm256_unpackhi_ps(a, b);
@@ -293,20 +298,17 @@ unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
         let out0 = _mm256_permute2f128_ps(r0, r1, 0x20);
         let out1 = _mm256_permute2f128_ps(r0, r1, 0x31);
 
-        _mm256_storeu_ps(ptr, out0);
-        _mm256_storeu_ps(ptr.add(8), out1);
-        j += 8;
+        store_f32x8(lo, out0);
+        store_f32x8(hi, out1);
     }
 
+    // The pairs after the last pass of eight, one by one.
     let scale = core::f32::consts::FRAC_1_SQRT_2;
-    while j < n {
-        let idx1 = 2 * j;
-        let idx2 = 2 * j + 1;
-        let tmp1 = scale * x[idx1];
-        let tmp2 = scale * x[idx2];
-        x[idx1] = tmp1 + tmp2;
-        x[idx2] = tmp1 - tmp2;
-        j += 1;
+    for pair in x[16 * (n / 8)..].as_chunks_mut::<2>().0 {
+        let tmp1 = scale * pair[0];
+        let tmp2 = scale * pair[1];
+        pair[0] = tmp1 + tmp2;
+        pair[1] = tmp1 - tmp2;
     }
 }
 
@@ -372,8 +374,10 @@ fn haar1_wide(x: &mut [f32], stride: usize) {
 /// bit-identical to `haar1_scalar`: the same multiply, add and subtract per
 /// value, with no fused multiply-add.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 #[inline]
 fn haar1_neon(x: &mut [f32], stride: usize) {
+    use crate::simd_mem::neon::{load_f32x4, load2_f32x4, store_f32x4, store2_f32x4};
     use core::arch::aarch64::*;
 
     debug_assert!(stride > 0 && x.len().is_multiple_of(2 * stride));
@@ -382,16 +386,12 @@ fn haar1_neon(x: &mut [f32], stride: usize) {
             // Four pairs per pass: split even and odd positions.
             let (blocks, tail) = x.as_chunks_mut::<8>();
             for block in blocks {
-                // SAFETY: `block` is a `[f32; 8]`. The load and the store
-                // each cover exactly these 8 values.
-                unsafe {
-                    let scale = vdupq_n_f32(HAAR_SCALE);
-                    let pairs = vld2q_f32(block.as_ptr());
-                    let even = vmulq_f32(pairs.0, scale);
-                    let odd = vmulq_f32(pairs.1, scale);
-                    let out = float32x4x2_t(vaddq_f32(even, odd), vsubq_f32(even, odd));
-                    vst2q_f32(block.as_mut_ptr(), out);
-                }
+                let scale = vdupq_n_f32(HAAR_SCALE);
+                let pairs = load2_f32x4(block);
+                let even = vmulq_f32(pairs.0, scale);
+                let odd = vmulq_f32(pairs.1, scale);
+                let out = float32x4x2_t(vaddq_f32(even, odd), vsubq_f32(even, odd));
+                store2_f32x4(block, out);
             }
             // At most three pairs are left.
             for pair in tail.as_chunks_mut::<2>().0.iter_mut().take(3) {
@@ -406,30 +406,22 @@ fn haar1_neon(x: &mut [f32], stride: usize) {
             // half is row `2j + 1`.
             let (blocks, _) = x.as_chunks_mut::<4>();
             for block in blocks {
-                // SAFETY: `block` is a `[f32; 4]`. The load and the store
-                // each cover exactly these 4 values.
-                unsafe {
-                    let v = vmulq_f32(vld1q_f32(block.as_ptr()), vdupq_n_f32(HAAR_SCALE));
-                    let a = vget_low_f32(v);
-                    let b = vget_high_f32(v);
-                    vst1q_f32(block.as_mut_ptr(), vcombine_f32(vadd_f32(a, b), vsub_f32(a, b)));
-                }
+                let v = vmulq_f32(load_f32x4(block), vdupq_n_f32(HAAR_SCALE));
+                let a = vget_low_f32(v);
+                let b = vget_high_f32(v);
+                store_f32x4(block, vcombine_f32(vadd_f32(a, b), vsub_f32(a, b)));
             }
         }
         4 => {
-            let (blocks, _) = x.as_chunks_mut::<8>();
-            for block in blocks {
-                // SAFETY: `block` is a `[f32; 8]`. Row `2j` is values 0..4,
-                // row `2j + 1` is values 4..8; each load and store covers
-                // one of these halves.
-                unsafe {
-                    let scale = vdupq_n_f32(HAAR_SCALE);
-                    let ptr = block.as_mut_ptr();
-                    let a = vmulq_f32(vld1q_f32(ptr), scale);
-                    let b = vmulq_f32(vld1q_f32(ptr.add(4)), scale);
-                    vst1q_f32(ptr, vaddq_f32(a, b));
-                    vst1q_f32(ptr.add(4), vsubq_f32(a, b));
-                }
+            // Row `2j` is values 0..4 of a block, row `2j + 1` values 4..8.
+            let (rows, _) = x.as_chunks_mut::<4>();
+            let (row_pairs, _) = rows.as_chunks_mut::<2>();
+            for [row_a, row_b] in row_pairs {
+                let scale = vdupq_n_f32(HAAR_SCALE);
+                let a = vmulq_f32(load_f32x4(row_a), scale);
+                let b = vmulq_f32(load_f32x4(row_b), scale);
+                store_f32x4(row_a, vaddq_f32(a, b));
+                store_f32x4(row_b, vsubq_f32(a, b));
             }
         }
         _ => haar1_wide(x, stride),
@@ -851,19 +843,17 @@ fn fill_with_noise_scalar(x: &mut [f32], mut seed: u32) -> u32 {
 
 /// The seeds of the next eight values, as two vectors, and the seed after
 /// them in every lane of a third one.
-///
-/// # Safety
-///
-/// Needs NEON, which is part of the baseline of every aarch64 target.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn lcg_next8(
+#[target_feature(enable = "neon")]
+#[inline]
+fn lcg_next8(
     vseed: core::arch::aarch64::uint32x4_t,
 ) -> (
     core::arch::aarch64::uint32x4_t,
     core::arch::aarch64::uint32x4_t,
     core::arch::aarch64::uint32x4_t,
 ) {
+    use crate::simd_mem::neon::load_u32x4;
     use core::arch::aarch64::*;
     const MUL: [u32; 8] = {
         let mut m = [0u32; 8];
@@ -883,19 +873,23 @@ unsafe fn lcg_next8(
         }
         a
     };
-    // SAFETY: each load reads four values of an array of eight.
-    unsafe {
-        let lo = vmlaq_u32(vld1q_u32(ADD.as_ptr()), vseed, vld1q_u32(MUL.as_ptr()));
-        let hi = vmlaq_u32(vld1q_u32(ADD.as_ptr().add(4)), vseed, vld1q_u32(MUL.as_ptr().add(4)));
-        // The seed eight steps ahead, computed in all lanes, so that the
-        // next pass does not wait for a move between registers.
-        let next = vmlaq_u32(vdupq_n_u32(ADD[7]), vseed, vdupq_n_u32(MUL[7]));
-        (lo, hi, next)
-    }
+    let (mul, _) = MUL.as_chunks::<4>();
+    let (add, _) = ADD.as_chunks::<4>();
+    let lo = vmlaq_u32(load_u32x4(&add[0]), vseed, load_u32x4(&mul[0]));
+    let hi = vmlaq_u32(load_u32x4(&add[1]), vseed, load_u32x4(&mul[1]));
+    // The seed eight steps ahead, computed in all lanes, so that the
+    // next pass does not wait for a move between registers.
+    let next = vmlaq_u32(vdupq_n_u32(ADD[7]), vseed, vdupq_n_u32(MUL[7]));
+    (lo, hi, next)
 }
 
 /// NEON form of `fold_with_noise`: eight values per pass. `lb` must be at
 /// least as long as `x`.
+///
+/// The loop is here, in a function that is always inlined, and one pass is
+/// `fold_with_noise8_neon`. A `#[target_feature]` function cannot be
+/// `#[inline(always)]`, and with the whole loop in one the compiler may
+/// inline it later and lay out the code around it differently.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn fold_with_noise_neon(x: &mut [f32], lb: &[f32], seed: u32) -> u32 {
@@ -904,50 +898,85 @@ fn fold_with_noise_neon(x: &mut [f32], lb: &[f32], seed: u32) -> u32 {
     let lb = &lb[..x.len()];
     let (x8, x_tail) = x.as_chunks_mut::<8>();
     let (lb8, lb_tail) = lb.as_chunks::<8>();
-    // SAFETY: NEON is part of the baseline of every aarch64 target. Each
-    // load and store covers one half of a `[f32; 8]`.
-    let seed = unsafe {
-        let bit = vdupq_n_u32(0x8000);
-        let plus = vdupq_n_f32(1.0 / 256.0);
-        let minus = vdupq_n_f32(-1.0 / 256.0);
-        let mut vseed = vdupq_n_u32(seed);
-        for (xo, l) in x8.iter_mut().zip(lb8) {
-            let (s_lo, s_hi, next) = lcg_next8(vseed);
-            vseed = next;
-            let n_lo = vbslq_f32(vtstq_u32(s_lo, bit), plus, minus);
-            let n_hi = vbslq_f32(vtstq_u32(s_hi, bit), plus, minus);
-            vst1q_f32(xo.as_mut_ptr(), vaddq_f32(vld1q_f32(l.as_ptr()), n_lo));
-            vst1q_f32(xo.as_mut_ptr().add(4), vaddq_f32(vld1q_f32(l.as_ptr().add(4)), n_hi));
-        }
-        vgetq_lane_u32::<0>(vseed)
-    };
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    let mut vseed = unsafe { vdupq_n_u32(seed) };
+    for (xo, l) in x8.iter_mut().zip(lb8) {
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        vseed = unsafe { fold_with_noise8_neon(xo, l, vseed) };
+    }
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    let seed = unsafe { vgetq_lane_u32::<0>(vseed) };
     fold_with_noise_scalar(x_tail, lb_tail, seed)
 }
 
-/// NEON form of `fill_with_noise`: eight values per pass.
+/// One pass of `fold_with_noise_neon`: `xo = l + noise` for eight values,
+/// with the seeds `lcg_next8(vseed)`. Returns the seed after them, in every
+/// lane.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn fold_with_noise8_neon(
+    xo: &mut [f32; 8],
+    l: &[f32; 8],
+    vseed: core::arch::aarch64::uint32x4_t,
+) -> core::arch::aarch64::uint32x4_t {
+    use crate::simd_mem::neon::{load_f32x4, store_f32x4};
+    use core::arch::aarch64::*;
+
+    let bit = vdupq_n_u32(0x8000);
+    let plus = vdupq_n_f32(1.0 / 256.0);
+    let minus = vdupq_n_f32(-1.0 / 256.0);
+    let (s_lo, s_hi, next) = lcg_next8(vseed);
+    let n_lo = vbslq_f32(vtstq_u32(s_lo, bit), plus, minus);
+    let n_hi = vbslq_f32(vtstq_u32(s_hi, bit), plus, minus);
+    let (l, _) = l.as_chunks::<4>();
+    let (xo, _) = xo.as_chunks_mut::<4>();
+    store_f32x4(&mut xo[0], vaddq_f32(load_f32x4(&l[0]), n_lo));
+    store_f32x4(&mut xo[1], vaddq_f32(load_f32x4(&l[1]), n_hi));
+    next
+}
+
+/// NEON form of `fill_with_noise`: eight values per pass. The loop is
+/// here and one pass is `fill_with_noise8_neon`, for the reason given at
+/// `fold_with_noise_neon`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn fill_with_noise_neon(x: &mut [f32], seed: u32) -> u32 {
     use core::arch::aarch64::*;
 
     let (x8, x_tail) = x.as_chunks_mut::<8>();
-    // SAFETY: NEON is part of the baseline of every aarch64 target. Each
-    // store covers one half of a `[f32; 8]`.
-    let seed = unsafe {
-        let mut vseed = vdupq_n_u32(seed);
-        for xo in x8.iter_mut() {
-            let (s_lo, s_hi, next) = lcg_next8(vseed);
-            vseed = next;
-            // The top 12 bits as a signed number, divided by 2^14. The
-            // conversion with 14 fraction bits does the division, exactly.
-            let v_lo = vcvtq_n_f32_s32::<14>(vshrq_n_s32::<20>(vreinterpretq_s32_u32(s_lo)));
-            let v_hi = vcvtq_n_f32_s32::<14>(vshrq_n_s32::<20>(vreinterpretq_s32_u32(s_hi)));
-            vst1q_f32(xo.as_mut_ptr(), v_lo);
-            vst1q_f32(xo.as_mut_ptr().add(4), v_hi);
-        }
-        vgetq_lane_u32::<0>(vseed)
-    };
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    let mut vseed = unsafe { vdupq_n_u32(seed) };
+    for xo in x8.iter_mut() {
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        vseed = unsafe { fill_with_noise8_neon(xo, vseed) };
+    }
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    let seed = unsafe { vgetq_lane_u32::<0>(vseed) };
     fill_with_noise_scalar(x_tail, seed)
+}
+
+/// One pass of `fill_with_noise_neon`: eight values from the seeds
+/// `lcg_next8(vseed)`. Returns the seed after them, in every lane.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn fill_with_noise8_neon(
+    xo: &mut [f32; 8],
+    vseed: core::arch::aarch64::uint32x4_t,
+) -> core::arch::aarch64::uint32x4_t {
+    use crate::simd_mem::neon::store_f32x4;
+    use core::arch::aarch64::*;
+
+    let (s_lo, s_hi, next) = lcg_next8(vseed);
+    // The top 12 bits as a signed number, divided by 2^14. The conversion
+    // with 14 fraction bits does the division, exactly.
+    let v_lo = vcvtq_n_f32_s32::<14>(vshrq_n_s32::<20>(vreinterpretq_s32_u32(s_lo)));
+    let v_hi = vcvtq_n_f32_s32::<14>(vshrq_n_s32::<20>(vreinterpretq_s32_u32(s_hi)));
+    let (xo, _) = xo.as_chunks_mut::<4>();
+    store_f32x4(&mut xo[0], v_lo);
+    store_f32x4(&mut xo[1], v_hi);
+    next
 }
 
 /// The seeds of the next eight values after `seed`, as two vectors, for
@@ -955,7 +984,8 @@ fn fill_with_noise_neon(x: &mut [f32], seed: u32) -> u32 {
 /// the lower halves of those, for the even and the odd steps, are the
 /// wrapping products of the scalar code.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn lcg_next8_sse2(seed: u32) -> (core::arch::x86_64::__m128i, core::arch::x86_64::__m128i) {
     use core::arch::x86_64::*;
     const fn lanes(first: usize, field: usize) -> [i32; 4] {
@@ -969,23 +999,19 @@ fn lcg_next8_sse2(seed: u32) -> (core::arch::x86_64::__m128i, core::arch::x86_64
         v
     }
     /// `seed * mul[k] + add[k]` for the four lanes `k`, wrapping.
-    #[inline(always)]
+    #[target_feature(enable = "sse2")]
+    #[inline]
     fn four(s: __m128i, mul: [i32; 4], add: [i32; 4]) -> __m128i {
-        // SAFETY: SSE2 is part of this target (see the `cfg` of the outer
-        // function); these instructions only compute in registers.
-        unsafe {
-            // Steps 0 and 2 in the 64-bit lanes of `even`, 1 and 3 in `odd`.
-            let even = _mm_mul_epu32(s, _mm_setr_epi32(mul[0], 0, mul[2], 0));
-            let odd = _mm_mul_epu32(s, _mm_setr_epi32(mul[1], 0, mul[3], 0));
-            let low = _mm_unpacklo_epi32(
-                _mm_shuffle_epi32::<0b11_11_10_00>(even),
-                _mm_shuffle_epi32::<0b11_11_10_00>(odd),
-            );
-            _mm_add_epi32(low, _mm_setr_epi32(add[0], add[1], add[2], add[3]))
-        }
+        // Steps 0 and 2 in the 64-bit lanes of `even`, 1 and 3 in `odd`.
+        let even = _mm_mul_epu32(s, _mm_setr_epi32(mul[0], 0, mul[2], 0));
+        let odd = _mm_mul_epu32(s, _mm_setr_epi32(mul[1], 0, mul[3], 0));
+        let low = _mm_unpacklo_epi32(
+            _mm_shuffle_epi32::<0b11_11_10_00>(even),
+            _mm_shuffle_epi32::<0b11_11_10_00>(odd),
+        );
+        _mm_add_epi32(low, _mm_setr_epi32(add[0], add[1], add[2], add[3]))
     }
-    // SAFETY: SSE2 is part of this target (see the `cfg`).
-    let s = unsafe { _mm_set1_epi32(seed as i32) };
+    let s = _mm_set1_epi32(seed as i32);
     (four(s, lanes(0, 0), lanes(0, 1)), four(s, lanes(4, 0), lanes(4, 1)))
 }
 
@@ -993,57 +1019,79 @@ fn lcg_next8_sse2(seed: u32) -> (core::arch::x86_64::__m128i, core::arch::x86_64
 /// eight steps ahead computed in a general register. `lb` must be at least
 /// as long as `x`.
 ///
-/// The noise is -1/256 with its sign bit flipped where bit 15 of the seed
-/// is set: bit 15 shifted to bit 31 and added with an exclusive or. The
-/// sum is the scalar code's.
+/// The loop is here and one pass is `fold_with_noise8_sse2`, for the
+/// reason given at `fold_with_noise_neon`.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[inline(always)]
 fn fold_with_noise_sse2(x: &mut [f32], lb: &[f32], mut seed: u32) -> u32 {
-    use core::arch::x86_64::*;
-
     let lb = &lb[..x.len()];
     let (x8, x_tail) = x.as_chunks_mut::<8>();
     let (lb8, lb_tail) = lb.as_chunks::<8>();
     let (mul8, add8) = LCG_AHEAD[7];
-    // SAFETY: SSE2 is part of this target (see the `cfg`). Each load and
-    // store covers one half of a `[f32; 8]`.
-    unsafe {
-        let minus = _mm_set1_epi32((-1.0f32 / 256.0).to_bits() as i32);
-        let bit = _mm_set1_epi32(0x8000);
-        let noise = |s: __m128i| _mm_castsi128_ps(_mm_xor_si128(minus, _mm_slli_epi32::<16>(_mm_and_si128(s, bit))));
-        for (xo, l) in x8.iter_mut().zip(lb8) {
-            let (s_lo, s_hi) = lcg_next8_sse2(seed);
-            seed = seed.wrapping_mul(mul8).wrapping_add(add8);
-            _mm_storeu_ps(xo.as_mut_ptr(), _mm_add_ps(_mm_loadu_ps(l.as_ptr()), noise(s_lo)));
-            _mm_storeu_ps(xo.as_mut_ptr().add(4), _mm_add_ps(_mm_loadu_ps(l.as_ptr().add(4)), noise(s_hi)));
-        }
+    for (xo, l) in x8.iter_mut().zip(lb8) {
+        // SAFETY: SSE2 is part of this target (see the `cfg`).
+        unsafe { fold_with_noise8_sse2(xo, l, seed) };
+        seed = seed.wrapping_mul(mul8).wrapping_add(add8);
     }
     fold_with_noise_scalar(x_tail, lb_tail, seed)
 }
 
-/// SSE2 form of `fill_with_noise`: eight values per pass. The top 12 bits
-/// as a signed number, converted to `f32` (exact) and multiplied by 2^-14,
-/// which is exact as the division by 16384 of the scalar code.
+/// One pass of `fold_with_noise_sse2`: `xo = l + noise` for eight values,
+/// with the seeds `lcg_next8_sse2(seed)`.
+///
+/// The noise is -1/256 with its sign bit flipped where bit 15 of the seed
+/// is set: bit 15 shifted to bit 31 and added with an exclusive or. The
+/// sum is the scalar code's.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[target_feature(enable = "sse2")]
+#[inline]
+fn fold_with_noise8_sse2(xo: &mut [f32; 8], l: &[f32; 8], seed: u32) {
+    use crate::simd_mem::x86::{load_f32x4, store_f32x4};
+    use core::arch::x86_64::*;
+
+    let minus = _mm_set1_epi32((-1.0f32 / 256.0).to_bits() as i32);
+    let bit = _mm_set1_epi32(0x8000);
+    let noise = |s: __m128i| _mm_castsi128_ps(_mm_xor_si128(minus, _mm_slli_epi32::<16>(_mm_and_si128(s, bit))));
+    let (s_lo, s_hi) = lcg_next8_sse2(seed);
+    let (l, _) = l.as_chunks::<4>();
+    let (xo, _) = xo.as_chunks_mut::<4>();
+    store_f32x4(&mut xo[0], _mm_add_ps(load_f32x4(&l[0]), noise(s_lo)));
+    store_f32x4(&mut xo[1], _mm_add_ps(load_f32x4(&l[1]), noise(s_hi)));
+}
+
+/// SSE2 form of `fill_with_noise`: eight values per pass. The loop is here
+/// and one pass is `fill_with_noise8_sse2`, for the reason given at
+/// `fold_with_noise_neon`.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[inline(always)]
 fn fill_with_noise_sse2(x: &mut [f32], mut seed: u32) -> u32 {
-    use core::arch::x86_64::*;
-
     let (x8, x_tail) = x.as_chunks_mut::<8>();
     let (mul8, add8) = LCG_AHEAD[7];
-    // SAFETY: SSE2 is part of this target (see the `cfg`). Each store
-    // covers one half of a `[f32; 8]`.
-    unsafe {
-        let scale = _mm_set1_ps(1.0 / 16384.0);
-        let value = |s: __m128i| _mm_mul_ps(_mm_cvtepi32_ps(_mm_srai_epi32::<20>(s)), scale);
-        for xo in x8.iter_mut() {
-            let (s_lo, s_hi) = lcg_next8_sse2(seed);
-            seed = seed.wrapping_mul(mul8).wrapping_add(add8);
-            _mm_storeu_ps(xo.as_mut_ptr(), value(s_lo));
-            _mm_storeu_ps(xo.as_mut_ptr().add(4), value(s_hi));
-        }
+    for xo in x8.iter_mut() {
+        // SAFETY: SSE2 is part of this target (see the `cfg`).
+        unsafe { fill_with_noise8_sse2(xo, seed) };
+        seed = seed.wrapping_mul(mul8).wrapping_add(add8);
     }
     fill_with_noise_scalar(x_tail, seed)
+}
+
+/// One pass of `fill_with_noise_sse2`: eight values from the seeds
+/// `lcg_next8_sse2(seed)`. The top 12 bits as a signed number, converted
+/// to `f32` (exact) and multiplied by 2^-14, which is exact as the division
+/// by 16384 of the scalar code.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[target_feature(enable = "sse2")]
+#[inline]
+fn fill_with_noise8_sse2(xo: &mut [f32; 8], seed: u32) {
+    use crate::simd_mem::x86::store_f32x4;
+    use core::arch::x86_64::*;
+
+    let scale = _mm_set1_ps(1.0 / 16384.0);
+    let value = |s: __m128i| _mm_mul_ps(_mm_cvtepi32_ps(_mm_srai_epi32::<20>(s)), scale);
+    let (s_lo, s_hi) = lcg_next8_sse2(seed);
+    let (xo, _) = xo.as_chunks_mut::<4>();
+    store_f32x4(&mut xo[0], value(s_lo));
+    store_f32x4(&mut xo[1], value(s_hi));
 }
 
 /// Fills a band that got no pulses with the folded band `lb` plus noise:
@@ -2659,36 +2707,34 @@ fn quant_all_bands_impl(
     *seed = ctx_seed;
 }
 
-/// # Safety
-///
-/// The CPU must have AVX2 and FMA. Every load covers `band[i..i + 8]` with
-/// `i + 8 <= band.len()`.
+/// The amplitude of one band, `sqrt(1e-27 + sum of x^2)`, with AVX2 and
+/// FMA: sixteen values per pass in two sums of eight lanes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn compute_band_energy_avx2(band: &[f32]) -> f32 {
+fn compute_band_energy_avx2(band: &[f32]) -> f32 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::load_f32x8;
 
-    let n = band.len();
-    let mut i = 0usize;
+    let (octets, tail) = band.as_chunks::<8>();
+    let (pairs, last) = octets.as_chunks::<2>();
 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
 
-    while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(band.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(band.as_ptr().add(i + 8));
+    for [a, b] in pairs {
+        let v0 = load_f32x8(a);
+        let v1 = load_f32x8(b);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         acc1 = _mm256_fmadd_ps(v1, v1, acc1);
-        i += 16;
     }
 
-    if i + 8 <= n {
-        let v0 = _mm256_loadu_ps(band.as_ptr().add(i));
+    // At most one group of eight is left.
+    if let [a] = last {
+        let v0 = load_f32x8(a);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
-        i += 8;
     }
 
     let acc = _mm256_add_ps(acc0, acc1);
@@ -2700,7 +2746,7 @@ unsafe fn compute_band_energy_avx2(band: &[f32]) -> f32 {
     let t2 = _mm_shuffle_ps(s2, s2, 0x55);
     let mut sum = 1e-27f32 + _mm_cvtss_f32(_mm_add_ss(s2, t2));
 
-    for &v in &band[i..] {
+    for &v in tail {
         sum += v * v;
     }
 
@@ -2795,15 +2841,13 @@ pub fn normalise_bands(
             let dst = &mut x[base..base + n];
             #[cfg(target_arch = "x86_64")]
             if n >= 8 && use_avx2 {
-                // SAFETY: `src` and `dst` were sliced to `n` values above,
-                // and the CPU has AVX2.
+                // SAFETY: the CPU has AVX2, the feature of the kernel.
                 unsafe { scale_slice_avx2(src, dst, norm, n) };
                 continue;
             }
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
-                // SAFETY: `src` and `dst` were sliced to `n` values above.
-                unsafe { scale_slice_neon(src, dst, norm, n) };
+                scale_slice_neon(src, dst, norm, n);
                 continue;
             }
             for (d, &s) in dst.iter_mut().zip(src) {
@@ -2813,13 +2857,12 @@ pub fn normalise_bands(
     }
 }
 
-/// # Safety
+/// `dst[i] = src[i] * scale` for `i < n`, with AVX2.
 ///
-/// `src` and `dst` must hold at least `n` values each, and the CPU must have
-/// AVX2.
+/// Panics when `src` or `dst` holds fewer than `n` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
+fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -2829,17 +2872,25 @@ unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
     let vscale = _mm256_set1_ps(scale);
     let mut i = 0;
 
-    while i + 16 <= n {
-        let s0 = _mm256_loadu_ps(src.as_ptr().add(i));
-        let s1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(s0, vscale));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), _mm256_mul_ps(s1, vscale));
-        i += 16;
-    }
-    while i + 8 <= n {
-        let sv = _mm256_loadu_ps(src.as_ptr().add(i));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(sv, vscale));
-        i += 8;
+    // The loops keep the pointer loads and stores of the original code:
+    // with the groups of eight taken from `as_chunks`, the compiler counted
+    // the steps with an extra compare.
+    // SAFETY: each load and store covers `src` or `dst` at `i..i + 8` or
+    // `i + 8..i + 16` with `i + 8 <= n` or `i + 16 <= n`, and both hold at
+    // least `n` values (checked above).
+    unsafe {
+        while i + 16 <= n {
+            let s0 = _mm256_loadu_ps(src.as_ptr().add(i));
+            let s1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(s0, vscale));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), _mm256_mul_ps(s1, vscale));
+            i += 16;
+        }
+        while i + 8 <= n {
+            let sv = _mm256_loadu_ps(src.as_ptr().add(i));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(sv, vscale));
+            i += 8;
+        }
     }
     for j in i..n {
         dst[j] = src[j] * scale;
@@ -2848,42 +2899,48 @@ unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
 
 /// `dst[i] = src[i] * scale` for `i < n`.
 ///
-/// # Safety
+/// Panics when `src` or `dst` holds fewer than `n` values.
 ///
-/// `src` and `dst` must each hold at least `n` values. Every load and store
-/// covers `[i..i + 4]` with `i + 4 <= n`.
+/// The loops keep their pointer loads and stores, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn scale_slice_neon(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
+fn scale_slice_neon(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
     use core::arch::aarch64::*;
-    debug_assert!(src.len() >= n && dst.len() >= n);
-    let vscale = vdupq_n_f32(scale);
-    let mut i = 0;
+    let (src, dst) = (&src[..n], &mut dst[..n]);
+    // SAFETY: NEON is part of the baseline of every aarch64 target. `src`
+    // and `dst` hold `n` values (sliced above), and every load and store
+    // covers `[i..i + 4]` with `i + 4 <= n`.
+    let i = unsafe {
+        let vscale = vdupq_n_f32(scale);
+        let mut i = 0;
 
-    while i + 16 <= n {
-        let s0 = vld1q_f32(src.as_ptr().add(i));
-        let s1 = vld1q_f32(src.as_ptr().add(i + 4));
-        let s2 = vld1q_f32(src.as_ptr().add(i + 8));
-        let s3 = vld1q_f32(src.as_ptr().add(i + 12));
-        vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 4), vmulq_f32(s1, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 8), vmulq_f32(s2, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 12), vmulq_f32(s3, vscale));
-        i += 16;
-    }
-    while i + 8 <= n {
-        let s0 = vld1q_f32(src.as_ptr().add(i));
-        let s1 = vld1q_f32(src.as_ptr().add(i + 4));
-        vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 4), vmulq_f32(s1, vscale));
-        i += 8;
-    }
-    while i + 4 <= n {
-        let s0 = vld1q_f32(src.as_ptr().add(i));
-        vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
-        i += 4;
-    }
+        while i + 16 <= n {
+            let s0 = vld1q_f32(src.as_ptr().add(i));
+            let s1 = vld1q_f32(src.as_ptr().add(i + 4));
+            let s2 = vld1q_f32(src.as_ptr().add(i + 8));
+            let s3 = vld1q_f32(src.as_ptr().add(i + 12));
+            vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
+            vst1q_f32(dst.as_mut_ptr().add(i + 4), vmulq_f32(s1, vscale));
+            vst1q_f32(dst.as_mut_ptr().add(i + 8), vmulq_f32(s2, vscale));
+            vst1q_f32(dst.as_mut_ptr().add(i + 12), vmulq_f32(s3, vscale));
+            i += 16;
+        }
+        while i + 8 <= n {
+            let s0 = vld1q_f32(src.as_ptr().add(i));
+            let s1 = vld1q_f32(src.as_ptr().add(i + 4));
+            vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
+            vst1q_f32(dst.as_mut_ptr().add(i + 4), vmulq_f32(s1, vscale));
+            i += 8;
+        }
+        while i + 4 <= n {
+            let s0 = vld1q_f32(src.as_ptr().add(i));
+            vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
+            i += 4;
+        }
+        i
+    };
     for j in i..n {
         dst[j] = src[j] * scale;
     }
@@ -2918,15 +2975,13 @@ pub fn denormalise_bands(
             let dst = &mut freq[base..base + n];
             #[cfg(target_arch = "x86_64")]
             if n >= 8 && use_avx2 {
-                // SAFETY: `src` and `dst` were sliced to `n` values above,
-                // and the CPU has AVX2.
+                // SAFETY: the CPU has AVX2, the feature of the kernel.
                 unsafe { scale_slice_avx2(src, dst, g, n) };
                 continue;
             }
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
-                // SAFETY: `src` and `dst` were sliced to `n` values above.
-                unsafe { scale_slice_neon(src, dst, g, n) };
+                scale_slice_neon(src, dst, g, n);
                 continue;
             }
             for (d, &s) in dst.iter_mut().zip(src) {
@@ -2940,37 +2995,39 @@ pub fn celt_lcg_rand(seed: u32) -> u32 {
     seed.wrapping_mul(1664525).wrapping_add(1013904223)
 }
 
-/// # Safety
+/// `renormalise_vector` with AVX2 and FMA: the energy of `x[..n]` in two
+/// sums of eight lanes, then every value times `(1 / sqrt(E)) * gain`.
 ///
-/// `x` must hold at least `n` values, and the CPU must have AVX2 and FMA.
+/// Panics when `x` holds fewer than `n` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
+fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::{load_f32x8, store_f32x8};
 
     // The loads and stores below cover `x[..n]`.
     assert!(x.len() >= n);
-
-    let mut i = 0usize;
+    let x = &mut x[..n];
 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
 
-    while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+    let (octets, tail) = x.as_chunks::<8>();
+    let (pairs, last) = octets.as_chunks::<2>();
+    for [a, b] in pairs {
+        let v0 = load_f32x8(a);
+        let v1 = load_f32x8(b);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         acc1 = _mm256_fmadd_ps(v1, v1, acc1);
-        i += 16;
     }
 
-    if i + 8 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
+    // At most one group of eight is left.
+    if let [a] = last {
+        let v0 = load_f32x8(a);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
-        i += 8;
     }
 
     let acc = _mm256_add_ps(acc0, acc1);
@@ -2982,7 +3039,7 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     let t2 = _mm_shuffle_ps(s2, s2, 0x55);
     let mut e = 1e-15f32 + _mm_cvtss_f32(_mm_add_ss(s2, t2));
 
-    for &v in &x[i..n] {
+    for &v in tail {
         e += v * v;
     }
 
@@ -2990,20 +3047,20 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     let norm = (1.0 / e.sqrt()) * gain;
     let vnorm = _mm256_set1_ps(norm);
 
-    i = 0;
-    while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v0, vnorm));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), _mm256_mul_ps(v1, vnorm));
-        i += 16;
+    let (octets, tail) = x.as_chunks_mut::<8>();
+    let (pairs, last) = octets.as_chunks_mut::<2>();
+    for [a, b] in pairs {
+        let v0 = load_f32x8(a);
+        let v1 = load_f32x8(b);
+        store_f32x8(a, _mm256_mul_ps(v0, vnorm));
+        store_f32x8(b, _mm256_mul_ps(v1, vnorm));
     }
-    while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.as_ptr().add(i));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v, vnorm));
-        i += 8;
+    // At most one group of eight is left.
+    if let [a] = last {
+        let v = load_f32x8(a);
+        store_f32x8(a, _mm256_mul_ps(v, vnorm));
     }
-    for v in &mut x[i..n] {
+    for v in tail {
         *v *= norm;
     }
 }
@@ -3025,14 +3082,12 @@ fn renormalise_vector_libopus(x: &mut [f32], gain: f32) {
 /// `renormalise_vector` does (see `renormalise_vector_libopus`). x86-64 with
 /// AVX2 sums bands of 16 values and more with its own kernel.
 pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
-    // The only bounds check. The vector kernel reads and writes `n` values
-    // through pointers.
+    // The only bounds check: the vector kernel works on `n` values.
     let x = &mut x[..n];
     #[cfg(target_arch = "x86_64")]
     {
         if n >= 16 && crate::compat::x86_has_avx2_fma() {
-            // SAFETY: `x` holds exactly `n` values, and the CPU has the
-            // features the kernel is compiled for.
+            // SAFETY: the CPU has AVX2 and FMA, the features of the kernel.
             unsafe { renormalise_vector_avx2(x, n, gain) };
             return;
         }
@@ -3232,7 +3287,9 @@ mod tests {
                     #[cfg(target_arch = "aarch64")]
                     {
                         let mut got = input.clone();
-                        haar1_neon(&mut got[..used], stride);
+                        // SAFETY: NEON is part of the baseline of every
+                        // aarch64 target.
+                        unsafe { haar1_neon(&mut got[..used], stride) };
                         assert_same_bits(&got, &want, &format!("haar1_neon, {what}"));
                     }
                 }
@@ -3490,8 +3547,7 @@ mod tests {
                 let scale = 1.0 + test_values(1, &mut seed, false)[0];
                 // Two values more than `n`: they must stay unchanged.
                 let mut dst = vec![7.0f32; n + 2];
-                // SAFETY: `src` holds `n` values and `dst` holds `n + 2`.
-                unsafe { scale_slice_neon(&src, &mut dst, scale, n) };
+                scale_slice_neon(&src, &mut dst, scale, n);
                 let mut want: Vec<f32> = src.iter().map(|&v| v * scale).collect();
                 want.extend([7.0, 7.0]);
                 assert_same_bits(&dst, &want, &format!("n {n} extremes {extremes}"));
