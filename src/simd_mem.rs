@@ -34,6 +34,10 @@
 //!   `x[i..i + 4]` and `x[i + stride..i + stride + 4]`, are views of the
 //!   same `&[Cell<f32>]` (`Cell::from_mut(x).as_slice_of_cells()`), split
 //!   with `as_chunks`. The `_cells` functions load and store them.
+//! - [`array_at_unchecked`] takes the array at an index without a check.
+//!   It is an `unsafe fn`, for reads at positions that come from data the
+//!   kernel checked before, such as the index table of a sparse layer of
+//!   the neural networks.
 //!
 //! The functions are `#[inline]`, not `#[inline(always)]`, which Rust does
 //! not allow together with `#[target_feature]`. Each is one instruction, so
@@ -62,6 +66,25 @@ pub(crate) fn array_at<T, const N: usize>(s: &[T], i: usize) -> &[T; N] {
 #[inline(always)]
 pub(crate) fn array_at_mut<T, const N: usize>(s: &mut [T], i: usize) -> &mut [T; N] {
     (&mut s[i..i + N]).try_into().unwrap()
+}
+
+/// The `N` values `s[i..i + N]` as an array, without an index check.
+///
+/// For reads at positions that come from data the caller has checked
+/// before, such as the index table of a sparse layer, where a check at
+/// every read would cost speed.
+///
+/// # Safety
+///
+/// `i + N <= s.len()`.
+// Only the neural network kernels use this.
+#[cfg_attr(not(feature = "dnn"), allow(dead_code))]
+#[inline(always)]
+pub(crate) unsafe fn array_at_unchecked<T, const N: usize>(s: &[T], i: usize) -> &[T; N] {
+    // SAFETY: the caller guarantees that `s[i..i + N]` lies inside `s`, so
+    // the pointer is valid for reading `N` values of `T`, and `[T; N]` has
+    // the alignment of `T`.
+    unsafe { &*s.as_ptr().add(i).cast::<[T; N]>() }
 }
 
 /// Loads and stores for NEON (aarch64).
@@ -421,6 +444,59 @@ pub(crate) mod neon {
         // what `vld1q_u8` reads. It needs no alignment.
         unsafe { vld1q_u8(a.as_ptr()) }
     }
+
+    /// Loads sixteen `i8` values.
+    // Only the neural network kernels (`crate::dnn`) use this.
+    #[cfg_attr(not(feature = "dnn"), allow(dead_code))]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_i8x16(a: &[i8; 16]) -> int8x16_t {
+        // SAFETY: `a` is valid for reading sixteen `i8` values, which is
+        // what `vld1q_s8` reads. It needs no alignment.
+        unsafe { vld1q_s8(a.as_ptr()) }
+    }
+
+    /// Loads 64 `i8` values into four registers (`vld1q_s8_x4`): register
+    /// `k` gets `a[16·k..16·k + 16]`.
+    // Only the neural network kernels (`crate::dnn`) use this.
+    #[cfg_attr(not(feature = "dnn"), allow(dead_code))]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_i8x16x4(a: &[i8; 64]) -> int8x16x4_t {
+        // SAFETY: `a` is valid for reading 64 `i8` values, which is what
+        // `vld1q_s8_x4` reads. It needs no alignment.
+        unsafe { vld1q_s8_x4(a.as_ptr()) }
+    }
+
+    /// Stores the low four `i8` values of `v` into memory that may not
+    /// hold values yet.
+    // Only the neural network kernels (`crate::dnn`) use this.
+    #[cfg_attr(not(feature = "dnn"), allow(dead_code))]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_i8x4_uninit(a: &mut [MaybeUninit<i8>; 4], v: int8x8_t) {
+        // The four bytes as one `i32`, written without alignment: `a` has
+        // the alignment of `i8` only.
+        let x = vget_lane_s32::<0>(vreinterpret_s32_s8(v));
+        // SAFETY: `a` is valid for writing four bytes, which is what
+        // `write_unaligned` of an `i32` writes, and no other reference
+        // reaches them. It needs no alignment. Writing values into
+        // `MaybeUninit` is always allowed.
+        unsafe { a.as_mut_ptr().cast::<i32>().write_unaligned(x) }
+    }
+
+    /// Stores sixteen `i8` values into memory that may not hold values yet.
+    // Only the neural network kernels (`crate::dnn`) use this.
+    #[cfg_attr(not(feature = "dnn"), allow(dead_code))]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_i8x16_uninit(a: &mut [MaybeUninit<i8>; 16], v: int8x16_t) {
+        // SAFETY: `a` is valid for writing sixteen bytes, which is what
+        // `vst1q_s8` writes, and no other reference reaches them. It needs
+        // no alignment. Writing values into `MaybeUninit` is always
+        // allowed.
+        unsafe { vst1q_s8(a.as_mut_ptr().cast(), v) }
+    }
 }
 
 /// Loads and stores for SSE, SSE2, AVX and AVX-512 (x86 and x86-64).
@@ -658,5 +734,27 @@ pub(crate) mod x86 {
         // SAFETY: `a` is valid for reading sixteen `u8` values (16 bytes),
         // which is what `_mm_loadu_si128` reads. It needs no alignment.
         unsafe { _mm_loadu_si128(a.as_ptr().cast()) }
+    }
+
+    /// Loads 32 `i8` values (AVX).
+    // Only the neural network kernels (`crate::dnn`) use this.
+    #[cfg_attr(not(feature = "dnn"), allow(dead_code))]
+    #[target_feature(enable = "avx")]
+    #[inline]
+    pub(crate) fn load_i8x32(a: &[i8; 32]) -> __m256i {
+        // SAFETY: `a` is valid for reading 32 bytes, which is what
+        // `_mm256_loadu_si256` reads. It needs no alignment.
+        unsafe { _mm256_loadu_si256(a.as_ptr().cast()) }
+    }
+
+    /// Loads 64 `i8` values (AVX-512 F).
+    // Only the neural network kernels (`crate::dnn`) use this.
+    #[cfg_attr(not(feature = "dnn"), allow(dead_code))]
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    pub(crate) fn load_i8x64(a: &[i8; 64]) -> __m512i {
+        // SAFETY: `a` is valid for reading 64 bytes, which is what
+        // `_mm512_loadu_si512` reads. It needs no alignment.
+        unsafe { _mm512_loadu_si512(a.as_ptr().cast()) }
     }
 }
