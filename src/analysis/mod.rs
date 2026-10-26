@@ -215,16 +215,21 @@ fn is_digital_silence_scalar(pcm: &[f32], threshold: f32) -> bool {
 /// NaN.
 #[cfg(target_arch = "aarch64")]
 fn max_abs_without_nan(pcm: &[f32]) -> Option<f32> {
+    use crate::simd_mem::{array_at, neon::load_f32x4};
     use core::arch::aarch64::*;
     let (blocks, tail) = pcm.as_chunks::<8>();
-    // SAFETY: NEON is part of every 64-bit ARM processor; each block holds
-    // 8 values, read as two vectors of 4.
+    // The loop stays in this plain function: in a `#[target_feature]`
+    // function, the compiler laid out the encoder, into which this is
+    // inlined, differently, and a scalar loop of the analysis got longer.
+    // SAFETY: NEON is part of the baseline of every aarch64 target. The
+    // block calls only NEON intrinsics and the load helpers of `simd_mem`.
+    // Each block holds 8 values, read as two vectors of 4.
     let (mut max, mut min) = unsafe {
         let zero = vdupq_n_f32(0.0);
         let (mut max0, mut max1, mut min0, mut min1) = (zero, zero, zero, zero);
         for b in blocks {
-            let a = vld1q_f32(b.as_ptr());
-            let c = vld1q_f32(b.as_ptr().add(4));
+            let a = load_f32x4(array_at(b, 0));
+            let c = load_f32x4(array_at(b, 4));
             // FMAX and FMIN give a NaN when either input is a NaN.
             max0 = vmaxq_f32(max0, a);
             max1 = vmaxq_f32(max1, c);
@@ -249,17 +254,21 @@ fn max_abs_without_nan(pcm: &[f32]) -> Option<f32> {
 /// same answer, and a mask of the lanes that saw a NaN.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 fn max_abs_without_nan(pcm: &[f32]) -> Option<f32> {
+    use crate::simd_mem::array_at;
+    use crate::simd_mem::x86::{load_f32x4, to_array_f32x4};
     use core::arch::x86_64::*;
     let (blocks, tail) = pcm.as_chunks::<8>();
-    // SAFETY: SSE is part of this target (see the `cfg`); each block holds
-    // 8 values, read as two vectors of 4.
+    // The loop stays in this plain function, as on aarch64 (see there).
+    // SAFETY: SSE2 is part of this target (see the `cfg`). The block calls
+    // only SSE and SSE2 intrinsics and the helpers of `simd_mem`. Each
+    // block holds 8 values, read as two vectors of 4.
     let (max, nan) = unsafe {
         let sign = _mm_set1_ps(-0.0);
         let zero = _mm_setzero_ps();
         let (mut max0, mut max1, mut nan0, mut nan1) = (zero, zero, zero, zero);
         for b in blocks {
-            let a = _mm_loadu_ps(b.as_ptr());
-            let c = _mm_loadu_ps(b.as_ptr().add(4));
+            let a = load_f32x4(array_at(b, 0));
+            let c = load_f32x4(array_at(b, 4));
             // `_mm_max_ps` skips a NaN in its first operand, so the NaN
             // test is separate: a NaN is unordered with itself.
             max0 = _mm_max_ps(_mm_andnot_ps(sign, a), max0);
@@ -267,7 +276,7 @@ fn max_abs_without_nan(pcm: &[f32]) -> Option<f32> {
             nan0 = _mm_or_ps(nan0, _mm_cmpunord_ps(a, a));
             nan1 = _mm_or_ps(nan1, _mm_cmpunord_ps(c, c));
         }
-        let max = core::mem::transmute::<__m128, [f32; 4]>(_mm_max_ps(max0, max1));
+        let max = to_array_f32x4(_mm_max_ps(max0, max1));
         (max, _mm_movemask_ps(_mm_or_ps(nan0, nan1)) != 0)
     };
     if nan || tail.iter().any(|x| x.is_nan()) {

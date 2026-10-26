@@ -390,7 +390,28 @@ pub(crate) mod neon {
         unsafe { vst1q_s16(a.as_mut_ptr(), v) }
     }
 
+    /// Loads sixteen `i16` values as two vectors: `.0` holds the values at
+    /// the even places, `.1` those at the odd places.
+    // Only the analysis of the encoder (`crate::analysis`) uses this.
+    #[cfg_attr(not(feature = "analysis"), allow(dead_code))]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load2_i16x8(a: &[i16; 16]) -> int16x8x2_t {
+        // SAFETY: `a` is valid for reading sixteen `i16` values, which is
+        // what `vld2q_s16` reads. It needs only the alignment of `i16`.
+        unsafe { vld2q_s16(a.as_ptr()) }
+    }
+
     // `u8` and `i8` values.
+
+    /// Loads eight `u8` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_u8x8(a: &[u8; 8]) -> uint8x8_t {
+        // SAFETY: `a` is valid for reading eight `u8` values, which is
+        // what `vld1_u8` reads. It needs no alignment.
+        unsafe { vld1_u8(a.as_ptr()) }
+    }
 
     /// Loads sixteen `u8` values, such as a byte table for `vqtbl1q_u8`.
     #[target_feature(enable = "neon")]
@@ -405,6 +426,7 @@ pub(crate) mod neon {
 /// Loads and stores for SSE, SSE2, AVX and AVX-512 (x86 and x86-64).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) mod x86 {
+    use crate::kiss_fft::KissCpx;
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -481,6 +503,36 @@ pub(crate) mod x86 {
         // what `_mm256_storeu_ps` writes, and no other reference reaches
         // them. It needs no alignment.
         unsafe { _mm256_storeu_ps(a.as_mut_ptr(), v) }
+    }
+
+    // Complex values (`KissCpx`: the real part, then the imaginary part,
+    // as two `f32` values without padding).
+
+    /// Stores the lower two lanes of `v` as one complex value: lane 0 as
+    /// the real part, lane 1 as the imaginary part (SSE2).
+    // Only the analysis of the encoder (`crate::analysis`) uses this.
+    #[cfg_attr(not(feature = "analysis"), allow(dead_code))]
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    pub(crate) fn store_f32x2_cpx(a: &mut KissCpx, v: __m128) {
+        // SAFETY: `KissCpx` is two `f32` values without padding
+        // (`#[repr(C)]`), so `a` is valid for writing two `f32` values
+        // (8 bytes), which is what `_mm_storel_epi64` writes, and no other
+        // reference reaches them. It needs no alignment.
+        unsafe { _mm_storel_epi64((a as *mut KissCpx).cast(), _mm_castps_si128(v)) }
+    }
+
+    /// Loads two complex values as four `f32` values: the real and the
+    /// imaginary part of the first, then those of the second (SSE).
+    // Only the analysis of the encoder (`crate::analysis`) uses this.
+    #[cfg_attr(not(feature = "analysis"), allow(dead_code))]
+    #[target_feature(enable = "sse")]
+    #[inline]
+    pub(crate) fn load_f32x4_cpx(a: &[KissCpx; 2]) -> __m128 {
+        // SAFETY: `KissCpx` is two `f32` values without padding
+        // (`#[repr(C)]`), so `a` is valid for reading four `f32` values,
+        // which is what `_mm_loadu_ps` reads. It needs no alignment.
+        unsafe { _mm_loadu_ps(a.as_ptr().cast()) }
     }
 
     // `i32` values.
@@ -575,6 +627,16 @@ pub(crate) mod x86 {
         // SAFETY: `a` is valid for reading eight `i16` values (16 bytes),
         // which is what `_mm_loadu_si128` reads. It needs no alignment.
         unsafe { _mm_loadu_si128(a.as_ptr().cast()) }
+    }
+
+    /// Stores eight `i16` values (SSE2).
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    pub(crate) fn store_i16x8(a: &mut [i16; 8], v: __m128i) {
+        // SAFETY: `a` is valid for writing eight `i16` values (16 bytes),
+        // which is what `_mm_storeu_si128` writes, and no other reference
+        // reaches them. It needs no alignment.
+        unsafe { _mm_storeu_si128(a.as_mut_ptr().cast(), v) }
     }
 
     /// Loads sixteen `i16` values (AVX).

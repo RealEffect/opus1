@@ -560,6 +560,11 @@ fn sin_table(w: usize, period: usize) -> Vec<f32> {
 /// 64-bit ARM: one fused multiply-add (`vfmaq_f32`) or fused
 /// multiply-subtract (`vfmsq_f32`) per bin and sample, as clang compiles
 /// the C loop (`fmadd`, `fmsub`).
+///
+/// The loop keeps its pointer loads and stores. With the blocks of the
+/// tables taken from `as_chunks` and loaded through `simd_mem`, the
+/// compiler assigned the registers of `opus_compare_many` differently on
+/// Android, and loops there got longer.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn dft_blocks<const N: usize, const B: usize>(

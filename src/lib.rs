@@ -6717,45 +6717,66 @@ pub(crate) fn celt_float2int16(input: &[f32], output: &mut [i16]) {
         all(target_arch = "x86_64", target_feature = "sse2")
     )))]
     let blocks = 0;
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    for (src, dst) in input[..blocks].as_chunks::<4>().0.iter().zip(output[..blocks].as_chunks_mut::<4>().0) {
-        use core::arch::aarch64::{vcvtaq_s32_f32, vld1q_f32, vmulq_n_f32, vqmovn_s32, vst1_s16};
-        // SAFETY: `src` and `dst` hold exactly 4 values each, the width of
-        // one load and one store. NEON is part of every 64-bit ARM
-        // processor.
-        unsafe {
-            let x = vmulq_n_f32(vld1q_f32(src.as_ptr()), 32768.0);
-            vst1_s16(dst.as_mut_ptr(), vqmovn_s32(vcvtaq_s32_f32(x)));
-        }
+    unsafe {
+        celt_float2int16_blocks_neon(&input[..blocks], &mut output[..blocks]);
     }
     #[cfg(target_arch = "arm")]
     for (dst, &src) in output[..blocks].iter_mut().zip(&input[..blocks]) {
         *dst = float2int16_neon_arm32(src);
     }
+    // SAFETY: SSE2 is part of this target (see the `cfg`).
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-    for (src, dst) in input[..blocks].as_chunks::<8>().0.iter().zip(output[..blocks].as_chunks_mut::<8>().0) {
-        use core::arch::x86_64::*;
-        // SAFETY: `src` and `dst` hold exactly 8 values each: two loads of
-        // 4 floats and one store of 8 samples. SSE and SSE2 are part of this
-        // target (see the `cfg`). The values are limited to the 16-bit range
-        // before the conversion, so it cannot overflow; it rounds as the
-        // processor's rounding mode says, to nearest with halfway values to
-        // the even integer unless a caller changed it, as `_mm_cvt_ss2si`
-        // in libopus.
-        unsafe {
-            let scale = _mm_set1_ps(32768.0);
-            let low = _mm_set1_ps(-32768.0);
-            let high = _mm_set1_ps(32767.0);
-            // `_mm_max_ps` returns its second operand when the first is NaN.
-            let limit = |x: __m128| _mm_min_ps(_mm_max_ps(_mm_mul_ps(x, scale), low), high);
-            let a = limit(_mm_loadu_ps(src.as_ptr()));
-            let b = limit(_mm_loadu_ps(src.as_ptr().add(4)));
-            let packed = _mm_packs_epi32(_mm_cvtps_epi32(a), _mm_cvtps_epi32(b));
-            _mm_storeu_si128(dst.as_mut_ptr().cast(), packed);
-        }
+    unsafe {
+        celt_float2int16_blocks_sse2(&input[..blocks], &mut output[..blocks]);
     }
     for (dst, &src) in output[blocks..].iter_mut().zip(&input[blocks..]) {
         *dst = float2int16(src);
+    }
+}
+
+/// The blocks of `celt_float2int16` on 64-bit ARM, four values at a time:
+/// scale by 32768, round with halfway values away from zero, limit to 16
+/// bits. Converts as many values as `input` and `output` both hold, in
+/// whole blocks of 4.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn celt_float2int16_blocks_neon(input: &[f32], output: &mut [i16]) {
+    use crate::simd_mem::neon::{load_f32x4, store_i16x4};
+    use core::arch::aarch64::{vcvtaq_s32_f32, vmulq_n_f32, vqmovn_s32};
+    for (src, dst) in input.as_chunks::<4>().0.iter().zip(output.as_chunks_mut::<4>().0) {
+        let x = vmulq_n_f32(load_f32x4(src), 32768.0);
+        store_i16x4(dst, vqmovn_s32(vcvtaq_s32_f32(x)));
+    }
+}
+
+/// The blocks of `celt_float2int16` on x86-64, eight values at a time:
+/// scale by 32768, limit to the 16-bit range, round, narrow. Converts as
+/// many values as `input` and `output` both hold, in whole blocks of 8.
+///
+/// The values are limited to the 16-bit range before the conversion, so it
+/// cannot overflow. It rounds as the processor's rounding mode says, to
+/// nearest with halfway values to the even integer unless a caller changed
+/// it, as `_mm_cvt_ss2si` in libopus.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[target_feature(enable = "sse2")]
+#[inline]
+fn celt_float2int16_blocks_sse2(input: &[f32], output: &mut [i16]) {
+    use crate::simd_mem::array_at;
+    use crate::simd_mem::x86::{load_f32x4, store_i16x8};
+    use core::arch::x86_64::*;
+    for (src, dst) in input.as_chunks::<8>().0.iter().zip(output.as_chunks_mut::<8>().0) {
+        let scale = _mm_set1_ps(32768.0);
+        let low = _mm_set1_ps(-32768.0);
+        let high = _mm_set1_ps(32767.0);
+        // `_mm_max_ps` returns its second operand when the first is NaN.
+        let limit = |x: __m128| _mm_min_ps(_mm_max_ps(_mm_mul_ps(x, scale), low), high);
+        let a = limit(load_f32x4(array_at(src, 0)));
+        let b = limit(load_f32x4(array_at(src, 4)));
+        let packed = _mm_packs_epi32(_mm_cvtps_epi32(a), _mm_cvtps_epi32(b));
+        store_i16x8(dst, packed);
     }
 }
 
