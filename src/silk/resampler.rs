@@ -748,8 +748,9 @@ fn down_fir_interpolated_neon(
     // and `x[14..18]` of the 18 samples.
     let products = |index_q16: i32| -> int32x4_t {
         let pos = (index_q16 >> 16) as usize;
-        // SAFETY: `down_fir_vector_len` has checked that every one of the
-        // `n4` samples reads 18 samples of `buf` that lie inside it.
+        // SAFETY: `down_fir_vector_len` has checked that the positions of
+        // the `n4` samples do not wrap and that the 18 samples each one
+        // reads lie inside `buf`.
         let x = unsafe { buf.get_unchecked(pos..pos + RESAMPLER_DOWN_ORDER_FIR0) };
         let w = &taps.wide[down_fir_phase(index_q16, fracs)];
         let p0 = vqdmulhq_s32(load_i32x4(array_at(x, 0)), load_i32x4(array_at(w, 0)));
@@ -771,11 +772,37 @@ fn down_fir_interpolated_neon(
     down_fir_interpolated_scalar(&mut out[n4..], buf, index_q16, index_increment_q16, fracs, taps);
 }
 
+/// The position (`index_q16`) of the last of `n` output samples, when a
+/// vector kernel starts at `index_q16` and adds `index_increment_q16` for
+/// each sample. The kernels add in wrapping `i32` arithmetic: a position
+/// above `i32::MAX` would wrap to a negative one, and `index_q16 >> 16`
+/// would then become a huge `usize` index.
+///
+/// Returns `None` unless `n >= 1`, `index_q16 >= 0`,
+/// `index_increment_q16 > 0` and the last position is at most `i32::MAX`.
+/// When it returns a value, the positions of the `n` samples grow from
+/// `index_q16` to that value without wrapping, so the last sample has the
+/// largest one.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn checked_last_index_q16(n: usize, index_q16: i32, index_increment_q16: i32) -> Option<usize> {
+    if index_q16 < 0 || index_increment_q16 <= 0 {
+        return None;
+    }
+    let last = (n as u64)
+        .checked_sub(1)?
+        .checked_mul(index_increment_q16 as u64)?
+        .checked_add(index_q16 as u64)?;
+    if last <= i32::MAX as u64 { Some(last as usize) } else { None }
+}
+
 /// How many of `n_out` output samples a vector kernel may compute: a
-/// multiple of four, all with their `window` input samples inside the
-/// `buf_len` samples of the buffer. With valid arguments this is `n_out`
-/// rounded down to a multiple of four; the scalar kernel computes the rest
-/// (and panics on an argument that is not valid).
+/// multiple of four. The kernel starts at position 0. For each of these
+/// samples, its position does not wrap (see [`checked_last_index_q16`]) and
+/// its `window` input samples lie inside the `buf_len` samples of the
+/// buffer. With valid arguments this is `n_out` rounded down to a multiple
+/// of four; the scalar kernel computes the rest (and panics on an argument
+/// that is not valid).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn down_fir_vector_len(
@@ -785,12 +812,11 @@ fn down_fir_vector_len(
     index_increment_q16: i32,
 ) -> usize {
     let n4 = n_out & !3;
-    if n4 == 0 || index_increment_q16 <= 0 {
-        return 0;
+    // The last sample has the largest position, so its window ends last.
+    match checked_last_index_q16(n4, 0, index_increment_q16) {
+        Some(last) if (last >> 16) + window <= buf_len => n4,
+        _ => 0,
     }
-    // The position never decreases, so the last sample has the largest one.
-    let last_pos = ((n4 as u64 - 1) * index_increment_q16 as u64) >> 16;
-    if last_pos + window as u64 <= buf_len as u64 { n4 } else { 0 }
 }
 
 /// Store four output samples: the lanes of each `p` add up to one sample
@@ -894,8 +920,9 @@ fn down_fir_symmetric_neon<const HALF: usize>(
     // both are inside because `4 * vectors <= 2 * HALF` (checked above).
     let products = |index_q16: i32| -> int32x4_t {
         let pos = (index_q16 >> 16) as usize;
-        // SAFETY: `down_fir_vector_len` has checked that every one of the
-        // `n4` samples reads `2 * HALF` samples of `buf` that lie inside it.
+        // SAFETY: `down_fir_vector_len` has checked that the positions of
+        // the `n4` samples do not wrap and that the `2 * HALF` samples each
+        // one reads lie inside `buf`.
         let x = unsafe { buf.get_unchecked(pos..pos + 2 * HALF) };
         let mut sum = vdupq_n_s32(0);
         for v in 0..vectors {
@@ -1028,7 +1055,9 @@ fn iir_fir_interpol_scalar(
 
 /// `iir_fir_interpol_scalar` with four output samples per step.
 ///
-/// Panics when `buf` is too short for the vector part.
+/// Panics when `buf` is too short for the vector part, or when the
+/// positions of the vector part do not grow from 0 or more to at most
+/// `i32::MAX` (see [`checked_last_index_q16`]).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -1047,22 +1076,19 @@ fn iir_fir_interpol_neon(
     let n = out.len();
     let n4 = n & !3;
     if n4 > 0 {
-        // The position in `buf` never decreases, so the last sample of the
-        // vector part has the largest one.
-        debug_assert!(index_q16 >= 0 && index_increment_q16 > 0);
-        let last_index_q16 = index_q16 as i64 + (n4 as i64 - 1) * index_increment_q16 as i64;
-        assert!(
-            index_q16 >= 0
-                && index_increment_q16 > 0
-                && (last_index_q16 >> 16) as usize + RESAMPLER_ORDER_FIR_12 <= buf.len()
-        );
+        // The positions of the vector part must not wrap. They then grow,
+        // so the 8 samples of the last sample end last.
+        let last_index_q16 = checked_last_index_q16(n4, index_q16, index_increment_q16)
+            .expect("the positions of the vector part must not wrap");
+        assert!((last_index_q16 >> 16) + RESAMPLER_ORDER_FIR_12 <= buf.len());
 
         // The 8 products of one output sample, added in pairs.
         let products = |index_q16: i32| -> int32x4_t {
             let pos = (index_q16 >> 16) as usize;
-            // SAFETY: the position of every sample of the vector part is
-            // from 0 to that of the last sample, whose 8 samples end inside
-            // `buf` (checked above).
+            // SAFETY: the checks above found that the positions of the
+            // vector part grow from `index_q16 >= 0` to that of the last
+            // sample without wrapping, and that the 8 samples of the last
+            // sample end inside `buf`.
             let x = unsafe { buf.get_unchecked(pos..pos + RESAMPLER_ORDER_FIR_12) };
             let x = load_i16x8(array_at(x, 0));
             let taps = load_i16x8(iir_fir_taps(index_q16));
@@ -1493,8 +1519,9 @@ mod x86 {
         // The loads read `x[0..16]` and `x[14..18]` of the 18 samples.
         let products = |index_q16: i32| -> __m128i {
             let pos = (index_q16 >> 16) as usize;
-            // SAFETY: `down_fir_vector_len` has checked that every one of
-            // the `n4` samples reads 18 samples of `buf` that lie inside it.
+            // SAFETY: `down_fir_vector_len` has checked that the positions
+            // of the `n4` samples do not wrap and that the 18 samples each
+            // one reads lie inside `buf`.
             let x = unsafe { buf.get_unchecked(pos..pos + RESAMPLER_DOWN_ORDER_FIR0) };
             let f = &factors[down_fir_phase(index_q16, fracs)];
             let load = |k: usize| load_i32x4(array_at(x, k));
@@ -1547,9 +1574,9 @@ mod x86 {
         // (checked above).
         let products = |index_q16: i32| -> __m128i {
             let pos = (index_q16 >> 16) as usize;
-            // SAFETY: `down_fir_vector_len` has checked that every one of
-            // the `n4` samples reads `2 * HALF` samples of `buf` that lie
-            // inside it.
+            // SAFETY: `down_fir_vector_len` has checked that the positions
+            // of the `n4` samples do not wrap and that the `2 * HALF`
+            // samples each one reads lie inside `buf`.
             let x = unsafe { buf.get_unchecked(pos..pos + 2 * HALF) };
             let mut acc = _mm_setzero_si128();
             for v in 0..vectors {
@@ -1583,7 +1610,9 @@ mod x86 {
     /// wrap at 32 bits as the scalar code's do (`silk_smlabb`), so the order
     /// of the additions does not change them.
     ///
-    /// Panics when `buf` is too short for the vector part.
+    /// Panics when `buf` is too short for the vector part, or when the
+    /// positions of the vector part do not grow from 0 or more to at most
+    /// `i32::MAX` (see [`super::checked_last_index_q16`]).
     #[cfg(target_feature = "sse2")]
     #[target_feature(enable = "sse2")]
     pub(super) fn iir_fir_interpol_sse2(
@@ -1595,21 +1624,19 @@ mod x86 {
         let n = out.len();
         let n4 = n & !3;
         if n4 > 0 {
-            // The position in `buf` never decreases, so the last sample of
-            // the vector part has the largest one.
-            let last_index_q16 = index_q16 as i64 + (n4 as i64 - 1) * index_increment_q16 as i64;
-            assert!(
-                index_q16 >= 0
-                    && index_increment_q16 > 0
-                    && (last_index_q16 >> 16) as usize + RESAMPLER_ORDER_FIR_12 <= buf.len()
-            );
+            // The positions of the vector part must not wrap. They then
+            // grow, so the 8 samples of the last sample end last.
+            let last_index_q16 = checked_last_index_q16(n4, index_q16, index_increment_q16)
+                .expect("the positions of the vector part must not wrap");
+            assert!((last_index_q16 >> 16) + RESAMPLER_ORDER_FIR_12 <= buf.len());
 
             // The 8 products of one output sample, added in pairs.
             let products = |index_q16: i32| -> __m128i {
                 let pos = (index_q16 >> 16) as usize;
-                // SAFETY: the position of every sample of the vector part
-                // is from 0 to that of the last sample, whose 8 samples end
-                // inside `buf` (checked above).
+                // SAFETY: the checks above found that the positions of
+                // the vector part grow from `index_q16 >= 0` to that of the
+                // last sample without wrapping, and that the 8 samples of
+                // the last sample end inside `buf`.
                 let x = unsafe { buf.get_unchecked(pos..pos + RESAMPLER_ORDER_FIR_12) };
                 let x = load_i16x8(array_at(x, 0));
                 let taps = load_i16x8(iir_fir_taps(index_q16));
@@ -2210,6 +2237,84 @@ mod tests {
             // leaves the buffer at the second sample and panics.
             assert_eq!(result.is_ok(), inc == 0, "inc={inc}");
         }
+    }
+
+    /// The kernels step the position in wrapping `i32` arithmetic. With
+    /// this increment the position of the last of 8 samples passes
+    /// `i32::MAX` and wraps to a negative value. Without the wrap that
+    /// sample would read from sample 32768 on, and the buffers below are
+    /// long enough for that. The vector kernels must not read at the
+    /// wrapped position: they must panic (in their check, or in the scalar
+    /// kernel they hand the samples to). One step less must still work.
+    #[test]
+    fn interpolation_kernels_panic_when_the_position_would_wrap() {
+        fn panics(f: impl FnOnce() + std::panic::UnwindSafe) -> bool {
+            std::panic::catch_unwind(f).is_err()
+        }
+        const N: usize = 8;
+        // `7 * INC` is `2^31 + 5`, just past `i32::MAX`.
+        const INC: i32 = i32::MAX / 7 + 1;
+        let last_pos = (((N as u64 - 1) * INC as u64) >> 16) as usize;
+        assert_eq!(last_pos, 32768);
+        let half_1_2: &[i16; 12] = SILK_RESAMPLER_1_2_COEFS[2..].try_into().unwrap();
+        let half_1_3: &[i16; 18] = SILK_RESAMPLER_1_3_COEFS[2..].try_into().unwrap();
+        let buf = vec![1i32; last_pos + 36];
+        let up_buf = vec![1i16; last_pos + RESAMPLER_ORDER_FIR_12];
+
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            assert_eq!(checked_last_index_q16(N, 0, INC), None);
+            assert_eq!(checked_last_index_q16(N, 0, INC - 1), Some(7 * (INC - 1) as usize));
+            assert_eq!(checked_last_index_q16(N, 2, INC - 1), None);
+            assert_eq!(checked_last_index_q16(0, 0, 1), None);
+            assert_eq!(checked_last_index_q16(usize::MAX, 0, i32::MAX), None);
+            for window in [RESAMPLER_DOWN_ORDER_FIR0, 24, 36] {
+                assert_eq!(down_fir_vector_len(N, buf.len(), window, INC), 0);
+                assert_eq!(down_fir_vector_len(N, buf.len(), window, INC - 1), N);
+            }
+        }
+
+        let up = |out: &mut [i16], inc: i32| {
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe {
+                iir_fir_interpol_neon(out, &up_buf, 0, inc);
+            }
+            #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+            // SAFETY: SSE2 is part of this target (see the `cfg`).
+            unsafe {
+                x86::iir_fir_interpol_sse2(out, &up_buf, 0, inc);
+            }
+            #[cfg(not(any(
+                target_arch = "aarch64",
+                all(target_arch = "x86_64", target_feature = "sse2")
+            )))]
+            iir_fir_interpol_scalar(out, &up_buf, 0, inc);
+        };
+
+        assert!(panics(|| {
+            down_fir_interpolated(&mut [0i16; N], &buf, INC, 3, &SILK_RESAMPLER_3_4_TAPS)
+        }));
+        assert!(panics(|| down_fir_symmetric(&mut [0i16; N], &buf, INC, half_1_2)));
+        assert!(panics(|| down_fir_symmetric(&mut [0i16; N], &buf, INC, half_1_3)));
+        assert!(panics(|| up(&mut [0i16; N], INC)));
+
+        // One step less: the last position is `i32::MAX - 1`, and the
+        // kernels give the scalar results.
+        let inc = INC - 1;
+        let mut expect = [0i16; N];
+        down_fir_interpolated_scalar(&mut expect, &buf, 0, inc, 3, &SILK_RESAMPLER_3_4_TAPS);
+        let mut out = [0x5555i16; N];
+        down_fir_interpolated(&mut out, &buf, inc, 3, &SILK_RESAMPLER_3_4_TAPS);
+        assert_eq!(out, expect, "interpolated");
+        down_fir_symmetric_scalar(&mut expect, &buf, 0, inc, half_1_3);
+        let mut out = [0x5555i16; N];
+        down_fir_symmetric(&mut out, &buf, inc, half_1_3);
+        assert_eq!(out, expect, "symmetric 36");
+        iir_fir_interpol_scalar(&mut expect, &up_buf, 0, inc);
+        let mut out = [0x5555i16; N];
+        up(&mut out, inc);
+        assert_eq!(out, expect, "up-sampler");
     }
 
     /// The tap tables of the interpolating down-FIR against the libopus
