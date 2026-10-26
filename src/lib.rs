@@ -126,6 +126,7 @@ mod quant_bands;
 mod range_coder;
 mod rate;
 mod silk;
+mod simd_mem;
 
 /// The Rust examples in `README.md` and in `docs/`. `cargo test --doc`
 /// compiles and runs every ` ```rust ` block in these files, so the
