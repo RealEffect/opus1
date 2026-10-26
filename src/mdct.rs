@@ -264,10 +264,7 @@ impl MdctLookup {
 
         // One choice of the implementation per transform.
         #[cfg(target_arch = "aarch64")]
-        {
-            // SAFETY: the arguments passed `forward_plan`.
-            unsafe { forward_neon(&p, input, output, window, overlap, stride) }
-        }
+        forward_neon(&p, input, output, window, overlap, stride);
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if crate::compat::x86_has_avx() {
@@ -353,10 +350,7 @@ impl MdctLookup {
 
         // One choice of the implementation per transform.
         #[cfg(target_arch = "aarch64")]
-        {
-            // SAFETY: the arguments passed `backward_plan`.
-            unsafe { backward_neon(&p, input, output, window, overlap, stride) }
-        }
+        backward_neon(&p, input, output, window, overlap, stride);
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if crate::compat::x86_has_avx() {
@@ -456,6 +450,41 @@ fn down2(s: &[f32]) -> impl ExactSizeIterator<Item = f32> + '_ {
 #[inline(always)]
 fn down1<T: Copy>(s: &[T]) -> impl ExactSizeIterator<Item = T> + '_ {
     s.rchunks_exact(1).map(|c| c[0])
+}
+
+// The vector steps walk the slices as arrays of the width they load and
+// store, with the same kind of zips.
+
+/// The arrays `s[0..N]`, `s[N..2 * N]`, ... of `s`, upwards. Values left
+/// over at the end are left out.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn up_arrays<T, const N: usize>(s: &[T]) -> core::slice::Iter<'_, [T; N]> {
+    s.as_chunks::<N>().0.iter()
+}
+
+/// `up_arrays` of a mutable slice.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn up_arrays_mut<T, const N: usize>(s: &mut [T]) -> core::slice::IterMut<'_, [T; N]> {
+    s.as_chunks_mut::<N>().0.iter_mut()
+}
+
+/// The arrays `s[len - N..len]`, `s[len - 2 * N..len - N]`, ... of `s`,
+/// downwards from its end. Values left over at the start are left out.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn down_arrays<T, const N: usize>(s: &[T]) -> impl ExactSizeIterator<Item = &[T; N]> + '_ {
+    s.rchunks_exact(N).map(|c| c.try_into().unwrap())
+}
+
+/// `down_arrays` of a mutable slice.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn down_arrays_mut<T, const N: usize>(
+    s: &mut [T],
+) -> impl ExactSizeIterator<Item = &mut [T; N]> + '_ {
+    s.rchunks_exact_mut(N).map(|c| c.try_into().unwrap())
 }
 
 /// Rotation in front of the forward FFT, with the FFT scale factor
@@ -741,7 +770,7 @@ fn backward_impl<A: Arith>(
 /// results are the same bits.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn forward_avx(
+fn forward_avx(
     p: &Plan<'_>,
     input: &[f32],
     output: &mut [f32],
@@ -759,7 +788,7 @@ unsafe fn forward_avx(
 /// steps. The results are the same bits.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn backward_avx(
+fn backward_avx(
     p: &Plan<'_>,
     input: &[f32],
     output: &mut [f32],
@@ -768,59 +797,60 @@ unsafe fn backward_avx(
     stride: usize,
 ) {
     backward_rotations::<Separate>(p, input, output, overlap, stride, opus_fft_impl);
-    // SAFETY: `backward_plan` checked that `output` and `window` hold
-    // `overlap` values.
     mdct_tdac_avx(output, window, overlap);
 }
 
 /// Inverse MDCT, last step, with AVX.
 ///
-/// # Safety
-/// The processor must support AVX. `output` and `window` must hold at least
-/// `overlap` values each.
+/// Panics when `output` or `window` holds fewer than `overlap` values.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn mdct_tdac_avx(output: &mut [f32], window: &[f32], overlap: usize) {
+fn mdct_tdac_avx(output: &mut [f32], window: &[f32], overlap: usize) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::{load_f32x8, store_f32x8};
 
     assert!(output.len() >= overlap && window.len() >= overlap);
     let overlap2 = overlap / 2;
-    let mut i = 0usize;
 
-    // SAFETY: the vector loads and the vector store touch `i..i + 8` with
-    // `i + 8 <= overlap / 2`. Everything else is indexed with a check.
-    while i + 8 <= overlap2 {
-        let x2 = _mm256_loadu_ps(output.as_ptr().add(i));
+    // Sample `i` and sample `overlap - 1 - i` form a pair, for `i` below
+    // `overlap / 2`. A step takes eight pairs: eight samples at the front,
+    // walking up from 0, and their mirror images at the back, walking down
+    // from `overlap - 1`.
+    let (front, back) = output[..overlap].split_at_mut(overlap - overlap2);
+    let (w_front, w_back) = window[..overlap].split_at(overlap - overlap2);
+    let samples =
+        up_arrays_mut::<f32, 8>(&mut front[..overlap2]).zip(down_arrays_mut::<f32, 8>(back));
+    let weights = up_arrays::<f32, 8>(&w_front[..overlap2]).zip(down_arrays::<f32, 8>(w_back));
+    for ((x_front, x_back), (w_front, w_back)) in samples.zip(weights) {
+        let x2 = load_f32x8(x_front);
 
         let mut x1_tmp = [0f32; 8];
         let mut w2_tmp = [0f32; 8];
         for j in 0..8 {
-            x1_tmp[j] = output[overlap - 1 - (i + j)];
-            w2_tmp[j] = window[overlap - 1 - (i + j)];
+            x1_tmp[j] = x_back[7 - j];
+            w2_tmp[j] = w_back[7 - j];
         }
-        let x1 = _mm256_loadu_ps(x1_tmp.as_ptr());
+        let x1 = load_f32x8(&x1_tmp);
 
-        let w1 = _mm256_loadu_ps(window.as_ptr().add(i));
-        let w2 = _mm256_loadu_ps(w2_tmp.as_ptr());
+        let w1 = load_f32x8(w_front);
+        let w2 = load_f32x8(&w2_tmp);
 
         let out_fwd = _mm256_sub_ps(_mm256_mul_ps(x2, w2), _mm256_mul_ps(x1, w1));
         let out_rev = _mm256_add_ps(_mm256_mul_ps(x2, w1), _mm256_mul_ps(x1, w2));
 
-        _mm256_storeu_ps(output.as_mut_ptr().add(i), out_fwd);
+        store_f32x8(x_front, out_fwd);
 
         let mut out_rev_tmp = [0f32; 8];
-        _mm256_storeu_ps(out_rev_tmp.as_mut_ptr(), out_rev);
+        store_f32x8(&mut out_rev_tmp, out_rev);
         for j in 0..8 {
-            output[overlap - 1 - (i + j)] = out_rev_tmp[j];
+            x_back[7 - j] = out_rev_tmp[j];
         }
-
-        i += 8;
     }
 
-    for i in i..overlap2 {
+    for i in 8 * (overlap2 / 8)..overlap2 {
         let x1 = output[overlap - 1 - i];
         let x2 = output[i];
         let wp1 = window[i];
@@ -844,15 +874,18 @@ unsafe fn mdct_tdac_avx(output: &mut [f32], window: &[f32], overlap: usize) {
 // is not a multiple of four, the last step is moved back so that it ends with
 // the last butterfly. It then computes some butterflies a second time, which
 // is harmless: no step reads what it writes.
+//
+// The loops walk the slices as arrays (`up_arrays`, `down_arrays`). Where a
+// step reads or writes values a stride apart, it indexes without a check,
+// after one check of the largest index.
 // ---------------------------------------------------------------------------
 
 /// Forward MDCT with the NEON steps.
 ///
-/// # Safety
-/// `p`, `input`, `output`, `window`, `overlap` and `stride` must have passed
-/// `MdctLookup::forward_plan`.
+/// The arguments are those that passed `MdctLookup::forward_plan`. The steps
+/// panic on others.
 #[cfg(target_arch = "aarch64")]
-unsafe fn forward_neon(
+fn forward_neon(
     p: &Plan<'_>,
     input: &[f32],
     output: &mut [f32],
@@ -879,28 +912,26 @@ unsafe fn forward_neon(
     let mut f2_buf: Work = [MaybeUninit::uninit(); MAX_N4];
     let f2 = &mut f2_buf[..n4];
 
-    // SAFETY: `forward_plan` checked that `overlap` is `4 * q`, that
-    // `n4 >= 2 * q`, that `input` holds `2 * n4 + 4 * q` values, `window`
-    // `4 * q` values and `output` `stride * (2 * n4 - 1) + 1` values. The plan
-    // has `2 * n4` rotation values and `n4` bit-reversal entries below `n4`.
-    // The group sizes were checked above.
-    neon::forward_fold_rotate(input, window, p.trig, &p.st.bitrev, f2, q, p.st.scale());
+    // SAFETY: NEON is part of the baseline of every aarch64 target. The
+    // bit-reversal table of a plan is a permutation of `0..n4`:
+    // `KissFftState::build` checks it, and `MdctLookup` never changes its
+    // plans. So each of its entries is below `n4`, as the step requires.
+    unsafe { neon::forward_fold_rotate(input, window, p.trig, &p.st.bitrev, f2, q, p.st.scale()) };
     // SAFETY: the fold step wrote entry `bitrev[i]` of `f2` for every
     // butterfly `i` in `0..n4`. The bit-reversal table of a plan is a
-    // permutation of `0..n4`: `KissFftState::build` checks it, and
-    // `MdctLookup` never changes its plans. So every entry was written.
-    let f2 = f2.assume_init_mut();
+    // permutation of `0..n4` (see above). So every entry was written.
+    let f2 = unsafe { f2.assume_init_mut() };
     opus_fft_impl(p.st, f2);
-    neon::forward_post_rotate(f2, p.trig, output, stride);
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    unsafe { neon::forward_post_rotate(f2, p.trig, output, stride) };
 }
 
 /// Inverse MDCT with the NEON steps.
 ///
-/// # Safety
-/// `p`, `input`, `output`, `window`, `overlap` and `stride` must have passed
-/// `MdctLookup::backward_plan`.
+/// The arguments are those that passed `MdctLookup::backward_plan`. The
+/// steps panic on others.
 #[cfg(target_arch = "aarch64")]
-unsafe fn backward_neon(
+fn backward_neon(
     p: &Plan<'_>,
     input: &[f32],
     output: &mut [f32],
@@ -923,70 +954,178 @@ unsafe fn backward_neon(
     let mut f2_buf: Work = [MaybeUninit::uninit(); MAX_N4];
     let f2 = &mut f2_buf[..n4];
 
-    // SAFETY: `backward_plan` checked that `input` holds
-    // `stride * (2 * n4 - 1) + 1` values and that `output` holds
-    // `overlap / 2 + 2 * n4` values. The plan has `2 * n4` rotation values and
-    // `n4` bit-reversal entries below `n4`. `n4 >= 4` was checked above.
-    neon::backward_pre_rotate(input, p.trig, &p.st.bitrev, f2, stride);
+    // SAFETY: NEON is part of the baseline of every aarch64 target. The
+    // bit-reversal table of a plan is a permutation of `0..n4`:
+    // `KissFftState::build` checks it, and `MdctLookup` never changes its
+    // plans. So each of its entries is below `n4`, as the step requires.
+    unsafe { neon::backward_pre_rotate(input, p.trig, &p.st.bitrev, f2, stride) };
     // SAFETY: the rotation wrote entry `bitrev[i]` of `f2` for every
     // butterfly `i` in `0..n4`. The bit-reversal table of a plan is a
-    // permutation of `0..n4`: `KissFftState::build` checks it, and
-    // `MdctLookup` never changes its plans. So every entry was written.
-    let f2 = f2.assume_init_mut();
+    // permutation of `0..n4` (see above). So every entry was written.
+    let f2 = unsafe { f2.assume_init_mut() };
     opus_fft_impl(p.st, f2);
     let overlap2 = overlap / 2;
-    neon::backward_post_rotate(f2, p.trig, &mut output[overlap2..overlap2 + p.n2]);
-    // SAFETY: `backward_plan` checked that `window` holds `overlap` values.
-    neon::tdac(&mut output[..overlap], window);
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    unsafe { neon::backward_post_rotate(f2, p.trig, &mut output[overlap2..overlap2 + p.n2]) };
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    unsafe { neon::tdac(&mut output[..overlap], window) };
 }
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::{Fused, KissCpx, tdac_scalar};
+    use super::{
+        Fused, KissCpx, down_arrays, down_arrays_mut, holds_strided, tdac_scalar, up_arrays,
+        up_arrays_mut,
+    };
+    use crate::simd_mem::neon::{
+        load_dup_f32x4, load_f32x4, load_lane_f32x4, load2_f32x4_cpx, store_f32x2_cpx_uninit,
+        store_f32x4, store_lane_f32x4, store2_f32x4_cells,
+    };
     use core::arch::aarch64::*;
+    use core::cell::Cell;
     use core::mem::MaybeUninit;
 
-    /// `[p[0], p[2], p[4], p[6]]`.
-    ///
-    /// # Safety
-    /// `p[0..8]` must be readable.
-    #[inline(always)]
-    unsafe fn up4(p: *const f32) -> float32x4_t {
-        vuzp1q_f32(vld1q_f32(p), vld1q_f32(p.add(4)))
+    /// `[a[0], a[2], a[4], a[6]]`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn up4(a: &[f32; 8]) -> float32x4_t {
+        let (h, _) = a.as_chunks::<4>();
+        vuzp1q_f32(load_f32x4(&h[0]), load_f32x4(&h[1]))
     }
 
-    /// `[p[0], p[-2], p[-4], p[-6]]`.
-    ///
-    /// # Safety
-    /// `p[-7..=0]` must be readable.
-    #[inline(always)]
-    unsafe fn down4(p: *const f32) -> float32x4_t {
-        let lo = vld1q_f32(p.sub(7));
-        let hi = vld1q_f32(p.sub(3));
-        // uzp2(hi, lo) is [p[-2], p[0], p[-6], p[-4]].
+    /// `[a[7], a[5], a[3], a[1]]`: every second value, downwards from the
+    /// last one.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn down4(a: &[f32; 8]) -> float32x4_t {
+        let (h, _) = a.as_chunks::<4>();
+        let lo = load_f32x4(&h[0]);
+        let hi = load_f32x4(&h[1]);
+        // uzp2(hi, lo) is [a[5], a[7], a[1], a[3]].
         vrev64q_f32(vuzp2q_f32(hi, lo))
     }
 
     /// The four lanes in reverse order.
-    #[inline(always)]
-    unsafe fn rev4(v: float32x4_t) -> float32x4_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn rev4(v: float32x4_t) -> float32x4_t {
         let r = vrev64q_f32(v);
         vextq_f32(r, r, 2)
+    }
+
+    /// The first eight values of `s`. Panics when it holds fewer.
+    #[inline(always)]
+    fn first8(s: &[f32]) -> &[f32; 8] {
+        s.first_chunk().unwrap()
+    }
+
+    /// The last eight values of `s`. Panics when it holds fewer.
+    #[inline(always)]
+    fn last8(s: &[f32]) -> &[f32; 8] {
+        s.last_chunk().unwrap()
+    }
+
+    /// The last four values of `s`. Panics when it holds fewer.
+    #[inline(always)]
+    fn last4<T>(s: &[T]) -> &[T; 4] {
+        s.last_chunk().unwrap()
     }
 
     /// Stores the complex values `(a[k], b[k])` at `f2[bitrev[k]]`, k = 0..4.
     ///
     /// # Safety
-    /// `bitrev[0..4]` must be readable and each entry must be the index of a
-    /// complex value inside the buffer `f2` points to.
-    #[inline(always)]
-    unsafe fn store_bitrev4(a: float32x4_t, b: float32x4_t, bitrev: *const i16, f2: *mut f32) {
+    /// Each entry of `bitrev` must be below `f2.len()`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn store_bitrev4(
+        a: float32x4_t,
+        b: float32x4_t,
+        bitrev: &[i16; 4],
+        f2: &mut [MaybeUninit<KissCpx>],
+    ) {
         let lo = vzip1q_f32(a, b);
         let hi = vzip2q_f32(a, b);
-        vst1_f32(f2.add(2 * *bitrev as usize), vget_low_f32(lo));
-        vst1_f32(f2.add(2 * *bitrev.add(1) as usize), vget_high_f32(lo));
-        vst1_f32(f2.add(2 * *bitrev.add(2) as usize), vget_low_f32(hi));
-        vst1_f32(f2.add(2 * *bitrev.add(3) as usize), vget_high_f32(hi));
+        // SAFETY: the caller guarantees that each entry of `bitrev` is an
+        // index of `f2`.
+        unsafe {
+            store_f32x2_cpx_uninit(f2.get_unchecked_mut(bitrev[0] as usize), vget_low_f32(lo));
+            store_f32x2_cpx_uninit(f2.get_unchecked_mut(bitrev[1] as usize), vget_high_f32(lo));
+            store_f32x2_cpx_uninit(f2.get_unchecked_mut(bitrev[2] as usize), vget_low_f32(hi));
+            store_f32x2_cpx_uninit(f2.get_unchecked_mut(bitrev[3] as usize), vget_high_f32(hi));
+        }
+    }
+
+    /// The coefficients of the butterflies `i..i + 4` of a transform of `n2`
+    /// coefficients that lie `stride` values apart in `input`: `x1` holds
+    /// the coefficients `2 * i`, `2 * i + 2`, `2 * i + 4` and `2 * i + 6`,
+    /// `x2` the coefficients `n2 - 1 - 2 * i`, `n2 - 3 - 2 * i`,
+    /// `n2 - 5 - 2 * i` and `n2 - 7 - 2 * i`.
+    ///
+    /// # Safety
+    /// `i + 4 <= n2 / 2`, and `stride * (n2 - 1)`, computed without
+    /// overflow, must be an index of `input`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn load_strided(
+        input: &[f32],
+        i: usize,
+        n2: usize,
+        stride: usize,
+    ) -> (float32x4_t, float32x4_t) {
+        let even = 2 * i * stride;
+        let odd = stride * (n2 - 1 - 2 * i);
+        // SAFETY: every index read is a multiple of `stride` between
+        // `stride * 0` and `stride * (n2 - 1)`, because `i + 4 <= n2 / 2`.
+        // The caller guarantees that `stride * (n2 - 1)` is an index of
+        // `input`.
+        unsafe {
+            let x1 = load_dup_f32x4(input.get_unchecked(even));
+            let x1 = load_lane_f32x4::<1>(input.get_unchecked(even + 2 * stride), x1);
+            let x1 = load_lane_f32x4::<2>(input.get_unchecked(even + 4 * stride), x1);
+            let x1 = load_lane_f32x4::<3>(input.get_unchecked(even + 6 * stride), x1);
+            let x2 = load_dup_f32x4(input.get_unchecked(odd));
+            let x2 = load_lane_f32x4::<1>(input.get_unchecked(odd - 2 * stride), x2);
+            let x2 = load_lane_f32x4::<2>(input.get_unchecked(odd - 4 * stride), x2);
+            let x2 = load_lane_f32x4::<3>(input.get_unchecked(odd - 6 * stride), x2);
+            (x1, x2)
+        }
+    }
+
+    /// Stores the coefficients of the butterflies `i..i + 4` of a transform
+    /// of `n2` coefficients that lie `stride` values apart in `output`:
+    /// `yr` at the coefficients `2 * i`, `2 * i + 2`, `2 * i + 4` and
+    /// `2 * i + 6`, `yi` at the coefficients `n2 - 1 - 2 * i`,
+    /// `n2 - 3 - 2 * i`, `n2 - 5 - 2 * i` and `n2 - 7 - 2 * i`.
+    ///
+    /// # Safety
+    /// `i + 4 <= n2 / 2`, and `stride * (n2 - 1)`, computed without
+    /// overflow, must be an index of `output`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn store_strided(
+        output: &mut [f32],
+        i: usize,
+        n2: usize,
+        stride: usize,
+        yr: float32x4_t,
+        yi: float32x4_t,
+    ) {
+        let even = 2 * i * stride;
+        let odd = stride * (n2 - 1 - 2 * i);
+        // SAFETY: every index written is a multiple of `stride` between
+        // `stride * 0` and `stride * (n2 - 1)`, because `i + 4 <= n2 / 2`.
+        // The caller guarantees that `stride * (n2 - 1)` is an index of
+        // `output`.
+        unsafe {
+            store_lane_f32x4::<0>(output.get_unchecked_mut(even), yr);
+            store_lane_f32x4::<1>(output.get_unchecked_mut(even + 2 * stride), yr);
+            store_lane_f32x4::<2>(output.get_unchecked_mut(even + 4 * stride), yr);
+            store_lane_f32x4::<3>(output.get_unchecked_mut(even + 6 * stride), yr);
+            store_lane_f32x4::<0>(output.get_unchecked_mut(odd), yi);
+            store_lane_f32x4::<1>(output.get_unchecked_mut(odd - 2 * stride), yi);
+            store_lane_f32x4::<2>(output.get_unchecked_mut(odd - 4 * stride), yi);
+            store_lane_f32x4::<3>(output.get_unchecked_mut(odd - 6 * stride), yi);
+        }
     }
 
     /// Forward MDCT, first step: window, fold, rotate and store in
@@ -994,13 +1133,15 @@ mod neon {
     ///
     /// Entry `bitrev[i]` of `f2` is written for every `i` in `0..f2.len()`.
     ///
+    /// With `n4 = f2.len()`, the step needs `n4 >= 2 * q`, `q` and
+    /// `n4 - 2 * q` each 0 or at least 4, and at least `2 * n4 + 4 * q`
+    /// values in `input`, `4 * q` in `window`, `2 * n4` in `trig` and `n4`
+    /// in `bitrev`. It panics when the slices are shorter, and may panic
+    /// when the sizes do not fit.
+    ///
     /// # Safety
-    /// With `n4 = f2.len()`:
-    /// - `n4 >= 2 * q`, and each of `q` and `n4 - 2 * q` is 0 or at least 4
-    /// - `input` holds at least `2 * n4 + 4 * q` values
-    /// - `window` holds at least `4 * q` values
-    /// - `trig` holds at least `2 * n4` values
-    /// - `bitrev` holds `n4` entries, each of them below `n4`
+    /// Each of the first `n4` entries of `bitrev` must be below `n4`.
+    #[target_feature(enable = "neon")]
     pub(super) unsafe fn forward_fold_rotate(
         input: &[f32],
         window: &[f32],
@@ -1019,100 +1160,125 @@ mod neon {
         debug_assert!(trig.len() >= n2 && bitrev.len() == n4);
         debug_assert!(bitrev.iter().all(|&r| (r as usize) < n4));
 
-        let inp = input.as_ptr();
-        let win = window.as_ptr();
-        let tr = trig.as_ptr();
-        let br = bitrev.as_ptr();
-        let out = f2.as_mut_ptr() as *mut f32;
         let vscale = vdupq_n_f32(scale);
+        // The windowed butterflies read the first `4 * q` samples (`lo`), the
+        // `4 * q` samples that start at `n2` (`hi`) and the window, each in
+        // two halves of `2 * q` values (`_a` and `_b`). The other butterflies
+        // read the samples between `lo` and `n2` (`mid`).
+        let len = 4 * q;
+        let (lo, mid) = input[..n2].split_at(len);
+        let hi = &input[n2..][..len];
+        let w = &window[..len];
+        let (lo_a, lo_b) = lo.split_at(2 * q);
+        let (hi_a, hi_b) = hi.split_at(2 * q);
+        let (w_a, w_b) = w.split_at(2 * q);
+        let (t0, t1) = trig[..n2].split_at(n4);
+        let bitrev = &bitrev[..n4];
 
-        // Rotates the butterflies `i..i + 4` and stores them.
-        // SAFETY (for every call below): `i + 4 <= n4`.
-        let rotate_store = |re: float32x4_t, im: float32x4_t, i: usize| {
-            let t0 = vld1q_f32(tr.add(i));
-            let t1 = vld1q_f32(tr.add(n4 + i));
-            // yr = re * t0 - im * t1 and yi = im * t0 + re * t1, the product
-            // on the left fused.
-            let yr = vfmaq_f32(vmulq_f32(vnegq_f32(im), t1), re, t0);
-            let yi = vfmaq_f32(vmulq_f32(re, t1), im, t0);
-            store_bitrev4(
-                vmulq_f32(yr, vscale),
-                vmulq_f32(yi, vscale),
-                br.add(i),
-                out,
-            );
-        };
+        // Rotates four butterflies with their rotation values `t0` and
+        // `t1` and stores them at their places `br`.
+        let mut rotate_store =
+            |re: float32x4_t, im: float32x4_t, t0: &[f32; 4], t1: &[f32; 4], br: &[i16; 4]| {
+                let t0 = load_f32x4(t0);
+                let t1 = load_f32x4(t1);
+                // yr = re * t0 - im * t1 and yi = im * t0 + re * t1, the
+                // product on the left fused.
+                let yr = vfmaq_f32(vmulq_f32(vnegq_f32(im), t1), re, t0);
+                let yi = vfmaq_f32(vmulq_f32(re, t1), im, t0);
+                // SAFETY: `br` is always a part of `bitrev`, whose entries
+                // the caller guarantees to be below `n4`, which is
+                // `f2.len()`.
+                unsafe { store_bitrev4(vmulq_f32(yr, vscale), vmulq_f32(yi, vscale), br, f2) };
+            };
 
         // Butterflies 0..q. `u` walks up and `d` walks down from the middle
-        // of the first `4 * q` samples, of the `4 * q` samples at `n2`, and
-        // of the window.
-        // SAFETY: `i <= q - 4`, so `u + 8 <= 4 * q` and `d >= 7`.
-        let mut start = 0;
-        while start < q {
-            let i = start.min(q - 4);
-            let u = 2 * q + 2 * i;
-            let d = 2 * q - 1 - 2 * i;
-            let w1 = up4(win.add(u));
-            let w2 = down4(win.add(d));
+        // of `lo`, of `hi` and of the window: step `k` reads the values
+        // `2 * q + 8 * k..` of each (`_b` upwards) and the eight values
+        // before `2 * q - 8 * k` (`_a` downwards).
+        let head = |w_u: &[f32; 8], w_d, l_u, l_d, h_u, h_d| {
+            let w1 = up4(w_u);
+            let w2 = down4(w_d);
             // re = hi[u] * w2 + hi[d] * w1 and im = lo[u] * w1 - lo[d] * w2,
             // the product on the left fused.
-            let re = vfmaq_f32(
-                vmulq_f32(down4(inp.add(n2 + d)), w1),
-                up4(inp.add(n2 + u)),
-                w2,
-            );
-            let im = vfmaq_f32(
-                vmulq_f32(vnegq_f32(down4(inp.add(d))), w2),
-                up4(inp.add(u)),
-                w1,
-            );
-            rotate_store(re, im, i);
-            start += 4;
+            let re = vfmaq_f32(vmulq_f32(down4(h_d), w1), up4(h_u), w2);
+            let im = vfmaq_f32(vmulq_f32(vnegq_f32(down4(l_d)), w2), up4(l_u), w1);
+            (re, im)
+        };
+        let (t0g, t1g, brg) = (&t0[..q], &t1[..q], &bitrev[..q]);
+        let windows = up_arrays(w_b).zip(down_arrays(w_a));
+        let lows = up_arrays(lo_b).zip(down_arrays(lo_a));
+        let highs = up_arrays(hi_b).zip(down_arrays(hi_a));
+        let rotations = up_arrays(t0g).zip(up_arrays(t1g)).zip(up_arrays(brg));
+        let steps = windows.zip(lows).zip(highs).zip(rotations);
+        for ((((w_u, w_d), (l_u, l_d)), (h_u, h_d)), ((t0, t1), br)) in steps {
+            let (re, im) = head(w_u, w_d, l_u, l_d, h_u, h_d);
+            rotate_store(re, im, t0, t1, br);
+        }
+        // When `q` is not a multiple of 4, a last step ends with butterfly
+        // `q - 1`.
+        if !q.is_multiple_of(4) {
+            let (w_u, w_d) = (last8(w_b), first8(w_a));
+            let (l_u, l_d) = (last8(lo_b), first8(lo_a));
+            let (h_u, h_d) = (last8(hi_b), first8(hi_a));
+            let (re, im) = head(w_u, w_d, l_u, l_d, h_u, h_d);
+            rotate_store(re, im, last4(t0g), last4(t1g), last4(brg));
         }
 
         // Butterflies q..n4 - q, no window. The real part walks down from
         // sample `n2 - 1`, the imaginary part walks up from sample `4 * q`.
-        // SAFETY: `q <= i <= n4 - q - 4`, so the real parts are read from
-        // `4 * q..` and the imaginary parts end before `n2`.
-        let mut start = q;
-        while start < n4 - q {
-            let i = start.min(n4 - q - 4);
-            let re = down4(inp.add(n2 - 1 + 2 * q - 2 * i));
-            let im = up4(inp.add(2 * q + 2 * i));
-            rotate_store(re, im, i);
-            start += 4;
+        let (t0g, t1g, brg) = (&t0[q..n4 - q], &t1[q..n4 - q], &bitrev[q..n4 - q]);
+        let samples = down_arrays(mid).zip(up_arrays(mid));
+        let rotations = up_arrays(t0g).zip(up_arrays(t1g)).zip(up_arrays(brg));
+        for ((re, im), ((t0, t1), br)) in samples.zip(rotations) {
+            rotate_store(down4(re), up4(im), t0, t1, br);
+        }
+        // When their number is not a multiple of 4, a last step ends with
+        // butterfly `n4 - q - 1`.
+        if !(n4 - 2 * q).is_multiple_of(4) {
+            rotate_store(down4(first8(mid)), up4(last8(mid)), last4(t0g), last4(t1g), last4(brg));
         }
 
         // Butterflies n4 - q..n4. `u` walks up from the start and `d` walks
-        // down from the end of the same three ranges as in the first loop.
-        // SAFETY: `k <= q - 4`, so `u + 8 <= 2 * q` and `d >= 2 * q + 7`.
-        let mut start = 0;
-        while start < q {
-            let k = start.min(q - 4);
-            let u = 2 * k;
-            let d = 4 * q - 1 - 2 * k;
-            let w1 = up4(win.add(u));
-            let w2 = down4(win.add(d));
+        // down from the end of the same three ranges as in the first loop:
+        // `_a` upwards and `_b` downwards.
+        let tail = |w_u: &[f32; 8], w_d, l_u, l_d, h_u, h_d| {
+            let w1 = up4(w_u);
+            let w2 = down4(w_d);
             // re = -lo[u] * w1 + lo[d] * w2: the negated product is the
             // fused one, so it is subtracted with `fmls`.
             // im = hi[u] * w2 + hi[d] * w1, the product on the left fused.
-            let re = vfmsq_f32(vmulq_f32(down4(inp.add(d)), w2), up4(inp.add(u)), w1);
-            let im = vfmaq_f32(
-                vmulq_f32(down4(inp.add(n2 + d)), w1),
-                up4(inp.add(n2 + u)),
-                w2,
-            );
-            rotate_store(re, im, n4 - q + k);
-            start += 4;
+            let re = vfmsq_f32(vmulq_f32(down4(l_d), w2), up4(l_u), w1);
+            let im = vfmaq_f32(vmulq_f32(down4(h_d), w1), up4(h_u), w2);
+            (re, im)
+        };
+        let (t0g, t1g, brg) = (&t0[n4 - q..], &t1[n4 - q..], &bitrev[n4 - q..]);
+        let windows = up_arrays(w_a).zip(down_arrays(w_b));
+        let lows = up_arrays(lo_a).zip(down_arrays(lo_b));
+        let highs = up_arrays(hi_a).zip(down_arrays(hi_b));
+        let rotations = up_arrays(t0g).zip(up_arrays(t1g)).zip(up_arrays(brg));
+        let steps = windows.zip(lows).zip(highs).zip(rotations);
+        for ((((w_u, w_d), (l_u, l_d)), (h_u, h_d)), ((t0, t1), br)) in steps {
+            let (re, im) = tail(w_u, w_d, l_u, l_d, h_u, h_d);
+            rotate_store(re, im, t0, t1, br);
+        }
+        // When `q` is not a multiple of 4, a last step ends with the last
+        // butterfly.
+        if !q.is_multiple_of(4) {
+            let (w_u, w_d) = (last8(w_a), first8(w_b));
+            let (l_u, l_d) = (last8(lo_a), first8(lo_b));
+            let (h_u, h_d) = (last8(hi_a), first8(hi_b));
+            let (re, im) = tail(w_u, w_d, l_u, l_d, h_u, h_d);
+            rotate_store(re, im, last4(t0g), last4(t1g), last4(brg));
         }
     }
 
     /// Forward MDCT, last step: rotate the FFT output and store it.
     ///
-    /// # Safety
-    /// With `n4 = f2.len()`: `n4 >= 4`, `stride >= 1`, `trig` holds at least
-    /// `2 * n4` values and `output` at least `stride * (2 * n4 - 1) + 1`.
-    pub(super) unsafe fn forward_post_rotate(
+    /// With `n4 = f2.len()`, panics when `n4 < 4`, when `stride` is 0, when
+    /// `trig` holds fewer than `2 * n4` values or `output` fewer than
+    /// `stride * (2 * n4 - 1) + 1`.
+    #[target_feature(enable = "neon")]
+    pub(super) fn forward_post_rotate(
         f2: &[KissCpx],
         trig: &[f32],
         output: &mut [f32],
@@ -1122,17 +1288,13 @@ mod neon {
         let n2 = 2 * n4;
         debug_assert!(n4 >= 4 && stride >= 1);
         debug_assert!(trig.len() >= n2 && output.len() > stride * (n2 - 1));
+        let (t0, t1) = trig[..n2].split_at(n4);
 
-        let f = f2.as_ptr() as *const f32;
-        let tr = trig.as_ptr();
-        let out = output.as_mut_ptr();
-
-        // The two outputs of the butterflies `i..i + 4`.
-        // SAFETY (for every call below): `i + 4 <= n4`.
-        let rotate = |i: usize| {
-            let c = vld2q_f32(f.add(2 * i));
-            let t0 = vld1q_f32(tr.add(i));
-            let t1 = vld1q_f32(tr.add(n4 + i));
+        // The two outputs of four butterflies.
+        let rotate = |f: &[KissCpx; 4], t0: &[f32; 4], t1: &[f32; 4]| {
+            let c = load2_f32x4_cpx(f);
+            let t0 = load_f32x4(t0);
+            let t1 = load_f32x4(t1);
             // (c.im * t1 - c.re * t0, c.re * t1 + c.im * t0), the product on
             // the left fused.
             (
@@ -1145,41 +1307,55 @@ mod neon {
             // Coefficient `2 * k` comes from butterfly `k`, coefficient
             // `2 * k + 1` from butterfly `n4 - 1 - k`. One step takes four
             // butterflies from the front and their four mirror images from
-            // the back, and writes eight coefficients at each end.
-            // SAFETY: `i + 4 <= n4` and `j + 4 <= n4`.
-            let mut i = 0;
-            loop {
-                let j = n4 - 4 - i;
-                let (yr_a, yi_a) = rotate(i);
-                let (yr_b, yi_b) = rotate(j);
-                vst2q_f32(out.add(2 * i), float32x4x2_t(yr_a, rev4(yi_b)));
-                vst2q_f32(out.add(2 * j), float32x4x2_t(yr_b, rev4(yi_a)));
-                // Done when the two blocks have met.
-                if 2 * i + 8 >= n4 {
-                    break;
-                }
-                i += 4;
+            // the back, and writes eight coefficients at each end. The steps
+            // end when the two blocks have met. The last two blocks may
+            // overlap; their coefficients are then written twice, with the
+            // same values. So the coefficients are written as cells.
+            assert!(n4 >= 4);
+            let out = Cell::from_mut(&mut output[..n2]).as_slice_of_cells();
+            // The first `m` butterflies and the last `m` (in blocks of four)
+            // and their coefficients (in blocks of eight).
+            let m = 4 * n4.div_ceil(8);
+            let (fa, _) = f2[..m].as_chunks::<4>();
+            let (a0, _) = t0[..m].as_chunks::<4>();
+            let (a1, _) = t1[..m].as_chunks::<4>();
+            let (oa, _) = out[..2 * m].as_chunks::<8>();
+            let (fb, _) = f2[n4 - m..].as_chunks::<4>();
+            let (b0, _) = t0[n4 - m..].as_chunks::<4>();
+            let (b1, _) = t1[n4 - m..].as_chunks::<4>();
+            let (ob, _) = out[n2 - 2 * m..].as_chunks::<8>();
+            // Each of them holds `m / 4` blocks. With their minimum as the
+            // number of steps, the compiler sees that every index below is
+            // inside its slice. Step `k` takes block `k` from the front and
+            // block `steps - 1 - k` from the back.
+            let steps = fa.len().min(a0.len()).min(a1.len()).min(oa.len());
+            let steps = steps.min(fb.len()).min(b0.len()).min(b1.len()).min(ob.len());
+            for k in 0..steps {
+                let j = steps - 1 - k;
+                let (yr_a, yi_a) = rotate(&fa[k], &a0[k], &a1[k]);
+                let (yr_b, yi_b) = rotate(&fb[j], &b0[j], &b1[j]);
+                store2_f32x4_cells(&oa[k], float32x4x2_t(yr_a, rev4(yi_b)));
+                store2_f32x4_cells(&ob[j], float32x4x2_t(yr_b, rev4(yi_a)));
             }
         } else {
             // Butterfly `i` gives coefficient `2 * i` and coefficient
             // `n2 - 1 - 2 * i`. They are `stride` values apart in `output`.
-            // SAFETY: `i + 3 < n4`, so the largest index written is at most
-            // `stride * (n2 - 1)`.
-            let mut start = 0;
-            while start < n4 {
-                let i = start.min(n4 - 4);
-                let (yr, yi) = rotate(i);
-                let even = out.add(2 * i * stride);
-                let odd = out.add(stride * (n2 - 1 - 2 * i));
-                vst1q_lane_f32::<0>(even, yr);
-                vst1q_lane_f32::<1>(even.add(2 * stride), yr);
-                vst1q_lane_f32::<2>(even.add(4 * stride), yr);
-                vst1q_lane_f32::<3>(even.add(6 * stride), yr);
-                vst1q_lane_f32::<0>(odd, yi);
-                vst1q_lane_f32::<1>(odd.sub(2 * stride), yi);
-                vst1q_lane_f32::<2>(odd.sub(4 * stride), yi);
-                vst1q_lane_f32::<3>(odd.sub(6 * stride), yi);
-                start += 4;
+            assert!(n4 >= 4 && stride >= 1 && holds_strided(output.len(), stride, n2));
+            let steps = up_arrays(f2).zip(up_arrays(t0)).zip(up_arrays(t1));
+            for (k, ((f, t0), t1)) in steps.enumerate() {
+                let (yr, yi) = rotate(f, t0, t1);
+                // SAFETY: the butterflies `4 * k..4 * k + 4` are below
+                // `n4`, and the assert above shows that `stride * (n2 - 1)`
+                // is an index of `output`.
+                unsafe { store_strided(output, 4 * k, n2, stride, yr, yi) };
+            }
+            if !n4.is_multiple_of(4) {
+                // The last step ends with the last butterfly.
+                let i = n4 - 4;
+                let (yr, yi) = rotate(last4(f2), last4(t0), last4(t1));
+                // SAFETY: `i + 4 == n4`, and the assert above shows that
+                // `stride * (n2 - 1)` is an index of `output`.
+                unsafe { store_strided(output, i, n2, stride, yr, yi) };
             }
         }
     }
@@ -1189,10 +1365,13 @@ mod neon {
     ///
     /// Entry `bitrev[i]` of `f2` is written for every `i` in `0..f2.len()`.
     ///
+    /// With `n4 = f2.len()`, panics when `n4 < 4`, when `stride` is 0, when
+    /// `input` holds fewer than `stride * (2 * n4 - 1) + 1` values, `trig`
+    /// fewer than `2 * n4` or `bitrev` fewer than `n4`.
+    ///
     /// # Safety
-    /// With `n4 = f2.len()`: `n4 >= 4`, `stride >= 1`, `input` holds at least
-    /// `stride * (2 * n4 - 1) + 1` values, `trig` at least `2 * n4`, and
-    /// `bitrev` holds `n4` entries, each of them below `n4`.
+    /// Each of the first `n4` entries of `bitrev` must be below `n4`.
+    #[target_feature(enable = "neon")]
     pub(super) unsafe fn backward_pre_rotate(
         input: &[f32],
         trig: &[f32],
@@ -1206,80 +1385,114 @@ mod neon {
         debug_assert!(input.len() > stride * (n2 - 1));
         debug_assert!(trig.len() >= n2 && bitrev.len() == n4);
         debug_assert!(bitrev.iter().all(|&r| (r as usize) < n4));
-
-        let inp = input.as_ptr();
-        let tr = trig.as_ptr();
-        let br = bitrev.as_ptr();
-        let out = f2.as_mut_ptr() as *mut f32;
+        assert!(n4 >= 4 && stride >= 1 && holds_strided(input.len(), stride, n2));
+        let (t0, t1) = trig[..n2].split_at(n4);
+        let bitrev = &bitrev[..n4];
 
         // Butterfly `i` reads coefficient `2 * i` (`x1`) and coefficient
-        // `n2 - 1 - 2 * i` (`x2`). One call rotates the butterflies
-        // `i..i + 4` and stores them.
-        // SAFETY (for every call below): `i + 4 <= n4`, so all coefficients
-        // read are below `n2`.
-        let block = |i: usize| {
-            let (x1, x2) = if stride == 1 {
-                (up4(inp.add(2 * i)), down4(inp.add(n2 - 1 - 2 * i)))
-            } else {
-                let even = inp.add(2 * i * stride);
-                let odd = inp.add(stride * (n2 - 1 - 2 * i));
-                let x1 = vld1q_dup_f32(even);
-                let x1 = vld1q_lane_f32::<1>(even.add(2 * stride), x1);
-                let x1 = vld1q_lane_f32::<2>(even.add(4 * stride), x1);
-                let x1 = vld1q_lane_f32::<3>(even.add(6 * stride), x1);
-                let x2 = vld1q_dup_f32(odd);
-                let x2 = vld1q_lane_f32::<1>(odd.sub(2 * stride), x2);
-                let x2 = vld1q_lane_f32::<2>(odd.sub(4 * stride), x2);
-                let x2 = vld1q_lane_f32::<3>(odd.sub(6 * stride), x2);
-                (x1, x2)
+        // `n2 - 1 - 2 * i` (`x2`). One call rotates four butterflies with
+        // their rotation values `t0` and `t1` and stores them at their
+        // places `br`.
+        let mut block =
+            |x1: float32x4_t, x2: float32x4_t, t0: &[f32; 4], t1: &[f32; 4], br: &[i16; 4]| {
+                let t0 = load_f32x4(t0);
+                let t1 = load_f32x4(t1);
+                // yr = x2 * t0 + x1 * t1 and yi = x1 * t0 - x2 * t1, the
+                // product on the left fused.
+                let yr = vfmaq_f32(vmulq_f32(x1, t1), x2, t0);
+                let yi = vfmaq_f32(vmulq_f32(vnegq_f32(x2), t1), x1, t0);
+                // SAFETY: `br` is always a part of `bitrev`, whose entries
+                // the caller guarantees to be below `n4`, which is
+                // `f2.len()`.
+                unsafe { store_bitrev4(yi, yr, br, f2) };
             };
-            let t0 = vld1q_f32(tr.add(i));
-            let t1 = vld1q_f32(tr.add(n4 + i));
-            // yr = x2 * t0 + x1 * t1 and yi = x1 * t0 - x2 * t1, the product
-            // on the left fused.
-            let yr = vfmaq_f32(vmulq_f32(x1, t1), x2, t0);
-            let yi = vfmaq_f32(vmulq_f32(vnegq_f32(x2), t1), x1, t0);
-            store_bitrev4(yi, yr, br.add(i), out);
-        };
         // Two blocks per step. They do not depend on each other, so a core
         // that runs the instructions in program order works on one while
-        // the other waits for a result. The last block may overlap the one
-        // before; it then stores some butterflies a second time, with the
-        // same values.
-        let mut start = 0;
-        while start + 8 <= n4 {
-            block(start);
-            block(start + 4);
-            start += 8;
+        // the other waits for a result.
+        let rotations =
+            up_arrays::<f32, 8>(t0).zip(up_arrays::<f32, 8>(t1)).zip(up_arrays::<i16, 8>(bitrev));
+        if stride == 1 {
+            // Step `k` reads the sixteen values from `16 * k` upwards and
+            // the sixteen values below `n2 - 16 * k`.
+            let input = &input[..n2];
+            let coefficients = up_arrays::<f32, 16>(input).zip(down_arrays::<f32, 16>(input));
+            for ((x1, x2), ((t0, t1), br)) in coefficients.zip(rotations) {
+                let ((x1, _), (x2, _)) = (x1.as_chunks::<8>(), x2.as_chunks::<8>());
+                let (t0, _) = t0.as_chunks::<4>();
+                let (t1, _) = t1.as_chunks::<4>();
+                let (br, _) = br.as_chunks::<4>();
+                block(up4(&x1[0]), down4(&x2[1]), &t0[0], &t1[0], &br[0]);
+                block(up4(&x1[1]), down4(&x2[0]), &t0[1], &t1[1], &br[1]);
+            }
+        } else {
+            for (k, ((t0, t1), br)) in rotations.enumerate() {
+                let (t0, _) = t0.as_chunks::<4>();
+                let (t1, _) = t1.as_chunks::<4>();
+                let (br, _) = br.as_chunks::<4>();
+                // SAFETY: the butterflies `8 * k..8 * k + 8` are below `n4`,
+                // and the assert above shows that `stride * (n2 - 1)` is an
+                // index of `input`.
+                let (x1, x2) = unsafe { load_strided(input, 8 * k, n2, stride) };
+                block(x1, x2, &t0[0], &t1[0], &br[0]);
+                // SAFETY: as above.
+                let (x1, x2) = unsafe { load_strided(input, 8 * k + 4, n2, stride) };
+                block(x1, x2, &t0[1], &t1[1], &br[1]);
+            }
         }
-        while start < n4 {
-            block(start.min(n4 - 4));
-            start += 4;
+        // At most one more whole block. Its butterflies start at `rest`.
+        let rest = 8 * (n4 / 8);
+        let (t0_rest, t1_rest, br_rest) = (&t0[rest..], &t1[rest..], &bitrev[rest..]);
+        let rotations = up_arrays(t0_rest).zip(up_arrays(t1_rest)).zip(up_arrays(br_rest));
+        if stride == 1 {
+            let (x1_rest, x2_rest) = (&input[2 * rest..n2], &input[..n2 - 2 * rest]);
+            let coefficients = up_arrays(x1_rest).zip(down_arrays(x2_rest));
+            for ((x1, x2), ((t0, t1), br)) in coefficients.zip(rotations) {
+                block(up4(x1), down4(x2), t0, t1, br);
+            }
+        } else {
+            for ((t0, t1), br) in rotations {
+                // SAFETY: the butterflies `rest..rest + 4` are below `n4`,
+                // and the assert above shows that `stride * (n2 - 1)` is an
+                // index of `input`.
+                let (x1, x2) = unsafe { load_strided(input, rest, n2, stride) };
+                block(x1, x2, t0, t1, br);
+            }
+        }
+        // When `n4` is not a multiple of 4, a last block ends with the last
+        // butterfly. It overlaps the block before and stores some
+        // butterflies a second time, with the same values.
+        if !n4.is_multiple_of(4) {
+            let i = n4 - 4;
+            let (x1, x2) = if stride == 1 {
+                (up4(last8(&input[..n2])), down4(first8(input)))
+            } else {
+                // SAFETY: `i + 4 == n4`, and the assert above shows that
+                // `stride * (n2 - 1)` is an index of `input`.
+                unsafe { load_strided(input, i, n2, stride) }
+            };
+            block(x1, x2, last4(t0), last4(t1), last4(bitrev));
         }
     }
 
     /// Inverse MDCT, step after the FFT: rotate and store `n2` samples.
     ///
-    /// # Safety
-    /// With `n4 = f2.len()`: `n4 >= 4`, `trig` holds at least `2 * n4` values
-    /// and `out` at least `2 * n4`.
-    pub(super) unsafe fn backward_post_rotate(f2: &[KissCpx], trig: &[f32], out: &mut [f32]) {
+    /// With `n4 = f2.len()`, panics when `n4 < 4` or when `trig` or `out`
+    /// holds fewer than `2 * n4` values.
+    #[target_feature(enable = "neon")]
+    pub(super) fn backward_post_rotate(f2: &[KissCpx], trig: &[f32], out: &mut [f32]) {
         let n4 = f2.len();
         debug_assert!(n4 >= 4);
         debug_assert!(trig.len() >= 2 * n4 && out.len() >= 2 * n4);
+        assert!(n4 >= 4);
+        let (t0, t1) = trig[..2 * n4].split_at(n4);
 
-        let f = f2.as_ptr() as *const f32;
-        let tr = trig.as_ptr();
-        let out = out.as_mut_ptr();
-
-        // The two outputs of the butterflies `i..i + 4`. The FFT output has
-        // the real part of the rotation input in `.i` and the imaginary part
-        // in `.r`.
-        // SAFETY (for every call below): `i + 4 <= n4`.
-        let rotate = |i: usize| {
-            let c = vld2q_f32(f.add(2 * i));
-            let t0 = vld1q_f32(tr.add(i));
-            let t1 = vld1q_f32(tr.add(n4 + i));
+        // The two outputs of four butterflies. The FFT output has the real
+        // part of the rotation input in `.i` and the imaginary part in
+        // `.r`.
+        let rotate = |f: &[KissCpx; 4], t0: &[f32; 4], t1: &[f32; 4]| {
+            let c = load2_f32x4_cpx(f);
+            let t0 = load_f32x4(t0);
+            let t1 = load_f32x4(t1);
             // (c.im * t0 + c.re * t1, c.im * t1 - c.re * t0), the product on
             // the left fused.
             (
@@ -1291,20 +1504,34 @@ mod neon {
         // Sample `2 * k` comes from butterfly `k`, sample `2 * k + 1` from
         // butterfly `n4 - 1 - k`. One step takes four butterflies from the
         // front and their four mirror images from the back, and writes eight
-        // samples at each end.
-        // SAFETY: `i + 4 <= n4` and `j + 4 <= n4`.
-        let mut i = 0;
-        loop {
-            let j = n4 - 4 - i;
-            let (yr_a, yi_a) = rotate(i);
-            let (yr_b, yi_b) = rotate(j);
-            vst2q_f32(out.add(2 * i), float32x4x2_t(yr_a, rev4(yi_b)));
-            vst2q_f32(out.add(2 * j), float32x4x2_t(yr_b, rev4(yi_a)));
-            // Done when the two blocks have met.
-            if 2 * i + 8 >= n4 {
-                break;
-            }
-            i += 4;
+        // samples at each end. The steps end when the two blocks have met.
+        // The last two blocks may overlap; their samples are then written
+        // twice, with the same values. So the samples are written as cells.
+        let n2 = 2 * n4;
+        let out = Cell::from_mut(&mut out[..n2]).as_slice_of_cells();
+        // The first `m` butterflies and the last `m` (in blocks of four)
+        // and their samples (in blocks of eight).
+        let m = 4 * n4.div_ceil(8);
+        let (fa, _) = f2[..m].as_chunks::<4>();
+        let (a0, _) = t0[..m].as_chunks::<4>();
+        let (a1, _) = t1[..m].as_chunks::<4>();
+        let (oa, _) = out[..2 * m].as_chunks::<8>();
+        let (fb, _) = f2[n4 - m..].as_chunks::<4>();
+        let (b0, _) = t0[n4 - m..].as_chunks::<4>();
+        let (b1, _) = t1[n4 - m..].as_chunks::<4>();
+        let (ob, _) = out[n2 - 2 * m..].as_chunks::<8>();
+        // Each of them holds `m / 4` blocks. With their minimum as the
+        // number of steps, the compiler sees that every index below is
+        // inside its slice. Step `k` takes block `k` from the front and
+        // block `steps - 1 - k` from the back.
+        let steps = fa.len().min(a0.len()).min(a1.len()).min(oa.len());
+        let steps = steps.min(fb.len()).min(b0.len()).min(b1.len()).min(ob.len());
+        for k in 0..steps {
+            let j = steps - 1 - k;
+            let (yr_a, yi_a) = rotate(&fa[k], &a0[k], &a1[k]);
+            let (yr_b, yi_b) = rotate(&fb[j], &b0[j], &b1[j]);
+            store2_f32x4_cells(&oa[k], float32x4x2_t(yr_a, rev4(yi_b)));
+            store2_f32x4_cells(&ob[j], float32x4x2_t(yr_b, rev4(yi_a)));
         }
     }
 
@@ -1315,41 +1542,41 @@ mod neon {
     /// four pairs. This step works in place, so no pair may be computed
     /// twice: the pairs left over in the middle go to the portable code.
     ///
-    /// # Safety
-    /// `window` must hold at least `out.len()` values.
-    pub(super) unsafe fn tdac(out: &mut [f32], window: &[f32]) {
+    /// Panics when `window` holds fewer than `out.len()` values.
+    #[target_feature(enable = "neon")]
+    pub(super) fn tdac(out: &mut [f32], window: &[f32]) {
         let overlap = out.len();
         debug_assert!(window.len() >= overlap);
+        let window = &window[..overlap];
         // Number of pairs the vector steps take.
         let vec = (overlap / 2) & !3;
-        let o = out.as_mut_ptr();
-        let w = window.as_ptr();
 
-        // SAFETY: `i + 4 <= vec <= overlap / 2`. The front vector covers the
-        // samples `i..i + 4`. The back vector covers
-        // `overlap - 4 - i..overlap - i`; it starts at or behind
-        // `overlap - overlap / 2`. Both lie inside `out` and inside
-        // `window`, and the two do not overlap. A step reads its samples
-        // before it writes them.
-        let mut i = 0;
-        while i < vec {
-            let x2 = vld1q_f32(o.add(i));
-            let x1 = rev4(vld1q_f32(o.add(overlap - 4 - i)));
-            let wp1 = vld1q_f32(w.add(i));
-            let wp2 = rev4(vld1q_f32(w.add(overlap - 4 - i)));
+        // The front vector of step `k` covers the samples `4 * k..4 * k + 4`,
+        // the back vector the four samples below `overlap - 4 * k`. The back
+        // ones start at or behind `overlap - overlap / 2`, so the two do not
+        // overlap. A step reads its samples before it writes them.
+        let (x_lo, x_rest) = out.split_at_mut(vec);
+        let x_hi = &mut x_rest[overlap - 2 * vec..];
+        let (w_lo, w_rest) = window.split_at(vec);
+        let w_hi = &w_rest[overlap - 2 * vec..];
+        let samples = up_arrays_mut::<f32, 4>(x_lo).zip(down_arrays_mut::<f32, 4>(x_hi));
+        let weights = up_arrays::<f32, 4>(w_lo).zip(down_arrays::<f32, 4>(w_hi));
+        for ((x_front, x_back), (w_front, w_back)) in samples.zip(weights) {
+            let x2 = load_f32x4(x_front);
+            let x1 = rev4(load_f32x4(x_back));
+            let wp1 = load_f32x4(w_front);
+            let wp2 = rev4(load_f32x4(w_back));
             // front = x2 * wp2 - x1 * wp1 and back = x2 * wp1 + x1 * wp2,
             // the product on the left fused.
             let front = vfmaq_f32(vmulq_f32(vnegq_f32(x1), wp1), x2, wp2);
             let back = vfmaq_f32(vmulq_f32(x1, wp2), x2, wp1);
-            vst1q_f32(o.add(i), front);
-            vst1q_f32(o.add(overlap - 4 - i), rev4(back));
-            i += 4;
+            store_f32x4(x_front, front);
+            store_f32x4(x_back, rev4(back));
         }
 
         tdac_scalar::<Fused>(&mut out[vec..overlap - vec], &window[vec..overlap - vec]);
     }
 }
-
 
 /// The rotation factors of the MDCT sizes of the 48 kHz mode: 960 values for
 /// the transform of 1920 samples, then 480, 240 and 120 values for the three
@@ -1821,9 +2048,9 @@ mod bit_exact_tests {
             fill(&mut rng, &mut coeffs, 0);
             let mut f2 = unwritten(n4);
             time(&format!("pre-rotation {n4}"), &mut || {
-                // SAFETY: `n4` is 480 or 60, `coeffs` holds `2 * n4`
-                // values, and the plan has `2 * n4` rotation values and a
-                // bit-reversal table of `n4` entries below `n4`.
+                // SAFETY: NEON is part of the baseline of every aarch64
+                // target, and the bit-reversal table of a plan has `n4`
+                // entries below `n4`.
                 unsafe { neon::backward_pre_rotate(&coeffs, p.trig, &p.st.bitrev, &mut f2, 1) };
                 std::hint::black_box(&mut f2);
             });
@@ -1831,15 +2058,16 @@ mod bit_exact_tests {
                 (0..n4).map(|_| KissCpx::new(rng.unit(), rng.unit())).collect();
             let mut out = vec![0f32; 2 * n4];
             time(&format!("post-rotation {n4}"), &mut || {
-                // SAFETY: as above; `spectrum` holds `n4` values and `out`
-                // `2 * n4`.
+                // SAFETY: NEON is part of the baseline of every aarch64
+                // target.
                 unsafe { neon::backward_post_rotate(&spectrum, p.trig, &mut out) };
                 std::hint::black_box(&mut out);
             });
             let mut out = vec![0f32; 120];
             fill(&mut rng, &mut out, 0);
             time("tdac 120", &mut || {
-                // SAFETY: `window` holds 120 values.
+                // SAFETY: NEON is part of the baseline of every aarch64
+                // target.
                 unsafe { neon::tdac(&mut out, &window) };
                 std::hint::black_box(&mut out);
             });
@@ -2449,6 +2677,9 @@ mod bit_exact_tests {
                     for at_end in PLACEMENTS {
                         let [a, b, c, d, e] = &mut regions;
                         let got = e.place(&unwritten(n4), at_end);
+                        // SAFETY: NEON is part of the baseline of every
+                        // aarch64 target, and `bitrev` is a permutation of
+                        // `0..n4`.
                         unsafe {
                             neon::forward_fold_rotate(
                                 a.place(&input, at_end),
@@ -2489,6 +2720,8 @@ mod bit_exact_tests {
                     for at_end in PLACEMENTS {
                         let [a, b, c] = &mut regions;
                         let got = c.place(&before, at_end);
+                        // SAFETY: NEON is part of the baseline of every
+                        // aarch64 target.
                         unsafe {
                             neon::forward_post_rotate(
                                 a.place(&f2, at_end),
@@ -2530,6 +2763,9 @@ mod bit_exact_tests {
                     for at_end in PLACEMENTS {
                         let [a, b, c, d] = &mut regions;
                         let got = d.place(&unwritten(n4), at_end);
+                        // SAFETY: NEON is part of the baseline of every
+                        // aarch64 target, and `bitrev` is a permutation of
+                        // `0..n4`.
                         unsafe {
                             neon::backward_pre_rotate(
                                 a.place(&input, at_end),
@@ -2566,6 +2802,8 @@ mod bit_exact_tests {
                 for at_end in PLACEMENTS {
                     let [a, b, c] = &mut regions;
                     let got = c.place(&vec![0f32; 2 * n4], at_end);
+                    // SAFETY: NEON is part of the baseline of every aarch64
+                    // target.
                     unsafe {
                         neon::backward_post_rotate(a.place(&f2, at_end), b.place(&trig, at_end), got)
                     };
@@ -2593,6 +2831,8 @@ mod bit_exact_tests {
                 for at_end in PLACEMENTS {
                     let [a, b] = &mut regions;
                     let got = a.place(&before, at_end);
+                    // SAFETY: NEON is part of the baseline of every aarch64
+                    // target.
                     unsafe { neon::tdac(got, b.place(&window, at_end)) };
                     assert_eq!(first_difference(got, &want), None, "overlap {overlap} class {class}");
                 }

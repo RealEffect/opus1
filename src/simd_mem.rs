@@ -67,11 +67,21 @@ pub(crate) fn array_at_mut<T, const N: usize>(s: &mut [T], i: usize) -> &mut [T;
 /// Loads and stores for NEON (aarch64).
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod neon {
+    use crate::kiss_fft::KissCpx;
     use core::arch::aarch64::*;
     use core::cell::Cell;
     use core::mem::MaybeUninit;
 
     // `f32` values.
+
+    /// Loads two `f32` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_f32x2(a: &[f32; 2]) -> float32x2_t {
+        // SAFETY: `a` is valid for reading two `f32` values, which is
+        // what `vld1_f32` reads. It needs only the alignment of `f32`.
+        unsafe { vld1_f32(a.as_ptr()) }
+    }
 
     /// Loads four `f32` values.
     #[target_feature(enable = "neon")]
@@ -112,6 +122,25 @@ pub(crate) mod neon {
         unsafe { vld1q_dup_f32(a) }
     }
 
+    /// Loads one `f32` value into lane `LANE` of `v`. The other lanes keep
+    /// their values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_lane_f32x4<const LANE: i32>(a: &f32, v: float32x4_t) -> float32x4_t {
+        // SAFETY: `a` is valid for reading one `f32` value, which is what
+        // `vld1q_lane_f32` reads.
+        unsafe { vld1q_lane_f32::<LANE>(a, v) }
+    }
+
+    /// Stores lane `LANE` of `v`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_lane_f32x4<const LANE: i32>(a: &mut f32, v: float32x4_t) {
+        // SAFETY: `a` is valid for writing one `f32` value, which is what
+        // `vst1q_lane_f32` writes, and no other reference reaches it.
+        unsafe { vst1q_lane_f32::<LANE>(a, v) }
+    }
+
     /// Loads eight `f32` values as two vectors: `.0` holds the values at
     /// the even places (0, 2, 4, 6), `.1` those at the odd places.
     #[target_feature(enable = "neon")]
@@ -120,6 +149,17 @@ pub(crate) mod neon {
         // SAFETY: `a` is valid for reading eight `f32` values, which is
         // what `vld2q_f32` reads. It needs only the alignment of `f32`.
         unsafe { vld2q_f32(a.as_ptr()) }
+    }
+
+    /// Stores two vectors as eight `f32` values, interleaved: lane `k` of
+    /// `v.0` at place `2 * k`, lane `k` of `v.1` at place `2 * k + 1`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store2_f32x4(a: &mut [f32; 8], v: float32x4x2_t) {
+        // SAFETY: `a` is valid for writing eight `f32` values, which is
+        // what `vst2q_f32` writes, and no other reference reaches them. It
+        // needs only the alignment of `f32`.
+        unsafe { vst2q_f32(a.as_mut_ptr(), v) }
     }
 
     /// Loads four `f32` values from cells.
@@ -144,6 +184,18 @@ pub(crate) mod neon {
         unsafe { vst1q_f32(a.as_ptr().cast_mut().cast(), v) }
     }
 
+    /// Stores two vectors as eight `f32` values into cells, interleaved as
+    /// `store2_f32x4` does.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store2_f32x4_cells(a: &[Cell<f32>; 8], v: float32x4x2_t) {
+        // SAFETY: `Cell<f32>` has the layout of `f32` and may be written
+        // through a shared reference, so `a` is valid for writing eight
+        // `f32` values. Nothing else reads or writes them during the store:
+        // a `Cell` lends no reference to its value and stays in one thread.
+        unsafe { vst2q_f32(a.as_ptr().cast_mut().cast(), v) }
+    }
+
     /// The four lanes of `v` as an array.
     #[target_feature(enable = "neon")]
     #[inline]
@@ -151,6 +203,82 @@ pub(crate) mod neon {
         // SAFETY: `float32x4_t` and `[f32; 4]` have the same size, and
         // every bit pattern is a valid value of both.
         unsafe { core::mem::transmute::<float32x4_t, [f32; 4]>(v) }
+    }
+
+    // Complex values (`KissCpx`: the real part, then the imaginary part,
+    // as two `f32` values without padding).
+
+    /// Loads one complex value as two `f32` values: lane 0 is the real
+    /// part, lane 1 the imaginary part.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_f32x2_cpx(a: &KissCpx) -> float32x2_t {
+        // SAFETY: `KissCpx` is two `f32` values without padding
+        // (`#[repr(C)]`), so `a` is valid for reading two `f32` values,
+        // which is what `vld1_f32` reads. It needs only the alignment of
+        // `f32`.
+        unsafe { vld1_f32((a as *const KissCpx).cast()) }
+    }
+
+    /// Stores two `f32` values as one complex value: lane 0 as the real
+    /// part, lane 1 as the imaginary part.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_f32x2_cpx(a: &mut KissCpx, v: float32x2_t) {
+        // SAFETY: `KissCpx` is two `f32` values without padding
+        // (`#[repr(C)]`), so `a` is valid for writing two `f32` values,
+        // which is what `vst1_f32` writes, and no other reference reaches
+        // them. It needs only the alignment of `f32`.
+        unsafe { vst1_f32((a as *mut KissCpx).cast(), v) }
+    }
+
+    /// Stores two `f32` values as one complex value, as `store_f32x2_cpx`,
+    /// into memory that may not hold a value yet.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_f32x2_cpx_uninit(a: &mut MaybeUninit<KissCpx>, v: float32x2_t) {
+        // SAFETY: `MaybeUninit<KissCpx>` has the layout of `KissCpx`, two
+        // `f32` values without padding, so `a` is valid for writing two
+        // `f32` values, which is what `vst1_f32` writes, and no other
+        // reference reaches them. It needs only the alignment of `f32`.
+        // After the store the value is initialized.
+        unsafe { vst1_f32(a.as_mut_ptr().cast(), v) }
+    }
+
+    /// Loads two complex values as four `f32` values: the real and the
+    /// imaginary part of the first, then those of the second.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_f32x4_cpx(a: &[KissCpx; 2]) -> float32x4_t {
+        // SAFETY: `KissCpx` is two `f32` values without padding
+        // (`#[repr(C)]`), so `a` is valid for reading four `f32` values,
+        // which is what `vld1q_f32` reads. It needs only the alignment of
+        // `f32`.
+        unsafe { vld1q_f32(a.as_ptr().cast()) }
+    }
+
+    /// Stores four `f32` values as two complex values, in the order of
+    /// `load_f32x4_cpx`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_f32x4_cpx(a: &mut [KissCpx; 2], v: float32x4_t) {
+        // SAFETY: `KissCpx` is two `f32` values without padding
+        // (`#[repr(C)]`), so `a` is valid for writing four `f32` values,
+        // which is what `vst1q_f32` writes, and no other reference reaches
+        // them. It needs only the alignment of `f32`.
+        unsafe { vst1q_f32(a.as_mut_ptr().cast(), v) }
+    }
+
+    /// Loads four complex values as two vectors: `.0` holds the real
+    /// parts, `.1` the imaginary parts.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load2_f32x4_cpx(a: &[KissCpx; 4]) -> float32x4x2_t {
+        // SAFETY: `KissCpx` is two `f32` values without padding
+        // (`#[repr(C)]`), so `a` is valid for reading eight `f32` values,
+        // which is what `vld2q_f32` reads. It needs only the alignment of
+        // `f32`.
+        unsafe { vld2q_f32(a.as_ptr().cast()) }
     }
 
     // `i32` and `u32` values.

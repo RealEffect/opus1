@@ -767,12 +767,9 @@ fn fft_stages_scalar<A: Arith>(st: &KissFftState, fout: &mut [KissCpx]) {
 ///
 /// The code is the portable one; AVX only changes how the compiler encodes
 /// and vectorizes it. The results are the same bits.
-///
-/// # Safety
-/// The processor must support AVX.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn fft_stages_avx(st: &KissFftState, fout: &mut [KissCpx]) {
+fn fft_stages_avx(st: &KissFftState, fout: &mut [KissCpx]) {
     fft_stages_scalar::<Separate>(st, fout);
 }
 
@@ -788,40 +785,40 @@ unsafe fn fft_stages_avx(st: &KissFftState, fout: &mut [KissCpx]) {
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::{KissCpx, c_add, c_sub};
+    use crate::simd_mem::neon::{load_f32x4, load_f32x4_cpx, load_u32x4, store_f32x4_cpx};
     use core::arch::aarch64::*;
 
     /// The first sample of each of two groups: `[a.lo, b.lo]`.
-    #[inline(always)]
-    unsafe fn lo2(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn lo2(a: float32x4_t, b: float32x4_t) -> float32x4_t {
         vcombine_f32(vget_low_f32(a), vget_low_f32(b))
     }
 
     /// The second sample of each of two groups: `[a.hi, b.hi]`.
-    #[inline(always)]
-    unsafe fn hi2(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn hi2(a: float32x4_t, b: float32x4_t) -> float32x4_t {
         vcombine_f32(vget_high_f32(a), vget_high_f32(b))
     }
 
     /// Radix-2 pass with one butterfly per group.
     ///
-    /// # Safety
-    /// `fout` must hold at least `2 * groups` samples.
-    pub(super) unsafe fn bfly2_m1(fout: &mut [KissCpx], groups: usize) {
+    /// Panics when `fout` holds fewer than `2 * groups` samples.
+    #[target_feature(enable = "neon")]
+    pub(super) fn bfly2_m1(fout: &mut [KissCpx], groups: usize) {
         debug_assert!(2 * groups <= fout.len());
-        let n = groups;
-        let ptr = fout.as_mut_ptr() as *mut f32;
+        // A group is two samples, four floats: one vector.
+        let (all, _) = fout[..2 * groups].as_chunks_mut::<2>();
 
-        // SAFETY: a group is 4 floats. The first loop touches the floats of
-        // groups `i..i + 4` with `i + 4 <= n`, the second loop those of
-        // groups `i..i + 2` with `i + 2 <= n`.
-        let mut i = 0usize;
-
-        while i + 4 <= n {
-            let base = i * 4;
-            let v0 = vld1q_f32(ptr.add(base));
-            let v1 = vld1q_f32(ptr.add(base + 4));
-            let v2 = vld1q_f32(ptr.add(base + 8));
-            let v3 = vld1q_f32(ptr.add(base + 12));
+        // Four groups per step, then at most one step of two groups and one
+        // group alone.
+        let (fours, rest) = all.as_chunks_mut::<4>();
+        for [g0, g1, g2, g3] in fours {
+            let v0 = load_f32x4_cpx(g0);
+            let v1 = load_f32x4_cpx(g1);
+            let v2 = load_f32x4_cpx(g2);
+            let v3 = load_f32x4_cpx(g3);
 
             let r0 = vcombine_f32(
                 vadd_f32(vget_low_f32(v0), vget_high_f32(v0)),
@@ -840,18 +837,16 @@ mod neon {
                 vsub_f32(vget_low_f32(v3), vget_high_f32(v3)),
             );
 
-            vst1q_f32(ptr.add(base), r0);
-            vst1q_f32(ptr.add(base + 4), r1);
-            vst1q_f32(ptr.add(base + 8), r2);
-            vst1q_f32(ptr.add(base + 12), r3);
-
-            i += 4;
+            store_f32x4_cpx(g0, r0);
+            store_f32x4_cpx(g1, r1);
+            store_f32x4_cpx(g2, r2);
+            store_f32x4_cpx(g3, r3);
         }
 
-        while i + 2 <= n {
-            let base = i * 4;
-            let v0 = vld1q_f32(ptr.add(base));
-            let v1 = vld1q_f32(ptr.add(base + 4));
+        let (twos, rest) = rest.as_chunks_mut::<2>();
+        if let [[g0, g1]] = twos {
+            let v0 = load_f32x4_cpx(g0);
+            let v1 = load_f32x4_cpx(g1);
             let r0 = vcombine_f32(
                 vadd_f32(vget_low_f32(v0), vget_high_f32(v0)),
                 vsub_f32(vget_low_f32(v0), vget_high_f32(v0)),
@@ -860,44 +855,41 @@ mod neon {
                 vadd_f32(vget_low_f32(v1), vget_high_f32(v1)),
                 vsub_f32(vget_low_f32(v1), vget_high_f32(v1)),
             );
-            vst1q_f32(ptr.add(base), r0);
-            vst1q_f32(ptr.add(base + 4), r1);
-            i += 2;
+            store_f32x4_cpx(g0, r0);
+            store_f32x4_cpx(g1, r1);
         }
 
-        while i < n {
-            let idx = i * 2;
-            let t = fout[idx + 1];
-            fout[idx + 1] = c_sub(&fout[idx], &t);
-            fout[idx] = c_add(&fout[idx], &t);
-            i += 1;
+        if let [g] = rest {
+            let t = g[1];
+            g[1] = c_sub(&g[0], &t);
+            g[0] = c_add(&g[0], &t);
         }
     }
 
     /// Radix-2 pass with four butterflies per group (fixed twiddles).
     ///
-    /// # Safety
-    /// `fout` must hold at least `8 * groups` samples.
-    pub(super) unsafe fn bfly2_m4(fout: &mut [KissCpx], groups: usize) {
+    /// Panics when `fout` holds fewer than `8 * groups` samples.
+    #[target_feature(enable = "neon")]
+    pub(super) fn bfly2_m4(fout: &mut [KissCpx], groups: usize) {
         debug_assert!(8 * groups <= fout.len());
         const SIGN: u32 = 0x8000_0000;
         const TW: f32 = core::f32::consts::FRAC_1_SQRT_2;
         // Lanes 0 and 1 hold a butterfly with twiddle 1 or -i: it has no
         // product. Multiplying by 1.0 leaves every value unchanged.
-        let scale = vld1q_f32([1.0, 1.0, TW, TW].as_ptr());
-        let hi_mask = vld1q_u32([0, 0, u32::MAX, u32::MAX].as_ptr());
-        let sign_k0 = vld1q_u32([SIGN, SIGN, 0, SIGN].as_ptr());
-        let sign_k1 = vld1q_u32([SIGN, SIGN, SIGN, 0].as_ptr());
-        let sign_odd = vld1q_u32([0, SIGN, 0, SIGN].as_ptr());
-        let ptr = fout.as_mut_ptr() as *mut f32;
+        let scale = load_f32x4(&[1.0, 1.0, TW, TW]);
+        let hi_mask = load_u32x4(&[0, 0, u32::MAX, u32::MAX]);
+        let sign_k0 = load_u32x4(&[SIGN, SIGN, 0, SIGN]);
+        let sign_k1 = load_u32x4(&[SIGN, SIGN, SIGN, 0]);
+        let sign_odd = load_u32x4(&[0, SIGN, 0, SIGN]);
+        let (all, _) = fout[..8 * groups].as_chunks_mut::<8>();
 
-        // One group: 16 floats at `p`.
-        // SAFETY (for every call below): `p` points to a whole group.
-        let group = |p: *mut f32| {
-            let a0 = vld1q_f32(p); // f0 f1
-            let a1 = vld1q_f32(p.add(4)); // f2 f3
-            let b0 = vld1q_f32(p.add(8)); // f4 f5
-            let b1 = vld1q_f32(p.add(12)); // f6 f7
+        // One group: eight samples, four vectors.
+        let group = |g: &mut [KissCpx; 8]| {
+            let (q, _) = g.as_chunks_mut::<2>();
+            let a0 = load_f32x4_cpx(&q[0]); // f0 f1
+            let a1 = load_f32x4_cpx(&q[1]); // f2 f3
+            let b0 = load_f32x4_cpx(&q[2]); // f4 f5
+            let b1 = load_f32x4_cpx(&q[3]); // f6 f7
 
             // t0 = [f4.r, f4.i, (f5.r + f5.i) * tw, (f5.i - f5.r) * tw].
             // k0 = [-0.0, -0.0, f5.i, -f5.r]; adding -0.0 changes nothing.
@@ -919,41 +911,37 @@ mod neon {
             let y = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(y), sign_odd));
             let t1 = vmulq_f32(y, scale);
 
-            vst1q_f32(p.add(8), vsubq_f32(a0, t0));
-            vst1q_f32(p, vaddq_f32(a0, t0));
-            vst1q_f32(p.add(12), vsubq_f32(a1, t1));
-            vst1q_f32(p.add(4), vaddq_f32(a1, t1));
+            store_f32x4_cpx(&mut q[2], vsubq_f32(a0, t0));
+            store_f32x4_cpx(&mut q[0], vaddq_f32(a0, t0));
+            store_f32x4_cpx(&mut q[3], vsubq_f32(a1, t1));
+            store_f32x4_cpx(&mut q[1], vaddq_f32(a1, t1));
         };
         // Two groups per step, as in `bfly4_m1`.
-        // SAFETY: a group is 16 floats and `g + 1 < groups`, then
-        // `g < groups`.
-        let mut g = 0;
-        while g + 2 <= groups {
-            let p = ptr.add(16 * g);
-            group(p);
-            group(p.add(16));
-            g += 2;
+        let (pairs, rest) = all.as_chunks_mut::<2>();
+        for [ga, gb] in pairs {
+            group(ga);
+            group(gb);
         }
-        if g < groups {
-            group(ptr.add(16 * g));
+        if let [g] = rest {
+            group(g);
         }
     }
 
     /// Radix-4 pass with one butterfly per group.
     ///
-    /// # Safety
-    /// `fout` must hold at least `4 * groups` samples.
-    pub(super) unsafe fn bfly4_m1(fout: &mut [KissCpx], groups: usize) {
+    /// Panics when `fout` holds fewer than `4 * groups` samples.
+    #[target_feature(enable = "neon")]
+    pub(super) fn bfly4_m1(fout: &mut [KissCpx], groups: usize) {
         debug_assert!(4 * groups <= fout.len());
         const SIGN: u32 = 0x8000_0000;
-        let sign_odd = vld1q_u32([0, SIGN, 0, SIGN].as_ptr());
-        let ptr = fout.as_mut_ptr() as *mut f32;
+        let sign_odd = load_u32x4(&[0, SIGN, 0, SIGN]);
+        let (all, _) = fout[..4 * groups].as_chunks_mut::<4>();
 
-        // One group: 8 floats at `p`.
-        // SAFETY (for every call below): `p` points to a whole group.
-        let group = |p: *mut f32| {
-            let v0 = vld1q_f32(p); // f0 f1
-            let v1 = vld1q_f32(p.add(4)); // f2 f3
+        // One group: four samples, two vectors.
+        let group = |g: &mut [KissCpx; 4]| {
+            let (h, _) = g.as_chunks_mut::<2>();
+            let v0 = load_f32x4_cpx(&h[0]); // f0 f1
+            let v1 = load_f32x4_cpx(&h[1]); // f2 f3
 
             // sum = [sum02, scratch1], diff = [scratch0, diff13]
             let sum = vaddq_f32(v0, v1);
@@ -967,22 +955,19 @@ mod neon {
             let a = lo2(sum, diff); // sum02, scratch0
             let b = hi2(sum, rot); // scratch1, rotated diff13
 
-            vst1q_f32(p, vaddq_f32(a, b));
-            vst1q_f32(p.add(4), vsubq_f32(a, b));
+            store_f32x4_cpx(&mut h[0], vaddq_f32(a, b));
+            store_f32x4_cpx(&mut h[1], vsubq_f32(a, b));
         };
         // Two groups per step. They do not depend on each other, so a core
         // that runs the instructions in program order works on one while
         // the other waits for a result.
-        // SAFETY: a group is 8 floats and `g + 1 < groups`, then `g < groups`.
-        let mut g = 0;
-        while g + 2 <= groups {
-            let p = ptr.add(8 * g);
-            group(p);
-            group(p.add(8));
-            g += 2;
+        let (pairs, rest) = all.as_chunks_mut::<2>();
+        for [ga, gb] in pairs {
+            group(ga);
+            group(gb);
         }
-        if g < groups {
-            group(ptr.add(8 * g));
+        if let [g] = rest {
+            group(g);
         }
     }
 }
@@ -1007,6 +992,10 @@ mod neon {
 #[cfg(target_arch = "aarch64")]
 mod fused {
     use super::{EPI3_I, KissCpx, KissFftState, YA_I, YA_R, YB_I, YB_R, neon};
+    use crate::simd_mem::neon::{
+        load_f32x2, load_f32x2_cpx, load_f32x4, load_f32x4_cpx, load_u32x4, store_f32x2_cpx,
+        store_f32x4_cpx,
+    };
     use core::arch::aarch64::*;
     use core::arch::asm;
 
@@ -1030,14 +1019,20 @@ mod fused {
             let a: float32x4_t = $a;
             let t: float32x4_t = $t;
             let mut acc = vdupq_n_f32(-0.0);
-            asm!(
-                "fcmla {acc:v}.4s, {a:v}.4s, {t:v}.4s, #90",
-                "fcmla {acc:v}.4s, {a:v}.4s, {t:v}.4s, #0",
-                acc = inout(vreg) acc,
-                a = in(vreg) a,
-                t = in(vreg) t,
-                options(pure, nomem, nostack),
-            );
+            // SAFETY: the two instructions read the registers `acc`, `a`
+            // and `t` and write `acc`, nothing else: no memory, no stack.
+            // The macro is used only in functions compiled for FEAT_FCMA,
+            // which has `fcmla`.
+            unsafe {
+                asm!(
+                    "fcmla {acc:v}.4s, {a:v}.4s, {t:v}.4s, #90",
+                    "fcmla {acc:v}.4s, {a:v}.4s, {t:v}.4s, #0",
+                    acc = inout(vreg) acc,
+                    a = in(vreg) a,
+                    t = in(vreg) t,
+                    options(pure, nomem, nostack),
+                );
+            }
             acc
         }};
     }
@@ -1049,18 +1044,24 @@ mod fused {
             let b: float32x4_t = $b;
             let plus: float32x4_t;
             let minus: float32x4_t;
-            asm!(
-                "fcadd {plus:v}.4s, {a:v}.4s, {b:v}.4s, #90",
-                "fcadd {minus:v}.4s, {a:v}.4s, {b:v}.4s, #270",
-                // `plus` is written while `a` and `b` are still needed, so it
-                // must not share a register with them. `minus` is written
-                // last and may.
-                plus = out(vreg) plus,
-                minus = lateout(vreg) minus,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(pure, nomem, nostack),
-            );
+            // SAFETY: the two instructions read the registers `a` and `b`
+            // and write `plus` and `minus`, nothing else: no memory, no
+            // stack. The macro is used only in functions compiled for
+            // FEAT_FCMA, which has `fcadd`.
+            unsafe {
+                asm!(
+                    "fcadd {plus:v}.4s, {a:v}.4s, {b:v}.4s, #90",
+                    "fcadd {minus:v}.4s, {a:v}.4s, {b:v}.4s, #270",
+                    // `plus` is written while `a` and `b` are still needed,
+                    // so it must not share a register with them. `minus` is
+                    // written last and may.
+                    plus = out(vreg) plus,
+                    minus = lateout(vreg) minus,
+                    a = in(vreg) a,
+                    b = in(vreg) b,
+                    options(pure, nomem, nostack),
+                );
+            }
             (plus, minus)
         }};
     }
@@ -1076,7 +1077,7 @@ mod fused {
             // i * t = (-t.im, t.re)
             let i_t = vreinterpretq_f32_u32(veorq_u32(
                 vreinterpretq_u32_f32(vrev64q_f32(t)),
-                vld1q_u32([SIGN, 0, SIGN, 0].as_ptr()),
+                load_u32x4(&[SIGN, 0, SIGN, 0]),
             ));
             // (-(a.im * t.im), a.im * t.re) is rounded. Then a.re * t is
             // fused onto it.
@@ -1091,8 +1092,8 @@ mod fused {
             let b_swapped = vreinterpretq_u32_f32(vrev64q_f32($b));
             // i * b = (-b.im, b.re) and -i * b = (b.im, -b.re). Adding -x
             // is the same as subtracting x, bit for bit.
-            let i_b = veorq_u32(b_swapped, vld1q_u32([SIGN, 0, SIGN, 0].as_ptr()));
-            let neg_i_b = veorq_u32(b_swapped, vld1q_u32([0, SIGN, 0, SIGN].as_ptr()));
+            let i_b = veorq_u32(b_swapped, load_u32x4(&[SIGN, 0, SIGN, 0]));
+            let neg_i_b = veorq_u32(b_swapped, load_u32x4(&[0, SIGN, 0, SIGN]));
             (
                 vaddq_f32(a, vreinterpretq_f32_u32(i_b)),
                 vaddq_f32(a, vreinterpretq_f32_u32(neg_i_b)),
@@ -1101,9 +1102,10 @@ mod fused {
     }
 
     /// `(a.re, b.im)` for two complex numbers.
-    #[inline(always)]
-    unsafe fn re_of_a_im_of_b(a: float32x4_t, b: float32x4_t) -> float32x4_t {
-        vbslq_f32(vld1q_u32([u32::MAX, 0, u32::MAX, 0].as_ptr()), a, b)
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn re_of_a_im_of_b(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+        vbslq_f32(load_u32x4(&[u32::MAX, 0, u32::MAX, 0]), a, b)
     }
 
     /// Two radix-3 butterflies. Returns the new `(f0, f1, f2)`.
@@ -1175,12 +1177,12 @@ mod fused {
             //   v.im = s9.im * ya.i + (-(s10.im * yb.i))    = scratch12.re
             let rounded = vmulq_f32(
                 re_of_a_im_of_b(s9, s10),
-                vld1q_f32([-YA_I, -YB_I, -YA_I, -YB_I].as_ptr()),
+                load_f32x4(&[-YA_I, -YB_I, -YA_I, -YB_I]),
             );
             let v = vfmaq_f32(
                 rounded,
                 re_of_a_im_of_b(s10, s9),
-                vld1q_f32([YB_I, YA_I, YB_I, YA_I].as_ptr()),
+                load_f32x4(&[YB_I, YA_I, YB_I, YA_I]),
             );
             let s12 = vrev64q_f32(v);
             (o0, o1, vaddq_f32(s11, s12), vsubq_f32(s11, s12), o4)
@@ -1188,26 +1190,38 @@ mod fused {
     }
 
     /// One complex number in the low half of a vector, zero in the high half.
-    ///
-    /// # Safety
-    /// `p[0..2]` must be readable.
-    #[inline(always)]
-    unsafe fn load1(p: *const f32) -> float32x4_t {
-        vcombine_f32(vld1_f32(p), vdup_n_f32(0.0))
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn load1(a: &KissCpx) -> float32x4_t {
+        vcombine_f32(load_f32x2_cpx(a), vdup_n_f32(0.0))
+    }
+
+    /// One twiddle, its real and its imaginary part, in the low half of a
+    /// vector, zero in the high half.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn load1_tw(a: &[f32; 2]) -> float32x4_t {
+        vcombine_f32(load_f32x2(a), vdup_n_f32(0.0))
     }
 
     /// Stores the complex number in the low half of `v`.
-    ///
-    /// # Safety
-    /// `p[0..2]` must be writable.
-    #[inline(always)]
-    unsafe fn store1(p: *mut f32, v: float32x4_t) {
-        vst1_f32(p, vget_low_f32(v));
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn store1(a: &mut KissCpx, v: float32x4_t) {
+        store_f32x2_cpx(a, vget_low_f32(v));
     }
 
     /// The kernels of one version. `$features` are the target features the
     /// functions are compiled with; `$cmul` and `$pm_i` are the two
     /// operations that differ between the versions.
+    ///
+    /// A pass works on `groups` groups of `radix * m` samples, which are
+    /// `radix` streams of `m` samples. A step takes two samples of each
+    /// stream, one vector each, and the two twiddles of each stream that has
+    /// twiddles. The last sample of an odd `m` is a step of its own, with one
+    /// complex number per vector. The stage table `tw` holds the `m`
+    /// twiddles of stream 1, then those of stream 2, and so on, as pairs of
+    /// real and imaginary part.
     macro_rules! kernels {
         ($name:ident, $features:literal, $cmul:ident, $pm_i:ident) => {
             pub(super) mod $name {
@@ -1215,12 +1229,10 @@ mod fused {
 
                 /// Radix-3 pass. Two butterflies per iteration.
                 ///
-                /// # Safety
-                /// The processor must have the target features of this
-                /// function. `fout` must hold at least `3 * m * groups`
-                /// samples and `tw` at least `4 * m` values.
+                /// Panics when `fout` holds fewer than `3 * m * groups`
+                /// samples or `tw` fewer than `4 * m` values.
                 #[target_feature(enable = $features)]
-                pub(crate) unsafe fn bfly3(
+                pub(crate) fn bfly3(
                     fout: &mut [KissCpx],
                     tw: &[f32],
                     m: usize,
@@ -1228,65 +1240,59 @@ mod fused {
                 ) {
                     debug_assert!(3 * m * groups <= fout.len());
                     debug_assert!(4 * m <= tw.len());
-                    let w1 = tw.as_ptr();
-                    let w2 = w1.add(2 * m);
-                    let base = fout.as_mut_ptr() as *mut f32;
+                    if m == 0 {
+                        return;
+                    }
+                    let (w1, w2) = (&tw[..2 * m], &tw[2 * m..4 * m]);
+                    let (w1_last, w2_last) =
+                        (w1.last_chunk::<2>().unwrap(), w2.last_chunk::<2>().unwrap());
+                    let (w1, _) = w1.as_chunks::<4>();
+                    let (w2, _) = w2.as_chunks::<4>();
 
-                    // SAFETY: group `g` is `3 * m` samples, 2 floats each.
-                    // `p0`, `p1`, `p2` point to its three streams of `m`
-                    // samples. A step at `j` touches samples `j` and `j + 1`
-                    // of each stream and of each twiddle table, with
-                    // `j + 2 <= m`. The last step of an odd `m` touches
-                    // sample `j = m - 1` only.
-                    for g in 0..groups {
-                        let p0 = base.add(6 * m * g);
-                        let p1 = p0.add(2 * m);
-                        let p2 = p1.add(2 * m);
-                        let step = |k: usize| {
+                    for group in fout[..3 * m * groups].chunks_exact_mut(3 * m) {
+                        let (f0, rest) = group.split_at_mut(m);
+                        let (f1, f2) = rest.split_at_mut(m);
+                        let (f0, f0_last) = f0.as_chunks_mut::<2>();
+                        let (f1, f1_last) = f1.as_chunks_mut::<2>();
+                        let (f2, f2_last) = f2.as_chunks_mut::<2>();
+                        let streams = f0.iter_mut().zip(f1).zip(f2);
+                        for (((p0, p1), p2), (t1, t2)) in streams.zip(w1.iter().zip(w2)) {
                             let (o0, o1, o2) = bfly3_step!(
                                 $cmul,
                                 $pm_i,
-                                vld1q_f32(p0.add(k)),
-                                vld1q_f32(p1.add(k)),
-                                vld1q_f32(p2.add(k)),
-                                vld1q_f32(w1.add(k)),
-                                vld1q_f32(w2.add(k))
+                                load_f32x4_cpx(p0),
+                                load_f32x4_cpx(p1),
+                                load_f32x4_cpx(p2),
+                                load_f32x4(t1),
+                                load_f32x4(t2)
                             );
-                            vst1q_f32(p0.add(k), o0);
-                            vst1q_f32(p1.add(k), o1);
-                            vst1q_f32(p2.add(k), o2);
-                        };
-                        let mut j = 0usize;
-                        while j + 2 <= m {
-                            step(2 * j);
-                            j += 2;
+                            store_f32x4_cpx(p0, o0);
+                            store_f32x4_cpx(p1, o1);
+                            store_f32x4_cpx(p2, o2);
                         }
-                        if j < m {
-                            let k = 2 * j;
+                        if let ([p0], [p1], [p2]) = (f0_last, f1_last, f2_last) {
                             let (o0, o1, o2) = bfly3_step!(
                                 $cmul,
                                 $pm_i,
-                                load1(p0.add(k)),
-                                load1(p1.add(k)),
-                                load1(p2.add(k)),
-                                load1(w1.add(k)),
-                                load1(w2.add(k))
+                                load1(p0),
+                                load1(p1),
+                                load1(p2),
+                                load1_tw(w1_last),
+                                load1_tw(w2_last)
                             );
-                            store1(p0.add(k), o0);
-                            store1(p1.add(k), o1);
-                            store1(p2.add(k), o2);
+                            store1(p0, o0);
+                            store1(p1, o1);
+                            store1(p2, o2);
                         }
                     }
                 }
 
                 /// Radix-4 pass with `m > 1`. Two butterflies per iteration.
                 ///
-                /// # Safety
-                /// The processor must have the target features of this
-                /// function. `fout` must hold at least `4 * m * groups`
-                /// samples and `tw` at least `6 * m` values.
+                /// Panics when `fout` holds fewer than `4 * m * groups`
+                /// samples or `tw` fewer than `6 * m` values.
                 #[target_feature(enable = $features)]
-                pub(crate) unsafe fn bfly4(
+                pub(crate) fn bfly4(
                     fout: &mut [KissCpx],
                     tw: &[f32],
                     m: usize,
@@ -1294,69 +1300,72 @@ mod fused {
                 ) {
                     debug_assert!(4 * m * groups <= fout.len());
                     debug_assert!(6 * m <= tw.len());
-                    let w1 = tw.as_ptr();
-                    let w2 = w1.add(2 * m);
-                    let w3 = w2.add(2 * m);
-                    let base = fout.as_mut_ptr() as *mut f32;
+                    if m == 0 {
+                        return;
+                    }
+                    let (w1, w2, w3) = (&tw[..2 * m], &tw[2 * m..4 * m], &tw[4 * m..6 * m]);
+                    let (w1_last, w2_last, w3_last) = (
+                        w1.last_chunk::<2>().unwrap(),
+                        w2.last_chunk::<2>().unwrap(),
+                        w3.last_chunk::<2>().unwrap(),
+                    );
+                    let (w1, _) = w1.as_chunks::<4>();
+                    let (w2, _) = w2.as_chunks::<4>();
+                    let (w3, _) = w3.as_chunks::<4>();
 
-                    // SAFETY: as in `bfly3`, with four streams and three
-                    // twiddle tables.
-                    for g in 0..groups {
-                        let p0 = base.add(8 * m * g);
-                        let p1 = p0.add(2 * m);
-                        let p2 = p1.add(2 * m);
-                        let p3 = p2.add(2 * m);
-                        let step = |k: usize| {
+                    for group in fout[..4 * m * groups].chunks_exact_mut(4 * m) {
+                        let (f0, rest) = group.split_at_mut(m);
+                        let (f1, rest) = rest.split_at_mut(m);
+                        let (f2, f3) = rest.split_at_mut(m);
+                        let (f0, f0_last) = f0.as_chunks_mut::<2>();
+                        let (f1, f1_last) = f1.as_chunks_mut::<2>();
+                        let (f2, f2_last) = f2.as_chunks_mut::<2>();
+                        let (f3, f3_last) = f3.as_chunks_mut::<2>();
+                        let streams = f0.iter_mut().zip(f1).zip(f2).zip(f3);
+                        let twiddles = w1.iter().zip(w2).zip(w3);
+                        for ((((p0, p1), p2), p3), ((t1, t2), t3)) in streams.zip(twiddles) {
                             let (o0, o1, o2, o3) = bfly4_step!(
                                 $cmul,
                                 $pm_i,
-                                vld1q_f32(p0.add(k)),
-                                vld1q_f32(p1.add(k)),
-                                vld1q_f32(p2.add(k)),
-                                vld1q_f32(p3.add(k)),
-                                vld1q_f32(w1.add(k)),
-                                vld1q_f32(w2.add(k)),
-                                vld1q_f32(w3.add(k))
+                                load_f32x4_cpx(p0),
+                                load_f32x4_cpx(p1),
+                                load_f32x4_cpx(p2),
+                                load_f32x4_cpx(p3),
+                                load_f32x4(t1),
+                                load_f32x4(t2),
+                                load_f32x4(t3)
                             );
-                            vst1q_f32(p0.add(k), o0);
-                            vst1q_f32(p1.add(k), o1);
-                            vst1q_f32(p2.add(k), o2);
-                            vst1q_f32(p3.add(k), o3);
-                        };
-                        let mut j = 0usize;
-                        while j + 2 <= m {
-                            step(2 * j);
-                            j += 2;
+                            store_f32x4_cpx(p0, o0);
+                            store_f32x4_cpx(p1, o1);
+                            store_f32x4_cpx(p2, o2);
+                            store_f32x4_cpx(p3, o3);
                         }
-                        if j < m {
-                            let k = 2 * j;
+                        if let ([p0], [p1], [p2], [p3]) = (f0_last, f1_last, f2_last, f3_last) {
                             let (o0, o1, o2, o3) = bfly4_step!(
                                 $cmul,
                                 $pm_i,
-                                load1(p0.add(k)),
-                                load1(p1.add(k)),
-                                load1(p2.add(k)),
-                                load1(p3.add(k)),
-                                load1(w1.add(k)),
-                                load1(w2.add(k)),
-                                load1(w3.add(k))
+                                load1(p0),
+                                load1(p1),
+                                load1(p2),
+                                load1(p3),
+                                load1_tw(w1_last),
+                                load1_tw(w2_last),
+                                load1_tw(w3_last)
                             );
-                            store1(p0.add(k), o0);
-                            store1(p1.add(k), o1);
-                            store1(p2.add(k), o2);
-                            store1(p3.add(k), o3);
+                            store1(p0, o0);
+                            store1(p1, o1);
+                            store1(p2, o2);
+                            store1(p3, o3);
                         }
                     }
                 }
 
                 /// Radix-5 pass. Two butterflies per iteration.
                 ///
-                /// # Safety
-                /// The processor must have the target features of this
-                /// function. `fout` must hold at least `5 * m * groups`
-                /// samples and `tw` at least `8 * m` values.
+                /// Panics when `fout` holds fewer than `5 * m * groups`
+                /// samples or `tw` fewer than `8 * m` values.
                 #[target_feature(enable = $features)]
-                pub(crate) unsafe fn bfly5(
+                pub(crate) fn bfly5(
                     fout: &mut [KissCpx],
                     tw: &[f32],
                     m: usize,
@@ -1364,80 +1373,91 @@ mod fused {
                 ) {
                     debug_assert!(5 * m * groups <= fout.len());
                     debug_assert!(8 * m <= tw.len());
-                    let w1 = tw.as_ptr();
-                    let w2 = w1.add(2 * m);
-                    let w3 = w2.add(2 * m);
-                    let w4 = w3.add(2 * m);
-                    let base = fout.as_mut_ptr() as *mut f32;
+                    if m == 0 {
+                        return;
+                    }
+                    let (w1, w2) = (&tw[..2 * m], &tw[2 * m..4 * m]);
+                    let (w3, w4) = (&tw[4 * m..6 * m], &tw[6 * m..8 * m]);
+                    let (w1_last, w2_last, w3_last, w4_last) = (
+                        w1.last_chunk::<2>().unwrap(),
+                        w2.last_chunk::<2>().unwrap(),
+                        w3.last_chunk::<2>().unwrap(),
+                        w4.last_chunk::<2>().unwrap(),
+                    );
+                    let (w1, _) = w1.as_chunks::<4>();
+                    let (w2, _) = w2.as_chunks::<4>();
+                    let (w3, _) = w3.as_chunks::<4>();
+                    let (w4, _) = w4.as_chunks::<4>();
 
-                    // SAFETY: as in `bfly3`, with five streams and four
-                    // twiddle tables.
-                    for g in 0..groups {
-                        let p0 = base.add(10 * m * g);
-                        let p1 = p0.add(2 * m);
-                        let p2 = p1.add(2 * m);
-                        let p3 = p2.add(2 * m);
-                        let p4 = p3.add(2 * m);
-                        let step = |k: usize| {
+                    for group in fout[..5 * m * groups].chunks_exact_mut(5 * m) {
+                        let (f0, rest) = group.split_at_mut(m);
+                        let (f1, rest) = rest.split_at_mut(m);
+                        let (f2, rest) = rest.split_at_mut(m);
+                        let (f3, f4) = rest.split_at_mut(m);
+                        let (f0, f0_last) = f0.as_chunks_mut::<2>();
+                        let (f1, f1_last) = f1.as_chunks_mut::<2>();
+                        let (f2, f2_last) = f2.as_chunks_mut::<2>();
+                        let (f3, f3_last) = f3.as_chunks_mut::<2>();
+                        let (f4, f4_last) = f4.as_chunks_mut::<2>();
+                        let streams = f0.iter_mut().zip(f1).zip(f2).zip(f3).zip(f4);
+                        let twiddles = w1.iter().zip(w2).zip(w3).zip(w4);
+                        for (((((p0, p1), p2), p3), p4), (((t1, t2), t3), t4)) in
+                            streams.zip(twiddles)
+                        {
                             let (o0, o1, o2, o3, o4) = bfly5_step!(
                                 $cmul,
                                 $pm_i,
-                                vld1q_f32(p0.add(k)),
-                                vld1q_f32(p1.add(k)),
-                                vld1q_f32(p2.add(k)),
-                                vld1q_f32(p3.add(k)),
-                                vld1q_f32(p4.add(k)),
-                                vld1q_f32(w1.add(k)),
-                                vld1q_f32(w2.add(k)),
-                                vld1q_f32(w3.add(k)),
-                                vld1q_f32(w4.add(k))
+                                load_f32x4_cpx(p0),
+                                load_f32x4_cpx(p1),
+                                load_f32x4_cpx(p2),
+                                load_f32x4_cpx(p3),
+                                load_f32x4_cpx(p4),
+                                load_f32x4(t1),
+                                load_f32x4(t2),
+                                load_f32x4(t3),
+                                load_f32x4(t4)
                             );
-                            vst1q_f32(p0.add(k), o0);
-                            vst1q_f32(p1.add(k), o1);
-                            vst1q_f32(p2.add(k), o2);
-                            vst1q_f32(p3.add(k), o3);
-                            vst1q_f32(p4.add(k), o4);
-                        };
-                        let mut j = 0usize;
-                        while j + 2 <= m {
-                            step(2 * j);
-                            j += 2;
+                            store_f32x4_cpx(p0, o0);
+                            store_f32x4_cpx(p1, o1);
+                            store_f32x4_cpx(p2, o2);
+                            store_f32x4_cpx(p3, o3);
+                            store_f32x4_cpx(p4, o4);
                         }
-                        if j < m {
-                            let k = 2 * j;
+                        if let ([p0], [p1], [p2], [p3], [p4]) =
+                            (f0_last, f1_last, f2_last, f3_last, f4_last)
+                        {
                             let (o0, o1, o2, o3, o4) = bfly5_step!(
                                 $cmul,
                                 $pm_i,
-                                load1(p0.add(k)),
-                                load1(p1.add(k)),
-                                load1(p2.add(k)),
-                                load1(p3.add(k)),
-                                load1(p4.add(k)),
-                                load1(w1.add(k)),
-                                load1(w2.add(k)),
-                                load1(w3.add(k)),
-                                load1(w4.add(k))
+                                load1(p0),
+                                load1(p1),
+                                load1(p2),
+                                load1(p3),
+                                load1(p4),
+                                load1_tw(w1_last),
+                                load1_tw(w2_last),
+                                load1_tw(w3_last),
+                                load1_tw(w4_last)
                             );
-                            store1(p0.add(k), o0);
-                            store1(p1.add(k), o1);
-                            store1(p2.add(k), o2);
-                            store1(p3.add(k), o3);
-                            store1(p4.add(k), o4);
+                            store1(p0, o0);
+                            store1(p1, o1);
+                            store1(p2, o2);
+                            store1(p3, o3);
+                            store1(p4, o4);
                         }
                     }
                 }
 
                 /// Runs all stages.
                 ///
-                /// # Safety
-                /// The processor must have the target features of this
-                /// function. `fout` must hold exactly `st.nfft` samples.
+                /// Panics when `fout` holds fewer than `st.nfft()`
+                /// samples.
                 #[target_feature(enable = $features)]
-                pub(crate) unsafe fn stages(st: &KissFftState, fout: &mut [KissCpx]) {
+                pub(crate) fn stages(st: &KissFftState, fout: &mut [KissCpx]) {
                     debug_assert!(fout.len() == st.nfft);
-                    // SAFETY: `KissFftState::build` makes
-                    // `groups * radix * m == nfft` for every stage, and gives
-                    // each stage a table of `tw_len()` values.
+                    // `KissFftState::build` makes `groups * radix * m ==
+                    // nfft` for every stage, and gives each stage a table
+                    // of `tw_len()` values.
                     for s in &st.stages[..st.nstages] {
                         let m = s.m as usize;
                         let groups = s.groups as usize;
@@ -1487,16 +1507,17 @@ fn has_fcma() -> bool {
 
 /// Runs all stages with the aarch64 butterflies.
 ///
-/// # Safety
-/// `fout` must hold exactly `st.nfft` samples.
+/// Panics when `fout` holds fewer than `st.nfft()` samples.
 #[cfg(target_arch = "aarch64")]
-unsafe fn fft_stages_neon(st: &KissFftState, fout: &mut [KissCpx]) {
+fn fft_stages_neon(st: &KissFftState, fout: &mut [KissCpx]) {
     debug_assert!(fout.len() == st.nfft);
     if has_fcma() {
-        // SAFETY: the processor has FEAT_FCMA.
-        fused::fcma::stages(st, fout)
+        // SAFETY: the processor has FEAT_FCMA (`has_fcma`), and NEON is
+        // part of the baseline of every aarch64 target.
+        unsafe { fused::fcma::stages(st, fout) }
     } else {
-        fused::fma::stages(st, fout)
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        unsafe { fused::fma::stages(st, fout) }
     }
 }
 
@@ -1506,8 +1527,7 @@ unsafe fn fft_stages_neon(st: &KissFftState, fout: &mut [KissCpx]) {
 /// of the arm64 build of libopus. On every other target it gives the bits of
 /// `opus_fft_impl_scalar`.
 pub fn opus_fft_impl(st: &KissFftState, fout: &mut [KissCpx]) {
-    // The vector kernels read and write `nfft` values through pointers, so
-    // the length is checked here.
+    // The kernels work on the first `nfft` values.
     assert!(
         fout.len() >= st.nfft,
         "opus_fft_impl: fout.len() ({}) < nfft ({})",
@@ -1519,10 +1539,7 @@ pub fn opus_fft_impl(st: &KissFftState, fout: &mut [KissCpx]) {
     // The choice of the implementation is made once per transform, not once
     // per stage.
     #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: `fout` holds exactly `nfft` samples.
-        unsafe { fft_stages_neon(st, fout) }
-    }
+    fft_stages_neon(st, fout);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if crate::compat::x86_has_avx() {
@@ -2668,9 +2685,12 @@ mod tests {
                 let mut a = want.clone();
                 let mut b = want.clone();
                 opus_fft_impl_fused(st, &mut want);
+                // SAFETY: NEON is part of the baseline of every aarch64
+                // target.
                 unsafe { fused::fma::stages(st, &mut a) };
                 assert_eq!(first_difference(&a, &want), None, "fma, nfft {nfft} class {class}");
                 if has_fcma() {
+                    // SAFETY: the processor has FEAT_FCMA (`has_fcma`).
                     unsafe { fused::fcma::stages(st, &mut b) };
                     assert_eq!(first_difference(&b, &want), None, "fcma, nfft {nfft} class {class}");
                 }
@@ -2721,18 +2741,26 @@ mod tests {
                             let what = format!("radix {radix} m {m} groups {groups} class {class}");
                             let b = samples.place(&input, at_end);
                             let tw = twiddles.place(tw, at_end);
-                            match radix {
-                                3 => unsafe { fused::fma::bfly3(b, tw, m, groups) },
-                                4 => unsafe { fused::fma::bfly4(b, tw, m, groups) },
-                                _ => unsafe { fused::fma::bfly5(b, tw, m, groups) },
+                            // SAFETY: NEON is part of the baseline of every
+                            // aarch64 target.
+                            unsafe {
+                                match radix {
+                                    3 => fused::fma::bfly3(b, tw, m, groups),
+                                    4 => fused::fma::bfly4(b, tw, m, groups),
+                                    _ => fused::fma::bfly5(b, tw, m, groups),
+                                }
                             }
                             assert_eq!(first_difference(&a, b), None, "fma, {what}");
                             if has_fcma() {
                                 let b = samples.place(&input, at_end);
-                                match radix {
-                                    3 => unsafe { fused::fcma::bfly3(b, tw, m, groups) },
-                                    4 => unsafe { fused::fcma::bfly4(b, tw, m, groups) },
-                                    _ => unsafe { fused::fcma::bfly5(b, tw, m, groups) },
+                                // SAFETY: the processor has FEAT_FCMA
+                                // (`has_fcma`).
+                                unsafe {
+                                    match radix {
+                                        3 => fused::fcma::bfly3(b, tw, m, groups),
+                                        4 => fused::fcma::bfly4(b, tw, m, groups),
+                                        _ => fused::fcma::bfly5(b, tw, m, groups),
+                                    }
                                 }
                                 assert_eq!(first_difference(&a, b), None, "fcma, {what}");
                             }
@@ -2752,10 +2780,14 @@ mod tests {
                     }
                     for at_end in PLACEMENTS {
                         let b = samples.place(&input, at_end);
-                        match (radix, m) {
-                            (2, 1) => unsafe { neon::bfly2_m1(b, groups) },
-                            (2, _) => unsafe { neon::bfly2_m4(b, groups) },
-                            _ => unsafe { neon::bfly4_m1(b, groups) },
+                        // SAFETY: NEON is part of the baseline of every
+                        // aarch64 target.
+                        unsafe {
+                            match (radix, m) {
+                                (2, 1) => neon::bfly2_m1(b, groups),
+                                (2, _) => neon::bfly2_m4(b, groups),
+                                _ => neon::bfly4_m1(b, groups),
+                            }
                         }
                         assert_eq!(
                             first_difference(&a, b),
