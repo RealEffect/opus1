@@ -157,13 +157,17 @@ pub(crate) fn silk_vq_wmat_ec_codebook(
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         let neg_xx_q24 = negate_to_q24(xx_in_q17);
-        let found = neon::search(
-            xx_q17,
-            &neg_xx_q24,
-            neon::CODEBOOKS[codebook],
-            subfr_len,
-            max_gain_q7,
-        );
+        // SAFETY: this code is only compiled when NEON is enabled for the
+        // whole build (`cfg(target_feature = "neon")`).
+        let found = unsafe {
+            neon::search(
+                xx_q17,
+                &neg_xx_q24,
+                neon::CODEBOOKS[codebook],
+                subfr_len,
+                max_gain_q7,
+            )
+        };
         vector_choice(codebook, xx_q17, &neg_xx_q24, max_gain_q7, found)
     }
     #[cfg(target_arch = "x86_64")]
@@ -225,6 +229,7 @@ mod neon {
         SILK_LTP_GAIN_VQ_0_GAIN, SILK_LTP_GAIN_VQ_1_GAIN, SILK_LTP_GAIN_VQ_2_GAIN,
         SILK_LTP_VQ_0_Q7, SILK_LTP_VQ_1_Q7, SILK_LTP_VQ_2_Q7,
     };
+    use crate::simd_mem::neon::{load_i32x4, store_i32x4};
     use core::arch::aarch64::*;
 
     /// Four codebook vectors side by side: lane `n` of every field belongs
@@ -296,6 +301,7 @@ mod neon {
     /// Every sum of the scalar code wraps around, so the order of the
     /// additions is free here. `silk_smulwb` is `vqdmulhq_s32` with a
     /// `smulwb_operand`.
+    #[target_feature(enable = "neon")]
     pub(super) fn search(
         xx_q17: &CorrMatrix,
         neg_xx_q24: &[i32; LTP_ORDER],
@@ -305,97 +311,93 @@ mod neon {
     ) -> Option<(usize, i32)> {
         let mut bits_q8 = [0i32; 4];
         let mut number = [0i32; 4];
-        // SAFETY: `vld1q_s32` reads and `vst1q_s32` writes four `i32`. Every
-        // pointer below comes from a `[i32; 4]`.
-        unsafe {
-            // Entry (row, column) of the matrix in all four lanes.
-            let xx = |row: usize, column: usize| vdupq_n_s32(xx_q17[LTP_ORDER * row + column]);
-            let (xx00, xx01, xx02, xx03, xx04) = (xx(0, 0), xx(0, 1), xx(0, 2), xx(0, 3), xx(0, 4));
-            let (xx11, xx12, xx13, xx14) = (xx(1, 1), xx(1, 2), xx(1, 3), xx(1, 4));
-            let (xx22, xx23, xx24) = (xx(2, 2), xx(2, 3), xx(2, 4));
-            let (xx33, xx34) = (xx(3, 3), xx(3, 4));
-            let xx44 = xx(4, 4);
-            let neg0 = vdupq_n_s32(neg_xx_q24[0]);
-            let neg1 = vdupq_n_s32(neg_xx_q24[1]);
-            let neg2 = vdupq_n_s32(neg_xx_q24[2]);
-            let neg3 = vdupq_n_s32(neg_xx_q24[3]);
-            let neg4_twice = vdupq_n_s32(neg_xx_q24[4] << 1);
-            let max_gain = vdupq_n_s32(max_gain_q7);
-            let subfr_len = vdupq_n_s32(subfr_len as i16 as i32);
-            let zero = vdupq_n_s32(0);
+        // Entry (row, column) of the matrix in all four lanes.
+        let xx = |row: usize, column: usize| vdupq_n_s32(xx_q17[LTP_ORDER * row + column]);
+        let (xx00, xx01, xx02, xx03, xx04) = (xx(0, 0), xx(0, 1), xx(0, 2), xx(0, 3), xx(0, 4));
+        let (xx11, xx12, xx13, xx14) = (xx(1, 1), xx(1, 2), xx(1, 3), xx(1, 4));
+        let (xx22, xx23, xx24) = (xx(2, 2), xx(2, 3), xx(2, 4));
+        let (xx33, xx34) = (xx(3, 3), xx(3, 4));
+        let xx44 = xx(4, 4);
+        let neg0 = vdupq_n_s32(neg_xx_q24[0]);
+        let neg1 = vdupq_n_s32(neg_xx_q24[1]);
+        let neg2 = vdupq_n_s32(neg_xx_q24[2]);
+        let neg3 = vdupq_n_s32(neg_xx_q24[3]);
+        let neg4_twice = vdupq_n_s32(neg_xx_q24[4] << 1);
+        let max_gain = vdupq_n_s32(max_gain_q7);
+        let subfr_len = vdupq_n_s32(subfr_len as i16 as i32);
+        let zero = vdupq_n_s32(0);
 
-            let mut best_bits = vdupq_n_s32(i32::MAX);
-            let mut best_number = vdupq_n_s32(-1);
-            let first_numbers: [i32; 4] = [0, 1, 2, 3];
-            let mut numbers = vld1q_s32(first_numbers.as_ptr());
+        let mut best_bits = vdupq_n_s32(i32::MAX);
+        let mut best_number = vdupq_n_s32(-1);
+        let first_numbers: [i32; 4] = [0, 1, 2, 3];
+        let mut numbers = load_i32x4(&first_numbers);
 
-            for group in codebook {
-                let cb0 = vld1q_s32(group.cb_q7[0].as_ptr());
-                let cb1 = vld1q_s32(group.cb_q7[1].as_ptr());
-                let cb2 = vld1q_s32(group.cb_q7[2].as_ptr());
-                let cb3 = vld1q_s32(group.cb_q7[3].as_ptr());
-                let cb4 = vld1q_s32(group.cb_q7[4].as_ptr());
+        for group in codebook {
+            let cb0 = load_i32x4(&group.cb_q7[0]);
+            let cb1 = load_i32x4(&group.cb_q7[1]);
+            let cb2 = load_i32x4(&group.cb_q7[2]);
+            let cb3 = load_i32x4(&group.cb_q7[3]);
+            let cb4 = load_i32x4(&group.cb_q7[4]);
 
-                // Prediction error, row by row as in `ltp_vq_error_q15`.
-                let mut row = vmlaq_s32(neg0, xx01, cb1);
-                row = vmlaq_s32(row, xx02, cb2);
-                row = vmlaq_s32(row, xx03, cb3);
-                row = vmlaq_s32(row, xx04, cb4);
-                row = vmlaq_s32(vshlq_n_s32::<1>(row), xx00, cb0);
-                let mut sum1 = vqdmulhq_s32(row, vld1q_s32(group.cb_q22[0].as_ptr()));
+            // Prediction error, row by row as in `ltp_vq_error_q15`.
+            let mut row = vmlaq_s32(neg0, xx01, cb1);
+            row = vmlaq_s32(row, xx02, cb2);
+            row = vmlaq_s32(row, xx03, cb3);
+            row = vmlaq_s32(row, xx04, cb4);
+            row = vmlaq_s32(vshlq_n_s32::<1>(row), xx00, cb0);
+            let mut sum1 = vqdmulhq_s32(row, load_i32x4(&group.cb_q22[0]));
 
-                row = vmlaq_s32(neg1, xx12, cb2);
-                row = vmlaq_s32(row, xx13, cb3);
-                row = vmlaq_s32(row, xx14, cb4);
-                row = vmlaq_s32(vshlq_n_s32::<1>(row), xx11, cb1);
-                sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, vld1q_s32(group.cb_q22[1].as_ptr())));
+            row = vmlaq_s32(neg1, xx12, cb2);
+            row = vmlaq_s32(row, xx13, cb3);
+            row = vmlaq_s32(row, xx14, cb4);
+            row = vmlaq_s32(vshlq_n_s32::<1>(row), xx11, cb1);
+            sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, load_i32x4(&group.cb_q22[1])));
 
-                row = vmlaq_s32(neg2, xx23, cb3);
-                row = vmlaq_s32(row, xx24, cb4);
-                row = vmlaq_s32(vshlq_n_s32::<1>(row), xx22, cb2);
-                sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, vld1q_s32(group.cb_q22[2].as_ptr())));
+            row = vmlaq_s32(neg2, xx23, cb3);
+            row = vmlaq_s32(row, xx24, cb4);
+            row = vmlaq_s32(vshlq_n_s32::<1>(row), xx22, cb2);
+            sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, load_i32x4(&group.cb_q22[2])));
 
-                row = vmlaq_s32(neg3, xx34, cb4);
-                row = vmlaq_s32(vshlq_n_s32::<1>(row), xx33, cb3);
-                sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, vld1q_s32(group.cb_q22[3].as_ptr())));
+            row = vmlaq_s32(neg3, xx34, cb4);
+            row = vmlaq_s32(vshlq_n_s32::<1>(row), xx33, cb3);
+            sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, load_i32x4(&group.cb_q22[3])));
 
-                row = vmlaq_s32(neg4_twice, xx44, cb4);
-                sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, vld1q_s32(group.cb_q22[4].as_ptr())));
-                sum1 = vaddq_s32(sum1, vdupq_n_s32(32801));
+            row = vmlaq_s32(neg4_twice, xx44, cb4);
+            sum1 = vaddq_s32(sum1, vqdmulhq_s32(row, load_i32x4(&group.cb_q22[4])));
+            sum1 = vaddq_s32(sum1, vdupq_n_s32(32801));
 
-                // Residual energy with the penalty for too large a gain.
-                let gain = vld1q_s32(group.gain_q7.as_ptr());
-                let penalty = vshlq_n_s32::<11>(vmaxq_s32(vsubq_s32(gain, max_gain), zero));
-                let res_nrg = vaddq_s32(sum1, penalty);
+            // Residual energy with the penalty for too large a gain.
+            let gain = load_i32x4(&group.gain_q7);
+            let penalty = vshlq_n_s32::<11>(vmaxq_s32(vsubq_s32(gain, max_gain), zero));
+            let res_nrg = vaddq_s32(sum1, penalty);
 
-                // silk_lin2log(res_nrg): the 7 bits below the leading one
-                // give the fraction; a negative shift count shifts right.
-                // As in libopus, the value is not checked: 0 gives -128,
-                // and a negative value counts as having no leading zero.
-                let lz = vclzq_s32(res_nrg);
-                let frac = vandq_s32(
-                    vshlq_s32(res_nrg, vsubq_s32(lz, vdupq_n_s32(24))),
-                    vdupq_n_s32(0x7f),
-                );
-                let curve = vmulq_s32(frac, vsubq_s32(vdupq_n_s32(128), frac));
-                let curve = vshrq_n_s32::<16>(vmulq_n_s32(curve, 179));
-                let whole = vshlq_n_s32::<7>(vsubq_s32(vdupq_n_s32(31), lz));
-                let log = vaddq_s32(vaddq_s32(frac, curve), whole);
+            // silk_lin2log(res_nrg): the 7 bits below the leading one
+            // give the fraction; a negative shift count shifts right.
+            // As in libopus, the value is not checked: 0 gives -128,
+            // and a negative value counts as having no leading zero.
+            let lz = vclzq_s32(res_nrg);
+            let frac = vandq_s32(
+                vshlq_s32(res_nrg, vsubq_s32(lz, vdupq_n_s32(24))),
+                vdupq_n_s32(0x7f),
+            );
+            let curve = vmulq_s32(frac, vsubq_s32(vdupq_n_s32(128), frac));
+            let curve = vshrq_n_s32::<16>(vmulq_n_s32(curve, 179));
+            let whole = vshlq_n_s32::<7>(vsubq_s32(vdupq_n_s32(31), lz));
+            let log = vaddq_s32(vaddq_s32(frac, curve), whole);
 
-                let bits = vmulq_s32(subfr_len, vsubq_s32(log, vdupq_n_s32(15 << 7)));
-                let bits = vaddq_s32(bits, vld1q_s32(group.half_cl_q8.as_ptr()));
+            let bits = vmulq_s32(subfr_len, vsubq_s32(log, vdupq_n_s32(15 << 7)));
+            let bits = vaddq_s32(bits, load_i32x4(&group.half_cl_q8));
 
-                // A vector qualifies when its error is not negative. In
-                // each lane the later of two equal vectors wins, as in the
-                // scalar code.
-                let take = vandq_u32(vcgezq_s32(sum1), vcleq_s32(bits, best_bits));
-                best_bits = vbslq_s32(take, bits, best_bits);
-                best_number = vbslq_s32(take, numbers, best_number);
-                numbers = vaddq_s32(numbers, vdupq_n_s32(4));
-            }
-            vst1q_s32(bits_q8.as_mut_ptr(), best_bits);
-            vst1q_s32(number.as_mut_ptr(), best_number);
+            // A vector qualifies when its error is not negative. In
+            // each lane the later of two equal vectors wins, as in the
+            // scalar code.
+            let take = vandq_u32(vcgezq_s32(sum1), vcleq_s32(bits, best_bits));
+            best_bits = vbslq_s32(take, bits, best_bits);
+            best_number = vbslq_s32(take, numbers, best_number);
+            numbers = vaddq_s32(numbers, vdupq_n_s32(4));
         }
+        store_i32x4(&mut bits_q8, best_bits);
+        store_i32x4(&mut number, best_number);
 
         // The best of the four lanes; of equal ones the later vector.
         let mut best: Option<(usize, i32)> = None;
@@ -437,6 +439,7 @@ mod x86 {
         SILK_LTP_GAIN_VQ_0_GAIN, SILK_LTP_GAIN_VQ_1_GAIN, SILK_LTP_GAIN_VQ_2_GAIN,
         SILK_LTP_VQ_0_Q7, SILK_LTP_VQ_1_Q7, SILK_LTP_VQ_2_Q7,
     };
+    use crate::simd_mem::x86::load_i32x4;
     use core::arch::x86_64::*;
 
     /// Four codebook vectors side by side: lane `n` of every field belongs
@@ -508,14 +511,6 @@ mod x86 {
     /// The three LTP codebooks, in the order of `SILK_LTP_VQ_PTRS_Q7`.
     pub(super) static CODEBOOKS: [&[Group]; 3] = [&CODEBOOK_0, &CODEBOOK_1, &CODEBOOK_2];
 
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    fn load(lanes: &[i32; 4]) -> __m128i {
-        // SAFETY: reads the 16 bytes of the array; the load needs no
-        // alignment.
-        unsafe { _mm_loadu_si128(lanes.as_ptr().cast()) }
-    }
-
     /// `(x * c) >> 16` per lane, as `silk_smulwb(x, c)`, with `c << 16` in
     /// `factor` and the factors of lanes 1 and 3 in lanes 0 and 2 of
     /// `factor_odd`.
@@ -567,13 +562,9 @@ mod x86 {
     }
 
     /// `lin2log` of four values, for the tests.
-    ///
-    /// # Safety
-    ///
-    /// The processor must have SSE4.1.
     #[cfg(test)]
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn lin2log_lanes(v: [i32; 4]) -> [i32; 4] {
+    pub(super) fn lin2log_lanes(v: [i32; 4]) -> [i32; 4] {
         let out = lin2log(_mm_setr_epi32(v[0], v[1], v[2], v[3]));
         [
             _mm_extract_epi32::<0>(out),
@@ -589,12 +580,8 @@ mod x86 {
     ///
     /// Every sum of the scalar code wraps around, so the order of the
     /// additions is free here.
-    ///
-    /// # Safety
-    ///
-    /// The processor must have SSE4.1.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn search(
+    pub(super) fn search(
         xx_q17: &CorrMatrix,
         neg_xx_q24: &[i32; LTP_ORDER],
         codebook: &[Group],
@@ -626,12 +613,12 @@ mod x86 {
         let mut numbers = _mm_setr_epi32(0, 1, 2, 3);
 
         for group in codebook {
-            let cb0 = load(&group.cb_q7[0]);
-            let cb1 = load(&group.cb_q7[1]);
-            let cb2 = load(&group.cb_q7[2]);
-            let cb3 = load(&group.cb_q7[3]);
-            let cb4 = load(&group.cb_q7[4]);
-            let factor = |c: usize| (load(&group.cb_q23[c]), load(&group.cb_q23_odd[c]));
+            let cb0 = load_i32x4(&group.cb_q7[0]);
+            let cb1 = load_i32x4(&group.cb_q7[1]);
+            let cb2 = load_i32x4(&group.cb_q7[2]);
+            let cb3 = load_i32x4(&group.cb_q7[3]);
+            let cb4 = load_i32x4(&group.cb_q7[4]);
+            let factor = |c: usize| (load_i32x4(&group.cb_q23[c]), load_i32x4(&group.cb_q23_odd[c]));
 
             // Prediction error, row by row as in `ltp_vq_error_q15`.
             let mut row = mla(neg0, xx01, cb1);
@@ -666,7 +653,7 @@ mod x86 {
             sum1 = _mm_add_epi32(sum1, _mm_set1_epi32(32801));
 
             // Residual energy with the penalty for too large a gain.
-            let gain = load(&group.gain_q7);
+            let gain = load_i32x4(&group.gain_q7);
             let penalty = _mm_slli_epi32::<11>(_mm_max_epi32(_mm_sub_epi32(gain, max_gain), zero));
             let res_nrg = _mm_add_epi32(sum1, penalty);
 
@@ -674,7 +661,7 @@ mod x86 {
             // between -2048 and 2175 and keeps its value in 16 bits.
             let log = _mm_sub_epi32(lin2log(res_nrg), _mm_set1_epi32(15 << 7));
             let bits = _mm_madd_epi16(log, subfr_len);
-            let bits = _mm_add_epi32(bits, load(&group.half_cl_q8));
+            let bits = _mm_add_epi32(bits, load_i32x4(&group.half_cl_q8));
 
             // A vector qualifies when its error is not negative. In each
             // lane the later of two equal vectors wins, as in the scalar
