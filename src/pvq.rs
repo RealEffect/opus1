@@ -3184,6 +3184,13 @@ mod tests {
                     assert_eq!(got, want, "n {n} k {k} i {i}");
                     let pulses: u32 = got[..n as usize].iter().map(|v| v.unsigned_abs()).sum();
                     assert_eq!(pulses, k, "n {n} k {k} i {i}");
+                    // The decoder's form: memory without values (`PulseSlot`).
+                    let mut slots = vec![MaybeUninit::<i32>::uninit(); n as usize];
+                    // SAFETY: the table covers `(n, k)` and `i < v`.
+                    unsafe { cwrsi_table(n as usize, k as usize, i, &mut slots[..]) };
+                    // SAFETY: `cwrsi_table` writes every value of `slots`.
+                    let slots: Vec<i32> = slots.iter().map(|v| unsafe { v.assume_init() }).collect();
+                    assert_eq!(slots[..], want[..n as usize], "uninit, n {n} k {k} i {i}");
                     // The public function takes the same path.
                     let mut public = vec![7i32; n as usize + 2];
                     cwrsi(n, k, i, &mut public);
@@ -3406,6 +3413,43 @@ mod tests {
             }
         }
         y
+    }
+
+    /// `decode_pulses_uninit`, the decoder's form (memory without values,
+    /// see `PulseSlot`), against `decode_pulses` on the same bits, which
+    /// `encode_pulses` wrote: every pulse count whose vectors can be coded,
+    /// for every band size of the standard mode (up to 176 values). Vectors
+    /// without pulses and pairs outside the table take the rare path.
+    #[test]
+    fn uninit_decoding_matches_decode_pulses() {
+        let mut rng = Lcg(61);
+        let (mut inside, mut rare) = (0, 0);
+        for n in 2..=176u32 {
+            for k in 0..=MAX_PVQ_K as u32 {
+                // Pulse counts whose number of vectors does not fit in 32
+                // bits are never coded.
+                if k > 0 && celt_pvq_v(n, k) == u32::MAX {
+                    continue;
+                }
+                if k > 0 && pvq_table_covers(n, k) {
+                    inside += 1;
+                } else {
+                    rare += 1;
+                }
+                let y = random_pulses(&mut rng, n as usize, k);
+                let mut enc = RangeCoder::new_encoder(64);
+                encode_pulses(&y, n, k, &mut enc);
+                enc.done();
+                let mut want = vec![7i32; n as usize];
+                decode_pulses(&mut want, n, k, &mut RangeCoder::new_decoder(&enc.buf[..]));
+                assert_eq!(want, y, "decode_pulses, n {n} k {k}");
+                let mut slots = vec![MaybeUninit::<i32>::uninit(); n as usize + 2];
+                let mut dec = RangeCoder::new_decoder(&enc.buf[..]);
+                let got = decode_pulses_uninit(&mut slots, n, k, &mut dec);
+                assert_eq!(got, &want[..], "decode_pulses_uninit, n {n} k {k}");
+            }
+        }
+        assert!(inside > 1000 && rare >= 175, "{inside} pairs inside the table, {rare} on the rare path");
     }
 
     #[test]
@@ -3715,6 +3759,8 @@ mod tests {
     /// the resynthesis of `alg_quant_with` from it gives the band of
     /// `alg_quant_resynth`, which sums the energy again.
     #[test]
+    // The x86-64 search kernels do not return the energy.
+    #[cfg(not(target_arch = "x86_64"))]
     fn resynthesis_from_the_search_energy_matches() {
         let mut rng = Lcg(57);
         for n in (2..=40usize).chain([44, 48, 64, 72, 96, 144, 176]) {
@@ -3726,9 +3772,7 @@ mod tests {
                 let k = 1 + (rng.next_u32() % (2 * n as u32 + 4)) as i32;
                 let mut y = vec![0i32; n];
                 let (_, energy) = pvq_search_energy(&x, &mut y, k, n);
-                let Some(energy) = energy else {
-                    return;
-                };
+                let energy = energy.expect("the search returns its energy");
                 let sum: i64 = y.iter().map(|&v| v as i64 * v as i64).sum();
                 assert_eq!(energy, sum as f32, "n {n} k {k}");
                 let gain = [1.0f32, 0.37, 1.0e-3][round % 3];
