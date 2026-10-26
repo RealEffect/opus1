@@ -2,30 +2,23 @@
 //! (silk/fixed/burg_modified_FIX.c).
 //!
 //! The libopus that the tests link is the floating-point build, which does
-//! not contain this function. The reference values in
-//! `perfk_silk_burg.expected` were therefore computed once by the C function
-//! itself: the source of the official libopus 1.6.1 release compiled with
-//! `FIXED_POINT`, called on the signals that `Generator` below produces. The
-//! generator uses integers only, so the C program and this test produce the
-//! same samples; each row carries a checksum of its input to make sure of
-//! that.
+//! not contain this function. The test calls it in the fixed-point build of
+//! the official libopus 1.6.1 release that the dev-dependency
+//! `libopus-fixed` compiles (tools/libopus-fixed), on the same signals.
 //!
 //! libopus's main branch adds 1 to the frame energy (line 72 of
-//! burg_modified_FIX.c). Its results differ from the 1.6.1 release in 622
-//! of the 1000 cases. opus1 follows the release.
+//! burg_modified_FIX.c). Its results differed from the 1.6.1 release in 622
+//! of these 1000 cases. opus1 follows the release.
 //!
 //! The function is fixed-point: the residual energy, its Q value and every
 //! coefficient must be identical.
 
 use opus1::internals::silk::lpc_analysis::silk_burg_modified_fix;
 
-/// (checksum of the input, residual energy, its Q value, checksum of all
-/// coefficients, coefficients 0, 1 and the last one).
-type Expected = (u64, i32, i32, u64, [i32; 3]);
+/// Number of cases.
+const CASES: usize = 1000;
 
-static EXPECTED: [Expected; 1000] = include!("perfk_silk_burg.expected");
-
-/// The generator of the C program that produced `EXPECTED`.
+/// Small deterministic generator: integers only.
 struct Generator(u32);
 
 impl Generator {
@@ -120,14 +113,16 @@ fn burg_modified_matches_libopus_fixed_point() {
     let mut g = Generator(0x2468_ace1);
     let mut failures = Vec::new();
     let mut q_values = std::collections::BTreeSet::new();
-    for (number, expected) in EXPECTED.iter().enumerate() {
+    for number in 0..CASES {
         let case = next_case(&mut g);
-        let checksum = case
-            .x
-            .iter()
-            .fold(0u64, |sum, &s| sum.wrapping_mul(31).wrapping_add(s as i64 as u64))
-            & 0xffff_ffff_ffff;
-        assert_eq!(checksum, expected.0, "case {number}: the input differs from the C program's");
+        let d = case.order;
+        let (c_nrg, c_nrg_q, c_a_q16) = libopus_fixed::burg_modified(
+            &case.x,
+            case.min_inv_gain_q30,
+            case.subfr_length,
+            case.nb_subfr,
+            d,
+        );
 
         let (mut res_nrg, mut res_nrg_q) = (0i32, 0i32);
         let mut a_q16 = [0i32; 16];
@@ -139,30 +134,26 @@ fn burg_modified_matches_libopus_fixed_point() {
             case.min_inv_gain_q30,
             case.subfr_length,
             case.nb_subfr,
-            case.order,
+            d,
         );
-        let d = case.order;
-        let a_checksum = a_q16[..d]
-            .iter()
-            .fold(0u64, |sum, &a| sum.wrapping_mul(1000003).wrapping_add(a as i64 as u64))
-            & 0xffff_ffff_ffff;
-        let got: Expected = (checksum, res_nrg, res_nrg_q, a_checksum, [a_q16[0], a_q16[1], a_q16[d - 1]]);
-        if got != *expected {
+        if (res_nrg, res_nrg_q, &a_q16[..d]) != (c_nrg, c_nrg_q, &c_a_q16[..]) {
             failures.push(format!(
                 "case {number} (order {d}, {} subframes of {}): opus1 {:?}, libopus {:?}",
-                case.nb_subfr, case.subfr_length, got, expected
+                case.nb_subfr,
+                case.subfr_length,
+                (res_nrg, res_nrg_q, &a_q16[..d]),
+                (c_nrg, c_nrg_q, &c_a_q16)
             ));
         }
-        q_values.insert(expected.2);
+        q_values.insert(c_nrg_q);
     }
     // The cases cover every scaling of the correlations: Q values from -7
     // (loud) to 16 (quiet).
     assert_eq!(q_values.len(), 24, "{q_values:?}");
     assert!(
         failures.is_empty(),
-        "{} of {} cases differ from libopus:\n{}",
+        "{} of {CASES} cases differ from libopus:\n{}",
         failures.len(),
-        EXPECTED.len(),
         failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
     );
 }

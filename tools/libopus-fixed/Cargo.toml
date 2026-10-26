@@ -1,0 +1,12 @@
+[package]
+name = "libopus-fixed"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Test-only: the fixed-point build of libopus 1.6.1, compiled from its source, as a reference for the tests of opus1"
+license = "BSD-3-Clause"
+
+# The build script compiles the C source with the `cc` crate, which the
+# dev-dependency `audiopus_sys` already pulls in (through `cmake`).
+[build-dependencies]
+cc = "1"

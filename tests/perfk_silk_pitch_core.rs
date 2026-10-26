@@ -2,12 +2,9 @@
 //! (silk/fixed/pitch_analysis_core_FIX.c).
 //!
 //! The libopus that the tests link is the floating-point build, which does
-//! not contain this function. The reference values in
-//! `perfk_silk_pitch_core.expected` were therefore computed once by the C
-//! function itself: the libopus 1.6.1 source compiled with `FIXED_POINT`,
-//! called on the signals that `Generator` below produces. The generator uses
-//! integers only, so the C program and this test produce the same samples;
-//! each row carries a checksum of its input to make sure of that.
+//! not contain this function. The test calls it in the fixed-point build of
+//! the official libopus 1.6.1 release that the dev-dependency
+//! `libopus-fixed` compiles (tools/libopus-fixed), on the same signals.
 //!
 //! The function is fixed-point: every output must be identical.
 //!
@@ -19,13 +16,10 @@
 
 use opus1::internals::silk::pitch_analysis::silk_pitch_analysis_core;
 
-/// (checksum of the input, return value, pitch lags, lag index, contour
-/// index, LTPCorr_Q15).
-type Expected = (u64, i32, [i32; 4], i16, i8, i32);
+/// Number of cases.
+const CASES: usize = 900;
 
-static EXPECTED: [Expected; 900] = include!("perfk_silk_pitch_core.expected");
-
-/// The generator of the C program that produced `EXPECTED`.
+/// Small deterministic generator: integers only.
 struct Generator(u32);
 
 impl Generator {
@@ -140,14 +134,19 @@ fn pitch_analysis_core_matches_libopus_fixed_point() {
     let mut g = Generator(0x1357_9bdf);
     let mut voiced_by_rate = [0usize; 3];
     let mut failures = Vec::new();
-    for (number, expected) in EXPECTED.iter().enumerate() {
+    for number in 0..CASES {
         let case = next_case(&mut g);
-        let checksum = case
-            .frame
-            .iter()
-            .fold(0u64, |sum, &s| sum.wrapping_mul(31).wrapping_add(s as i64 as u64))
-            & 0xffff_ffff_ffff;
-        assert_eq!(checksum, expected.0, "case {number}: the input differs from the C program's");
+        let c = libopus_fixed::pitch_analysis_core(
+            &case.frame,
+            case.ltp_corr,
+            case.prev_lag,
+            case.thres1_q16,
+            case.thres2_q13,
+            case.fs_khz,
+            case.complexity as i32,
+            case.nb_subfr,
+        );
+        let expected = (c.unvoiced, c.pitch_out, c.lag_index, c.contour_index, c.ltp_corr_q15);
 
         let mut pitch_out = [0i32; 4];
         let (mut lag_index, mut contour_index) = (0i16, 0i8);
@@ -165,24 +164,23 @@ fn pitch_analysis_core_matches_libopus_fixed_point() {
             case.complexity,
             case.nb_subfr,
         );
-        let got: Expected = (checksum, unvoiced, pitch_out, lag_index, contour_index, ltp_corr);
-        if got != *expected {
+        let got = (unvoiced, pitch_out, lag_index, contour_index, ltp_corr);
+        if got != expected {
             failures.push(format!(
                 "case {number} ({} kHz, {} subframes, complexity {}, signal {}, previous lag {}): opus1 {:?}, libopus {:?}",
                 case.fs_khz, case.nb_subfr, case.complexity, case.kind, case.prev_lag, got, expected
             ));
         }
-        if expected.1 == 0 {
+        if c.unvoiced == 0 {
             voiced_by_rate[(case.fs_khz / 4 - 2) as usize] += 1;
         }
     }
-    // The table has voiced results for every sampling rate.
+    // libopus finds voiced frames at every sampling rate.
     assert!(voiced_by_rate.iter().all(|&n| n > 100), "{voiced_by_rate:?}");
     assert!(
         failures.is_empty(),
-        "{} of {} cases differ from libopus:\n{}",
+        "{} of {CASES} cases differ from libopus:\n{}",
         failures.len(),
-        EXPECTED.len(),
         failures.iter().take(12).cloned().collect::<Vec<_>>().join("\n")
     );
 }

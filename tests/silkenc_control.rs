@@ -17,7 +17,7 @@ use opus1::internals::silk::enc_api::{silk_encode_do_vad, silk_encode_packet, si
 use opus1::internals::silk::stereo_lr_to_ms::silk_stereo_lr_to_ms;
 use opus1::internals::silk::init_decoder::{silk_create_decoder, silk_decoder_set_fs};
 use opus1::internals::silk::init_encoder::silk_init_encoder;
-use opus1::internals::silk::structs::SilkEncoderState;
+use opus1::internals::silk::structs::{SilkEncoderState, SilkEncoderStateCommon};
 use opus1::{Application, Bandwidth, Bitrate, Channels, ForcedMode, InbandFec, OpusEncoder, SampleRate};
 
 const FS: usize = 16_000;
@@ -283,15 +283,47 @@ fn bandwidth_control(desired_khz: i32, max_bits: i32) -> SilkBandwidthControl {
     }
 }
 
+/// `silk_control_audio_bandwidth` of opus1 and of the fixed-point libopus
+/// 1.6.1 (silk/control_audio_bandwidth.c) on the same state and control:
+/// both must return the same rate and leave the same low-pass state,
+/// `maxBits` and `switchReady`. Returns the rate.
+fn control_audio_bandwidth(cmn: &mut SilkEncoderStateCommon, ctl: &mut SilkBandwidthControl) -> i32 {
+    let mut c = libopus_fixed::BandwidthState {
+        fs_khz: cmn.fs_khz,
+        allow_bandwidth_switch: ctl.allow_bandwidth_switch as i32,
+        api_fs_hz: ctl.api_fs_hz,
+        max_internal_fs_hz: ctl.max_internal_fs_hz,
+        min_internal_fs_hz: ctl.min_internal_fs_hz,
+        desired_internal_fs_hz: ctl.desired_internal_fs_hz,
+        in_lp_state: cmn.s_lp.in_lp_state,
+        transition_frame_no: cmn.s_lp.transition_frame_no,
+        mode: cmn.s_lp.mode,
+        saved_fs_khz: cmn.s_lp.saved_fs_khz,
+        opus_can_switch: ctl.opus_can_switch as i32,
+        payload_size_ms: ctl.payload_size_ms,
+        max_bits: ctl.max_bits,
+        switch_ready: ctl.switch_ready as i32,
+    };
+    let c_rate = libopus_fixed::control_audio_bandwidth(&mut c);
+    let rate = silk_control_audio_bandwidth(cmn, ctl);
+    let lp = &cmn.s_lp;
+    assert_eq!(
+        (rate, lp.in_lp_state, lp.transition_frame_no, lp.mode, ctl.max_bits, ctl.switch_ready as i32),
+        (c_rate, c.in_lp_state, c.transition_frame_no, c.mode, c.max_bits, c.switch_ready),
+        "rate, low-pass state, maxBits and switchReady of opus1 and libopus"
+    );
+    rate
+}
+
 /// In a stereo packet libopus runs the rate switch state machine for the mid
 /// and for the side (silk/control_codec.c:101). Each channel that reports
 /// that it is ready takes room for the redundant frame out of `maxBits`
 /// (silk/control_audio_bandwidth.c:86-88, 114-116).
 ///
-/// The figures are those of the fixed-point build of libopus for a 48 kb/s
-/// constant bitrate stereo stream with 20 ms packets, on the packet before a
-/// switch from 16 to 12 kHz: 952 bits become 762, then 610. opus1, whose
-/// caller reduces the bits once, gave SILK 762.
+/// For a 48 kb/s constant bitrate stereo stream with 20 ms packets, on the
+/// packet before a switch from 16 to 12 kHz, libopus's fixed-point build
+/// takes the room twice: 952 bits became 762, then 610. opus1, whose caller
+/// reduced the bits once, gave SILK 762.
 #[test]
 fn each_channel_that_is_ready_to_switch_takes_room_out_of_max_bits() {
     let mut channels = encoders(20, 2);
@@ -301,26 +333,29 @@ fn each_channel_that_is_ready_to_switch_takes_room_out_of_max_bits() {
         enc.s_cmn.s_lp.transition_frame_no = 0;
     }
     let mut ctl = bandwidth_control(12, 952);
-    assert_eq!(silk_control_audio_bandwidth(&mut channels[0].s_cmn, &mut ctl), 16);
-    assert_eq!((ctl.switch_ready, ctl.max_bits), (true, 762));
-    assert_eq!(silk_control_audio_bandwidth(&mut channels[1].s_cmn, &mut ctl), 16);
-    assert_eq!((ctl.switch_ready, ctl.max_bits), (true, 610));
+    control_audio_bandwidth(&mut channels[0].s_cmn, &mut ctl);
+    let after_mid = ctl.max_bits;
+    control_audio_bandwidth(&mut channels[1].s_cmn, &mut ctl);
+    assert!(ctl.switch_ready && ctl.max_bits < after_mid && after_mid < 952, "{after_mid}, {}", ctl.max_bits);
 
-    // A side whose filter is still closing does not: one reduction.
+    // A side whose filter is still closing takes no room.
     channels[1].s_cmn.s_lp.transition_frame_no = 7;
     let mut ctl = bandwidth_control(12, 952);
-    silk_control_audio_bandwidth(&mut channels[0].s_cmn, &mut ctl);
-    silk_control_audio_bandwidth(&mut channels[1].s_cmn, &mut ctl);
-    assert_eq!((ctl.switch_ready, ctl.max_bits), (true, 762));
+    control_audio_bandwidth(&mut channels[0].s_cmn, &mut ctl);
+    let after_mid = ctl.max_bits;
+    control_audio_bandwidth(&mut channels[1].s_cmn, &mut ctl);
+    assert!(ctl.switch_ready && ctl.max_bits == after_mid, "{after_mid}, {}", ctl.max_bits);
 
     // 10 ms packets keep a third for the redundant frame: 5 / (10 + 5).
     let mut ctl = SilkBandwidthControl { payload_size_ms: 10, ..bandwidth_control(12, 480) };
-    silk_control_audio_bandwidth(&mut channels[0].s_cmn, &mut ctl);
-    assert_eq!(ctl.max_bits, 320);
+    control_audio_bandwidth(&mut channels[0].s_cmn, &mut ctl);
+    assert!(ctl.switch_ready);
 }
 
 /// The steps of a switch down and of a switch up, as in
-/// silk/control_audio_bandwidth.c.
+/// silk/control_audio_bandwidth.c. Every call is compared with libopus's
+/// (`control_audio_bandwidth`); the checks after a call name the branch it
+/// took.
 #[test]
 fn the_rate_switch_state_machine_follows_libopus() {
     let mut enc = encoders(20, 1).remove(0);
@@ -330,57 +365,52 @@ fn the_rate_switch_state_machine_follows_libopus() {
     // filter, and the filter closes at double speed.
     cmn.s_lp.in_lp_state = [5, 6];
     let mut ctl = bandwidth_control(8, 1000);
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 16);
-    assert_eq!((cmn.s_lp.mode, cmn.s_lp.transition_frame_no), (-2, TRANSITION_FRAMES));
-    assert_eq!(cmn.s_lp.in_lp_state, [0, 0]);
-    assert_eq!((ctl.switch_ready, ctl.max_bits), (false, 1000));
+    control_audio_bandwidth(cmn, &mut ctl);
+    assert_eq!(cmn.s_lp.transition_frame_no, TRANSITION_FRAMES);
+    assert!(!ctl.switch_ready);
     // Not while SILK does not allow a switch.
     cmn.s_lp.transition_frame_no = 0;
     let mut ctl =
         SilkBandwidthControl { allow_bandwidth_switch: false, ..bandwidth_control(8, 1000) };
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 16);
-    assert_eq!((ctl.switch_ready, ctl.max_bits), (false, 1000));
+    control_audio_bandwidth(cmn, &mut ctl);
+    assert!(!ctl.switch_ready);
     // The filter is closed: ready. The caller then switches one step.
     let mut ctl = bandwidth_control(8, 1000);
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 16);
-    assert_eq!((ctl.switch_ready, ctl.max_bits), (true, 800));
+    control_audio_bandwidth(cmn, &mut ctl);
+    assert!(ctl.switch_ready);
     let mut ctl = SilkBandwidthControl { opus_can_switch: true, ..bandwidth_control(8, 1000) };
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 12);
-    assert_eq!((cmn.s_lp.mode, ctl.switch_ready, ctl.max_bits), (0, false, 1000));
+    assert!(control_audio_bandwidth(cmn, &mut ctl) < 16);
 
     // Up, from 12 kHz. Ready at once when no transition runs. The switch
     // opens the filter from a cleared state.
     cmn.fs_khz = 12;
     cmn.s_lp.transition_frame_no = 0;
     let mut ctl = bandwidth_control(16, 1000);
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 12);
-    assert_eq!((ctl.switch_ready, ctl.max_bits), (true, 800));
+    control_audio_bandwidth(cmn, &mut ctl);
+    assert!(ctl.switch_ready);
     cmn.s_lp.in_lp_state = [5, 6];
     let mut ctl = SilkBandwidthControl { opus_can_switch: true, ..bandwidth_control(16, 1000) };
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 16);
-    assert_eq!((cmn.s_lp.mode, cmn.s_lp.transition_frame_no), (1, 0));
-    assert_eq!(cmn.s_lp.in_lp_state, [0, 0]);
+    assert!(control_audio_bandwidth(cmn, &mut ctl) > 12);
     // The transition ends when the counter is full.
     cmn.fs_khz = 16;
     cmn.s_lp.transition_frame_no = TRANSITION_FRAMES;
     let mut ctl = bandwidth_control(16, 1000);
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 16);
-    assert_eq!(cmn.s_lp.mode, 0);
+    control_audio_bandwidth(cmn, &mut ctl);
 
     // A new encoder takes the desired rate, at most the input's. One that
     // was reset for a switch goes on from the rate it had.
     cmn.fs_khz = 0;
     let mut ctl = SilkBandwidthControl { api_fs_hz: 12_000, ..bandwidth_control(16, 1000) };
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 12);
+    control_audio_bandwidth(cmn, &mut ctl);
     cmn.s_lp.saved_fs_khz = 16;
     cmn.s_lp.mode = 0;
     let mut ctl = SilkBandwidthControl { opus_can_switch: true, ..bandwidth_control(12, 1000) };
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 12);
+    control_audio_bandwidth(cmn, &mut ctl);
     // A rate above the maximum allowed drops to it at once.
     cmn.fs_khz = 16;
     let mut ctl =
         SilkBandwidthControl { max_internal_fs_hz: 12_000, ..bandwidth_control(12, 1000) };
-    assert_eq!(silk_control_audio_bandwidth(cmn, &mut ctl), 12);
+    control_audio_bandwidth(cmn, &mut ctl);
 }
 
 /// Everything the voice activity detector leaves in the encoder state.

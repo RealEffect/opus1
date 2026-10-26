@@ -120,6 +120,13 @@ if [ ! -f "$TARBALL" ]; then
     curl -fL -o "$TARBALL" "$OPUS_URL" || die "download of $OPUS_URL failed"
 fi
 echo "$OPUS_SHA256  $TARBALL" | sha256sum -c - || die "SHA-256 of $TARBALL does not match"
+# An unbuilt copy of the source for the tests: tools/libopus-fixed builds
+# the fixed-point libopus from it (LIBOPUS_SRC_1_6_1).
+if [ ! -f "$WORK/src-1.6.1/package_version" ]; then
+    rm -rf "$WORK/src-1.6.1" && mkdir -p "$WORK/src-1.6.1"
+    tar xzf "$TARBALL" -C "$WORK/src-1.6.1" --strip-components=1
+fi
+export LIBOPUS_SRC_1_6_1="$WORK/src-1.6.1"
 
 # build_libopus NAME CONFIGURE_OPTIONS...: builds into $WORK/NAME (once).
 build_libopus() {

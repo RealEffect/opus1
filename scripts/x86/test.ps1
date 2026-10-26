@@ -120,6 +120,16 @@ if (-not (Test-Path $Tarball)) {
 $hash = (Get-FileHash -Algorithm SHA256 -Path $Tarball).Hash
 if ($hash -ne $OpusSha256) { Die "SHA-256 of $Tarball does not match ($hash)" }
 Write-Host "SHA-256 ok"
+# An unbuilt copy of the source for the tests: tools/libopus-fixed builds
+# the fixed-point libopus from it (LIBOPUS_SRC_1_6_1).
+$fixedSrc = Join-Path $Work 'src-1.6.1'
+if (-not (Test-Path (Join-Path $fixedSrc 'package_version'))) {
+    Remove-Item -Recurse -Force -Path $fixedSrc -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $fixedSrc | Out-Null
+    & tar -xzf $Tarball -C $fixedSrc --strip-components=1
+    if ($LASTEXITCODE -ne 0) { Die "unpacking $Tarball failed" }
+}
+$env:LIBOPUS_SRC_1_6_1 = $fixedSrc
 
 $Generator = $env:OPUS1_CMAKE_GENERATOR
 if (-not $Generator) { $Generator = 'Visual Studio 17 2022' }
