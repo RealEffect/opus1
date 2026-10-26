@@ -6,6 +6,11 @@
 //! scalar code does in a chain of its own (one sample, one FFT bin). So the
 //! results are the same bits as the scalar code, which matches libopus. The
 //! tests at the end of this file compare the two on random and real input.
+//!
+//! The kernels are safe functions compiled with `#[target_feature(enable =
+//! "neon")]`. Their loads and stores go through `crate::simd_mem`. A caller
+//! without that feature calls them in an `unsafe` block; NEON is part of
+//! the baseline of every aarch64 target.
 
 use core::arch::aarch64::*;
 
@@ -17,43 +22,40 @@ use super::tonality::{
 };
 use super::{AnalysisPcm, PcmRef, SecondChannel};
 use crate::kiss_fft::{KissCpx, KissFftState};
+use crate::simd_mem::neon::{
+    load_f32x4, load_i16x8, load2_f32x4, load2_f32x4_cpx, load2_i16x8, store_f32x2_cpx, store_f32x4,
+};
+use crate::simd_mem::{array_at, array_at_mut};
 
 /// `window_for_fft_scalar` of `tonality.rs`, four samples of each of the
 /// four quarters of the window at a time.
+#[target_feature(enable = "neon")]
 pub(super) fn window_for_fft(inmem: &[f32; ANALYSIS_BUF_SIZE], st: &KissFftState, fout: &mut [KissCpx; N]) {
     let scale = st.scale();
     let bitrev: &[i16; N] = st.bitrev[..N].try_into().expect("a plan of 480 points");
     // Stores one complex value at its bit-reversed place. The index is
     // checked: the plan holds a permutation of 0..480.
-    let mut put = |index: i16, v: float32x2_t| {
-        let c = &mut fout[index as usize];
-        // SAFETY: `c` is one complex value, two f32 in a `repr(C)` struct.
-        unsafe { vst1_f32((c as *mut KissCpx).cast::<f32>(), v) };
-    };
-    // SAFETY: NEON is part of every 64-bit ARM processor. For i from 0 to
-    // 236 in steps of 4, the loads read ANALYSIS_WINDOW[i..i+4] and inmem
-    // at i, N2+i, N-i-4 and N+N2-i-4, four values each, all inside the
-    // 240 and 720 values.
-    unsafe {
-        for i in (0..N2).step_by(4) {
-            let w = vld1q_f32(ANALYSIS_WINDOW.as_ptr().add(i));
-            let x = inmem.as_ptr();
-            // (w * x) * scale, the same two roundings as the scalar code.
-            let re = vmulq_n_f32(vmulq_f32(w, vld1q_f32(x.add(i))), scale);
-            let im = vmulq_n_f32(vmulq_f32(w, vld1q_f32(x.add(N2 + i))), scale);
-            let re_end = vmulq_n_f32(vmulq_f32(w, reverse(vld1q_f32(x.add(N - i - 4)))), scale);
-            let im_end = vmulq_n_f32(vmulq_f32(w, reverse(vld1q_f32(x.add(N + N2 - i - 4)))), scale);
-            let (lo, hi) = (vzip1q_f32(re, im), vzip2q_f32(re, im));
-            put(bitrev[i], vget_low_f32(lo));
-            put(bitrev[i + 1], vget_high_f32(lo));
-            put(bitrev[i + 2], vget_low_f32(hi));
-            put(bitrev[i + 3], vget_high_f32(hi));
-            let (lo, hi) = (vzip1q_f32(re_end, im_end), vzip2q_f32(re_end, im_end));
-            put(bitrev[N - 1 - i], vget_low_f32(lo));
-            put(bitrev[N - 2 - i], vget_high_f32(lo));
-            put(bitrev[N - 3 - i], vget_low_f32(hi));
-            put(bitrev[N - 4 - i], vget_high_f32(hi));
-        }
+    let mut put = |index: i16, v: float32x2_t| store_f32x2_cpx(&mut fout[index as usize], v);
+    // For i from 0 to 236 in steps of 4, the loads read ANALYSIS_WINDOW at
+    // i and inmem at i, N2+i, N-i-4 and N+N2-i-4, four values each.
+    for i in (0..N2).step_by(4) {
+        let w = load_f32x4(array_at(&ANALYSIS_WINDOW, i));
+        let x = |at: usize| load_f32x4(array_at(inmem, at));
+        // (w * x) * scale, the same two roundings as the scalar code.
+        let re = vmulq_n_f32(vmulq_f32(w, x(i)), scale);
+        let im = vmulq_n_f32(vmulq_f32(w, x(N2 + i)), scale);
+        let re_end = vmulq_n_f32(vmulq_f32(w, reverse(x(N - i - 4))), scale);
+        let im_end = vmulq_n_f32(vmulq_f32(w, reverse(x(N + N2 - i - 4))), scale);
+        let (lo, hi) = (vzip1q_f32(re, im), vzip2q_f32(re, im));
+        put(bitrev[i], vget_low_f32(lo));
+        put(bitrev[i + 1], vget_high_f32(lo));
+        put(bitrev[i + 2], vget_low_f32(hi));
+        put(bitrev[i + 3], vget_high_f32(hi));
+        let (lo, hi) = (vzip1q_f32(re_end, im_end), vzip2q_f32(re_end, im_end));
+        put(bitrev[N - 1 - i], vget_low_f32(lo));
+        put(bitrev[N - 2 - i], vget_high_f32(lo));
+        put(bitrev[N - 3 - i], vget_low_f32(hi));
+        put(bitrev[N - 4 - i], vget_high_f32(hi));
     }
 }
 
@@ -66,124 +68,111 @@ pub(super) fn window_for_fft(inmem: &[f32; ANALYSIS_BUF_SIZE], st: &KissFftState
 /// first picks the larger and the smaller square, and one division serves
 /// both branches; the selects at the end give the result of the branch the
 /// scalar code takes. Negation is exact, so these are the scalar bits.
+#[target_feature(enable = "neon")]
 pub(super) fn tonality_bins(out: &[KissCpx; N], phase: &mut Phase<'_>, r: &mut BinScratch) -> usize {
     let mut i = 1;
-    // SAFETY: `bins4` reads and writes bins i..i+4 and their mirrors, which
-    // lie inside the arrays for i from 1 to 236 (see there).
-    unsafe {
-        // Two groups per pass give a processor that runs instructions in
-        // order independent work while the divisions of one group run.
-        while i + 8 <= N2 {
-            bins4(out, i, phase, r);
-            bins4(out, i + 4, phase, r);
-            i += 8;
-        }
-        while i + 4 <= N2 {
-            bins4(out, i, phase, r);
-            i += 4;
-        }
+    // The group at `i` takes the bins i..i+4 and N-i-3..N-i+1 of `out`.
+    // Two groups per pass give a processor that runs instructions in
+    // order independent work while the divisions of one group run.
+    while i + 8 <= N2 {
+        bins4(array_at(out, i), array_at(out, N - i - 3), i, phase, r);
+        bins4(array_at(out, i + 4), array_at(out, N - i - 7), i + 4, phase, r);
+        i += 8;
+    }
+    while i + 4 <= N2 {
+        bins4(array_at(out, i), array_at(out, N - i - 3), i, phase, r);
+        i += 4;
     }
     i
 }
 
-/// Bins `i..i+4` of `tonality_bins`.
+/// Bins `i..i+4` of `tonality_bins`. `front` holds the complex values
+/// i..i+4 of the FFT output and `back` the values N-i-3..N-i+1. The
+/// 240-value arrays are read and written at i..i+4.
 ///
-/// # Safety
-///
-/// `i` must be at least 1 and `i + 4` at most 240. The loads then read the
-/// complex values i..i+4 and N-i-3..N-i+1 of `out` (2*i to 2*(N-i)+1 as
-/// f32, inside its 960 values), and the loads and stores of the 240-value
-/// arrays touch i..i+4.
-#[inline(always)]
-unsafe fn bins4(out: &[KissCpx; N], i: usize, phase: &mut Phase<'_>, r: &mut BinScratch) {
+/// Panics when `i + 4` is above 240.
+#[target_feature(enable = "neon")]
+#[inline]
+fn bins4(front: &[KissCpx; 4], back: &[KissCpx; 4], i: usize, phase: &mut Phase<'_>, r: &mut BinScratch) {
     debug_assert!((1..=N2 - 4).contains(&i));
-    // SAFETY: NEON is part of every 64-bit ARM processor; the caller keeps
-    // `i` in range (see above).
-    unsafe {
-        let p = out.as_ptr().cast::<f32>();
-        let one = vdupq_n_f32(1.0);
-        let offset = vdupq_n_f32(0.015);
-        let a = vld2q_f32(p.add(2 * i));
-        let b = vld2q_f32(p.add(2 * (N - i - 3)));
-        let (ar, ai) = (a.0, a.1);
-        let (br, bi) = (reverse(b.0), reverse(b.1));
-        let x1r = vaddq_f32(ar, br);
-        let x1i = vsubq_f32(ai, bi);
-        let x2r = vaddq_f32(ai, bi);
-        let x2i = vsubq_f32(br, ar);
+    let one = vdupq_n_f32(1.0);
+    let offset = vdupq_n_f32(0.015);
+    let a = load2_f32x4_cpx(front);
+    let b = load2_f32x4_cpx(back);
+    let (ar, ai) = (a.0, a.1);
+    let (br, bi) = (reverse(b.0), reverse(b.1));
+    let x1r = vaddq_f32(ar, br);
+    let x1i = vsubq_f32(ai, bi);
+    let x2r = vaddq_f32(ai, bi);
+    let x2i = vsubq_f32(br, ar);
 
-        let old_angle = vld1q_f32(phase.angle.as_ptr().add(i));
-        let old_d_angle = vld1q_f32(phase.d_angle.as_ptr().add(i));
-        let old_d2_angle = vld1q_f32(phase.d2_angle.as_ptr().add(i));
+    let old_angle = load_f32x4(array_at(phase.angle, i));
+    let old_d_angle = load_f32x4(array_at(phase.d_angle, i));
+    let old_d2_angle = load_f32x4(array_at(phase.d2_angle, i));
 
-        let angle = vmulq_n_f32(atan2(x1i, x1r), INV_TWO_PI);
-        let d_angle = vsubq_f32(angle, old_angle);
-        let d2_angle = vsubq_f32(d_angle, old_d_angle);
+    let angle = vmulq_n_f32(atan2(x1i, x1r), INV_TWO_PI);
+    let d_angle = vsubq_f32(angle, old_angle);
+    let d2_angle = vsubq_f32(d_angle, old_d_angle);
 
-        let angle2 = vmulq_n_f32(atan2(x2i, x2r), INV_TWO_PI);
-        let d_angle2 = vsubq_f32(angle2, angle);
-        let d2_angle2 = vsubq_f32(d_angle2, d_angle);
+    let angle2 = vmulq_n_f32(atan2(x2i, x2r), INV_TWO_PI);
+    let d_angle2 = vsubq_f32(angle2, angle);
+    let d2_angle2 = vsubq_f32(d_angle2, d_angle);
 
-        // float2int: round to nearest, ties to even (FCVTNS).
-        let mut mod1 = vsubq_f32(d2_angle, vcvtq_f32_s32(vcvtnq_s32_f32(d2_angle)));
-        let noisiness = vabsq_f32(mod1);
-        mod1 = vmulq_f32(mod1, mod1);
-        mod1 = vmulq_f32(mod1, mod1);
+    // float2int: round to nearest, ties to even (FCVTNS).
+    let mut mod1 = vsubq_f32(d2_angle, vcvtq_f32_s32(vcvtnq_s32_f32(d2_angle)));
+    let noisiness = vabsq_f32(mod1);
+    mod1 = vmulq_f32(mod1, mod1);
+    mod1 = vmulq_f32(mod1, mod1);
 
-        let mut mod2 = vsubq_f32(d2_angle2, vcvtq_f32_s32(vcvtnq_s32_f32(d2_angle2)));
-        let noisiness = vaddq_f32(noisiness, vabsq_f32(mod2));
-        mod2 = vmulq_f32(mod2, mod2);
-        mod2 = vmulq_f32(mod2, mod2);
+    let mut mod2 = vsubq_f32(d2_angle2, vcvtq_f32_s32(vcvtnq_s32_f32(d2_angle2)));
+    let noisiness = vaddq_f32(noisiness, vabsq_f32(mod2));
+    mod2 = vmulq_f32(mod2, mod2);
+    mod2 = vmulq_f32(mod2, mod2);
 
-        // mod2 + mod2 is 2*mod2 exactly.
-        let avg_mod = vmulq_n_f32(vaddq_f32(vaddq_f32(old_d2_angle, mod1), vaddq_f32(mod2, mod2)), 0.25);
-        let tonality = vsubq_f32(vdivq_f32(one, vfmaq_n_f32(one, avg_mod, TONALITY_SCALE)), offset);
-        let tonality2 = vsubq_f32(vdivq_f32(one, vfmaq_n_f32(one, mod2, TONALITY_SCALE)), offset);
+    // mod2 + mod2 is 2*mod2 exactly.
+    let avg_mod = vmulq_n_f32(vaddq_f32(vaddq_f32(old_d2_angle, mod1), vaddq_f32(mod2, mod2)), 0.25);
+    let tonality = vsubq_f32(vdivq_f32(one, vfmaq_n_f32(one, avg_mod, TONALITY_SCALE)), offset);
+    let tonality2 = vsubq_f32(vdivq_f32(one, vfmaq_n_f32(one, mod2, TONALITY_SCALE)), offset);
 
-        vst1q_f32(r.noisiness.as_mut_ptr().add(i), noisiness);
-        vst1q_f32(r.tonality.as_mut_ptr().add(i), tonality);
-        vst1q_f32(r.tonality2.as_mut_ptr().add(i), tonality2);
-        vst1q_f32(phase.angle.as_mut_ptr().add(i), angle2);
-        vst1q_f32(phase.d_angle.as_mut_ptr().add(i), d_angle2);
-        vst1q_f32(phase.d2_angle.as_mut_ptr().add(i), mod2);
+    store_f32x4(array_at_mut(&mut r.noisiness, i), noisiness);
+    store_f32x4(array_at_mut(&mut r.tonality, i), tonality);
+    store_f32x4(array_at_mut(&mut r.tonality2, i), tonality2);
+    store_f32x4(array_at_mut(phase.angle, i), angle2);
+    store_f32x4(array_at_mut(phase.d_angle, i), d_angle2);
+    store_f32x4(array_at_mut(phase.d2_angle, i), mod2);
 
-        let energy = vfmaq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(br, br), ar, ar), ai, ai), bi, bi);
-        vst1q_f32(r.energy.as_mut_ptr().add(i), energy);
-    }
+    let energy = vfmaq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(br, br), ar, ar), ai, ai), bi, bi);
+    store_f32x4(array_at_mut(&mut r.energy, i), energy);
 }
 
 /// The lanes of `v` in reverse order.
-#[inline(always)]
-unsafe fn reverse(v: float32x4_t) -> float32x4_t {
-    // SAFETY: NEON is part of every 64-bit ARM processor.
-    unsafe {
-        let v = vrev64q_f32(v);
-        vextq_f32::<2>(v, v)
-    }
+#[target_feature(enable = "neon")]
+#[inline]
+fn reverse(v: float32x4_t) -> float32x4_t {
+    let v = vrev64q_f32(v);
+    vextq_f32::<2>(v, v)
 }
 
 /// `fast_atan2f(y, x)` of `tonality.rs` on four lanes, with one division.
-#[inline(always)]
-unsafe fn atan2(y: float32x4_t, x: float32x4_t) -> float32x4_t {
-    // SAFETY: NEON is part of every 64-bit ARM processor.
-    unsafe {
-        let zero = vdupq_n_f32(0.0);
-        let x2 = vmulq_f32(x, x);
-        let y2 = vmulq_f32(y, y);
-        // The scalar code takes its first branch where x2 < y2.
-        let first = vcltq_f32(x2, y2);
-        let big = vbslq_f32(first, y2, x2);
-        let small = vbslq_f32(first, x2, y2);
-        let den = vmulq_f32(vfmaq_n_f32(big, small, ATAN_B), vfmaq_n_f32(big, small, ATAN_C));
-        let xy = vmulq_f32(x, y);
-        let q = vdivq_f32(vmulq_f32(xy, vfmaq_n_f32(big, small, ATAN_A)), den);
-        let pos = vdupq_n_f32(ATAN_E);
-        let neg = vdupq_n_f32(-ATAN_E);
-        let c1 = vbslq_f32(vcltq_f32(y, zero), neg, pos);
-        let c2 = vbslq_f32(vcltq_f32(xy, zero), neg, pos);
-        let r = vbslq_f32(first, vsubq_f32(c1, q), vsubq_f32(vaddq_f32(q, c1), c2));
-        vbslq_f32(vcltq_f32(vaddq_f32(x2, y2), vdupq_n_f32(1e-18)), zero, r)
-    }
+#[target_feature(enable = "neon")]
+#[inline]
+fn atan2(y: float32x4_t, x: float32x4_t) -> float32x4_t {
+    let zero = vdupq_n_f32(0.0);
+    let x2 = vmulq_f32(x, x);
+    let y2 = vmulq_f32(y, y);
+    // The scalar code takes its first branch where x2 < y2.
+    let first = vcltq_f32(x2, y2);
+    let big = vbslq_f32(first, y2, x2);
+    let small = vbslq_f32(first, x2, y2);
+    let den = vmulq_f32(vfmaq_n_f32(big, small, ATAN_B), vfmaq_n_f32(big, small, ATAN_C));
+    let xy = vmulq_f32(x, y);
+    let q = vdivq_f32(vmulq_f32(xy, vfmaq_n_f32(big, small, ATAN_A)), den);
+    let pos = vdupq_n_f32(ATAN_E);
+    let neg = vdupq_n_f32(-ATAN_E);
+    let c1 = vbslq_f32(vcltq_f32(y, zero), neg, pos);
+    let c2 = vbslq_f32(vcltq_f32(xy, zero), neg, pos);
+    let r = vbslq_f32(first, vsubq_f32(c1, q), vsubq_f32(vaddq_f32(q, c1), c2));
+    vbslq_f32(vcltq_f32(vaddq_f32(x2, y2), vdupq_n_f32(1e-18)), zero, r)
 }
 
 /// libopus `downmix_float` and `downmix_int` for the layouts that
@@ -195,6 +184,7 @@ unsafe fn atan2(y: float32x4_t, x: float32x4_t) -> float32x4_t {
 /// Float input: `x * 32768`, plus `x2 * 32768` fused into the sum, then the
 /// limits -65536 and 65536 and NaN to 0, as the scalar code. 16-bit input:
 /// the conversion to `f32` and a plain sum.
+#[target_feature(enable = "neon")]
 pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bool {
     let n = y.len();
     let two = match (pcm.channels, pcm.c1, pcm.c2) {
@@ -208,22 +198,22 @@ pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bo
         PcmRef::I32(_) => return false,
         PcmRef::F32(x) => {
             let x = &x[offset * ch..offset * ch + n * ch];
-            let (blocks, tail) = (n / 4, n % 4);
-            // SAFETY: NEON is part of every 64-bit ARM processor. Block `k`
-            // reads samples `4 * k * ch` to `4 * (k + 1) * ch - 1` of `x`
-            // and writes `y[4 * k..4 * k + 4]`, all inside the slices,
-            // whose lengths were checked above.
-            unsafe {
-                let lo = vdupq_n_f32(-65536.0);
-                let hi = vdupq_n_f32(65536.0);
-                for k in 0..blocks {
-                    let v = if two {
-                        let lr = vld2q_f32(x.as_ptr().add(8 * k));
-                        vfmaq_n_f32(vmulq_n_f32(lr.0, 32768.0), lr.1, 32768.0)
-                    } else {
-                        vmulq_n_f32(vld1q_f32(x.as_ptr().add(4 * k)), 32768.0)
-                    };
-                    vst1q_f32(y.as_mut_ptr().add(4 * k), limit(v, lo, hi));
+            let tail = n % 4;
+            // Blocks of 4 samples: 8 values of `x` with two channels, 4
+            // with one.
+            let lo = vdupq_n_f32(-65536.0);
+            let hi = vdupq_n_f32(65536.0);
+            let y4 = y.as_chunks_mut::<4>().0;
+            if two {
+                for (xb, yb) in x.as_chunks::<8>().0.iter().zip(y4) {
+                    let lr = load2_f32x4(xb);
+                    let v = vfmaq_n_f32(vmulq_n_f32(lr.0, 32768.0), lr.1, 32768.0);
+                    store_f32x4(yb, limit(v, lo, hi));
+                }
+            } else {
+                for (xb, yb) in x.as_chunks::<4>().0.iter().zip(y4) {
+                    let v = vmulq_n_f32(load_f32x4(xb), 32768.0);
+                    store_f32x4(yb, limit(v, lo, hi));
                 }
             }
             for j in n - tail..n {
@@ -236,22 +226,22 @@ pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bo
         }
         PcmRef::I16(x) => {
             let x = &x[offset * ch..offset * ch + n * ch];
-            let (blocks, tail) = (n / 8, n % 8);
-            // SAFETY: as above, with blocks of 8 samples.
-            unsafe {
-                for k in 0..blocks {
-                    let (a, b) = if two {
-                        let lr = vld2q_s16(x.as_ptr().add(16 * k));
-                        (
-                            vaddq_f32(to_f32(vget_low_s16(lr.0)), to_f32(vget_low_s16(lr.1))),
-                            vaddq_f32(to_f32(vget_high_s16(lr.0)), to_f32(vget_high_s16(lr.1))),
-                        )
-                    } else {
-                        let v = vld1q_s16(x.as_ptr().add(8 * k));
-                        (to_f32(vget_low_s16(v)), to_f32(vget_high_s16(v)))
-                    };
-                    vst1q_f32(y.as_mut_ptr().add(8 * k), a);
-                    vst1q_f32(y.as_mut_ptr().add(8 * k + 4), b);
+            let tail = n % 8;
+            // Blocks of 8 samples, as above.
+            let y8 = y.as_chunks_mut::<8>().0;
+            if two {
+                for (xb, yb) in x.as_chunks::<16>().0.iter().zip(y8) {
+                    let lr = load2_i16x8(xb);
+                    let a = vaddq_f32(to_f32(vget_low_s16(lr.0)), to_f32(vget_low_s16(lr.1)));
+                    let b = vaddq_f32(to_f32(vget_high_s16(lr.0)), to_f32(vget_high_s16(lr.1)));
+                    store_f32x4(array_at_mut(yb, 0), a);
+                    store_f32x4(array_at_mut(yb, 4), b);
+                }
+            } else {
+                for (xb, yb) in x.as_chunks::<8>().0.iter().zip(y8) {
+                    let v = load_i16x8(xb);
+                    store_f32x4(array_at_mut(yb, 0), to_f32(vget_low_s16(v)));
+                    store_f32x4(array_at_mut(yb, 4), to_f32(vget_high_s16(v)));
                 }
             }
             for j in n - tail..n {
@@ -267,23 +257,21 @@ pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bo
 }
 
 /// Four 16-bit samples as `f32`.
-#[inline(always)]
-unsafe fn to_f32(v: int16x4_t) -> float32x4_t {
-    // SAFETY: NEON is part of every 64-bit ARM processor.
-    unsafe { vcvtq_f32_s32(vmovl_s16(v)) }
+#[target_feature(enable = "neon")]
+#[inline]
+fn to_f32(v: int16x4_t) -> float32x4_t {
+    vcvtq_f32_s32(vmovl_s16(v))
 }
 
 /// The limits of `downmix_float`, lane by lane: below -65536 becomes
 /// -65536, above 65536 becomes 65536, and a NaN becomes 0.
-#[inline(always)]
-unsafe fn limit(v: float32x4_t, lo: float32x4_t, hi: float32x4_t) -> float32x4_t {
-    // SAFETY: NEON is part of every 64-bit ARM processor.
-    unsafe {
-        let v = vbslq_f32(vcltq_f32(v, lo), lo, v);
-        let v = vbslq_f32(vcgtq_f32(v, hi), hi, v);
-        // A NaN is the only value not equal to itself.
-        vbslq_f32(vceqq_f32(v, v), v, vdupq_n_f32(0.0))
-    }
+#[target_feature(enable = "neon")]
+#[inline]
+fn limit(v: float32x4_t, lo: float32x4_t, hi: float32x4_t) -> float32x4_t {
+    let v = vbslq_f32(vcltq_f32(v, lo), lo, v);
+    let v = vbslq_f32(vcgtq_f32(v, hi), hi, v);
+    // A NaN is the only value not equal to itself.
+    vbslq_f32(vceqq_f32(v, v), v, vdupq_n_f32(0.0))
 }
 
 /// The scalar form of `limit`.
@@ -301,46 +289,39 @@ fn limit_scalar(mut v: f32) -> f32 {
 }
 
 /// `tansig_approx` of `mlp.rs` on four lanes.
-#[inline(always)]
-unsafe fn tansig(x: float32x4_t) -> float32x4_t {
-    // SAFETY: NEON is part of every 64-bit ARM processor.
-    unsafe {
-        let x2 = vmulq_f32(x, x);
-        let n = vfmaq_f32(vdupq_n_f32(TANSIG_N[0]), vfmaq_f32(vdupq_n_f32(TANSIG_N[1]), vdupq_n_f32(TANSIG_N[2]), x2), x2);
-        let d = vfmaq_f32(vdupq_n_f32(TANSIG_D[0]), vfmaq_f32(vdupq_n_f32(TANSIG_D[1]), vdupq_n_f32(TANSIG_D[2]), x2), x2);
-        let r = vdivq_f32(vmulq_f32(n, x), d);
-        // The ternaries of C: 1 < r ? 1 : r, then -1 > r ? -1 : r. A NaN
-        // stays a NaN.
-        let one = vdupq_n_f32(1.0);
-        let r = vbslq_f32(vcltq_f32(one, r), one, r);
-        let minus_one = vdupq_n_f32(-1.0);
-        vbslq_f32(vcgtq_f32(minus_one, r), minus_one, r)
-    }
+#[target_feature(enable = "neon")]
+#[inline]
+fn tansig(x: float32x4_t) -> float32x4_t {
+    let x2 = vmulq_f32(x, x);
+    let n = vfmaq_f32(vdupq_n_f32(TANSIG_N[0]), vfmaq_f32(vdupq_n_f32(TANSIG_N[1]), vdupq_n_f32(TANSIG_N[2]), x2), x2);
+    let d = vfmaq_f32(vdupq_n_f32(TANSIG_D[0]), vfmaq_f32(vdupq_n_f32(TANSIG_D[1]), vdupq_n_f32(TANSIG_D[2]), x2), x2);
+    let r = vdivq_f32(vmulq_f32(n, x), d);
+    // The ternaries of C: 1 < r ? 1 : r, then -1 > r ? -1 : r. A NaN
+    // stays a NaN.
+    let one = vdupq_n_f32(1.0);
+    let r = vbslq_f32(vcltq_f32(one, r), one, r);
+    let minus_one = vdupq_n_f32(-1.0);
+    vbslq_f32(vcgtq_f32(minus_one, r), minus_one, r)
 }
 
 /// `sigmoid_approx` of `mlp.rs` on four lanes.
-#[inline(always)]
-unsafe fn sigmoid(x: float32x4_t) -> float32x4_t {
-    // SAFETY: NEON is part of every 64-bit ARM processor.
-    unsafe {
-        let half = vdupq_n_f32(0.5);
-        vfmaq_f32(half, half, tansig(vmulq_n_f32(x, 0.5)))
-    }
+#[target_feature(enable = "neon")]
+#[inline]
+fn sigmoid(x: float32x4_t) -> float32x4_t {
+    let half = vdupq_n_f32(0.5);
+    vfmaq_f32(half, half, tansig(vmulq_n_f32(x, 0.5)))
 }
 
 /// The end of `compute_dense` of `mlp.rs`, four outputs at a time: the
 /// scaling by `WEIGHTS_SCALE` and the activation. Returns the outputs left
 /// over (fewer than four), which the scalar code does.
+#[target_feature(enable = "neon")]
 pub(super) fn scale_and_activate(output: &mut [f32], sigmoid_output: bool) -> &mut [f32] {
     let (blocks, rest) = output.as_chunks_mut::<4>();
     for b in blocks {
-        // SAFETY: NEON is part of every 64-bit ARM processor; `b` holds 4
-        // values.
-        unsafe {
-            let v = vmulq_n_f32(vld1q_f32(b.as_ptr()), WEIGHTS_SCALE);
-            let v = if sigmoid_output { sigmoid(v) } else { tansig(v) };
-            vst1q_f32(b.as_mut_ptr(), v);
-        }
+        let v = vmulq_n_f32(load_f32x4(b), WEIGHTS_SCALE);
+        let v = if sigmoid_output { sigmoid(v) } else { tansig(v) };
+        store_f32x4(b, v);
     }
     rest
 }
@@ -360,6 +341,7 @@ const GATE_VECTORS: usize = GRU_NEURONS / 4;
 /// Each output still adds its bias, then its input terms in the order of
 /// the inputs, then its state terms in the order of the state, each with
 /// one fused multiply-add, as in C.
+#[target_feature(enable = "neon")]
 pub(super) fn gru(layer: &GruLayer, state: &mut [f32; GRU_NEURONS], input: &[f32]) {
     const G: usize = 3 * GRU_NEURONS;
     let input: &[f32; GRU_INPUTS] = input[..GRU_INPUTS].try_into().expect("32 inputs");
@@ -367,51 +349,46 @@ pub(super) fn gru(layer: &GruLayer, state: &mut [f32; GRU_NEURONS], input: &[f32
     let w_in: &[f32; GRU_INPUTS * G] = layer.input_weights[..GRU_INPUTS * G].try_into().expect("input weights");
     let w_rec: &[f32; GRU_NEURONS * G] =
         layer.recurrent_weights[..GRU_NEURONS * G].try_into().expect("recurrent weights");
-    // SAFETY: NEON is part of every 64-bit ARM processor. Every load and
-    // store reads or writes four values inside the arrays above, whose sizes
-    // the types fix: gate `g`, vector `k` of row `j` starts at
-    // `j * 72 + g * 24 + 4 * k`, at most 71 - 3 within the row.
-    unsafe {
-        let load = |p: *const f32, k: usize| vld1q_f32(p.add(4 * k));
-        let mut z: [float32x4_t; GATE_VECTORS] = core::array::from_fn(|k| load(bias.as_ptr(), k));
-        let mut r: [float32x4_t; GATE_VECTORS] = core::array::from_fn(|k| load(bias.as_ptr().add(GRU_NEURONS), k));
-        let mut h: [float32x4_t; GATE_VECTORS] =
-            core::array::from_fn(|k| load(bias.as_ptr().add(2 * GRU_NEURONS), k));
-        for (j, &x) in input.iter().enumerate() {
-            let row = w_in.as_ptr().add(j * G);
-            for k in 0..GATE_VECTORS {
-                z[k] = vfmaq_n_f32(z[k], load(row, k), x);
-                r[k] = vfmaq_n_f32(r[k], load(row.add(GRU_NEURONS), k), x);
-                h[k] = vfmaq_n_f32(h[k], load(row.add(2 * GRU_NEURONS), k), x);
-            }
-        }
-        for (j, &x) in state.iter().enumerate() {
-            let row = w_rec.as_ptr().add(j * G);
-            for k in 0..GATE_VECTORS {
-                z[k] = vfmaq_n_f32(z[k], load(row, k), x);
-                r[k] = vfmaq_n_f32(r[k], load(row.add(GRU_NEURONS), k), x);
-            }
-        }
-        let old: [float32x4_t; GATE_VECTORS] = core::array::from_fn(|k| load(state.as_ptr(), k));
-        let mut reset_state = [0.0f32; GRU_NEURONS];
+    // Vector `k` of gate `g` (0 update, 1 reset, 2 output) in the biases or
+    // in a row of weights: values `g * 24 + 4 * k` to `g * 24 + 4 * k + 3`.
+    let load = |row: &[f32; G], g: usize, k: usize| load_f32x4(array_at(row, g * GRU_NEURONS + 4 * k));
+    let mut z: [float32x4_t; GATE_VECTORS] = core::array::from_fn(|k| load(bias, 0, k));
+    let mut r: [float32x4_t; GATE_VECTORS] = core::array::from_fn(|k| load(bias, 1, k));
+    let mut h: [float32x4_t; GATE_VECTORS] = core::array::from_fn(|k| load(bias, 2, k));
+    for (j, &x) in input.iter().enumerate() {
+        let row = array_at(w_in, j * G);
         for k in 0..GATE_VECTORS {
-            z[k] = sigmoid(vmulq_n_f32(z[k], WEIGHTS_SCALE));
-            r[k] = sigmoid(vmulq_n_f32(r[k], WEIGHTS_SCALE));
-            vst1q_f32(reset_state.as_mut_ptr().add(4 * k), vmulq_f32(old[k], r[k]));
+            z[k] = vfmaq_n_f32(z[k], load(row, 0, k), x);
+            r[k] = vfmaq_n_f32(r[k], load(row, 1, k), x);
+            h[k] = vfmaq_n_f32(h[k], load(row, 2, k), x);
         }
-        for (j, &x) in reset_state.iter().enumerate() {
-            let row = w_rec.as_ptr().add(j * G + 2 * GRU_NEURONS);
-            for k in 0..GATE_VECTORS {
-                h[k] = vfmaq_n_f32(h[k], load(row, k), x);
-            }
-        }
-        let one = vdupq_n_f32(1.0);
+    }
+    for (j, &x) in state.iter().enumerate() {
+        let row = array_at(w_rec, j * G);
         for k in 0..GATE_VECTORS {
-            // z*state + (1-z)*tanh(h): the left product fused, the right one
-            // rounded, as in the scalar code.
-            let t = vmulq_f32(vsubq_f32(one, z[k]), tansig(vmulq_n_f32(h[k], WEIGHTS_SCALE)));
-            vst1q_f32(state.as_mut_ptr().add(4 * k), vfmaq_f32(t, z[k], old[k]));
+            z[k] = vfmaq_n_f32(z[k], load(row, 0, k), x);
+            r[k] = vfmaq_n_f32(r[k], load(row, 1, k), x);
         }
+    }
+    let old: [float32x4_t; GATE_VECTORS] = core::array::from_fn(|k| load_f32x4(array_at(state, 4 * k)));
+    let mut reset_state = [0.0f32; GRU_NEURONS];
+    for k in 0..GATE_VECTORS {
+        z[k] = sigmoid(vmulq_n_f32(z[k], WEIGHTS_SCALE));
+        r[k] = sigmoid(vmulq_n_f32(r[k], WEIGHTS_SCALE));
+        store_f32x4(array_at_mut(&mut reset_state, 4 * k), vmulq_f32(old[k], r[k]));
+    }
+    for (j, &x) in reset_state.iter().enumerate() {
+        let row = array_at(w_rec, j * G);
+        for k in 0..GATE_VECTORS {
+            h[k] = vfmaq_n_f32(h[k], load(row, 2, k), x);
+        }
+    }
+    let one = vdupq_n_f32(1.0);
+    for k in 0..GATE_VECTORS {
+        // z*state + (1-z)*tanh(h): the left product fused, the right one
+        // rounded, as in the scalar code.
+        let t = vmulq_f32(vsubq_f32(one, z[k]), tansig(vmulq_n_f32(h[k], WEIGHTS_SCALE)));
+        store_f32x4(array_at_mut(state, 4 * k), vfmaq_f32(t, z[k], old[k]));
     }
 }
 
@@ -475,7 +452,9 @@ mod tests {
                         let p = AnalysisPcm { pcm, channels, c1, c2, frame_size: n };
                         let mut a = vec![7.0f32; n];
                         let mut b = vec![7.0f32; n];
-                        assert_eq!(downmix(&p, &mut a, offset), covered);
+                        // SAFETY: NEON is part of the baseline of every
+                        // aarch64 target.
+                        assert_eq!(unsafe { downmix(&p, &mut a, offset) }, covered);
                         downmix_scalar(&p, &mut b, offset);
                         if covered {
                             let nan = |v: &[f32]| v.iter().any(|x| x.is_nan());
@@ -501,7 +480,8 @@ mod tests {
         {
             let [angle, d_angle, d2_angle] = &mut a;
             let mut phase = Phase { angle, d_angle, d2_angle };
-            let first = tonality_bins(out, &mut phase, &mut ra);
+            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            let first = unsafe { tonality_bins(out, &mut phase, &mut ra) };
             assert_eq!(first, 237);
             tonality_bins_scalar(out, first, &mut phase, &mut ra);
         }
@@ -590,7 +570,8 @@ mod tests {
             });
             let mut a = [KissCpx::new(7.0, 7.0); N];
             let mut b = a;
-            window_for_fft(&inmem, fft_state(), &mut a);
+            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            unsafe { window_for_fft(&inmem, fft_state(), &mut a) };
             window_for_fft_scalar(&inmem, fft_state(), &mut b);
             let flat = |v: &[KissCpx; N]| v.iter().flat_map(|c| [c.r, c.i]).collect::<Vec<_>>();
             assert!(same(&flat(&a), &flat(&b)), "case {case}");
@@ -619,7 +600,9 @@ mod tests {
             // Activations after the scaling by 1/128, on 4 lanes.
             for sig in [false, true] {
                 let mut a = x;
-                let rest = scale_and_activate(&mut a[..30], sig).len();
+                // SAFETY: NEON is part of the baseline of every aarch64
+                // target.
+                let rest = unsafe { scale_and_activate(&mut a[..30], sig) }.len();
                 assert_eq!(rest, 2);
                 for (k, (&got, &inp)) in a[..28].iter().zip(&x[..28]).enumerate() {
                     let v = inp * WEIGHTS_SCALE;
@@ -630,7 +613,8 @@ mod tests {
             // The recurrent layer, from a random state.
             let state0: [f32; GRU_NEURONS] = core::array::from_fn(|_| next());
             let (mut a, mut b) = (state0, state0);
-            gru(&LAYER1, &mut a, &x);
+            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            unsafe { gru(&LAYER1, &mut a, &x) };
             compute_gru_scalar(&LAYER1, &mut b, &x);
             assert!(same(&a, &b), "case {case}");
         }
@@ -640,7 +624,8 @@ mod tests {
             let feat: [f32; 25] = core::array::from_fn(|_| next() * 3.0);
             let mut hidden = [0.0f32; 32];
             crate::analysis::mlp::compute_dense(&LAYER0, &mut hidden, &feat);
-            gru(&LAYER1, (&mut a[..24]).try_into().unwrap(), &hidden);
+            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            unsafe { gru(&LAYER1, (&mut a[..24]).try_into().unwrap(), &hidden) };
             compute_gru_scalar(&LAYER1, &mut b, &hidden);
             assert!(same(&a, &b), "step {step}");
             let mut out = [0.0f32; 2];

@@ -4,7 +4,10 @@
 //! by lane: a lane only takes work that the scalar code of `tonality.rs`
 //! and `mlp.rs` does in a chain of its own (one sample, one FFT bin, one
 //! output of a layer). Every x86-64 processor has SSE2, so the kernels run
-//! without a check.
+//! without a check. They are safe functions compiled with
+//! `#[target_feature(enable = "sse2")]`, and their loads and stores go
+//! through `crate::simd_mem`. A caller without that feature calls them in
+//! an `unsafe` block; SSE2 is part of every x86-64 target.
 //!
 //! On x86-64 the scalar code rounds each product before its addition (see
 //! [`crate::mathops::mac`]). The kernels do the same, with the same
@@ -35,6 +38,8 @@ use super::tonality::{
 };
 use super::{AnalysisPcm, PcmRef, SecondChannel};
 use crate::kiss_fft::{KissCpx, KissFftState};
+use crate::simd_mem::x86::{load_f32x4, load_f32x4_cpx, load_i16x8, store_f32x2_cpx, store_f32x4};
+use crate::simd_mem::{array_at, array_at_mut};
 
 /// `_MM_SHUFFLE(2, 0, 2, 0)`: lanes 0 and 2 of each operand, the real parts
 /// of two complex values each (or the first channel of two pairs).
@@ -43,75 +48,64 @@ const EVEN: i32 = 0x88;
 const ODD: i32 = 0xDD;
 
 /// `a` where `mask` is set, `b` elsewhere.
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn select(mask: __m128, a: __m128, b: __m128) -> __m128 {
-    // SAFETY: SSE is part of this target (see the `cfg` of the module), and
-    // these instructions only compute on values held in registers.
-    unsafe { _mm_or_ps(_mm_and_ps(mask, a), _mm_andnot_ps(mask, b)) }
+    _mm_or_ps(_mm_and_ps(mask, a), _mm_andnot_ps(mask, b))
 }
 
 /// `acc + a * k`, the product rounded first, as `mac` on x86-64.
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn mul_add(acc: __m128, a: __m128, k: f32) -> __m128 {
-    // SAFETY: as in `select`.
-    unsafe { _mm_add_ps(acc, _mm_mul_ps(a, _mm_set1_ps(k))) }
+    _mm_add_ps(acc, _mm_mul_ps(a, _mm_set1_ps(k)))
 }
 
 /// The magnitude of each lane: the sign bit cleared, as `f32::abs`.
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn abs(v: __m128) -> __m128 {
-    // SAFETY: as in `select`.
-    unsafe { _mm_andnot_ps(_mm_set1_ps(-0.0), v) }
+    _mm_andnot_ps(_mm_set1_ps(-0.0), v)
 }
 
 /// The lanes of `v` in reverse order (`_MM_SHUFFLE(0, 1, 2, 3)`).
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn reverse(v: __m128) -> __m128 {
-    // SAFETY: as in `select`.
-    unsafe { _mm_shuffle_ps::<0x1B>(v, v) }
+    _mm_shuffle_ps::<0x1B>(v, v)
 }
 
 /// `window_for_fft_scalar` of `tonality.rs`, four samples of each of the
 /// four quarters of the window at a time.
+#[target_feature(enable = "sse2")]
 pub(super) fn window_for_fft(inmem: &[f32; ANALYSIS_BUF_SIZE], st: &KissFftState, fout: &mut [KissCpx; N]) {
     let scale = st.scale();
     let bitrev: &[i16; N] = st.bitrev[..N].try_into().expect("a plan of 480 points");
     // Stores the two lower lanes of `v` as one complex value at its
     // bit-reversed place. The index is checked: the plan holds a
     // permutation of 0..480.
-    let mut put = |index: i16, v: __m128| {
-        let c = &mut fout[index as usize];
-        // SAFETY: SSE2 is part of this target (see the `cfg` of the
-        // module). `c` is one complex value, two f32 in a `repr(C)` struct:
-        // the 8 bytes that `_mm_storel_epi64` writes, which need no
-        // alignment.
-        unsafe { _mm_storel_epi64((c as *mut KissCpx).cast::<__m128i>(), _mm_castps_si128(v)) };
-    };
-    // SAFETY: SSE is part of this target. For i from 0 to 236 in steps of
-    // 4, the loads read ANALYSIS_WINDOW[i..i+4] and inmem at i, N2+i,
-    // N-i-4 and N+N2-i-4, four values each, all inside the 240 and 720
-    // values.
-    unsafe {
-        let s = _mm_set1_ps(scale);
-        for i in (0..N2).step_by(4) {
-            let w = _mm_loadu_ps(ANALYSIS_WINDOW.as_ptr().add(i));
-            let x = inmem.as_ptr();
-            // (w * x) * scale, the same two roundings as the scalar code.
-            let re = _mm_mul_ps(_mm_mul_ps(w, _mm_loadu_ps(x.add(i))), s);
-            let im = _mm_mul_ps(_mm_mul_ps(w, _mm_loadu_ps(x.add(N2 + i))), s);
-            let re_end = _mm_mul_ps(_mm_mul_ps(w, reverse(_mm_loadu_ps(x.add(N - i - 4)))), s);
-            let im_end = _mm_mul_ps(_mm_mul_ps(w, reverse(_mm_loadu_ps(x.add(N + N2 - i - 4)))), s);
-            let (lo, hi) = (_mm_unpacklo_ps(re, im), _mm_unpackhi_ps(re, im));
-            put(bitrev[i], lo);
-            put(bitrev[i + 1], _mm_movehl_ps(lo, lo));
-            put(bitrev[i + 2], hi);
-            put(bitrev[i + 3], _mm_movehl_ps(hi, hi));
-            let (lo, hi) = (_mm_unpacklo_ps(re_end, im_end), _mm_unpackhi_ps(re_end, im_end));
-            put(bitrev[N - 1 - i], lo);
-            put(bitrev[N - 2 - i], _mm_movehl_ps(lo, lo));
-            put(bitrev[N - 3 - i], hi);
-            put(bitrev[N - 4 - i], _mm_movehl_ps(hi, hi));
-        }
+    let mut put = |index: i16, v: __m128| store_f32x2_cpx(&mut fout[index as usize], v);
+    let s = _mm_set1_ps(scale);
+    // For i from 0 to 236 in steps of 4, the loads read ANALYSIS_WINDOW at
+    // i and inmem at i, N2+i, N-i-4 and N+N2-i-4, four values each.
+    for i in (0..N2).step_by(4) {
+        let w = load_f32x4(array_at(&ANALYSIS_WINDOW, i));
+        let x = |at: usize| load_f32x4(array_at(inmem, at));
+        // (w * x) * scale, the same two roundings as the scalar code.
+        let re = _mm_mul_ps(_mm_mul_ps(w, x(i)), s);
+        let im = _mm_mul_ps(_mm_mul_ps(w, x(N2 + i)), s);
+        let re_end = _mm_mul_ps(_mm_mul_ps(w, reverse(x(N - i - 4))), s);
+        let im_end = _mm_mul_ps(_mm_mul_ps(w, reverse(x(N + N2 - i - 4))), s);
+        let (lo, hi) = (_mm_unpacklo_ps(re, im), _mm_unpackhi_ps(re, im));
+        put(bitrev[i], lo);
+        put(bitrev[i + 1], _mm_movehl_ps(lo, lo));
+        put(bitrev[i + 2], hi);
+        put(bitrev[i + 3], _mm_movehl_ps(hi, hi));
+        let (lo, hi) = (_mm_unpacklo_ps(re_end, im_end), _mm_unpackhi_ps(re_end, im_end));
+        put(bitrev[N - 1 - i], lo);
+        put(bitrev[N - 2 - i], _mm_movehl_ps(lo, lo));
+        put(bitrev[N - 3 - i], hi);
+        put(bitrev[N - 4 - i], _mm_movehl_ps(hi, hi));
     }
 }
 
@@ -123,120 +117,109 @@ pub(super) fn window_for_fft(inmem: &[f32; ANALYSIS_BUF_SIZE], st: &KissFftState
 /// in each lane, so that one division serves both branches of
 /// `fast_atan2f`, and selects the result of the branch the scalar code
 /// takes.
+#[target_feature(enable = "sse2")]
 pub(super) fn tonality_bins(out: &[KissCpx; N], phase: &mut Phase<'_>, r: &mut BinScratch) -> usize {
     let mut i = 1;
-    // SAFETY: `bins4` reads and writes bins i..i+4 and their mirrors, which
-    // lie inside the arrays for i from 1 to 236 (see there).
-    unsafe {
-        while i + 4 <= N2 {
-            bins4(out, i, phase, r);
-            i += 4;
-        }
+    // The group at `i` takes the bins i..i+4 and N-i-3..N-i+1 of `out`.
+    while i + 4 <= N2 {
+        bins4(array_at(out, i), array_at(out, N - i - 3), i, phase, r);
+        i += 4;
     }
     i
 }
 
-/// Bins `i..i+4` of `tonality_bins`.
+/// Bins `i..i+4` of `tonality_bins`. `front` holds the complex values
+/// i..i+4 of the FFT output and `back` the values N-i-3..N-i+1. The
+/// 240-value arrays are read and written at i..i+4.
 ///
-/// # Safety
-///
-/// `i` must be at least 1 and `i + 4` at most 240. The loads then read the
-/// complex values i..i+4 and N-i-3..N-i+1 of `out` (2*i to 2*(N-i)+1 as
-/// f32, inside its 960 values), and the loads and stores of the 240-value
-/// arrays touch i..i+4.
-#[inline(always)]
-unsafe fn bins4(out: &[KissCpx; N], i: usize, phase: &mut Phase<'_>, r: &mut BinScratch) {
+/// Panics when `i + 4` is above 240.
+#[target_feature(enable = "sse2")]
+#[inline]
+fn bins4(front: &[KissCpx; 4], back: &[KissCpx; 4], i: usize, phase: &mut Phase<'_>, r: &mut BinScratch) {
     debug_assert!((1..=N2 - 4).contains(&i));
-    // SAFETY: SSE2 is part of this target; the caller keeps `i` in range
-    // (see above).
-    unsafe {
-        let p = out.as_ptr().cast::<f32>();
-        let one = _mm_set1_ps(1.0);
-        let offset = _mm_set1_ps(0.015);
-        // Bins i..i+4, as (re, im) pairs.
-        let a0 = _mm_loadu_ps(p.add(2 * i));
-        let a1 = _mm_loadu_ps(p.add(2 * i + 4));
-        let (ar, ai) = (_mm_shuffle_ps::<EVEN>(a0, a1), _mm_shuffle_ps::<ODD>(a0, a1));
-        // Bins N-i-3..N-i+1, taken in reverse order: N-i, N-i-1, N-i-2,
-        // N-i-3. `_MM_SHUFFLE(0, 2, 0, 2)` takes lanes 2 and 0 of each
-        // operand, `_MM_SHUFFLE(1, 3, 1, 3)` lanes 3 and 1.
-        let b0 = _mm_loadu_ps(p.add(2 * (N - i - 3)));
-        let b1 = _mm_loadu_ps(p.add(2 * (N - i - 1)));
-        let (br, bi) = (_mm_shuffle_ps::<0x22>(b1, b0), _mm_shuffle_ps::<0x77>(b1, b0));
-        let x1r = _mm_add_ps(ar, br);
-        let x1i = _mm_sub_ps(ai, bi);
-        let x2r = _mm_add_ps(ai, bi);
-        let x2i = _mm_sub_ps(br, ar);
+    let one = _mm_set1_ps(1.0);
+    let offset = _mm_set1_ps(0.015);
+    // Bins i..i+4, as (re, im) pairs.
+    let a0 = load_f32x4_cpx(array_at(front, 0));
+    let a1 = load_f32x4_cpx(array_at(front, 2));
+    let (ar, ai) = (_mm_shuffle_ps::<EVEN>(a0, a1), _mm_shuffle_ps::<ODD>(a0, a1));
+    // Bins N-i-3..N-i+1, taken in reverse order: N-i, N-i-1, N-i-2,
+    // N-i-3. `_MM_SHUFFLE(0, 2, 0, 2)` takes lanes 2 and 0 of each
+    // operand, `_MM_SHUFFLE(1, 3, 1, 3)` lanes 3 and 1.
+    let b0 = load_f32x4_cpx(array_at(back, 0));
+    let b1 = load_f32x4_cpx(array_at(back, 2));
+    let (br, bi) = (_mm_shuffle_ps::<0x22>(b1, b0), _mm_shuffle_ps::<0x77>(b1, b0));
+    let x1r = _mm_add_ps(ar, br);
+    let x1i = _mm_sub_ps(ai, bi);
+    let x2r = _mm_add_ps(ai, bi);
+    let x2i = _mm_sub_ps(br, ar);
 
-        let old_angle = _mm_loadu_ps(phase.angle.as_ptr().add(i));
-        let old_d_angle = _mm_loadu_ps(phase.d_angle.as_ptr().add(i));
-        let old_d2_angle = _mm_loadu_ps(phase.d2_angle.as_ptr().add(i));
+    let old_angle = load_f32x4(array_at(phase.angle, i));
+    let old_d_angle = load_f32x4(array_at(phase.d_angle, i));
+    let old_d2_angle = load_f32x4(array_at(phase.d2_angle, i));
 
-        let inv_two_pi = _mm_set1_ps(INV_TWO_PI);
-        let angle = _mm_mul_ps(atan2(x1i, x1r), inv_two_pi);
-        let d_angle = _mm_sub_ps(angle, old_angle);
-        let d2_angle = _mm_sub_ps(d_angle, old_d_angle);
+    let inv_two_pi = _mm_set1_ps(INV_TWO_PI);
+    let angle = _mm_mul_ps(atan2(x1i, x1r), inv_two_pi);
+    let d_angle = _mm_sub_ps(angle, old_angle);
+    let d2_angle = _mm_sub_ps(d_angle, old_d_angle);
 
-        let angle2 = _mm_mul_ps(atan2(x2i, x2r), inv_two_pi);
-        let d_angle2 = _mm_sub_ps(angle2, angle);
-        let d2_angle2 = _mm_sub_ps(d_angle2, d_angle);
+    let angle2 = _mm_mul_ps(atan2(x2i, x2r), inv_two_pi);
+    let d_angle2 = _mm_sub_ps(angle2, angle);
+    let d2_angle2 = _mm_sub_ps(d_angle2, d_angle);
 
-        // float2int: round to nearest, ties to even (see the top of the
-        // file).
-        let mut mod1 = _mm_sub_ps(d2_angle, _mm_cvtepi32_ps(_mm_cvtps_epi32(d2_angle)));
-        let noisiness = abs(mod1);
-        mod1 = _mm_mul_ps(mod1, mod1);
-        mod1 = _mm_mul_ps(mod1, mod1);
+    // float2int: round to nearest, ties to even (see the top of the
+    // file).
+    let mut mod1 = _mm_sub_ps(d2_angle, _mm_cvtepi32_ps(_mm_cvtps_epi32(d2_angle)));
+    let noisiness = abs(mod1);
+    mod1 = _mm_mul_ps(mod1, mod1);
+    mod1 = _mm_mul_ps(mod1, mod1);
 
-        let mut mod2 = _mm_sub_ps(d2_angle2, _mm_cvtepi32_ps(_mm_cvtps_epi32(d2_angle2)));
-        let noisiness = _mm_add_ps(noisiness, abs(mod2));
-        mod2 = _mm_mul_ps(mod2, mod2);
-        mod2 = _mm_mul_ps(mod2, mod2);
+    let mut mod2 = _mm_sub_ps(d2_angle2, _mm_cvtepi32_ps(_mm_cvtps_epi32(d2_angle2)));
+    let noisiness = _mm_add_ps(noisiness, abs(mod2));
+    mod2 = _mm_mul_ps(mod2, mod2);
+    mod2 = _mm_mul_ps(mod2, mod2);
 
-        // mod2 + mod2 is 2*mod2 exactly.
-        let sum = _mm_add_ps(_mm_add_ps(old_d2_angle, mod1), _mm_add_ps(mod2, mod2));
-        let avg_mod = _mm_mul_ps(sum, _mm_set1_ps(0.25));
-        let tonality = _mm_sub_ps(_mm_div_ps(one, mul_add(one, avg_mod, TONALITY_SCALE)), offset);
-        let tonality2 = _mm_sub_ps(_mm_div_ps(one, mul_add(one, mod2, TONALITY_SCALE)), offset);
+    // mod2 + mod2 is 2*mod2 exactly.
+    let sum = _mm_add_ps(_mm_add_ps(old_d2_angle, mod1), _mm_add_ps(mod2, mod2));
+    let avg_mod = _mm_mul_ps(sum, _mm_set1_ps(0.25));
+    let tonality = _mm_sub_ps(_mm_div_ps(one, mul_add(one, avg_mod, TONALITY_SCALE)), offset);
+    let tonality2 = _mm_sub_ps(_mm_div_ps(one, mul_add(one, mod2, TONALITY_SCALE)), offset);
 
-        _mm_storeu_ps(r.noisiness.as_mut_ptr().add(i), noisiness);
-        _mm_storeu_ps(r.tonality.as_mut_ptr().add(i), tonality);
-        _mm_storeu_ps(r.tonality2.as_mut_ptr().add(i), tonality2);
-        _mm_storeu_ps(phase.angle.as_mut_ptr().add(i), angle2);
-        _mm_storeu_ps(phase.d_angle.as_mut_ptr().add(i), d_angle2);
-        _mm_storeu_ps(phase.d2_angle.as_mut_ptr().add(i), mod2);
+    store_f32x4(array_at_mut(&mut r.noisiness, i), noisiness);
+    store_f32x4(array_at_mut(&mut r.tonality, i), tonality);
+    store_f32x4(array_at_mut(&mut r.tonality2, i), tonality2);
+    store_f32x4(array_at_mut(phase.angle, i), angle2);
+    store_f32x4(array_at_mut(phase.d_angle, i), d_angle2);
+    store_f32x4(array_at_mut(phase.d2_angle, i), mod2);
 
-        // ((b*b + a*a) + c*c) + d*d, each product rounded, as the scalar
-        // code on x86-64.
-        let sq = |v: __m128| _mm_mul_ps(v, v);
-        let energy = _mm_add_ps(_mm_add_ps(_mm_add_ps(sq(br), sq(ar)), sq(ai)), sq(bi));
-        _mm_storeu_ps(r.energy.as_mut_ptr().add(i), energy);
-    }
+    // ((b*b + a*a) + c*c) + d*d, each product rounded, as the scalar
+    // code on x86-64.
+    let sq = |v: __m128| _mm_mul_ps(v, v);
+    let energy = _mm_add_ps(_mm_add_ps(_mm_add_ps(sq(br), sq(ar)), sq(ai)), sq(bi));
+    store_f32x4(array_at_mut(&mut r.energy, i), energy);
 }
 
 /// `fast_atan2f(y, x)` of `tonality.rs` on four lanes, with one division.
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn atan2(y: __m128, x: __m128) -> __m128 {
-    // SAFETY: as in `select`.
-    unsafe {
-        let zero = _mm_setzero_ps();
-        let x2 = _mm_mul_ps(x, x);
-        let y2 = _mm_mul_ps(y, y);
-        // The scalar code takes its first branch where x2 < y2.
-        let first = _mm_cmplt_ps(x2, y2);
-        let big = select(first, y2, x2);
-        let small = select(first, x2, y2);
-        let den = _mm_mul_ps(mul_add(big, small, ATAN_B), mul_add(big, small, ATAN_C));
-        let xy = _mm_mul_ps(x, y);
-        let q = _mm_div_ps(_mm_mul_ps(xy, mul_add(big, small, ATAN_A)), den);
-        let pos = _mm_set1_ps(ATAN_E);
-        let neg = _mm_set1_ps(-ATAN_E);
-        let c1 = select(_mm_cmplt_ps(y, zero), neg, pos);
-        let c2 = select(_mm_cmplt_ps(xy, zero), neg, pos);
-        let r = select(first, _mm_sub_ps(c1, q), _mm_sub_ps(_mm_add_ps(q, c1), c2));
-        // 0 where x2 + y2 < 1e-18.
-        _mm_andnot_ps(_mm_cmplt_ps(_mm_add_ps(x2, y2), _mm_set1_ps(1e-18)), r)
-    }
+    let zero = _mm_setzero_ps();
+    let x2 = _mm_mul_ps(x, x);
+    let y2 = _mm_mul_ps(y, y);
+    // The scalar code takes its first branch where x2 < y2.
+    let first = _mm_cmplt_ps(x2, y2);
+    let big = select(first, y2, x2);
+    let small = select(first, x2, y2);
+    let den = _mm_mul_ps(mul_add(big, small, ATAN_B), mul_add(big, small, ATAN_C));
+    let xy = _mm_mul_ps(x, y);
+    let q = _mm_div_ps(_mm_mul_ps(xy, mul_add(big, small, ATAN_A)), den);
+    let pos = _mm_set1_ps(ATAN_E);
+    let neg = _mm_set1_ps(-ATAN_E);
+    let c1 = select(_mm_cmplt_ps(y, zero), neg, pos);
+    let c2 = select(_mm_cmplt_ps(xy, zero), neg, pos);
+    let r = select(first, _mm_sub_ps(c1, q), _mm_sub_ps(_mm_add_ps(q, c1), c2));
+    // 0 where x2 + y2 < 1e-18.
+    _mm_andnot_ps(_mm_cmplt_ps(_mm_add_ps(x2, y2), _mm_set1_ps(1e-18)), r)
 }
 
 /// libopus `downmix_float` and `downmix_int` for the layouts that
@@ -249,6 +232,7 @@ fn atan2(y: __m128, x: __m128) -> __m128 {
 /// first, then the limits -65536 and 65536 and NaN to 0, as the scalar
 /// code. 16-bit input: the conversion to `f32` and a plain sum. The last
 /// samples that do not fill a block are left to `downmix_scalar`.
+#[target_feature(enable = "sse2")]
 pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bool {
     let n = y.len();
     let two = match (pcm.channels, pcm.c1, pcm.c2) {
@@ -263,59 +247,55 @@ pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bo
         PcmRef::I32(_) => return false,
         PcmRef::F32(x) => {
             let x = &x[offset * ch..offset * ch + n * ch];
+            // Blocks of 4 samples: 8 values of `x` with two channels, 4
+            // with one.
             let blocks = n / 4;
-            // SAFETY: SSE is part of this target. Block `k` reads samples
-            // `4 * k * ch` to `4 * (k + 1) * ch - 1` of `x` and writes
-            // `y[4 * k..4 * k + 4]`, all inside the slices, whose lengths
-            // were checked above.
-            unsafe {
-                let scale = _mm_set1_ps(32768.0);
-                let lo = _mm_set1_ps(-65536.0);
-                let hi = _mm_set1_ps(65536.0);
-                for k in 0..blocks {
-                    let v = if two {
-                        let a = _mm_loadu_ps(x.as_ptr().add(8 * k));
-                        let b = _mm_loadu_ps(x.as_ptr().add(8 * k + 4));
-                        let (l, r) = (_mm_shuffle_ps::<EVEN>(a, b), _mm_shuffle_ps::<ODD>(a, b));
-                        _mm_add_ps(_mm_mul_ps(l, scale), _mm_mul_ps(r, scale))
-                    } else {
-                        _mm_mul_ps(_mm_loadu_ps(x.as_ptr().add(4 * k)), scale)
-                    };
-                    _mm_storeu_ps(y.as_mut_ptr().add(4 * k), limit(v, lo, hi));
+            let scale = _mm_set1_ps(32768.0);
+            let lo = _mm_set1_ps(-65536.0);
+            let hi = _mm_set1_ps(65536.0);
+            let y4 = y.as_chunks_mut::<4>().0;
+            if two {
+                for (xb, yb) in x.as_chunks::<8>().0.iter().zip(y4) {
+                    let a = load_f32x4(array_at(xb, 0));
+                    let b = load_f32x4(array_at(xb, 4));
+                    let (l, r) = (_mm_shuffle_ps::<EVEN>(a, b), _mm_shuffle_ps::<ODD>(a, b));
+                    let v = _mm_add_ps(_mm_mul_ps(l, scale), _mm_mul_ps(r, scale));
+                    store_f32x4(yb, limit(v, lo, hi));
+                }
+            } else {
+                for (xb, yb) in x.as_chunks::<4>().0.iter().zip(y4) {
+                    let v = _mm_mul_ps(load_f32x4(xb), scale);
+                    store_f32x4(yb, limit(v, lo, hi));
                 }
             }
             4 * blocks
         }
         PcmRef::I16(x) => {
             let x = &x[offset * ch..offset * ch + n * ch];
+            // Blocks of 8 samples, as above: 16 or 8 values of `x`.
             let blocks = n / 8;
-            // SAFETY: SSE2 is part of this target. Block `k` reads samples
-            // `8 * k * ch` to `8 * (k + 1) * ch - 1` of `x` (16 or 32
-            // bytes) and writes `y[8 * k..8 * k + 8]`, all inside the
-            // slices, whose lengths were checked above.
-            unsafe {
-                let p = x.as_ptr();
-                let o = y.as_mut_ptr();
-                for k in 0..blocks {
-                    if two {
-                        // Each 32-bit lane holds one pair: the first channel
-                        // in its lower half, the second in its upper half.
-                        for h in 0..2 {
-                            let v = _mm_loadu_si128(p.add(16 * k + 8 * h).cast::<__m128i>());
-                            let l = _mm_srai_epi32::<16>(_mm_slli_epi32::<16>(v));
-                            let r = _mm_srai_epi32::<16>(v);
-                            let sum = _mm_add_ps(_mm_cvtepi32_ps(l), _mm_cvtepi32_ps(r));
-                            _mm_storeu_ps(o.add(8 * k + 4 * h), sum);
-                        }
-                    } else {
-                        let v = _mm_loadu_si128(p.add(8 * k).cast::<__m128i>());
-                        // Each sample twice, then the arithmetic shift
-                        // extends its sign to 32 bits.
-                        let a = _mm_srai_epi32::<16>(_mm_unpacklo_epi16(v, v));
-                        let b = _mm_srai_epi32::<16>(_mm_unpackhi_epi16(v, v));
-                        _mm_storeu_ps(o.add(8 * k), _mm_cvtepi32_ps(a));
-                        _mm_storeu_ps(o.add(8 * k + 4), _mm_cvtepi32_ps(b));
+            let y8 = y.as_chunks_mut::<8>().0;
+            if two {
+                for (xb, yb) in x.as_chunks::<16>().0.iter().zip(y8) {
+                    // Each 32-bit lane holds one pair: the first channel
+                    // in its lower half, the second in its upper half.
+                    for h in 0..2 {
+                        let v = load_i16x8(array_at(xb, 8 * h));
+                        let l = _mm_srai_epi32::<16>(_mm_slli_epi32::<16>(v));
+                        let r = _mm_srai_epi32::<16>(v);
+                        let sum = _mm_add_ps(_mm_cvtepi32_ps(l), _mm_cvtepi32_ps(r));
+                        store_f32x4(array_at_mut(yb, 4 * h), sum);
                     }
+                }
+            } else {
+                for (xb, yb) in x.as_chunks::<8>().0.iter().zip(y8) {
+                    let v = load_i16x8(xb);
+                    // Each sample twice, then the arithmetic shift
+                    // extends its sign to 32 bits.
+                    let a = _mm_srai_epi32::<16>(_mm_unpacklo_epi16(v, v));
+                    let b = _mm_srai_epi32::<16>(_mm_unpackhi_epi16(v, v));
+                    store_f32x4(array_at_mut(yb, 0), _mm_cvtepi32_ps(a));
+                    store_f32x4(array_at_mut(yb, 4), _mm_cvtepi32_ps(b));
                 }
             }
             8 * blocks
@@ -330,58 +310,50 @@ pub(super) fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) -> bo
 ///
 /// `_mm_max_ps(a, b)` is `a > b ? a : b` and `_mm_min_ps(a, b)` is
 /// `a < b ? a : b`, so both keep a NaN in `b`, as the tests of C do.
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn limit(v: __m128, lo: __m128, hi: __m128) -> __m128 {
-    // SAFETY: as in `select`.
-    unsafe {
-        let v = _mm_max_ps(lo, v);
-        let v = _mm_min_ps(hi, v);
-        // A NaN is the only value that is unordered with itself.
-        _mm_and_ps(_mm_cmpord_ps(v, v), v)
-    }
+    let v = _mm_max_ps(lo, v);
+    let v = _mm_min_ps(hi, v);
+    // A NaN is the only value that is unordered with itself.
+    _mm_and_ps(_mm_cmpord_ps(v, v), v)
 }
 
 /// `tansig_approx` of `mlp.rs` on four lanes.
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn tansig(x: __m128) -> __m128 {
-    // SAFETY: as in `select`.
-    unsafe {
-        let x2 = _mm_mul_ps(x, x);
-        // c0 + (c1 + c2 * x2) * x2, each product rounded first.
-        let poly = |c: [f32; 3]| _mm_add_ps(_mm_set1_ps(c[0]), _mm_mul_ps(mul_add(_mm_set1_ps(c[1]), x2, c[2]), x2));
-        let n = poly(TANSIG_N);
-        let d = poly(TANSIG_D);
-        let r = _mm_div_ps(_mm_mul_ps(n, x), d);
-        // The ternaries of C: 1 < r ? 1 : r, then -1 > r ? -1 : r, which
-        // are `_mm_min_ps` and `_mm_max_ps` with r second. A NaN stays a
-        // NaN.
-        let r = _mm_min_ps(_mm_set1_ps(1.0), r);
-        _mm_max_ps(_mm_set1_ps(-1.0), r)
-    }
+    let x2 = _mm_mul_ps(x, x);
+    // c0 + (c1 + c2 * x2) * x2, each product rounded first.
+    let poly = |c: [f32; 3]| _mm_add_ps(_mm_set1_ps(c[0]), _mm_mul_ps(mul_add(_mm_set1_ps(c[1]), x2, c[2]), x2));
+    let n = poly(TANSIG_N);
+    let d = poly(TANSIG_D);
+    let r = _mm_div_ps(_mm_mul_ps(n, x), d);
+    // The ternaries of C: 1 < r ? 1 : r, then -1 > r ? -1 : r, which
+    // are `_mm_min_ps` and `_mm_max_ps` with r second. A NaN stays a
+    // NaN.
+    let r = _mm_min_ps(_mm_set1_ps(1.0), r);
+    _mm_max_ps(_mm_set1_ps(-1.0), r)
 }
 
 /// `sigmoid_approx` of `mlp.rs` on four lanes.
-#[inline(always)]
+#[target_feature(enable = "sse2")]
+#[inline]
 fn sigmoid(x: __m128) -> __m128 {
-    // SAFETY: as in `select`.
-    unsafe {
-        let half = _mm_set1_ps(0.5);
-        _mm_add_ps(half, _mm_mul_ps(half, tansig(_mm_mul_ps(x, half))))
-    }
+    let half = _mm_set1_ps(0.5);
+    _mm_add_ps(half, _mm_mul_ps(half, tansig(_mm_mul_ps(x, half))))
 }
 
 /// The end of `compute_dense` of `mlp.rs`, four outputs at a time: the
 /// scaling by `WEIGHTS_SCALE` and the activation. Returns the outputs left
 /// over (fewer than four), which the scalar code does.
+#[target_feature(enable = "sse2")]
 pub(super) fn scale_and_activate(output: &mut [f32], sigmoid_output: bool) -> &mut [f32] {
     let (blocks, rest) = output.as_chunks_mut::<4>();
     for b in blocks {
-        // SAFETY: SSE is part of this target; `b` holds 4 values.
-        unsafe {
-            let v = _mm_mul_ps(_mm_loadu_ps(b.as_ptr()), _mm_set1_ps(WEIGHTS_SCALE));
-            let v = if sigmoid_output { sigmoid(v) } else { tansig(v) };
-            _mm_storeu_ps(b.as_mut_ptr(), v);
-        }
+        let v = _mm_mul_ps(load_f32x4(b), _mm_set1_ps(WEIGHTS_SCALE));
+        let v = if sigmoid_output { sigmoid(v) } else { tansig(v) };
+        store_f32x4(b, v);
     }
     rest
 }
@@ -403,6 +375,7 @@ const GATE_VECTORS: usize = GRU_NEURONS / 4;
 /// vector registers, too few for 18 sums. Each output still adds its bias,
 /// then its input terms in the order of the inputs, then its state terms in
 /// the order of the state, each product rounded first, as the scalar code.
+#[target_feature(enable = "sse2")]
 pub(super) fn gru(layer: &GruLayer, state: &mut [f32; GRU_NEURONS], input: &[f32]) {
     const G: usize = 3 * GRU_NEURONS;
     let input: &[f32; GRU_INPUTS] = input[..GRU_INPUTS].try_into().expect("32 inputs");
@@ -414,62 +387,64 @@ pub(super) fn gru(layer: &GruLayer, state: &mut [f32; GRU_NEURONS], input: &[f32
     // gate).
     let mut update = [0.0f32; GRU_NEURONS];
     let mut reset_state = [0.0f32; GRU_NEURONS];
-    // SAFETY: SSE is part of this target (see the `cfg` of the module).
-    // Every load and store reads or writes four values inside the arrays
-    // above, whose sizes the types fix: gate `g`, vector `k` of row `j`
-    // starts at `j * 72 + g * 24 + 4 * k`, at most 71 - 3 within the row,
-    // and vector `k` of a 24-value array at `4 * k`, at most 23 - 3.
-    unsafe {
-        let load = |p: *const f32, k: usize| _mm_loadu_ps(p.add(4 * k));
-        // acc + w * x, the product rounded first.
-        let term = |acc: __m128, w: __m128, x: __m128| _mm_add_ps(acc, _mm_mul_ps(w, x));
-        let scale = _mm_set1_ps(WEIGHTS_SCALE);
-        let mut z: [__m128; GATE_VECTORS] = core::array::from_fn(|k| load(bias.as_ptr(), k));
-        let mut r: [__m128; GATE_VECTORS] = core::array::from_fn(|k| load(bias.as_ptr().add(GRU_NEURONS), k));
-        for (j, &x) in input.iter().enumerate() {
-            let row = w_in.as_ptr().add(j * G);
-            let x = _mm_set1_ps(x);
-            for k in 0..GATE_VECTORS {
-                z[k] = term(z[k], load(row, k), x);
-                r[k] = term(r[k], load(row.add(GRU_NEURONS), k), x);
-            }
-        }
-        for (j, &x) in state.iter().enumerate() {
-            let row = w_rec.as_ptr().add(j * G);
-            let x = _mm_set1_ps(x);
-            for k in 0..GATE_VECTORS {
-                z[k] = term(z[k], load(row, k), x);
-                r[k] = term(r[k], load(row.add(GRU_NEURONS), k), x);
-            }
-        }
+    // Vector `k` of gate `g` (0 update, 1 reset, 2 output) in the biases or
+    // in a row of weights: values `g * 24 + 4 * k` to `g * 24 + 4 * k + 3`.
+    let load = |row: &[f32; G], g: usize, k: usize| load_f32x4(array_at(row, g * GRU_NEURONS + 4 * k));
+    // Vector `k` of a 24-value array: values `4 * k` to `4 * k + 3`.
+    let vector = |a: &[f32; GRU_NEURONS], k: usize| load_f32x4(array_at(a, 4 * k));
+    // acc + w * x, the product rounded first.
+    let term = |acc: __m128, w: __m128, x: __m128| _mm_add_ps(acc, _mm_mul_ps(w, x));
+    let scale = _mm_set1_ps(WEIGHTS_SCALE);
+    // The loops below take row `j` of the weights at `j.min(rows - 1) * G`.
+    // `j` is always below the number of rows, so `min` changes nothing. It
+    // shows the compiler early that the row lies inside the weights, so the
+    // range check of `array_at` goes away before the loops are optimized.
+    // With `j * G` alone, the loop over the state got one more instruction.
+    let mut z: [__m128; GATE_VECTORS] = core::array::from_fn(|k| load(bias, 0, k));
+    let mut r: [__m128; GATE_VECTORS] = core::array::from_fn(|k| load(bias, 1, k));
+    for (j, &x) in input.iter().enumerate() {
+        let row = array_at(w_in, j.min(GRU_INPUTS - 1) * G);
+        let x = _mm_set1_ps(x);
         for k in 0..GATE_VECTORS {
-            _mm_storeu_ps(update.as_mut_ptr().add(4 * k), sigmoid(_mm_mul_ps(z[k], scale)));
-            let r = sigmoid(_mm_mul_ps(r[k], scale));
-            _mm_storeu_ps(reset_state.as_mut_ptr().add(4 * k), _mm_mul_ps(load(state.as_ptr(), k), r));
+            z[k] = term(z[k], load(row, 0, k), x);
+            r[k] = term(r[k], load(row, 1, k), x);
         }
-        let mut h: [__m128; GATE_VECTORS] =
-            core::array::from_fn(|k| load(bias.as_ptr().add(2 * GRU_NEURONS), k));
-        for (j, &x) in input.iter().enumerate() {
-            let row = w_in.as_ptr().add(j * G + 2 * GRU_NEURONS);
-            let x = _mm_set1_ps(x);
-            for k in 0..GATE_VECTORS {
-                h[k] = term(h[k], load(row, k), x);
-            }
-        }
-        for (j, &x) in reset_state.iter().enumerate() {
-            let row = w_rec.as_ptr().add(j * G + 2 * GRU_NEURONS);
-            let x = _mm_set1_ps(x);
-            for k in 0..GATE_VECTORS {
-                h[k] = term(h[k], load(row, k), x);
-            }
-        }
-        let one = _mm_set1_ps(1.0);
+    }
+    for (j, &x) in state.iter().enumerate() {
+        let row = array_at(w_rec, j.min(GRU_NEURONS - 1) * G);
+        let x = _mm_set1_ps(x);
         for k in 0..GATE_VECTORS {
-            // (1-z)*tanh(h) + z*state, each product rounded first.
-            let z = load(update.as_ptr(), k);
-            let t = _mm_mul_ps(_mm_sub_ps(one, z), tansig(_mm_mul_ps(h[k], scale)));
-            _mm_storeu_ps(state.as_mut_ptr().add(4 * k), term(t, z, load(state.as_ptr(), k)));
+            z[k] = term(z[k], load(row, 0, k), x);
+            r[k] = term(r[k], load(row, 1, k), x);
         }
+    }
+    for k in 0..GATE_VECTORS {
+        store_f32x4(array_at_mut(&mut update, 4 * k), sigmoid(_mm_mul_ps(z[k], scale)));
+        let r = sigmoid(_mm_mul_ps(r[k], scale));
+        store_f32x4(array_at_mut(&mut reset_state, 4 * k), _mm_mul_ps(vector(state, k), r));
+    }
+    let mut h: [__m128; GATE_VECTORS] = core::array::from_fn(|k| load(bias, 2, k));
+    for (j, &x) in input.iter().enumerate() {
+        let row = array_at(w_in, j.min(GRU_INPUTS - 1) * G);
+        let x = _mm_set1_ps(x);
+        for k in 0..GATE_VECTORS {
+            h[k] = term(h[k], load(row, 2, k), x);
+        }
+    }
+    for (j, &x) in reset_state.iter().enumerate() {
+        let row = array_at(w_rec, j.min(GRU_NEURONS - 1) * G);
+        let x = _mm_set1_ps(x);
+        for k in 0..GATE_VECTORS {
+            h[k] = term(h[k], load(row, 2, k), x);
+        }
+    }
+    let one = _mm_set1_ps(1.0);
+    for k in 0..GATE_VECTORS {
+        // (1-z)*tanh(h) + z*state, each product rounded first.
+        let z = vector(&update, k);
+        let t = _mm_mul_ps(_mm_sub_ps(one, z), tansig(_mm_mul_ps(h[k], scale)));
+        let v = term(t, z, vector(state, k));
+        store_f32x4(array_at_mut(state, 4 * k), v);
     }
 }
 
@@ -553,7 +528,8 @@ mod tests {
                         let p = AnalysisPcm { pcm, channels, c1, c2, frame_size: n };
                         let mut a = vec![7.0f32; n];
                         let mut b = vec![7.0f32; n];
-                        assert_eq!(downmix(&p, &mut a, offset), covered);
+                        // SAFETY: SSE2 is part of every x86-64 target.
+                        assert_eq!(unsafe { downmix(&p, &mut a, offset) }, covered);
                         downmix_scalar(&p, &mut b, offset);
                         if covered {
                             let nan = |v: &[f32]| v.iter().any(|x| x.is_nan());
@@ -570,7 +546,8 @@ mod tests {
         // 24-bit input is left to the scalar code.
         let x = [0i32; 8];
         let p = AnalysisPcm { pcm: PcmRef::I32(&x), channels: 1, c1: 0, c2: SecondChannel::None, frame_size: 8 };
-        assert!(!downmix(&p, &mut [0.0; 8], 0));
+        // SAFETY: as above.
+        assert!(!unsafe { downmix(&p, &mut [0.0; 8], 0) });
     }
 
     /// Runs the SSE and the scalar bins on the same input and state and
@@ -581,7 +558,8 @@ mod tests {
         {
             let [angle, d_angle, d2_angle] = &mut a;
             let mut phase = Phase { angle, d_angle, d2_angle };
-            let first = tonality_bins(out, &mut phase, &mut ra);
+            // SAFETY: SSE2 is part of every x86-64 target.
+            let first = unsafe { tonality_bins(out, &mut phase, &mut ra) };
             assert_eq!(first, 237);
             tonality_bins_scalar(out, first, &mut phase, &mut ra);
         }
@@ -670,7 +648,8 @@ mod tests {
             });
             let mut a = [KissCpx::new(7.0, 7.0); N];
             let mut b = a;
-            window_for_fft(&inmem, fft_state(), &mut a);
+            // SAFETY: SSE2 is part of every x86-64 target.
+            unsafe { window_for_fft(&inmem, fft_state(), &mut a) };
             window_for_fft_scalar(&inmem, fft_state(), &mut b);
             let flat = |v: &[KissCpx; N]| v.iter().flat_map(|c| [c.r, c.i]).collect::<Vec<_>>();
             assert!(same(&flat(&a), &flat(&b)), "case {case}");
@@ -698,7 +677,8 @@ mod tests {
             let len = case % 33;
             for sig in [false, true] {
                 let mut a = x;
-                let rest = scale_and_activate(&mut a[..len], sig).len();
+                // SAFETY: SSE2 is part of every x86-64 target.
+                let rest = unsafe { scale_and_activate(&mut a[..len], sig) }.len();
                 assert_eq!(rest, len % 4);
                 for (k, (&got, &inp)) in a[..len - rest].iter().zip(&x).enumerate() {
                     let v = inp * WEIGHTS_SCALE;
@@ -710,7 +690,8 @@ mod tests {
             // The recurrent layer, from a random state.
             let state0: [f32; GRU_NEURONS] = core::array::from_fn(|_| rng.unit() * 2.0);
             let (mut a, mut b) = (state0, state0);
-            gru(&LAYER1, &mut a, &x);
+            // SAFETY: SSE2 is part of every x86-64 target.
+            unsafe { gru(&LAYER1, &mut a, &x) };
             compute_gru_scalar(&LAYER1, &mut b, &x);
             assert!(same(&a, &b), "case {case}");
         }
@@ -720,7 +701,8 @@ mod tests {
             let feat: [f32; 25] = core::array::from_fn(|_| rng.unit() * 6.0);
             let mut hidden = [0.0f32; 32];
             crate::analysis::mlp::compute_dense(&LAYER0, &mut hidden, &feat);
-            gru(&LAYER1, (&mut a[..24]).try_into().unwrap(), &hidden);
+            // SAFETY: SSE2 is part of every x86-64 target.
+            unsafe { gru(&LAYER1, (&mut a[..24]).try_into().unwrap(), &hidden) };
             compute_gru_scalar(&LAYER1, &mut b, &hidden);
             assert!(same(&a, &b), "step {step}");
             let mut out = [0.0f32; 2];

@@ -673,10 +673,12 @@ impl TonalityAnalysisState {
 
         let sc = &mut self.scratch;
         let fft = fft_state();
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
         #[cfg(target_arch = "aarch64")]
-        super::neon::window_for_fft(&self.inmem, fft, &mut sc.fft);
+        unsafe { super::neon::window_for_fft(&self.inmem, fft, &mut sc.fft) };
+        // SAFETY: SSE2 is part of this target (see the `cfg`).
         #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-        super::x86::window_for_fft(&self.inmem, fft, &mut sc.fft);
+        unsafe { super::x86::window_for_fft(&self.inmem, fft, &mut sc.fft) };
         #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
         window_for_fft_scalar(&self.inmem, fft, &mut sc.fft);
         self.inmem.copy_within(ANALYSIS_BUF_SIZE - 240.., 0);
@@ -708,10 +710,12 @@ impl TonalityAnalysisState {
         // Phase-based tonality of each bin (C 570-608), and the energy of
         // each bin.
         let mut phase = Phase { angle: &mut self.angle, d_angle: &mut self.d_angle, d2_angle: &mut self.d2_angle };
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
         #[cfg(target_arch = "aarch64")]
-        let first_scalar_bin = super::neon::tonality_bins(out, &mut phase, &mut sc.bins);
+        let first_scalar_bin = unsafe { super::neon::tonality_bins(out, &mut phase, &mut sc.bins) };
+        // SAFETY: SSE2 is part of this target (see the `cfg`).
         #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-        let first_scalar_bin = super::x86::tonality_bins(out, &mut phase, &mut sc.bins);
+        let first_scalar_bin = unsafe { super::x86::tonality_bins(out, &mut phase, &mut sc.bins) };
         #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse2"))))]
         let first_scalar_bin = 1;
         tonality_bins_scalar(out, first_scalar_bin, &mut phase, &mut sc.bins);
@@ -1321,12 +1325,14 @@ fn downmix_and_resample(
 /// `y.len()` samples from sample `offset` on, channel `c1` plus the
 /// channels that `c2` names.
 fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) {
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    if super::neon::downmix(pcm, y, offset) {
+    if unsafe { super::neon::downmix(pcm, y, offset) } {
         return;
     }
+    // SAFETY: SSE2 is part of this target (see the `cfg`).
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-    if super::x86::downmix(pcm, y, offset) {
+    if unsafe { super::x86::downmix(pcm, y, offset) } {
         return;
     }
     downmix_scalar(pcm, y, offset);

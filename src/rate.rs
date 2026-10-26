@@ -125,6 +125,7 @@ static PULSE_ROW_LANES: [u8; 48] = {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn bits2pulses_count(row: &[u8; 48], bits: i32) -> Option<i32> {
+    use crate::simd_mem::{array_at, neon::load_u8x16};
     use core::arch::aarch64::*;
 
     let k = row[0];
@@ -137,17 +138,20 @@ fn bits2pulses_count(row: &[u8; 48], bits: i32) -> Option<i32> {
     // case above 255 is handled apart.
     let below_all = b > 255;
     let b8 = b.clamp(0, 255) as u8;
-    // SAFETY: NEON is part of the baseline of every aarch64 target. `row`
-    // and `PULSE_ROW_LANES` hold 48 bytes each, and the loads read bytes
-    // 0 to 47.
+    // The vector code stays in this always-inlined function: a function
+    // with `#[target_feature]` cannot be `#[inline(always)]`, and the
+    // compiler did not inline one here.
+    // SAFETY: NEON is part of the baseline of every aarch64 target. The
+    // block calls only NEON intrinsics and the load helpers of
+    // `simd_mem`.
     let count = unsafe {
-        let (p, l) = (row.as_ptr(), PULSE_ROW_LANES.as_ptr());
         let (vb, vk) = (vdupq_n_u8(b8), vdupq_n_u8(k));
-        // All bits set in lanes 1 to `K` whose cost is below `b`.
+        // All bits set in lanes 1 to `K` whose cost is below `b`, among
+        // the 16 lanes from `o` on.
         let below = |o: usize| {
             vandq_u8(
-                vcltq_u8(vld1q_u8(p.add(o)), vb),
-                vcleq_u8(vld1q_u8(l.add(o)), vk),
+                vcltq_u8(load_u8x16(array_at(row, o)), vb),
+                vcleq_u8(load_u8x16(array_at(&PULSE_ROW_LANES, o)), vk),
             )
         };
         // Each set lane is -1; subtracting adds one per lane. At most 3
@@ -328,31 +332,29 @@ impl SearchLanes {
     #[target_feature(enable = "neon")]
     #[inline]
     fn sum(&self, bits: [core::arch::aarch64::int32x4_t; BAND_LANES / 4], floor: i32) -> i32 {
+        use crate::simd_mem::{array_at, neon::load_i32x4};
         use core::arch::aarch64::*;
         let lanes = [0i32, 1, 2, 3];
-        // SAFETY: `lanes` holds four values; each load below reads
-        // `[4 * g, 4 * g + 4)` of an array of `BAND_LANES` values with
-        // `g < BAND_LANES / 4`.
-        unsafe {
-            let first = vld1q_s32(lanes.as_ptr());
-            let none = vdupq_n_s32(-1);
-            let mut top = none;
-            for (g, &b) in bits.iter().enumerate() {
-                let idx = vaddq_s32(first, vdupq_n_s32(4 * g as i32));
-                let reached = vcgeq_s32(b, vld1q_s32(self.thresh.as_ptr().add(4 * g)));
-                top = vmaxq_s32(top, vbslq_s32(reached, idx, none));
-            }
-            let top = vdupq_n_s32(vmaxvq_s32(top));
-            let vfloor = vdupq_n_s32(floor);
-            let mut acc = vdupq_n_s32(0);
-            for (g, &b) in bits.iter().enumerate() {
-                let idx = vaddq_s32(first, vdupq_n_s32(4 * g as i32));
-                let capped = vminq_s32(b, vld1q_s32(self.cap.as_ptr().add(4 * g)));
-                let below = vandq_s32(vreinterpretq_s32_u32(vcgeq_s32(b, vfloor)), vfloor);
-                acc = vaddq_s32(acc, vbslq_s32(vcleq_s32(idx, top), capped, below));
-            }
-            vaddvq_s32(acc)
+        // The loads below read `[4 * g, 4 * g + 4)` of arrays of
+        // `BAND_LANES` values with `g < BAND_LANES / 4`.
+        let first = load_i32x4(&lanes);
+        let none = vdupq_n_s32(-1);
+        let mut top = none;
+        for (g, &b) in bits.iter().enumerate() {
+            let idx = vaddq_s32(first, vdupq_n_s32(4 * g as i32));
+            let reached = vcgeq_s32(b, load_i32x4(array_at(&self.thresh, 4 * g)));
+            top = vmaxq_s32(top, vbslq_s32(reached, idx, none));
         }
+        let top = vdupq_n_s32(vmaxvq_s32(top));
+        let vfloor = vdupq_n_s32(floor);
+        let mut acc = vdupq_n_s32(0);
+        for (g, &b) in bits.iter().enumerate() {
+            let idx = vaddq_s32(first, vdupq_n_s32(4 * g as i32));
+            let capped = vminq_s32(b, load_i32x4(array_at(&self.cap, 4 * g)));
+            let below = vandq_s32(vreinterpretq_s32_u32(vcgeq_s32(b, vfloor)), vfloor);
+            acc = vaddq_s32(acc, vbslq_s32(vcleq_s32(idx, top), capped, below));
+        }
+        vaddvq_s32(acc)
     }
 
     /// `vector_bits` for the vector `row` (one byte per band of the frame,
@@ -369,42 +371,40 @@ impl SearchLanes {
         len: usize,
         floor: i32,
     ) -> i32 {
+        use crate::simd_mem::{array_at, neon::{load_i32x4, load_u8x8, load_u8x16}};
         use core::arch::aarch64::*;
         let mut bytes = [0u8; BAND_LANES];
         for (b, &r) in bytes.iter_mut().zip(&row[..len]) {
             *b = r;
         }
-        // SAFETY: `bytes` holds 24 values; the loads read bytes 0 to 23.
-        // The other loads read `[4 * g, 4 * g + 4)` of arrays of
-        // `BAND_LANES` values with `g < BAND_LANES / 4`.
-        unsafe {
-            let b16 = vld1q_u8(bytes.as_ptr());
-            let b8 = vld1_u8(bytes.as_ptr().add(16));
-            let (lo, hi, top) = (vmovl_u8(vget_low_u8(b16)), vmovl_high_u8(b16), vmovl_u8(b8));
-            let rows = [
-                vmovl_u16(vget_low_u16(lo)),
-                vmovl_high_u16(lo),
-                vmovl_u16(vget_low_u16(hi)),
-                vmovl_high_u16(hi),
-                vmovl_u16(vget_low_u16(top)),
-                vmovl_high_u16(top),
-            ];
-            let zero = vdupq_n_s32(0);
-            let mut bits = [zero; BAND_LANES / 4];
-            for (g, (out, &r)) in bits.iter_mut().zip(&rows).enumerate() {
-                let w = vld1q_s32(width.as_ptr().add(4 * g));
-                // C: `(C*N*alloc) << LM >> 2`, as in `vector_bits`.
-                let b = vshrq_n_s32::<2>(vmulq_s32(w, vreinterpretq_s32_u32(r)));
-                // C: the trim only for a positive value, then `IMAX(0, .)`.
-                let t = vandq_s32(
-                    vreinterpretq_s32_u32(vcgtq_s32(b, zero)),
-                    vld1q_s32(trim.as_ptr().add(4 * g)),
-                );
-                let b = vmaxq_s32(vaddq_s32(b, t), zero);
-                *out = vaddq_s32(b, vld1q_s32(offsets.as_ptr().add(4 * g)));
-            }
-            self.sum(bits, floor)
+        // The loads read bytes 0 to 23 of `bytes`, and `[4 * g, 4 * g + 4)`
+        // of arrays of `BAND_LANES` values with `g < BAND_LANES / 4`.
+        let b16 = load_u8x16(array_at(&bytes, 0));
+        let b8 = load_u8x8(array_at(&bytes, 16));
+        let (lo, hi, top) = (vmovl_u8(vget_low_u8(b16)), vmovl_high_u8(b16), vmovl_u8(b8));
+        let rows = [
+            vmovl_u16(vget_low_u16(lo)),
+            vmovl_high_u16(lo),
+            vmovl_u16(vget_low_u16(hi)),
+            vmovl_high_u16(hi),
+            vmovl_u16(vget_low_u16(top)),
+            vmovl_high_u16(top),
+        ];
+        let zero = vdupq_n_s32(0);
+        let mut bits = [zero; BAND_LANES / 4];
+        for (g, (out, &r)) in bits.iter_mut().zip(&rows).enumerate() {
+            let w = load_i32x4(array_at(width, 4 * g));
+            // C: `(C*N*alloc) << LM >> 2`, as in `vector_bits`.
+            let b = vshrq_n_s32::<2>(vmulq_s32(w, vreinterpretq_s32_u32(r)));
+            // C: the trim only for a positive value, then `IMAX(0, .)`.
+            let t = vandq_s32(
+                vreinterpretq_s32_u32(vcgtq_s32(b, zero)),
+                load_i32x4(array_at(trim, 4 * g)),
+            );
+            let b = vmaxq_s32(vaddq_s32(b, t), zero);
+            *out = vaddq_s32(b, load_i32x4(array_at(offsets, 4 * g)));
         }
+        self.sum(bits, floor)
     }
 
     /// `interp_bits` with `bits1` and `bits2` in lanes with 0 after the
@@ -412,17 +412,13 @@ impl SearchLanes {
     #[target_feature(enable = "neon")]
     #[inline]
     fn interp_bits(&self, bits1: &BandLanes, bits2: &BandLanes, mid: i32, floor: i32) -> i32 {
+        use crate::simd_mem::{array_at, neon::load_i32x4};
         use core::arch::aarch64::*;
         let mut bits = [vdupq_n_s32(0); BAND_LANES / 4];
         for (g, out) in bits.iter_mut().enumerate() {
-            // SAFETY: the loads read `[4 * g, 4 * g + 4)` of arrays of
+            // The loads read `[4 * g, 4 * g + 4)` of arrays of
             // `BAND_LANES` values with `g < BAND_LANES / 4`.
-            let (b1, b2) = unsafe {
-                (
-                    vld1q_s32(bits1.as_ptr().add(4 * g)),
-                    vld1q_s32(bits2.as_ptr().add(4 * g)),
-                )
-            };
+            let (b1, b2) = (load_i32x4(array_at(bits1, 4 * g)), load_i32x4(array_at(bits2, 4 * g)));
             *out = vaddq_s32(b1, vshrq_n_s32::<6>(vmulq_n_s32(b2, mid)));
         }
         self.sum(bits, floor)

@@ -189,10 +189,12 @@ pub fn compute_dense(layer: &DenseLayer, output: &mut [f32], input: &[f32]) {
     let output = &mut output[..n];
     output.copy_from_slice(&layer.bias[..n]);
     gemm_accum(output, layer.input_weights, n, &input[..m]);
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    let output = super::neon::scale_and_activate(output, layer.sigmoid);
+    let output = unsafe { super::neon::scale_and_activate(output, layer.sigmoid) };
+    // SAFETY: SSE2 is part of this target (see the `cfg`).
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-    let output = super::x86::scale_and_activate(output, layer.sigmoid);
+    let output = unsafe { super::x86::scale_and_activate(output, layer.sigmoid) };
     for o in output.iter_mut() {
         *o *= WEIGHTS_SCALE;
     }
@@ -213,12 +215,16 @@ pub fn compute_dense(layer: &DenseLayer, output: &mut [f32], input: &[f32]) {
 pub fn compute_gru(gru: &GruLayer, state: &mut [f32], input: &[f32]) {
     #[cfg(target_arch = "aarch64")]
     if gru.nb_inputs == super::neon::GRU_INPUTS && gru.nb_neurons == super::neon::GRU_NEURONS {
-        super::neon::gru(gru, (&mut state[..super::neon::GRU_NEURONS]).try_into().expect("24 values"), input);
+        let state = (&mut state[..super::neon::GRU_NEURONS]).try_into().expect("24 values");
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        unsafe { super::neon::gru(gru, state, input) };
         return;
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     if gru.nb_inputs == super::x86::GRU_INPUTS && gru.nb_neurons == super::x86::GRU_NEURONS {
-        super::x86::gru(gru, (&mut state[..super::x86::GRU_NEURONS]).try_into().expect("24 values"), input);
+        let state = (&mut state[..super::x86::GRU_NEURONS]).try_into().expect("24 values");
+        // SAFETY: SSE2 is part of this target (see the `cfg`).
+        unsafe { super::x86::gru(gru, state, input) };
         return;
     }
     compute_gru_scalar(gru, state, input);
