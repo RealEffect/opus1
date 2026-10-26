@@ -20,6 +20,23 @@
 //! the kernel itself, from code without the feature, where the caller
 //! states why the processor has the feature.
 //!
+//! The names say what moves between memory and registers:
+//! - `load_` and `store_`, then the type and the number of values read or
+//!   written: `load_f32x4` reads four `f32` values, `store_i16x4` writes
+//!   four `i16` values (on x86 from the lower half of a 128-bit register).
+//! - `load2_` and `store2_` read or write two registers interleaved
+//!   (`vld2q_f32`, `vst2q_f32`); `load_i8x16x4` reads four registers one
+//!   after the other (`vld1q_s8_x4`).
+//! - `load_dup_` reads one value into every lane, `load_lane_` and
+//!   `store_lane_` read or write one lane. Here the name gives the register
+//!   (`f32x4`).
+//! - The end of the name says what the array holds when it is not plain
+//!   values: `_cells` for `Cell` values, `_uninit` for `MaybeUninit`
+//!   values that the store initializes, `_cpx` for complex values
+//!   ([`KissCpx`](crate::kiss_fft::KissCpx), two `f32` values each).
+//! - `to_array_` copies the lanes of a register into an array value; it
+//!   touches no memory the caller can see.
+//!
 //! How a kernel gets the arrays from a slice without an index check in its
 //! loop:
 //! - `as_chunks`, `as_chunks_mut`, `as_rchunks` and `chunks_exact` split a
