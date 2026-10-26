@@ -42,8 +42,11 @@
 /// The `N` values `s[i..i + N]` as an array.
 ///
 /// Panics when `s` holds fewer than `i + N` values.
-// The library uses this and `array_at_mut` only in x86 kernels so far.
-#[cfg_attr(not(any(target_arch = "x86", target_arch = "x86_64")), allow(dead_code))]
+// Only the NEON and x86 kernels use this and `array_at_mut`.
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 #[inline(always)]
 pub(crate) fn array_at<T, const N: usize>(s: &[T], i: usize) -> &[T; N] {
     s[i..i + N].try_into().unwrap()
@@ -52,7 +55,10 @@ pub(crate) fn array_at<T, const N: usize>(s: &[T], i: usize) -> &[T; N] {
 /// The `N` values `s[i..i + N]` as a mutable array.
 ///
 /// Panics when `s` holds fewer than `i + N` values.
-#[cfg_attr(not(any(target_arch = "x86", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 #[inline(always)]
 pub(crate) fn array_at_mut<T, const N: usize>(s: &mut [T], i: usize) -> &mut [T; N] {
     (&mut s[i..i + N]).try_into().unwrap()
@@ -63,6 +69,7 @@ pub(crate) fn array_at_mut<T, const N: usize>(s: &mut [T], i: usize) -> &mut [T;
 pub(crate) mod neon {
     use core::arch::aarch64::*;
     use core::cell::Cell;
+    use core::mem::MaybeUninit;
 
     // `f32` values.
 
@@ -85,6 +92,36 @@ pub(crate) mod neon {
         unsafe { vst1q_f32(a.as_mut_ptr(), v) }
     }
 
+    /// Stores four `f32` values into memory that may not hold values yet.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_f32x4_uninit(a: &mut [MaybeUninit<f32>; 4], v: float32x4_t) {
+        // SAFETY: `MaybeUninit<f32>` has the layout of `f32`, so `a` is
+        // valid for writing four `f32` values, which is what `vst1q_f32`
+        // writes, and no other reference reaches them. It needs only the
+        // alignment of `f32`.
+        unsafe { vst1q_f32(a.as_mut_ptr().cast(), v) }
+    }
+
+    /// Loads one `f32` value into all four lanes.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_dup_f32x4(a: &f32) -> float32x4_t {
+        // SAFETY: `a` is valid for reading one `f32` value, which is what
+        // `vld1q_dup_f32` reads.
+        unsafe { vld1q_dup_f32(a) }
+    }
+
+    /// Loads eight `f32` values as two vectors: `.0` holds the values at
+    /// the even places (0, 2, 4, 6), `.1` those at the odd places.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load2_f32x4(a: &[f32; 8]) -> float32x4x2_t {
+        // SAFETY: `a` is valid for reading eight `f32` values, which is
+        // what `vld2q_f32` reads. It needs only the alignment of `f32`.
+        unsafe { vld2q_f32(a.as_ptr()) }
+    }
+
     /// Loads four `f32` values from cells.
     #[target_feature(enable = "neon")]
     #[inline]
@@ -105,6 +142,15 @@ pub(crate) mod neon {
         // values. Nothing else reads or writes them during the store: a
         // `Cell` lends no reference to its value and stays in one thread.
         unsafe { vst1q_f32(a.as_ptr().cast_mut().cast(), v) }
+    }
+
+    /// The four lanes of `v` as an array.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn to_array_f32x4(v: float32x4_t) -> [f32; 4] {
+        // SAFETY: `float32x4_t` and `[f32; 4]` have the same size, and
+        // every bit pattern is a valid value of both.
+        unsafe { core::mem::transmute::<float32x4_t, [f32; 4]>(v) }
     }
 
     // `i32` and `u32` values.
@@ -148,6 +194,16 @@ pub(crate) mod x86 {
         unsafe { _mm_loadu_ps(a.as_ptr()) }
     }
 
+    /// Stores four `f32` values (SSE).
+    #[target_feature(enable = "sse")]
+    #[inline]
+    pub(crate) fn store_f32x4(a: &mut [f32; 4], v: __m128) {
+        // SAFETY: `a` is valid for writing four `f32` values, which is
+        // what `_mm_storeu_ps` writes, and no other reference reaches
+        // them. It needs no alignment.
+        unsafe { _mm_storeu_ps(a.as_mut_ptr(), v) }
+    }
+
     /// Loads four `f32` values from cells (SSE).
     #[target_feature(enable = "sse")]
     #[inline]
@@ -168,6 +224,15 @@ pub(crate) mod x86 {
         // values. Nothing else reads or writes them during the store: a
         // `Cell` lends no reference to its value and stays in one thread.
         unsafe { _mm_storeu_ps(a.as_ptr().cast_mut().cast(), v) }
+    }
+
+    /// The four lanes of `v` as an array (SSE).
+    #[target_feature(enable = "sse")]
+    #[inline]
+    pub(crate) fn to_array_f32x4(v: __m128) -> [f32; 4] {
+        // SAFETY: `__m128` and `[f32; 4]` have the same size, and every
+        // bit pattern is a valid value of both.
+        unsafe { core::mem::transmute::<__m128, [f32; 4]>(v) }
     }
 
     /// Loads eight `f32` values (AVX).

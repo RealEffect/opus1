@@ -119,6 +119,13 @@ fn xcorr_by_sample_scalar(x: &[f32], y: &[f32], out: &mut [f32], len: usize) {
 /// from 0, with `mac`.
 ///
 /// `y` must be at least as long as `x`.
+///
+/// The vector loops keep their pointer loads. The function is inlined into
+/// many large callers, such as `prefilter_pitch` and `quant_partition`.
+/// With the groups of four taken from `as_chunks` and loaded through
+/// `simd_mem`, the compiler assigned the registers of those callers
+/// differently, and some of their loops got longer. The same holds for the
+/// other small kernels in this crate that say so.
 #[inline(always)]
 pub(crate) fn celt_inner_prod(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
@@ -191,15 +198,12 @@ pub(crate) fn celt_inner_prod(x: &[f32], y: &[f32]) -> f32 {
 /// `vadd_f32` of the low and the high half, then `vpadd_f32`, which is
 /// (v0 + v2) + (v1 + v3).
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[target_feature(enable = "neon")]
+#[inline]
 fn lanes_sum(v: core::arch::aarch64::float32x4_t) -> f32 {
     use core::arch::aarch64::*;
-    // SAFETY: these vector instructions are part of every 64-bit ARM
-    // processor.
-    unsafe {
-        let half = vadd_f32(vget_low_f32(v), vget_high_f32(v));
-        vget_lane_f32::<0>(vpadd_f32(half, half))
-    }
+    let half = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+    vget_lane_f32::<0>(vpadd_f32(half, half))
 }
 
 /// Sum of `x[i] * y[i]` for `i < n`: libopus `celt_inner_prod`. Panics when
@@ -207,17 +211,15 @@ fn lanes_sum(v: core::arch::aarch64::float32x4_t) -> f32 {
 ///
 /// On x86 this uses this crate's own SSE and AVX kernels.
 pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
-    // The vector kernels read `n` samples through pointers without a check,
-    // so the lengths are checked here.
+    // The kernels take exactly `n` samples of each, so a short slice panics
+    // here.
     let (x, y) = (&x[..n], &y[..n]);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if crate::compat::x86_has_avx_fma() {
-        // SAFETY: `x` and `y` hold exactly `n` samples, and the CPU has AVX
-        // and FMA (checked just above).
+        // SAFETY: the CPU has AVX and FMA (checked just above).
         return unsafe { inner_prod_avx(x, y, n) };
     }
-    // SAFETY: `x` and `y` hold exactly `n` samples, and SSE is part of the
-    // baseline of x86-64.
+    // SAFETY: SSE is part of the baseline of x86-64 (see the `cfg`).
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         inner_prod_sse(x, y, n)
@@ -234,16 +236,14 @@ pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
 /// libopus `dual_inner_prod_neon`. Other targets without an x86 kernel add
 /// one value at a time, as libopus `dual_inner_prod_c` does.
 pub fn dual_inner_prod(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
-    // As in `inner_prod`: the kernels read `n` samples without a check.
+    // As in `inner_prod`: the kernels take exactly `n` samples of each.
     let (x, y1, y2) = (&x[..n], &y1[..n], &y2[..n]);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if crate::compat::x86_has_avx_fma() {
-        // SAFETY: the three slices hold exactly `n` samples, and the CPU has
-        // AVX and FMA (checked just above).
+        // SAFETY: the CPU has AVX and FMA (checked just above).
         return unsafe { dual_inner_prod_avx(x, y1, y2, n) };
     }
-    // SAFETY: the three slices hold exactly `n` samples, and SSE is part of
-    // the baseline of x86-64.
+    // SAFETY: SSE is part of the baseline of x86-64 (see the `cfg`).
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         dual_inner_prod_sse(x, y1, y2, n)
@@ -275,23 +275,18 @@ pub fn pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitc
     if max_pitch == 0 {
         return;
     }
-    // The vector kernels read `len` samples of `x` through pointers without
-    // a check, so its length is checked here.
+    // The kernels take exactly `len` samples of `x`, so a short `x` panics
+    // here. `y` holds `len + max_pitch - 1` samples (`max_pitch` was limited
+    // to that above).
     let x = &x[..len];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if crate::compat::x86_has_avx_fma() {
-        // SAFETY: `x` holds exactly `len` samples and `y` at least
-        // `len + max_pitch - 1` (`max_pitch` was limited to that above).
-        // `xcorr` is written with index checks. The CPU has AVX and FMA
-        // (checked just above).
+        // SAFETY: the CPU has AVX and FMA (checked just above).
         return unsafe { pitch_xcorr_avx(x, y, xcorr, len, max_pitch) };
     }
     #[cfg(target_arch = "aarch64")]
     pitch_xcorr_neon(x, y, &mut xcorr[..max_pitch]);
-    // SAFETY: `x` holds exactly `len` samples and `y` at least
-    // `len + max_pitch - 1` (`max_pitch` was limited to that above).
-    // `xcorr` is written with index checks. SSE is part of the baseline of
-    // x86-64.
+    // SAFETY: SSE is part of the baseline of x86-64 (see the `cfg`).
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         pitch_xcorr_sse(x, y, xcorr, len, max_pitch)
@@ -1085,7 +1080,8 @@ fn pitch_xcorr_neon(x: &[f32], y: &[f32], xcorr: &mut [f32]) {
 
     if lags == 5 {
         // The autocorrelation of `pitch_downsample`.
-        xcorr5_neon(x, y, xcorr);
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        unsafe { xcorr5_neon(x, y, xcorr) };
         return;
     }
     let by_sample = lags & !3;
@@ -1135,78 +1131,83 @@ fn xcorr_by_sample_groups_neon(x: &[f32], y: &[f32], grouped: &mut [f32]) {
 /// `len` is `x.len()`. Panics unless `y` holds `len + 4` samples and `xcorr`
 /// holds 5 lags.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 fn xcorr5_neon(x: &[f32], y: &[f32], xcorr: &mut [f32]) {
+    use crate::simd_mem::neon::{load_f32x4, store_f32x4};
+    use crate::simd_mem::{array_at, array_at_mut};
     use core::arch::aarch64::*;
 
     let len = x.len();
     let y = &y[..len + 4];
     let xcorr = &mut xcorr[..5];
-    // SAFETY: `x` holds `len` samples and `y` len + 4 (sliced above). The
-    // four-sample loop reads x[j..j + 4] and y[j + t..][..4] for t <= 4, with
-    // j + 4 <= len, which ends at y[j + 7] <= y[len + 3]. The one-sample loop
-    // reads x[j] and y[j..j + 4] with j < len, which ends at y[len + 2].
-    unsafe {
-        let (xp, yp) = (x.as_ptr(), y.as_ptr());
-        let mut by_sample = vdupq_n_f32(0.0);
-        let mut lag4 = vdupq_n_f32(0.0);
-        let mut j = 0;
-        while j + 4 <= len {
-            let xv = vld1q_f32(xp.add(j));
-            let w = yp.add(j);
-            let mut s = by_sample;
-            s = vfmaq_laneq_f32::<0>(s, vld1q_f32(w), xv);
-            s = vfmaq_laneq_f32::<1>(s, vld1q_f32(w.add(1)), xv);
-            s = vfmaq_laneq_f32::<2>(s, vld1q_f32(w.add(2)), xv);
-            s = vfmaq_laneq_f32::<3>(s, vld1q_f32(w.add(3)), xv);
-            by_sample = s;
-            lag4 = vfmaq_f32(lag4, xv, vld1q_f32(w.add(4)));
-            j += 4;
-        }
-        let mut lag4 = lanes_sum(lag4);
-        while j < len {
-            let xj = *xp.add(j);
-            by_sample = vfmaq_f32(by_sample, vld1q_f32(yp.add(j)), vdupq_n_f32(xj));
-            lag4 = mac(lag4, xj, *yp.add(j + 4));
-            j += 1;
-        }
-        vst1q_f32(xcorr.as_mut_ptr(), by_sample);
-        xcorr[4] = lag4;
+    let (x4, x_tail) = x.as_chunks::<4>();
+    // `w(t)` yields y[j + t..j + t + 4] for the groups x[j..j + 4] of `x4`.
+    let w = |t: usize| y[t..].as_chunks::<4>().0[..x4.len()].iter();
+    let mut by_sample = vdupq_n_f32(0.0);
+    let mut lag4 = vdupq_n_f32(0.0);
+    let groups = x4.iter().zip(w(0)).zip(w(1)).zip(w(2)).zip(w(3)).zip(w(4));
+    for (((((xa, w0), w1), w2), w3), w4) in groups {
+        let xv = load_f32x4(xa);
+        let mut s = by_sample;
+        s = vfmaq_laneq_f32::<0>(s, load_f32x4(w0), xv);
+        s = vfmaq_laneq_f32::<1>(s, load_f32x4(w1), xv);
+        s = vfmaq_laneq_f32::<2>(s, load_f32x4(w2), xv);
+        s = vfmaq_laneq_f32::<3>(s, load_f32x4(w3), xv);
+        by_sample = s;
+        lag4 = vfmaq_f32(lag4, xv, load_f32x4(w4));
     }
+    let mut lag4 = lanes_sum(lag4);
+    // The last `len % 4` samples x[j], each with y[j..j + 5].
+    let done = len - x_tail.len();
+    for (&xj, w) in x_tail.iter().zip(y[done..].windows(5)) {
+        by_sample = vfmaq_f32(by_sample, load_f32x4(array_at(w, 0)), vdupq_n_f32(xj));
+        lag4 = mac(lag4, xj, w[4]);
+    }
+    store_f32x4(array_at_mut(xcorr, 0), by_sample);
+    xcorr[4] = lag4;
 }
 
-/// # Safety
+/// This crate's SSE kernel of `inner_prod`: the sum of `x[i] * y[i]` for
+/// `i < n`, in two running sums of four lanes.
 ///
-/// `x` and `y` must hold at least `n` samples each, and the CPU must have the
-/// features this function is compiled for.
+/// Panics when `x` or `y` holds fewer than `n` samples.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn inner_prod_sse(x: &[f32], y: &[f32], n: usize) -> f32 {
+#[target_feature(enable = "sse")]
+#[inline]
+fn inner_prod_sse(x: &[f32], y: &[f32], n: usize) -> f32 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::load_f32x4;
     assert!(x.len() >= n && y.len() >= n);
 
+    // Groups of four samples, two groups per step.
+    let (x4, x_tail) = x[..n].as_chunks::<4>();
+    let (y4, y_tail) = y[..n].as_chunks::<4>();
+    let (x8, x4) = x4.as_chunks::<2>();
+    let (y8, y4) = y4.as_chunks::<2>();
     let mut sum0 = _mm_setzero_ps();
     let mut sum1 = _mm_setzero_ps();
-    let mut i = 0;
 
-    while i + 8 <= n {
-        let x0 = _mm_loadu_ps(x.as_ptr().add(i));
-        let y0 = _mm_loadu_ps(y.as_ptr().add(i));
+    // The slices are taken apart from the front, one step at a time:
+    // the loop has one counter and no index check.
+    let (mut xs, mut ys) = (x8, &y8[..x8.len()]);
+    while let ([xa, x_rest @ ..], [ya, y_rest @ ..]) = (xs, ys) {
+        let x0 = load_f32x4(&xa[0]);
+        let y0 = load_f32x4(&ya[0]);
         sum0 = _mm_add_ps(sum0, _mm_mul_ps(x0, y0));
-        let x1 = _mm_loadu_ps(x.as_ptr().add(i + 4));
-        let y1 = _mm_loadu_ps(y.as_ptr().add(i + 4));
+        let x1 = load_f32x4(&xa[1]);
+        let y1 = load_f32x4(&ya[1]);
         sum1 = _mm_add_ps(sum1, _mm_mul_ps(x1, y1));
-        i += 8;
+        (xs, ys) = (x_rest, y_rest);
     }
 
-    if i + 4 <= n {
-        let x0 = _mm_loadu_ps(x.as_ptr().add(i));
-        let y0 = _mm_loadu_ps(y.as_ptr().add(i));
+    // The group of four that is left, if there is one.
+    if let ([xa], [ya]) = (x4, y4) {
+        let x0 = load_f32x4(xa);
+        let y0 = load_f32x4(ya);
         sum0 = _mm_add_ps(sum0, _mm_mul_ps(x0, y0));
-        i += 4;
     }
 
     let sum = _mm_add_ps(sum0, sum1);
@@ -1216,22 +1217,21 @@ unsafe fn inner_prod_sse(x: &[f32], y: &[f32], n: usize) -> f32 {
     let sum = _mm_add_ss(sum, tmp2);
     let mut result = _mm_cvtss_f32(sum);
 
-    while i < n {
-        result += x[i] * y[i];
-        i += 1;
+    for (&a, &b) in x_tail.iter().zip(y_tail) {
+        result += a * b;
     }
 
     result
 }
 
-/// # Safety
+/// This crate's SSE kernel of `dual_inner_prod`: the inner products of `x`
+/// with `y1` and with `y2` over `n` samples.
 ///
-/// `x`, `y1` and `y2` must hold at least `n` samples each, and the CPU must
-/// have the features this function is compiled for.
+/// Panics when `x`, `y1` or `y2` holds fewer than `n` samples.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
+#[target_feature(enable = "sse")]
+#[inline]
+fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -1242,13 +1242,21 @@ unsafe fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
     let mut xy2 = _mm_setzero_ps();
     let mut i = 0;
 
-    while i + 4 <= n {
-        let xi = _mm_loadu_ps(x.as_ptr().add(i));
-        let y1i = _mm_loadu_ps(y1.as_ptr().add(i));
-        let y2i = _mm_loadu_ps(y2.as_ptr().add(i));
-        xy1 = _mm_add_ps(xy1, _mm_mul_ps(xi, y1i));
-        xy2 = _mm_add_ps(xy2, _mm_mul_ps(xi, y2i));
-        i += 4;
+    // The loop keeps the pointer loads of the original code: with the
+    // groups of four taken from `as_chunks`, the compiler counted the steps
+    // with an extra compare.
+    // SAFETY: each load reads `x`, `y1` or `y2` at `i..i + 4` with
+    // `i + 4 <= n`, and all three hold at least `n` samples (checked
+    // above).
+    unsafe {
+        while i + 4 <= n {
+            let xi = _mm_loadu_ps(x.as_ptr().add(i));
+            let y1i = _mm_loadu_ps(y1.as_ptr().add(i));
+            let y2i = _mm_loadu_ps(y2.as_ptr().add(i));
+            xy1 = _mm_add_ps(xy1, _mm_mul_ps(xi, y1i));
+            xy2 = _mm_add_ps(xy2, _mm_mul_ps(xi, y2i));
+            i += 4;
+        }
     }
 
     let tmp = _mm_movehl_ps(xy1, xy1);
@@ -1272,31 +1280,40 @@ unsafe fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
     (s1, s2)
 }
 
-/// # Safety
+/// This crate's SSE kernel of four lags of `pitch_xcorr`: adds
+/// `sum over j < len of x[j] * y[j + k]` to `sum[k]` for `k < 4`.
 ///
-/// `x` must hold at least `len` samples and `y` at least `len + 3`, and the
-/// CPU must have the features this function is compiled for. The loads read
-/// up to `y[len + 2]`.
+/// Panics unless `x` holds at least `len` samples and `y` at least
+/// `len + 3`. The loads read up to `y[len + 2]`.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn xcorr_kernel_sse(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize) {
+#[target_feature(enable = "sse")]
+#[inline]
+fn xcorr_kernel_sse(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::array_at;
+    use crate::simd_mem::x86::{load_f32x4, store_f32x4};
     // The loads read `x[..len]` and `y[..len + 3]`.
     assert!(x.len() >= len && y.len() >= len + 3);
 
-    let mut xsum1 = _mm_loadu_ps(sum.as_ptr());
+    // For the groups x[j..j + 4]: y[j..j + 4] and y[j + 3..j + 7].
+    let (x4, x_tail) = x[..len].as_chunks::<4>();
+    let y0 = y[..len].as_chunks::<4>().0;
+    let y3 = y[3..len + 3].as_chunks::<4>().0;
+
+    let mut xsum1 = load_f32x4(sum);
     let mut xsum2 = _mm_setzero_ps();
 
-    let mut j = 0;
-
-    while j + 4 <= len {
-        let x0 = _mm_loadu_ps(x.as_ptr().add(j));
-        let yj = _mm_loadu_ps(y.as_ptr().add(j));
-        let y3 = _mm_loadu_ps(y.as_ptr().add(j + 3));
+    // The slices are taken apart from the front, one step at a time:
+    // the loop has one counter and no index check.
+    let (mut xs, mut y0s, mut y3s) = (x4, &y0[..x4.len()], &y3[..x4.len()]);
+    while let ([xa, x_rest @ ..], [ya, y0_rest @ ..], [yb, y3_rest @ ..]) = (xs, y0s, y3s) {
+        (xs, y0s, y3s) = (x_rest, y0_rest, y3_rest);
+        let x0 = load_f32x4(xa);
+        let yj = load_f32x4(ya);
+        let y3 = load_f32x4(yb);
 
         xsum1 = _mm_add_ps(xsum1, _mm_mul_ps(_mm_shuffle_ps(x0, x0, 0x00), yj));
 
@@ -1311,52 +1328,31 @@ unsafe fn xcorr_kernel_sse(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
         );
 
         xsum2 = _mm_add_ps(xsum2, _mm_mul_ps(_mm_shuffle_ps(x0, x0, 0xff), y3));
-
-        j += 4;
     }
 
-    if j < len {
-        xsum1 = _mm_add_ps(
-            xsum1,
-            _mm_mul_ps(
-                _mm_set1_ps(*x.as_ptr().add(j)),
-                _mm_loadu_ps(y.as_ptr().add(j)),
-            ),
-        );
-        j += 1;
-        if j < len {
-            xsum2 = _mm_add_ps(
-                xsum2,
-                _mm_mul_ps(
-                    _mm_set1_ps(*x.as_ptr().add(j)),
-                    _mm_loadu_ps(y.as_ptr().add(j)),
-                ),
-            );
-            j += 1;
-            if j < len {
-                xsum1 = _mm_add_ps(
-                    xsum1,
-                    _mm_mul_ps(
-                        _mm_set1_ps(*x.as_ptr().add(j)),
-                        _mm_loadu_ps(y.as_ptr().add(j)),
-                    ),
-                );
-            }
+    // The last `len % 4` samples x[j], each with y[j..j + 4], into the two
+    // sums in turn.
+    let done = len - x_tail.len();
+    for (k, (&xj, w)) in x_tail.iter().zip(y[done..].windows(4)).enumerate() {
+        let v = _mm_mul_ps(_mm_set1_ps(xj), load_f32x4(array_at(w, 0)));
+        if k % 2 == 0 {
+            xsum1 = _mm_add_ps(xsum1, v);
+        } else {
+            xsum2 = _mm_add_ps(xsum2, v);
         }
     }
 
-    _mm_storeu_ps(sum.as_mut_ptr(), _mm_add_ps(xsum1, xsum2));
+    store_f32x4(sum, _mm_add_ps(xsum1, xsum2));
 }
 
-/// # Safety
+/// This crate's SSE kernel of `pitch_xcorr`.
 ///
-/// `x` must hold at least `len` samples and `y` at least
-/// `len + max_pitch - 1`, and the CPU must have the features this function is
-/// compiled for. `xcorr` is written with index checks.
+/// Panics unless `x` holds at least `len` samples and `y` at least
+/// `len + max_pitch - 1`. `xcorr` is written with index checks.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn pitch_xcorr_sse(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
+#[target_feature(enable = "sse")]
+#[inline]
+fn pitch_xcorr_sse(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
     // Lag `i` reads `y[i..i + len + 3]` for `i + 4 <= max_pitch`.
     assert!(x.len() >= len && y.len() + 1 >= len + max_pitch);
     let mut i = 0;
@@ -1376,13 +1372,13 @@ unsafe fn pitch_xcorr_sse(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, m
     }
 }
 
-/// # Safety
+/// This crate's AVX kernel of `inner_prod`: the sum of `x[i] * y[i]` for
+/// `i < n`, in two running sums of eight lanes.
 ///
-/// `x` and `y` must hold at least `n` samples each, and the CPU must have the
-/// features this function is compiled for.
+/// Panics when `x` or `y` holds fewer than `n` samples.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
-unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
+fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -1394,22 +1390,30 @@ unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
     let mut acc1 = _mm256_setzero_ps();
     let mut i = 0usize;
 
-    while i + 16 <= n {
-        let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
-        acc0 = _mm256_fmadd_ps(x0, y0, acc0);
+    // The loops keep the pointer loads of the original code: with the
+    // groups of eight taken from `as_chunks`, the compiler counted the
+    // steps with an extra compare.
+    // SAFETY: each load reads `x` or `y` at `i..i + 8` or `i + 8..i + 16`
+    // with `i + 8 <= n` or `i + 16 <= n`, and both hold at least `n`
+    // samples (checked above).
+    unsafe {
+        while i + 16 <= n {
+            let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
+            let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
+            acc0 = _mm256_fmadd_ps(x0, y0, acc0);
 
-        let x1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        let y1 = _mm256_loadu_ps(y.as_ptr().add(i + 8));
-        acc1 = _mm256_fmadd_ps(x1, y1, acc1);
-        i += 16;
-    }
+            let x1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+            let y1 = _mm256_loadu_ps(y.as_ptr().add(i + 8));
+            acc1 = _mm256_fmadd_ps(x1, y1, acc1);
+            i += 16;
+        }
 
-    while i + 8 <= n {
-        let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
-        acc0 = _mm256_fmadd_ps(x0, y0, acc0);
-        i += 8;
+        while i + 8 <= n {
+            let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
+            let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
+            acc0 = _mm256_fmadd_ps(x0, y0, acc0);
+            i += 8;
+        }
     }
 
     let acc = _mm256_add_ps(acc0, acc1);
@@ -1429,47 +1433,57 @@ unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
     result
 }
 
-/// # Safety
+/// This crate's AVX kernel of `dual_inner_prod`: the inner products of `x`
+/// with `y1` and with `y2` over `n` samples.
 ///
-/// `x`, `y1` and `y2` must hold at least `n` samples each, and the CPU must
-/// have the features this function is compiled for.
+/// Panics when `x`, `y1` or `y2` holds fewer than `n` samples.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
-unsafe fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
+fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::load_f32x8;
 
     assert!(x.len() >= n && y1.len() >= n && y2.len() >= n);
 
+    // Groups of eight samples, two groups per step.
+    let (x8, x_tail) = x[..n].as_chunks::<8>();
+    let (y18, y1_tail) = y1[..n].as_chunks::<8>();
+    let (y28, y2_tail) = y2[..n].as_chunks::<8>();
+    let (x16, x8) = x8.as_chunks::<2>();
+    let (y116, y18) = y18.as_chunks::<2>();
+    let (y216, y28) = y28.as_chunks::<2>();
     let mut acc1 = _mm256_setzero_ps();
     let mut acc2 = _mm256_setzero_ps();
     let mut acc1b = _mm256_setzero_ps();
     let mut acc2b = _mm256_setzero_ps();
-    let mut i = 0usize;
 
-    while i + 16 <= n {
-        let xv0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let xv1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        let y1v0 = _mm256_loadu_ps(y1.as_ptr().add(i));
-        let y2v0 = _mm256_loadu_ps(y2.as_ptr().add(i));
-        let y1v1 = _mm256_loadu_ps(y1.as_ptr().add(i + 8));
-        let y2v1 = _mm256_loadu_ps(y2.as_ptr().add(i + 8));
+    // The slices are taken apart from the front, one step at a time:
+    // the loop has one counter and no index check.
+    let (mut xs, mut y1s, mut y2s) = (x16, &y116[..x16.len()], &y216[..x16.len()]);
+    while let ([xa, x_rest @ ..], [y1a, y1_rest @ ..], [y2a, y2_rest @ ..]) = (xs, y1s, y2s) {
+        (xs, y1s, y2s) = (x_rest, y1_rest, y2_rest);
+        let xv0 = load_f32x8(&xa[0]);
+        let xv1 = load_f32x8(&xa[1]);
+        let y1v0 = load_f32x8(&y1a[0]);
+        let y2v0 = load_f32x8(&y2a[0]);
+        let y1v1 = load_f32x8(&y1a[1]);
+        let y2v1 = load_f32x8(&y2a[1]);
         acc1 = _mm256_fmadd_ps(xv0, y1v0, acc1);
         acc2 = _mm256_fmadd_ps(xv0, y2v0, acc2);
         acc1b = _mm256_fmadd_ps(xv1, y1v1, acc1b);
         acc2b = _mm256_fmadd_ps(xv1, y2v1, acc2b);
-        i += 16;
     }
 
-    while i + 8 <= n {
-        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
-        let y1v = _mm256_loadu_ps(y1.as_ptr().add(i));
-        let y2v = _mm256_loadu_ps(y2.as_ptr().add(i));
+    // The group of eight that is left, if there is one.
+    if let ([xa], [y1a], [y2a]) = (x8, y18, y28) {
+        let xv = load_f32x8(xa);
+        let y1v = load_f32x8(y1a);
+        let y2v = load_f32x8(y2a);
         acc1 = _mm256_fmadd_ps(xv, y1v, acc1);
         acc2 = _mm256_fmadd_ps(xv, y2v, acc2);
-        i += 8;
     }
 
     let acc1 = _mm256_add_ps(acc1, acc1b);
@@ -1491,23 +1505,21 @@ unsafe fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
     let t22 = _mm_shuffle_ps(s22, s22, 0x55);
     let mut s2 = _mm_cvtss_f32(_mm_add_ss(s22, t22));
 
-    while i < n {
-        s1 += x[i] * y1[i];
-        s2 += x[i] * y2[i];
-        i += 1;
+    for ((&a, &b1), &b2) in x_tail.iter().zip(y1_tail).zip(y2_tail) {
+        s1 += a * b1;
+        s2 += a * b2;
     }
 
     (s1, s2)
 }
 
-/// # Safety
+/// This crate's AVX kernel of `pitch_xcorr`.
 ///
-/// `x` must hold at least `len` samples and `y` at least
-/// `len + max_pitch - 1`, and the CPU must have the features this function is
-/// compiled for. `xcorr` is written with index checks.
+/// Panics unless `x` holds at least `len` samples and `y` at least
+/// `len + max_pitch - 1`. `xcorr` is written with index checks.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
-unsafe fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
+fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
     // Lag `i` reads `y[i..i + len + 3]` for `i + 4 <= max_pitch`.
     assert!(x.len() >= len && y.len() + 1 >= len + max_pitch);
     let mut i = 0;
@@ -1527,31 +1539,45 @@ unsafe fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, m
     }
 }
 
-/// # Safety
+/// This crate's AVX kernel of four lags of `pitch_xcorr`: adds
+/// `sum over j < len of x[j] * y[j + k]` to `sum[k]` for `k < 4`, with
+/// fused multiply-adds.
 ///
-/// `x` must hold at least `len` samples and `y` at least `len + 3`, and the
-/// CPU must have the features this function is compiled for. The loads read
-/// up to `y[len + 2]`.
+/// Panics unless `x` holds at least `len` samples and `y` at least
+/// `len + 3`. The loads read up to `y[len + 2]`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
-unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize) {
+fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize) {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::array_at;
+    use crate::simd_mem::x86::{load_f32x4, store_f32x4};
 
     // The loads read `x[..len]` and `y[..len + 3]`.
     assert!(x.len() >= len && y.len() >= len + 3);
 
-    let mut xsum1 = _mm_loadu_ps(sum.as_ptr());
+    // For the groups x[j..j + 4]: y[j..j + 4] and y[j + 3..j + 7]. Two
+    // groups per step.
+    let (x4, x_tail) = x[..len].as_chunks::<4>();
+    let y0 = y[..len].as_chunks::<4>().0;
+    let y3 = y[3..len + 3].as_chunks::<4>().0;
+    let (x8, x4) = x4.as_chunks::<2>();
+    let (y08, y0) = y0.as_chunks::<2>();
+    let (y38, y3) = y3.as_chunks::<2>();
+
+    let mut xsum1 = load_f32x4(sum);
     let mut xsum2 = _mm_setzero_ps();
 
-    let mut j = 0;
-
-    while j + 8 <= len {
-        let x0 = _mm_loadu_ps(x.as_ptr().add(j));
-        let yj = _mm_loadu_ps(y.as_ptr().add(j));
-        let y3 = _mm_loadu_ps(y.as_ptr().add(j + 3));
+    // The slices are taken apart from the front, one step at a time:
+    // the loop has one counter and no index check.
+    let (mut xs, mut y0s, mut y3s) = (x8, &y08[..x8.len()], &y38[..x8.len()]);
+    while let ([xa, x_rest @ ..], [ya, y0_rest @ ..], [yb, y3_rest @ ..]) = (xs, y0s, y3s) {
+        (xs, y0s, y3s) = (x_rest, y0_rest, y3_rest);
+        let x0 = load_f32x4(&xa[0]);
+        let yj = load_f32x4(&ya[0]);
+        let y3 = load_f32x4(&yb[0]);
 
         xsum1 = _mm_fmadd_ps(_mm_shuffle_ps(x0, x0, 0x00), yj, xsum1);
         xsum2 = _mm_fmadd_ps(
@@ -1566,9 +1592,9 @@ unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
         );
         xsum2 = _mm_fmadd_ps(_mm_shuffle_ps(x0, x0, 0xff), y3, xsum2);
 
-        let x1 = _mm_loadu_ps(x.as_ptr().add(j + 4));
-        let yj4 = _mm_loadu_ps(y.as_ptr().add(j + 4));
-        let y7 = _mm_loadu_ps(y.as_ptr().add(j + 7));
+        let x1 = load_f32x4(&xa[1]);
+        let yj4 = load_f32x4(&ya[1]);
+        let y7 = load_f32x4(&yb[1]);
 
         xsum1 = _mm_fmadd_ps(_mm_shuffle_ps(x1, x1, 0x00), yj4, xsum1);
         xsum2 = _mm_fmadd_ps(
@@ -1582,14 +1608,13 @@ unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
             xsum1,
         );
         xsum2 = _mm_fmadd_ps(_mm_shuffle_ps(x1, x1, 0xff), y7, xsum2);
-
-        j += 8;
     }
 
-    if j + 4 <= len {
-        let x0 = _mm_loadu_ps(x.as_ptr().add(j));
-        let yj = _mm_loadu_ps(y.as_ptr().add(j));
-        let y3 = _mm_loadu_ps(y.as_ptr().add(j + 3));
+    // The group of four that is left, if there is one.
+    if let ([xa], [ya], [yb]) = (x4, y0, y3) {
+        let x0 = load_f32x4(xa);
+        let yj = load_f32x4(ya);
+        let y3 = load_f32x4(yb);
 
         xsum1 = _mm_fmadd_ps(_mm_shuffle_ps(x0, x0, 0x00), yj, xsum1);
         xsum2 = _mm_fmadd_ps(
@@ -1603,35 +1628,21 @@ unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize)
             xsum1,
         );
         xsum2 = _mm_fmadd_ps(_mm_shuffle_ps(x0, x0, 0xff), y3, xsum2);
-
-        j += 4;
     }
 
-    if j < len {
-        xsum1 = _mm_fmadd_ps(
-            _mm_set1_ps(*x.as_ptr().add(j)),
-            _mm_loadu_ps(y.as_ptr().add(j)),
-            xsum1,
-        );
-        j += 1;
-        if j < len {
-            xsum2 = _mm_fmadd_ps(
-                _mm_set1_ps(*x.as_ptr().add(j)),
-                _mm_loadu_ps(y.as_ptr().add(j)),
-                xsum2,
-            );
-            j += 1;
-            if j < len {
-                xsum1 = _mm_fmadd_ps(
-                    _mm_set1_ps(*x.as_ptr().add(j)),
-                    _mm_loadu_ps(y.as_ptr().add(j)),
-                    xsum1,
-                );
-            }
+    // The last `len % 4` samples x[j], each with y[j..j + 4], into the two
+    // sums in turn.
+    let done = len - x_tail.len();
+    for (k, (&xj, w)) in x_tail.iter().zip(y[done..].windows(4)).enumerate() {
+        let yv = load_f32x4(array_at(w, 0));
+        if k % 2 == 0 {
+            xsum1 = _mm_fmadd_ps(_mm_set1_ps(xj), yv, xsum1);
+        } else {
+            xsum2 = _mm_fmadd_ps(_mm_set1_ps(xj), yv, xsum2);
         }
     }
 
-    _mm_storeu_ps(sum.as_mut_ptr(), _mm_add_ps(xsum1, xsum2));
+    store_f32x4(sum, _mm_add_ps(xsum1, xsum2));
 }
 
 /// libopus `pitch_downsample` (celt/pitch.c) of the float build: decimates
@@ -1659,10 +1670,13 @@ pub fn pitch_downsample(x: &[&[f32]], x_lp: &mut [f32], len: usize, c: usize, fa
         && x[..c].iter().all(|x_k| x_k.len() >= 2 * len)
     {
         let mut ac = [0.0f32; 5];
-        if c == 1 {
-            decimate2_autocorr5_neon([x[0]], &mut x_lp[..len], &mut ac);
-        } else {
-            decimate2_autocorr5_neon([x[0], x[1]], &mut x_lp[..len], &mut ac);
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        unsafe {
+            if c == 1 {
+                decimate2_autocorr5_neon([x[0]], &mut x_lp[..len], &mut ac);
+            } else {
+                decimate2_autocorr5_neon([x[0], x[1]], &mut x_lp[..len], &mut ac);
+            }
         }
         flatten_with(&mut x_lp[..len], ac);
         return;
@@ -1778,8 +1792,11 @@ fn flatten_with(x_lp: &mut [f32], mut ac: [f32; 5]) {
 /// before `x[0]` taken as zero and the old values of `x` on the right. The
 /// products are added in that order, each with `mac`.
 fn celt_fir5(x: &mut [f32], num: &[f32; 5]) {
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    celt_fir5_neon(x, num);
+    unsafe {
+        celt_fir5_neon(x, num);
+    }
     #[cfg(not(target_arch = "aarch64"))]
     celt_fir5_scalar(x, num, [0.0; 5]);
 }
@@ -1808,82 +1825,78 @@ fn celt_fir5_scalar(x: &mut [f32], num: &[f32; 5], mut mem: [f32; 5]) {
 /// instructions in program order, such as the Cortex-A55, then has three
 /// other multiply-adds to issue while each one finishes.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 fn celt_fir5_neon(x: &mut [f32], num: &[f32; 5]) {
+    use crate::simd_mem::neon::{load_f32x4, store_f32x4};
     use core::arch::aarch64::*;
 
-    let n = x.len();
-    let blocks = n / 4;
-    // SAFETY: block `b` reads and writes x[4b..4b + 4] with 4b + 4 <= n. The
-    // inputs of the samples before a block are kept in registers, and a step
-    // loads all its blocks before it stores any, so every load reads an
-    // input that has not been overwritten yet.
-    unsafe {
-        let p = x.as_mut_ptr();
-        let taps = [
-            vdupq_n_f32(num[0]),
-            vdupq_n_f32(num[1]),
-            vdupq_n_f32(num[2]),
-            vdupq_n_f32(num[3]),
-            vdupq_n_f32(num[4]),
+    // Blocks of four samples, and steps of four blocks. Each block is read
+    // and written in place. The inputs of the samples before a block are
+    // kept in registers, and a step loads all its blocks before it stores
+    // any, so every load reads an input that has not been overwritten yet.
+    let (blocks, x_tail) = x.as_chunks_mut::<4>();
+    let (steps, blocks) = blocks.as_chunks_mut::<4>();
+    let taps = [
+        vdupq_n_f32(num[0]),
+        vdupq_n_f32(num[1]),
+        vdupq_n_f32(num[2]),
+        vdupq_n_f32(num[3]),
+        vdupq_n_f32(num[4]),
+    ];
+    // x[i - 1 - k] for the four outputs i of the block `cur`, for k from
+    // 0 to 4. `prev` and `prev2` are the inputs of the two blocks before.
+    let delayed = |prev2: float32x4_t, prev: float32x4_t, cur: float32x4_t| {
+        [
+            vextq_f32::<3>(prev, cur),
+            vextq_f32::<2>(prev, cur),
+            vextq_f32::<1>(prev, cur),
+            prev,
+            vextq_f32::<3>(prev2, prev),
+        ]
+    };
+    // The inputs of the two blocks before this one; zero before x[0].
+    let mut prev2 = vdupq_n_f32(0.0);
+    let mut prev = vdupq_n_f32(0.0);
+    for step in steps.iter_mut() {
+        let cur: [float32x4_t; 4] = core::array::from_fn(|k| load_f32x4(&step[k]));
+        let m = [
+            delayed(prev2, prev, cur[0]),
+            delayed(prev, cur[0], cur[1]),
+            delayed(cur[0], cur[1], cur[2]),
+            delayed(cur[1], cur[2], cur[3]),
         ];
-        // x[i - 1 - k] for the four outputs i of the block `cur`, for k from
-        // 0 to 4. `prev` and `prev2` are the inputs of the two blocks before.
-        let delayed = |prev2: float32x4_t, prev: float32x4_t, cur: float32x4_t| {
-            [
-                vextq_f32::<3>(prev, cur),
-                vextq_f32::<2>(prev, cur),
-                vextq_f32::<1>(prev, cur),
-                prev,
-                vextq_f32::<3>(prev2, prev),
-            ]
-        };
-        // The inputs of the two blocks before this one; zero before x[0].
-        let mut prev2 = vdupq_n_f32(0.0);
-        let mut prev = vdupq_n_f32(0.0);
-        let mut b = 0;
-        while b + 4 <= blocks {
-            let cur: [float32x4_t; 4] = core::array::from_fn(|k| vld1q_f32(p.add(4 * (b + k))));
-            let m = [
-                delayed(prev2, prev, cur[0]),
-                delayed(prev, cur[0], cur[1]),
-                delayed(cur[0], cur[1], cur[2]),
-                delayed(cur[1], cur[2], cur[3]),
-            ];
-            let mut sum = cur;
-            for (tap, &t) in taps.iter().enumerate() {
-                for k in 0..4 {
-                    sum[k] = vfmaq_f32(sum[k], t, m[k][tap]);
-                }
+        let mut sum = cur;
+        for (tap, &t) in taps.iter().enumerate() {
+            for k in 0..4 {
+                sum[k] = vfmaq_f32(sum[k], t, m[k][tap]);
             }
-            for (k, s) in sum.iter().enumerate() {
-                vst1q_f32(p.add(4 * (b + k)), *s);
-            }
-            prev2 = cur[2];
-            prev = cur[3];
-            b += 4;
         }
-        while b < blocks {
-            let cur = vld1q_f32(p.add(4 * b));
-            let m = delayed(prev2, prev, cur);
-            let mut sum = cur;
-            for (&t, &d) in taps.iter().zip(&m) {
-                sum = vfmaq_f32(sum, t, d);
-            }
-            vst1q_f32(p.add(4 * b), sum);
-            prev2 = prev;
-            prev = cur;
-            b += 1;
+        for (block, s) in step.iter_mut().zip(&sum) {
+            store_f32x4(block, *s);
         }
-        // The history of the last samples: the five inputs before x[4 * blocks].
-        let mem = [
-            vgetq_lane_f32::<3>(prev),
-            vgetq_lane_f32::<2>(prev),
-            vgetq_lane_f32::<1>(prev),
-            vgetq_lane_f32::<0>(prev),
-            vgetq_lane_f32::<3>(prev2),
-        ];
-        celt_fir5_scalar(&mut x[4 * blocks..], num, mem);
+        prev2 = cur[2];
+        prev = cur[3];
     }
+    for block in blocks.iter_mut() {
+        let cur = load_f32x4(block);
+        let m = delayed(prev2, prev, cur);
+        let mut sum = cur;
+        for (&t, &d) in taps.iter().zip(&m) {
+            sum = vfmaq_f32(sum, t, d);
+        }
+        store_f32x4(block, sum);
+        prev2 = prev;
+        prev = cur;
+    }
+    // The history of the last samples: the five inputs before them.
+    let mem = [
+        vgetq_lane_f32::<3>(prev),
+        vgetq_lane_f32::<2>(prev),
+        vgetq_lane_f32::<1>(prev),
+        vgetq_lane_f32::<0>(prev),
+        vgetq_lane_f32::<3>(prev2),
+    ];
+    celt_fir5_scalar(x_tail, num, mem);
 }
 
 /// Decimation by two with the low-pass filter (0.25, 0.5, 0.25), summed over
@@ -1895,8 +1908,11 @@ fn celt_fir5_neon(x: &mut [f32], num: &[f32; 5]) {
 /// `2 * out.len()` samples.
 #[inline(always)]
 fn decimate2<const C: usize>(x: [&[f32]; C], out: &mut [f32]) {
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    decimate2_neon(x, out);
+    unsafe {
+        decimate2_neon(x, out);
+    }
     #[cfg(not(target_arch = "aarch64"))]
     decimate2_scalar(x, out);
 }
@@ -1923,47 +1939,48 @@ fn decimate2_scalar<const C: usize>(x: [&[f32]; C], out: &mut [f32]) {
 /// NEON version of `decimate2`: four outputs per pass, with the same
 /// operations per output as `decimate2_scalar`.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[target_feature(enable = "neon")]
+#[inline]
 fn decimate2_neon<const C: usize>(x: [&[f32]; C], out: &mut [f32]) {
+    use crate::simd_mem::neon::{load2_f32x4, load_dup_f32x4, store_f32x4};
     use core::arch::aarch64::*;
 
     let n = out.len();
-    // Checked here once, so that the loads below need no check.
     assert!(x.iter().all(|x_k| x_k.len() >= 2 * n));
     let mut i = 1;
     if n >= 5 {
-        // SAFETY: a pass at output `i` runs only when i + 4 <= n. It reads
-        // x_k[2i..2i + 8], which ends at 2n - 1 at most, and writes
-        // out[i..i + 4]. Before the loop x_k[1] is read; n >= 5 means the
-        // channel has at least 10 samples.
-        unsafe {
-            let quarter = vdupq_n_f32(0.25);
-            let half = vdupq_n_f32(0.5);
-            // x[2i + 1] of the pass before. Its last lane is x[2i - 1] for
-            // the first output of this pass.
-            let mut odd_prev = [vdupq_n_f32(0.0); C];
-            for (o, x_k) in odd_prev.iter_mut().zip(&x) {
-                *o = vld1q_dup_f32(x_k.as_ptr().add(1));
-            }
-            while i + 4 <= n {
-                let mut val = vdupq_n_f32(0.0);
-                for (k, (o, x_k)) in odd_prev.iter_mut().zip(&x).enumerate() {
-                    // .0 = x[2i], x[2i + 2], ..; .1 = x[2i + 1], x[2i + 3], ..
-                    let pair = vld2q_f32(x_k.as_ptr().add(2 * i));
-                    // x[2i - 1], x[2i + 1], x[2i + 3], x[2i + 5]
-                    let before = vextq_f32::<3>(*o, pair.1);
-                    let v = vfmaq_f32(
-                        vfmaq_f32(vmulq_f32(pair.1, quarter), before, quarter),
-                        pair.0,
-                        half,
-                    );
-                    val = if k == 0 { v } else { vaddq_f32(val, v) };
-                    *o = pair.1;
-                }
-                vst1q_f32(out.as_mut_ptr().add(i), val);
-                i += 4;
-            }
+        let quarter = vdupq_n_f32(0.25);
+        let half = vdupq_n_f32(0.5);
+        // One pass per four outputs out[i..i + 4] with i + 4 <= n, from
+        // i = 1 on. A pass reads x_k[2i..2i + 8], which ends at 2n - 1 at
+        // most.
+        let (passes, _) = out[1..].as_chunks_mut::<4>();
+        let x8: [&[[f32; 8]]; C] = x.map(|x_k| &x_k[2..].as_chunks::<8>().0[..passes.len()]);
+        // x[2i + 1] of the pass before. Its last lane is x[2i - 1] for
+        // the first output of this pass. n >= 5 means the channel has at
+        // least 10 samples.
+        let mut odd_prev = [vdupq_n_f32(0.0); C];
+        for (o, x_k) in odd_prev.iter_mut().zip(&x) {
+            *o = load_dup_f32x4(&x_k[1]);
         }
+        for p in 0..passes.len() {
+            let mut val = vdupq_n_f32(0.0);
+            for (k, (o, x_k)) in odd_prev.iter_mut().zip(&x8).enumerate() {
+                // .0 = x[2i], x[2i + 2], ..; .1 = x[2i + 1], x[2i + 3], ..
+                let pair = load2_f32x4(&x_k[p]);
+                // x[2i - 1], x[2i + 1], x[2i + 3], x[2i + 5]
+                let before = vextq_f32::<3>(*o, pair.1);
+                let v = vfmaq_f32(
+                    vfmaq_f32(vmulq_f32(pair.1, quarter), before, quarter),
+                    pair.0,
+                    half,
+                );
+                val = if k == 0 { v } else { vaddq_f32(val, v) };
+                *o = pair.1;
+            }
+            store_f32x4(&mut passes[p], val);
+        }
+        i += 4 * passes.len();
     }
     // The last outputs: the same formula on the samples from 2 * (i - 1) on,
     // where output `i` is the second one.
@@ -1984,105 +2001,107 @@ fn decimate2_neon<const C: usize>(x: [&[f32]; C], out: &mut [f32]) {
 /// channel. Panics unless `x_lp` holds 8 samples or more and every channel
 /// `2 * x_lp.len()`.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 fn decimate2_autocorr5_neon<const C: usize>(x: [&[f32]; C], x_lp: &mut [f32], ac: &mut [f32; 5]) {
+    use crate::simd_mem::neon::{load2_f32x4, load_f32x4, store_f32x4};
+    use crate::simd_mem::{array_at, array_at_mut};
     use core::arch::aarch64::*;
 
     let n = x_lp.len();
     assert!(n >= 8 && x.iter().all(|x_k| x_k.len() >= 2 * n));
-    let blocks = n / 4;
-    let out = x_lp.as_mut_ptr();
+    // Block `m` writes x_lp[4m..4m + 4] from x_k[8m..8m + 8]. Every channel
+    // holds at least 16 samples.
+    let (out, x_lp_tail) = x_lp.as_chunks_mut::<4>();
+    let blocks = out.len();
+    let x8: [&[[f32; 8]]; C] = x.map(|x_k| &x_k.as_chunks::<8>().0[..blocks]);
 
-    // SAFETY: block `m < blocks` reads x_k[8m..8m + 8] with 8m + 8 <= 2n and
-    // writes x_lp[4m..4m + 4] with 4m + 4 <= n. Before the loop x_k[0] and
-    // x_k[1] are read; every channel holds at least 16 samples.
-    unsafe {
-        let quarter = vdupq_n_f32(0.25);
-        let half = vdupq_n_f32(0.5);
-        // x[8m - 1] in lane 3, for the first output of block m.
-        let mut odd_prev = [vdupq_n_f32(0.0); C];
-        let block = |m: usize, odd_prev: &mut [float32x4_t; C]| {
-            let mut val = vdupq_n_f32(0.0);
-            for (k, (o, x_k)) in odd_prev.iter_mut().zip(&x).enumerate() {
-                // .0 = x[8m], x[8m + 2], ..; .1 = x[8m + 1], x[8m + 3], ..
-                let pair = vld2q_f32(x_k.as_ptr().add(8 * m));
-                let before = vextq_f32::<3>(*o, pair.1);
-                let v = vfmaq_f32(
-                    vfmaq_f32(vmulq_f32(pair.1, quarter), before, quarter),
-                    pair.0,
-                    half,
-                );
-                val = if k == 0 { v } else { vaddq_f32(val, v) };
-                *o = pair.1;
-            }
-            val
-        };
-
-        // Block 0, whose first output has no sample before it.
-        let mut first = 0.0f32;
-        for (k, x_k) in x.iter().enumerate() {
-            let v = mac(0.5 * x_k[0], x_k[1], 0.25);
-            first = if k == 0 { v } else { first + v };
+    let quarter = vdupq_n_f32(0.25);
+    let half = vdupq_n_f32(0.5);
+    // x[8m - 1] in lane 3, for the first output of block m.
+    let mut odd_prev = [vdupq_n_f32(0.0); C];
+    let block = |m: usize, odd_prev: &mut [float32x4_t; C]| {
+        let mut val = vdupq_n_f32(0.0);
+        for (k, (o, x_k)) in odd_prev.iter_mut().zip(&x8).enumerate() {
+            // .0 = x[8m], x[8m + 2], ..; .1 = x[8m + 1], x[8m + 3], ..
+            let pair = load2_f32x4(&x_k[m]);
+            let before = vextq_f32::<3>(*o, pair.1);
+            let v = vfmaq_f32(
+                vfmaq_f32(vmulq_f32(pair.1, quarter), before, quarter),
+                pair.0,
+                half,
+            );
+            val = if k == 0 { v } else { vaddq_f32(val, v) };
+            *o = pair.1;
         }
-        let mut cur = vsetq_lane_f32::<0>(first, block(0, &mut odd_prev));
-        vst1q_f32(out, cur);
+        val
+    };
 
-        // Step `m` adds the products of the samples 4(m - 1) to 4m - 1 to
-        // the autocorrelation: lags 0 to 3 by sample, lag 4 in four lanes as
-        // `celt_inner_prod`. The last of these samples is fast_n - 1 = n - 5
-        // or before. It needs the blocks m - 1 (`cur`) and m (`next`).
-        //
-        // The four multiply-adds of lags 0 to 3 wait for each other. So step
-        // `m` also decimates block m + 1, which the step after it needs: that
-        // work does not depend on the chain, and a core that runs the
-        // instructions in program order can do it while the chain waits.
-        let mut by_sample = vdupq_n_f32(0.0);
-        let mut lag4 = vdupq_n_f32(0.0);
-        let step = |by_sample: &mut float32x4_t,
-                    lag4: &mut float32x4_t,
-                    cur: float32x4_t,
-                    next: float32x4_t| {
-            let mut s = *by_sample;
-            s = vfmaq_laneq_f32::<0>(s, cur, cur);
-            s = vfmaq_laneq_f32::<1>(s, vextq_f32::<1>(cur, next), cur);
-            s = vfmaq_laneq_f32::<2>(s, vextq_f32::<2>(cur, next), cur);
-            s = vfmaq_laneq_f32::<3>(s, vextq_f32::<3>(cur, next), cur);
-            *by_sample = s;
-            *lag4 = vfmaq_f32(*lag4, cur, next);
-        };
-        // `blocks` is 2 or more, because n >= 8.
-        let mut next = block(1, &mut odd_prev);
-        vst1q_f32(out.add(4), next);
-        for m in 1..blocks - 1 {
-            let after = block(m + 1, &mut odd_prev);
-            step(&mut by_sample, &mut lag4, cur, next);
-            vst1q_f32(out.add(4 * (m + 1)), after);
-            cur = next;
-            next = after;
-        }
-        step(&mut by_sample, &mut lag4, cur, next);
-
-        // The last n % 4 outputs.
-        for i in 4 * blocks..n {
-            let mut val = 0.0f32;
-            for (k, x_k) in x.iter().enumerate() {
-                let v = lowpass3(x_k[2 * i - 1], x_k[2 * i], x_k[2 * i + 1]);
-                val = if k == 0 { v } else { val + v };
-            }
-            x_lp[i] = val;
-        }
-
-        // The samples of the autocorrelation after the vector steps: from
-        // 4 * (blocks - 1) to fast_n - 1, one at a time.
-        let fast_n = n - 4;
-        let mut lag4 = lanes_sum(lag4);
-        for j in 4 * (blocks - 1)..fast_n {
-            let xj = x_lp[j];
-            by_sample = vfmaq_f32(by_sample, vld1q_f32(x_lp.as_ptr().add(j)), vdupq_n_f32(xj));
-            lag4 = mac(lag4, xj, x_lp[j + 4]);
-        }
-        vst1q_f32(ac.as_mut_ptr(), by_sample);
-        ac[4] = lag4;
+    // Block 0, whose first output has no sample before it.
+    let mut first = 0.0f32;
+    for (k, x_k) in x.iter().enumerate() {
+        let v = mac(0.5 * x_k[0], x_k[1], 0.25);
+        first = if k == 0 { v } else { first + v };
     }
+    let mut cur = vsetq_lane_f32::<0>(first, block(0, &mut odd_prev));
+    store_f32x4(&mut out[0], cur);
+
+    // Step `m` adds the products of the samples 4(m - 1) to 4m - 1 to
+    // the autocorrelation: lags 0 to 3 by sample, lag 4 in four lanes as
+    // `celt_inner_prod`. The last of these samples is fast_n - 1 = n - 5
+    // or before. It needs the blocks m - 1 (`cur`) and m (`next`).
+    //
+    // The four multiply-adds of lags 0 to 3 wait for each other. So step
+    // `m` also decimates block m + 1, which the step after it needs: that
+    // work does not depend on the chain, and a core that runs the
+    // instructions in program order can do it while the chain waits.
+    let mut by_sample = vdupq_n_f32(0.0);
+    let mut lag4 = vdupq_n_f32(0.0);
+    let step = |by_sample: &mut float32x4_t,
+                lag4: &mut float32x4_t,
+                cur: float32x4_t,
+                next: float32x4_t| {
+        let mut s = *by_sample;
+        s = vfmaq_laneq_f32::<0>(s, cur, cur);
+        s = vfmaq_laneq_f32::<1>(s, vextq_f32::<1>(cur, next), cur);
+        s = vfmaq_laneq_f32::<2>(s, vextq_f32::<2>(cur, next), cur);
+        s = vfmaq_laneq_f32::<3>(s, vextq_f32::<3>(cur, next), cur);
+        *by_sample = s;
+        *lag4 = vfmaq_f32(*lag4, cur, next);
+    };
+    // `blocks` is 2 or more, because n >= 8.
+    let mut next = block(1, &mut odd_prev);
+    store_f32x4(&mut out[1], next);
+    // Block m + 1 for the steps m from 1 to blocks - 2.
+    for m1 in 2..blocks {
+        let after = block(m1, &mut odd_prev);
+        step(&mut by_sample, &mut lag4, cur, next);
+        store_f32x4(&mut out[m1], after);
+        cur = next;
+        next = after;
+    }
+    step(&mut by_sample, &mut lag4, cur, next);
+
+    // The last n % 4 outputs.
+    for (i, o) in (4 * blocks..).zip(x_lp_tail) {
+        let mut val = 0.0f32;
+        for (k, x_k) in x.iter().enumerate() {
+            let v = lowpass3(x_k[2 * i - 1], x_k[2 * i], x_k[2 * i + 1]);
+            val = if k == 0 { v } else { val + v };
+        }
+        *o = val;
+    }
+
+    // The samples of the autocorrelation after the vector steps: from
+    // 4 * (blocks - 1) to fast_n - 1, one at a time, each sample x_lp[j]
+    // with x_lp[j..j + 5].
+    let mut lag4 = lanes_sum(lag4);
+    for w in x_lp[4 * (blocks - 1)..].windows(5) {
+        let xj = w[0];
+        by_sample = vfmaq_f32(by_sample, load_f32x4(array_at(w, 0)), vdupq_n_f32(xj));
+        lag4 = mac(lag4, xj, w[4]);
+    }
+    store_f32x4(array_at_mut(ac, 0), by_sample);
+    ac[4] = lag4;
 
     // The last products of each lag, as in `celt_lpc::autocorr`.
     let fast_n = n - 4;
@@ -2166,61 +2185,69 @@ fn best_pitch_from(xcorr: &[f32], syy: &[f32], best_pitch: &mut [usize; 2]) {
     let n = xcorr.len();
     let syy = &syy[..n];
     let mut best = BestPitch::new();
-    // Only the aarch64 code moves `i` on.
-    #[allow(unused_mut)]
-    let mut i = 0;
+    // The lags that the vector code has taken.
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        // SAFETY: the loads read xcorr[i..i + 8] and syy[i..i + 8] with
-        // i + 8 <= n; both slices hold `n` values.
-        unsafe {
-            let (xp, sp) = (xcorr.as_ptr(), syy.as_ptr());
-            let zero = vdupq_n_f32(0.0);
-            // Bit `l` of the mask of lane `l` of the two vectors.
-            let bits = [
-                vld1q_u32([1u32, 2, 4, 8].as_ptr()),
-                vld1q_u32([16u32, 32, 64, 128].as_ptr()),
-            ];
-            while i + 8 <= n {
-                let xc = [vld1q_f32(xp.add(i)), vld1q_f32(xp.add(i + 4))];
-                let s = [vld1q_f32(sp.add(i)), vld1q_f32(sp.add(i + 4))];
-                let num = xc.map(|v| {
-                    let xc16 = vmulq_n_f32(v, 1e-12);
-                    vmulq_f32(xc16, xc16)
-                });
-                let positive = [vcgtq_f32(xc[0], zero), vcgtq_f32(xc[1], zero)];
-                // The lanes from `from` on that beat the second best lag as
-                // it is now. Lanes before the first of them change nothing.
-                let mut from = 0;
-                loop {
-                    let mut mask = 0u32;
-                    for h in 0..2 {
-                        let beats = vcgtq_f32(
-                            vmulq_n_f32(num[h], best.den[1]),
-                            vmulq_n_f32(s[h], best.num[1]),
-                        );
-                        mask |= vaddvq_u32(vandq_u32(vandq_u32(beats, positive[h]), bits[h]));
-                    }
-                    mask &= !0u32 << from;
-                    if mask == 0 {
-                        break;
-                    }
-                    let lane = mask.trailing_zeros() as usize;
-                    let (h, l) = (lane / 4, lane % 4);
-                    let mut nums = [0.0f32; 4];
-                    vst1q_f32(nums.as_mut_ptr(), num[h]);
-                    best.take(i + lane, nums[l], syy[i + lane]);
-                    from = lane + 1;
-                }
-                i += 8;
-            }
-        }
-    }
+    let i = unsafe { best_pitch_neon(xcorr, syy, &mut best) };
+    #[cfg(not(target_arch = "aarch64"))]
+    let i = 0;
     for k in i..n {
         best.consider(k, xcorr[k], syy[k]);
     }
     *best_pitch = best.pitch;
+}
+
+/// The vector part of `best_pitch_from`: the lags in groups of eight. Returns
+/// how many lags it has taken, a multiple of eight.
+///
+/// Panics when `syy` is shorter than `xcorr`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn best_pitch_neon(xcorr: &[f32], syy: &[f32], best: &mut BestPitch) -> usize {
+    use crate::simd_mem::neon::{load_f32x4, load_u32x4, store_f32x4};
+    use core::arch::aarch64::*;
+
+    let (xc8, _) = xcorr.as_chunks::<8>();
+    let syy8 = &syy.as_chunks::<8>().0[..xc8.len()];
+    let zero = vdupq_n_f32(0.0);
+    // Bit `l` of the mask of lane `l` of the two vectors.
+    let bits = [load_u32x4(&[1, 2, 4, 8]), load_u32x4(&[16, 32, 64, 128])];
+    for (g, (xa, sa)) in xc8.iter().zip(syy8).enumerate() {
+        let i = 8 * g;
+        let (xa, sa) = (xa.as_chunks::<4>().0, sa.as_chunks::<4>().0);
+        let xc = [load_f32x4(&xa[0]), load_f32x4(&xa[1])];
+        let s = [load_f32x4(&sa[0]), load_f32x4(&sa[1])];
+        let num = xc.map(|v| {
+            let xc16 = vmulq_n_f32(v, 1e-12);
+            vmulq_f32(xc16, xc16)
+        });
+        let positive = [vcgtq_f32(xc[0], zero), vcgtq_f32(xc[1], zero)];
+        // The lanes from `from` on that beat the second best lag as
+        // it is now. Lanes before the first of them change nothing.
+        let mut from = 0;
+        loop {
+            let mut mask = 0u32;
+            for h in 0..2 {
+                let beats = vcgtq_f32(
+                    vmulq_n_f32(num[h], best.den[1]),
+                    vmulq_n_f32(s[h], best.num[1]),
+                );
+                mask |= vaddvq_u32(vandq_u32(vandq_u32(beats, positive[h]), bits[h]));
+            }
+            mask &= !0u32 << from;
+            if mask == 0 {
+                break;
+            }
+            let lane = mask.trailing_zeros() as usize;
+            let (h, l) = (lane / 4, lane % 4);
+            let mut nums = [0.0f32; 4];
+            store_f32x4(&mut nums, num[h]);
+            best.take(i + lane, nums[l], syy[i + lane]);
+            from = lane + 1;
+        }
+    }
+    8 * xc8.len()
 }
 
 /// C `Syy` of libopus `find_best_pitch` at every lag, filled in parts.
@@ -2290,25 +2317,12 @@ impl<'a> WindowEnergies<'a> {
         let range = self.next..end;
         let (old, new) = (&self.leaving[range.clone()], &self.entering[range.clone()]);
         let out = &mut self.table[range];
-        // Only the aarch64 code moves `done` on.
-        #[allow(unused_mut)]
-        let mut done = 0;
+        // The entries that the vector code has written.
+        // SAFETY: NEON is part of the baseline of every aarch64 target.
         #[cfg(target_arch = "aarch64")]
-        {
-            use core::arch::aarch64::*;
-            let n = out.len();
-            // SAFETY: the three slices hold `n` values each; the loads and
-            // the store touch [i, i + 4) with i + 4 <= n.
-            unsafe {
-                while done + 4 <= n {
-                    let o = vld1q_f32(old.as_ptr().add(done));
-                    let w = vld1q_f32(new.as_ptr().add(done));
-                    let d = vfmaq_f32(vnegq_f32(vmulq_f32(o, o)), w, w);
-                    vst1q_f32(out.as_mut_ptr().add(done).cast(), d);
-                    done += 4;
-                }
-            }
-        }
+        let done = unsafe { increments_neon(old, new, out) };
+        #[cfg(not(target_arch = "aarch64"))]
+        let done = 0;
         for ((d, &o), &w) in out[done..].iter_mut().zip(&old[done..]).zip(&new[done..]) {
             d.write(mac(-(o * o), w, w));
         }
@@ -2393,6 +2407,31 @@ impl<'a> WindowEnergies<'a> {
     }
 }
 
+/// The vector part of `WindowEnergies::increments`: `out[i]` gets
+/// `new[i]^2 - old[i]^2` for the groups of four of `out`, with the first
+/// product fused into the subtraction. Returns how many entries it wrote, a
+/// multiple of four.
+///
+/// Panics when `old` or `new` is shorter than `out`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn increments_neon(old: &[f32], new: &[f32], out: &mut [MaybeUninit<f32>]) -> usize {
+    use crate::simd_mem::neon::{load_f32x4, store_f32x4_uninit};
+    use core::arch::aarch64::*;
+
+    let (out4, _) = out.as_chunks_mut::<4>();
+    let old4 = &old.as_chunks::<4>().0[..out4.len()];
+    let new4 = &new.as_chunks::<4>().0[..out4.len()];
+    for ((d, oa), wa) in out4.iter_mut().zip(old4).zip(new4) {
+        let o = load_f32x4(oa);
+        let w = load_f32x4(wa);
+        let d4 = vfmaq_f32(vnegq_f32(vmulq_f32(o, o)), w, w);
+        store_f32x4_uninit(d, d4);
+    }
+    4 * out4.len()
+}
+
 /// `v` as the values it holds.
 ///
 /// # Safety
@@ -2418,6 +2457,9 @@ unsafe fn assume_written_mut(v: &mut [MaybeUninit<f32>]) -> &mut [f32] {
 }
 
 /// Whether any value of `v` is below 1. Not-a-number values are not.
+///
+/// The vector loop keeps its pointer loads, for the reason given at
+/// `celt_inner_prod`.
 fn below_one(v: &[f32]) -> bool {
     // Only the aarch64 code moves `done` on.
     #[allow(unused_mut)]
@@ -4180,13 +4222,16 @@ pub(crate) mod tests {
                     let x1 = samples(&mut rng, 2 * n, kind);
 
                     let mut got = vec![f32::NAN; n];
-                    decimate2_neon([&x0[..]], &mut got);
+                    // SAFETY: NEON is part of the baseline of every aarch64
+                    // target.
+                    unsafe { decimate2_neon([&x0[..]], &mut got) };
                     let mut want = vec![f32::NAN; n];
                     decimate2_scalar([&x0[..]], &mut want);
                     assert_same(&got, &want, &format!("{kind:?} n {n} mono"));
 
                     let mut got = vec![f32::NAN; n];
-                    decimate2_neon([&x0[..], &x1[..]], &mut got);
+                    // SAFETY: as above.
+                    unsafe { decimate2_neon([&x0[..], &x1[..]], &mut got) };
                     let mut want = vec![f32::NAN; n];
                     decimate2_scalar([&x0[..], &x1[..]], &mut want);
                     assert_same(&got, &want, &format!("{kind:?} n {n} stereo"));
@@ -4209,11 +4254,16 @@ pub(crate) mod tests {
                         let mut got_ac = [f32::NAN; 5];
                         let mut want = vec![f32::NAN; n];
                         if stereo {
-                            decimate2_autocorr5_neon([&x0[..], &x1[..]], &mut got, &mut got_ac);
+                            // SAFETY: NEON is part of the baseline of every
+                            // aarch64 target.
+                            unsafe {
+                                decimate2_autocorr5_neon([&x0[..], &x1[..]], &mut got, &mut got_ac)
+                            };
                             decimate2_scalar([&x0[..], &x1[..]], &mut want);
                             want[0] = mac(0.5 * x0[0], x0[1], 0.25) + mac(0.5 * x1[0], x1[1], 0.25);
                         } else {
-                            decimate2_autocorr5_neon([&x0[..]], &mut got, &mut got_ac);
+                            // SAFETY: as above.
+                            unsafe { decimate2_autocorr5_neon([&x0[..]], &mut got, &mut got_ac) };
                             decimate2_scalar([&x0[..]], &mut want);
                             want[0] = mac(0.5 * x0[0], x0[1], 0.25);
                         }
@@ -4235,7 +4285,9 @@ pub(crate) mod tests {
                     let x = samples(&mut rng, len, kind);
                     let y = samples(&mut rng, len + 4, kind);
                     let mut got = [f32::NAN; 5];
-                    xcorr5_neon(&x, &y, &mut got);
+                    // SAFETY: NEON is part of the baseline of every aarch64
+                    // target.
+                    unsafe { xcorr5_neon(&x, &y, &mut got) };
                     let mut want = [f32::NAN; 5];
                     xcorr_by_sample_scalar(&x, &y, &mut want[..4], len);
                     want[4] = inner_prod_model(&x, &y[4..4 + len]);
