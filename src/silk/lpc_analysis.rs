@@ -311,15 +311,14 @@ mod burg_neon {
     use super::BURG_QA as QA;
     use crate::silk::define::MAX_LPC_ORDER;
     use crate::silk::macros::silk_rshift_round;
+    use crate::simd_mem::neon::{load_i16x4, load_i16x8, store_i16x8};
     use core::arch::aarch64::*;
 
     /// The samples at one position of up to four subframes, as 32-bit lanes.
     #[inline]
     #[target_feature(enable = "neon")]
     fn widen(samples: &[i16; 4]) -> int32x4_t {
-        // SAFETY: the pointer comes from a `[i16; 4]`, which is what
-        // `vld1_s16` reads.
-        unsafe { vmovl_s16(vld1_s16(samples.as_ptr())) }
+        vmovl_s16(load_i16x4(samples))
     }
 
     /// `(a * b) >> 16` per lane with a 64-bit product (`silk_smulww`).
@@ -350,9 +349,7 @@ mod burg_neon {
         // Eight samples of one subframe, or zeros if it does not exist.
         let load = |s: usize, at: usize| -> int16x8_t {
             match subframes[s].get(at..at + 8) {
-                // SAFETY: `block` is 8 samples long, which `vld1q_s16`
-                // reads.
-                Some(block) => unsafe { vld1q_s16(block.as_ptr()) },
+                Some(block) => load_i16x8(block.try_into().unwrap()),
                 None => vdupq_n_s16(0),
             }
         };
@@ -365,16 +362,12 @@ mod burg_neon {
             let (a, b, c, d) = (load(0, at), load(1, at), load(2, at), load(3, at));
             let (ac_low, ac_high) = (vzip1q_s16(a, c), vzip2q_s16(a, c));
             let (bd_low, bd_high) = (vzip1q_s16(b, d), vzip2q_s16(b, d));
-            let out: &mut [i16] = rows.as_flattened_mut();
-            // SAFETY: `out` is 8 rows of 4 samples. Each `vst1q_s16` writes 8
-            // samples at an offset of at most 24.
-            unsafe {
-                let out = out.as_mut_ptr();
-                vst1q_s16(out, vzip1q_s16(ac_low, bd_low));
-                vst1q_s16(out.add(8), vzip2q_s16(ac_low, bd_low));
-                vst1q_s16(out.add(16), vzip1q_s16(ac_high, bd_high));
-                vst1q_s16(out.add(24), vzip2q_s16(ac_high, bd_high));
-            }
+            // The 8 rows of 4 samples as 4 vectors of 8 samples.
+            let (out, _) = rows.as_flattened_mut().as_chunks_mut::<8>();
+            store_i16x8(&mut out[0], vzip1q_s16(ac_low, bd_low));
+            store_i16x8(&mut out[1], vzip2q_s16(ac_low, bd_low));
+            store_i16x8(&mut out[2], vzip1q_s16(ac_high, bd_high));
+            store_i16x8(&mut out[3], vzip2q_s16(ac_high, bd_high));
         }
         // The positions that are left.
         for (row, at) in rest.iter_mut().zip(whole..) {
@@ -637,13 +630,9 @@ pub fn silk_burg_modified_fix(
 /// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
 /// multiplication, which fixed-point code needs; AVX2 has both. The results
 /// are the same bits.
-///
-/// # Safety
-///
-/// The processor must have AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn burg_modified_avx2(
+fn burg_modified_avx2(
     res_nrg: &mut i32,
     res_nrg_q: &mut i32,
     a_q16: &mut [i32],

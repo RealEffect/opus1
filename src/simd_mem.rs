@@ -283,6 +283,25 @@ pub(crate) mod neon {
 
     // `i32` and `u32` values.
 
+    /// Loads two `i32` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_i32x2(a: &[i32; 2]) -> int32x2_t {
+        // SAFETY: `a` is valid for reading two `i32` values, which is what
+        // `vld1_s32` reads. It needs only the alignment of `i32`.
+        unsafe { vld1_s32(a.as_ptr()) }
+    }
+
+    /// Stores two `i32` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_i32x2(a: &mut [i32; 2], v: int32x2_t) {
+        // SAFETY: `a` is valid for writing two `i32` values, which is what
+        // `vst1_s32` writes, and no other reference reaches them. It needs
+        // only the alignment of `i32`.
+        unsafe { vst1_s32(a.as_mut_ptr(), v) }
+    }
+
     /// Loads four `i32` values.
     #[target_feature(enable = "neon")]
     #[inline]
@@ -302,6 +321,15 @@ pub(crate) mod neon {
         unsafe { vst1q_s32(a.as_mut_ptr(), v) }
     }
 
+    /// Stores lane `LANE` of `v`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_lane_i32x4<const LANE: i32>(a: &mut i32, v: int32x4_t) {
+        // SAFETY: `a` is valid for writing one `i32` value, which is what
+        // `vst1q_lane_s32` writes, and no other reference reaches it.
+        unsafe { vst1q_lane_s32::<LANE>(a, v) }
+    }
+
     /// Loads four `u32` values.
     #[target_feature(enable = "neon")]
     #[inline]
@@ -309,6 +337,57 @@ pub(crate) mod neon {
         // SAFETY: `a` is valid for reading four `u32` values, which is
         // what `vld1q_u32` reads. It needs only the alignment of `u32`.
         unsafe { vld1q_u32(a.as_ptr()) }
+    }
+
+    // `i16` values.
+
+    /// Loads four `i16` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_i16x4(a: &[i16; 4]) -> int16x4_t {
+        // SAFETY: `a` is valid for reading four `i16` values, which is
+        // what `vld1_s16` reads. It needs only the alignment of `i16`.
+        unsafe { vld1_s16(a.as_ptr()) }
+    }
+
+    /// Stores four `i16` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_i16x4(a: &mut [i16; 4], v: int16x4_t) {
+        // SAFETY: `a` is valid for writing four `i16` values, which is
+        // what `vst1_s16` writes, and no other reference reaches them. It
+        // needs only the alignment of `i16`.
+        unsafe { vst1_s16(a.as_mut_ptr(), v) }
+    }
+
+    /// Stores four `i16` values into memory that may not hold values yet.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_i16x4_uninit(a: &mut [MaybeUninit<i16>; 4], v: int16x4_t) {
+        // SAFETY: `MaybeUninit<i16>` has the layout of `i16`, so `a` is
+        // valid for writing four `i16` values, which is what `vst1_s16`
+        // writes, and no other reference reaches them. It needs only the
+        // alignment of `i16`.
+        unsafe { vst1_s16(a.as_mut_ptr().cast(), v) }
+    }
+
+    /// Loads eight `i16` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn load_i16x8(a: &[i16; 8]) -> int16x8_t {
+        // SAFETY: `a` is valid for reading eight `i16` values, which is
+        // what `vld1q_s16` reads. It needs only the alignment of `i16`.
+        unsafe { vld1q_s16(a.as_ptr()) }
+    }
+
+    /// Stores eight `i16` values.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) fn store_i16x8(a: &mut [i16; 8], v: int16x8_t) {
+        // SAFETY: `a` is valid for writing eight `i16` values, which is
+        // what `vst1q_s16` writes, and no other reference reaches them. It
+        // needs only the alignment of `i16`.
+        unsafe { vst1q_s16(a.as_mut_ptr(), v) }
     }
 
     // `u8` and `i8` values.
@@ -331,6 +410,7 @@ pub(crate) mod x86 {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
     use core::cell::Cell;
+    use core::mem::MaybeUninit;
 
     // `f32` values.
 
@@ -424,6 +504,18 @@ pub(crate) mod x86 {
         unsafe { _mm_storeu_si128(a.as_mut_ptr().cast(), v) }
     }
 
+    /// Stores four `i32` values into memory that may not hold values yet
+    /// (SSE2).
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    pub(crate) fn store_i32x4_uninit(a: &mut [MaybeUninit<i32>; 4], v: __m128i) {
+        // SAFETY: `MaybeUninit<i32>` has the layout of `i32`, so `a` is
+        // valid for writing four `i32` values (16 bytes), which is what
+        // `_mm_storeu_si128` writes, and no other reference reaches them.
+        // It needs no alignment.
+        unsafe { _mm_storeu_si128(a.as_mut_ptr().cast(), v) }
+    }
+
     /// Loads eight `i32` values (AVX).
     #[target_feature(enable = "avx")]
     #[inline]
@@ -441,6 +533,57 @@ pub(crate) mod x86 {
         // which is what `_mm256_storeu_si256` writes, and no other
         // reference reaches them. It needs no alignment.
         unsafe { _mm256_storeu_si256(a.as_mut_ptr().cast(), v) }
+    }
+
+    // `i16` values.
+
+    /// Loads four `i16` values into the lower half (SSE2).
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    pub(crate) fn load_i16x4(a: &[i16; 4]) -> __m128i {
+        // SAFETY: `a` is valid for reading four `i16` values (8 bytes),
+        // which is what `_mm_loadl_epi64` reads. It needs no alignment.
+        unsafe { _mm_loadl_epi64(a.as_ptr().cast()) }
+    }
+
+    /// Stores the four `i16` values of the lower half (SSE2).
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    pub(crate) fn store_i16x4(a: &mut [i16; 4], v: __m128i) {
+        // SAFETY: `a` is valid for writing four `i16` values (8 bytes),
+        // which is what `_mm_storel_epi64` writes, and no other reference
+        // reaches them. It needs no alignment.
+        unsafe { _mm_storel_epi64(a.as_mut_ptr().cast(), v) }
+    }
+
+    /// Stores the four `i16` values of the lower half into memory that may
+    /// not hold values yet (SSE2).
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    pub(crate) fn store_i16x4_uninit(a: &mut [MaybeUninit<i16>; 4], v: __m128i) {
+        // SAFETY: `MaybeUninit<i16>` has the layout of `i16`, so `a` is
+        // valid for writing four `i16` values (8 bytes), which is what
+        // `_mm_storel_epi64` writes, and no other reference reaches them.
+        // It needs no alignment.
+        unsafe { _mm_storel_epi64(a.as_mut_ptr().cast(), v) }
+    }
+
+    /// Loads eight `i16` values (SSE2).
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    pub(crate) fn load_i16x8(a: &[i16; 8]) -> __m128i {
+        // SAFETY: `a` is valid for reading eight `i16` values (16 bytes),
+        // which is what `_mm_loadu_si128` reads. It needs no alignment.
+        unsafe { _mm_loadu_si128(a.as_ptr().cast()) }
+    }
+
+    /// Loads sixteen `i16` values (AVX).
+    #[target_feature(enable = "avx")]
+    #[inline]
+    pub(crate) fn load_i16x16(a: &[i16; 16]) -> __m256i {
+        // SAFETY: `a` is valid for reading sixteen `i16` values (32 bytes),
+        // which is what `_mm256_loadu_si256` reads. It needs no alignment.
+        unsafe { _mm256_loadu_si256(a.as_ptr().cast()) }
     }
 
     // `u8` and `i8` values.
