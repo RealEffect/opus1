@@ -107,8 +107,12 @@ pub struct Conv2dLayer<'w> {
 /// The kernels of one `DnnArch` that this processor can run.
 ///
 /// It can only be made with `Kernels::new`, which replaces a variant the
-/// processor cannot run (`arch::usable`). Its methods check the slices, so
-/// the `unsafe` kernels below them only see valid input.
+/// processor cannot run (`arch::usable`). So its methods may call the
+/// kernels of its variant, which are compiled for the instructions of that
+/// variant (`#[target_feature]`): the `unsafe` block around each call only
+/// states that the processor has them. The methods check the slices first;
+/// the kernels check them again, and the kernels of sparse layers check
+/// the index table (`check_sparse`).
 #[derive(Clone, Copy)]
 struct Kernels(DnnArch);
 
@@ -136,6 +140,20 @@ fn sparse_blocks(idx: &[i32], rows: usize, cols: usize) -> usize {
     total
 }
 
+/// Checks the index table of a sparse layer with `sparse_blocks` (`rows`
+/// rows, inputs of length `cols`), and that `w_len` weights hold 32 for
+/// each block the table lists. The sparse kernels of every variant run
+/// only after this check: those of `vec_neon` and `vec_x86` call it
+/// themselves and then read the table, the weights and the inputs at the
+/// listed positions without index checks.
+///
+/// Panics when the table is invalid or the weights are too short.
+#[inline]
+pub(crate) fn check_sparse(idx: &[i32], rows: usize, cols: usize, w_len: usize) {
+    let blocks = sparse_blocks(idx, rows, cols);
+    assert!(blocks.checked_mul(32).is_some_and(|n| w_len >= n), "sparse weights shorter than the index table");
+}
+
 impl Kernels {
     #[inline]
     fn new(arch: DnnArch) -> Kernels {
@@ -150,7 +168,7 @@ impl Kernels {
         }
         if cols == 0 {
             // No products: every chain stays at +0. The kernels are not
-            // called, so they never form a pointer into empty weights.
+            // called.
             out[..rows].fill(0.0);
             return;
         }
@@ -159,13 +177,13 @@ impl Kernels {
         assert!(stride >= rows && need.is_some_and(|n| w.len() >= n), "float weights shorter than the layer");
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: `Kernels::new` checked the processor; the lengths are
-            // checked above.
+            // SAFETY: NEON is part of every aarch64 target.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe {
                 super::vec_neon::sgemv(out, w, rows, cols, stride, x)
             },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps these variants only on a
+            // processor with AVX2 and FMA.
             DnnArch::Avx2Fma | DnnArch::AvxVnni | DnnArch::Avx512Vnni => unsafe {
                 super::vec_x86::sgemv_avx2(out, w, rows, cols, stride, x)
             },
@@ -176,21 +194,22 @@ impl Kernels {
     /// `vec_portable::sparse_sgemv8x4` on this variant.
     fn sparse_sgemv8x4(self, out: &mut [f32], w: &[f32], idx: &[i32], rows: usize, x: &[f32]) {
         assert!(out.len() >= rows);
-        let blocks = sparse_blocks(idx, rows, x.len());
-        assert!(blocks.checked_mul(32).is_some_and(|n| w.len() >= n), "sparse weights shorter than the index table");
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: `Kernels::new` checked the processor; the table and the
-            // lengths are checked above.
+            // SAFETY: NEON is part of every aarch64 target.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe {
                 super::vec_neon::sparse_sgemv8x4(out, w, idx, rows, x)
             },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps these variants only on a
+            // processor with AVX2 and FMA.
             DnnArch::Avx2Fma | DnnArch::AvxVnni | DnnArch::Avx512Vnni => unsafe {
                 super::vec_x86::sparse_sgemv8x4_avx2(out, w, idx, rows, x)
             },
-            _ => vec_portable::sparse_sgemv8x4(out, w, idx, rows, x),
+            _ => {
+                check_sparse(idx, rows, x.len(), w.len());
+                vec_portable::sparse_sgemv8x4(out, w, idx, rows, x)
+            }
         }
     }
 
@@ -203,24 +222,27 @@ impl Kernels {
         assert!(rows.checked_mul(cols).is_some_and(|n| w.len() >= n), "int8 weights shorter than the layer");
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: `Kernels::new` checked the processor; the lengths are
-            // checked above.
+            // SAFETY: NEON is part of every aarch64 target.
             DnnArch::Neon => unsafe { super::vec_neon::cgemv8x4(out, w, scale, rows, cols, x) },
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: as above; `NeonDotprod` is usable only with DotProd.
+            // SAFETY: as above; `Kernels::new` keeps `NeonDotprod` only on a
+            // processor with DotProd.
             DnnArch::NeonDotprod => unsafe {
                 super::vec_neon::cgemv8x4_dotprod(out, w, scale, rows, cols, x)
             },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps `Avx2Fma` only on a processor with
+            // AVX2 and FMA.
             DnnArch::Avx2Fma => unsafe { super::vec_x86::cgemv8x4_avx2(out, w, scale, rows, cols, x) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps `AvxVnni` only on a processor with
+            // AVX2, FMA and AVX-VNNI.
             DnnArch::AvxVnni => unsafe {
                 super::vec_x86::cgemv8x4_avxvnni(out, w, scale, rows, cols, x)
             },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps `Avx512Vnni` only on a processor
+            // with AVX2, FMA and AVX-512 F, BW and VNNI.
             DnnArch::Avx512Vnni => unsafe {
                 super::vec_x86::cgemv8x4_avx512vnni(out, w, scale, rows, cols, x)
             },
@@ -242,36 +264,40 @@ impl Kernels {
     ) {
         assert!(cols <= MAX_INPUTS);
         assert!(out.len() >= rows && x.len() >= cols && scale.len() >= rows);
-        let blocks = sparse_blocks(idx, rows, cols);
-        assert!(blocks.checked_mul(32).is_some_and(|n| w.len() >= n), "sparse weights shorter than the index table");
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: `Kernels::new` checked the processor; the table and the
-            // lengths are checked above.
+            // SAFETY: NEON is part of every aarch64 target.
             DnnArch::Neon => unsafe {
                 super::vec_neon::sparse_cgemv8x4(out, w, idx, scale, rows, cols, x)
             },
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: as above; `NeonDotprod` is usable only with DotProd.
+            // SAFETY: as above; `Kernels::new` keeps `NeonDotprod` only on a
+            // processor with DotProd.
             DnnArch::NeonDotprod => unsafe {
                 super::vec_neon::sparse_cgemv8x4_dotprod(out, w, idx, scale, rows, cols, x)
             },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps `Avx2Fma` only on a processor with
+            // AVX2 and FMA.
             DnnArch::Avx2Fma => unsafe {
                 super::vec_x86::sparse_cgemv8x4_avx2(out, w, idx, scale, rows, cols, x)
             },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps `AvxVnni` only on a processor with
+            // AVX2, FMA and AVX-VNNI.
             DnnArch::AvxVnni => unsafe {
                 super::vec_x86::sparse_cgemv8x4_avxvnni(out, w, idx, scale, rows, cols, x)
             },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps `Avx512Vnni` only on a processor
+            // with AVX2, FMA and AVX-512 F, BW and VNNI.
             DnnArch::Avx512Vnni => unsafe {
                 super::vec_x86::sparse_cgemv8x4_avx512vnni(out, w, idx, scale, rows, cols, x)
             },
-            _ => vec_portable::sparse_cgemv8x4(out, w, idx, scale, rows, cols, x),
+            _ => {
+                check_sparse(idx, rows, cols, w.len());
+                vec_portable::sparse_cgemv8x4(out, w, idx, scale, rows, cols, x)
+            }
         }
     }
 
@@ -279,10 +305,11 @@ impl Kernels {
     fn vec_exp(self, buf: &mut [f32]) {
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: `Kernels::new` checked the processor.
+            // SAFETY: NEON is part of every aarch64 target.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe { super::vec_neon::vec_exp(buf) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps these variants only on a
+            // processor with AVX2 and FMA.
             DnnArch::Avx2Fma | DnnArch::AvxVnni | DnnArch::Avx512Vnni => unsafe {
                 super::vec_x86::vec_exp_avx2(buf)
             },
@@ -294,10 +321,11 @@ impl Kernels {
     fn vec_tanh(self, buf: &mut [f32]) {
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: `Kernels::new` checked the processor.
+            // SAFETY: NEON is part of every aarch64 target.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe { super::vec_neon::vec_tanh(buf) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps these variants only on a
+            // processor with AVX2 and FMA.
             DnnArch::Avx2Fma | DnnArch::AvxVnni | DnnArch::Avx512Vnni => unsafe {
                 super::vec_x86::vec_tanh_avx2(buf)
             },
@@ -309,10 +337,11 @@ impl Kernels {
     fn vec_sigmoid(self, buf: &mut [f32]) {
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: `Kernels::new` checked the processor.
+            // SAFETY: NEON is part of every aarch64 target.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe { super::vec_neon::vec_sigmoid(buf) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            // SAFETY: as above.
+            // SAFETY: `Kernels::new` keeps these variants only on a
+            // processor with AVX2 and FMA.
             DnnArch::Avx2Fma | DnnArch::AvxVnni | DnnArch::Avx512Vnni => unsafe {
                 super::vec_x86::vec_sigmoid_avx2(buf)
             },

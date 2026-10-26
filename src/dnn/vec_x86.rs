@@ -22,56 +22,165 @@
 //!
 //! They can only be compile-checked on the development machine (an Apple
 //! M4); a run on an x86 machine is an open item.
+//!
+//! The kernels are safe functions compiled with the target features they
+//! use. They reach the slices through arrays (`as_chunks`,
+//! `chunks_exact`), loaded and stored with the functions of
+//! `crate::simd_mem`. Each kernel checks the lengths it needs and panics
+//! when a slice is too short. The kernels of sparse layers also check the
+//! index table (`nnet::check_sparse`); after that check they read the
+//! weights and the inputs at the listed positions without index checks.
+//! Only `quantize`, the conversion of the inputs of the int8 layers, keeps
+//! the pointer loads and stores of its loop (see there).
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
-use core::ptr;
+use core::mem::MaybeUninit;
+use core::iter::Zip;
+use core::slice::{self, ChunksExact};
 
 use super::MAX_INPUTS;
+use super::nnet::check_sparse;
 use super::vec_portable;
+use crate::simd_mem::array_at_unchecked;
+use crate::simd_mem::x86::{
+    load_f32x4, load_f32x8, load_i8x32, load_i8x64, load_i32x8, store_f32x4, store_f32x8,
+    store_i32x8,
+};
 
 // ---------------------------------------------------------------------------
 // Float products
 // ---------------------------------------------------------------------------
 
-/// One pass of `sgemv` over `V` vectors of 8 rows.
-///
-/// # Safety
-///
-/// AVX2 and FMA. `out` has `8·V` values; `w` has `8·V` values at each
-/// multiple of `stride` below `cols·stride`; `x` has `cols` values.
+/// The columns of an `sgemv` product before the last one, each with its
+/// input: `(x[j], column j)`. Column `j` holds the weight of row `r` at
+/// index `r` and has `stride` values. `sgemv` builds this iterator once
+/// and gives each pass over the rows a copy.
+type Columns<'a> = Zip<slice::Iter<'a, f32>, ChunksExact<'a, f32>>;
+
+/// The products of one column for `V` vectors of 8 rows:
+/// `acc[v] += w[v] · xj`, one fused multiply-add per lane.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn sgemv_pass<const V: usize>(out: *mut f32, w: *const f32, cols: usize, stride: usize, x: *const f32) {
-    // SAFETY: the caller guarantees the lengths.
-    unsafe {
-        let mut acc = [_mm256_setzero_ps(); V];
-        let mut wj = w;
-        for j in 0..cols {
-            let xj = _mm256_broadcast_ss(&*x.add(j));
-            for (v, a) in acc.iter_mut().enumerate() {
-                *a = _mm256_fmadd_ps(_mm256_loadu_ps(wj.add(8 * v)), xj, *a);
-            }
-            // After the last column this points past the weights; it is
-            // not read then. `wrapping_add` makes that pointer allowed.
-            wj = wj.wrapping_add(stride);
-        }
-        for (v, a) in acc.iter().enumerate() {
-            _mm256_storeu_ps(out.add(8 * v), *a);
-        }
+fn sgemv_column<const V: usize>(acc: &mut [__m256; V], w: &[[f32; 8]; V], xj: &f32) {
+    let xj = _mm256_broadcast_ss(xj);
+    for (a, w) in acc.iter_mut().zip(w) {
+        *a = _mm256_fmadd_ps(load_f32x8(w), xj, *a);
+    }
+}
+
+/// One pass of `sgemv` over `V` vectors of 8 rows: `out` gets the rows
+/// `i..i + 8·V`.
+///
+/// `columns` yields the columns before the last one with their inputs.
+/// `last` holds the weights of these rows in the last column, and `x_last`
+/// is its input.
+///
+/// Panics when `stride < i + 8·V`.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+fn sgemv_pass<const V: usize>(
+    out: &mut [[f32; 8]; V],
+    i: usize,
+    columns: Columns<'_>,
+    stride: usize,
+    last: &[[f32; 8]; V],
+    x_last: &f32,
+) {
+    // Each column of `columns` holds `stride` values, so this check covers
+    // the reads of all of them.
+    assert!(i <= stride && 8 * V <= stride - i);
+    let mut acc = [_mm256_setzero_ps(); V];
+    for (xj, col) in columns {
+        let w = col[i..][..8 * V].as_chunks::<8>().0.try_into().unwrap();
+        sgemv_column(&mut acc, w, xj);
+    }
+    sgemv_column(&mut acc, last, x_last);
+    for (o, a) in out.iter_mut().zip(&acc) {
+        store_f32x8(o, *a);
+    }
+}
+
+/// 4 rows of `sgemv` in one 128-bit register: `out` gets the rows
+/// `i..i + 4`. The other arguments are those of `sgemv_pass`.
+///
+/// Panics when `stride < i + 4`.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+fn sgemv_quad(
+    out: &mut [f32; 4],
+    i: usize,
+    columns: Columns<'_>,
+    stride: usize,
+    last: &[f32; 4],
+    x_last: &f32,
+) {
+    // As in `sgemv_pass`.
+    assert!(i <= stride && 4 <= stride - i);
+    let mut acc = _mm_setzero_ps();
+    for (&xj, col) in columns {
+        acc = _mm_fmadd_ps(load_f32x4(col[i..].first_chunk().unwrap()), _mm_set1_ps(xj), acc);
+    }
+    acc = _mm_fmadd_ps(load_f32x4(last), _mm_set1_ps(*x_last), acc);
+    store_f32x4(out, acc);
+}
+
+/// The products of one column for the last 1 to 3 rows, one scalar chain
+/// each: `acc[k] = fma(w[k], xj, acc[k])`.
+///
+/// Panics when `w` and `acc` differ in length.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+fn sgemv_tail_column(acc: &mut [__m128], w: &[f32], xj: f32) {
+    let xj = _mm_set_ss(xj);
+    let w = &w[..acc.len()];
+    for (a, &wk) in acc.iter_mut().zip(w) {
+        *a = _mm_fmadd_ss(_mm_set_ss(wk), xj, *a);
+    }
+}
+
+/// The last 1 to 3 rows of `sgemv`, one scalar chain each: `out` gets the
+/// rows `i..i + out.len()`. The other arguments are those of
+/// `sgemv_pass`.
+///
+/// Panics when `out` holds more than 3 values, when `last` and `out`
+/// differ in length, or when `stride < i + out.len()`.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+fn sgemv_tail(
+    out: &mut [f32],
+    i: usize,
+    columns: Columns<'_>,
+    stride: usize,
+    last: &[f32],
+    x_last: &f32,
+) {
+    let r = out.len();
+    // As in `sgemv_pass`.
+    assert!(i <= stride && r <= stride - i);
+    let mut acc = [_mm_setzero_ps(); 3];
+    let acc = &mut acc[..r];
+    for (&xj, col) in columns {
+        sgemv_tail_column(acc, &col[i..], xj);
+    }
+    sgemv_tail_column(acc, last, *x_last);
+    for (o, a) in out.iter_mut().zip(acc.iter()) {
+        *o = _mm_cvtss_f32(*a);
     }
 }
 
 /// AVX2 `sgemv`. Same contract as `vec_portable::sgemv`.
 ///
+/// Panics when a slice is shorter than `vec_portable::sgemv` requires,
+/// when `rows > 0` and `cols == 0`, and when `col_stride < rows`.
+///
 /// # Safety
 ///
-/// The processor must support AVX2 and FMA. The slices must have the
-/// lengths that `vec_portable::sgemv` requires, and `col_stride >= rows`.
+/// The processor must support AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
-pub unsafe fn sgemv_avx2(
+pub fn sgemv_avx2(
     out: &mut [f32],
     weights: &[f32],
     rows: usize,
@@ -87,102 +196,103 @@ pub unsafe fn sgemv_avx2(
             && x.len() >= cols
             && (rows == 0
                 || cols > 0
+                    && col_stride >= rows
                     && (cols - 1)
                         .checked_mul(col_stride)
                         .and_then(|n| n.checked_add(rows))
                         .is_some_and(|n| weights.len() >= n)),
         "sgemv_avx2: slices shorter than the layer"
     );
-    let o = out.as_mut_ptr();
-    let w = weights.as_ptr();
-    let xp = x.as_ptr();
-    let mut i = 0;
-    // SAFETY: the caller guarantees the lengths; every pass stays below
-    // `rows`.
-    unsafe {
-        while rows - i >= 32 {
-            sgemv_pass::<4>(o.add(i), w.add(i), cols, col_stride, xp);
-            i += 32;
-        }
-        match (rows - i) / 8 {
-            3 => sgemv_pass::<3>(o.add(i), w.add(i), cols, col_stride, xp),
-            2 => sgemv_pass::<2>(o.add(i), w.add(i), cols, col_stride, xp),
-            1 => sgemv_pass::<1>(o.add(i), w.add(i), cols, col_stride, xp),
-            _ => {}
-        }
-        i += (rows - i) & !7;
-        if rows - i >= 4 {
-            let mut acc = _mm_setzero_ps();
-            let mut wj = w.add(i);
-            for j in 0..cols {
-                acc = _mm_fmadd_ps(_mm_loadu_ps(wj), _mm_set1_ps(*xp.add(j)), acc);
-                wj = wj.wrapping_add(col_stride);
-            }
-            _mm_storeu_ps(o.add(i), acc);
-            i += 4;
-        }
-        let r = rows - i;
-        if r > 0 {
-            let mut acc = [_mm_setzero_ps(); 3];
-            let mut wj = w.add(i);
-            for j in 0..cols {
-                let xj = _mm_set_ss(*xp.add(j));
-                for (k, a) in acc[..r].iter_mut().enumerate() {
-                    *a = _mm_fmadd_ss(_mm_set_ss(*wj.add(k)), xj, *a);
-                }
-                wj = wj.wrapping_add(col_stride);
-            }
-            for (k, a) in acc[..r].iter().enumerate() {
-                *o.add(i + k) = _mm_cvtss_f32(*a);
-            }
-        }
+    if rows == 0 {
+        return;
+    }
+    let out = &mut out[..rows];
+    let Some((x_last, x_body)) = x[..cols].split_last() else {
+        // Not reached: with `rows > 0` the check above needs `cols > 0`.
+        return;
+    };
+    // The columns before the last one, `col_stride` values each, and the
+    // last one, which only needs `rows` values. The passes over the rows
+    // split `out` and the last column alike.
+    let (body, last) = weights.split_at(x_body.len() * col_stride);
+    let columns = x_body.iter().zip(body.chunks_exact(col_stride));
+    let (o32, o_rest) = out.as_chunks_mut::<32>();
+    let (l32, l_rest) = last[..rows].as_chunks::<32>();
+    for (k, (o, l)) in o32.iter_mut().zip(l32).enumerate() {
+        let o = o.as_chunks_mut::<8>().0.try_into().unwrap();
+        let l = l.as_chunks::<8>().0.try_into().unwrap();
+        sgemv_pass::<4>(o, 32 * k, columns.clone(), col_stride, l, x_last);
+    }
+    let mut i = 32 * o32.len();
+    let (o8, o_rest) = o_rest.as_chunks_mut::<8>();
+    let (l8, l_rest) = l_rest.as_chunks::<8>();
+    let c = columns.clone();
+    match o8.len() {
+        3 => sgemv_pass::<3>(o8.try_into().unwrap(), i, c, col_stride, l8.try_into().unwrap(), x_last),
+        2 => sgemv_pass::<2>(o8.try_into().unwrap(), i, c, col_stride, l8.try_into().unwrap(), x_last),
+        1 => sgemv_pass::<1>(o8.try_into().unwrap(), i, c, col_stride, l8.try_into().unwrap(), x_last),
+        _ => {}
+    }
+    i += 8 * o8.len();
+    let (o4, o_tail) = o_rest.as_chunks_mut::<4>();
+    let (l4, l_tail) = l_rest.as_chunks::<4>();
+    if let (Some(o), Some(l)) = (o4.first_mut(), l4.first()) {
+        sgemv_quad(o, i, columns.clone(), col_stride, l, x_last);
+        i += 4;
+    }
+    if !o_tail.is_empty() {
+        sgemv_tail(o_tail, i, columns, col_stride, l_tail, x_last);
     }
 }
 
 /// AVX2 `sparse_sgemv8x4`. Same contract as
 /// `vec_portable::sparse_sgemv8x4`.
 ///
+/// Panics when `rows` is not a multiple of 8, when `out` holds fewer than
+/// `rows` values, or when the index table or the weights fail
+/// `nnet::check_sparse` for `rows` rows and inputs of the length of `x`.
+///
 /// # Safety
 ///
-/// The processor must support AVX2 and FMA. The index table must be valid
-/// for `rows` and the length of `x`, and `weights` must hold 32 floats for
-/// each listed block, as `nnet` checks.
+/// The processor must support AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
-pub unsafe fn sparse_sgemv8x4_avx2(
+pub fn sparse_sgemv8x4_avx2(
     out: &mut [f32],
     weights: &[f32],
     idx: &[i32],
     rows: usize,
     x: &[f32],
 ) {
-    // Each block of 8 rows stores 8 values. `nnet` checks the index table
-    // (`sparse_blocks`); the debug checks below repeat that per entry.
+    // Each block of 8 rows stores 8 values. `check_sparse` checks the index
+    // table; the debug checks below repeat that per entry.
     assert!(rows.is_multiple_of(8) && out.len() >= rows);
-    let w = weights.as_ptr();
-    let xp = x.as_ptr();
-    let o = out.as_mut_ptr();
-    // The next entry of `idx` and the next block of `weights`.
-    let mut p = 0usize;
+    check_sparse(idx, rows, x.len(), weights.len());
+    // The entries of the table in order, and the offset of the next block
+    // of weights.
+    let mut table = idx.iter();
     let mut wo = 0usize;
-    // SAFETY: the caller guarantees the table and the lengths.
-    unsafe {
-        for i in (0..rows).step_by(8) {
-            let mut y = _mm256_setzero_ps();
-            let count = idx[p] as usize;
-            p += 1;
-            for _ in 0..count {
-                debug_assert!(p < idx.len() && wo + 32 <= weights.len());
-                let pos = *idx.get_unchecked(p) as usize;
-                debug_assert!(pos + 4 <= x.len());
-                p += 1;
-                for c in 0..4 {
-                    let xc = _mm256_set1_ps(*xp.add(pos + c));
-                    y = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(wo + 8 * c)), xc, y);
-                }
-                wo += 32;
+    for o in out[..rows].as_chunks_mut::<8>().0 {
+        let mut y = _mm256_setzero_ps();
+        let count = *table.next().unwrap() as usize;
+        for _ in 0..count {
+            debug_assert!(!table.as_slice().is_empty() && wo + 32 <= weights.len());
+            // SAFETY: `check_sparse` checked that `count` positions follow
+            // the count of this block.
+            let pos = unsafe { *table.next().unwrap_unchecked() } as usize;
+            debug_assert!(pos + 4 <= x.len());
+            // SAFETY: `check_sparse` checked that each listed position has
+            // `pos + 4 <= x.len()`, and that the weights hold a block of 32
+            // values for each listed position, so the block at `wo` is
+            // inside them.
+            let (xa, w) =
+                unsafe { (array_at_unchecked::<f32, 4>(x, pos), array_at_unchecked::<f32, 32>(weights, wo)) };
+            for (&xc, w) in xa.iter().zip(w.as_chunks::<8>().0) {
+                let xc = _mm256_set1_ps(xc);
+                y = _mm256_fmadd_ps(load_f32x8(w), xc, y);
             }
-            _mm256_storeu_ps(o.add(i), y);
+            wo += 32;
         }
+        store_f32x8(o, y);
     }
 }
 
@@ -192,92 +302,92 @@ pub unsafe fn sparse_sgemv8x4_avx2(
 
 /// The quantized input of an int8 product.
 #[repr(C, align(32))]
-struct XBuf([i8; MAX_INPUTS]);
+struct XBuf([MaybeUninit<i8>; MAX_INPUTS]);
 
-/// `xq[j] = quantize(x[j])` for `j < cols`, with the ARM results.
+/// `xq[j] = quantize(x[j])` for every `j`, with the ARM results. Returns
+/// `xq`, which then holds values.
 ///
-/// # Safety
-///
-/// AVX2. `x` has `cols` values and `xq` room for them.
+/// Panics when `xq` and `x` differ in length.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn quantize(xq: *mut i8, x: *const f32, cols: usize) {
-    // SAFETY: the caller guarantees the lengths.
+fn quantize<'a>(xq: &'a mut [MaybeUninit<i8>], x: &[f32]) -> &'a [i8] {
+    assert_eq!(xq.len(), x.len());
+    let c127 = _mm256_set1_ps(127.0);
+    let two31 = _mm256_set1_ps(2_147_483_648.0);
+    // Byte 0 of each 32-bit lane, in each 128-bit half.
+    let pick = _mm256_setr_epi8(
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    );
+    let join = _mm256_setr_epi32(0, 4, 1, 1, 1, 1, 1, 1);
+    let cols = x.len();
+    let (q, xp) = (xq.as_mut_ptr().cast::<i8>(), x.as_ptr());
+    // The loops keep the pointer loads and stores of the original code:
+    // with the groups of eight taken from `as_chunks`, the compiler counted
+    // the steps with an extra compare.
+    // SAFETY: a step reads `x[j..j + 8]` and writes `xq[j..j + 8]` with
+    // `j + 8 <= cols`, and the last loop reads and writes index `j < cols`;
+    // both slices hold `cols` values (checked above). Writing a value into
+    // `MaybeUninit` is always allowed.
     unsafe {
-        let c127 = _mm256_set1_ps(127.0);
-        let two31 = _mm256_set1_ps(2_147_483_648.0);
-        // Byte 0 of each 32-bit lane, in each 128-bit half.
-        let pick = _mm256_setr_epi8(
-            0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1, -1, -1,
-            -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        );
-        let join = _mm256_setr_epi32(0, 4, 1, 1, 1, 1, 1, 1);
         let mut j = 0;
         while j + 8 <= cols {
-            let p = _mm256_mul_ps(c127, _mm256_loadu_ps(x.add(j)));
+            let p = _mm256_mul_ps(c127, _mm256_loadu_ps(xp.add(j)));
             let i = _mm256_cvtps_epi32(p);
             // ARM saturates to i32::MAX, whose low byte is 0xff.
             let big = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_GE_OQ>(p, two31));
             let i = _mm256_or_si256(i, big);
             let b = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(i, pick), join);
-            _mm_storel_epi64(xq.add(j) as *mut __m128i, _mm256_castsi256_si128(b));
+            _mm_storel_epi64(q.add(j).cast(), _mm256_castsi256_si128(b));
             j += 8;
         }
         while j < cols {
-            *xq.add(j) = vec_portable::quantize(*x.add(j));
+            *q.add(j) = vec_portable::quantize(*xp.add(j));
             j += 1;
         }
     }
+    // SAFETY: `xq` and `x` have the same length, so the two loops above
+    // wrote every value of `xq`: the groups of 8, then the last values one
+    // by one.
+    unsafe { xq.assume_init_ref() }
 }
 
-/// The 4 quantized inputs at `q`, repeated in each 32-bit lane.
-///
-/// # Safety
-///
-/// AVX; `q` has 4 bytes.
+/// The 4 quantized inputs `q` as one 32-bit value (in memory order).
+#[inline(always)]
+fn x4_bits(q: &[i8; 4]) -> i32 {
+    i32::from_ne_bytes(q.map(|b| b as u8))
+}
+
+/// The 4 quantized inputs `q`, repeated in each 32-bit lane.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn load_x4(q: *const i8) -> __m256i {
-    // SAFETY: the caller guarantees 4 readable bytes.
-    unsafe { _mm256_set1_epi32(ptr::read_unaligned(q as *const i32)) }
+fn load_x4(q: &[i8; 4]) -> __m256i {
+    _mm256_set1_epi32(x4_bits(q))
 }
 
 /// The dot products of the 8 rows of one 8 × 4 block with 4 inputs,
 /// exactly: `maddubs(|x|, sign(w, x))` gives 16-bit pairs, `madd` with ones
 /// adds the pairs of each row.
-///
-/// # Safety
-///
-/// AVX2.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn dot_avx2(acc: __m256i, w: __m256i, x: __m256i) -> __m256i {
+fn dot_avx2(acc: __m256i, w: __m256i, x: __m256i) -> __m256i {
     let t = _mm256_maddubs_epi16(_mm256_abs_epi8(x), _mm256_sign_epi8(w, x));
     _mm256_add_epi32(acc, _mm256_madd_epi16(t, _mm256_set1_epi16(1)))
 }
 
 /// `dot_avx2` with AVX-VNNI: `dpbusd` adds the 4 products of each row
 /// without an intermediate 16-bit sum.
-///
-/// # Safety
-///
-/// AVX2 and AVX-VNNI.
 #[target_feature(enable = "avx2,fma,avxvnni")]
 #[inline]
-unsafe fn dot_avxvnni(acc: __m256i, w: __m256i, x: __m256i) -> __m256i {
+fn dot_avxvnni(acc: __m256i, w: __m256i, x: __m256i) -> __m256i {
     _mm256_dpbusd_avx_epi32(acc, _mm256_abs_epi8(x), _mm256_sign_epi8(w, x))
 }
 
 /// `out[k] = scale[k] · acc[k]` for the 8 rows of one block.
-///
-/// # Safety
-///
-/// AVX; `out` and `scale` have 8 values.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn store8(out: *mut f32, scale: *const f32, acc: __m256i) {
-    // SAFETY: the caller guarantees the lengths.
-    unsafe { _mm256_storeu_ps(out, _mm256_mul_ps(_mm256_loadu_ps(scale), _mm256_cvtepi32_ps(acc))) }
+fn store8(out: &mut [f32; 8], scale: &[f32; 8], acc: __m256i) {
+    store_f32x8(out, _mm256_mul_ps(load_f32x8(scale), _mm256_cvtepi32_ps(acc)))
 }
 
 /// Defines a dense and a sparse int8 product on one 256-bit dot product.
@@ -285,13 +395,14 @@ macro_rules! int8_kernels {
     ($features:literal, $dot:ident, $dense:ident, $sparse:ident, $what:literal) => {
         #[doc = concat!($what, " `cgemv8x4`. Same contract as `vec_portable::cgemv8x4`.")]
         ///
+        /// Panics when a slice is shorter than `vec_portable::cgemv8x4`
+        /// requires, or when `cols > MAX_INPUTS`.
+        ///
         /// # Safety
         ///
-        /// The processor must support the instructions named above. The
-        /// slices must have the lengths that `vec_portable::cgemv8x4`
-        /// requires.
+        /// The processor must support the instructions named above.
         #[target_feature(enable = $features)]
-        pub unsafe fn $dense(
+        pub fn $dense(
             out: &mut [f32],
             weights: &[i8],
             scale: &[f32],
@@ -310,55 +421,63 @@ macro_rules! int8_kernels {
                     && rows.checked_mul(cols).is_some_and(|n| weights.len() >= n),
                 "cgemv8x4: slices shorter than the layer"
             );
-            let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
-            let q = xq.as_mut_ptr() as *mut i8;
-            let o = out.as_mut_ptr();
-            let s = scale.as_ptr();
+            let mut xq = XBuf([MaybeUninit::uninit(); MAX_INPUTS]);
+            let xq = quantize(&mut xq.0[..cols], &x[..cols]);
+            let out = out[..rows].as_chunks_mut::<8>().0;
+            let scale = scale[..rows].as_chunks::<8>().0;
             let groups = cols / 4;
-            // SAFETY: the caller guarantees the lengths; only the `cols`
-            // bytes written by `quantize` are read.
-            unsafe {
-                quantize(q, x.as_ptr(), cols);
-                // One block of 8 rows at a time, so the weights are one
-                // sequential stream (several streams were slower on 64-bit
-                // ARM when the weights are not in the caches); 4 column
-                // groups on separate accumulators.
-                let mut w = weights.as_ptr();
-                for b in 0..rows / 8 {
-                    let mut acc = [_mm256_setzero_si256(); 4];
-                    let mut g = 0;
-                    while g + 4 <= groups {
-                        for (u, a) in acc.iter_mut().enumerate() {
-                            let vx = load_x4(q.add(4 * (g + u)));
-                            *a = $dot(*a, _mm256_loadu_si256(w.add(32 * u) as *const __m256i), vx);
-                        }
-                        w = w.add(128);
-                        g += 4;
-                    }
-                    while g < groups {
-                        let vx = load_x4(q.add(4 * g));
-                        acc[0] = $dot(acc[0], _mm256_loadu_si256(w as *const __m256i), vx);
-                        w = w.add(32);
-                        g += 1;
-                    }
-                    let a = _mm256_add_epi32(
-                        _mm256_add_epi32(acc[0], acc[1]),
-                        _mm256_add_epi32(acc[2], acc[3]),
-                    );
-                    store8(o.add(8 * b), s.add(8 * b), a);
+            if groups == 0 {
+                // No column group: every sum is 0.
+                for (o, s) in out.iter_mut().zip(scale) {
+                    store8(o, s, _mm256_setzero_si256());
                 }
+                return;
+            }
+            // One block of 8 rows at a time, so the weights are one
+            // sequential stream (several streams were slower on 64-bit
+            // ARM when the weights are not in the caches); 4 column
+            // groups on separate accumulators.
+            let (x16, x_rest) = xq.as_chunks::<16>();
+            let x4 = x_rest.as_chunks::<4>().0;
+            // The weights of a block of 8 rows: one 8 × 4 block (32 bytes)
+            // for each column group.
+            let wlen = 32 * groups;
+            let wblocks = weights[..out.len() * wlen].chunks_exact(wlen);
+            for ((o, s), w) in out.iter_mut().zip(scale).zip(wblocks) {
+                let mut acc = [_mm256_setzero_si256(); 4];
+                let (w128, w_rest) = w.as_chunks::<128>();
+                for (xg, w) in x16.iter().zip(w128) {
+                    let xg = xg.as_chunks::<4>().0;
+                    let w = w.as_chunks::<32>().0;
+                    for ((a, xg), w) in acc.iter_mut().zip(xg).zip(w) {
+                        let vx = load_x4(xg);
+                        *a = $dot(*a, load_i8x32(w), vx);
+                    }
+                }
+                for (xg, w) in x4.iter().zip(w_rest.as_chunks::<32>().0) {
+                    let vx = load_x4(xg);
+                    acc[0] = $dot(acc[0], load_i8x32(w), vx);
+                }
+                let a = _mm256_add_epi32(
+                    _mm256_add_epi32(acc[0], acc[1]),
+                    _mm256_add_epi32(acc[2], acc[3]),
+                );
+                store8(o, s, a);
             }
         }
 
         #[doc = concat!($what, " `sparse_cgemv8x4`. Same contract as `vec_portable::sparse_cgemv8x4`.")]
         ///
+        /// Panics when a slice is shorter than the layer, when `rows` is
+        /// not a multiple of 8, when `cols > MAX_INPUTS`, or when the index
+        /// table or the weights fail `nnet::check_sparse` for `rows` rows
+        /// and `cols` inputs.
+        ///
         /// # Safety
         ///
-        /// The processor must support the instructions named above. The
-        /// index table must be valid for `rows` and `cols`, and `weights`
-        /// must hold 32 bytes for each listed block, as `nnet` checks.
+        /// The processor must support the instructions named above.
         #[target_feature(enable = $features)]
-        pub unsafe fn $sparse(
+        pub fn $sparse(
             out: &mut [f32],
             weights: &[i8],
             idx: &[i32],
@@ -368,8 +487,8 @@ macro_rules! int8_kernels {
             x: &[f32],
         ) {
             // `quantize` writes `cols` bytes into a buffer of `MAX_INPUTS`;
-            // each block of 8 rows stores 8 values. `nnet` checks the index
-            // table (`sparse_blocks`); the debug checks below repeat that per
+            // each block of 8 rows stores 8 values. `check_sparse` checks
+            // the index table; the debug checks below repeat that per
             // entry.
             assert!(
                 rows.is_multiple_of(8)
@@ -379,33 +498,42 @@ macro_rules! int8_kernels {
                     && scale.len() >= rows,
                 "sparse_cgemv8x4: slices shorter than the layer"
             );
-            let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
-            let q = xq.as_mut_ptr() as *mut i8;
-            let o = out.as_mut_ptr();
-            let s = scale.as_ptr();
-            let w = weights.as_ptr();
-            // The next entry of `idx` and the next block of `weights`.
-            let mut p = 0usize;
+            check_sparse(idx, rows, cols, weights.len());
+            let mut xq = XBuf([MaybeUninit::uninit(); MAX_INPUTS]);
+            let xq = quantize(&mut xq.0[..cols], &x[..cols]);
+            let mut out = out[..rows].as_chunks_mut::<8>().0;
+            let mut scale = scale[..rows].as_chunks::<8>().0;
+            // The entries of the table in order, and the offset of the
+            // weights of the next block of 8 rows.
+            let mut table = idx.iter();
             let mut wo = 0usize;
-            // SAFETY: the caller guarantees the table and the lengths, so
-            // only bytes written by `quantize` are read.
-            unsafe {
-                quantize(q, x.as_ptr(), cols);
-                for i in (0..rows).step_by(8) {
-                    let mut acc = _mm256_setzero_si256();
-                    let count = idx[p] as usize;
-                    p += 1;
-                    for _ in 0..count {
-                        debug_assert!(p < idx.len() && wo + 32 <= weights.len());
-                        let pos = *idx.get_unchecked(p) as usize;
-                        debug_assert!(pos + 4 <= cols);
-                        let vx = load_x4(q.add(pos));
-                        acc = $dot(acc, _mm256_loadu_si256(w.add(wo) as *const __m256i), vx);
-                        p += 1;
-                        wo += 32;
-                    }
-                    store8(o.add(i), s.add(i), acc);
+            // The blocks of the output and of the scales are taken apart
+            // from the front, one step at a time. With a zip of the two,
+            // the compiler addressed them by block number, which took
+            // three more instructions per block.
+            while let ([o, out_rest @ ..], [s, s_rest @ ..]) = (core::mem::take(&mut out), scale) {
+                (out, scale) = (out_rest, s_rest);
+                let mut acc = _mm256_setzero_si256();
+                let count = *table.next().unwrap() as usize;
+                debug_assert!(wo + 32 * count <= weights.len());
+                // SAFETY: `check_sparse` checked that the weights hold a
+                // block of 32 bytes for each listed position.
+                let wrow = unsafe { weights.get_unchecked(wo..wo + 32 * count) };
+                wo += 32 * count;
+                for w in wrow.as_chunks::<32>().0 {
+                    debug_assert!(!table.as_slice().is_empty());
+                    // SAFETY: `check_sparse` checked that `count` positions
+                    // follow the count of this block.
+                    let pos = unsafe { *table.next().unwrap_unchecked() } as usize;
+                    debug_assert!(pos + 4 <= cols);
+                    // SAFETY: `check_sparse` checked that each listed
+                    // position has `pos + 4 <= cols` (`xq` holds `cols`
+                    // values).
+                    let xg = unsafe { array_at_unchecked::<i8, 4>(xq, pos) };
+                    let vx = load_x4(xg);
+                    acc = $dot(acc, load_i8x32(w), vx);
                 }
+                store8(o, s, acc);
             }
         }
     };
@@ -424,56 +552,44 @@ int8_kernels!(
 /// half of `w` and `x` is one column group, the high half the next one.
 /// AVX-512 has no `sign_epi8`; the weights are negated where the input is
 /// negative.
-///
-/// # Safety
-///
-/// AVX-512 F, BW and VNNI.
 #[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vnni")]
 #[inline]
-unsafe fn dot_avx512vnni(acc: __m512i, w: __m512i, x: __m512i) -> __m512i {
+fn dot_avx512vnni(acc: __m512i, w: __m512i, x: __m512i) -> __m512i {
     let neg = _mm512_movepi8_mask(x);
     let sw = _mm512_mask_sub_epi8(w, neg, _mm512_setzero_si512(), w);
     _mm512_dpbusd_epi32(acc, _mm512_abs_epi8(x), sw)
 }
 
-/// The inputs of two column groups: 4 bytes at `q` in the low 8 lanes,
-/// the next 4 in the high 8 lanes.
-///
-/// # Safety
-///
-/// AVX-512 F; `q` has 8 bytes.
+/// The inputs of two column groups: the first 4 bytes of `q` in the low 8
+/// lanes, the next 4 in the high 8 lanes.
 #[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vnni")]
 #[inline]
-unsafe fn load_x8(q: *const i8) -> __m512i {
-    // SAFETY: the caller guarantees 8 readable bytes.
-    unsafe {
-        let lo = _mm256_set1_epi32(ptr::read_unaligned(q as *const i32));
-        let hi = _mm256_set1_epi32(ptr::read_unaligned(q.add(4) as *const i32));
-        _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
-    }
+fn load_x8(q: &[i8; 8]) -> __m512i {
+    let (q, _) = q.as_chunks::<4>();
+    let lo = _mm256_set1_epi32(x4_bits(&q[0]));
+    let hi = _mm256_set1_epi32(x4_bits(&q[1]));
+    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
 }
 
 /// The sum of the two halves of a 512-bit accumulator: the 8 rows.
-///
-/// # Safety
-///
-/// AVX-512 F.
 #[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vnni")]
 #[inline]
-unsafe fn fold512(acc: __m512i) -> __m256i {
+fn fold512(acc: __m512i) -> __m256i {
     _mm256_add_epi32(_mm512_castsi512_si256(acc), _mm512_extracti64x4_epi64::<1>(acc))
 }
 
 /// AVX-512 VNNI `cgemv8x4` (`_mm512_dpbusd_epi32` on two 8 × 4 blocks at
 /// a time). Same contract as `vec_portable::cgemv8x4`.
 ///
+/// Panics when a slice is shorter than `vec_portable::cgemv8x4` requires,
+/// or when `cols > MAX_INPUTS`.
+///
 /// # Safety
 ///
 /// The processor must support AVX2, FMA, AVX-512 F, AVX-512 BW and
-/// AVX-512 VNNI. The slices must have the lengths that
-/// `vec_portable::cgemv8x4` requires.
+/// AVX-512 VNNI.
 #[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vnni")]
-pub unsafe fn cgemv8x4_avx512vnni(
+pub fn cgemv8x4_avx512vnni(
     out: &mut [f32],
     weights: &[i8],
     scale: &[f32],
@@ -492,45 +608,52 @@ pub unsafe fn cgemv8x4_avx512vnni(
             && rows.checked_mul(cols).is_some_and(|n| weights.len() >= n),
         "cgemv8x4: slices shorter than the layer"
     );
-    let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
-    let q = xq.as_mut_ptr() as *mut i8;
-    let o = out.as_mut_ptr();
-    let s = scale.as_ptr();
+    let mut xq = XBuf([MaybeUninit::uninit(); MAX_INPUTS]);
+    let xq = quantize(&mut xq.0[..cols], &x[..cols]);
+    let out = out[..rows].as_chunks_mut::<8>().0;
+    let scale = scale[..rows].as_chunks::<8>().0;
     let bstride = cols * 8;
-    let groups = cols / 4;
-    // SAFETY: the caller guarantees the lengths; only the `cols` bytes
-    // written by `quantize` are read.
-    unsafe {
-        quantize(q, x.as_ptr(), cols);
-        for b in 0..rows / 8 {
-            let w = weights.as_ptr().add(b * bstride);
-            let mut acc = _mm512_setzero_si512();
-            let mut g = 0;
-            while g + 2 <= groups {
-                let vx = load_x8(q.add(4 * g));
-                acc = dot_avx512vnni(acc, _mm512_loadu_si512(w.add(32 * g) as *const _), vx);
-                g += 2;
-            }
-            let mut acc = fold512(acc);
-            if g < groups {
-                let vx = load_x4(q.add(4 * g));
-                acc = dot_avx2(acc, _mm256_loadu_si256(w.add(32 * g) as *const __m256i), vx);
-            }
-            store8(o.add(8 * b), s.add(8 * b), acc);
+    if bstride == 0 {
+        // No inputs: every sum is 0.
+        for (o, s) in out.iter_mut().zip(scale) {
+            store8(o, s, _mm256_setzero_si256());
         }
+        return;
+    }
+    // The inputs of 2 column groups at a time, then those of the last
+    // group when their number is odd.
+    let (x8, x_rest) = xq.as_chunks::<8>();
+    let x_odd = x_rest.first_chunk::<4>();
+    let wblocks = weights[..out.len() * bstride].chunks_exact(bstride);
+    for ((o, s), w) in out.iter_mut().zip(scale).zip(wblocks) {
+        let mut acc = _mm512_setzero_si512();
+        let (w64, w_rest) = w.as_chunks::<64>();
+        for (xg, w) in x8.iter().zip(w64) {
+            let vx = load_x8(xg);
+            acc = dot_avx512vnni(acc, load_i8x64(w), vx);
+        }
+        let mut acc = fold512(acc);
+        if let (Some(xg), Some(w)) = (x_odd, w_rest.first_chunk::<32>()) {
+            let vx = load_x4(xg);
+            acc = dot_avx2(acc, load_i8x32(w), vx);
+        }
+        store8(o, s, acc);
     }
 }
 
 /// AVX-512 VNNI `sparse_cgemv8x4`. Same contract as
 /// `vec_portable::sparse_cgemv8x4`.
 ///
+/// Panics when a slice is shorter than the layer, when `rows` is not a
+/// multiple of 8, when `cols > MAX_INPUTS`, or when the index table or the
+/// weights fail `nnet::check_sparse` for `rows` rows and `cols` inputs.
+///
 /// # Safety
 ///
 /// The processor must support AVX2, FMA, AVX-512 F, AVX-512 BW and
-/// AVX-512 VNNI. The index table must be valid for `rows` and `cols`, and
-/// `weights` must hold 32 bytes for each listed block, as `nnet` checks.
+/// AVX-512 VNNI.
 #[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vnni")]
-pub unsafe fn sparse_cgemv8x4_avx512vnni(
+pub fn sparse_cgemv8x4_avx512vnni(
     out: &mut [f32],
     weights: &[i8],
     idx: &[i32],
@@ -540,9 +663,8 @@ pub unsafe fn sparse_cgemv8x4_avx512vnni(
     x: &[f32],
 ) {
     // `quantize` writes `cols` bytes into a buffer of `MAX_INPUTS`;
-    // each block of 8 rows stores 8 values. `nnet` checks the index
-    // table (`sparse_blocks`); the debug checks below repeat that per
-    // entry.
+    // each block of 8 rows stores 8 values. `check_sparse` checks the
+    // index table; the debug checks below repeat that per entry.
     assert!(
         rows.is_multiple_of(8)
             && cols <= MAX_INPUTS
@@ -551,47 +673,52 @@ pub unsafe fn sparse_cgemv8x4_avx512vnni(
             && scale.len() >= rows,
         "sparse_cgemv8x4: slices shorter than the layer"
     );
-    let mut xq = core::mem::MaybeUninit::<XBuf>::uninit();
-    let q = xq.as_mut_ptr() as *mut i8;
-    let o = out.as_mut_ptr();
-    let s = scale.as_ptr();
-    let w = weights.as_ptr();
-    // The next entry of `idx` and the next block of `weights`.
-    let mut p = 0usize;
+    check_sparse(idx, rows, cols, weights.len());
+    let mut xq = XBuf([MaybeUninit::uninit(); MAX_INPUTS]);
+    let xq = quantize(&mut xq.0[..cols], &x[..cols]);
+    let out = out[..rows].as_chunks_mut::<8>().0;
+    let scale = scale[..rows].as_chunks::<8>().0;
+    // The entries of the table in order, and the offset of the weights of
+    // the next block of 8 rows.
+    let mut table = idx.iter();
     let mut wo = 0usize;
-    // SAFETY: the caller guarantees the table and the lengths.
-    unsafe {
-        quantize(q, x.as_ptr(), cols);
-        for i in (0..rows).step_by(8) {
-            let mut acc = _mm512_setzero_si512();
-            let count = idx[p] as usize;
-            p += 1;
-            let mut c = 0;
-            while c + 2 <= count {
-                debug_assert!(p + 1 < idx.len() && wo + 64 <= weights.len());
-                let pos0 = *idx.get_unchecked(p) as usize;
-                let pos1 = *idx.get_unchecked(p + 1) as usize;
-                debug_assert!(pos0 + 4 <= cols && pos1 + 4 <= cols);
-                let lo = _mm256_set1_epi32(ptr::read_unaligned(q.add(pos0) as *const i32));
-                let hi = _mm256_set1_epi32(ptr::read_unaligned(q.add(pos1) as *const i32));
-                let vx = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi);
-                acc = dot_avx512vnni(acc, _mm512_loadu_si512(w.add(wo) as *const _), vx);
-                p += 2;
-                wo += 64;
-                c += 2;
-            }
-            let mut acc = fold512(acc);
-            if c < count {
-                // Checked: at most once per block of 8 rows.
-                let pos = idx[p] as usize;
-                debug_assert!(pos + 4 <= cols && wo + 32 <= weights.len());
-                let vx = load_x4(q.add(pos));
-                acc = dot_avx2(acc, _mm256_loadu_si256(w.add(wo) as *const __m256i), vx);
-                p += 1;
-                wo += 32;
-            }
-            store8(o.add(i), s.add(i), acc);
+    for (o, s) in out.iter_mut().zip(scale) {
+        let mut acc = _mm512_setzero_si512();
+        let count = *table.next().unwrap() as usize;
+        debug_assert!(wo + 32 * count <= weights.len());
+        // SAFETY: `check_sparse` checked that the weights hold a block of 32
+        // bytes for each listed position.
+        let wrow = unsafe { weights.get_unchecked(wo..wo + 32 * count) };
+        wo += 32 * count;
+        // Two positions at a time, then the last one when `count` is odd.
+        let (pairs, odd) = wrow.as_chunks::<64>();
+        for w in pairs {
+            debug_assert!(table.as_slice().len() >= 2);
+            // SAFETY: `check_sparse` checked that `count` positions follow
+            // the count of this block.
+            let (pos0, pos1) = unsafe {
+                (*table.next().unwrap_unchecked() as usize, *table.next().unwrap_unchecked() as usize)
+            };
+            debug_assert!(pos0 + 4 <= cols && pos1 + 4 <= cols);
+            // SAFETY: `check_sparse` checked that each listed position has
+            // `pos + 4 <= cols` (`xq` holds `cols` values).
+            let (x0, x1) = unsafe { (array_at_unchecked::<i8, 4>(xq, pos0), array_at_unchecked::<i8, 4>(xq, pos1)) };
+            let lo = _mm256_set1_epi32(x4_bits(x0));
+            let hi = _mm256_set1_epi32(x4_bits(x1));
+            let vx = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi);
+            acc = dot_avx512vnni(acc, load_i8x64(w), vx);
         }
+        let mut acc = fold512(acc);
+        if let Some(w) = odd.first_chunk::<32>() {
+            // Checked: at most once per block of 8 rows.
+            let pos = *table.next().unwrap() as usize;
+            debug_assert!(pos + 4 <= cols);
+            // SAFETY: as above.
+            let xg = unsafe { array_at_unchecked::<i8, 4>(xq, pos) };
+            let vx = load_x4(xg);
+            acc = dot_avx2(acc, load_i8x32(w), vx);
+        }
+        store8(o, s, acc);
     }
 }
 
@@ -611,13 +738,9 @@ pub unsafe fn sparse_cgemv8x4_avx512vnni(
 /// are computed here. Other lanes (zeros, subnormals, and inputs from 2^126
 /// up, whose estimate is subnormal) are rare; when one occurs, the whole
 /// vector goes through `vec_portable::frecpe_bits`.
-///
-/// # Safety
-///
-/// AVX2.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn frecpe8(d: __m256) -> __m256 {
+fn frecpe8(d: __m256) -> __m256 {
     let bits = _mm256_castps_si256(d);
     let sign = _mm256_and_si256(bits, _mm256_set1_epi32(i32::MIN));
     let e = _mm256_and_si256(_mm256_srli_epi32::<23>(bits), _mm256_set1_epi32(0xff));
@@ -651,27 +774,23 @@ unsafe fn frecpe8(d: __m256) -> __m256 {
         _mm256_cmpgt_epi32(_mm256_set1_epi32(255), e),
     );
     if _mm256_movemask_epi8(_mm256_or_si256(low, high)) != 0 {
-        let mut v = [0u32; 8];
-        // SAFETY: `v` has 8 lanes.
-        unsafe { _mm256_storeu_si256(v.as_mut_ptr() as *mut __m256i, bits) };
+        // The bits of each lane, as `i32` (`frecpe_bits` takes them as
+        // `u32`).
+        let mut v = [0i32; 8];
+        store_i32x8(&mut v, bits);
         for lane in v.iter_mut() {
-            *lane = vec_portable::frecpe_bits(*lane);
+            *lane = vec_portable::frecpe_bits(*lane as u32) as i32;
         }
-        // SAFETY: as above.
-        return unsafe { _mm256_castsi256_ps(_mm256_loadu_si256(v.as_ptr() as *const __m256i)) };
+        return _mm256_castsi256_ps(load_i32x8(&v));
     }
     _mm256_castsi256_ps(_mm256_blendv_epi8(normal, special, is_max))
 }
 
 /// `exp4_approx` on 8 lanes.
-///
-/// # Safety
-///
-/// AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 #[allow(clippy::excessive_precision, clippy::approx_constant)]
-unsafe fn exp8(x: __m256) -> __m256 {
+fn exp8(x: __m256) -> __m256 {
     // `min` and `max` with the constant first return the input when it is
     // NaN, like FMIN and FMAX.
     let x = _mm256_max_ps(_mm256_set1_ps(-88.0), _mm256_min_ps(_mm256_set1_ps(88.0), x));
@@ -689,14 +808,10 @@ unsafe fn exp8(x: __m256) -> __m256 {
 }
 
 /// `tanh4_approx` on 8 lanes.
-///
-/// # Safety
-///
-/// AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 #[allow(clippy::excessive_precision)]
-unsafe fn tanh8(x: __m256) -> __m256 {
+fn tanh8(x: __m256) -> __m256 {
     let x2 = _mm256_mul_ps(x, x);
     let num = _mm256_fmadd_ps(
         x2,
@@ -709,20 +824,15 @@ unsafe fn tanh8(x: __m256) -> __m256 {
         _mm256_set1_ps(952.72399902),
     );
     let num = _mm256_mul_ps(num, x);
-    // SAFETY: AVX2 is enabled.
-    let num = _mm256_mul_ps(num, unsafe { frecpe8(den) });
+    let num = _mm256_mul_ps(num, frecpe8(den));
     _mm256_max_ps(_mm256_set1_ps(-1.0), _mm256_min_ps(_mm256_set1_ps(1.0), num))
 }
 
 /// `sigmoid4_approx` on 8 lanes.
-///
-/// # Safety
-///
-/// AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 #[allow(clippy::excessive_precision)]
-unsafe fn sigmoid8(x: __m256) -> __m256 {
+fn sigmoid8(x: __m256) -> __m256 {
     let x2 = _mm256_mul_ps(x, x);
     let num = _mm256_fmadd_ps(
         x2,
@@ -735,8 +845,7 @@ unsafe fn sigmoid8(x: __m256) -> __m256 {
         _mm256_set1_ps(952.72399902),
     );
     let num = _mm256_mul_ps(num, x);
-    // SAFETY: AVX2 is enabled.
-    let num = _mm256_fmadd_ps(num, unsafe { frecpe8(den) }, _mm256_set1_ps(0.5));
+    let num = _mm256_fmadd_ps(num, frecpe8(den), _mm256_set1_ps(0.5));
     // The result is never -0.0, so the order of `max` for two zeros does
     // not matter here.
     _mm256_max_ps(_mm256_setzero_ps(), _mm256_min_ps(_mm256_set1_ps(1.0), num))
@@ -748,14 +857,10 @@ unsafe fn sigmoid8(x: __m256) -> __m256 {
 ///
 /// The processor must support AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
-pub unsafe fn vec_exp_avx2(buf: &mut [f32]) {
+pub fn vec_exp_avx2(buf: &mut [f32]) {
     let n8 = buf.len() & !7;
-    let p = buf.as_mut_ptr();
-    // SAFETY: `i + 8 <= buf.len()`.
-    unsafe {
-        for i in (0..n8).step_by(8) {
-            _mm256_storeu_ps(p.add(i), exp8(_mm256_loadu_ps(p.add(i))));
-        }
+    for v in buf[..n8].as_chunks_mut::<8>().0 {
+        store_f32x8(v, exp8(load_f32x8(v)));
     }
     for v in &mut buf[n8..] {
         *v = vec_portable::lpcnet_exp(*v);
@@ -768,15 +873,11 @@ pub unsafe fn vec_exp_avx2(buf: &mut [f32]) {
 ///
 /// The processor must support AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
-pub unsafe fn vec_tanh_avx2(buf: &mut [f32]) {
+pub fn vec_tanh_avx2(buf: &mut [f32]) {
     let groups = buf.len() & !3;
     let n8 = buf.len() & !7;
-    let p = buf.as_mut_ptr();
-    // SAFETY: `i + 8 <= buf.len()`.
-    unsafe {
-        for i in (0..n8).step_by(8) {
-            _mm256_storeu_ps(p.add(i), tanh8(_mm256_loadu_ps(p.add(i))));
-        }
+    for v in buf[..n8].as_chunks_mut::<8>().0 {
+        store_f32x8(v, tanh8(load_f32x8(v)));
     }
     // A last group of 4 with the group formula, then the tail formula.
     for v in &mut buf[n8..groups] {
@@ -793,15 +894,11 @@ pub unsafe fn vec_tanh_avx2(buf: &mut [f32]) {
 ///
 /// The processor must support AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
-pub unsafe fn vec_sigmoid_avx2(buf: &mut [f32]) {
+pub fn vec_sigmoid_avx2(buf: &mut [f32]) {
     let groups = buf.len() & !3;
     let n8 = buf.len() & !7;
-    let p = buf.as_mut_ptr();
-    // SAFETY: `i + 8 <= buf.len()`.
-    unsafe {
-        for i in (0..n8).step_by(8) {
-            _mm256_storeu_ps(p.add(i), sigmoid8(_mm256_loadu_ps(p.add(i))));
-        }
+    for v in buf[..n8].as_chunks_mut::<8>().0 {
+        store_f32x8(v, sigmoid8(load_f32x8(v)));
     }
     for v in &mut buf[n8..groups] {
         *v = vec_portable::sigmoid_approx(*v);

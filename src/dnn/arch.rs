@@ -144,9 +144,10 @@ pub fn available() -> &'static [DnnArch] {
 /// only changes the speed.
 ///
 /// The layer functions call this before they call a kernel, so the
-/// `unsafe` kernels only ever run on a processor that has their
-/// instructions. The checks are cached by `std` (one atomic load each) or
-/// known at compile time.
+/// kernels, which are compiled for their instructions
+/// (`#[target_feature]`), only ever run on a processor that has them.
+/// The checks are cached by `std` (one atomic load each) or known at
+/// compile time.
 #[inline]
 pub(crate) fn usable(arch: DnnArch) -> DnnArch {
     match arch {
