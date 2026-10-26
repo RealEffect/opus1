@@ -581,23 +581,48 @@ fn damaged_packets_and_losses_in_the_opus_decoder() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// A damaged CELT-only packet (20 ms, stereo, eight flipped bits) after
-/// which libopus 1.6.1 reports the final range 0x159e9700.
-const PACKET_WITH_OUT_OF_RANGE_INTEGER: &[&str] = &[
-    "fcd913102fd6a7ae1f74c9fcb8fd941fcd9666463058b886562b62bb30542cd8",
-    "6cd9813dc3c368bcc3947a5bc62420719df0fd6737ea95eb589d41ed54210bbd",
-    "8c8143eb8cd1ff53aead3aa631caedc5e0f30cab7687849bd482e3c17220a5ba",
-    "b8772d0bf27d1be5c0954a787340bdb406f37973710d64fdec2c68483a8e4ff9",
-    "7a2df998ce391044cea3db2afa5a71491c83c6eb0ae5c78693fe48f79315972a",
-    "3fc19a778a73848c97259065db0c8467f2a9648e404328ae4ea193ae22e4c3a7",
-    "543834f7589f86138b",
-];
+/// `ec_ctx` of libopus (celt/entcode.h).
+#[repr(C)]
+struct EcCtx {
+    buf: *mut u8,
+    storage: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    offs: u32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    error: i32,
+}
 
-fn hex_bytes(lines: &[&str]) -> Vec<u8> {
-    let hex: String = lines.concat();
-    (0..hex.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
-        .collect()
+unsafe extern "C" {
+    fn ec_dec_init(this: *mut EcCtx, buf: *mut u8, size: u32);
+    fn ec_dec_uint(this: *mut EcCtx, ft: u32) -> u32;
+}
+
+/// A damaged CELT-only packet of 20 ms, stereo and fullband, which holds an
+/// integer that `dec_uint` decodes out of range. The search damages packets
+/// of libopus's encoder and decodes each with a new `CeltDecoder` until one
+/// leaves the range decoder's error flag set: only that case sets it in a
+/// decoder.
+fn packet_with_out_of_range_integer() -> Vec<u8> {
+    let mut rng = Rng(0x0dec_0de5);
+    let packets = damage_test_packets(48000, 2, BW_FB, 960, 48000, 10.0);
+    let mut planar = vec![0f32; 2 * 960];
+    for packet in &packets {
+        let p = damage(packet, &mut rng);
+        let mut dec = CeltDecoder::new(default_mode(), 2, 48000);
+        dec.set_end_band(end_band(p[0])).unwrap();
+        let mut rc = RangeCoder::new_decoder(&p[1..]);
+        assert_eq!(dec.decode(&mut rc, (p.len() * 8 - 8) as i32, 960, &mut planar, PcmLayout::Planar), 960);
+        if rc.error != 0 {
+            return p;
+        }
+    }
+    panic!("none of {} damaged packets decodes an integer out of range", packets.len());
 }
 
 /// libopus `ec_dec_uint` (celt/entdec.c) decodes an integer below `ft` in
@@ -625,11 +650,19 @@ fn hex_bytes(lines: &[&str]) -> Vec<u8> {
 fn damaged_frames_read_the_same_symbols_as_libopus() {
     // The smallest case: 257 values, the top value of the high part and a
     // raw bit of 1 give 257.
-    let mut rc = RangeCoder::new_decoder(&[0xff; 4]);
-    assert_eq!(rc.dec_uint(257), 256, "dec_uint(257) on a frame of ones");
+    let mut ones = [0xffu8; 4];
+    let mut rc = RangeCoder::new_decoder(&ones);
+    let mut ctx: EcCtx = unsafe { std::mem::zeroed() };
+    // SAFETY: the buffer holds 4 bytes, which is the size given.
+    let libopus = unsafe {
+        ec_dec_init(&mut ctx, ones.as_mut_ptr(), 4);
+        ec_dec_uint(&mut ctx, 257)
+    };
+    assert_eq!(rc.dec_uint(257), libopus, "dec_uint(257) on a frame of ones");
+    assert_eq!((rc.error, ctx.error), (1, 1), "error flags of opus1 and libopus");
 
     // A whole frame.
-    let packet = hex_bytes(PACKET_WITH_OUT_OF_RANGE_INTEGER);
+    let packet = packet_with_out_of_range_integer();
     assert_eq!(toc(packet[0]).to_string(), toc(0xfc).to_string());
     let mut c_dec = CDecoder::new(48000, 2);
     let mut dec = CeltDecoder::new(default_mode(), 2, 48000);
@@ -637,8 +670,7 @@ fn damaged_frames_read_the_same_symbols_as_libopus() {
     let c = c_dec.decode(Some(&packet), 960);
     let n = decode_all(&mut dec, &packet[1..], 960, &mut planar, PcmLayout::Planar);
     assert_eq!(n, 960);
-    assert_eq!(c_dec.final_range(), 0x159e_9700, "libopus");
-    assert_eq!(dec.final_range(), 0x159e_9700, "opus1");
+    assert_eq!(dec.final_range(), c_dec.final_range(), "final range of opus1 and libopus");
     let db = snr(&c, &interleave(&planar, 2));
     assert!(db > 100.0, "{db:.1} dB");
 

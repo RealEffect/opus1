@@ -1,36 +1,98 @@
-// Verification scripts intentionally mirror the C reference style
-// (index-based loops, grouped hex tables) — keep clippy quiet.
-#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+//! The coarse and fine energy quantizers (`quant_coarse_energy`,
+//! `quant_fine_energy`, src/quant_bands.rs) against the functions of the
+//! same name in libopus (celt/quant_bands.c), called in the static library
+//! the tests link.
+//!
+//! Both get the same band energies, all previous energies at zero and a
+//! range coder of 1000 bytes. The bytes of the two coders, the quantized
+//! energies and the remaining errors must be equal.
 
 use opus1::internals::modes::default_mode;
 use opus1::internals::quant_bands::{quant_coarse_energy, quant_fine_energy};
 use opus1::internals::range_coder::RangeCoder;
+use std::os::raw::{c_int, c_void};
+
+/// `ec_ctx` of libopus (celt/entcode.h).
+#[repr(C)]
+struct EcCtx {
+    buf: *mut u8,
+    storage: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: c_int,
+    nbits_total: c_int,
+    offs: u32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: c_int,
+    error: c_int,
+}
+
+unsafe extern "C" {
+    fn opus_custom_mode_create(fs: i32, frame_size: c_int, error: *mut c_int) -> *const c_void;
+    fn ec_enc_init(this: *mut EcCtx, buf: *mut u8, size: u32);
+    fn ec_enc_done(this: *mut EcCtx);
+    #[link_name = "quant_coarse_energy"]
+    fn c_quant_coarse_energy(
+        m: *const c_void,
+        start: c_int,
+        end: c_int,
+        eff_end: c_int,
+        e_bands: *const f32,
+        old_e_bands: *mut f32,
+        budget: u32,
+        error: *mut f32,
+        enc: *mut EcCtx,
+        channels: c_int,
+        lm: c_int,
+        nb_available_bytes: c_int,
+        force_intra: c_int,
+        delayed_intra: *mut f32,
+        two_pass: c_int,
+        loss_rate: c_int,
+        lfe: c_int,
+    );
+    #[link_name = "quant_fine_energy"]
+    fn c_quant_fine_energy(
+        m: *const c_void,
+        start: c_int,
+        end: c_int,
+        old_e_bands: *mut f32,
+        error: *mut f32,
+        prev_quant: *const c_int,
+        extra_quant: *const c_int,
+        enc: *mut EcCtx,
+        channels: c_int,
+    );
+}
+
+/// The 48 kHz mode of libopus. The call also makes sure the test binary
+/// links the static library that `audiopus_sys` brings along.
+fn c_mode() -> *const c_void {
+    let version = unsafe { audiopus_sys::opus_get_version_string() };
+    assert!(!version.is_null());
+    let mut err: c_int = -1;
+    let mode = unsafe { opus_custom_mode_create(48000, 960, &mut err) };
+    assert!(err == 0 && !mode.is_null(), "libopus has no 48 kHz mode: {err}");
+    mode
+}
 
 #[test]
 fn test_quant_energy_match() {
     let mode = default_mode();
     let nb_ebands = mode.nb_ebands;
+    let e_bands: Vec<f32> = (0..nb_ebands).map(|i| 5.0 + (i as f32 * 0.5).sin() * 2.0).collect();
+    let fine_quant: Vec<i32> = (0..nb_ebands).map(|i| (i % 3) as i32).collect();
+    let (start, end, budget, channels, lm) = (0, nb_ebands, 10000u32, 1, 3);
+    let nb_available_bytes = (budget / 8) as usize;
+    // Without intra coding forced (`force_intra` 0 and `delayedIntra` 0
+    // in libopus).
+    let intra = false;
 
-    // Inputs matching verify_quant.c
-    let mut e_bands = vec![0.0f32; nb_ebands];
-    for i in 0..nb_ebands {
-        e_bands[i] = 5.0 + (i as f32 * 0.5).sin() * 2.0;
-    }
-
-    let mut old_e_bands = vec![0.0f32; nb_ebands]; // All zeros
+    let mut old_e_bands = vec![0.0f32; nb_ebands];
     let mut error = vec![0.0f32; nb_ebands];
-
-    // Encoder
     let mut enc = RangeCoder::new_encoder(1000);
-
-    let start = 0;
-    let end = nb_ebands;
-    let budget = 10000;
-    let channels = 1;
-    let lm = 3;
-    let intra = false; // Based on verify_quant.c logic (force_intra=0, delayedIntra=0 => intra=0)
-
-    // 1. Coarse Energy
     quant_coarse_energy(
         mode,
         start,
@@ -43,63 +105,58 @@ fn test_quant_energy_match() {
         channels,
         lm,
         intra,
-        (budget / 8) as usize,
+        nb_available_bytes,
     );
-
-    // 2. Fine Energy
-    let mut fine_quant = vec![0i32; nb_ebands];
-    for i in 0..nb_ebands {
-        fine_quant[i] = (i % 3) as i32;
-    }
-
-    quant_fine_energy(
-        mode,
-        start,
-        end,
-        &mut old_e_bands,
-        &mut error,
-        &fine_quant,
-        &mut enc,
-        channels,
-    );
-
+    quant_fine_energy(mode, start, end, &mut old_e_bands, &mut error, &fine_quant, &mut enc, channels);
     enc.done();
 
-    // Verification
-    // Reference output from verify_quant.c (Opus 1.6)
-    let ref_old_e_bands = [
-        5.000000, 5.749939, 6.724915, 7.399902, 6.949_89, 6.074_89, 5.399902, 4.349915, 3.424927,
-        2.999939, 2.949951, 3.574951, 4.199951, 5.249939, 6.424927, 6.399902, 7.149902, 6.574_89,
-        5.399902, 4.849915, 3.924927,
-    ];
-
-    let ref_bytes: [u8; 7] = [0xDB, 0x43, 0xC7, 0x87, 0x70, 0x68, 0xC4];
-    let ref_last_bytes: [u8; 3] = [0x17, 0x1C, 0x14]; // [997], [998], [999]
-
-    for i in 0..7 {
-        assert_eq!(enc.buf[i], ref_bytes[i], "Byte {} mismatch", i);
-    }
-
-    // Check end bytes. RangeCoder done() flushed bits to the end of buffer.
-    for i in 0..3 {
-        assert_eq!(
-            enc.buf[enc.storage as usize - 3 + i],
-            ref_last_bytes[i],
-            "End byte {} mismatch",
-            i
+    let mut c_old = vec![0.0f32; nb_ebands];
+    let mut c_error = vec![0.0f32; nb_ebands];
+    let mut c_buf = vec![0u8; 1000];
+    let mut c_enc: EcCtx = unsafe { std::mem::zeroed() };
+    let mut delayed_intra = 0.0f32;
+    // SAFETY: the band arrays hold `nb_ebands` values for one channel, the
+    // buffer 1000 bytes, and the mode is libopus's own.
+    unsafe {
+        let m = c_mode();
+        ec_enc_init(&mut c_enc, c_buf.as_mut_ptr(), 1000);
+        c_quant_coarse_energy(
+            m,
+            start as c_int,
+            end as c_int,
+            end as c_int,
+            e_bands.as_ptr(),
+            c_old.as_mut_ptr(),
+            budget,
+            c_error.as_mut_ptr(),
+            &mut c_enc,
+            channels as c_int,
+            lm as c_int,
+            nb_available_bytes as c_int,
+            intra as c_int,
+            &mut delayed_intra,
+            0,
+            0,
+            0,
         );
-    }
-
-    for i in 0..nb_ebands {
-        let diff = (old_e_bands[i] - ref_old_e_bands[i]).abs();
-        assert!(
-            diff < 1e-4,
-            "Band {} mismatch: expected {}, got {}",
-            i,
-            ref_old_e_bands[i],
-            old_e_bands[i]
+        c_quant_fine_energy(
+            m,
+            start as c_int,
+            end as c_int,
+            c_old.as_mut_ptr(),
+            c_error.as_mut_ptr(),
+            std::ptr::null(),
+            fine_quant.as_ptr(),
+            &mut c_enc,
+            channels as c_int,
         );
+        ec_enc_done(&mut c_enc);
     }
 
-    println!("Everything matches bit-exactly (stream) and with low precision error (values)!");
+    assert_eq!(c_enc.error, 0, "libopus's coder ran out of room");
+    assert!(c_enc.offs > 0 && c_enc.end_offs > 0, "libopus wrote range coder bytes and raw bits");
+    assert_eq!(&enc.buf[..1000], &c_buf[..], "bytes");
+    assert_eq!((enc.offs, enc.end_offs), (c_enc.offs, c_enc.end_offs), "bytes written at the front and the end");
+    assert_eq!(old_e_bands, c_old, "quantized energies");
+    assert_eq!(error, c_error, "remaining errors");
 }

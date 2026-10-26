@@ -4703,36 +4703,83 @@ mod tests {
         check_shaping_filter::<4>(&mut rng);
     }
 
+    /// The survivor selection as libopus writes it
+    /// (`silk_noise_shape_quantizer_del_dec`, silk/NSQ_del_dec.c 565-604):
+    /// `(Winner_ind, RDmax_ind, RDmin_ind, RDmin_Q10, replace)`. The costs
+    /// must leave room for the penalty: libopus adds it without saturation.
+    fn select_survivors_by_definition<const N: usize>(
+        rd0: &mut [i32; N],
+        rd1: &mut [i32; N],
+        rand_state: &[i32; N],
+    ) -> (usize, usize, usize, i32, bool) {
+        // Find winner.
+        let mut rd_min_q10 = rd0[0];
+        let mut winner_ind = 0;
+        for k in 1..N {
+            if rd0[k] < rd_min_q10 {
+                rd_min_q10 = rd0[k];
+                winner_ind = k;
+            }
+        }
+        // Increase RD values of expired states.
+        let winner_rand_state = rand_state[winner_ind];
+        for k in 0..N {
+            if rand_state[k] != winner_rand_state {
+                rd0[k] += i32::MAX >> 4;
+                rd1[k] += i32::MAX >> 4;
+            }
+        }
+        // Find worst in first set and best in second set.
+        let mut rd_max_q10 = rd0[0];
+        let mut rd_min_q10 = rd1[0];
+        let (mut rd_max_ind, mut rd_min_ind) = (0, 0);
+        for k in 1..N {
+            if rd0[k] > rd_max_q10 {
+                rd_max_q10 = rd0[k];
+                rd_max_ind = k;
+            }
+            if rd1[k] < rd_min_q10 {
+                rd_min_q10 = rd1[k];
+                rd_min_ind = k;
+            }
+        }
+        (winner_ind, rd_max_ind, rd_min_ind, rd_min_q10, rd_min_q10 < rd_max_q10)
+    }
+
+    fn check_survivors<const N: usize>(rng: &mut Rng) {
+        for case in 0..4000 {
+            // Costs from a few values only, so that many are equal, and
+            // dither states from two or three values: ties and states on
+            // other paths in most cases. Every cost leaves room for the
+            // penalty.
+            let top = [3, 40, 1 << 20, (i32::MAX - (i32::MAX >> 4)) as i64][case % 4];
+            let mut rd0: [i32; N] = core::array::from_fn(|_| rng.range(0, top) as i32);
+            let mut rd1: [i32; N] = core::array::from_fn(|_| rng.range(0, top) as i32);
+            let paths = 1 + case % 3;
+            let rand_state: [i32; N] = core::array::from_fn(|_| rng.range(0, paths as i64 - 1) as i32);
+            let (mut want0, mut want1) = (rd0, rd1);
+            let want = select_survivors_by_definition(&mut want0, &mut want1, &rand_state);
+            let sv = select_survivors(&mut rd0, &mut rd1, &rand_state);
+            let what = format!("{N} states, case {case}: {rd0:?} {rd1:?} {rand_state:?}");
+            assert_eq!((sv.winner_ind, sv.rd_max_ind, sv.rd_min_ind, sv.rd_min_q10, sv.replace), want, "{what}");
+            assert_eq!((rd0, rd1), (want0, want1), "{what}");
+        }
+    }
+
     #[test]
     fn survivors_keep_the_lowest_index_on_ties() {
-        // All equal: state 0 wins, nothing is replaced.
-        let (mut rd0, mut rd1) = ([5; 4], [5; 4]);
-        let sv = select_survivors(&mut rd0, &mut rd1, &[7; 4]);
-        assert_eq!(
-            (sv.winner_ind, sv.rd_max_ind, sv.rd_min_ind, sv.replace),
-            (0, 0, 0, false)
-        );
+        let mut rng = Rng(5);
+        check_survivors::<1>(&mut rng);
+        check_survivors::<2>(&mut rng);
+        check_survivors::<3>(&mut rng);
+        check_survivors::<4>(&mut rng);
 
-        // Two equal minima and two equal maxima: the first of each.
-        let (mut rd0, mut rd1) = ([9, 3, 3, 9], [20, 4, 4, 20]);
-        let sv = select_survivors(&mut rd0, &mut rd1, &[7; 4]);
-        assert_eq!((sv.winner_ind, sv.rd_max_ind, sv.rd_min_ind), (1, 0, 1));
-        assert!(sv.replace);
-        assert_eq!(sv.rd_min_q10, 4);
-
-        // A state on another path than the winner is made expensive, then
-        // replaced even though it was cheaper than the others.
-        let (mut rd0, mut rd1) = ([10, 11, 12], [30, 31, 32]);
-        let sv = select_survivors(&mut rd0, &mut rd1, &[1, 2, 1]);
-        assert_eq!((sv.winner_ind, sv.rd_max_ind, sv.rd_min_ind), (0, 1, 0));
-        assert_eq!(rd0, [10, 11 + (i32::MAX >> 4), 12]);
-        assert_eq!(rd1, [30, 31 + (i32::MAX >> 4), 32]);
-        assert!(sv.replace);
-
-        // The penalty saturates.
+        // Where libopus's addition would overflow, the penalty saturates:
+        // the cost of a state on another path never wraps around to a
+        // small value.
         let (mut rd0, mut rd1) = ([0, i32::MAX - 5], [1, i32::MAX - 1]);
         select_survivors(&mut rd0, &mut rd1, &[1, 2]);
-        assert_eq!((rd0[1], rd1[1]), (i32::MAX, i32::MAX));
+        assert!(rd0[1] >= i32::MAX - 5 && rd1[1] >= i32::MAX - 1, "{rd0:?} {rd1:?}");
     }
 
     /// The tests of the vector sample loops: `mod neon` on aarch64, `mod x86`

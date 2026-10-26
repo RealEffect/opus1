@@ -372,10 +372,84 @@ mod tests {
     use crate::range_coder::RangeCoder;
     use crate::silk::decode_indices::silk_stereo_decode_pred;
     use crate::silk::encode_indices::{silk_stereo_encode_mid_only, silk_stereo_encode_pred};
+    use audiopus_sys as _;
 
-    /// The integer test-signal generator of the libopus oracle harness used to
-    /// verify this port (xorshift32 noise in seven shapes), so that its golden
-    /// hashes can be reproduced here.
+    /// `stereo_enc_state` of libopus (silk/structs.h).
+    #[repr(C)]
+    struct CStereoState {
+        pred_prev_q13: [i16; 2],
+        s_mid: [i16; 2],
+        s_side: [i16; 2],
+        mid_side_amp_q0: [i32; 4],
+        smth_width_q14: i16,
+        width_prev_q14: i16,
+        silent_side_len: i16,
+        pred_ix: [[[i8; 3]; 2]; 3],
+        mid_only_flags: [i8; 3],
+    }
+
+    /// `ec_ctx` of libopus (celt/entcode.h).
+    #[repr(C)]
+    struct EcCtx {
+        buf: *mut u8,
+        storage: u32,
+        end_offs: u32,
+        end_window: u32,
+        nend_bits: i32,
+        nbits_total: i32,
+        offs: u32,
+        rng: u32,
+        val: u32,
+        ext: u32,
+        rem: i32,
+        error: i32,
+    }
+
+    impl CStereoState {
+        /// libopus's state with the values of `s`.
+        fn of(s: &SilkStereoState) -> Self {
+            CStereoState {
+                pred_prev_q13: s.pred_prev_q13,
+                s_mid: s.s_mid,
+                s_side: s.s_side,
+                mid_side_amp_q0: s.mid_side_amp_q0,
+                smth_width_q14: s.smth_width_q14,
+                width_prev_q14: s.width_prev_q14,
+                silent_side_len: s.silent_side_len,
+                pred_ix: s.pred_ix,
+                mid_only_flags: s.mid_only_flags,
+            }
+        }
+    }
+
+    // The functions of the float libopus that the tests link: integer code,
+    // the same in every build.
+    unsafe extern "C" {
+        fn ec_enc_init(this: *mut EcCtx, buf: *mut u8, size: u32);
+        fn ec_enc_done(this: *mut EcCtx);
+        /// `x1` and `x2` point 2 samples into their buffers: libopus reads
+        /// and writes `x1[-2]` and `x1[-1]`.
+        #[link_name = "silk_stereo_LR_to_MS"]
+        fn c_silk_stereo_lr_to_ms(
+            state: *mut CStereoState,
+            x1: *mut i16,
+            x2: *mut i16,
+            ix: *mut [i8; 3],
+            mid_only_flag: *mut i8,
+            mid_side_rates_bps: *mut i32,
+            total_rate_bps: i32,
+            prev_speech_act_q8: i32,
+            to_mono: i32,
+            fs_khz: i32,
+            frame_length: i32,
+        );
+        #[link_name = "silk_stereo_encode_pred"]
+        fn c_silk_stereo_encode_pred(enc: *mut EcCtx, ix: *mut [i8; 3]);
+        #[link_name = "silk_stereo_encode_mid_only"]
+        fn c_silk_stereo_encode_mid_only(enc: *mut EcCtx, mid_only_flag: i8);
+    }
+
+    /// An integer test-signal generator: xorshift32 noise in seven shapes.
     struct Gen {
         rng: u32,
         lp: i32,
@@ -418,17 +492,12 @@ mod tests {
         }
     }
 
-    fn fnv_i32(h: &mut u64, v: i32) {
-        for b in v.to_le_bytes() {
-            *h ^= b as u64;
-            *h = h.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    /// FNV-1a-64 of every output of `frames` frames of oracle stream `st`:
-    /// the mid and side buffers, the indices, the mid-only flag, the rates,
-    /// the stereo state, then the range-coded predictors and flags.
-    fn stream_hash(st: u32, frames: usize) -> u64 {
+    /// Runs `frames` frames of stream `st` through opus1 and through
+    /// libopus's `silk_stereo_LR_to_MS`, `silk_stereo_encode_pred` and
+    /// `silk_stereo_encode_mid_only`. After each frame the mid and side
+    /// buffers, the indices, the mid-only flag, the rates and the stereo
+    /// state must be equal; at the end the coded bytes.
+    fn compare_stream(st: u32, frames: usize) {
         let mut g = Gen {
             rng: 0x9E37_79B9 ^ st.wrapping_mul(2_654_435_761),
             lp: 0,
@@ -441,9 +510,17 @@ mod tests {
         } as usize;
         let mut kind = st % 7;
         let sh = g.xs() % 9;
+        // Both start from opus1's initial state, whose norms are those that
+        // libopus's silk_Encode sets when the input becomes stereo
+        // (enc_API.c:195-198).
         let mut state = SilkStereoState::default();
+        let mut c_state = CStereoState::of(&state);
         let mut rc = RangeCoder::new_encoder(1275);
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut c_buf = [0u8; 1275];
+        // SAFETY: an all-zero `ec_ctx` is valid input to `ec_enc_init`.
+        let mut c_rc: EcCtx = unsafe { core::mem::zeroed() };
+        // SAFETY: the buffer holds 1275 bytes, the size given.
+        unsafe { ec_enc_init(&mut c_rc, c_buf.as_mut_ptr(), 1275) };
         for f in 0..frames {
             let rate = match g.xs() % 6 {
                 0 => 1 + g.xs() % 2000,
@@ -465,6 +542,7 @@ mod tests {
             if st % 5 == 4 && f == frames / 2 {
                 kind = (kind + 3) % 7;
             }
+            let (mut c_x1, mut c_x2) = (x1, x2);
             let (mut ix, mut mid_only, mut rates) = ([[0i8; 3]; 2], 0i8, [0i32; 2]);
             silk_stereo_lr_to_ms(
                 &mut state,
@@ -481,62 +559,58 @@ mod tests {
             );
             silk_stereo_encode_pred(&mut rc, &ix);
             silk_stereo_encode_mid_only(&mut rc, mid_only);
-            for &v in x1[..fl + 2].iter().chain(&x2[..fl + 2]) {
-                fnv_i32(&mut h, v as i32);
+            let (mut c_ix, mut c_mid_only, mut c_rates) = ([[0i8; 3]; 2], 0i8, [0i32; 2]);
+            // SAFETY: both buffers hold 2 samples before the frame and
+            // `fl` samples of it; the outputs have the sizes libopus writes.
+            unsafe {
+                c_silk_stereo_lr_to_ms(
+                    &mut c_state,
+                    c_x1.as_mut_ptr().add(2),
+                    c_x2.as_mut_ptr().add(2),
+                    c_ix.as_mut_ptr(),
+                    &mut c_mid_only,
+                    c_rates.as_mut_ptr(),
+                    rate,
+                    sa,
+                    to_mono as i32,
+                    fs_khz,
+                    fl as i32,
+                );
+                c_silk_stereo_encode_pred(&mut c_rc, c_ix.as_mut_ptr());
+                c_silk_stereo_encode_mid_only(&mut c_rc, c_mid_only);
             }
-            for v in ix.iter().flatten() {
-                fnv_i32(&mut h, *v as i32);
-            }
-            for v in [mid_only as i32, rates[0], rates[1]] {
-                fnv_i32(&mut h, v);
-            }
+            let what = format!("stream {st} ({fs_khz} kHz, {fl} samples), frame {f}");
+            assert_eq!(x1[..fl + 2], c_x1[..fl + 2], "{what}: mid");
+            assert_eq!(x2[..fl + 2], c_x2[..fl + 2], "{what}: side");
+            assert_eq!((ix, mid_only, rates), (c_ix, c_mid_only, c_rates), "{what}: indices, mid only, rates");
             let s = &state;
-            for v in [
-                s.pred_prev_q13[0] as i32,
-                s.pred_prev_q13[1] as i32,
-                s.mid_side_amp_q0[0],
-                s.mid_side_amp_q0[1],
-                s.mid_side_amp_q0[2],
-                s.mid_side_amp_q0[3],
-                s.smth_width_q14 as i32,
-                s.width_prev_q14 as i32,
-                s.silent_side_len as i32,
-            ] {
-                fnv_i32(&mut h, v);
-            }
+            let c = &c_state;
+            assert_eq!(
+                (s.pred_prev_q13, s.s_mid, s.s_side, s.mid_side_amp_q0),
+                (c.pred_prev_q13, c.s_mid, c.s_side, c.mid_side_amp_q0),
+                "{what}: state"
+            );
+            assert_eq!(
+                (s.smth_width_q14, s.width_prev_q14, s.silent_side_len),
+                (c.smth_width_q14, c.width_prev_q14, c.silent_side_len),
+                "{what}: width state"
+            );
         }
         rc.done();
-        for &b in &rc.buf[..rc.offs as usize] {
-            fnv_i32(&mut h, b as i32);
-        }
-        h
+        // SAFETY: `c_rc` was set up by `ec_enc_init` on `c_buf`.
+        unsafe { ec_enc_done(&mut c_rc) };
+        assert_eq!(c_rc.error, 0);
+        assert_eq!(&rc.buf[..1275], &c_buf[..], "stream {st}: coded bytes");
     }
 
-    /// Golden hashes from libopus 1.5.2's own `silk_stereo_LR_to_MS`,
-    /// `silk_stereo_encode_pred` and `silk_stereo_encode_mid_only`, driven by
-    /// the same generator: 12 frames per stream, every signal shape, all three
-    /// internal rates, 10 and 20 ms frames. The port was also checked against
-    /// a 60 000-frame trace of the same harness.
+    /// Every output of libopus's own `silk_stereo_LR_to_MS`,
+    /// `silk_stereo_encode_pred` and `silk_stereo_encode_mid_only` (the
+    /// linked library) on the same frames: 14 streams of 40 frames, every
+    /// signal shape, all three internal rates, 10 and 20 ms frames.
     #[test]
-    fn lr_to_ms_matches_libopus_golden_hashes() {
-        const GOLDEN: [u64; 14] = [
-            0xbc97853bc7159113,
-            0x2f6bd3e1297bf691,
-            0x944514f2e0ed6f31,
-            0x8aeb5777da033f30,
-            0xdd8a9cbc17c9f343,
-            0x700b37dd8a30969e,
-            0x198e0299dda3e429,
-            0xb87ea872eb3f5c82,
-            0xa2316219c7ca9e98,
-            0xf87f9d49621cf386,
-            0xd9e1034e331c3d27,
-            0xb89856069d5ed7e1,
-            0x20d6b330fbe21897,
-            0xc85d45c3b82c0698,
-        ];
-        for (st, &golden) in GOLDEN.iter().enumerate() {
-            assert_eq!(stream_hash(st as u32, 12), golden, "oracle stream {st}");
+    fn lr_to_ms_matches_libopus() {
+        for st in 0..14 {
+            compare_stream(st, 40);
         }
     }
 

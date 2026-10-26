@@ -1,146 +1,110 @@
-// Verification scripts intentionally mirror the C reference style
-// (index-based loops, grouped hex tables) — keep clippy quiet.
-#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+//! The pulse vector quantizer (`alg_quant`, `alg_unquant`, src/pvq.rs)
+//! against the functions of the same name in libopus (celt/vq.c), called in
+//! the static library the tests link.
+//!
+//! Both quantize the same band into range coders of 1024 bytes. The bytes,
+//! the quantized band and the collapse mask must be equal. Then both decode
+//! the bytes, which must give the band again.
 
 use opus1::internals::pvq::{alg_quant, alg_unquant};
 use opus1::internals::range_coder::RangeCoder;
+use std::os::raw::c_int;
+
+/// `ec_ctx` of libopus (celt/entcode.h).
+#[repr(C)]
+struct EcCtx {
+    buf: *mut u8,
+    storage: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: c_int,
+    nbits_total: c_int,
+    offs: u32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: c_int,
+    error: c_int,
+}
+
+unsafe extern "C" {
+    fn ec_enc_init(this: *mut EcCtx, buf: *mut u8, size: u32);
+    fn ec_enc_done(this: *mut EcCtx);
+    fn ec_dec_init(this: *mut EcCtx, buf: *mut u8, size: u32);
+    #[link_name = "alg_quant"]
+    fn c_alg_quant(
+        x: *mut f32,
+        n: c_int,
+        k: c_int,
+        spread: c_int,
+        b: c_int,
+        enc: *mut EcCtx,
+        gain: f32,
+        resynth: c_int,
+        arch: c_int,
+    ) -> u32;
+    #[link_name = "alg_unquant"]
+    fn c_alg_unquant(x: *mut f32, n: c_int, k: c_int, spread: c_int, b: c_int, dec: *mut EcCtx, gain: f32) -> u32;
+}
+
+/// Size of the range coder buffers.
+const BYTES: usize = 1024;
+
+/// Quantizes and decodes `x` (`k` pulses, spreading `spread`, one block)
+/// with opus1 and with libopus, and compares every result.
+fn compare(x: &[f32], k: i32, spread: i32) {
+    let n = x.len();
+    // Makes sure the test binary links the static library that
+    // `audiopus_sys` brings along.
+    assert!(!unsafe { audiopus_sys::opus_get_version_string() }.is_null());
+
+    let mut rc = RangeCoder::new_encoder(BYTES as u32);
+    let mut x_quant = x.to_vec();
+    let mask = alg_quant(&mut x_quant, n, k, spread, 1, &mut rc, 1.0, true);
+    rc.done();
+
+    let mut c_buf = vec![0u8; BYTES];
+    let mut c_quant = x.to_vec();
+    let mut ec: EcCtx = unsafe { std::mem::zeroed() };
+    // SAFETY: the band holds `n` values and the buffer `BYTES` bytes.
+    let c_mask = unsafe {
+        ec_enc_init(&mut ec, c_buf.as_mut_ptr(), BYTES as u32);
+        let mask = c_alg_quant(c_quant.as_mut_ptr(), n as c_int, k, spread, 1, &mut ec, 1.0, 1, 0);
+        ec_enc_done(&mut ec);
+        mask
+    };
+    assert_eq!(ec.error, 0, "libopus's coder failed");
+    assert_eq!(&rc.buf[..BYTES], &c_buf[..], "bytes of N={n} K={k} spread={spread}");
+    assert_eq!(x_quant, c_quant, "quantized band of N={n} K={k} spread={spread}");
+    assert_eq!(mask, c_mask, "collapse mask");
+    assert!(c_quant.iter().any(|&v| v != 0.0));
+
+    let mut dec = RangeCoder::new_decoder(&c_buf);
+    let mut x_unquant = vec![0.0f32; n];
+    let unquant_mask = alg_unquant(&mut x_unquant, n, k, spread, 1, &mut dec, 1.0);
+    let mut c_unquant = vec![0.0f32; n];
+    // SAFETY: the band holds `n` values and the buffer `BYTES` bytes.
+    let c_unquant_mask = unsafe {
+        ec_dec_init(&mut ec, c_buf.as_mut_ptr(), BYTES as u32);
+        c_alg_unquant(c_unquant.as_mut_ptr(), n as c_int, k, spread, 1, &mut ec, 1.0)
+    };
+    assert_eq!(x_unquant, c_unquant, "decoded band of N={n} K={k} spread={spread}");
+    assert_eq!(unquant_mask, c_unquant_mask, "collapse mask of the decoder");
+    // The decoder gives the band that the encoder quantized.
+    assert_eq!(c_unquant, c_quant, "libopus's decoded band");
+}
 
 #[test]
 fn test_pvq_match() {
-    let n = 8;
-    let k = 10;
-    let spread = 0;
-
-    // Input vector X from C
-    // float X[N]; for(int i=0; i<N; i++) X[i] = sin(i * 0.5f);
-    let mut x_in = vec![0.0f32; n];
-    for i in 0..n {
-        x_in[i] = (i as f32 * 0.5f32).sin();
-    }
-
-    // Normalize input to match C input assumption?
-    // In C, I passed X to alg_quant. C alg_quant might normalize internally?
-    // C source: alg_quant calls celt_renormalise_vector(X, N, gain, arch) if gain is passed?
-    // Wait, alg_quant in C modifies X to be the QUANTIZED vector. It does NOT normalize input initially?
-    // Actually, alg_quant typically expects normalized input, or at least input that resembles the band energy.
-    // The coefficients passed to alg_quant are usually already normalized by band energy.
-    // But `pvq_search` projects X onto the K-pyramid.
-    // In strict C implementation, `alg_quant` assumes X is already somewhat normalized or energy doesn't matter for specific pulse search if using projection.
-
-    // Let's assume the Rust implementation expects raw coefficients as passed.
-    // The C example passed unnormalized sin wave.
-
-    let mut rc = RangeCoder::new_encoder(1024);
-    let mut x_quant = x_in.clone();
-    alg_quant(&mut x_quant, n, k, spread, 1, &mut rc, 1.0, true);
-
-    rc.done();
-    let nbytes_start = rc.offs as usize;
-    let mut nbytes_end = rc.end_offs as usize;
-    if rc.nend_bits > 0 {
-        nbytes_end += 1;
-    }
-
-    let mut buffer = Vec::new();
-    buffer.extend_from_slice(&rc.buf[0..nbytes_start]);
-
-    if nbytes_end > 0 {
-        let start_idx = rc.storage as usize - nbytes_end;
-        buffer.extend_from_slice(&rc.buf[start_idx..]);
-    }
-
-    println!("Final buffer: {:?}", buffer);
-    // ...
-
-    // Expected quantized X from C:
-    // 0.000000 0.235702 0.471405 0.471405 0.471405 0.471405 0.000000 -0.235702
-    let expected_x = [
-        0.000000, 0.235702, 0.471405, 0.471405, 0.471405, 0.471405, 0.000000, -0.235702,
-    ];
-
-    println!("Quantized X: {:?}", x_quant);
-
-    for i in 0..n {
-        assert!(
-            (x_quant[i] - expected_x[i]).abs() < 1e-4,
-            "Quantized value mismatch at index {}",
-            i
-        );
-    }
-
-    // Test Unquant
-    let mut rc_dec = RangeCoder::new_decoder(&buffer);
-    let mut x_unquant = vec![0.0f32; n];
-    alg_unquant(&mut x_unquant, n, k, spread, 1, &mut rc_dec, 1.0);
-
-    println!("Unquantized X: {:?}", x_unquant);
-
-    for i in 0..n {
-        assert!(
-            (x_unquant[i] - expected_x[i]).abs() < 1e-4,
-            "Unquantized value mismatch at index {}",
-            i
-        );
-    }
+    // No spreading.
+    let x: Vec<f32> = (0..8).map(|i| (i as f32 * 0.5f32).sin()).collect();
+    compare(&x, 10, 0);
 }
 
 #[test]
 fn test_pvq_complex_match() {
-    use opus1::internals::pvq::alg_quant;
-    use opus1::internals::range_coder::RangeCoder;
-
-    let n = 16;
-    let k = 10;
-    let spread = 2; // NORMAL
-
-    let mut x_in = vec![0.0f32; n];
-    for i in 0..n {
-        x_in[i] = (i as f32 * 0.4f32).sin();
-    }
-
-    let mut rc = RangeCoder::new_encoder(1024);
-    let mut x_quant = x_in.clone();
-    alg_quant(&mut x_quant, n, k, spread, 1, &mut rc, 1.0, true);
-
-    rc.done();
-
-    // Check bitstream bytes
-    // Reference from C (SMALL_FOOTPRINT): 62 80
-    println!("rc.offs: {}", rc.offs);
-    println!("rc.buf[0]: {:02X}", rc.buf[0]);
-    assert_eq!(rc.offs, 2);
-    assert_eq!(rc.buf[0], 0x62);
-    assert_eq!(rc.buf[1], 0x80);
-
-    // Check end bits
-    // Reference from C (SMALL_FOOTPRINT, last 4 bytes of 1024 buffer): 00 08 87 C3
-    println!(
-        "End bits: {:02X} {:02X} {:02X} {:02X}",
-        rc.buf[1020], rc.buf[1021], rc.buf[1022], rc.buf[1023]
-    );
-    assert_eq!(rc.buf[1020], 0x00);
-    assert_eq!(rc.buf[1021], 0x08);
-    assert_eq!(rc.buf[1022], 0x87);
-    assert_eq!(rc.buf[1023], 0xC3);
-
-    // Test Unquant
-    let mut buffer = Vec::new();
-    buffer.extend_from_slice(&rc.buf[0..rc.offs as usize]);
-    if rc.end_offs < 1024 {
-        buffer.extend_from_slice(&rc.buf[rc.end_offs as usize..1024]);
-    }
-
-    let mut rc_dec = RangeCoder::new_decoder(&buffer);
-    let mut x_unquant = vec![0.0f32; n];
-    alg_unquant(&mut x_unquant, n, k, spread, 1, &mut rc_dec, 1.0);
-
-    println!("Unquantized X: {:?}", x_unquant);
-    // x_quant was normalized at the end of alg_quant.
-    for i in 0..n {
-        assert!(
-            (x_unquant[i] - x_quant[i]).abs() < 1e-5,
-            "Unquant mismatch at index {}",
-            i
-        );
-    }
+    // Normal spreading (SPREAD_NORMAL), which rotates the band before and
+    // after the search.
+    let x: Vec<f32> = (0..16).map(|i| (i as f32 * 0.4f32).sin()).collect();
+    compare(&x, 10, 2);
 }

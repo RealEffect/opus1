@@ -1,5 +1,5 @@
 use std::num::NonZeroU32;
-use opus::{Application as CApp, Channels as CCh, Encoder as CEnc};
+use opus::{Application as CApp, Channels as CCh, Decoder as CDec, Encoder as CEnc};
 use opus1::{
     Application as RsApp, Bitrate, Channels, OpusDecoder as RsDec, OpusEncoder as RsEnc, SampleRate,
 };
@@ -16,54 +16,26 @@ fn make_sine(sr: i32, ch: usize, frame_size: usize, freq: f32) -> Vec<f32> {
     v
 }
 
-fn hex_to_bytes(s: &str) -> Vec<u8> {
-    let s = s.trim();
-    assert!(s.len().is_multiple_of(2), "odd hex length");
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
-}
-
-// Byte-exact fixtures are SIMD-path dependent: the encoder mirrors libopus'
-// per-architecture kernels (x86 SSE2/AVX2 vs aarch64 NEON), which produce
-// different, equally valid bitstreams. There is a stored fixture for x86_64
-// only; other arches fall back to size/determinism/decode checks.
+// The packets of opus1 and of the linked libopus are compared live. On
+// 64-bit ARM opus1 mirrors libopus's kernels and rounding, so the two
+// `..._is_the_packet_of_libopus` tests below require the same bytes. On
+// other processors opus1 may round differently (x86 libopus and opus1 each
+// have their own SSE and AVX2 kernels), so there libopus decodes both
+// packets and the two results must be close (`decoded_snr`).
 //
-// aarch64 had stored fixtures too. They were packets recorded from opus1,
-// not packets of libopus: the sine fixture equalled the packet of the linked
-// libopus 1.6.1 (arm64) in 124 of 160 bytes, the impulse fixture in the
-// first 7. They went away when the pulse search became the one of libopus
-// (celt/vq.c, op_pvq_search_c), which changes both packets. On aarch64 the
-// two `..._is_the_packet_of_libopus` tests below compare with the linked
-// libopus itself instead of a recording.
-#[cfg(target_arch = "x86_64")]
-fn sine_fixture_hex() -> Option<&'static str> {
-    // Validated against libopus 1.6.1-51-g03647f52 (float, x86 SSE2/AVX2).
-    Some(
-        "f87b5e0950b78c08d0bbae9ae1d725a72fe5ee25c2740398a4615b113822973b042c80fdb66da4a3a2cb9c192af55d6bf6dd65c5c7653367144ecc6b0565efad221c5de2215ab8fc6f9f4f48cad42d1c1999da21cfa221cfa037aa44b81ad91d4a8d1d581540cf6c39176eeab2770f00b461d43fa328ae650837e79c9e8f6c417951dc2e4d32634de493b88e0d167016e2646590e686571dcf2104af43ab137d",
-    )
-}
+// x86-64 had a stored packet instead: one recorded on x86-64 from libopus's
+// main branch (1.6.1-51-g03647f52), compared byte for byte. That asked for
+// bit-exactness on x86, where opus1 aims for correct, clear audio, and
+// with another libopus than the one the tests link.
 
-#[cfg(not(target_arch = "x86_64"))]
-fn sine_fixture_hex() -> Option<&'static str> {
-    None
-}
-
-// The x86_64 impulse fixture was a recording of opus1 before it ran the
-// speech and music analysis (analysis.c). Its first 7 bytes matched
-// libopus 1.6.1; the rest diverged because the analysis changes the
-// allocation trim through `tonality_slope` (C trim 1, opus1 trim 0). opus1
-// now runs the analysis, so that recording is no longer its output, and
-// there is no x86 machine here to record a new one. On aarch64
-// `impulse_48k_mono_64k_is_the_packet_of_libopus` compares with libopus.
-fn impulse_fixture_hex() -> Option<&'static str> {
-    None
-}
+/// Lowest accepted `decoded_snr`, in dB. On x86-64 the sine gave equal
+/// frames and the impulse 44.2 dB: under Rosetta 2 against libopus 1.6.1
+/// built by clang, with and without AVX2, and on an i7-12700 under Windows
+/// against libopus built by MSVC.
+const MIN_DECODED_SNR_DB: f64 = 30.0;
 
 /// One 20 ms frame, 48 kHz mono, 64 kb/s constant bitrate, complexity 10,
 /// through opus1 and through the linked libopus: (opus1, libopus).
-#[cfg(target_arch = "aarch64")]
 fn first_packets(pcm: &[f32]) -> (Vec<u8>, Vec<u8>) {
     let mut rs_enc = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(64000).unwrap()));
@@ -81,11 +53,27 @@ fn first_packets(pcm: &[f32]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Number of equal bytes and the position of the first byte that differs.
-#[cfg(target_arch = "aarch64")]
 fn equal_bytes(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
     let equal = a.iter().zip(b).filter(|(x, y)| x == y).count();
     let first = a.iter().zip(b).position(|(x, y)| x != y);
     (equal, first)
+}
+
+/// libopus decodes opus1's packet and its own packet of the same frame
+/// (48 kHz mono, each with a new decoder). Returns how close the two
+/// decoded frames are: the signal-to-noise ratio in dB, infinite when they
+/// are equal.
+fn decoded_snr(rs: &[u8], c: &[u8]) -> f64 {
+    let decode = |packet: &[u8]| {
+        let mut dec = CDec::new(48000, CCh::Mono).unwrap();
+        let mut out = vec![0f32; 960];
+        assert_eq!(dec.decode_float(packet, &mut out, false).unwrap(), 960);
+        out
+    };
+    let (rs, c) = (decode(rs), decode(c));
+    let signal: f64 = c.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    let noise: f64 = rs.iter().zip(&c).map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2)).sum();
+    10.0 * (signal / noise).log10()
 }
 
 /// The sine packet of `oracle_celt_sine_48k_mono_64k`, byte for byte against
@@ -95,7 +83,7 @@ fn equal_bytes(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
 /// there is one right answer. opus1 reaches it: all 160 bytes are equal
 /// at the tip of integ6 (4726c16). When the test was ignored, 132 were.
 #[test]
-#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn sine_48k_mono_64k_is_the_packet_of_libopus() {
     let (rs, c) = first_packets(&make_sine(48000, 1, 960, 440.0));
     let (equal, first) = equal_bytes(&rs, &c);
@@ -111,7 +99,7 @@ fn sine_48k_mono_64k_is_the_packet_of_libopus() {
 /// 160 are.
 #[cfg(feature = "analysis")]
 #[test]
-#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
 fn impulse_48k_mono_64k_is_the_packet_of_libopus() {
     let mut pcm = vec![0.0f32; 960];
     pcm[0] = 1.0;
@@ -162,17 +150,11 @@ fn oracle_celt_sine_48k_mono_64k() {
         c_n,
         diff
     );
-    // Byte-exact regression for 48k mono 64k CBR sine (arch-specific fixture,
-    // see sine_fixture_hex). vs local C libopus only size proximity is required.
-    if let Some(hex) = sine_fixture_hex() {
-        let expected = hex_to_bytes(hex);
-        assert_eq!(rs_n, expected.len(), "fixture len mismatch for 48k sine");
-        assert_eq!(
-            &rs_buf[..rs_n],
-            &expected[..],
-            "full byte-exact mismatch for 48k sine 64k"
-        );
-    }
+    // libopus decodes opus1's packet to nearly what it decodes from its own
+    // (on 64-bit ARM the packets are the same).
+    let db = decoded_snr(&rs_buf[..rs_n], &c_buf[..c_n]);
+    println!("sine: opus1's packet against libopus's, both decoded by libopus: {db:.1} dB");
+    assert!(db > MIN_DECODED_SNR_DB, "sine: {db:.1} dB");
     // Determinism: re-encode same input must be byte-identical
     let mut rs_enc2 = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
@@ -228,17 +210,11 @@ fn oracle_impulse_48k_mono_64k() {
     assert!(max < 15.0 && max.is_finite());
     // For 48k CBR, also check byte closeness (allow small divergence due to remaining tone/Hybrid gaps)
     assert!((rs_n as i32 - c_n as i32).abs() <= 5);
-    // Byte-exact for Rust's own 48k impulse (arch-specific fixture, see
-    // impulse_fixture_hex). Freezes the current deterministic output.
-    if let Some(hex) = impulse_fixture_hex() {
-        let expected = hex_to_bytes(hex);
-        assert_eq!(rs_n, expected.len(), "fixture len mismatch for impulse");
-        assert_eq!(
-            &rs_buf[..rs_n],
-            &expected[..],
-            "full byte-exact mismatch for impulse"
-        );
-    }
+    // libopus decodes opus1's packet to nearly what it decodes from its own
+    // (on 64-bit ARM the packets are the same).
+    let db = decoded_snr(&rs_buf[..rs_n], &c_buf[..c_n]);
+    println!("impulse: opus1's packet against libopus's, both decoded by libopus: {db:.1} dB");
+    assert!(db > MIN_DECODED_SNR_DB, "impulse: {db:.1} dB");
     let mut rs_enc2 = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     rs_enc2.set_vbr(false);
