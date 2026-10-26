@@ -85,6 +85,7 @@ pub(crate) fn silk_div32_varq_batch(out: &mut [i32], a: &[i32], b: &[i32], qres:
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 mod div_neon {
+    use crate::simd_mem::neon::{load_i32x4, store_i32x4};
     use core::arch::aarch64::*;
 
     /// 2^29 - 1 divided by each of two 16-bit values, rounded towards zero,
@@ -113,9 +114,7 @@ mod div_neon {
     /// is half of the upper half of `2 * x * y`.
     #[target_feature(enable = "neon")]
     pub(super) fn div32_varq_x4(a: &[i32; 4], b: &[i32; 4], qres: i32) -> [i32; 4] {
-        // SAFETY: each pointer comes from a `[i32; 4]`, which is what
-        // `vld1q_s32` reads and `vst1q_s32` writes.
-        let (a32, b32) = unsafe { (vld1q_s32(a.as_ptr()), vld1q_s32(b.as_ptr())) };
+        let (a32, b32) = (load_i32x4(a), load_i32x4(b));
 
         // Shift both numbers so that the highest bit below the sign is
         // used. The count is -1 for the most negative number: a shift count
@@ -160,14 +159,14 @@ mod div_neon {
         );
 
         let mut out = [0i32; 4];
-        // SAFETY: see above.
-        unsafe { vst1q_s32(out.as_mut_ptr(), shifted) };
+        store_i32x4(&mut out, shifted);
         out
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 mod div_x86 {
+    use crate::simd_mem::x86::{load_i32x8, store_i32x8};
     use core::arch::x86_64::*;
 
     /// The number of leading zeros in each lane of `v`, which holds absolute
@@ -234,20 +233,9 @@ mod div_x86 {
     /// `silk_div32_varq(a[i], b[i], qres)` in the eight lanes of a vector.
     /// No `b[i]` is zero and `qres` is at most 24. The steps are those of
     /// `div_neon::div32_varq_x4`.
-    ///
-    /// # Safety
-    ///
-    /// The processor must have AVX2.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn div32_varq_x8(a: &[i32; 8], b: &[i32; 8], qres: i32) -> [i32; 8] {
-        // SAFETY: both arrays are 32 bytes long, what the loads read; they
-        // need no alignment.
-        let (a32, b32) = unsafe {
-            (
-                _mm256_loadu_si256(a.as_ptr().cast()),
-                _mm256_loadu_si256(b.as_ptr().cast()),
-            )
-        };
+    pub(super) fn div32_varq_x8(a: &[i32; 8], b: &[i32; 8], qres: i32) -> [i32; 8] {
+        let (a32, b32) = (load_i32x8(a), load_i32x8(b));
 
         // Shift both numbers so that the highest bit below the sign is
         // used. The count is -1 for the most negative number.
@@ -293,9 +281,7 @@ mod div_x86 {
         let shifted = _mm256_blendv_epi8(shifted_right, shifted_left, negative);
 
         let mut out = [0i32; 8];
-        // SAFETY: `out` is 32 bytes long, what the store writes; it needs
-        // no alignment.
-        unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), shifted) };
+        store_i32x8(&mut out, shifted);
         out
     }
 }
@@ -476,13 +462,9 @@ pub fn silk_pitch_analysis_core(
 /// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
 /// multiplication, which fixed-point code needs; AVX2 has both. The results
 /// are the same bits.
-///
-/// # Safety
-///
-/// The processor must have AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn pitch_analysis_core_avx2(
+fn pitch_analysis_core_avx2(
     frame_unscaled: &[i16],
     pitch_out: &mut [i32],
     lag_index: &mut i16,

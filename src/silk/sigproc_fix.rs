@@ -143,8 +143,7 @@ pub fn silk_biquad_alt_stride2(
     let s: &mut [i32; 4] = (&mut s[..4]).try_into().unwrap();
 
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline. The kernel requires
-    // `input_output.len()` to be even, which the slicing above guarantees.
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
         silk_biquad_alt_stride2_neon(input_output, b_q28, a_q28, s);
     }
@@ -254,14 +253,13 @@ fn xcorr_kernel_scalar(x: &[i16], y: &[i16], sum: &mut [i32; 4]) {
 #[target_feature(enable = "neon")]
 #[inline]
 fn xcorr_kernel_neon(x: &[i16], y: &[i16], sum: &mut [i32; 4]) {
+    use crate::simd_mem::{array_at, neon::load_i16x8};
     use core::arch::aarch64::*;
 
     #[target_feature(enable = "neon")]
     #[inline]
     fn load(v: &[i16], at: usize) -> int16x8_t {
-        let lanes: &[i16; 8] = v[at..at + 8].try_into().unwrap();
-        // SAFETY: `lanes` refers to eight readable `i16`.
-        unsafe { vld1q_s16(lanes.as_ptr()) }
+        load_i16x8(array_at(v, at))
     }
 
     /// Adds the 8 products `a[i] * b[i]` to `acc`. Lane `i % 4` receives
@@ -356,13 +354,9 @@ fn autocorr_sums(results: &mut [i32], x: &[i16]) {
 /// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
 /// multiplication, which fixed-point code needs; AVX2 has both. The results
 /// are the same bits.
-///
-/// # Safety
-///
-/// The processor must have AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn autocorr_sums_avx2(results: &mut [i32], x: &[i16]) {
+fn autocorr_sums_avx2(results: &mut [i32], x: &[i16]) {
     autocorr_sums_portable(results, x);
 }
 
@@ -533,21 +527,17 @@ pub fn silk_inner_prod_aligned_scale(
 /// wraps on overflow (libopus `silk_inner_prod_aligned`).
 #[inline(always)]
 pub fn silk_inner_prod_aligned(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
-    // The vector kernels read `len` elements through pointers, so both
-    // lengths are checked here.
+    // The kernels read the first `len` elements of both slices.
     let ptr1 = &ptr1[..len];
     let ptr2 = &ptr2[..len];
 
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline. Both slices have `len`
-    // elements, which is what the kernel requires.
-    unsafe {
+    {
         silk_inner_prod_aligned_neon(ptr1, ptr2, len)
     }
     #[cfg(target_arch = "x86_64")]
     if crate::compat::x86_has_avx2() {
-        // SAFETY: AVX2 was detected. Both slices have `len` elements, which
-        // is what the kernel requires.
+        // SAFETY: AVX2 was detected.
         return unsafe { silk_inner_prod_aligned_avx2(ptr1, ptr2, len) };
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -585,62 +575,71 @@ fn silk_inner_prod_aligned_scalar(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32
         .wrapping_add(sum3)
 }
 
-/// NEON form of [`silk_inner_prod_aligned`].
+/// NEON form of [`silk_inner_prod_aligned`]. Reads the first `len`
+/// elements of both slices.
 ///
-/// # Safety
+/// Panics when a slice holds fewer than `len` elements.
 ///
-/// Both slices must have at least `len` elements: the loads read 8 elements
-/// at an offset `i` with `i + 8 <= len`.
+/// The loops keep their pointer loads. The function is inlined into many
+/// large callers, such as `silk_corr_matrix_fix`. With the blocks taken
+/// from `as_chunks`, or with ranges checked once and taken with
+/// `get_unchecked`, the compiler assigned the registers of those callers
+/// differently, and some of their loops got longer.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
+fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
     use core::arch::aarch64::*;
 
-    debug_assert!(ptr1.len() >= len && ptr2.len() >= len);
+    let ptr1 = &ptr1[..len];
+    let ptr2 = &ptr2[..len];
 
-    let mut acc0 = vdupq_n_s32(0i32);
-    let mut acc1 = vdupq_n_s32(0i32);
-    let mut acc2 = vdupq_n_s32(0i32);
-    let mut acc3 = vdupq_n_s32(0i32);
+    // SAFETY: NEON is part of the aarch64 baseline. Both slices hold `len`
+    // elements (sliced above), and every load reads 8 elements at an offset
+    // `i` with `i + 8 <= len`.
+    let (mut result, mut i) = unsafe {
+        let mut acc0 = vdupq_n_s32(0i32);
+        let mut acc1 = vdupq_n_s32(0i32);
+        let mut acc2 = vdupq_n_s32(0i32);
+        let mut acc3 = vdupq_n_s32(0i32);
 
-    let mut i = 0;
+        let mut i = 0;
 
-    while i + 32 <= len {
-        let a0 = vld1q_s16(ptr1.as_ptr().add(i));
-        let b0 = vld1q_s16(ptr2.as_ptr().add(i));
-        let a1 = vld1q_s16(ptr1.as_ptr().add(i + 8));
-        let b1 = vld1q_s16(ptr2.as_ptr().add(i + 8));
-        let a2 = vld1q_s16(ptr1.as_ptr().add(i + 16));
-        let b2 = vld1q_s16(ptr2.as_ptr().add(i + 16));
-        let a3 = vld1q_s16(ptr1.as_ptr().add(i + 24));
-        let b3 = vld1q_s16(ptr2.as_ptr().add(i + 24));
+        while i + 32 <= len {
+            let a0 = vld1q_s16(ptr1.as_ptr().add(i));
+            let b0 = vld1q_s16(ptr2.as_ptr().add(i));
+            let a1 = vld1q_s16(ptr1.as_ptr().add(i + 8));
+            let b1 = vld1q_s16(ptr2.as_ptr().add(i + 8));
+            let a2 = vld1q_s16(ptr1.as_ptr().add(i + 16));
+            let b2 = vld1q_s16(ptr2.as_ptr().add(i + 16));
+            let a3 = vld1q_s16(ptr1.as_ptr().add(i + 24));
+            let b3 = vld1q_s16(ptr2.as_ptr().add(i + 24));
 
-        acc0 = vmlal_s16(acc0, vget_low_s16(a0), vget_low_s16(b0));
-        acc0 = vmlal_high_s16(acc0, a0, b0);
-        acc1 = vmlal_s16(acc1, vget_low_s16(a1), vget_low_s16(b1));
-        acc1 = vmlal_high_s16(acc1, a1, b1);
-        acc2 = vmlal_s16(acc2, vget_low_s16(a2), vget_low_s16(b2));
-        acc2 = vmlal_high_s16(acc2, a2, b2);
-        acc3 = vmlal_s16(acc3, vget_low_s16(a3), vget_low_s16(b3));
-        acc3 = vmlal_high_s16(acc3, a3, b3);
+            acc0 = vmlal_s16(acc0, vget_low_s16(a0), vget_low_s16(b0));
+            acc0 = vmlal_high_s16(acc0, a0, b0);
+            acc1 = vmlal_s16(acc1, vget_low_s16(a1), vget_low_s16(b1));
+            acc1 = vmlal_high_s16(acc1, a1, b1);
+            acc2 = vmlal_s16(acc2, vget_low_s16(a2), vget_low_s16(b2));
+            acc2 = vmlal_high_s16(acc2, a2, b2);
+            acc3 = vmlal_s16(acc3, vget_low_s16(a3), vget_low_s16(b3));
+            acc3 = vmlal_high_s16(acc3, a3, b3);
 
-        i += 32;
-    }
+            i += 32;
+        }
 
-    while i + 8 <= len {
-        let a0 = vld1q_s16(ptr1.as_ptr().add(i));
-        let b0 = vld1q_s16(ptr2.as_ptr().add(i));
-        acc0 = vmlal_s16(acc0, vget_low_s16(a0), vget_low_s16(b0));
-        acc0 = vmlal_high_s16(acc0, a0, b0);
-        i += 8;
-    }
+        while i + 8 <= len {
+            let a0 = vld1q_s16(ptr1.as_ptr().add(i));
+            let b0 = vld1q_s16(ptr2.as_ptr().add(i));
+            acc0 = vmlal_s16(acc0, vget_low_s16(a0), vget_low_s16(b0));
+            acc0 = vmlal_high_s16(acc0, a0, b0);
+            i += 8;
+        }
 
-    let sum01 = vpaddq_s32(acc0, acc1);
-    let sum23 = vpaddq_s32(acc2, acc3);
-    let sum = vpaddq_s32(sum01, sum23);
-    let wide = vpaddlq_s32(sum);
-    let mut result = vaddvq_s64(wide);
+        let sum01 = vpaddq_s32(acc0, acc1);
+        let sum23 = vpaddq_s32(acc2, acc3);
+        let sum = vpaddq_s32(sum01, sum23);
+        let wide = vpaddlq_s32(sum);
+        (vaddvq_s64(wide), i)
+    };
 
     while i < len {
         result += (ptr1[i] as i64) * (ptr2[i] as i64);
@@ -669,13 +668,9 @@ pub fn silk_corr_vector_fix(
 
 /// [`silk_corr_vector_fix`] compiled with AVX2 enabled. The results are the
 /// same bits; see [`autocorr_sums_avx2`].
-///
-/// # Safety
-///
-/// The processor must have AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn corr_vector_avx2(
+fn corr_vector_avx2(
     x: &[i16],
     t: &[i16],
     l: usize,
@@ -736,13 +731,9 @@ pub fn silk_corr_matrix_fix(
 
 /// [`silk_corr_matrix_fix`] compiled with AVX2 enabled. The results are the
 /// same bits; see [`autocorr_sums_avx2`].
-///
-/// # Safety
-///
-/// The processor must have AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn corr_matrix_avx2(
+fn corr_matrix_avx2(
     x: &[i16],
     l: usize,
     order: usize,
@@ -1125,6 +1116,7 @@ fn warped_autocorr_neon<const K: usize>(
     warping_q16: i32,
     order: usize,
 ) {
+    use crate::simd_mem::neon::{load_i32x4, store_i32x4};
     use core::arch::aarch64::*;
 
     /// Number of sample vectors kept. A power of two above `K`.
@@ -1132,20 +1124,6 @@ fn warped_autocorr_neon<const K: usize>(
 
     assert!(K >= 1 && K < RING && 4 * K <= MAX_SHAPE_LPC_ORDER && order <= 4 * K);
     debug_assert!(warping_q16.unsigned_abs() <= 65535);
-
-    #[target_feature(enable = "neon")]
-    #[inline]
-    fn load(lanes: &[i32; 4]) -> int32x4_t {
-        // SAFETY: `lanes` refers to four readable `i32`.
-        unsafe { vld1q_s32(lanes.as_ptr()) }
-    }
-
-    #[target_feature(enable = "neon")]
-    #[inline]
-    fn store(lanes: &mut [i32; 4], v: int32x4_t) {
-        // SAFETY: `lanes` refers to four writable `i32`.
-        unsafe { vst1q_s32(lanes.as_mut_ptr(), v) }
-    }
 
     let warping = vdupq_n_s32(warping_q16 << 15);
     let zero = vdupq_n_s32(0);
@@ -1170,10 +1148,10 @@ fn warped_autocorr_neon<const K: usize>(
         // one lane, then section 0. The same move turns vector `m - K` into
         // vector `m`.
         let below_last = vextq_s32::<1>(cur[0], newest);
-        let x_new = vextq_s32::<1>(load(&samples[oldest % RING]), newest);
+        let x_new = vextq_s32::<1>(load_i32x4(&samples[oldest % RING]), newest);
         for r in 0..K {
             let below = if r + 1 < K { cur[r + 1] } else { below_last };
-            let x = load(&samples[oldest.wrapping_add(r) % RING]);
+            let x = load_i32x4(&samples[oldest.wrapping_add(r) % RING]);
             sum_lo[r] =
                 vsraq_n_s64::<16>(sum_lo[r], vmull_s32(vget_low_s32(cur[r]), vget_low_s32(x)));
             sum_hi[r] = vsraq_n_s64::<16>(sum_hi[r], vmull_high_s32(cur[r], x));
@@ -1183,7 +1161,7 @@ fn warped_autocorr_neon<const K: usize>(
             );
             below_before[r] = below;
         }
-        store(&mut samples[m % RING], x_new);
+        store_i32x4(&mut samples[m % RING], x_new);
     };
     for (m, &sample) in input.iter().enumerate() {
         step(m, vdupq_n_s32((sample as i32) << WARPED_QS));
@@ -1293,13 +1271,12 @@ fn warped_mulw_avx2(d: __m256i, w_low: __m256i, w_high: __m256i) -> __m256i {
 /// register, for up to `4 * K` sections, and warping factors from 0 to
 /// `2^15 - 1`. See the comment above [`WARPED_RING`].
 ///
-/// # Safety
-///
-/// The processor must have SSE4.1.
+/// Panics when `order` exceeds `4 * K` or the warping factor is outside
+/// that range.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[inline(never)]
-unsafe fn warped_autocorr_sse41<const K: usize>(
+fn warped_autocorr_sse41<const K: usize>(
     corr: &mut [i32],
     scale: &mut i32,
     input: &[i16],
@@ -1373,13 +1350,12 @@ unsafe fn warped_autocorr_sse41<const K: usize>(
 /// [`warped_autocorr_sse41`]; only the move by one lane crosses the two
 /// 128-bit halves.
 ///
-/// # Safety
-///
-/// The processor must have AVX2.
+/// Panics when `order` exceeds `8 * K` or the warping factor is outside
+/// the range of [`warped_autocorr_sse41`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline(never)]
-unsafe fn warped_autocorr_avx2<const K: usize>(
+fn warped_autocorr_avx2<const K: usize>(
     corr: &mut [i32],
     scale: &mut i32,
     input: &[i16],
@@ -1716,31 +1692,53 @@ pub fn silk_scale_copy_vector16(
 }
 
 #[cfg(target_arch = "x86_64")]
+use crate::simd_mem::{
+    array_at,
+    x86::{load_i16x4, load_i16x8, load_i16x16, store_i32x4},
+};
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+// `silk_inner_prod_aligned_avx2`, `xcorr_kernel_avx2` and
+// `silk_sum_sqr_shift_avx2` keep their loops as they were
+// (`while i + 32 <= len` and so on) and take the ranges they load with
+// `get_unchecked`. They are inlined into large functions that are compiled
+// with AVX2. When their arrays came from `as_chunks` or from windows
+// instead, the loops counted differently, the compiler assigned the
+// registers of those large functions differently, and other loops there
+// had to load values from the stack.
+
+/// AVX2 form of [`silk_inner_prod_aligned`].
+///
+/// Panics when `ptr1` or `ptr2` holds fewer than `len` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
-    // The caller guarantees this; checked here too. Every load below stays inside `len`.
+fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
+    // The caller guarantees this; checked here too. Every range read below
+    // lies inside `len`.
     assert!(ptr1.len() >= len && ptr2.len() >= len);
     let mut acc0 = _mm256_setzero_si256();
     let mut acc1 = _mm256_setzero_si256();
     let mut i = 0;
 
     while i + 32 <= len {
-        let a0 = _mm256_loadu_si256(ptr1.as_ptr().add(i) as *const __m256i);
-        let b0 = _mm256_loadu_si256(ptr2.as_ptr().add(i) as *const __m256i);
-        let a1 = _mm256_loadu_si256(ptr1.as_ptr().add(i + 16) as *const __m256i);
-        let b1 = _mm256_loadu_si256(ptr2.as_ptr().add(i + 16) as *const __m256i);
+        // SAFETY: `i + 32 <= len`, and both slices hold `len` values.
+        let (a, b) = unsafe { (ptr1.get_unchecked(i..i + 32), ptr2.get_unchecked(i..i + 32)) };
+        let a0 = load_i16x16(array_at(a, 0));
+        let b0 = load_i16x16(array_at(b, 0));
+        let a1 = load_i16x16(array_at(a, 16));
+        let b1 = load_i16x16(array_at(b, 16));
 
         acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0, b0));
         acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(a1, b1));
         i += 32;
     }
     while i + 16 <= len {
-        let a = _mm256_loadu_si256(ptr1.as_ptr().add(i) as *const __m256i);
-        let b = _mm256_loadu_si256(ptr2.as_ptr().add(i) as *const __m256i);
+        // SAFETY: `i + 16 <= len`, and both slices hold `len` values.
+        let (a, b) = unsafe { (ptr1.get_unchecked(i..i + 16), ptr2.get_unchecked(i..i + 16)) };
+        let a = load_i16x16(array_at(a, 0));
+        let b = load_i16x16(array_at(b, 0));
         acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a, b));
         i += 16;
     }
@@ -1754,8 +1752,10 @@ unsafe fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -
     let mut result = _mm_cvtsi128_si32(sum1);
 
     if i + 8 <= len {
-        let a = _mm_loadu_si128(ptr1.as_ptr().add(i) as *const __m128i);
-        let b = _mm_loadu_si128(ptr2.as_ptr().add(i) as *const __m128i);
+        // SAFETY: `i + 8 <= len`, and both slices hold `len` values.
+        let (a, b) = unsafe { (ptr1.get_unchecked(i..i + 8), ptr2.get_unchecked(i..i + 8)) };
+        let a = load_i16x8(array_at(a, 0));
+        let b = load_i16x8(array_at(b, 0));
         let p = _mm_madd_epi16(a, b);
         let p2 = _mm_add_epi32(p, _mm_srli_si128(p, 8));
         let p1 = _mm_add_epi32(p2, _mm_srli_si128(p2, 4));
@@ -1771,10 +1771,14 @@ unsafe fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -
     result
 }
 
+/// AVX2 form of [`xcorr_kernel`].
+///
+/// Panics when `x` holds fewer than `len` values or `y` fewer than
+/// `len + 4`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
+fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
     // Each 8-sample load of `y` starts at `i <= len - 4`, so the last one
     // ends at `y[len + 3]`: `y` needs `len + 4` samples, as the caller
     // checks.
@@ -1784,10 +1788,13 @@ unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize
     let mut i = 0;
 
     while i + 4 <= len {
-        let x4 = _mm_loadl_epi64(x.as_ptr().add(i) as *const __m128i);
+        // SAFETY: `i + 4 <= len`, so `x` holds `x[i..i + 4]` and `y` holds
+        // `y[i..i + 8]` (checked above).
+        let (x4, y8) = unsafe { (x.get_unchecked(i..i + 4), y.get_unchecked(i..i + 8)) };
+        let x4 = load_i16x4(array_at(x4, 0));
         let xdup = _mm_unpacklo_epi64(x4, x4);
 
-        let y8 = _mm_loadu_si128(y.as_ptr().add(i) as *const __m128i);
+        let y8 = load_i16x8(array_at(y8, 0));
         let y1 = _mm_bsrli_si128(y8, 2);
         let y2 = _mm_bsrli_si128(y8, 4);
         let y3 = _mm_bsrli_si128(y8, 6);
@@ -1805,7 +1812,7 @@ unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize
     }
 
     let mut tmp = [0i32; 4];
-    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, acc);
+    store_i32x4(&mut tmp, acc);
     sum[0] = sum[0].wrapping_add(tmp[0]);
     sum[1] = sum[1].wrapping_add(tmp[1]);
     sum[2] = sum[2].wrapping_add(tmp[2]);
@@ -1827,17 +1834,22 @@ unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize
     }
 }
 
+/// AVX2 form of the second pass of [`silk_sum_sqr_shift`].
+///
+/// Panics when `x` holds fewer than `len` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
-    // The caller guarantees this; checked here too. Every load below stays inside `len`.
+fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
+    // The caller guarantees this; checked here too. Every range read below
+    // lies inside `len`.
     assert!(x.len() >= len);
     let mut acc = _mm256_setzero_si256();
     let mut i = 0;
 
     while i + 16 <= len {
-        let v = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
+        // SAFETY: `i + 16 <= len`, and `x` holds `len` values.
+        let v = load_i16x16(array_at(unsafe { x.get_unchecked(i..i + 16) }, 0));
 
         let sq = _mm256_madd_epi16(v, v);
 
@@ -1864,10 +1876,14 @@ unsafe fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
     sum_sqr_pairs_shifted(&x[i..len], nrg, shft)
 }
 
+/// AVX2 form of [`silk_lpc_analysis_filter`] for up to 16 taps.
+///
+/// Panics when `input` or `out` holds fewer than `len` values or `b` fewer
+/// than `d`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn silk_lpc_analysis_filter_avx2(
+fn silk_lpc_analysis_filter_avx2(
     out: &mut [i16],
     input: &[i16],
     b: &[i16],
@@ -1875,8 +1891,8 @@ unsafe fn silk_lpc_analysis_filter_avx2(
     d: usize,
 ) {
     debug_assert!(d >= 6 && (d & 1) == 0 && d <= 16);
-    // The caller guarantees this; checked here too. The vector loads read `input[ix - 16..ix]`
-    // with `ix < len`.
+    // The caller guarantees this; checked here too. The vector loads read
+    // `input[ix - 16..ix]` with `ix < len`.
     assert!(input.len() >= len && out.len() >= len);
 
     let mut b_rev_pad = [0i16; 16];
@@ -1902,13 +1918,17 @@ unsafe fn silk_lpc_analysis_filter_avx2(
         return;
     }
 
-    let b_lo = _mm256_cvtepi16_epi32(_mm_loadu_si128(b_rev_pad.as_ptr() as *const __m128i));
-    let b_hi = _mm256_cvtepi16_epi32(_mm_loadu_si128(b_rev_pad.as_ptr().add(8) as *const __m128i));
+    let b_lo = _mm256_cvtepi16_epi32(load_i16x8(array_at(&b_rev_pad, 0)));
+    let b_hi = _mm256_cvtepi16_epi32(load_i16x8(array_at(&b_rev_pad, 8)));
 
+    // `history` is the 16 samples before output sample `ix`. This is an
+    // index loop on purpose: a loop over `windows()` made the compiler
+    // reload the `out` pointer from the stack for every sample. The assert
+    // at the top lets the compiler remove the index checks.
     for ix in avx_start..len {
-        let base = input.as_ptr().add(ix - 16);
-        let inp_lo = _mm256_cvtepi16_epi32(_mm_loadu_si128(base as *const __m128i));
-        let inp_hi = _mm256_cvtepi16_epi32(_mm_loadu_si128(base.add(8) as *const __m128i));
+        let history: &[i16; 16] = array_at(input, ix - 16);
+        let inp_lo = _mm256_cvtepi16_epi32(load_i16x8(array_at(history, 0)));
+        let inp_hi = _mm256_cvtepi16_epi32(load_i16x8(array_at(history, 8)));
 
         let prod_lo = _mm256_mullo_epi32(inp_lo, b_lo);
         let prod_hi = _mm256_mullo_epi32(inp_hi, b_hi);
@@ -1928,30 +1948,28 @@ unsafe fn silk_lpc_analysis_filter_avx2(
 
 /// NEON form of [`silk_biquad_alt_stride2`], as libopus
 /// `silk_biquad_alt_stride2_neon`: two pairs of samples per pass.
-///
-/// # Safety
-///
-/// `input_output.len()` must be even. Each pass reads and writes the 4
-/// samples from `2 * k` on, with `2 * k + 4 <= input_output.len()`. The
-/// loads of the coefficients and of the state read whole arrays.
+/// `input_output` holds pairs of samples.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn silk_biquad_alt_stride2_neon(
+#[target_feature(enable = "neon")]
+#[inline]
+fn silk_biquad_alt_stride2_neon(
     input_output: &mut [i16],
     b_q28: &[i32; 3],
     a_q28: &[i32; 2],
     s: &mut [i32; 4],
 ) {
+    use crate::simd_mem::{
+        array_at,
+        neon::{load_i16x4, load_i32x2, load_i32x4, store_i16x4, store_lane_i32x4},
+    };
     use core::arch::aarch64::*;
 
     debug_assert!(input_output.len().is_multiple_of(2));
-    let len = input_output.len() / 2;
 
     let offset_s32x2 = vdup_n_s32((1 << 14) - 1);
     let offset_s32x4 = vcombine_s32(offset_s32x2, offset_s32x2);
 
-    let a_q28_s32x2 = vneg_s32(vld1_s32(a_q28.as_ptr()));
+    let a_q28_s32x2 = vneg_s32(load_i32x2(a_q28));
     let a_l_s32x2 = vreinterpret_s32_u32(vshr_n_u32(
         vreinterpret_u32_s32(vshl_n_s32(a_q28_s32x2, 18)),
         3,
@@ -1959,8 +1977,8 @@ unsafe fn silk_biquad_alt_stride2_neon(
     let mut a_u_s32x2 = vshr_n_s32(a_q28_s32x2, 14);
     a_u_s32x2 = vshr_n_s32(vshl_n_s32(a_u_s32x2, 16), 1);
 
-    let b_q28_s32x2 = vld1_s32(b_q28.as_ptr());
-    let t_s32x2 = vld1_s32(b_q28.as_ptr().add(1));
+    let b_q28_s32x2 = load_i32x2(array_at(b_q28, 0));
+    let t_s32x2 = load_i32x2(array_at(b_q28, 1));
 
     let t0_s32x2x2 = vzip_s32(a_l_s32x2, a_l_s32x2);
     let t1_s32x2x2 = vzip_s32(a_u_s32x2, a_u_s32x2);
@@ -1970,13 +1988,14 @@ unsafe fn silk_biquad_alt_stride2_neon(
     let a_u_s32x4 = vcombine_s32(t1_s32x2x2.0, t1_s32x2x2.1);
     let b_q28_s32x4 = vcombine_s32(t2_s32x2x2.0, t2_s32x2x2.1);
 
-    let mut s_s32x4 = vld1q_s32(s.as_ptr());
+    let mut s_s32x4 = load_i32x4(s);
     let s_s32x2x2 = vtrn_s32(vget_low_s32(s_s32x4), vget_high_s32(s_s32x4));
     s_s32x4 = vcombine_s32(s_s32x2x2.0, s_s32x2x2.1);
 
-    let mut k = 0;
-    while k + 1 < len {
-        let in_s16x4 = vld1_s16(input_output.as_ptr().add(2 * k));
+    // Each pass reads and writes the 4 samples of two pairs.
+    let (quads, rest) = input_output.as_chunks_mut::<4>();
+    for quad in quads.iter_mut() {
+        let in_s16x4 = load_i16x4(quad);
         let in_s32x4 = vshll_n_s16(in_s16x4, 15);
 
         let t_s32x4 = vqdmulhq_lane_s32(in_s32x4, b_q28_s32x2, 0);
@@ -2023,16 +2042,14 @@ unsafe fn silk_biquad_alt_stride2_neon(
         let out_s32x4 = vaddq_s32(out32_q14_combined, offset_s32x4);
         let out_s16x4 = vqshrn_n_s32(out_s32x4, 14);
 
-        vst1_s16(input_output.as_mut_ptr().add(2 * k), out_s16x4);
-
-        k += 2;
+        store_i16x4(quad, out_s16x4);
     }
 
-    if k < len {
+    if let [io0, io1, ..] = rest {
         // One pair is left. The register holds the state as
         // `[s[0], s[2], s[1], s[3]]`.
-        let in0 = input_output[2 * k] as i32;
-        let in1 = input_output[2 * k + 1] as i32;
+        let in0 = *io0 as i32;
+        let in1 = *io1 as i32;
 
         let out32_q14_0 = silk_smlawb(vgetq_lane_s32(s_s32x4, 0), b_q28[0], in0) << 2;
         let out32_q14_1 = silk_smlawb(vgetq_lane_s32(s_s32x4, 1), b_q28[0], in1) << 2;
@@ -2059,20 +2076,18 @@ unsafe fn silk_biquad_alt_stride2_neon(
         let s1_new = silk_smlawb(s1_new, b_q28[2], in0);
         let s3_new = silk_smlawb(s3_new, b_q28[2], in1);
 
-        input_output[2 * k] =
-            silk_sat16(silk_rshift(out32_q14_0.wrapping_add((1 << 14) - 1), 14)) as i16;
-        input_output[2 * k + 1] =
-            silk_sat16(silk_rshift(out32_q14_1.wrapping_add((1 << 14) - 1), 14)) as i16;
+        *io0 = silk_sat16(silk_rshift(out32_q14_0.wrapping_add((1 << 14) - 1), 14)) as i16;
+        *io1 = silk_sat16(silk_rshift(out32_q14_1.wrapping_add((1 << 14) - 1), 14)) as i16;
 
         s[0] = s0_new;
         s[1] = s1_new;
         s[2] = s2_new;
         s[3] = s3_new;
     } else {
-        vst1q_lane_s32(&mut s[0], s_s32x4, 0);
-        vst1q_lane_s32(&mut s[1], s_s32x4, 2);
-        vst1q_lane_s32(&mut s[2], s_s32x4, 1);
-        vst1q_lane_s32(&mut s[3], s_s32x4, 3);
+        store_lane_i32x4::<0>(&mut s[0], s_s32x4);
+        store_lane_i32x4::<2>(&mut s[1], s_s32x4);
+        store_lane_i32x4::<1>(&mut s[2], s_s32x4);
+        store_lane_i32x4::<3>(&mut s[3], s_s32x4);
     }
 }
 

@@ -170,13 +170,9 @@ pub fn silk_ltp_analysis_filter_fix(
 /// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
 /// multiplication, which fixed-point code needs; AVX2 has both. The results
 /// are the same bits.
-///
-/// # Safety
-///
-/// The processor must have AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn ltp_analysis_filter_avx2(
+fn ltp_analysis_filter_avx2(
     ltp_res: &mut [i16],
     x: &[i16],
     x_base_idx: usize,

@@ -346,6 +346,12 @@ fn rewhiten_scalar<const ORDER: usize>(
 }
 
 /// `rewhiten_scalar` with four outputs per step.
+///
+/// The loop keeps its pointer loads and stores. The function is inlined
+/// into the SILK decoder. With the ranges taken from `as_chunks` and
+/// windows, or checked once and taken with `get_unchecked`, the compiler
+/// assigned the registers of the decoder differently on Android, and
+/// loops of the decoder got longer.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn rewhiten_neon<const ORDER: usize>(
@@ -487,6 +493,9 @@ fn ltp_block_scalar(
 }
 
 /// `ltp_block_scalar` with four samples per step.
+///
+/// The loop keeps its pointer loads and stores, for the reason given at
+/// `rewhiten_neon`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn ltp_block_neon(
@@ -659,6 +668,7 @@ fn lpc_synthesis_neon<const ORDER: usize>(
     bias: i32,
 ) {
     use crate::silk::sigproc_fix::smulwb_operand;
+    use crate::simd_mem::{array_at, neon::load_i32x4};
     use core::arch::aarch64::*;
 
     let n = res_q14.len();
@@ -680,15 +690,15 @@ fn lpc_synthesis_neon<const ORDER: usize>(
     for k in MAX_LPC_ORDER - ORDER..IN_VECTORS {
         c_vec[k] = smulwb_operand(a_q12[MAX_LPC_ORDER - 1 - k]);
     }
-    // SAFETY: each load reads 4 elements; `c_vec` has 12 and `state` has 16.
+    // SAFETY: NEON is part of the aarch64 baseline.
     let (c0, c1, c2, mut h0, mut h1, mut h2) = unsafe {
         (
-            vld1q_s32(c_vec.as_ptr()),
-            vld1q_s32(c_vec.as_ptr().add(4)),
-            vld1q_s32(c_vec.as_ptr().add(8)),
-            vld1q_s32(state.as_ptr()),
-            vld1q_s32(state.as_ptr().add(4)),
-            vld1q_s32(state.as_ptr().add(8)),
+            load_i32x4(array_at(&c_vec, 0)),
+            load_i32x4(array_at(&c_vec, 4)),
+            load_i32x4(array_at(&c_vec, 8)),
+            load_i32x4(array_at(state, 0)),
+            load_i32x4(array_at(state, 4)),
+            load_i32x4(array_at(state, 8)),
         )
     };
 
@@ -750,9 +760,20 @@ fn lpc_synthesis_neon<const ORDER: usize>(
 /// `silk_smulwb(x, c)`, `(x * c) >> 16` for a 16-bit `c`, is the upper half
 /// of the 64-bit product of `x` and `c << 16`. `_mm_mul_epi32` gives that
 /// product for lanes 0 and 2, so the results land in lanes 1 and 3.
+///
+/// `rewhiten_sse41` and `ltp_block_sse41` keep their loops (`while m < n4`)
+/// and take the ranges they read and write with `get_unchecked` and
+/// `get_unchecked_mut`. They are inlined into the SILK decoder. With the
+/// ranges taken from `as_chunks` and windows, the loops counted
+/// differently, the compiler assigned the registers of the decoder
+/// differently, and the loops of the range decoder there got longer.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::*;
+    use crate::simd_mem::{
+        array_at,
+        x86::{load_i16x4, load_i16x8, load_i32x4, store_i32x4, store_i32x4_uninit},
+    };
     use core::arch::x86_64::*;
 
     /// The sums of `silk_smulwb(x, c)` over several pairs, as two vectors:
@@ -819,10 +840,9 @@ mod x86 {
     /// one covered set to zero. The products and their sums wrap at 32 bits
     /// as in the scalar code, so their order does not matter.
     ///
-    /// # Safety
-    /// The processor must have SSE4.1.
+    /// Panics when `input` does not hold `ORDER` samples more than `out`.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn rewhiten_sse41<const ORDER: usize>(
+    pub(super) fn rewhiten_sse41<const ORDER: usize>(
         out: &mut [MaybeUninit<i32>],
         input: &[i16],
         a_q12: &[i16; MAX_LPC_ORDER],
@@ -843,56 +863,55 @@ mod x86 {
             second[k] = a_rev[ORDER - 8 + k];
         }
 
-        // SAFETY: the processor has SSE4.1 (the caller's contract). A step
-        // at `m` has `m + 4 <= n`. For output `m + l` it reads
-        // `input[m + l..m + l + 8]`, `input[m + l + ORDER - 8..m + l +
-        // ORDER]` and `input[m + l + ORDER]`; the last index is
-        // `m + 3 + ORDER < n + ORDER`, the length of `input` (checked
-        // above). It writes `out[m..m + 4]`. The coefficient arrays hold 16
-        // and 8 values.
-        unsafe {
-            let taps0 = _mm_loadu_si128(a_rev.as_ptr().cast());
-            let taps1 = _mm_loadu_si128(second.as_ptr().cast());
-            let gain = _mm_set1_epi32(inv_gain_q31);
-            let one = _mm_set1_epi32(1);
-            let mut m = 0;
-            while m < n4 {
-                let x = input.as_ptr().add(m);
-                // The prediction of output `m + l`, in four lanes.
-                let pred = |l: usize| {
-                    let first = _mm_madd_epi16(_mm_loadu_si128(x.add(l).cast()), taps0);
-                    let second = _mm_madd_epi16(_mm_loadu_si128(x.add(l + ORDER - 8).cast()), taps1);
-                    _mm_add_epi32(first, second)
-                };
-                let (p0, p1, p2, p3) = (pred(0), pred(1), pred(2), pred(3));
-                let t01 = _mm_add_epi32(_mm_unpacklo_epi32(p0, p1), _mm_unpackhi_epi32(p0, p1));
-                let t23 = _mm_add_epi32(_mm_unpacklo_epi32(p2, p3), _mm_unpackhi_epi32(p2, p3));
-                let pred_q12 = _mm_add_epi32(_mm_unpacklo_epi64(t01, t23), _mm_unpackhi_epi64(t01, t23));
+        // The step at `m` writes `out[m..m + 4]` and reads
+        // `input[m..m + ORDER + 4]`: for output `m + l` the samples from
+        // `m + l` to `m + l + 8`, from `m + l + ORDER - 8` to
+        // `m + l + ORDER` and at `m + l + ORDER`.
+        let taps0 = load_i16x8(array_at(&a_rev, 0));
+        let taps1 = load_i16x8(&second);
+        let gain = _mm_set1_epi32(inv_gain_q31);
+        let one = _mm_set1_epi32(1);
+        let mut m = 0;
+        while m < n4 {
+            // SAFETY: `m + 4 <= n`, so the range ends at most at
+            // `n + ORDER`, the length of `input` (checked above).
+            let x = unsafe { input.get_unchecked(m..m + ORDER + 4) };
+            // The prediction of output `m + l`, in four lanes.
+            let pred = |l: usize| {
+                let first = _mm_madd_epi16(load_i16x8(array_at(x, l)), taps0);
+                let second = _mm_madd_epi16(load_i16x8(array_at(x, l + ORDER - 8)), taps1);
+                _mm_add_epi32(first, second)
+            };
+            let (p0, p1, p2, p3) = (pred(0), pred(1), pred(2), pred(3));
+            let t01 = _mm_add_epi32(_mm_unpacklo_epi32(p0, p1), _mm_unpackhi_epi32(p0, p1));
+            let t23 = _mm_add_epi32(_mm_unpacklo_epi32(p2, p3), _mm_unpackhi_epi32(p2, p3));
+            let pred_q12 = _mm_add_epi32(_mm_unpacklo_epi64(t01, t23), _mm_unpackhi_epi64(t01, t23));
 
-                let newest = _mm_cvtepi16_epi32(_mm_loadl_epi64(x.add(ORDER).cast()));
-                let res_q12 = _mm_sub_epi32(_mm_slli_epi32::<12>(newest), pred_q12);
-                // Round to Q0, ((x >> 11) + 1) >> 1 as silk_rshift_round,
-                // and saturate to 16 bits.
-                let rounded = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_srai_epi32::<11>(res_q12), one));
-                let res = _mm_packs_epi32(rounded, rounded);
-                // silk_smulwb(gain, res) per lane: the factor `res << 16` is
-                // `res` in the upper half of each 32-bit lane.
-                let factor = _mm_unpacklo_epi16(_mm_setzero_si128(), res);
-                let mut sums = Sums::new();
-                sums.add(gain, factor, odd_lanes(factor));
-                _mm_storeu_si128(out.as_mut_ptr().add(m).cast(), sums.lanes());
-                m += 4;
-            }
+            let newest = _mm_cvtepi16_epi32(load_i16x4(array_at(x, ORDER)));
+            let res_q12 = _mm_sub_epi32(_mm_slli_epi32::<12>(newest), pred_q12);
+            // Round to Q0, ((x >> 11) + 1) >> 1 as silk_rshift_round,
+            // and saturate to 16 bits.
+            let rounded = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_srai_epi32::<11>(res_q12), one));
+            let res = _mm_packs_epi32(rounded, rounded);
+            // silk_smulwb(gain, res) per lane: the factor `res << 16` is
+            // `res` in the upper half of each 32-bit lane.
+            let factor = _mm_unpacklo_epi16(_mm_setzero_si128(), res);
+            let mut sums = Sums::new();
+            sums.add(gain, factor, odd_lanes(factor));
+            // SAFETY: `m + 4 <= n`, the length of `out`.
+            let o = unsafe { out.get_unchecked_mut(m..m + 4) };
+            store_i32x4_uninit(o.try_into().unwrap(), sums.lanes());
+            m += 4;
         }
         rewhiten_scalar::<ORDER>(&mut out[n4..], &input[n4..], a_q12, inv_gain_q31);
     }
 
     /// `ltp_block_scalar` with four samples per step, as `ltp_block_neon`.
     ///
-    /// # Safety
-    /// The processor must have SSE4.1.
+    /// Panics when `taps` does not hold four samples more than `exc_q14`,
+    /// or `res_q14` or `new_state` not as many.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn ltp_block_sse41(
+    pub(super) fn ltp_block_sse41(
         taps: &[i32],
         b_q14: &[i16; LTP_ORDER],
         exc_q14: &[i32],
@@ -903,34 +922,38 @@ mod x86 {
         assert!(taps.len() == n + LTP_ORDER - 1 && res_q14.len() == n && new_state.len() == n);
         let n4 = n & !3;
 
-        // SAFETY: the processor has SSE4.1 (the caller's contract). A step
-        // at `i` has `i + 4 <= n`. It reads `taps[i + k..i + k + 4]` for
-        // `k <= 4`; the last index is `i + 7 < n + 4`, the length of `taps`
-        // (checked above). It reads `exc_q14[i..i + 4]` and writes
-        // `res_q14[i..i + 4]` and `new_state[i..i + 4]`, which all have `n`
-        // elements.
-        unsafe {
-            // `b_q14[k] << 16` in every lane: the factor of the sample
-            // `4 - k` places into the five.
-            let f = |k: usize| _mm_set1_epi32((b_q14[k] as i32) << 16);
-            let f = [f(0), f(1), f(2), f(3), f(4)];
-            // The 2 avoids a bias: silk_smlawb always rounds down.
-            let bias = _mm_set1_epi32(2);
-            let mut i = 0;
-            while i < n4 {
-                let x = taps.as_ptr().add(i);
-                let mut sums = Sums::new();
-                for (k, &f) in f.iter().enumerate() {
-                    sums.add(_mm_loadu_si128(x.add(LTP_ORDER - 1 - k).cast()), f, f);
-                }
-                let pred_q13 = _mm_add_epi32(bias, sums.lanes());
-
-                let exc = _mm_loadu_si128(exc_q14.as_ptr().add(i).cast());
-                let res = _mm_add_epi32(exc, _mm_slli_epi32::<1>(pred_q13));
-                _mm_storeu_si128(res_q14.as_mut_ptr().add(i).cast(), res);
-                _mm_storeu_si128(new_state.as_mut_ptr().add(i).cast(), _mm_slli_epi32::<1>(res));
-                i += 4;
+        // The step at `i` reads `taps[i..i + 8]` and `exc_q14[i..i + 4]`,
+        // and writes `res_q14` and `new_state` there.
+        //
+        // `b_q14[k] << 16` in every lane: the factor of the sample
+        // `4 - k` places into the five.
+        let f = |k: usize| _mm_set1_epi32((b_q14[k] as i32) << 16);
+        let f = [f(0), f(1), f(2), f(3), f(4)];
+        // The 2 avoids a bias: silk_smlawb always rounds down.
+        let bias = _mm_set1_epi32(2);
+        let mut i = 0;
+        while i < n4 {
+            // SAFETY: `i + 4 <= n`; `taps` has `n + 4` elements, the other
+            // slices `n` (checked above).
+            let (x, exc, res_out, state_out) = unsafe {
+                (
+                    taps.get_unchecked(i..i + 8),
+                    exc_q14.get_unchecked(i..i + 4),
+                    res_q14.get_unchecked_mut(i..i + 4),
+                    new_state.get_unchecked_mut(i..i + 4),
+                )
+            };
+            let mut sums = Sums::new();
+            for (k, &f) in f.iter().enumerate() {
+                sums.add(load_i32x4(array_at(x, LTP_ORDER - 1 - k)), f, f);
             }
+            let pred_q13 = _mm_add_epi32(bias, sums.lanes());
+
+            let exc = load_i32x4(array_at(exc, 0));
+            let res = _mm_add_epi32(exc, _mm_slli_epi32::<1>(pred_q13));
+            store_i32x4(res_out.try_into().unwrap(), res);
+            store_i32x4_uninit(state_out.try_into().unwrap(), _mm_slli_epi32::<1>(res));
+            i += 4;
         }
         ltp_block_scalar(
             &taps[n4..],
@@ -957,10 +980,10 @@ mod x86 {
     /// scalar code does; that gives the scalar code's result also when it
     /// would not have saturated.
     ///
-    /// # Safety
-    /// The processor must have SSE4.1.
+    /// Panics when `s_lpc_q14` does not hold `MAX_LPC_ORDER` samples more
+    /// than `res_q14`.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn lpc_synthesis_sse41<const ORDER: usize>(
+    pub(super) fn lpc_synthesis_sse41<const ORDER: usize>(
         s_lpc_q14: &mut [i32],
         res_q14: &[i32],
         a_q12: &[i16; MAX_LPC_ORDER],
@@ -988,17 +1011,15 @@ mod x86 {
         for k in MAX_LPC_ORDER - ORDER..IN_VECTORS {
             c_vec[k] = (a_q12[MAX_LPC_ORDER - 1 - k] as i32) << 16;
         }
-        // SAFETY: each load reads 4 elements; `c_vec` has 12 and `state`
-        // has 16. The processor has SSE4.1 (the caller's contract).
-        let (f, mut h0, mut h1, mut h2) = unsafe {
-            let c0 = _mm_loadu_si128(c_vec.as_ptr().cast());
-            let c1 = _mm_loadu_si128(c_vec.as_ptr().add(4).cast());
-            let c2 = _mm_loadu_si128(c_vec.as_ptr().add(8).cast());
+        let (f, mut h0, mut h1, mut h2) = {
+            let c0 = load_i32x4(array_at(&c_vec, 0));
+            let c1 = load_i32x4(array_at(&c_vec, 4));
+            let c2 = load_i32x4(array_at(&c_vec, 8));
             (
                 [(c0, odd_lanes(c0)), (c1, odd_lanes(c1)), (c2, odd_lanes(c2))],
-                _mm_loadu_si128(state.as_ptr().cast()),
-                _mm_loadu_si128(state.as_ptr().add(4).cast()),
-                _mm_loadu_si128(state.as_ptr().add(8).cast()),
+                load_i32x4(array_at(state, 0)),
+                load_i32x4(array_at(state, 4)),
+                load_i32x4(array_at(state, 8)),
             )
         };
 
