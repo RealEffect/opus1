@@ -165,6 +165,10 @@ use core::arch::aarch64::*;
 /// order. The four are then added as `(s0 + s1) + (s2 + s3)`, and the last
 /// `len % 4` samples are added one by one. `sum_abs_lanes_reference` in the
 /// tests is this order written as a plain loop.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn sum_abs_neon(x: &[f32]) -> f32 {
@@ -193,13 +197,10 @@ fn sum_abs_neon(x: &[f32]) -> f32 {
 
 #[inline(always)]
 fn sum_abs(x: &[f32]) -> f32 {
-    // SAFETY: the AVX version runs only when the processor has AVX, and it
-    // reads `x.len()` values of `x`.
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if crate::compat::x86_has_avx() {
-            return sum_abs_avx(x, x.len());
-        }
+    if crate::compat::x86_has_avx() {
+        // SAFETY: the CPU has AVX (checked just above).
+        return unsafe { sum_abs_avx(x, x.len()) };
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -235,6 +236,10 @@ fn max_abs_scalar(x: &[f32], init: f32) -> f32 {
 /// `v > max`, so a sample that is not a number is skipped here too. A
 /// maximum does not depend on the order of the comparisons, so the result
 /// has the same bits as the scalar one.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn max_abs_neon(x: &[f32], init: f32) -> f32 {
@@ -291,6 +296,10 @@ fn max_abs_neon(x: &[f32], init: f32) -> f32 {
 /// `_mm_max_ps(v, m)` is `v > m ? v : m`, the test of the scalar loop, and
 /// it gives `m` where `v` is not a number. So the result has the same bits
 /// as the scalar one.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[inline]
 fn max_abs_sse(x: &[f32], init: f32) -> f32 {
@@ -421,6 +430,10 @@ fn preemphasis_scalar(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 
 /// samples can be computed side by side. The product and the difference
 /// stay two operations with a rounding each, as in the scalar loop, so the
 /// result has the same bits.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn preemphasis_neon(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
@@ -473,6 +486,10 @@ fn preemphasis_neon(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
 /// `preemphasis_neon` for x86-64 with SSE: 8 samples per pass, in two
 /// vectors of 4. The product and the difference are two operations with a
 /// rounding each, as in the scalar loop, so the result has the same bits.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[inline]
 fn preemphasis_sse(pcm: &[f32], out: &mut [f32], coef: f32, mem: f32) -> f32 {
@@ -635,6 +652,10 @@ fn preemphasis_stereo_scalar(
 /// right samples. Each output is `x[i] - coef * x[i - 1]` with the product
 /// and the difference rounded on their own, as in the scalar loop, so the
 /// result has the same bits.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn preemphasis_stereo_neon(
@@ -699,6 +720,10 @@ fn preemphasis_stereo_neon(
 /// and the 4 right samples. Each output is `x[i] - coef * x[i - 1]` with
 /// the product and the difference rounded on their own, as in the scalar
 /// loop, so the result has the same bits.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `crate::pitch::celt_inner_prod`: the function is inlined into
+/// `CeltEncoder::encode`, whose loops got longer with the safe form.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[inline]
 fn preemphasis_stereo_sse(
@@ -1136,22 +1161,18 @@ fn patch_transient_decision(
 }
 
 fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
-    // The vector versions read `n` values through a pointer. This check
-    // makes a call with `n > tmp.len()` panic instead.
+    // The vector versions take exactly `n` values. This check makes a call
+    // with `n > tmp.len()` panic here.
     let tmp = &tmp[..n];
-    // SAFETY: the AVX version runs only when the processor has AVX, and
-    // `tmp` holds exactly `n` values (sliced above).
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if n >= 16 && crate::compat::x86_has_avx() {
-            return l1_metric_avx(tmp, n, lm, bias);
-        }
+    if n >= 16 && crate::compat::x86_has_avx() {
+        // SAFETY: the CPU has AVX (checked just above).
+        return unsafe { l1_metric_avx(tmp, n, lm, bias) };
     }
     #[cfg(target_arch = "aarch64")]
     {
         if n >= 16 {
-            // SAFETY: `tmp` holds exactly `n` values (sliced above), and
-            // NEON is part of every aarch64 target this crate builds for.
+            // SAFETY: NEON is part of the baseline of every aarch64 target.
             return unsafe { l1_metric_neon(tmp, n, lm, bias) };
         }
     }
@@ -1165,39 +1186,36 @@ fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
 
 /// Sum of the first `n` values of `|x[i]|`, in two groups of 8 partial sums.
 ///
-/// # Safety
-///
-/// The processor must have AVX. Reads `x[..n]` through a pointer without
-/// checks, so the caller must make sure that `n <= x.len()`. Every load
-/// reads 8 values at `i .. i + 8`, and the loop conditions keep
-/// `i + 8 <= n` (`i + 16 <= n` for the two loads of the first loop).
+/// Panics when `x` holds fewer than `n` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
+fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::load_f32x8;
     // The loads below cover `x[..n]`.
     assert!(n <= x.len());
 
+    // Groups of eight values, two groups per step.
+    let (x8, x_tail) = x[..n].as_chunks::<8>();
+    let (x16, x8) = x8.as_chunks::<2>();
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
-    let mut i = 0usize;
     let sign_mask = _mm256_set1_ps(-0.0);
 
-    while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+    for a in x16 {
+        let v0 = load_f32x8(&a[0]);
+        let v1 = load_f32x8(&a[1]);
         sum0 = _mm256_add_ps(sum0, _mm256_andnot_ps(sign_mask, v0));
         sum1 = _mm256_add_ps(sum1, _mm256_andnot_ps(sign_mask, v1));
-        i += 16;
     }
 
-    while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+    // The group of eight that is left, if there is one.
+    if let [a] = x8 {
+        let v = load_f32x8(a);
         sum0 = _mm256_add_ps(sum0, _mm256_andnot_ps(sign_mask, v));
-        i += 8;
     }
 
     let sum = _mm256_add_ps(sum0, sum1);
@@ -1209,30 +1227,36 @@ unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
     let t2 = _mm_shuffle_ps(s2, s2, 0x55);
     let mut out = _mm_cvtss_f32(_mm_add_ss(s2, t2));
 
-    for j in i..n {
-        out += x[j].abs();
+    for &v in x_tail {
+        out += v.abs();
     }
 
     out
 }
 
-/// # Safety
+/// `l1_metric` with AVX for `n >= 16` (see `sum_abs_avx`).
 ///
-/// The processor must have AVX, and `n <= tmp.len()` (see `sum_abs_avx`).
+/// Panics when `tmp` holds fewer than `n` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-unsafe fn l1_metric_avx(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
+fn l1_metric_avx(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
     debug_assert!(n <= tmp.len());
-    // SAFETY: the caller guarantees AVX and `n <= tmp.len()`.
     let l1 = sum_abs_avx(tmp, n);
     l1 + (lm as f32) * bias * l1
 }
 
+/// `l1_metric` with NEON for `n >= 16`: four partial sums, sixteen values
+/// per pass.
+///
+/// Panics when `tmp` holds fewer than `n` values.
+///
+/// The vector loops keep their pointer loads, for the reason given at
+/// `sum_abs_neon`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn l1_metric_neon(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
-    debug_assert!(n <= tmp.len());
-    // SAFETY: the caller guarantees `n <= tmp.len()`. Every load reads the
+fn l1_metric_neon(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
+    let tmp = &tmp[..n];
+    // SAFETY: `tmp` holds `n` values (sliced above). Every load reads the
     // 4 values at `i .. i + 4`, and the loop conditions keep `i + 4 <= n`.
     unsafe {
         let mut sum4 = vdupq_n_f32(0.0);
@@ -1629,27 +1653,25 @@ fn comb_filter_const(
     g11: f32,
     g12: f32,
 ) {
-    // The vector versions below read and write through pointers without
-    // further checks. They read `x[x_idx - t - 2 .. x_idx + n]` and write
-    // `y[y_idx .. y_idx + n]`. A caller with other values gets a panic here.
+    // The vector versions below read `x[x_idx - t - 2 .. x_idx + n]` and
+    // write `y[y_idx .. y_idx + n]`. A caller with other values gets a panic
+    // here.
     assert!(
         t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len(),
         "comb_filter_const: range outside its buffers"
     );
+    // SAFETY: NEON is part of the baseline of every aarch64 target.
     #[cfg(target_arch = "aarch64")]
-    {
+    unsafe {
         comb_filter_const_neon(y, x, y_idx, x_idx, t, n, g10, g11, g12);
     }
-    // SAFETY: the range was checked above, and this version runs only when
-    // the processor has AVX and FMA.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        if crate::compat::x86_has_avx_fma() {
-            comb_filter_const_avx(y, x, y_idx, x_idx, t, n, g10, g11, g12);
-            return;
-        }
+    if crate::compat::x86_has_avx_fma() {
+        // SAFETY: the CPU has AVX and FMA (checked just above).
+        unsafe { comb_filter_const_avx(y, x, y_idx, x_idx, t, n, g10, g11, g12) };
+        return;
     }
-    // SAFETY: the range was checked above, and SSE is part of this target.
+    // SAFETY: SSE is part of this target (see the `cfg`).
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
     unsafe {
         comb_filter_const_sse(y, x, y_idx, x_idx, t, n, g10, g11, g12);
@@ -1699,7 +1721,17 @@ fn comb_filter_const_scalar(
     }
 }
 
+/// `comb_filter_const` for 64-bit ARM, four samples per pass.
+///
+/// Every sample adds each product with a fused multiply-add, in the order
+/// of `comb_tap3`, as libopus's arm64 build does. The result has the bits
+/// of `comb_filter_const_scalar`.
+///
+/// Reads `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`.
+/// Panics unless `t >= 2` and both ranges are inside their slices.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn comb_filter_const_neon(
     y: &mut [f32],
     x: &[f32],
@@ -1711,59 +1743,29 @@ fn comb_filter_const_neon(
     g11: f32,
     g12: f32,
 ) {
+    use crate::simd_mem::array_at;
+    use crate::simd_mem::neon::{load_f32x4, store_f32x4, to_array_f32x4};
     // The only caller is `comb_filter_const`, which has checked this range.
-    // The check is repeated here so that this safe function stays safe if
-    // it gets another caller.
+    // The check is repeated here so that this function does not depend on
+    // its caller.
     assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
-    // SAFETY: the range the kernel reads and writes is inside `x` and `y`
-    // (checked above).
-    unsafe { comb_filter_const_neon_impl(y, x, y_idx, x_idx, t, n, g10, g11, g12) }
-}
-
-/// `comb_filter_const` for 64-bit ARM, four samples per pass.
-///
-/// Every sample adds each product with a fused multiply-add, in the order
-/// of `comb_tap3`, as libopus's arm64 build does. The result has the bits
-/// of `comb_filter_const_scalar`.
-///
-/// # Safety
-///
-/// Reads `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`
-/// without checks. The caller must make sure that `t >= 2` and that both
-/// ranges are inside their slices. With `t >= 2`, the load of the four
-/// values at `x_idx + i - t + 2` ends at or before `x_idx + i + 4`, which
-/// the loop condition keeps at or below `x_idx + n`. The first load, at
-/// `x_idx - t - 2`, also happens when `n` is 0; it ends at or before
-/// `x_idx`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_neon_impl(
-    y: &mut [f32],
-    x: &[f32],
-    y_idx: usize,
-    x_idx: usize,
-    t: usize,
-    n: usize,
-    g10: f32,
-    g11: f32,
-    g12: f32,
-) {
-    use core::arch::aarch64::*;
-    debug_assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = vdupq_n_f32(g10);
     let g11v = vdupq_n_f32(g11);
     let g12v = vdupq_n_f32(g12);
 
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
+    // For the groups of four outputs `i .. i + 4`: the inputs
+    // `x[x_idx + i ..]` and `x[x_idx + i - t + 2 ..]`, four each. With
+    // `t >= 2` the second ends at or before `x_idx + i + 4`.
+    let (xs, _) = x[x_idx..x_idx + n].as_chunks::<4>();
+    let groups = xs.len();
+    let x4s = &x[x_idx + 2 - t..].as_chunks::<4>().0[..groups];
+    let (ys, _) = y[y_idx..y_idx + n].as_chunks_mut::<4>();
 
-    let mut x0v = vld1q_f32(xbase.sub(t + 2));
+    let mut x0v = load_f32x4(array_at(x, x_idx - t - 2));
 
-    let mut i = 0;
-    while i + 4 <= n {
-        let x4v = vld1q_f32(xbase.add(i).sub(t - 2));
+    for ((xa, x4a), ya) in xs.iter().zip(x4s).zip(ys) {
+        let x4v = load_f32x4(x4a);
 
         let x2v = vextq_f32(x0v, x4v, 2);
 
@@ -1771,46 +1773,48 @@ unsafe fn comb_filter_const_neon_impl(
 
         let x3v = vextq_f32(x0v, x4v, 3);
 
-        let xi = vld1q_f32(xbase.add(i));
+        let xi = load_f32x4(xa);
 
         let mut yi = xi;
         yi = vfmaq_f32(yi, g10v, x2v);
         yi = vfmaq_f32(yi, g11v, vaddq_f32(x1v, x3v));
         yi = vfmaq_f32(yi, g12v, vaddq_f32(x4v, x0v));
-        vst1q_f32(ybase.add(i), yi);
+        store_f32x4(ya, yi);
 
         x0v = x4v;
-        i += 4;
     }
 
-    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
+    let x0v_arr = to_array_f32x4(x0v);
     let mut sx4 = x0v_arr[0];
     let mut sx3 = x0v_arr[1];
     let mut sx2 = x0v_arr[2];
     let mut sx1 = x0v_arr[3];
 
-    while i < n {
-        let sx0 = x[x_idx + i - t + 2];
-        y[y_idx + i] = comb_tap3(x[x_idx + i], [g10, g11, g12], sx2, sx1 + sx3, sx0 + sx4);
+    // The last `n % 4` outputs `i`, with x[x_idx + i] and
+    // x[x_idx + i - t + 2].
+    let i = 4 * groups;
+    let tail = y[y_idx + i..y_idx + n]
+        .iter_mut()
+        .zip(&x[x_idx + i..x_idx + n])
+        .zip(&x[x_idx + i + 2 - t..]);
+    for ((yo, &xi), &sx0) in tail {
+        *yo = comb_tap3(xi, [g10, g11, g12], sx2, sx1 + sx3, sx0 + sx4);
         sx4 = sx3;
         sx3 = sx2;
         sx2 = sx1;
         sx1 = sx0;
-        i += 1;
     }
 }
 
-/// # Safety
+/// `comb_filter_const` for x86-64 with SSE, four samples per pass.
 ///
-/// Reads `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`
-/// without checks. The caller must make sure that `t >= 2` and that both
-/// ranges are inside their slices. With `t >= 2`, the load of the four
-/// values at `x_idx + i - t + 2` ends at or before `x_idx + i + 4`, which
-/// the loop condition keeps at or below `x_idx + n`.
+/// Reads `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`.
+/// Panics unless `t >= 2` and both ranges are inside their slices.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_sse(
+#[target_feature(enable = "sse")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn comb_filter_const_sse(
     y: &mut [f32],
     x: &[f32],
     y_idx: usize,
@@ -1825,19 +1829,25 @@ unsafe fn comb_filter_const_sse(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::array_at;
+    use crate::simd_mem::x86::{load_f32x4, store_f32x4, to_array_f32x4};
     assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);
     let g12v = _mm_set1_ps(g12);
 
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
-    let mut x0v = _mm_loadu_ps(xbase.sub(t + 2));
+    // For the groups of four outputs `i .. i + 4`: the inputs
+    // `x[x_idx + i ..]` and `x[x_idx + i - t + 2 ..]`, four each. With
+    // `t >= 2` the second ends at or before `x_idx + i + 4`.
+    let (xs, _) = x[x_idx..x_idx + n].as_chunks::<4>();
+    let groups = xs.len();
+    let x4s = &x[x_idx + 2 - t..].as_chunks::<4>().0[..groups];
+    let (ys, _) = y[y_idx..y_idx + n].as_chunks_mut::<4>();
+    let mut x0v = load_f32x4(array_at(x, x_idx - t - 2));
 
-    let mut i = 0;
-    while i + 4 <= n {
-        let x4v = _mm_loadu_ps(xbase.add(i).sub(t - 2));
+    for ((xa, x4a), ya) in xs.iter().zip(x4s).zip(ys) {
+        let x4v = load_f32x4(x4a);
 
         let x2v = _mm_shuffle_ps(x0v, x4v, 0x4e);
 
@@ -1845,7 +1855,7 @@ unsafe fn comb_filter_const_sse(
 
         let x3v = _mm_shuffle_ps(x2v, x4v, 0x99);
 
-        let xi = _mm_loadu_ps(xbase.add(i));
+        let xi = load_f32x4(xa);
 
         let mut yi = xi;
         yi = _mm_add_ps(yi, _mm_mul_ps(g10v, x2v));
@@ -1854,18 +1864,18 @@ unsafe fn comb_filter_const_sse(
             _mm_mul_ps(g12v, _mm_add_ps(x4v, x0v)),
         );
         yi = _mm_add_ps(yi, yi2);
-        _mm_storeu_ps(ybase.add(i), yi);
+        store_f32x4(ya, yi);
 
         x0v = x4v;
-        i += 4;
     }
 
-    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
+    let x0v_arr = to_array_f32x4(x0v);
     let mut sx4 = x0v_arr[0];
     let mut sx3 = x0v_arr[1];
     let mut sx2 = x0v_arr[2];
     let mut sx1 = x0v_arr[3];
 
+    let mut i = 4 * groups;
     while i < n {
         let sx0 = x[x_idx + i - t + 2];
         y[y_idx + i] = x[x_idx + i] + g10 * sx2 + g11 * (sx1 + sx3) + g12 * (sx0 + sx4);
@@ -1877,18 +1887,14 @@ unsafe fn comb_filter_const_sse(
     }
 }
 
-/// # Safety
+/// `comb_filter_const` for x86 with AVX and FMA, eight samples per pass.
 ///
-/// The processor must have AVX and FMA. Reads
-/// `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`
-/// without checks. The caller must make sure that `t >= 2` and that both
-/// ranges are inside their slices. With `t >= 2`, the load of the eight
-/// values at `x_idx + i - t + 2` ends at or before `x_idx + i + 8`, which
-/// the loop conditions keep at or below `x_idx + n`.
+/// Reads `x[x_idx - t - 2 .. x_idx + n]` and writes `y[y_idx .. y_idx + n]`.
+/// Panics unless `t >= 2` and both ranges are inside their slices.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_avx(
+#[allow(clippy::too_many_arguments)]
+fn comb_filter_const_avx(
     y: &mut [f32],
     x: &[f32],
     y_idx: usize,
@@ -1903,78 +1909,79 @@ unsafe fn comb_filter_const_avx(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::x86::{load_f32x8, store_f32x8};
     assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm256_set1_ps(g10);
     let g11v = _mm256_set1_ps(g11);
     let g12v = _mm256_set1_ps(g12);
 
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
+    // For the groups of eight outputs `i .. i + 8`: eight inputs from
+    // `x_idx + i - d` on for each tap `d`. With `t >= 2` the last tap
+    // (`d = t - 2`) ends at or before `x_idx + i + 8`. Two groups per step.
+    let (xi8, _) = x[x_idx..x_idx + n].as_chunks::<8>();
+    let groups = xi8.len();
+    let tap = |d: usize| &x[x_idx - d..].as_chunks::<8>().0[..groups];
+    let (x08, x48, x28) = (tap(t + 2), tap(t - 2), tap(t));
+    let (x18, x38) = (tap(t + 1), tap(t - 1));
+    let (y8, _) = y[y_idx..y_idx + n].as_chunks_mut::<8>();
+    let (xi16, xi8) = xi8.as_chunks::<2>();
+    let (x016, x08) = x08.as_chunks::<2>();
+    let (x416, x48) = x48.as_chunks::<2>();
+    let (x216, x28) = x28.as_chunks::<2>();
+    let (x116, x18) = x18.as_chunks::<2>();
+    let (x316, x38) = x38.as_chunks::<2>();
+    let (y16, y8) = y8.as_chunks_mut::<2>();
 
-    let mut i = 0;
+    for k in 0..y16.len() {
+        let xi_a = load_f32x8(&xi16[k][0]);
+        let x0_a = load_f32x8(&x016[k][0]);
+        let x4_a = load_f32x8(&x416[k][0]);
 
-    while i + 16 <= n {
-        let xi_a = _mm256_loadu_ps(xbase.add(i));
-        let x0_a = _mm256_loadu_ps(xbase.add(i).sub(t + 2));
-        let x4_a = _mm256_loadu_ps(xbase.add(i).sub(t - 2));
-
-        let x2_a = _mm256_loadu_ps(xbase.add(i).sub(t));
-        let x1x3_a = _mm256_add_ps(
-            _mm256_loadu_ps(xbase.add(i).sub(t + 1)),
-            _mm256_loadu_ps(xbase.add(i).sub(t - 1)),
-        );
+        let x2_a = load_f32x8(&x216[k][0]);
+        let x1x3_a = _mm256_add_ps(load_f32x8(&x116[k][0]), load_f32x8(&x316[k][0]));
         let x0x4_a = _mm256_add_ps(x0_a, x4_a);
 
         let mut yi_a = xi_a;
         yi_a = _mm256_fmadd_ps(g10v, x2_a, yi_a);
         yi_a = _mm256_fmadd_ps(g11v, x1x3_a, yi_a);
         yi_a = _mm256_fmadd_ps(g12v, x0x4_a, yi_a);
-        _mm256_storeu_ps(ybase.add(i), yi_a);
+        store_f32x8(&mut y16[k][0], yi_a);
 
-        let j = i + 8;
-        let xi_b = _mm256_loadu_ps(xbase.add(j));
-        let x0_b = _mm256_loadu_ps(xbase.add(j).sub(t + 2));
-        let x4_b = _mm256_loadu_ps(xbase.add(j).sub(t - 2));
-        let x2_b = _mm256_loadu_ps(xbase.add(j).sub(t));
-        let x1x3_b = _mm256_add_ps(
-            _mm256_loadu_ps(xbase.add(j).sub(t + 1)),
-            _mm256_loadu_ps(xbase.add(j).sub(t - 1)),
-        );
+        let xi_b = load_f32x8(&xi16[k][1]);
+        let x0_b = load_f32x8(&x016[k][1]);
+        let x4_b = load_f32x8(&x416[k][1]);
+        let x2_b = load_f32x8(&x216[k][1]);
+        let x1x3_b = _mm256_add_ps(load_f32x8(&x116[k][1]), load_f32x8(&x316[k][1]));
         let x0x4_b = _mm256_add_ps(x0_b, x4_b);
 
         let mut yi_b = xi_b;
         yi_b = _mm256_fmadd_ps(g10v, x2_b, yi_b);
         yi_b = _mm256_fmadd_ps(g11v, x1x3_b, yi_b);
         yi_b = _mm256_fmadd_ps(g12v, x0x4_b, yi_b);
-        _mm256_storeu_ps(ybase.add(j), yi_b);
-
-        i += 16;
+        store_f32x8(&mut y16[k][1], yi_b);
     }
 
-    while i + 8 <= n {
-        let xi = _mm256_loadu_ps(xbase.add(i));
-        let x0 = _mm256_loadu_ps(xbase.add(i).sub(t + 2));
-        let x4 = _mm256_loadu_ps(xbase.add(i).sub(t - 2));
-        let x2 = _mm256_loadu_ps(xbase.add(i).sub(t));
-        let x1x3 = _mm256_add_ps(
-            _mm256_loadu_ps(xbase.add(i).sub(t + 1)),
-            _mm256_loadu_ps(xbase.add(i).sub(t - 1)),
-        );
+    // The group of eight that is left, if there is one.
+    if let ([xi], [x0], [x4], [x2], [x1], [x3], [yo]) = (xi8, x08, x48, x28, x18, x38, y8) {
+        let xi = load_f32x8(xi);
+        let x0 = load_f32x8(x0);
+        let x4 = load_f32x8(x4);
+        let x2 = load_f32x8(x2);
+        let x1x3 = _mm256_add_ps(load_f32x8(x1), load_f32x8(x3));
         let x0x4 = _mm256_add_ps(x0, x4);
 
         let mut yi = xi;
         yi = _mm256_fmadd_ps(g10v, x2, yi);
         yi = _mm256_fmadd_ps(g11v, x1x3, yi);
         yi = _mm256_fmadd_ps(g12v, x0x4, yi);
-        _mm256_storeu_ps(ybase.add(i), yi);
-
-        i += 8;
+        store_f32x8(yo, yi);
     }
 
+    let mut i = 8 * groups;
     if i + 4 <= n {
-        // SAFETY: the same ranges as this call's, without the first `i`
-        // samples: `x_idx + i >= t + 2`, and both ends stay where they were.
+        // The same ranges as this call's, without the first `i` samples:
+        // `x_idx + i >= t + 2`, and both ends stay where they were.
         comb_filter_const_sse_fma(y, x, y_idx + i, x_idx + i, t, n - i, g10, g11, g12);
         return;
     }
@@ -1994,14 +2001,15 @@ unsafe fn comb_filter_const_avx(
     }
 }
 
-/// # Safety
+/// `comb_filter_const_sse` with fused multiply-adds, for the last group of
+/// four samples of `comb_filter_const_avx`.
 ///
-/// The processor must have AVX and FMA. The ranges are those of
-/// `comb_filter_const_sse`, with the same conditions for the caller.
+/// Panics unless `t >= 2` and the ranges of `comb_filter_const_sse` are
+/// inside their slices.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_sse_fma(
+#[allow(clippy::too_many_arguments)]
+fn comb_filter_const_sse_fma(
     y: &mut [f32],
     x: &[f32],
     y_idx: usize,
@@ -2016,39 +2024,43 @@ unsafe fn comb_filter_const_sse_fma(
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use crate::simd_mem::array_at;
+    use crate::simd_mem::x86::{load_f32x4, store_f32x4, to_array_f32x4};
     assert!(t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len());
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);
     let g12v = _mm_set1_ps(g12);
 
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
-    let mut x0v = _mm_loadu_ps(xbase.sub(t + 2));
+    // As in `comb_filter_const_sse`.
+    let (xs, _) = x[x_idx..x_idx + n].as_chunks::<4>();
+    let groups = xs.len();
+    let x4s = &x[x_idx + 2 - t..].as_chunks::<4>().0[..groups];
+    let (ys, _) = y[y_idx..y_idx + n].as_chunks_mut::<4>();
+    let mut x0v = load_f32x4(array_at(x, x_idx - t - 2));
 
-    let mut i = 0;
-    while i + 4 <= n {
-        let x4v = _mm_loadu_ps(xbase.add(i).sub(t - 2));
+    for ((xa, x4a), ya) in xs.iter().zip(x4s).zip(ys) {
+        let x4v = load_f32x4(x4a);
         let x2v = _mm_shuffle_ps(x0v, x4v, 0x4e);
         let x1v = _mm_shuffle_ps(x0v, x2v, 0x99);
         let x3v = _mm_shuffle_ps(x2v, x4v, 0x99);
-        let xi = _mm_loadu_ps(xbase.add(i));
+        let xi = load_f32x4(xa);
 
         let mut yi = xi;
         yi = _mm_fmadd_ps(g10v, x2v, yi);
         yi = _mm_fmadd_ps(g11v, _mm_add_ps(x1v, x3v), yi);
         yi = _mm_fmadd_ps(g12v, _mm_add_ps(x0v, x4v), yi);
-        _mm_storeu_ps(ybase.add(i), yi);
+        store_f32x4(ya, yi);
 
         x0v = x4v;
-        i += 4;
     }
 
-    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
+    let x0v_arr = to_array_f32x4(x0v);
     let mut sx4 = x0v_arr[0];
     let mut sx3 = x0v_arr[1];
     let mut sx2 = x0v_arr[2];
     let mut sx1 = x0v_arr[3];
+    let mut i = 4 * groups;
     while i < n {
         let sx0 = x[x_idx + i - t + 2];
         y[y_idx + i] = x[x_idx + i] + g10 * sx2 + g11 * (sx1 + sx3) + g12 * (sx0 + sx4);
@@ -7660,22 +7672,19 @@ std::thread_local! {
 /// Rows to columns: lane `j` of the result's vector `k` is lane `k` of
 /// `rows[j]`. Applying it twice gives the input back.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[target_feature(enable = "neon")]
+#[inline]
 fn transpose4(rows: [float32x4_t; 4]) -> [float32x4_t; 4] {
-    // SAFETY: these instructions are part of every 64-bit ARM processor,
-    // and they only rearrange values held in registers.
-    unsafe {
-        let t0 = vreinterpretq_f64_f32(vtrn1q_f32(rows[0], rows[1]));
-        let t1 = vreinterpretq_f64_f32(vtrn2q_f32(rows[0], rows[1]));
-        let t2 = vreinterpretq_f64_f32(vtrn1q_f32(rows[2], rows[3]));
-        let t3 = vreinterpretq_f64_f32(vtrn2q_f32(rows[2], rows[3]));
-        [
-            vreinterpretq_f32_f64(vtrn1q_f64(t0, t2)),
-            vreinterpretq_f32_f64(vtrn1q_f64(t1, t3)),
-            vreinterpretq_f32_f64(vtrn2q_f64(t0, t2)),
-            vreinterpretq_f32_f64(vtrn2q_f64(t1, t3)),
-        ]
-    }
+    let t0 = vreinterpretq_f64_f32(vtrn1q_f32(rows[0], rows[1]));
+    let t1 = vreinterpretq_f64_f32(vtrn2q_f32(rows[0], rows[1]));
+    let t2 = vreinterpretq_f64_f32(vtrn1q_f32(rows[2], rows[3]));
+    let t3 = vreinterpretq_f64_f32(vtrn2q_f32(rows[2], rows[3]));
+    [
+        vreinterpretq_f32_f64(vtrn1q_f64(t0, t2)),
+        vreinterpretq_f32_f64(vtrn1q_f64(t1, t3)),
+        vreinterpretq_f32_f64(vtrn2q_f64(t0, t2)),
+        vreinterpretq_f32_f64(vtrn2q_f64(t1, t3)),
+    ]
 }
 
 /// De-emphasis of one frame of `C` channels (1 or 2), computed in eight
@@ -7946,24 +7955,21 @@ fn deemph_segments<const C: usize, const INTERLEAVED: bool>(
 /// `transpose4` for SSE: lane `j` of the result's vector `k` is lane `k`
 /// of `rows[j]`.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-#[inline(always)]
+#[target_feature(enable = "sse")]
+#[inline]
 fn transpose4_sse(rows: [core::arch::x86_64::__m128; 4]) -> [core::arch::x86_64::__m128; 4] {
     use core::arch::x86_64::*;
     // `_MM_TRANSPOSE4_PS` of the C headers.
-    // SAFETY: SSE is part of this target (see the `cfg`), and these
-    // instructions only rearrange values held in registers.
-    unsafe {
-        let t0 = _mm_unpacklo_ps(rows[0], rows[1]);
-        let t1 = _mm_unpackhi_ps(rows[0], rows[1]);
-        let t2 = _mm_unpacklo_ps(rows[2], rows[3]);
-        let t3 = _mm_unpackhi_ps(rows[2], rows[3]);
-        [
-            _mm_movelh_ps(t0, t2),
-            _mm_movehl_ps(t2, t0),
-            _mm_movelh_ps(t1, t3),
-            _mm_movehl_ps(t3, t1),
-        ]
-    }
+    let t0 = _mm_unpacklo_ps(rows[0], rows[1]);
+    let t1 = _mm_unpackhi_ps(rows[0], rows[1]);
+    let t2 = _mm_unpacklo_ps(rows[2], rows[3]);
+    let t3 = _mm_unpackhi_ps(rows[2], rows[3]);
+    [
+        _mm_movelh_ps(t0, t2),
+        _mm_movehl_ps(t2, t0),
+        _mm_movelh_ps(t1, t3),
+        _mm_movehl_ps(t3, t1),
+    ]
 }
 
 /// `deemph_segments_neon` for x86-64 with SSE: the same segments, run-in,
