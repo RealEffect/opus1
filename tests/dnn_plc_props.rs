@@ -6,7 +6,7 @@
 
 mod dnn_plc_common;
 
-use dnn_plc_common::{Lcg, fixture};
+use dnn_plc_common::{Lcg, fixture, thread_stack_size};
 use opus1::internals::dnn::arch::{self, DnnArch};
 use opus1::internals::dnn::builtin;
 use opus1::internals::dnn::models::DeepPlcModels;
@@ -460,8 +460,11 @@ fn conceal_fits_in_a_small_stack() {
     // The first lost frame of a loss is the deepest call: the batch of
     // analyses and `fargan_cont`. Measured on the M4: release builds run
     // in 16 KB (the smallest thread stack macOS gives), debug builds need
-    // about 100 KB.
-    let stack = if cfg!(debug_assertions) { 256 << 10 } else { 64 << 10 };
+    // about 100 KB. The test claims 64 KB (256 KB in a debug build). On
+    // Windows the thread gets more, so that `conceal` can use that much
+    // (see `thread_stack_size`).
+    let claim = if cfg!(debug_assertions) { 256 << 10 } else { 64 << 10 };
+    let stack = thread_stack_size(claim);
     let s = fixture();
     let handle = std::thread::Builder::new()
         .stack_size(stack)

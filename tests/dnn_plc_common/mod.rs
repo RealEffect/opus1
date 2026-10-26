@@ -1,5 +1,6 @@
 //! Signals for the deep PLC tests: the 16 kHz speech fixture, the TSP
-//! speech corpus resampled to 16 kHz, and a fixed generator.
+//! speech corpus resampled to 16 kHz, and a fixed generator. Also the
+//! thread stack size for the tests that run on a small stack.
 
 // Each test file uses a part of this module.
 #![allow(dead_code)]
@@ -129,6 +130,23 @@ impl Lcg {
     pub fn below(&mut self, n: u32) -> u32 {
         ((self.next_u32() as u64 * n as u64) >> 32) as u32
     }
+}
+
+/// The stack size to ask for when a test claims that code runs on `usable`
+/// bytes of stack.
+///
+/// On Windows a thread cannot use all of its stack:
+/// - Rust's standard library asks Windows to keep 20 KB of each thread's
+///   stack for its stack overflow handler (`SetThreadStackGuarantee`).
+/// - The end of the stack holds guard pages.
+///
+/// So a thread built with 64 KB of stack can use only about 36 KB there
+/// (measured on Windows 11, x86-64). On Windows the thread therefore gets
+/// 32 KB more than the claim. Other platforms need nothing extra, so the
+/// claim is tested as it is.
+pub fn thread_stack_size(usable: usize) -> usize {
+    const WINDOWS_RESERVE: usize = 32 << 10;
+    if cfg!(windows) { usable + WINDOWS_RESERVE } else { usable }
 }
 
 /// The name of a file for messages: `CA/CA01_01.wav`.

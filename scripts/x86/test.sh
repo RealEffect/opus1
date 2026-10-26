@@ -176,20 +176,50 @@ fi
 
 # run_tests NAME LIBOPUS_PREFIX CARGO_ARGS...: one cargo test run, with a
 # summary of each test program in NAME-summary.txt.
+#
+# A test program that crashes (a stack overflow, for example) prints no
+# "test result" line. Cargo then prints "process didn't exit successfully"
+# and goes on with the next program. Each such program is named in the
+# summary and counted as one failed test. If cargo fails and the log shows
+# no failed test at all, that counts as one failed test too. So the totals
+# never say "failed 0" when cargo reported a failure.
 run_tests() {
-    local name=$1 prefix=$2; shift 2
+    local name=$1 prefix=$2 status; shift 2
     echo "cargo test $*" > "$OUT/$name.txt"
     LIBOPUS_LIB_DIR="$prefix" CARGO_TARGET_DIR="$REPO/target/x86-$name" \
         cargo test --release --no-fail-fast "$@" >> "$OUT/$name.txt" 2>&1
-    echo "exit status: $?" >> "$OUT/$name.txt"
-    awk '/Running /{prog=$2} /^test result:/{print prog": "$0}' "$OUT/$name.txt" > "$OUT/$name-summary.txt"
-    grep -E '^test .* FAILED$' "$OUT/$name.txt" | sort -u > "$OUT/$name-failed.txt" || true
+    status=$?
+    echo "exit status: $status" >> "$OUT/$name.txt"
+    # `open`: the current test program has not printed its "test result" yet.
+    awk '/^ +(Running|Doc-tests) /{prog=$2; open=1; rerun=""}
+        /^test result:/{print prog": "$0; open=0}
+        open && /^error: test failed, to rerun pass /{rerun=$0; sub(/.*to rerun pass /, "", rerun)}
+        open && /process didn.t exit successfully: /{
+            why=$0; sub(/.*process didn.t exit successfully: /, "", why)
+            # The end of the line says why, as "(signal: 11, SIGSEGV: invalid memory reference)".
+            if (match(why, /\([^()]*\) *$/)) why=substr(why, RSTART + 1, RLENGTH - 2)
+            print prog" "rerun": crashed without a test result ("why")"; open=0}' \
+        "$OUT/$name.txt" > "$OUT/$name-summary.txt"
+    { grep -E '^test .* FAILED$' "$OUT/$name.txt" | sort -u; grep -F ': crashed without a test result' "$OUT/$name-summary.txt"; } \
+        > "$OUT/$name-failed.txt" || true
     if grep -qE '^error(\[E[0-9]+\])?: (could not compile|failed to run custom build command)|^error\[E[0-9]+\]' "$OUT/$name.txt"; then
         echo "$name: compile failed (see $name.txt)" | tee -a "$OUT/summary.txt"
         return
     fi
-    awk -v n="$name" '/^test result:/{p+=$4; f+=$6; i+=$8} END {printf "%s: passed %d, failed %d, ignored %d\n", n, p, f, i}' "$OUT/$name.txt" \
-        | tee -a "$OUT/summary.txt"
+    awk -v n="$name" -v status="$status" -v per="$OUT/$name-summary.txt" '
+        /^test result:/{p+=$4; f+=$6; i+=$8}
+        END {
+            while ((getline line < per) > 0)
+                if (index(line, ": crashed without a test result")) crashed[++c] = line
+            f += c
+            if (status != 0 && f == 0) {
+                f = 1
+                none = n": cargo exit status "status" but no failed test in the log, counted as 1 failed (see "n".txt)"
+            }
+            printf "%s: passed %d, failed %d, ignored %d\n", n, p, f, i
+            for (k = 1; k <= c; k++) printf "%s: %s, counted as 1 failed\n", n, crashed[k]
+            if (none != "") print none
+        }' "$OUT/$name.txt" | tee -a "$OUT/summary.txt"
 }
 
 step "test suite, default features (several minutes)"

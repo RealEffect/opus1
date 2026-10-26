@@ -15,10 +15,16 @@
 #   4. Runs the neural network tests that compare every x86 kernel variant
 #      the CPU has with the portable code, then the tests that compare with
 #      the libopus built with its neural network code.
-#   5. Checks the golden file of 64-bit ARM (x86 is expected to differ in
-#      some streams; the number is recorded). Then compares opus1 with
-#      libopus live, scenario by scenario (perf_harness modes): both
-#      encoders and both decoders on the same input, as modes.md.
+#   5. Checks the golden file of 64-bit ARM and records the number of
+#      scenarios that differ. On Windows every scenario differs: the golden
+#      file also holds libopus's packets (c_pk), and the libopus built here
+#      with Visual Studio gives other packets than the ARM build. To see
+#      whether opus1's output changed, write a golden file on this
+#      computer with the tree to compare with (perf_harness golden --write
+#      PATH) and check this tree against it (golden --check PATH). Then
+#      compares opus1 with libopus live, scenario by scenario (perf_harness
+#      modes): both encoders and both decoders on the same input, as
+#      modes.md.
 #   6. Times encoding and decoding against the default libopus build
 #      (skipped with -Quick).
 #      With -AbBaseline DIR it times this tree against the baseline tree
@@ -186,29 +192,57 @@ $env:LIBOPUS_NO_PKG = '1'
 $env:LIBOPUS_STATIC = '1'
 
 # One cargo test run, with a summary of each test program.
+#
+# A test program that crashes (a stack overflow, for example) prints no
+# "test result" line. Cargo then prints "process didn't exit successfully"
+# and goes on with the next program. Each such program is named in the
+# summary and counted as one failed test. If cargo fails and the log shows
+# no failed test at all, that counts as one failed test too. So the totals
+# never say "failed 0" when cargo reported a failure.
 function Run-Tests([string]$name, [string]$prefix, [string]$cargoArgs) {
     $env:LIBOPUS_LIB_DIR = $prefix
     $env:CARGO_TARGET_DIR = Join-Path $Repo "target\x86w-$name"
     $log = Join-Path $Out "$name.txt"
     Set-Content -Path $log -Value "cargo test --release --no-fail-fast $cargoArgs"
     cmd /c "cargo test --release --no-fail-fast $cargoArgs >> `"$log`" 2>&1"
-    Add-Content -Path $log -Value "exit status: $LASTEXITCODE"
+    $status = $LASTEXITCODE
+    Add-Content -Path $log -Value "exit status: $status"
     $p = 0; $f = 0; $i = 0; $prog = ''
+    # $open: the current test program has not printed its "test result" yet.
+    $open = $false; $rerun = ''; $crashed = @(); $noFailure = ''
     $lines = Get-Content $log
     if ($lines | Where-Object { $_ -match '^error(\[E\d+\])?: (could not compile|failed to run custom build command)|^error\[E\d+\]' }) {
         Note "${name}: compile failed (see $name.txt)"
         return
     }
     $per = foreach ($l in $lines) {
-        if ($l -match 'Running (\S+)') { $prog = $Matches[1] }
+        if ($l -match '^\s+(Running|Doc-tests) (\S+)') { $prog = $Matches[2]; $open = $true; $rerun = '' }
         elseif ($l -match '^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored') {
             $p += [int]$Matches[1]; $f += [int]$Matches[2]; $i += [int]$Matches[3]
+            $open = $false
             "${prog}: $l"
         }
+        elseif ($open -and $l -match '^error: test failed, to rerun pass (.+)$') { $rerun = $Matches[1] }
+        elseif ($open -and $l -match 'process didn''t exit successfully: (.*)$') {
+            # The end of the line says why, as "(exit code: 0xc00000fd, STATUS_STACK_OVERFLOW)".
+            $why = $Matches[1]
+            if ($why -match '\(([^()]*)\)\s*$') { $why = $Matches[1] }
+            $open = $false
+            $crash = "${prog} ${rerun}: crashed without a test result ($why)"
+            $crashed += $crash
+            $crash
+        }
+    }
+    $f += $crashed.Count
+    if ($status -ne 0 -and $f -eq 0) {
+        $f = 1
+        $noFailure = "${name}: cargo exit status $status but no failed test in the log, counted as 1 failed (see $name.txt)"
     }
     $per | Set-Content -Path (Join-Path $Out "$name-summary.txt")
-    $lines | Where-Object { $_ -match '^test .* FAILED$' } | Sort-Object -Unique | Set-Content -Path (Join-Path $Out "$name-failed.txt")
+    @($lines | Where-Object { $_ -match '^test .* FAILED$' } | Sort-Object -Unique) + $crashed | Set-Content -Path (Join-Path $Out "$name-failed.txt")
     Note "${name}: passed $p, failed $f, ignored $i"
+    foreach ($crash in $crashed) { Note "${name}: $crash, counted as 1 failed" }
+    if ($noFailure) { Note $noFailure }
 }
 
 Step 'test suite, default features (several minutes)'

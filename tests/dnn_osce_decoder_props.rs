@@ -255,10 +255,12 @@ fn ms_packet(p: &[u8]) -> Vec<u8> {
 /// Decode calls with NoLACE, BWE and deep PLC run on a thread with a
 /// 64 KB stack in a release build (256 KB in a debug build): SILK
 /// wideband, Hybrid and the switch to CELT-only, mono and stereo, with
-/// losses.
+/// losses. On Windows the thread gets more, so that the decoder can use
+/// that much (see `thread_stack_size`).
 #[test]
 fn decoding_with_osce_fits_a_small_stack() {
-    let stack = if cfg!(debug_assertions) { 256 * 1024 } else { 64 * 1024 };
+    let claim = if cfg!(debug_assertions) { 256 * 1024 } else { 64 * 1024 };
+    let stack = dnn_plc_common::thread_stack_size(claim);
     let kinds = [Kind::SilkWb, Kind::SilkWb10, Kind::Hybrid, Kind::SilkCelt];
     let cases: Vec<(usize, Vec<Vec<u8>>)> = kinds.iter().flat_map(|&k| [1, 2].map(|c| (c, packets(k, c)))).collect();
     let mut decoders: Vec<OpusDecoder> = cases.iter().map(|(channels, _)| decoder(48000, *channels, 10, true)).collect();

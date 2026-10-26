@@ -636,6 +636,15 @@ mod tests {
     /// macOS). Elsewhere the thread gets 64 KB: with 32 KB the test
     /// overflowed its stack on Android 14 (HONOR CLK-AN00, NDK 27) and on
     /// x86-64.
+    ///
+    /// On Windows a thread cannot use all of its stack. Rust's standard
+    /// library asks Windows to keep 20 KB of each thread's stack for its
+    /// stack overflow handler (`SetThreadStackGuarantee`), and the end of
+    /// the stack holds guard pages. A thread built with 64 KB can use only
+    /// about 36 KB there (measured on Windows 11, x86-64). So on Windows
+    /// the thread gets 32 KB more, and the code can still use 64 KB.
+    /// The tests in `tests/` do the same with `thread_stack_size`.
+    ///
     /// Debug builds need more, so the test runs only in optimized builds.
     #[cfg(all(feature = "osce-bwe", not(debug_assertions)))]
     #[test]
@@ -643,8 +652,11 @@ mod tests {
         let models = OsceModels::builtin(crate::dnn::arch::detect());
         let mut ch = std::boxed::Box::new(OsceChannel::new());
         let mut bwe = std::boxed::Box::new(OsceBweChannel::new());
+        let apple_arm = cfg!(all(target_arch = "aarch64", target_vendor = "apple"));
+        let usable = if apple_arm { 32 * 1024 } else { 64 * 1024 };
+        let windows_reserve = if cfg!(windows) { 32 * 1024 } else { 0 };
         std::thread::Builder::new()
-            .stack_size(if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) { 32 } else { 64 } * 1024)
+            .stack_size(usable + windows_reserve)
             .spawn(move || {
                 for method in [OsceMethod::Nolace, OsceMethod::Lace] {
                     osce_reset(&mut ch, method);
