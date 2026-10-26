@@ -184,10 +184,12 @@ fn ms_packet(p: &[u8]) -> Vec<u8> {
 /// Each decode call with deep PLC runs on a thread with a 64 KB stack in a
 /// release build (256 KB in a debug build): the first lost frame of SILK
 /// wideband and of CELT, mono and stereo, which analyses the whole history
-/// and starts FARGAN.
+/// and starts FARGAN. On Windows the thread gets more, so that the decoder
+/// can use that much (see `thread_stack_size`).
 #[test]
 fn decoding_with_deep_plc_fits_a_small_stack() {
-    let stack = if cfg!(debug_assertions) { 256 * 1024 } else { 64 * 1024 };
+    let claim = if cfg!(debug_assertions) { 256 * 1024 } else { 64 * 1024 };
+    let stack = dnn_plc_common::thread_stack_size(claim);
     let cases: Vec<(ForcedMode, usize, Vec<Vec<u8>>)> =
         MODES.iter().flat_map(|&m| [1, 2].map(|c| (m, c, packets(m, c)))).collect();
     let mut decoders: Vec<OpusDecoder> = cases
