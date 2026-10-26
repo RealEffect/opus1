@@ -135,15 +135,12 @@ fn silk_a2nlsf_eval_table(
 mod a2nlsf_x86 {
     use super::{A2NLSF_COS_Q16, A2NLSF_TABLE_LEN};
     use crate::silk::define::MAX_LPC_ORDER;
+    use crate::simd_mem::x86::{load_i32x4, load_i32x8, store_i32x4, store_i32x8};
     use core::arch::x86_64::*;
 
     /// Same result as `silk_a2nlsf_eval_table_scalar`, with AVX2.
-    ///
-    /// # Safety
-    ///
-    /// The processor must have AVX2.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn eval_table_avx2(
+    pub(super) fn eval_table_avx2(
         y: &mut [i32; A2NLSF_TABLE_LEN],
         p: &[i32; MAX_LPC_ORDER / 2 + 1],
         dd: usize,
@@ -154,31 +151,22 @@ mod a2nlsf_x86 {
         for &coefficient in p[..dd].iter().rev() {
             let c = _mm256_set1_epi32(coefficient);
             for (y_block, x_block) in y_blocks.iter_mut().zip(x_blocks) {
-                // SAFETY: both arrays have 8 elements, the 32 bytes that
-                // the loads read and the store writes; they need no
-                // alignment.
-                unsafe {
-                    let y = _mm256_loadu_si256(y_block.as_ptr().cast());
-                    let x = _mm256_loadu_si256(x_block.as_ptr().cast());
-                    let even = _mm256_srli_epi64::<16>(_mm256_mul_epi32(y, x));
-                    let odd = _mm256_slli_epi64::<16>(_mm256_mul_epi32(
-                        _mm256_srli_epi64::<32>(y),
-                        _mm256_srli_epi64::<32>(x),
-                    ));
-                    let product = _mm256_blend_epi32::<0b1010_1010>(even, odd);
-                    _mm256_storeu_si256(y_block.as_mut_ptr().cast(), _mm256_add_epi32(c, product));
-                }
+                let y = load_i32x8(y_block);
+                let x = load_i32x8(x_block);
+                let even = _mm256_srli_epi64::<16>(_mm256_mul_epi32(y, x));
+                let odd = _mm256_slli_epi64::<16>(_mm256_mul_epi32(
+                    _mm256_srli_epi64::<32>(y),
+                    _mm256_srli_epi64::<32>(x),
+                ));
+                let product = _mm256_blend_epi32::<0b1010_1010>(even, odd);
+                store_i32x8(y_block, _mm256_add_epi32(c, product));
             }
         }
     }
 
     /// Same result as `silk_a2nlsf_eval_table_scalar`, with SSE4.1.
-    ///
-    /// # Safety
-    ///
-    /// The processor must have SSE4.1.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn eval_table_sse41(
+    pub(super) fn eval_table_sse41(
         y: &mut [i32; A2NLSF_TABLE_LEN],
         p: &[i32; MAX_LPC_ORDER / 2 + 1],
         dd: usize,
@@ -189,20 +177,15 @@ mod a2nlsf_x86 {
         for &coefficient in p[..dd].iter().rev() {
             let c = _mm_set1_epi32(coefficient);
             for (y_block, x_block) in y_blocks.iter_mut().zip(x_blocks) {
-                // SAFETY: both arrays have 4 elements, the 16 bytes that
-                // the loads read and the store writes; they need no
-                // alignment.
-                unsafe {
-                    let y = _mm_loadu_si128(y_block.as_ptr().cast());
-                    let x = _mm_loadu_si128(x_block.as_ptr().cast());
-                    let even = _mm_srli_epi64::<16>(_mm_mul_epi32(y, x));
-                    let odd = _mm_slli_epi64::<16>(_mm_mul_epi32(
-                        _mm_srli_epi64::<32>(y),
-                        _mm_srli_epi64::<32>(x),
-                    ));
-                    let product = _mm_blend_epi16::<0b1100_1100>(even, odd);
-                    _mm_storeu_si128(y_block.as_mut_ptr().cast(), _mm_add_epi32(c, product));
-                }
+                let y = load_i32x4(y_block);
+                let x = load_i32x4(x_block);
+                let even = _mm_srli_epi64::<16>(_mm_mul_epi32(y, x));
+                let odd = _mm_slli_epi64::<16>(_mm_mul_epi32(
+                    _mm_srli_epi64::<32>(y),
+                    _mm_srli_epi64::<32>(x),
+                ));
+                let product = _mm_blend_epi16::<0b1100_1100>(even, odd);
+                store_i32x4(y_block, _mm_add_epi32(c, product));
             }
         }
     }
@@ -212,6 +195,7 @@ mod a2nlsf_x86 {
 mod a2nlsf_neon {
     use super::{A2NLSF_BLOCK, A2NLSF_COS_Q16, A2NLSF_TABLE_LEN};
     use crate::silk::define::MAX_LPC_ORDER;
+    use crate::simd_mem::neon::{load_i32x4, store_i32x4};
     use core::arch::aarch64::*;
 
     /// One step of Horner's rule in four lanes: `c + ((y * x) >> 16)`,
@@ -245,14 +229,9 @@ mod a2nlsf_neon {
         let (y_blocks, _) = y.as_chunks_mut::<A2NLSF_BLOCK>();
         let (x_blocks, _) = A2NLSF_COS_Q16.as_chunks::<A2NLSF_BLOCK>();
         for (y_block, x_block) in y_blocks.iter_mut().zip(x_blocks) {
-            // SAFETY: `x_block` is a `[i32; 8]`. The two loads read its
-            // elements 0 to 3 and 4 to 7.
-            let (x0, x1) = unsafe {
-                (
-                    vld1q_s32(x_block.as_ptr()),
-                    vld1q_s32(x_block.as_ptr().add(4)),
-                )
-            };
+            // Elements 0 to 3 and 4 to 7 of the block.
+            let (x_halves, _) = x_block.as_chunks::<4>();
+            let (x0, x1) = (load_i32x4(&x_halves[0]), load_i32x4(&x_halves[1]));
             let mut y0 = top;
             let mut y1 = top;
             for &coefficient in p_wide[..dd].iter().rev() {
@@ -260,12 +239,9 @@ mod a2nlsf_neon {
                 y0 = step(c_wide, y0, x0);
                 y1 = step(c_wide, y1, x1);
             }
-            // SAFETY: `y_block` is a `[i32; 8]`. The two stores write its
-            // elements 0 to 3 and 4 to 7.
-            unsafe {
-                vst1q_s32(y_block.as_mut_ptr(), y0);
-                vst1q_s32(y_block.as_mut_ptr().add(4), y1);
-            }
+            let (y_halves, _) = y_block.as_chunks_mut::<4>();
+            store_i32x4(&mut y_halves[0], y0);
+            store_i32x4(&mut y_halves[1], y1);
         }
     }
 }

@@ -288,19 +288,17 @@ fn short_prediction_products_neon(
     window: &[i32; MAX_LPC_ORDER],
     reversed_q27: &[i32; MAX_LPC_ORDER],
 ) -> core::arch::aarch64::int32x4_t {
+    use crate::simd_mem::neon::load_i32x4;
     use core::arch::aarch64::*;
 
-    // SAFETY: each load reads 4 elements at offset 0, 4, 8 or 12 of a
-    // 16-element array, so it stays inside the array.
-    unsafe {
-        let w = window.as_ptr();
-        let c = reversed_q27.as_ptr();
-        let t0 = vqdmulhq_s32(vld1q_s32(w), vld1q_s32(c));
-        let t1 = vqdmulhq_s32(vld1q_s32(w.add(4)), vld1q_s32(c.add(4)));
-        let t2 = vqdmulhq_s32(vld1q_s32(w.add(8)), vld1q_s32(c.add(8)));
-        let t3 = vqdmulhq_s32(vld1q_s32(w.add(12)), vld1q_s32(c.add(12)));
-        vaddq_s32(vaddq_s32(t0, t1), vaddq_s32(t2, t3))
-    }
+    // The 4 values from position `i` on.
+    let w = |i: usize| load_i32x4(window[i..i + 4].try_into().unwrap());
+    let c = |i: usize| load_i32x4(reversed_q27[i..i + 4].try_into().unwrap());
+    let t0 = vqdmulhq_s32(w(0), c(0));
+    let t1 = vqdmulhq_s32(w(4), c(4));
+    let t2 = vqdmulhq_s32(w(8), c(8));
+    let t3 = vqdmulhq_s32(w(12), c(12));
+    vaddq_s32(vaddq_s32(t0, t1), vaddq_s32(t2, t3))
 }
 
 /// NEON short-term prediction, as libopus
@@ -1110,6 +1108,8 @@ fn store_if<T: Copy>(buf: &mut [T], idx: isize, ok: bool, spare: &mut T, value: 
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::*;
+    // `load` and `store` read and write one row of four `i32` values.
+    use crate::simd_mem::neon::{load_i32x4 as load, load_u8x16, load_u32x4, store_i32x4 as store};
     use core::arch::aarch64::*;
 
     /// `LANE_MASK[k]` has all bits of lane `k` set. Entry 4 selects no lane.
@@ -1164,20 +1164,6 @@ mod neon {
     #[inline]
     fn from_packed<const N: usize>(p: PerState<N>) -> int32x4_t {
         vcombine_s32(vcreate_s32(p.0 as u64), vcreate_s32((p.0 >> 64) as u64))
-    }
-
-    #[target_feature(enable = "neon")]
-    #[inline]
-    fn load(row: &[i32; 4]) -> int32x4_t {
-        // SAFETY: reads the 4 elements of the array.
-        unsafe { vld1q_s32(row.as_ptr()) }
-    }
-
-    #[target_feature(enable = "neon")]
-    #[inline]
-    fn store(row: &mut [i32; 4], v: int32x4_t) {
-        // SAFETY: writes the 4 elements of the array.
-        unsafe { vst1q_s32(row.as_mut_ptr(), v) }
     }
 
     /// `-v` in the lanes where `negative` is all ones, `v` elsewhere.
@@ -1555,8 +1541,7 @@ mod neon {
         #[target_feature(enable = "neon")]
         #[inline]
         pub(super) fn keep(diff_q14: int32x4_t) -> Self {
-            // SAFETY: each load reads the 16 bytes of a table.
-            let identity = unsafe { vld1q_u8(IDENTITY.as_ptr()) };
+            let identity = load_u8x16(&IDENTITY);
             Self {
                 diff_first: diff_q14,
                 diff_second: diff_q14,
@@ -1807,11 +1792,11 @@ mod neon {
                 second[best] = diff_q14[dst];
                 let mut mask = [0u32; 4];
                 mask[dst] = !0;
-                last.replaced = vld1q_u32(mask.as_ptr());
-                last.from_best = vld1q_u8(BROADCAST[best].as_ptr());
+                last.replaced = load_u32x4(&mask);
+                last.from_best = load_u8x16(&BROADCAST[best]);
                 let mut table = IDENTITY;
                 table[4 * dst..4 * dst + 4].copy_from_slice(&BROADCAST[best][..4]);
-                last.perm = vld1q_u8(table.as_ptr());
+                last.perm = load_u8x16(&table);
             }
             last.diff_second = load(&second);
             let n_ar = if both {
@@ -1965,8 +1950,7 @@ mod neon {
         // that tells the filter which state each state continues.
         let shaping_coefs = ShapingCoefs::new(setup.ar_shp_q13, p.warping_q16, keep_coef_lanes(N));
         let mut shaping_rows = load_shaping_rows(states);
-        // SAFETY: reads the 16 bytes of the table.
-        let identity = unsafe { vld1q_u8(IDENTITY.as_ptr()) };
+        let identity = load_u8x16(&IDENTITY);
         let mut perm = identity;
 
         // A store that has no place to go goes to one of these. The compiler
@@ -2081,13 +2065,10 @@ mod neon {
             // state and `from_best` reads the lane of the best state.
             copy_history(states, delay_lines, &mut spare_lpc, &sv, idx);
             let replaced_lane = select(sv.replace, sv.rd_max_ind, 4);
-            // SAFETY: each load reads one whole 16-byte entry of a table.
-            let (replaced, from_best) = unsafe {
-                (
-                    vld1q_u32(LANE_MASK[replaced_lane].as_ptr()),
-                    vld1q_u8(BROADCAST[sv.rd_min_ind].as_ptr()),
-                )
-            };
+            let (replaced, from_best) = (
+                load_u32x4(&LANE_MASK[replaced_lane]),
+                load_u8x16(&BROADCAST[sv.rd_min_ind]),
+            );
             let take = |first: int32x4_t, second: int32x4_t| {
                 let second = vqtbl1q_u8(vreinterpretq_u8_s32(second), from_best);
                 vbslq_s32(replaced, vreinterpretq_s32_u8(second), first)
@@ -2224,9 +2205,18 @@ mod neon {
 /// callers; a call per sample would cost more than the function saves. They
 /// are `unsafe` because they need the target features of the loop that
 /// inlines them.
+///
+/// The intrinsics in the bodies of these `unsafe fn` are not wrapped in
+/// `unsafe` blocks of their own: what makes each call sound is the
+/// contract of the function, that the processor has SSE4.1. This module is
+/// the only place of the library that allows `unsafe_op_in_unsafe_fn`.
 #[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
 mod x86 {
     use super::*;
+    // `load` and `store` read and write one row of four `i32` values,
+    // `load_table` a byte table for `_mm_shuffle_epi8`.
+    use crate::simd_mem::x86::{load_i32x4 as load, load_u8x16 as load_table, store_i32x4 as store};
     use core::arch::x86_64::*;
 
     /// `LANE_MASK[k]` has all bits of lane `k` set. Entry 4 selects no lane.
@@ -2302,30 +2292,6 @@ mod x86 {
             r += 1;
         }
         tables
-    }
-
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    fn load(row: &[i32; 4]) -> __m128i {
-        // SAFETY: reads the 16 bytes of the array; the load needs no
-        // alignment.
-        unsafe { _mm_loadu_si128(row.as_ptr().cast()) }
-    }
-
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    fn load_table(table: &[u8; 16]) -> __m128i {
-        // SAFETY: reads the 16 bytes of the array; the load needs no
-        // alignment.
-        unsafe { _mm_loadu_si128(table.as_ptr().cast()) }
-    }
-
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    fn store(row: &mut [i32; 4], v: __m128i) {
-        // SAFETY: writes the 16 bytes of the array; the store needs no
-        // alignment.
-        unsafe { _mm_storeu_si128(row.as_mut_ptr().cast(), v) }
     }
 
     /// The first `N` lanes of `v`.
@@ -3135,6 +3101,8 @@ mod x86 {
     /// rows keep their layout, one state per 32-bit lane.
     mod wide {
         use super::*;
+        // `load8` reads one table of eight `i32` values.
+        use crate::simd_mem::x86::load_i32x8 as load8;
 
         /// `WIDEN[r][b]` is the index table for `_mm256_permutevar8x32_epi32`
         /// that reads a row through `PERM[r][b]` into the layout of this
@@ -3164,14 +3132,6 @@ mod x86 {
                 r += 1;
             }
             tables
-        }
-
-        #[target_feature(enable = "avx2")]
-        #[inline]
-        fn load8(table: &[i32; 8]) -> __m256i {
-            // SAFETY: reads the 32 bytes of the array; the load needs no
-            // alignment.
-            unsafe { _mm256_loadu_si256(table.as_ptr().cast()) }
         }
 
         /// `row`, one state per 32-bit lane, in the layout of this module,
@@ -3539,12 +3499,8 @@ mod x86 {
     /// on x86-64 with SSE4.1. Same results as `quantize_subframe`.
     ///
     /// `ORDER` is the shaping order when it is known at compile time, or 0.
-    ///
-    /// # Safety
-    ///
-    /// The processor must have SSE4.1.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn quantize_subframe_sse41<const N: usize, const ORDER: usize>(
+    pub(super) fn quantize_subframe_sse41<const N: usize, const ORDER: usize>(
         nsq: &mut SilkNSQState,
         states: &mut [PathState; N],
         delay_lines: &mut DelayLines,
@@ -3555,8 +3511,8 @@ mod x86 {
         smpl_buf_idx: &mut i32,
         p: &SubframeParams,
     ) {
-        // SAFETY: the caller guarantees SSE4.1, all that `WIDE == false`
-        // needs.
+        // SAFETY: the processor has SSE4.1, the feature of this function,
+        // and that is all `WIDE == false` needs.
         unsafe {
             quantize_subframe_x86::<N, ORDER, false>(
                 nsq,
@@ -3577,12 +3533,8 @@ mod x86 {
     /// registers (`wide`). Every other step uses the same instructions in the
     /// VEX encoding, which has a separate destination register and so needs
     /// fewer copies between registers.
-    ///
-    /// # Safety
-    ///
-    /// The processor must have AVX2.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn quantize_subframe_avx2<const N: usize, const ORDER: usize>(
+    pub(super) fn quantize_subframe_avx2<const N: usize, const ORDER: usize>(
         nsq: &mut SilkNSQState,
         states: &mut [PathState; N],
         delay_lines: &mut DelayLines,
@@ -3593,7 +3545,8 @@ mod x86 {
         smpl_buf_idx: &mut i32,
         p: &SubframeParams,
     ) {
-        // SAFETY: the caller guarantees AVX2, which includes SSE4.1.
+        // SAFETY: the processor has AVX2, the feature of this function,
+        // which includes SSE4.1.
         unsafe {
             quantize_subframe_x86::<N, ORDER, true>(
                 nsq,

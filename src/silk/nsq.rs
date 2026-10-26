@@ -72,13 +72,9 @@ pub fn silk_nsq(
 /// default x86-64 target has no 32-bit and no 32x32-to-64-bit vector
 /// multiplication, which fixed-point code needs; AVX2 has both. The results
 /// are the same bits.
-///
-/// # Safety
-///
-/// The processor must have AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn nsq_avx2(
+fn nsq_avx2(
     ps_enc_c: &SilkEncoderStateCommon,
     nsq: &mut SilkNSQState,
     ps_indices: &SideInfoIndices,
@@ -440,16 +436,17 @@ fn short_prediction_neon(
     a0: i16,
     newest: i32,
 ) -> i32 {
+    use crate::simd_mem::neon::load_i32x4;
     use core::arch::aarch64::*;
-    // SAFETY: NEON is part of the aarch64 baseline. The loads read 4
-    // elements at offset 0, 4, 8 and 11 of the 16-element window and the 4
-    // elements of each coefficient row.
+    // Window positions 0 to 3, 4 to 7 and 8 to 11, then 11 to 14.
+    let (w, _) = window.as_chunks::<4>();
+    // SAFETY: NEON is part of the aarch64 baseline.
     let sum = unsafe {
-        let w = window.as_ptr();
-        let t0 = vqdmulhq_s32(vld1q_s32(w), vld1q_s32(c.older[0].as_ptr()));
-        let t1 = vqdmulhq_s32(vld1q_s32(w.add(4)), vld1q_s32(c.older[1].as_ptr()));
-        let t2 = vqdmulhq_s32(vld1q_s32(w.add(8)), vld1q_s32(c.older[2].as_ptr()));
-        let t3 = vqdmulhq_s32(vld1q_s32(w.add(11)), vld1q_s32(c.older[3].as_ptr()));
+        let t0 = vqdmulhq_s32(load_i32x4(&w[0]), load_i32x4(&c.older[0]));
+        let t1 = vqdmulhq_s32(load_i32x4(&w[1]), load_i32x4(&c.older[1]));
+        let t2 = vqdmulhq_s32(load_i32x4(&w[2]), load_i32x4(&c.older[2]));
+        let last = window[11..15].try_into().unwrap();
+        let t3 = vqdmulhq_s32(load_i32x4(last), load_i32x4(&c.older[3]));
         vaddvq_s32(vaddq_s32(vaddq_s32(t0, t1), vaddq_s32(t2, t3)))
     };
     silk_smlawb(bias.wrapping_add(sum), newest, a0 as i32)
@@ -484,7 +481,7 @@ impl FeedbackNeon {
     /// `state` and `coef` have the same length, the shaping order, at most
     /// `FEEDBACK_NEON_MAX_ORDER`.
     fn new(state: &[i32], coef: &[i16]) -> Self {
-        use core::arch::aarch64::*;
+        use crate::simd_mem::neon::load_i32x4;
         let order = coef.len().min(FEEDBACK_NEON_MAX_ORDER);
         debug_assert_eq!(state.len(), coef.len());
         debug_assert!(coef.len() <= FEEDBACK_NEON_MAX_ORDER);
@@ -496,9 +493,9 @@ impl FeedbackNeon {
                 *dst = smulwb_operand(coef[j + 1]);
             }
         }
-        // SAFETY: NEON is part of the aarch64 baseline; each load reads 4
-        // elements of the 16-element array.
-        let state = unsafe { core::array::from_fn(|v| vld1q_s32(lanes.as_ptr().add(4 * v))) };
+        let (rows, _) = lanes.as_chunks::<4>();
+        // SAFETY: NEON is part of the aarch64 baseline.
+        let state = unsafe { core::array::from_fn(|v| load_i32x4(&rows[v])) };
         Self {
             state,
             coef: c,
@@ -511,16 +508,16 @@ impl FeedbackNeon {
     /// same new state.
     #[inline(always)]
     fn step(&mut self, newest: i32) -> i32 {
+        use crate::simd_mem::neon::load_i32x4;
         use core::arch::aarch64::*;
         let s = &mut self.state;
-        // SAFETY: NEON is part of the aarch64 baseline; each load reads one
-        // 4-element row.
+        // SAFETY: NEON is part of the aarch64 baseline.
         let sum = unsafe {
             let c = &self.coef;
-            let t0 = vqdmulhq_s32(s[0], vld1q_s32(c[0].as_ptr()));
-            let t1 = vqdmulhq_s32(s[1], vld1q_s32(c[1].as_ptr()));
-            let t2 = vqdmulhq_s32(s[2], vld1q_s32(c[2].as_ptr()));
-            let t3 = vqdmulhq_s32(s[3], vld1q_s32(c[3].as_ptr()));
+            let t0 = vqdmulhq_s32(s[0], load_i32x4(&c[0]));
+            let t1 = vqdmulhq_s32(s[1], load_i32x4(&c[1]));
+            let t2 = vqdmulhq_s32(s[2], load_i32x4(&c[2]));
+            let t3 = vqdmulhq_s32(s[3], load_i32x4(&c[3]));
             vaddvq_s32(vaddq_s32(vaddq_s32(t0, t1), vaddq_s32(t2, t3)))
         };
         // Every entry moves up by one place and `newest` enters at place 0.
@@ -536,12 +533,12 @@ impl FeedbackNeon {
 
     /// Writes the state back; `state` has the length of the order.
     fn store(&self, state: &mut [i32]) {
-        use core::arch::aarch64::*;
+        use crate::simd_mem::neon::store_i32x4;
         let mut lanes = [0i32; FEEDBACK_NEON_MAX_ORDER];
-        for (v, &row) in self.state.iter().enumerate() {
-            // SAFETY: NEON is part of the aarch64 baseline; each store
-            // writes 4 elements of the 16-element array.
-            unsafe { vst1q_s32(lanes.as_mut_ptr().add(4 * v), row) };
+        let (rows, _) = lanes.as_chunks_mut::<4>();
+        for (dst, &row) in rows.iter_mut().zip(&self.state) {
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe { store_i32x4(dst, row) };
         }
         let order = state.len().min(FEEDBACK_NEON_MAX_ORDER);
         state[..order].copy_from_slice(&lanes[..order]);
@@ -559,6 +556,7 @@ impl FeedbackNeon {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::*;
+    use crate::simd_mem::x86::{load_i32x4, store_i32x4};
     use core::arch::x86_64::*;
 
     /// Shaping orders up to this one keep the feedback state in registers
@@ -571,20 +569,6 @@ mod x86 {
     /// by one lane (positions 11 and 13). Positions 10 and 11 are in two
     /// loads each.
     const OFFSETS: [usize; 7] = [0, 1, 4, 5, 8, 9, 10];
-
-    #[inline(always)]
-    fn load(row: &[i32; 4]) -> __m128i {
-        // SAFETY: SSE2 is part of the x86-64 baseline. The load reads the
-        // 16 bytes of the array and needs no alignment.
-        unsafe { _mm_loadu_si128(row.as_ptr().cast()) }
-    }
-
-    #[inline(always)]
-    fn store(row: &mut [i32; 4], v: __m128i) {
-        // SAFETY: SSE2 is part of the x86-64 baseline. The store writes the
-        // 16 bytes of the array and needs no alignment.
-        unsafe { _mm_storeu_si128(row.as_mut_ptr().cast(), v) }
-    }
 
     /// The coefficients of `short_prediction` in the form it reads,
     /// prepared once per subframe.
@@ -634,11 +618,11 @@ mod x86 {
         let mut sum = _mm_setzero_si128();
         let mut last = sum;
         for (row, &offset) in c.older.iter().zip(&OFFSETS) {
-            last = load(window[offset..offset + 4].try_into().unwrap());
-            sum = _mm_add_epi32(sum, _mm_mul_epi32(last, load(row)));
+            last = load_i32x4(window[offset..offset + 4].try_into().unwrap());
+            sum = _mm_add_epi32(sum, _mm_mul_epi32(last, load_i32x4(row)));
         }
         let shifted = _mm_srli_epi64::<32>(last);
-        sum = _mm_add_epi32(sum, _mm_mul_epi32(shifted, load(&c.older[7])));
+        sum = _mm_add_epi32(sum, _mm_mul_epi32(shifted, load_i32x4(&c.older[7])));
         // Lane 1 plus lane 3.
         let sum = _mm_add_epi32(sum, _mm_unpackhi_epi64(sum, sum));
         let older = _mm_extract_epi32::<1>(sum);
@@ -693,7 +677,8 @@ mod x86 {
                 odd[v] = [o1, o1, o3, o3];
             }
             Self {
-                state: lanes.map(|row| load(&row)),
+                // SAFETY: SSE2 is part of the x86-64 baseline.
+                state: unsafe { lanes.map(|row| load_i32x4(&row)) },
                 even,
                 odd,
                 coef0: coef.first().copied().unwrap_or(0),
@@ -709,8 +694,8 @@ mod x86 {
             let s = &mut self.state;
             let mut sum = _mm_setzero_si128();
             for v in 0..4 {
-                let even = _mm_mul_epi32(s[v], load(&self.even[v]));
-                let odd = _mm_mul_epi32(_mm_srli_epi64::<32>(s[v]), load(&self.odd[v]));
+                let even = _mm_mul_epi32(s[v], load_i32x4(&self.even[v]));
+                let odd = _mm_mul_epi32(_mm_srli_epi64::<32>(s[v]), load_i32x4(&self.odd[v]));
                 sum = _mm_add_epi32(sum, _mm_add_epi32(even, odd));
             }
             // Lane 1 plus lane 3.
@@ -729,7 +714,8 @@ mod x86 {
         pub(super) fn store(&self, state: &mut [i32]) {
             let mut lanes = [[0i32; 4]; 4];
             for (row, &v) in lanes.iter_mut().zip(&self.state) {
-                store(row, v);
+                // SAFETY: SSE2 is part of the x86-64 baseline.
+                unsafe { store_i32x4(row, v) };
             }
             let order = state.len().min(FEEDBACK_MAX_ORDER);
             state[..order].copy_from_slice(&lanes.as_flattened()[..order]);
@@ -738,14 +724,11 @@ mod x86 {
 
     /// The sample loop of `silk_noise_shape_quantizer` with the vector
     /// kernels, one copy for each combination of long-term prediction and
-    /// harmonic shaping (`quantize_subframe_cases`). The shaping order must
-    /// be at most `FEEDBACK_MAX_ORDER`.
+    /// harmonic shaping (`quantize_subframe_cases`).
     ///
-    /// # Safety
-    ///
-    /// The processor must have SSE4.1.
+    /// Panics when the shaping order exceeds `FEEDBACK_MAX_ORDER`.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn quantize_subframe_sse41(
+    pub(super) fn quantize_subframe_sse41(
         nsq: &mut SilkNSQState,
         x_sc_q10: &[i32],
         pulses: &mut [i8],
