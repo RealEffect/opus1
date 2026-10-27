@@ -18,7 +18,7 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 - **Pure Rust** — no C dependencies
 - **High performance:** on Apple M4 Pro, decoding takes 0.56-0.81x and encoding 0.48-0.71x the time of C libopus 1.6.1 built at `-O2`, the optimization level of libopus's own build, at every complexity, with the speech and music analysis in both from complexity 7 on. Against the Homebrew build of libopus 1.6.1, which behaves like a build at `-Os` and takes about 24 % more time to encode and 12 % more to decode, the ranges are 0.49-0.76x and 0.37-0.63x. opus1 is also faster than libopus on the big and the small cores of an Android phone, and on average over the bench set on an Intel Core i7-12700 (x86-64) (see [Performance](#performance))
 - **Multichannel:** multistream encoder and decoder (mapping families 0, 1, 2 and 255), interoperable with libopus
-- **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels, signal type, input bit depth, DTX, frame duration from 2.5 to 120 ms)
+- **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels, signal type, input bit depth, DTX, frame duration from 2.5 to 120 ms), with one exception: a forced stereo count on a mono encoder is kept, with no effect, where libopus refuses it
 - **Packets:** the `packet` module parses, writes and pads packets and has libopus's repacketizer. The `extensions` module reads and writes the padding extensions of libopus 1.5 and later
 - **64-bit ARM and x86-64:** on 64-bit ARM the output is checked bit for bit against libopus 1.6.1. On x86-64 it is correct but not bit-exact with libopus: opus1's x86 vector kernels do not follow libopus's, and libopus's own x86 output depends on the C compiler (see [docs/guide/10](docs/guide/10-differences-from-libopus.md#platforms))
 - **The speech and music analysis of libopus:** from complexity 7 on, the encoder estimates whether the input is speech or music and which bandwidth it uses, as libopus does, with the same results to the last bit on 64-bit ARM. CELT-only packets at complexity 7 to 10 are libopus's byte for byte
@@ -34,7 +34,8 @@ use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate
 
 // Encode. Without `set_bitrate` the encoder uses libopus's automatic
 // bitrate (`Bitrate::Auto`, 19 kb/s for 16 kHz mono in 20 ms frames).
-// Each setter refuses what libopus refuses, for example a complexity of 11.
+// The setters refuse what libopus refuses, for example a complexity of 11
+// (the one exception is in the documentation of `set_force_channels`).
 let mut encoder = OpusEncoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip).unwrap();
 encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(16000).unwrap()));
 encoder.set_vbr(false); // constant bitrate: every packet has 40 bytes
@@ -211,7 +212,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   first codec (see the `init` documentation). The test suite of this build
   needs big test-thread stacks: `scripts/check_no_std.sh` sets
   `RUST_MIN_STACK=33554432` (32 MiB).
-- **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
+- **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2,+fma"` to enable it (AVX2 includes AVX and SSE4.1; FMA is separate). aarch64 NEON is unconditional.
 - **Frames are capped** at the RFC 6716 maximum of 1275 bytes (the heap-free range-coder buffer is sized accordingly). A packet of 40 to 120 ms holds up to six such frames.
 - **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target; with `portable-atomic`, also `thumbv6m-none-eabi` (Cortex-M0/M0+). Check with `scripts/check_no_std.sh`.
 
@@ -495,6 +496,9 @@ added since 0.1.37 is under New features)
 - SILK: VBR ignored the bitrate (issue #43); CBR with in-band FEC turned
   packets into concealed frames (issue #51); 12 kHz (mediumband) packets
   decoded to noise (issue #53); 10 ms SILK and Hybrid frames decoded to noise.
+- CELT from 24 kHz input: a cancelled pitch pre-filter now fades out over the
+  overlap as in libopus, which raises the SNR on the issue's chirp from about
+  20 dB to 29-42 dB (issue #54).
 - Closer to libopus on 64-bit ARM: the CELT encoder writes libopus's packets in
   all 1,080,000 packets of the 960 streams of `celtenc_gap_report` (up from
   91.2 %), and the CELT decoder gives libopus's samples in 51 of 51 CELT
@@ -525,7 +529,7 @@ now runs libopus's stereo pitch pre-filter and `theta_rdo`.
   differences and their sizes.
 - x86-64 gives correct output but is not bit-exact with libopus. opus1's x86
   vector kernels do not follow libopus's x86 kernels, and libopus's own x86
-  output depends on the C compiler. About 40 tests that require libopus's bits
+  output depends on the C compiler. 54 tests that require libopus's bits
   are ignored on targets other than 64-bit ARM. x86-64 was run on an Intel
   Core i7-12700 (AVX2, FMA and AVX-VNNI), under Linux in WSL2 and natively on
   Windows ([docs/guide/10](docs/guide/10-differences-from-libopus.md#platforms)).
@@ -571,19 +575,6 @@ now runs libopus's stereo pitch pre-filter and `theta_rdo`.
 
 ### 0.1.37 (earlier changes)
 
-- **Fix: CELT from 24 kHz input stuck at ~20 dB SNR (issue #54).** When
-  `run_prefilter` cancelled the pitch pre-filter for a frame (libopus 1.6's
-  `cancel_pitch`), it restored the unfiltered input over the whole frame.
-  libopus still fades the previous frame's comb filter out over the overlap
-  (celt_encoder.c:1572-1584), and the decoder's post-filter always applies
-  that fade. So every cancel right after an "on" frame left 120 samples the
-  decoder post-filtered but the encoder never pre-filtered. From 24 kHz the
-  zero-stuffed input is dominated by its image above 12 kHz, so the filter
-  was cancelled whenever the pitch period was odd, in 18 of 66 frames on the
-  issue's chirp. The SNR was 20.1 / 20.9 / 21.1 dB at 32 / 64 / 128 kbps and
-  is now 29.4 / 36.2 / 41.9 dB. libopus 1.6.1 scores 38.8 / 41.9 dB at 64 /
-  128 kbps (35.2 / 41.1 with its tonality analysis off, which opus-rs does
-  not port). The 48 kHz chirp packets are byte-identical.
 - **Fix: CELT flagged transients on steady pitched input (issue #38).** The
   encoder ran `tone_detect` and `transient_analysis` on a buffer whose
   overlap head was the previous frame's *prefiltered* signal while the body

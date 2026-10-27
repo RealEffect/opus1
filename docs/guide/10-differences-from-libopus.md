@@ -514,7 +514,7 @@ Without `std`, the networks' `log10`, `pow`, `exp`, `exp2` and `log`, and the `s
 
 ## Tests that track these gaps
 
-No test is ignored because of a gap. On targets other than 64-bit ARM, about 40 tests that require libopus's bits are ignored (see [Platforms](#platforms)). The two tests that were, both because of the missing speech and music analysis, pass now:
+No test is ignored because of a gap. On targets other than 64-bit ARM, 54 tests that require libopus's bits are ignored (see [Platforms](#platforms)). The two tests that were, both because of the missing speech and music analysis, pass now:
 
 | Test | Measured |
 |---|---|
