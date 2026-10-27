@@ -36,7 +36,7 @@
 // With `test-libopus-dnn` the tests link a libopus built with its neural
 // network code and without vector loops. Its analysis rounds two sums of
 // the cepstrum differently from the Homebrew build that opus1 follows
-// (docs/10-differences-from-libopus.md), so these tests run only without
+// (docs/guide/10-differences-from-libopus.md), so these tests run only without
 // that feature.
 #![cfg(not(feature = "test-libopus-dnn"))]
 

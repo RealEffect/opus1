@@ -37,13 +37,13 @@
 //! 12 kHz, 160 kb/s, 20 ms frames: one output channel holds the other
 //! channel's tone 8.8 dB above its own in fixed-point libopus and 15.5 dB
 //! above its own in opus1, while the float build keeps its own tone at
-//! least 78 dB above the other (docs/10-differences-from-libopus.md).
+//! least 78 dB above the other (docs/guide/10-differences-from-libopus.md).
 //!
 //! What the layout maps to the same coded channel comes from the first
 //! input channel that names it, in both encoders. An output channel the
 //! mapping leaves silent is not checked. A surround layout always gets an
 //! explicit bitrate: with the automatic one the encoders choose other
-//! bandwidths on purpose (D1 in docs/10-differences-from-libopus.md).
+//! bandwidths on purpose (D1 in docs/guide/10-differences-from-libopus.md).
 
 #![no_main]
 
@@ -315,7 +315,7 @@ fn multistream(u: &mut Unstructured, s: Settings) -> Result<()> {
     let layout = rust.layout().clone();
     let channels = layout.channels();
     // With the automatic bitrate in surround mode the two encoders choose
-    // other audio bandwidths on purpose (D1 in docs/10: libopus compares the
+    // other audio bandwidths on purpose (D1 in docs/guide/10: libopus compares the
     // raw setting and codes narrowband), so the allocation within each
     // stream differs. These layouts get an explicit bitrate.
     let s = if rust.mapping_type() == MappingType::Surround && s.bitrate.is_none() {

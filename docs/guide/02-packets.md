@@ -1,6 +1,6 @@
 # Opus packets
 
-This document describes the bytes of an Opus packet, as section 3 of RFC 6716 (Request for Comments 6716, the Opus specification) defines them. It also describes the `opus1::packet` module, which reads and writes them. It covers the table-of-contents (TOC) byte and its 32 configurations, the four ways a packet can hold its frames, and the size limits. It then covers the self-delimited form (RFC 6716 appendix B) that multistream packets use, and what the decoder does with a packet that carries no audio. [Multichannel audio](05-multichannel.md) builds on the self-delimited form. The [documentation index](README.md) lists the other documents.
+This document describes the bytes of an Opus packet, as section 3 of RFC 6716 (Request for Comments 6716, the Opus specification) defines them. It also describes the `opus1::packet` module, which reads and writes them. It covers the table-of-contents (TOC) byte and its 32 configurations, the four ways a packet can hold its frames, and the size limits. It then covers the self-delimited form (RFC 6716 appendix B) that multistream packets use, and what the decoder does with a packet that carries no audio. [Multichannel audio](05-multichannel.md) builds on the self-delimited form. The [documentation index](../README.md) lists the other documents.
 
 ## Terms
 

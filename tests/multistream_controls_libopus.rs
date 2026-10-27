@@ -131,7 +131,7 @@ fn forced_channels_are_forwarded_as_libopus_does() {
     // In surround mode the coupled streams are forced to two channels on
     // every frame, over the caller's setting, in both. (Surround packets
     // are not compared: opus1 chooses the bandwidth of surround streams
-    // differently on purpose, difference D1 of docs/10.)
+    // differently on purpose, difference D1 of docs/guide/10.)
     let mut rust = MultistreamEncoder::new_surround(
         SampleRate::try_from(FS).unwrap(),
         6,
@@ -155,7 +155,7 @@ fn forced_channels_are_forwarded_as_libopus_does() {
 /// CELT-only packets equal libopus's with each setting. Disabling phase
 /// inversion changes the packets of the coupled streams.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn prediction_and_phase_inversion_are_forwarded_as_libopus_does() {
     for layout in LAYOUTS {
         let (channels, streams, coupled, _) = layout;
@@ -203,7 +203,7 @@ fn prediction_and_phase_inversion_are_forwarded_as_libopus_does() {
 /// current application is accepted. The voice ratio of the first stream
 /// equals libopus's after every frame.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn application_and_voice_ratio_follow_libopus() {
     let apps = [
         (APP_VOIP, Application::Voip),
@@ -245,7 +245,7 @@ fn application_and_voice_ratio_follow_libopus() {
 /// output. The defaults are libopus's: phase inversion is disabled at the
 /// start only when the first stream is mono.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn decoder_gain_and_phase_inversion_follow_libopus() {
     for layout in LAYOUTS {
         let (channels, streams, coupled, mapping) = layout;
@@ -336,7 +336,7 @@ fn decoder_gain_and_phase_inversion_follow_libopus() {
 /// `encode24` and `decode24` of the multistream encoder and decoder against
 /// libopus, CELT-only, with input at and beyond the 24-bit limits.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn encode24_and_decode24_follow_libopus() {
     for layout in LAYOUTS {
         let (mut rust, mut c) = pair(layout, APP_AUDIO);
@@ -418,7 +418,7 @@ fn surround_encode24_codes_as_encode_of_the_scaled_samples() {
 /// with SILK are not compared byte for byte (see the top of this file); the
 /// decoder reads libopus's packets.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn getters_of_the_first_stream_follow_libopus() {
     let get_bw = sys::OPUS_GET_BANDWIDTH_REQUEST;
     let get_dur = sys::OPUS_GET_LAST_PACKET_DURATION_REQUEST;
@@ -500,7 +500,7 @@ fn getters_of_the_first_stream_follow_libopus() {
     }
 
     // A 5.1 surround encoder with an explicit bitrate, where the encoder
-    // sets the bandwidth of every stream on every frame (docs/10, D1 is
+    // sets the bandwidth of every stream on every frame (docs/guide/10, D1 is
     // about the automatic bitrate only).
     let mut rust =
         MultistreamEncoder::new_surround(SampleRate::try_from(FS).unwrap(), 6, 1, Application::Audio).unwrap();

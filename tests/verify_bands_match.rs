@@ -90,7 +90,7 @@ fn test_bands_match() {
 }
 
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn bands_are_those_of_libopus_bit_for_bit() {
     let ((band_e, x_norm), (c_band_e, c_norm)) = both();
     assert_eq!(band_e, c_band_e, "band energies");

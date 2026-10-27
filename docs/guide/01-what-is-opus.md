@@ -1,6 +1,6 @@
 # What Opus is
 
-This document explains what the Opus audio codec is and what it can do. It describes the two coding layers, SILK and CELT (Constrained Energy Lapped Transform), and the three modes built from them. It lists the audio bandwidths, sampling rates, frame durations, bitrates and channel counts that Opus supports. It then covers delay, the tools for networks that lose packets, the Ogg Opus file format, and the history of the reference library libopus. The last section explains how this library, `opus1`, relates to libopus. The [glossary](glossary.md) defines the terms used here, and the [documentation index](README.md) lists the other documents.
+This document explains what the Opus audio codec is and what it can do. It describes the two coding layers, SILK and CELT (Constrained Energy Lapped Transform), and the three modes built from them. It lists the audio bandwidths, sampling rates, frame durations, bitrates and channel counts that Opus supports. It then covers delay, the tools for networks that lose packets, the Ogg Opus file format, and the history of the reference library libopus. The last section explains how this library, `opus1`, relates to libopus. The [glossary](glossary.md) defines the terms used here, and the [documentation index](../README.md) lists the other documents.
 
 ## What Opus is for
 

@@ -21,7 +21,7 @@
 # Debug assertions and overflow checks are on: an integer overflow in
 # opus1 stops the run like a panic.
 #
-# libopus is linked as for the main crate's tests (docs/09-testing.md):
+# libopus is linked as for the main crate's tests (docs/guide/09-testing.md):
 # set LIBOPUS_LIB_DIR and LIBOPUS_NO_PKG, or keep them in .cargo/config.toml.
 
 set -euo pipefail

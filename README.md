@@ -20,7 +20,7 @@ A systematic introduction to Opus and to this library is in [docs/](docs/README.
 - **Multichannel:** multistream encoder and decoder (mapping families 0, 1, 2 and 255), interoperable with libopus
 - **libopus controls:** the encoder settings, their defaults and the values they refuse follow libopus's `OPUS_SET_*` requests (automatic bitrate, VBR and its constraint, complexity, in-band FEC, packet loss, forced mode, bandwidth and channels, signal type, input bit depth, DTX, frame duration from 2.5 to 120 ms)
 - **Packets:** the `packet` module parses, writes and pads packets and has libopus's repacketizer. The `extensions` module reads and writes the padding extensions of libopus 1.5 and later
-- **64-bit ARM and x86-64:** on 64-bit ARM the output is checked bit for bit against libopus 1.6.1. On x86-64 it is correct but not bit-exact with libopus: opus1's x86 vector kernels do not follow libopus's, and libopus's own x86 output depends on the C compiler (see [docs/10](docs/10-differences-from-libopus.md#platforms))
+- **64-bit ARM and x86-64:** on 64-bit ARM the output is checked bit for bit against libopus 1.6.1. On x86-64 it is correct but not bit-exact with libopus: opus1's x86 vector kernels do not follow libopus's, and libopus's own x86 output depends on the C compiler (see [docs/guide/10](docs/guide/10-differences-from-libopus.md#platforms))
 - **The speech and music analysis of libopus:** from complexity 7 on, the encoder estimates whether the input is speech or music and which bandwidth it uses, as libopus does, with the same results to the last bit on 64-bit ARM. CELT-only packets at complexity 7 to 10 are libopus's byte for byte
 - **The neural decoder features of libopus 1.5 and 1.6 (optional):** deep packet loss concealment, the LACE and NoLACE speech enhancement of SILK, and the bandwidth extension of SILK wideband to fullband. Each is compiled only with its cargo feature and runs only when the decoder complexity is raised, as in libopus: `set_complexity(5)` for deep PLC (packet loss concealment), 6 for LACE, 7 for NoLACE, and 4 with `set_osce_bwe(true)` for the bandwidth extension. On 64-bit ARM the output is that of libopus 1.6.1 built with these features (without loop vectorization) to the last bit.
 - **Deep redundancy (DRED, optional):** with the cargo feature `dred`, the encoder adds a compressed description of up to about one second of earlier speech to each packet (`set_dred_duration`, libopus `OPUS_SET_DRED_DURATION`), and the decoder rebuilds a burst of lost packets from the next packet that arrives (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`). CELT-only packets with DRED, and the DRED data in SILK and Hybrid packets with the `Audio` application and VBR, are those of libopus 1.6.1 built with DRED, byte for byte. Decoding gives libopus's output to the last bit.
@@ -67,7 +67,7 @@ types `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`,
 `Error` and `ErrorKind`, the function `pcm_soft_clip` and the constants
 `VERSION` and `LIBOPUS_VERSION`. The neural network features add `DnnBlob` and
 `DnnModels`, and `dred` adds `OpusDredDecoder`, `OpusDred`, `DredParse` and
-`DredProcessing`. [docs/06](docs/06-using-the-library.md) shows the settings and
+`DredProcessing`. [docs/guide/06](docs/guide/06-using-the-library.md) shows the settings and
 recipes for calls, voice agents and music.
 
 Decoding to 16-bit PCM, and recovering a lost packet from the in-band
@@ -174,10 +174,10 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 | `osce-bwe` | no    | The bandwidth extension of SILK wideband to 48 kHz fullband output, switched on with `set_osce_bwe` (weights 685,888 bytes). Turns on `osce`. |
 | `dred`   | no      | Deep redundancy (DRED): the encoder writes DRED data (`OpusEncoder::set_dred_duration`), the decoder rebuilds lost packets from it (`OpusDredDecoder`, `OpusDred`, `OpusDecoder::dred_decode`). Embeds the RDOVAE encoder and decoder (weights 565,440 bytes). Turns on `deep-plc`, as libopus's `--enable-dred` does. |
 | `dnn`    | no      | The code that the neural network features share (layer kernels, weight blob parser). `deep-plc`, `osce`, `osce-bwe` and `dred` turn it on. Alone it adds no public API: `DnnBlob` and `set_dnn_blob` come with `deep-plc`. |
-| `test-libopus-dnn` | no | Test only: compiles the tests that compare with a libopus built with its neural network code (see [docs/09](docs/09-testing.md#tests-of-the-neural-network-code)). |
-| `__internals` | no | Test only, outside semantic versioning: adds the hidden module `opus1::internals` for the tests, benchmarks, examples and fuzz targets of the repository (see [docs/09](docs/09-testing.md#how-the-tests-reach-internal-code)). Applications never enable it. |
+| `test-libopus-dnn` | no | Test only: compiles the tests that compare with a libopus built with its neural network code (see [docs/guide/09](docs/guide/09-testing.md#tests-of-the-neural-network-code)). |
+| `__internals` | no | Test only, outside semantic versioning: adds the hidden module `opus1::internals` for the tests, benchmarks, examples and fuzz targets of the repository (see [docs/guide/09](docs/guide/09-testing.md#how-the-tests-reach-internal-code)). Applications never enable it. |
 | `libm`   | no      | Required for `#![no_std]` builds — provides float math via a pure-Rust port of musl `libm`. Not needed when `std` is on. |
-| `portable-atomic` | no | For targets without atomic compare-and-swap, such as `thumbv6m-none-eabi` (Cortex-M0/M0+) or `riscv32imc-unknown-none-elf` (ESP32-C3): the shared tables are built with the atomics of the [`portable-atomic`](https://crates.io/crates/portable-atomic) crate. There portable-atomic also needs its `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip (see [docs/06](docs/06-using-the-library.md#targets-without-compare-and-swap)). |
+| `portable-atomic` | no | For targets without atomic compare-and-swap, such as `thumbv6m-none-eabi` (Cortex-M0/M0+) or `riscv32imc-unknown-none-elf` (ESP32-C3): the shared tables are built with the atomics of the [`portable-atomic`](https://crates.io/crates/portable-atomic) crate. There portable-atomic also needs its `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip (see [docs/guide/06](docs/guide/06-using-the-library.md#targets-without-compare-and-swap)). |
 
 > Runtime dependency footprint: `std` build → **0 deps**; `no_std` build → **1 dep** (`libm`, pure Rust), 2 with `portable-atomic`.
 
@@ -191,7 +191,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
   than on the stack. `OpusEncoder::new` and `OpusDecoder::new` return the codec
   through the stack; `OpusEncoder::init` and `OpusDecoder::init` build it
   directly in memory you provide, with less than 16 KB of stack (see
-  [docs/06](docs/06-using-the-library.md#building-the-encoder-and-the-decoder-in-place)):
+  [docs/guide/06](docs/guide/06-using-the-library.md#building-the-encoder-and-the-decoder-in-place)):
 
   ```rust
   use core::mem::MaybeUninit;
@@ -262,8 +262,8 @@ Over all 28 scenarios of the bench set (geometric means), opus1 takes 0.572 of
 the encode time and 0.669 of the decode time of libopus 1.6.1 at `-O2`, and
 0.461 and 0.598 of the Homebrew build. Before the analysis, when only libopus
 ran it, encoding took 0.546 and 0.443 in the same passes. The full table is in
-[docs/08-performance.md](docs/08-performance.md#latest-results), and
-[The C reference](docs/08-performance.md#the-c-reference) explains the builds.
+[docs/guide/08-performance.md](docs/guide/08-performance.md#latest-results), and
+[The C reference](docs/guide/08-performance.md#the-c-reference) explains the builds.
 
 On an Android phone (MediaTek MT6833), against libopus 1.6.1 built with the
 NDK's clang at `-O2` and the flags of libopus's `configure` for Android, opus1
@@ -273,7 +273,7 @@ run the speech and music analysis (geometric means over the bench set, commit
 Cortex-A76, 0.698 and 0.824 on the in-order Cortex-A55. Before the analysis,
 when only libopus ran it, encoding took 0.625 and 0.650. opus1's analysis
 alone takes 0.36 to 0.40 of the time of libopus's on these cores. See
-[docs/08-performance.md](docs/08-performance.md#on-an-android-phone).
+[docs/guide/08-performance.md](docs/guide/08-performance.md#on-an-android-phone).
 
 The latest speed work ("round 8" in the performance document) made the
 release libopus 1.6.1, built from Xiph's release file, the C reference on the
@@ -297,7 +297,7 @@ CELT encoding and decoding take 2.3-4.2 % less time on all three cores. Most
 of that comes from the PVQ search and the allocation. On Apple M4 Pro, SILK and
 Hybrid encoding at complexity 6 and 7 take 3.8-6.4 % less time. That removes
 the slowdown that round 7 left there. See
-[docs/08-performance.md](docs/08-performance.md#round-8-more-work-for-in-order-cores).
+[docs/guide/08-performance.md](docs/guide/08-performance.md#round-8-more-work-for-in-order-cores).
 
 Round 7 before it was aimed at the in-order Cortex-A55. It rewrote the pitch
 analysis of the CELT encoder, the
@@ -310,7 +310,7 @@ Apple M4 Pro. Decoding takes 1.9-2.0 % less on the Cortex-A55, 1.0 % less on
 the Cortex-A76 and about the same time (within 0.4 %) on Apple M4 Pro. From
 the Cortex-A76 to the Cortex-A55, opus1's encoding now grows 3.02 times slower
 and libopus's 2.90 times; before this work opus1's grew 3.14 times. See
-[docs/08-performance.md](docs/08-performance.md#round-7-work-for-in-order-cores).
+[docs/guide/08-performance.md](docs/guide/08-performance.md#round-7-work-for-in-order-cores).
 
 Against opus-rs 0.1.37 on the same machine (change of the opus1 / libopus
 ratio, Homebrew libopus), encoding takes 33-56 % less time for SILK and Hybrid
@@ -322,7 +322,7 @@ complexity 5 it now runs libopus's stereo pitch pre-filter and, from complexity
 of the Homebrew libopus's time.
 
 Build settings that help (measured, see
-[docs/06-using-the-library.md](docs/06-using-the-library.md#build-settings-for-speed)):
+[docs/guide/06-using-the-library.md](docs/guide/06-using-the-library.md#build-settings-for-speed)):
 `lto = "fat"`, `codegen-units = 1` and `panic = "abort"` in the application's
 release profile take 1.7 % off decoding on Apple M4 Pro and 1.1-1.5 % off
 encoding on the Cortex-A76. For Android, `-C target-cpu=cortex-a55` orders the
@@ -345,7 +345,7 @@ opus1 takes 0.90 of libopus's time to encode and 0.81 to decode under Linux in
 WSL2, and 0.88 and 0.80 natively on Windows. Low-complexity SILK encoding took
 1.04 to 1.10 of libopus's time. On x86-64 the output is correct but not
 bit-exact with libopus (see
-[docs/10](docs/10-differences-from-libopus.md#platforms)).
+[docs/guide/10](docs/guide/10-differences-from-libopus.md#platforms)).
 
 ### Earlier measurement: x86-64 (AVX2/FMA), opus-rs 0.1.x
 
@@ -521,18 +521,18 @@ now runs libopus's stereo pitch pre-filter and `theta_rdo`.
 **Platforms**
 - 64-bit ARM is the reference platform. There the output is checked bit for
   bit against libopus 1.6.1, and every test that requires libopus's bits
-  passes. [docs/10](docs/10-differences-from-libopus.md) lists the remaining
+  passes. [docs/guide/10](docs/guide/10-differences-from-libopus.md) lists the remaining
   differences and their sizes.
 - x86-64 gives correct output but is not bit-exact with libopus. opus1's x86
   vector kernels do not follow libopus's x86 kernels, and libopus's own x86
   output depends on the C compiler. About 40 tests that require libopus's bits
   are ignored on targets other than 64-bit ARM. x86-64 was run on an Intel
   Core i7-12700 (AVX2, FMA and AVX-VNNI), under Linux in WSL2 and natively on
-  Windows ([docs/10](docs/10-differences-from-libopus.md#platforms)).
+  Windows ([docs/guide/10](docs/guide/10-differences-from-libopus.md#platforms)).
 - The minimum Rust version is 1.98: the 64-bit ARM dot-product intrinsics of
   the neural network code are stable from that version on.
 
-**Known gaps** (see [docs/10](docs/10-differences-from-libopus.md#not-implemented))
+**Known gaps** (see [docs/guide/10](docs/guide/10-differences-from-libopus.md#not-implemented))
 - The scalable quality extension of libopus 1.6 (QEXT) is not ported.
 - Mapping family 3 (ambisonics mixed through a matrix, libopus's
   `opus_projection_*` functions) is not implemented.

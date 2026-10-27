@@ -162,7 +162,7 @@ const HYBRID_32K: Stream = Stream { mode: MODE_HYBRID, bandwidth: BW_FB, bitrate
 /// Hybrid: when measured, 11 (`MD19_04`) and 18 (`MH43_04`) of the 250
 /// frames of SILK at 12 kb/s, 11 and 23 of Hybrid at 32 kb/s.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn voip_at_48_khz_adds_no_low_frequency_energy_in_quiet_frames() {
     let lookahead = 312; // 2.5 ms + 4 ms at 48 kHz, for every encoder
     for (name, s) in [("MD19_04", SILK_12K), ("MD19_04", HYBRID_32K), ("MH43_04", SILK_12K), ("MH43_04", HYBRID_32K)] {

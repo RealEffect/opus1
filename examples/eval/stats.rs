@@ -132,7 +132,7 @@ pub enum GateKind {
     /// most the limit.
     BytesMax,
     /// The same for VBR jobs with frames of 40 ms and more, where opus1
-    /// deliberately differs (docs/10, "Deliberate differences").
+    /// deliberately differs (docs/guide/10, "Deliberate differences").
     BytesMaxLong,
     /// The smallest `ratio_bytes` of VBR jobs is at least the limit.
     BytesMin,

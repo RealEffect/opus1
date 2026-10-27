@@ -106,7 +106,7 @@ pub fn gates(group: &str) -> Vec<Gate> {
 /// at most 1.50 for CELT at high bitrates, 1.35 and 2.00 for speech. The
 /// bytes limits follow section 4.4 of the design note: at most 2 % more
 /// than libopus for CELT, and 10 % for frames of 40 ms and more, where
-/// opus1 deliberately differs (docs/10). The MOC limits are those of the
+/// opus1 deliberately differs (docs/guide/10). The MOC limits are those of the
 /// OSCE draft's relative test (-0.1 per clip, -0.025 on average).
 ///
 /// Every group also gets the gates of `--baseline` (opus1 now against a

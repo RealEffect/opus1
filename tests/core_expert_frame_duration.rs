@@ -146,7 +146,7 @@ fn check_calls(fs: usize, channels: usize, app: (i32, Application), cbr: bool, s
 }
 
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn the_same_frames_are_coded_as_by_libopus() {
     for fs in [8000, 12000, 16000, 24000, 48000] {
         for channels in [1, 2] {

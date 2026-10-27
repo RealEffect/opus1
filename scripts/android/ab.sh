@@ -8,7 +8,7 @@
 # the linker placed the code at other addresses. Builds measured one right
 # after the other see the same state of the phone. A change is real when it
 # has the same sign in every pair and is larger than the difference between
-# two placements of the same code (docs/08-performance.md, "Code
+# two placements of the same code (docs/guide/08-performance.md, "Code
 # placement").
 #
 # The whole series runs as one job on the phone, detached from adb (see

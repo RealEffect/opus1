@@ -700,7 +700,7 @@ pub fn mutate(u: &mut Unstructured, packet: &mut Vec<u8>, keep_toc: bool) -> Res
 /// The output of opus1 is within 50 dB of libopus's, or differs by less
 /// than `floor` per sample on average (in squared units). This holds while
 /// both decoders have decoded the same packets in full: opus1's decoder
-/// differs from libopus's only in rounding (docs/10).
+/// differs from libopus's only in rounding (docs/guide/10).
 pub fn assert_close<T: Copy + Into<f64>>(what: &str, rust: &[T], c: &[T], floor: f64) {
     let (mut sig, mut err) = (0.0f64, 0.0f64);
     for (&r, &c) in rust.iter().zip(c) {
