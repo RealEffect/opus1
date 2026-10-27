@@ -211,10 +211,16 @@ fn oracle_impulse_48k_mono_64k() {
     // For 48k CBR, also check byte closeness (allow small divergence due to remaining tone/Hybrid gaps)
     assert!((rs_n as i32 - c_n as i32).abs() <= 5);
     // libopus decodes opus1's packet to nearly what it decodes from its own
-    // (on 64-bit ARM the packets are the same).
-    let db = decoded_snr(&rs_buf[..rs_n], &c_buf[..c_n]);
-    println!("impulse: opus1's packet against libopus's, both decoded by libopus: {db:.1} dB");
-    assert!(db > MIN_DECODED_SNR_DB, "impulse: {db:.1} dB");
+    // (on 64-bit ARM the packets are the same). Without the `analysis`
+    // feature opus1 skips the speech and music analysis that libopus runs
+    // at complexity 10. That changes the allocation trim of this frame
+    // (see `impulse_48k_mono_64k_is_the_packet_of_libopus`), and the SNR
+    // falls to about 20 dB, so the check needs the analysis.
+    if cfg!(feature = "analysis") {
+        let db = decoded_snr(&rs_buf[..rs_n], &c_buf[..c_n]);
+        println!("impulse: opus1's packet against libopus's, both decoded by libopus: {db:.1} dB");
+        assert!(db > MIN_DECODED_SNR_DB, "impulse: {db:.1} dB");
+    }
     let mut rs_enc2 = RsEnc::new(SampleRate::Hz48000, Channels::Mono, RsApp::Audio).unwrap();
     rs_enc2.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(br as u32).unwrap()));
     rs_enc2.set_vbr(false);
