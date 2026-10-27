@@ -9,7 +9,7 @@ File counts and test counts on this page were taken at commit `9891020` (2026-10
 ## The project in brief
 
 - **What it is.** `opus1` is a port of libopus 1.6.1, the reference implementation of Opus in C. A "port" here means Rust code that computes what the C file computes, function by function.
-- **Crate facts.** Name `opus1`, version `0.2.0` (not yet released), Rust edition 2024, minimum Rust version 1.98, licence BSD-3-Clause ([COPYING](../COPYING)). Repository: <https://github.com/RealEffect/opus1>.
+- **Crate facts.** Name `opus1`, version `0.2.1` (the first release, 2026-10-27), Rust edition 2024, minimum Rust version 1.98, licence BSD-3-Clause ([COPYING](../COPYING)). Repository: <https://github.com/RealEffect/opus1>.
 - **History.** It is a hard fork of [opus-rs](https://github.com/restsend/opus-rs), taken at version 0.1.37. The two projects no longer share changes. Code that used `opus_rs::` now uses `opus1::`.
 - **Not ported.** The projection encoder and decoder (mapping family 3), the floating-point SILK encoder, the scalable quality extension (QEXT) and Opus Custom. [Differences from libopus](guide/10-differences-from-libopus.md) lists every gap.
 
@@ -31,7 +31,7 @@ The numbered documents and the glossary are in the folder [`guide/`](guide).
 | [10 Differences from libopus](guide/10-differences-from-libopus.md) | What `opus1` does not implement, where it differs on purpose, and how far its output differs from libopus, with the measured figures and the results of the evaluation tools; and the platforms it was built and tested on. |
 | [Glossary](guide/glossary.md) | The terms used in these documents, in alphabetical order. |
 | [The architecture of opus1](framework.md) | The overall design: the layers of the codec and how one encode and one decode call pass through them, the public interface, a map of the source files, the feature flags and the rules the code follows. |
-| [Changes in 0.2.0](changelog-0.2.0.md) | The detailed list of changes from opus-rs 0.1.37 to opus1 0.2.0, with the measurements behind each fix. The README has the short release note. |
+| [Changes in 0.2.1](changelog-0.2.1.md) | The detailed list of changes from opus-rs 0.1.37 to opus1 0.2.1, with the measurements behind each fix. The README has the short release note. |
 
 Other parts of the repository have their own README:
 

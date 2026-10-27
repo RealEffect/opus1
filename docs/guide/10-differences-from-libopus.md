@@ -42,7 +42,7 @@ opus1 follows libopus 1.6, the reference implementation of Opus in C. This docum
 
 opus1 offers the functions, requests and constants of the public headers of libopus 1.6.1 (`opus.h`, `opus_multistream.h` and `opus_defines.h`) in a Rust form, except those in the second table below. Constructors, `Drop` and `size_of` take the place of the `*_get_size`, `*_create` and `*_destroy` functions. A typed method takes the place of each request of the `*_ctl` functions.
 
-The interface review of opus1 0.2 added the parts that were still missing (the [changelog](../changelog-0.2.0.md) lists the changes since opus-rs 0.1.37):
+The interface review of opus1 0.2 added the parts that were still missing (the [changelog](../changelog-0.2.1.md) lists the changes since opus-rs 0.1.37):
 
 | libopus | opus1 0.2 |
 |---|---|

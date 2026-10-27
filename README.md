@@ -2,7 +2,7 @@
 
 A pure-Rust implementation of the [Opus audio codec](https://opus-codec.org/) (RFC 6716), ported from the reference C implementation (libopus 1.6). The name says what it follows: the Opus 1.x bitstream and the behaviour of libopus 1.x.
 
-opus1 is a hard fork of [opus-rs](https://github.com/restsend/opus-rs), taken at version 0.1.37. It is developed separately at [github.com/RealEffect/opus1](https://github.com/RealEffect/opus1); opus-rs continues on its own. Code that used `opus_rs::` uses `opus1::` (see the [0.2.0 notes](#020-unreleased) for the API changes):
+opus1 is a hard fork of [opus-rs](https://github.com/restsend/opus-rs), taken at version 0.1.37. It is developed separately at [github.com/RealEffect/opus1](https://github.com/RealEffect/opus1); opus-rs continues on its own. Code that used `opus_rs::` uses `opus1::` (see the [0.2.1 notes](#021-2026-10-27) for the API changes):
 
 ```toml
 [dependencies]
@@ -363,13 +363,16 @@ complexity 0).
 
 ## Release Notes
 
-### 0.2.0 (unreleased)
+### 0.2.1 (2026-10-27)
+
+The first release of opus1. Version 0.2.0 was used only during development and
+was never published.
 
 The crate is renamed from `opus-rs` to `opus1`: code that used `opus_rs::` now
 uses `opus1::`. This release follows libopus 1.6.1 and was checked against it
 throughout: every fix has a test that compares opus1 with the C library under
 the same settings. The full list of changes, with the measurements behind each
-fix, is in [docs/changelog-0.2.0.md](docs/changelog-0.2.0.md).
+fix, is in [docs/changelog-0.2.1.md](docs/changelog-0.2.1.md).
 
 **Breaking changes** (what code written for opus-rs 0.1.37 must change; API
 added since 0.1.37 is under New features)

@@ -1,6 +1,6 @@
-# Changes in opus1 0.2.0
+# Changes in opus1 0.2.1
 
-This file keeps the detailed list of changes from opus-rs 0.1.37 to opus1 0.2.0, with the measurements behind each fix. The short release note is in the [README](../README.md#020-unreleased).
+This file keeps the detailed list of changes from opus-rs 0.1.37 to opus1 0.2.1, with the measurements behind each fix. The short release note is in the [README](../README.md#021-2026-10-27). 0.2.1 is the first release of opus1; version 0.2.0 was used only during development and was never published.
 
 The crate is renamed from `opus-rs` to `opus1`. Code that used `opus_rs::` now uses `opus1::`.
 
@@ -16,9 +16,9 @@ interface of 0.1.37 was small: `OpusEncoder` (`new`, `encode`,
 the enums `Application` and `Bandwidth`, the internal modules, and with
 `std` the module `multistream` (`ChannelMappingTable`,
 `split_self_delimited`, and `MultistreamDecoder` with `new` and `decode`).
-Everything else is new in 0.2.0. It is listed under
-[New features](#new-features) in its 0.2.0 form, also where it changed
-while 0.2.0 was developed.
+Everything else is new in 0.2.1. It is listed under
+[New features](#new-features) in its 0.2.1 form, also where it changed
+while 0.2.1 was developed.
 
 - Errors: every call that can fail returns `Result<T, opus1::Error>` instead
   of `Result<T, &'static str>`. Of the calls of 0.1.37 these are
@@ -158,7 +158,7 @@ while 0.2.0 was developed.
 ## New features
 
 Everything in this section is new since opus-rs 0.1.37, and is described in
-its 0.2.0 form.
+its 0.2.1 form.
 
 - Multichannel audio, module `multistream`: `MultistreamEncoder` (surround
   families 0, 1, 2 and 255, rate allocation, LFE stream, surround masking)
