@@ -17,7 +17,7 @@ This directory is a separate package, `opus1-fuzz`. Each target is a program for
   export LIBOPUS_NO_PKG=1
   ```
 
-  [docs/09-testing.md](../docs/09-testing.md#how-libopus-is-linked) explains how the C library is found.
+  [docs/guide/09-testing.md](../docs/guide/09-testing.md#how-libopus-is-linked) explains how the C library is found.
 
 ## Running
 
@@ -98,7 +98,7 @@ A fixed failure becomes a test in `tests/fuzz_regressions.rs`, with the minimize
 
 FEC is forward error correction, DTX discontinuous transmission, VBR and CBR variable and constant bitrate, and LFE the low-frequency-effects channel.
 
-The output check allows 50 dB because opus1's decoder differs from libopus's only in rounding: on real streams the two agree to 136 dB or better ([docs/10](../docs/10-differences-from-libopus.md#decoder)). After a lost or damaged packet the output is not compared. The concealment of a loss searches the decoded signal for its pitch, and a rounding difference can change what it finds. These count as a loss as well:
+The output check allows 50 dB because opus1's decoder differs from libopus's only in rounding: on real streams the two agree to 136 dB or better ([docs/guide/10](../docs/guide/10-differences-from-libopus.md#decoder)). After a lost or damaged packet the output is not compared. The concealment of a loss searches the decoded signal for its pitch, and a rounding difference can change what it finds. These count as a loss as well:
 
 - a packet with a frame of 0 or 1 bytes, which the decoder conceals;
 - a packet that takes the stream from CELT-only to SILK or Hybrid. The decoder conceals 5 ms in CELT and fades them into the new frame, unless the packet carries a redundant CELT frame.

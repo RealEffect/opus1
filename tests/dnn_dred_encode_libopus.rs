@@ -1,6 +1,6 @@
 // opus1 computes the 64-bit ARM bits of the neural network code on every
 // target, and these tests compare with the bits of the linked libopus, so
-// they are compiled for 64-bit ARM only (docs/10, Platforms).
+// they are compiled for 64-bit ARM only (docs/guide/10, Platforms).
 #![cfg(all(feature = "test-libopus-dnn", feature = "dred", target_arch = "aarch64"))]
 //! The DRED encoder against libopus 1.6.1 built with DRED, without loop
 //! vectorization (`libopus-host-1.6.1-dred-novec`, a float build).
@@ -321,7 +321,7 @@ fn celt_only_packets_with_dred_equal_libopus() {
 /// packets and their DRED data. The analysis of opus1 follows the Homebrew
 /// build of libopus, whose roundings differ from the build without vector
 /// loops in the last bits of some probabilities
-/// (docs/10-differences-from-libopus.md), so a decision can differ now and
+/// (docs/guide/10-differences-from-libopus.md), so a decision can differ now and
 /// then; the test allows 1 % of the packets to differ.
 #[test]
 fn celt_only_packets_with_dred_and_the_analysis_equal_libopus() {

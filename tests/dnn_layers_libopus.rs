@@ -1,6 +1,6 @@
 // opus1 computes the 64-bit ARM bits of the neural network code on every
 // target, and these tests compare with the bits of the linked libopus, so
-// they are compiled for 64-bit ARM only (docs/10, Platforms).
+// they are compiled for 64-bit ARM only (docs/guide/10, Platforms).
 #![cfg(all(feature = "test-libopus-dnn", target_arch = "aarch64"))]
 #![cfg(feature = "deep-plc")]
 //! Every layer of the libopus 1.6.1 models through opus1 and through

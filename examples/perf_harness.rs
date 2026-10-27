@@ -98,7 +98,7 @@ const MODE_CELT_ONLY: c_int = 1002;
 // the code, so a timing difference between two builds may have nothing to
 // do with the change.
 //
-// Measured in October 2026 (docs/08-performance.md, "Code placement"):
+// Measured in October 2026 (docs/guide/08-performance.md, "Code placement"):
 // moving the code by 16 to 48 bytes changed single timings by up to about
 // 2 % on Apple M4 Pro and on a Cortex-A76, by up to 4 % for libopus's SILK
 // encoding on the Cortex-A76, and by at most 0.5 % on a Cortex-A55.
@@ -2430,7 +2430,7 @@ fn cmd_bench(opts: &Opts) -> Result<i32, String> {
     );
     let _ = writeln!(
         header,
-        "- where the linker places the code moves single timings by up to about 2 % on Apple M4 Pro and on a Cortex-A76 (4 % for libopus on the A76); to compare two builds, run them in turns and use the `pairs` command (docs/08-performance.md, \"Comparing two builds\")"
+        "- where the linker places the code moves single timings by up to about 2 % on Apple M4 Pro and on a Cortex-A76 (4 % for libopus on the A76); to compare two builds, run them in turns and use the `pairs` command (docs/guide/08-performance.md, \"Comparing two builds\")"
     );
     println!("{header}");
     println!("{BENCH_HEADER}");

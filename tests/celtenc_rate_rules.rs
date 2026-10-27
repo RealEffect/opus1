@@ -54,7 +54,7 @@ fn vbr_stream(channels: usize, frame_ms_x2: usize, bitrate_per_channel: i32) -> 
 /// rounded down, and the target in 1/8 bit from that. These bitrates leave
 /// a remainder at every frame size.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn vbr_at_bitrates_that_are_not_whole_bits_per_frame() {
     for channels in [1usize, 2] {
         let pcm = music_for(channels, 1);
@@ -81,7 +81,7 @@ fn vbr_at_bitrates_that_are_not_whole_bits_per_frame() {
 /// Above the limit each encoder must write the packets it writes at the
 /// limit, and the packets of the two encoders must be the same.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn bitrate_is_limited_to_750_kbps_per_channel() {
     for channels in [1usize, 2] {
         let pcm = music_for(channels, 1);
@@ -106,7 +106,7 @@ fn bitrate_is_limited_to_750_kbps_per_channel() {
 /// depends on that byte count; the test keeps silent frames under VBR
 /// equal to libopus's.)
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn silent_frames_under_vbr() {
     for channels in [1usize, 2] {
         let mut pcm = music_for(channels, 2);
@@ -141,7 +141,7 @@ fn silent_frames_under_vbr() {
 /// ends fall at every place in a frame. The test counts the frames where
 /// measuring the whole frame would give another flag, and requires some.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn silence_flag_of_stereo_input_coded_as_mono() {
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut pick = move |n: usize| {

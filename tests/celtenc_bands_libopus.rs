@@ -140,7 +140,7 @@ fn c_mode() -> *const c_void {
 /// opus1 started at 1e-15 and rounded `0.5 + 16384 * theta`: a silent
 /// band got 8192 instead of 0, and one angle in two was one step too high.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn stereo_angles_are_the_ones_libopus_computes() {
     let mut noise = Noise(3);
     let mut checked = 0;
@@ -638,7 +638,7 @@ fn agreement(
 /// Without resynthesis libopus leaves the collapse mask of a band without
 /// pulses at 0; opus1 gave it the mask of a filled band.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn mono_bands_are_coded_as_libopus_codes_them() {
     for (lm, bytes) in [(3usize, 160usize), (3, 60), (2, 80), (1, 40), (0, 30)] {
         let (same, first) = agreement(1, lm, bytes, 9, 200, 11 + lm as u32, false);
@@ -659,7 +659,7 @@ fn mono_bands_are_coded_as_libopus_codes_them() {
 /// The frames mix bands coded as mid and side, intensity stereo and dual
 /// stereo (`stereo_choice`).
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn stereo_bands_are_coded_as_libopus_codes_them() {
     for complexity in [5, 9] {
         for (lm, bytes) in [(3usize, 160usize), (3, 60), (3, 400), (2, 80), (1, 40), (0, 30)] {
@@ -677,7 +677,7 @@ fn stereo_bands_are_coded_as_libopus_codes_them() {
 /// 19, 20). Also with phase inversion disabled, and with bands whose energy
 /// in one channel is below `MIN_STEREO_ENERGY`.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn bands_of_hybrid_and_narrow_frames_are_coded_as_libopus_codes_them() {
     let mut noise = Noise(77);
     let mut frames = 0;
@@ -744,7 +744,7 @@ fn bands_of_hybrid_and_narrow_frames_are_coded_as_libopus_codes_them() {
 /// root of the energies and to the root. At band energies of 1e-6 and
 /// below this changes the weights, and so the pulses.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn stereo_bands_that_are_scaled_copies_at_low_levels_are_coded_as_libopus_codes_them() {
     let m = default_mode();
     let mut noise = Noise(91);
@@ -915,7 +915,7 @@ fn decode_both(f: &Frame, bytes: &[u8]) -> (Coded, Coded) {
 /// `celt_inner_prod` (on arm64 the NEON form) and `mid * mid + side` fused;
 /// opus1 summed one value at a time without fusing.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn bands_are_decoded_as_libopus_decodes_them() {
     for channels in [1usize, 2] {
         for (lm, bytes) in [(3usize, 160usize), (3, 60), (2, 80), (1, 40), (0, 30)] {

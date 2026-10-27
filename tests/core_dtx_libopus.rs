@@ -756,7 +756,7 @@ fn dtx_controls() {
 /// bit of some samples of their last 2.5 ms (4 of 480 samples of packet 21
 /// of `24 kHz 1 ch voip 40/2 ms 48000 b/s c9 Cbr speech with pauses`).
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn opus1_dtx_streams_decode_like_libopus() {
     let mut rng = Lcg(41);
     let (mut streams, mut dtx_checked, mut not_identical, mut total) = (0, 0, 0, 0);

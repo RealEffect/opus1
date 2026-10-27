@@ -25,7 +25,7 @@ use std::os::raw::{c_int, c_uchar};
 
 /// Without the feature `alloc`, opus1 refuses with `AllocFail` a call that
 /// has to keep more than 32 extensions or to copy more than 1275 bytes of
-/// old padding, where libopus allocates (docs/10, "Packet padding
+/// old padding, where libopus allocates (docs/guide/10, "Packet padding
 /// extensions"). Such a call is not compared.
 fn allocation_refused(e: opus1::Error) -> bool {
     cfg!(not(feature = "alloc")) && e.kind() == opus1::ErrorKind::AllocFail
@@ -905,7 +905,7 @@ fn malformed_packets_give_the_errors_of_libopus() {
 /// extensions added: libopus and opus1 decode them as the packets without
 /// extensions, and the repacketizer gives libopus's bytes.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn encoded_packets_with_extensions_decode_as_without() {
     use opus1::{Application, Bitrate, Channels, OpusDecoder, OpusEncoder, SampleRate};
     let mut enc = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();

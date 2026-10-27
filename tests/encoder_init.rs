@@ -96,7 +96,7 @@ fn init_encodes_like_new() {
 /// than 256 KB there.
 ///
 /// The encoder is then used on the main thread, because encoding needs
-/// more stack than building: about 100 KB, see docs/06.
+/// more stack than building: about 100 KB, see docs/guide/06.
 ///
 /// The first encoder of a program also builds the shared tables (the CELT
 /// mode, and the built-in models of DRED with that feature); if this test

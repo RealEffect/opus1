@@ -83,7 +83,7 @@ fn decoded_snr(rs: &[u8], c: &[u8]) -> f64 {
 /// there is one right answer. opus1 reaches it: all 160 bytes are equal
 /// at the tip of integ6 (4726c16). When the test was ignored, 132 were.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn sine_48k_mono_64k_is_the_packet_of_libopus() {
     let (rs, c) = first_packets(&make_sine(48000, 1, 960, 440.0));
     let (equal, first) = equal_bytes(&rs, &c);
@@ -99,7 +99,7 @@ fn sine_48k_mono_64k_is_the_packet_of_libopus() {
 /// 160 are.
 #[cfg(feature = "analysis")]
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn impulse_48k_mono_64k_is_the_packet_of_libopus() {
     let mut pcm = vec![0.0f32; 960];
     pcm[0] = 1.0;

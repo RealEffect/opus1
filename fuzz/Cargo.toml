@@ -14,7 +14,7 @@ libfuzzer-sys = "0.4"
 opus1 = { path = "..", features = ["__internals"] }
 # The raw C interface of libopus, the reference the differential targets
 # compare with. It finds libopus as the main crate's tests do (see
-# docs/09-testing.md, "How libopus is linked").
+# docs/guide/09-testing.md, "How libopus is linked").
 audiopus_sys = "0.2"
 
 # `dnn`: opus1's neural network features, for `fuzz_dnn_blob` only. That

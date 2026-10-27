@@ -132,7 +132,7 @@ fn parse_exact(exit: i32, stderr: &str) -> Outcome {
 }
 
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn port_matches_the_recorded_c_values() {
     let cases = compare_cases();
     let expected: Vec<Vec<&str>> = EXPECTED

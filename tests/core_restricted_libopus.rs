@@ -4,11 +4,11 @@
 //!
 //! - `RestrictedCelt` codes CELT-only packets. opus1's CELT encoder is
 //!   libopus's byte for byte, so the packets and the final ranges are
-//!   compared byte for byte (on 64-bit ARM, see docs/10, Platforms). They
+//!   compared byte for byte (on 64-bit ARM, see docs/guide/10, Platforms). They
 //!   are also the packets of `RestrictedLowDelay`.
 //! - `RestrictedSilk` codes SILK-only packets. opus1's SILK encoder is a
 //!   port of the fixed-point SILK encoder, and the linked libopus is the
-//!   float build, so the bytes after the first one differ (docs/10, SILK).
+//!   float build, so the bytes after the first one differ (docs/guide/10, SILK).
 //!   The tests compare what the two encoders must share: the configuration
 //!   and the stereo flag of every packet (its first byte without the frame
 //!   count code), the size of every constant-bitrate packet, the state a
@@ -345,14 +345,14 @@ fn check_celt_stream(
 /// stereo, frames of 2.5 to 120 ms, low to high bitrates and complexities
 /// 0, 5 and 10. Frames of up to 20 ms are coded with VBR, constrained VBR
 /// and CBR. Longer packets hold several 20 ms frames, which opus1 codes
-/// without libopus's limit of each frame under VBR on purpose (docs/10,
+/// without libopus's limit of each frame under VBR on purpose (docs/guide/10,
 /// Deliberate differences), so they are compared with CBR.
 ///
 /// At complexity 10 the speech and music analysis runs, so the test needs
 /// the feature `analysis`.
 #[test]
 #[cfg(feature = "analysis")]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn restricted_celt_packets_and_final_ranges_are_libopus() {
     // A debug build codes a part of the matrix.
     let debug = cfg!(debug_assertions);
@@ -529,7 +529,7 @@ fn restricted_silk_packets_follow_libopus() {
 /// changes its rate. In every stream the first packet where the two setups
 /// differ is the same in opus1 as in libopus, or there is none in both.
 /// Packets of 80 to 120 ms are coded with CBR only: with VBR opus1 leaves
-/// out libopus's limit of each of their frames on purpose (docs/10,
+/// out libopus's limit of each of their frames on purpose (docs/guide/10,
 /// Deliberate differences), which changes SILK's internal rate at low
 /// bitrates. Every packet of opus1's `RestrictedSilk` stream also has the
 /// configuration and stereo flag of libopus's.

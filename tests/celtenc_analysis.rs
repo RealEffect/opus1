@@ -408,7 +408,7 @@ fn short_vbr_frames_stay_below_510_kbps() {
 /// channels, 8, 16 and 48 kHz, frames of 2.5 to 20 ms, constant and
 /// variable bitrate.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it() {
     use opus1::internals::hp_cutoff::dc_reject_float;
     // A debug build (the `no_std` check runs one) codes a part of the matrix.

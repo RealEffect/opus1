@@ -1,6 +1,6 @@
 # Testing
 
-This document explains how opus1 is tested. Most tests run the C library libopus in the same process and compare its output with the output of opus1. The sections below cover how libopus is linked, what the tests check, and the groups of test files. They then cover the checks against a fixed-point build of libopus, and the evaluation tools: the conformance test of RFC 8251 and the comparison of decoded audio with the original. Then come fuzzing, the `#![no_std]` checks, the ignored tests and the documentation examples. The last section gives the command for each part.
+This document explains how opus1 is tested. Most tests run the C library libopus in the same process and compare its output with the output of opus1. The sections below cover how libopus is linked, what the tests check, and the groups of test files. They then cover the checks against a fixed-point build of libopus, and the evaluation tools: the conformance test of RFC 8251 and the comparison of decoded audio with the original. Then come fuzzing, the `#![no_std]` checks, the ignored tests, the documentation examples, and the tests on an Android phone and on an x86-64 computer. The last section gives the command for each part.
 
 ## Terms used here
 
@@ -17,18 +17,18 @@ This document explains how opus1 is tested. Most tests run the C library libopus
 
 ## The test suite in numbers
 
-Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-apple-darwin`) with the default features:
+Counted with `cargo test --release -- --list` on 64-bit ARM macOS (`aarch64-apple-darwin`) with the default features, at commit `9891020`:
 
 | Part | Files | Tests |
 |---|---:|---:|
-| Integration tests in `tests/*.rs` | 289 | 1300 |
-| Unit tests inside `src/` | - | 401 |
-| Documentation tests: the doc comments of `src/` (15) and the Rust examples of `README.md` and `docs/` (55) | - | 70 |
-| **Total** | | **1771** |
+| Integration tests in `tests/*.rs` | 289 | 1302 |
+| Unit tests inside `src/` | - | 408 |
+| Documentation tests: the doc comments of `src/` (15) and the Rust examples of `README.md` and `docs/guide/` (55) | - | 70 |
+| **Total** | | **1780** |
 
-29 of these tests are ignored, and the listing shows one more documentation example apart, which is not run (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 16 directories of shared helper code (for example `tests/k24_common/` and `tests/analysis_common/`) and 6 files of recorded reference values (`*.expected`).
+29 of these tests are ignored, and the listing shows one more documentation example apart, which is not run (see [Ignored tests](#ignored-tests)). Some unit tests exist only on 64-bit ARM, because they test NEON code. So the count differs on other targets. `tests/` also has 17 directories of shared helper code (for example `tests/k24_common/` and `tests/analysis_common/`) and 2 files of recorded reference values (`tests/eval_moc.expected` and `tests/eval_opus_compare.expected`).
 
-A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1645 tests that are not ignored on Apple M4 Pro (commit `5e899cd`). On the branch `next-dred` (commit `8aedd12`), `cargo test --release` passed all 1659 tests that are not ignored. On the branch `next-gaps`, with the tests of phase inversion disabling, the decoder gain and pitch, the 24-bit calls and the multistream controls (`core_controls_libopus`, `multistream_controls_libopus`), it passed all 1676 tests that are not ignored (30 ignored). On the branch `next-release` (commit `3ecd7e0`, the x86 work included), `cargo test --release` without the corpora passed all 1676 tests that are not ignored (30 ignored, the documentation example included). On the branch `release/0.2.0-api`, which reviewed the public interface for 0.2.0, `cargo test --release` passed all 1742 tests that are not ignored (30 ignored, the documentation example included).
+A full run, `cargo test --release` with the RFC 8251 test vectors present (see [Corpora](#corpora)), passed all 1645 tests that are not ignored on Apple M4 Pro (commit `5e899cd`). On the branch `next-dred` (commit `8aedd12`), `cargo test --release` passed all 1659 tests that are not ignored. On the branch `next-gaps`, with the tests of phase inversion disabling, the decoder gain and pitch, the 24-bit calls and the multistream controls (`core_controls_libopus`, `multistream_controls_libopus`), it passed all 1676 tests that are not ignored (30 ignored). On the branch `next-release` (commit `3ecd7e0`, the x86 work included), `cargo test --release` without the corpora passed all 1676 tests that are not ignored (30 ignored, the documentation example included). On the branch `release/0.2.0-api`, which reviewed the public interface for 0.2.0, `cargo test --release` passed all 1742 tests that are not ignored (30 ignored, the documentation example included). At commit `9891020`, with the fixed-point build of `libopus-fixed` compiled from the 1.6.1 release, `cargo test --release` without the corpora passed all 1751 tests that are not ignored (30 ignored, the documentation example included) on Apple M4 Pro.
 
 The 23 files of the neural network code (`tests/dnn_*.rs`) have no tests in the default build: they need a model feature, and 12 of them also need `test-libopus-dnn` (see [Tests of the neural network code](#tests-of-the-neural-network-code)).
 
@@ -49,10 +49,11 @@ Cargo merges the features of both requests for opus1. So `cargo test`, `cargo be
 
 ## How libopus is linked
 
-Two development dependencies give the tests access to libopus:
+Three development dependencies give the tests access to libopus:
 
 - `opus` 0.3: a safe Rust wrapper around the libopus encoder and decoder.
 - `audiopus_sys` 0.2: the raw C interface of libopus. The tests need it for controls that `opus` does not expose. Examples are forcing the coding mode (`OPUS_SET_FORCE_MODE`), decoding with the FEC flag (`opus_decode_float` with `decode_fec = 1`), the repacketizer and the multistream functions.
+- `libopus-fixed`: a test-only crate of this repository (`tools/libopus-fixed/`). It compiles the fixed-point build of libopus 1.6.1 from its source, for the tests of the SILK encoder (see [Checks against the fixed-point build of libopus](#checks-against-the-fixed-point-build-of-libopus)).
 
 `opus` uses `audiopus_sys`, so both reach the same libopus. Some tests also call internal functions of libopus directly, such as its fast Fourier transform (FFT), its pitch search and its comb filter (`tests/perfk_fft_libopus.rs`, `tests/perfk_pitch_libopus.rs`, the module `comb_filter_libopus_tests` in `src/celt.rs`). That works because libopus is linked as a static library, which is the default of `audiopus_sys` on macOS.
 
@@ -81,7 +82,7 @@ LIBOPUS_LIB_DIR = "/opt/homebrew"
 LIBOPUS_NO_PKG = "1"
 ```
 
-The libopus that Homebrew ships is a floating-point build. Its SILK encoder is the floating-point one. The SILK encoder of opus1 is a port of the fixed-point one, so SILK encoder packets are compared against a separate fixed-point build (see [Checks against the fixed-point build of libopus](#checks-against-the-fixed-point-build-of-libopus)).
+The libopus that Homebrew ships is a floating-point build. Its SILK encoder is the floating-point one. The SILK encoder of opus1 is a port of the fixed-point one, so SILK encoder packets are compared against a separate fixed-point build, which `libopus-fixed` compiles. It needs the source of libopus 1.6.1 (see [Checks against the fixed-point build of libopus](#checks-against-the-fixed-point-build-of-libopus)).
 
 ## What the tests check
 
@@ -130,14 +131,14 @@ A test file's name starts with a prefix that says what it covers. The counts are
 
 | Prefix | Files | Tests | What the files cover |
 |---|---:|---:|---|
-| `multistream_` | 36 | 294 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`), the surround analysis (`_surround_*`), and the speech and music analysis and DTX of each stream (`_analysis_libopus`, `_analysis_walk_libopus`, `_dtx_libopus`). |
-| `core_` | 38 | 243 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, the error codes (`core_error_kinds_libopus`), channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the stereo width estimate (`core_stereo_width_libopus`, bit for bit against libopus's `compute_stereo_width`), the speech and music analysis (`core_analysis_libopus`, and with settings that change during a stream `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`) and the decoder controls of the neural network features. |
+| `multistream_` | 38 | 300 | The multistream encoder and decoder (several Opus streams in one packet, for surround sound) against libopus's multistream functions: layouts (`_c_layout`), rates, the decoder (`_dec_*`), the encoder (`_enc_*`), end to end (`_e2e_*`), the surround analysis (`_surround_*`), and the speech and music analysis and DTX of each stream (`_analysis_libopus`, `_analysis_walk_libopus`, `_dtx_libopus`). |
+| `core_` | 39 | 251 | The top layer, `OpusEncoder` and `OpusDecoder`, against libopus: controls, the error codes (`core_error_kinds_libopus`), channel counts, packet loss, FEC, mode switches and their redundant frames, packet framing, limits, 16-bit output, the high-pass filter in front of SILK, the stereo width estimate (`core_stereo_width_libopus`, bit for bit against libopus's `compute_stereo_width`), the speech and music analysis (`core_analysis_libopus`, and with settings that change during a stream `core_analysis_walk_libopus`), DTX (`core_dtx_libopus`), the decoder controls of the neural network features, and the packets of the fixed-point build (`core_fixed_point`). |
 | `dnn_` | 23 | 0 | The neural network code: kernels, the layers of every network, weights, signal analysis, the models of deep PLC and of OSCE. Their tests compile only with a model feature (see [Tests of the neural network code](#tests-of-the-neural-network-code)). |
-| `perfk_` | 33 | 114 | Guards for the speed work. Each rewritten kernel is compared with the libopus function, with reference values recorded from libopus, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
+| `perfk_` | 33 | 114 | Guards for the speed work. Each rewritten kernel is compared with the same function of the linked libopus or of its fixed-point build, or with the code from before the rewrite (`tests/perfk_nsq_replay.rs` keeps the old quantizers for that). |
 | `celtenc_` | 19 | 93 | Decisions of the CELT encoder against libopus: band energies, stereo, the pitch pre-filter, the low-frequency effects (LFE) channel, the energy mask, mode switching, the rate rules (`celtenc_rate_rules.rs`), the results of the speech and music analysis (`celtenc_analysis_info_libopus.rs`). |
-| `issue_` | 14 | 75 | Regression tests named after GitHub issues, most of them against libopus (for example `issue_42_stereo_channels.rs`). `issues_repro.rs` adds 14 more tests. |
+| `issue_`, `issues_` | 15 | 89 | Regression tests named after GitHub issues, most of them against libopus (for example `issue_42_stereo_channels.rs`). `issues_repro.rs` holds 14 of the tests. |
 | `k24_` | 21 | 72 | The 24 kilohertz (kHz) path: decoding at every output rate, encoding in each mode, SILK loss handling. `k24_main_use.rs` lets libopus choose the mode, as in a real call. |
-| `silk_` | 14 | 66 | SILK parts tested one by one: the bitstream, Burg analysis, linear predictive coding (LPC), the normalized line spectral frequencies (NLSF), the quantizer, and packets of the fixed-point build. |
+| `silk_` | 14 | 67 | SILK parts tested one by one: the bitstream, Burg analysis, linear predictive coding (LPC), the normalized line spectral frequencies (NLSF), the quantizer, and packets of the fixed-point build. |
 | `celtdec_` | 4 | 38 | The CELT decoder: channel conversions, edge cases, loss concealment and robustness, against libopus. |
 | `silkdec_` | 10 | 31 | The SILK decoder alone (`SilkDecoder`), against libopus with SILK-only streams. These require identical 16-bit samples. |
 | `eval_` | 5 | 26 | The evaluation tools: the ports of `opus_compare`, MOC and the `opus_demo` loop against their C and Python originals, the RFC 8251 conformance test, and the paired-comparison harness (see [Evaluation tools](#evaluation-tools)). |
@@ -146,9 +147,9 @@ A test file's name starts with a prefix that says what it covers. The counts are
 | `hybrid_` | 4 | 19 | Hybrid mode encoding and decoding. |
 | `celt_` | 8 | 17 | CELT round trips and regressions. |
 | `mdct_` | 16 | 17 | The modified discrete cosine transform (MDCT): identity, gain and round trips. |
-| `verify_` | 5 | 16 | Band, PVQ (pyramid vector quantization), energy and SILK results against values from small C reference programs. |
+| `verify_` | 5 | 17 | Band energies, normalisation, energy quantization, PVQ (pyramid vector quantization), the SILK decoder and the SILK resampler against the same libopus functions on the same input; and a SILK round trip. Since commit `5c833c1` they call libopus instead of comparing with values that small C programs once printed. The exact comparison of band results is ignored off 64-bit ARM, where one energy differs in its last bit; a comparison within a few units in the last place runs everywhere. |
 | `pvq_` | 4 | 7 | The PVQ codebook: its tables, its signs, and agreement between encoder and decoder. |
-| other | 20 | 102 | Single files, for example `stack_usage_test.rs` (struct sizes and stack use), `panic_surface_repro.rs` (inputs that used to panic), `fuzz_toc_sequences.rs`, `proptest_encode_indices.rs` and `oracle_celt.rs`. |
+| other | 22 | 98 | Single files, for example `stack_usage_test.rs` (struct sizes and stack use), `panic_surface_repro.rs` (inputs that used to panic), `fuzz_toc_sequences.rs`, `proptest_encode_indices.rs` and `oracle_celt.rs`. |
 
 Two files compare against reference files that are not in the repository. `tests/c_interop_diff.rs` reads `/tmp/opus_ref/`. `tests/multistream_interop.rs` reads `tmp/opus_ref/` under the crate root. Without those files their tests print a message and pass without checking anything.
 
@@ -198,27 +199,50 @@ The vector kernels have unit tests that compare them with scalar versions of the
 - `celt::comb_inplace_tests::const_part_neon_matches_portable_version`
 - `analysis::neon::tests::tonality_bins_match_the_scalar_code`, and the other tests of `src/analysis/neon.rs` (downmix, window, network) and `analysis::tests::vector_silence_test_matches_the_scalar_loop`
 
-Run them with `cargo test --release --lib`. The NEON tests run only on 64-bit ARM. The x86-64 vector code was only compiled in this release, not run (see [Differences from libopus](10-differences-from-libopus.md#platforms)).
+Run them with `cargo test --release --lib`. The NEON tests run only on 64-bit ARM, and the x86 tests only on x86-64. The x86-64 vector code runs in the scripts of [Tests on an x86-64 computer](#tests-on-an-x86-64-computer). Its output is correct but not bit-exact with libopus (see [Differences from libopus](10-differences-from-libopus.md#platforms)).
 
 ## Checks against the fixed-point build of libopus
 
-The SILK encoder of opus1 is a port of the fixed-point SILK encoder of libopus (`silk/fixed`). The linked libopus is a floating-point build, so it does not contain that encoder. The fixed-point comparisons therefore use values recorded from a separate build:
+The SILK encoder of opus1 is a port of the fixed-point SILK encoder of libopus (`silk/fixed`). The linked libopus is a floating-point build, so it does not contain that encoder. The tests therefore also link a fixed-point build of libopus, and call it on the same input as opus1. The test-only crate `libopus-fixed` (`tools/libopus-fixed/`) compiles that build when the tests are built:
 
-1. The source of the official libopus 1.6.1 release (the tarball named in [Which libopus source to build](#which-libopus-source-to-build)) is compiled with `cc` alone, without `configure` or cmake. The C files are the ones that `opus_sources.mk`, `celt_sources.mk` and `silk_sources.mk` list (`OPUS_SOURCES`, `OPUS_SOURCES_FLOAT`, `CELT_SOURCES`, `SILK_SOURCES` and `SILK_SOURCES_FIXED`). The flags are `-O2 -DFIXED_POINT -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF -DHAVE_LRINT`.
-2. A small C program drives it: either `opus_encode` with the controls a test names, or one internal function (for example `silk_burg_modified_c`). For `opus_encode`, each control is set before the first packet and again whenever its value changes.
-3. Its output is recorded into the test files:
-   - packet bytes as hexadecimal text (`tests/silk_fixed_point_compare.rs`, 280 packets),
-   - a 32-bit FNV-1a (Fowler-Noll-Vo) hash of every packet (`tests/core_fixed_point.rs`),
-   - function results in `tests/perfk_silk_burg.expected`, `tests/perfk_silk_nsq_plain.expected`, `tests/perfk_silk_pitch_core.expected` and `tests/perfk_silk_process_nlsfs.expected`.
-4. The C program and the Rust test make their input with the same integer-only generator. Each recorded row carries a checksum of its input, so a test can tell that both used the same samples. For the tests that code speech, the input is the test's own 16-bit samples, written to a file.
+1. Its build script (`tools/libopus-fixed/build.rs`) compiles the source of the official libopus 1.6.1 release with the `cc` crate, without `configure` or cmake. The C files are the ones that `opus_sources.mk`, `celt_sources.mk` and `silk_sources.mk` list (`OPUS_SOURCES`, `OPUS_SOURCES_FLOAT`, `CELT_SOURCES`, `SILK_SOURCES` and `SILK_SOURCES_FIXED`), so the build has no vector code and no neural network code. The flags are `-O2 -DFIXED_POINT -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF -DHAVE_LRINT`. MSVC (Microsoft's C compiler) has no variable-length arrays and gets `USE_ALLOCA` instead. That changes where the scratch memory is, not the results.
+2. Both builds of libopus define the same symbols, such as `opus_encode` and `silk_NSQ_c`. So the build script gives every global symbol of the fixed-point build the prefix `libopus_fixed_`, and checks that no symbol is left without it. Then the two builds link into one test program.
+3. `tools/libopus-fixed/shim.c` adds plain C entry points, named `fixed_ref_*`. They cover an encoder with its controls, and the SILK functions that take the encoder state, whose layout depends on how libopus was built. `tools/libopus-fixed/src/lib.rs` wraps them for the tests: `Encoder`, `burg_modified`, `pitch_analysis_core`, `hp_variable_cutoff`, `control_audio_bandwidth`, `nsq` and `process_nlsfs`.
 
-Do not build this reference from the libopus source that the crate `opus-head-sys` vendors. That source is libopus's main branch (commit `228a0f85`). Its fixed-point SILK encoder adds 1 to the frame energy of the Burg analysis (`silk/fixed/burg_modified_FIX.c`, line 72), which the 1.6.1 release does not. With it, the packets of every stream in `tests/core_fixed_point.rs` differ from 1.6.1's from packet 0 to 13 on, and 622 of the 1000 rows of `tests/perfk_silk_burg.expected` differ. Until October 2026 several of these tests held values from that source. They now hold the values of the release (see [Differences from libopus](10-differences-from-libopus.md#libopus-main-branch-and-the-161-release)).
+The build script looks for the source in this order:
 
-The fixed-point build and its driver programs are kept outside git, in the git-ignored folder `target/perf/fixed-1.6.1/`: `build.py SRC OUT [driver.c ...]` builds the library `OUT/libopus_fixed.a` and links each driver program in `drivers/`. Only the recorded values are in the repository, so the tests run without the C build.
+1. the folder that the environment variable `LIBOPUS_SRC_1_6_1` names;
+2. `opus-1.6.1/` in the repository;
+3. `target/perf/libopus-1.6.1-src/opus-1.6.1/`, where `scripts/android/build-libopus.sh` looks too (see [Which libopus source to build](#which-libopus-source-to-build)).
 
-These tests require identical results: the same packets, or the same integers. In the recorded streams, the SILK-only packets of opus1 with the `Voip` application and 16-bit input (`OpusEncoder::encode_i16`) are byte for byte those of the fixed-point build. The same holds for 47 of the 49 SILK streams of the golden file. At 48 kHz opus1's SILK reads the float high-pass filter, not the fixed-point build's integer one (see [Differences from libopus](10-differences-from-libopus.md#deliberate-differences)). A test that compares packets at 48 kHz first calls the test control `internals::silk_input::set_integer_hp_at_48k`, which brings back the integer filter. In rare frames opus1's SILK also takes a quantization gain from the residual energy of the unscaled signal, where the fixed-point build reads a residual energy with a large rounding error (see [Differences from libopus](10-differences-from-libopus.md#silk)). None of the recorded streams has such a frame. A test that needs the fixed-point build's gains in such frames calls the test control `internals::silk_input::set_fixed_point_res_nrg`.
+A git worktree has its own `target/` folder, so a test run there needs `LIBOPUS_SRC_1_6_1`, for example in `.cargo/config.toml`:
 
-The fixed-point build runs libopus's speech and music analysis only at complexity 10, for input at 16 to 48 kHz (the float build runs it from complexity 7). opus1 has no such analysis. In the recorded streams at complexity 10 with 16 kHz input, and in `silk_wb_16k_mono_20k_vbr_c10_20ms` of the golden file, the packets are equal all the same. [Differences from libopus](10-differences-from-libopus.md#silk) lists the cases where the packets of longer streams start to differ.
+```toml
+[env]
+LIBOPUS_SRC_1_6_1 = "/path/to/opus-1.6.1"
+```
+
+Without the source, or when its build fails, cargo prints a warning and builds the crate without the library. Each of its functions then panics with the reason. So the tests that need the fixed-point build fail and say why, and the other tests still run. After you put the source in place, run `cargo clean -p libopus-fixed` so that cargo runs the build script again. `scripts/x86/test.sh` and `test.ps1` unpack the release they download and set `LIBOPUS_SRC_1_6_1` themselves.
+
+These tests call the fixed-point build:
+
+| File | What it compares |
+|---|---|
+| `silk_fixed_point_compare.rs` | An encoder of the fixed-point build next to `OpusEncoder`: SILK-only, `Voip`, mono, 16-bit input. Every packet, byte for byte. |
+| `core_fixed_point.rs` | The same for more settings: stereo input, complexity changes, digital silence, prediction disabled, SILK rate switches, and DTX decided by SILK (every packet and `in_dtx`). For Hybrid packets and rate switches it compares the SILK layers only. |
+| `core_voip_input_filter.rs` | With the integer high-pass filter, opus1's SILK-only packets are those of the fixed-point build. |
+| `perfk_silk_burg.rs`, `perfk_silk_pitch_core.rs`, `perfk_silk_nsq_plain.rs`, `perfk_silk_process_nlsfs.rs` | Burg's method, the core of the pitch analysis, the plain noise-shaping quantizer and the NLSF processing, on the same input. The quantizer test compares the whole quantizer state after every frame. |
+| `silk_nsq_test.rs` | `silk_NSQ_c` and `silk_NSQ_del_dec_c` from the same state: the pulses, the whole quantizer state and the seed, with 1 to 4 states of the delayed-decision quantizer. |
+| `silk_hp_variable_cutoff.rs` | `silk_HP_variable_cutoff` on the same sequence of encoder states. |
+| `silkenc_control.rs` | `silk_control_audio_bandwidth`, called on both sides. |
+
+Until commit `9218041` (2026-10-26) these tests held values recorded once from C programs: packet bytes as hexadecimal text, hashes of packets, and four `.expected` tables. They now call the build itself.
+
+Do not point `LIBOPUS_SRC_1_6_1` at the libopus source that the crate `opus-head-sys` vendors. That source is libopus's main branch (commit `228a0f85`). Its fixed-point SILK encoder adds 1 to the frame energy of the Burg analysis (`silk/fixed/burg_modified_FIX.c`, line 72), which the 1.6.1 release does not. With it, the packets of every stream in `tests/core_fixed_point.rs` differ from 1.6.1's from packet 0 to 13 on, and 622 of the 1000 cases of `tests/perfk_silk_burg.rs` differ. Until October 2026 several of these tests held values from that source (see [Differences from libopus](10-differences-from-libopus.md#libopus-main-branch-and-the-161-release)).
+
+These tests require identical results: the same packets, or the same integers. In the streams of these tests, the SILK-only packets of opus1 with the `Voip` application and 16-bit input (`OpusEncoder::encode_i16`) are byte for byte those of the fixed-point build. The same holds for 47 of the 49 SILK streams of the golden file. At 48 kHz opus1's SILK reads the float high-pass filter, not the fixed-point build's integer one (see [Differences from libopus](10-differences-from-libopus.md#deliberate-differences)). A test that compares packets at 48 kHz first calls the test control `internals::silk_input::set_integer_hp_at_48k`, which brings back the integer filter. In rare frames opus1's SILK also takes a quantization gain from the residual energy of the unscaled signal, where the fixed-point build reads a residual energy with a large rounding error (see [Differences from libopus](10-differences-from-libopus.md#silk)). None of the streams of these tests has such a frame. A test that needs the fixed-point build's gains in such frames calls the test control `internals::silk_input::set_fixed_point_res_nrg`.
+
+The fixed-point build runs libopus's speech and music analysis only at complexity 10, for input at 16 to 48 kHz (the float build runs it from complexity 7). opus1 has no such analysis. In the streams of these tests at complexity 10 with 16 kHz input, and in `silk_wb_16k_mono_20k_vbr_c10_20ms` of the golden file, the packets are equal all the same. [Differences from libopus](10-differences-from-libopus.md#silk) lists the cases where the packets of longer streams start to differ.
 
 ## Evaluation tools
 
@@ -457,7 +481,7 @@ The analysis (`src/analysis/`) is compared with libopus at three levels. The Hom
 | `core_dtx_libopus.rs` | 14 | DTX of `OpusEncoder` against libopus: the 1-byte packets, `in_dtx` and the CBR sizes in the same places. CELT-only DTX in 840 streams (920,530 packets) byte for byte; streams with SILK and Hybrid; packets of several frames; decoding of opus1's DTX streams. |
 | `multistream_dtx_libopus.rs` | 4 | DTX of `MultistreamEncoder` against libopus for every layout of the test matrix. |
 
-`core_fixed_point.rs` also holds the hashes of six DTX streams of the fixed-point build (768 packets). The tests that compare with the fixed-point build run opus1's analysis at complexity 10 only, as that build does (`set_analysis_gate(AnalysisGate::FixedPointBuild)`).
+`core_fixed_point.rs` also compares six streams with DTX decided by SILK with the fixed-point build: every packet and `in_dtx`, for 20 to 120 ms, mono and stereo, VBR and CBR, complexity 0 to 9. The tests that compare with the fixed-point build run opus1's analysis at complexity 10 only, as that build does (`set_analysis_gate(AnalysisGate::FixedPointBuild)`).
 
 Each kind of difference these tests guard was put into a copy of the code once, and the tests failed. For example: a sum of the band tonality without the fused rounding of the Homebrew build, the downmix without its fused sum, the input precision of 16-bit input, the read position of packets of several frames, the speech estimate kept across a reset, the symmetric distance cache of the spectral variability, and the CBR padding of packets whose frames were all left out by DTX.
 
@@ -618,7 +642,7 @@ The four targets then ran again without a defect, 10.5 minutes each, as four pro
 
 ## `#![no_std]` checks
 
-Without its default features, opus1 builds as `#![no_std]` with no heap allocation (see the [README](../README.md)). `scripts/check_no_std.sh` checks this:
+Without its default features, opus1 builds as `#![no_std]` with no heap allocation (see the [README](../../README.md)). `scripts/check_no_std.sh` checks this:
 
 It does each step three times: with `--features libm`, with `--features libm,analysis`, which adds the speech and music analysis, and with `--features alloc,libm`, which adds the `multistream` module for a target that has a global allocator.
 
@@ -644,7 +668,7 @@ The multistream module needs the `alloc` feature, so the first two runs leave it
 
 ## Documentation examples
 
-`src/lib.rs` includes `README.md` and each file of `docs/` that has Rust examples. Each file becomes the documentation of a private item under `#[cfg(all(doctest, feature = "std"))]`. So `cargo test --doc` compiles and runs every `rust` block of these files. An example must be a complete program fragment that uses `unwrap` or `expect`. Hidden lines (lines that start with `# `) are not used, because GitHub would show them. The examples need the `std` feature, because some use the `multistream` module. They also run without `heap`: `cargo test --doc --no-default-features --features std`.
+`src/lib.rs` includes `README.md` and each file of `docs/guide/` that has Rust examples. Each file becomes the documentation of a private item under `#[cfg(all(doctest, feature = "std"))]`. So `cargo test --doc` compiles and runs every `rust` block of these files. An example must be a complete program fragment that uses `unwrap` or `expect`. Hidden lines (lines that start with `# `) are not used, because GitHub would show them. The examples need the `std` feature, because some use the `multistream` module. They also run without `heap`: `cargo test --doc --no-default-features --features std`.
 
 ## Tests on an Android phone
 
@@ -903,6 +927,49 @@ The earlier runs linked the main branch of libopus (see [Which libopus source to
 
 At git commit `f952b46`, the harness on the phone wrote a golden file identical in every field to `target/perf/golden_analysis.txt` of the Mac, against the `-O2` build of 1.6.1. Both encoders run the speech and music analysis in 104 of these streams (complexity 7 to 10 at 16 to 48 kHz, among them the 8 mode-switching streams), and the last bits of libopus's analysis at `-O2` changed none of libopus's packets there. Earlier, `golden.sh --check target/perf/golden_r6.txt` found 0 of 137 streams that differ, against the `-O2` build of 1.6.1 and against the build without vector loops. The golden file of the phone is identical in every field to the one of the Mac, whether the Mac links the Homebrew library or a build of 1.6.1 at `-O2` or `-Os`. So neither the vector code of `-O2` nor Android's C library changes a hash of these streams. Android's `acos`, `cos`, `exp` and `log` give other last bits than Apple's for some inputs. With the main branch, 86 of the 137 streams differed in the fields that depend on libopus's packets: `c_pk`, `dec_c`, `dec_c_plc` and `dec_c_burst`, and in 7 of them also `fec_silk`.
 
+## Tests on an x86-64 computer
+
+The scripts in `scripts/x86/` test and time opus1 on a 64-bit x86 computer. Each script explains its options and settings at its top.
+
+| Script | What it does |
+|---|---|
+| `test.sh` | Tests opus1 under Linux, also inside WSL2 (Windows Subsystem for Linux) on Windows. It needs a C compiler, `make`, `curl` and Rust. It writes `x86-results-<date>.tar.gz` in the repository root. |
+| `test.ps1` | The same natively on 64-bit Windows, with Rust's MSVC toolchain. It builds libopus with CMake and Visual Studio. It writes `x86-windows-results-<date>.zip` in the repository root. |
+| `ab.sh`, `ab.ps1` | Time two source trees of opus1 in turns on one computer: A, the baseline, named on the command line, and B, the tree that holds the script. `ab.sh` runs on Linux, WSL2 and macOS; `ab.ps1` on Windows. |
+| `ab_report.rs` | Writes the report of an A/B timing. It needs only `rustc`. |
+
+`test.sh` and `test.ps1` take the same steps:
+
+1. They record the CPU (central processing unit), its vector instruction sets (SSE2, AVX, AVX2, FMA, AVX-512, AVX-VNNI), the operating system and the tool versions.
+2. They download the libopus 1.6.1 release, or take the file that `OPUS_TARBALL` names, and check its SHA-256 sum. They build it twice as a static library: the default build, and a build with deep PLC, OSCE and DRED. `test.sh` uses libopus's `configure` script, at `-O2` and with libopus's run-time CPU detection. `test.ps1` uses CMake and Visual Studio, in the Release configuration. They also unpack the release for `libopus-fixed` and set `LIBOPUS_SRC_1_6_1` (see [Checks against the fixed-point build of libopus](#checks-against-the-fixed-point-build-of-libopus)).
+3. They run the whole test suite, linked with the default build.
+4. They run the tests that compare every x86 kernel variant of the neural networks that the CPU has (AVX2 with FMA, AVX-VNNI, AVX-512 VNNI) with the portable code. Then they run the tests against the libopus built with its neural network code.
+5. They check the golden file of 64-bit ARM and record how many streams differ. On Windows every stream differs: the golden file also holds libopus's packets (`c_pk`), and the libopus that Visual Studio builds gives other packets. Then they run `perf_harness modes`, which runs both encoders and both decoders on the same input and writes `modes.md`. It holds how far the two decoders agree, in decibels (dB), and the coding error of each encoder when libopus decodes its packets.
+6. They time encoding and decoding against the default libopus build.
+
+Their options:
+
+- `--quick` (`-Quick`) skips the timing of step 6.
+- `--no-dnn` (`-NoDnn`) skips the libopus build with the neural network code and the tests against it. The kernel tests of step 4 still run.
+- `--ab BASELINE_DIR` (`-AbBaseline DIR`) replaces the timing of step 6 with an A/B timing against the source tree `BASELINE_DIR`, by `ab.sh` or `ab.ps1`. `--passes N` (`-Passes N`) sets the number of runs of each build, 5 by default. With `--quick` the A/B step only builds the two programs.
+- `OPUS1_CORPUS` names a corpus folder with `rfc8251/`, for the conformance tests. Without it they are skipped (see [Corpora](#corpora)).
+
+On x86-64 the output of opus1 is correct but not bit-exact with libopus (see [Differences from libopus](10-differences-from-libopus.md#platforms)). The tests that require libopus's bits are ignored there, with the reason "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)". So on x86 the golden file of 64-bit ARM is only a record of how many streams differ. To see whether a change altered the output of opus1, write a golden file on the same computer with the tree before the change (`perf_harness golden --write FILE`), then check the tree after the change against it (`golden --check FILE`). `modes.md` shows whether the output is still correct.
+
+Each run of the test suite writes its cargo log (`NAME.txt`), the result line of each test program (`NAME-summary.txt`) and the failed tests (`NAME-failed.txt`). `summary.txt` collects the passed, failed and ignored counts of all runs. A test program that crashes, for example with a stack overflow, prints no result line. The scripts name such a program in `summary.txt` and `NAME-failed.txt`, with the reason that cargo gives, and count it as one failed test. If cargo fails and the log shows no failed test, the summary counts one failed test and says so.
+
+On Windows a thread cannot use all of its stack. Rust's standard library keeps 20 KB of each thread's stack for its stack overflow handler, and the end of the stack holds guard pages. So the four tests that run the neural network code on a thread of 64 KB give that thread 32 KB more on Windows (`thread_stack_size` in `tests/dnn_plc_common/mod.rs`, and the unit test `the_osce_path_runs_on_32_kb_of_stack`). On other systems the thread gets the size that the test names.
+
+The A/B timing runs the two builds in turns because the clock and the temperature of a computer change during a session. Two runs one right after the other see the same state, so each such pair gives one comparison. The order turns from pair to pair: with 5 passes it is A B B A A B B A A B. One run is the bench set of `perf_harness`, about 3 minutes on an Intel Core i7-12700. Both builds link the same libopus, so the libopus times are a control: their ratio B/A should stay near 1. The output folder holds `ab-report.md` (time of B divided by time of A, per scenario and as geometric means, for opus1 encode and decode and for libopus), `ab-summary.txt`, `pairs.md`, `system.txt`, `builds.txt` and the records of each run in `runs/`. `ab.sh` can also build for another target, for example `CARGO_BUILD_TARGET=x86_64-apple-darwin` under Rosetta 2 on a Mac.
+
+```text
+scripts/x86/test.sh
+scripts/x86/test.sh --ab ../opus1-base
+scripts/x86/ab.sh --passes 3 ../opus1-base -- --filter celt_fb_48k_mono --reps 3 --procs 1
+```
+
+`test.sh` and `test.ps1` ran on an Intel Core i7-12700 (AVX2, FMA and AVX-VNNI, no AVX-512) on 2026-10-21, under Linux in WSL2 and natively on Windows. [Performance](08-performance.md#on-x86-64) gives the timings. The tests that call the fixed-point build were also checked there with MSVC (commit `9218041`).
+
 ## How to run each part
 
 | What | Command |
@@ -928,6 +995,9 @@ At git commit `f952b46`, the harness on the phone wrote a golden file identical 
 | Golden hashes on a phone | `scripts/android/golden.sh --check <file>` |
 | Timings on a phone | `scripts/android/bench.sh --runs 2` |
 | Hardware counters and hot functions on a phone | `scripts/android/profile.sh --little <scenario> enc rust` |
+| Tests that call the fixed-point build | `LIBOPUS_SRC_1_6_1=<libopus 1.6.1 source> cargo test --release --test core_fixed_point` |
+| Tests on an x86-64 computer | `scripts/x86/test.sh` (Linux, WSL2) or `scripts/x86/test.ps1` (Windows) |
+| A/B timing of two source trees | `scripts/x86/ab.sh <baseline tree>` (Linux, WSL2, macOS) or `scripts/x86/ab.ps1` (Windows) |
 
 Run the tests with `--release`. The tests encode and decode seconds of audio per case. All timings in this document are for release builds.
 
@@ -937,4 +1007,4 @@ Run the tests with `--release`. The tests encode and decode seconds of audio per
 - [Differences from libopus](10-differences-from-libopus.md): what the tests show to differ.
 - [Architecture](07-architecture.md): where the code under test lives.
 - [Glossary](glossary.md): the terms used in these documents.
-- The documentation index: [README.md](README.md).
+- The documentation index: [README.md](../README.md).

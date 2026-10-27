@@ -13,7 +13,7 @@
 //! A stereo stream whose bitrate drops below the stereo threshold shows it.
 //! In the packet of the drop the stereo width falls to 0: the side channel
 //! fades out over 8 ms and then holds zeros, and it gets almost no bits.
-//! In the example of docs/10-differences-from-libopus.md (section SILK) the
+//! In the example of docs/guide/10-differences-from-libopus.md (section SILK) the
 //! gain of that frame came out 15 dB above the float build's, and the decoded
 //! left and right channels held a burst of energy below 200 Hz.
 //!
@@ -151,7 +151,7 @@ fn bursts(input: &[f32], out: &[f32], libopus: &[f32]) -> usize {
 /// | gains from libopus's energies (the fixed-point build) | 15 | 10 |
 /// | opus1 | 5 | 2 |
 ///
-/// docs/10-differences-from-libopus.md (section SILK) describes the bursts
+/// docs/guide/10-differences-from-libopus.md (section SILK) describes the bursts
 /// that stay.
 #[test]
 fn a_drop_of_the_stereo_bitrate_plays_fewer_low_frequency_bursts() {

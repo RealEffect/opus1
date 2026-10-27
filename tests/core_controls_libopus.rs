@@ -8,7 +8,7 @@
 //! return the same values, and a setter must refuse exactly the values
 //! libopus refuses. Packets are compared byte for byte where opus1's
 //! encoder is libopus's byte for byte: CELT-only frames of up to 20 ms
-//! (see docs/10-differences-from-libopus.md). Elsewhere a test compares
+//! (see docs/guide/10-differences-from-libopus.md). Elsewhere a test compares
 //! the mode of each packet.
 // Without `analysis`, the tests that compare encoded packets are left out.
 #![cfg_attr(not(feature = "analysis"), allow(dead_code, unused_imports))]
@@ -110,7 +110,7 @@ fn steps(packets: &[Vec<u8>]) -> Vec<Step<'_>> {
 /// Runs both decoders over `steps` with float output and compares every
 /// call. `check` runs after each call. The samples must be equal only on
 /// 64-bit ARM: elsewhere CELT and Hybrid output is not bit-exact with
-/// libopus (docs/10, Platforms), so only the lengths are compared there.
+/// libopus (docs/guide/10, Platforms), so only the lengths are compared there.
 fn decode_both(
     rust: &mut OpusDecoder,
     c: &mut CDecoder,
@@ -147,7 +147,7 @@ fn decode_both(
 // libopus runs its speech and music analysis at the default complexity.
 #[cfg(feature = "analysis")]
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn phase_inversion_disabled_encodes_as_libopus() {
     let rate = 48_000;
     let pcm = anti_phase_stereo(rate, rate);
@@ -212,7 +212,7 @@ fn phase_inversion_disabled_encodes_as_libopus() {
 /// a CELT stream that uses phase inversion to libopus's samples. The
 /// defaults are libopus's: on for a mono decoder, off for a stereo one.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn phase_inversion_disabled_decodes_as_libopus() {
     let rate = 48_000;
     let frame = rate / 50;
@@ -274,7 +274,7 @@ const GAINS: [i16; 13] = [-32768, -32767, -12000, -1536, -256, -1, 0, 1, 255, 15
 /// and FEC, with float, 16-bit and 24-bit output. Out-of-range values are
 /// refused by both, and the setting stays.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn gain_matches_libopus() {
     for (rate, channels) in [(48_000, 2), (48_000, 1), (16_000, 1), (24_000, 2)] {
         let frame = rate / 50;
@@ -360,7 +360,7 @@ fn gain_matches_libopus() {
 /// losses, FEC and resets, equals libopus's `OPUS_GET_PITCH`. Both the SILK
 /// lag and the CELT post-filter period show up with nonzero values.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn pitch_matches_libopus() {
     for (rate, channels) in [(48_000, 1), (48_000, 2), (16_000, 1), (8_000, 2), (12_000, 1)] {
         let frame = rate / 50;
@@ -447,7 +447,7 @@ fn pcm24(rate: usize, channels: usize, seconds: f64) -> Vec<i32> {
 // libopus runs its speech and music analysis at the default complexity.
 #[cfg(feature = "analysis")]
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn encode24_and_decode24_match_libopus() {
     for (rate, channels, app) in [
         (48_000, 2, APP_AUDIO),
@@ -573,7 +573,7 @@ fn errors_of_the_24_bit_calls_follow_libopus() {
 // libopus runs its speech and music analysis at the default complexity.
 #[cfg(feature = "analysis")]
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn set_application_follows_libopus() {
     let apps = [
         (APP_VOIP, Application::Voip),
@@ -696,7 +696,7 @@ fn c_bandwidth(bandwidth: Option<Bandwidth>) -> i32 {
 // libopus runs its speech and music analysis at the default complexity.
 #[cfg(feature = "analysis")]
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn encoder_bandwidth_matches_libopus() {
     let configs = [
         (48_000, 1, APP_AUDIO, Application::Audio),

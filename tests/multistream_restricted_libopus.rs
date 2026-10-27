@@ -18,7 +18,7 @@
 //!
 //! Every stream gets an explicit bitrate. With the automatic or the maximum
 //! bitrate, a surround encoder chooses another bandwidth than libopus on
-//! purpose (difference D1 of docs/10).
+//! purpose (difference D1 of docs/guide/10).
 #![cfg(feature = "std")]
 
 mod ms_support;
@@ -198,7 +198,7 @@ fn check_celt(layout: Layout, fs: i32, frame: usize, bitrate_per_channel: i32, c
 /// and music analysis runs, so the test needs the feature `analysis`.
 #[test]
 #[cfg(feature = "analysis")]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn restricted_celt_packets_and_final_ranges_are_libopus() {
     let debug = cfg!(debug_assertions);
     let layouts: &[Layout] = if debug { &LAYOUTS[..4] } else { &LAYOUTS };
@@ -240,7 +240,7 @@ fn restricted_silk_streams_follow_libopus() {
                     for vbr in [true, false] {
                         if vbr && frame > 3 * fs as usize / 50 {
                             // opus1 leaves out libopus's limit of each frame
-                            // of such a packet under VBR on purpose (docs/10).
+                            // of such a packet under VBR on purpose (docs/guide/10).
                             continue;
                         }
                         let label = format!("{layout:?}, {fs} Hz, {frame} samples, {bitrate_per_channel} b/s per channel, vbr {vbr}");

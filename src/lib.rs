@@ -40,7 +40,7 @@
 // needs a cargo feature with that feature. Other builds ignore this line.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Every `unsafe` block of the library needs a `// SAFETY:` comment that
-// says why it is sound (docs/07-architecture.md, "Unsafe code"). The unit
+// says why it is sound (docs/guide/07-architecture.md, "Unsafe code"). The unit
 // tests are left out: they call kernels directly, on inputs they build.
 #![cfg_attr(not(test), warn(clippy::undocumented_unsafe_blocks))]
 #![allow(clippy::too_many_arguments)]
@@ -138,7 +138,7 @@ mod rate;
 mod silk;
 mod simd_mem;
 
-/// The Rust examples in `README.md` and in `docs/`. `cargo test --doc`
+/// The Rust examples in `README.md` and in `docs/guide/`. `cargo test --doc`
 /// compiles and runs every ` ```rust ` block in these files, so the
 /// examples stay in step with the code. Nothing here is part of the
 /// library: these items exist only when rustdoc collects doc tests. Some
@@ -148,34 +148,34 @@ mod doc_examples {
     #[doc = include_str!("../README.md")]
     struct Readme;
 
-    #[doc = include_str!("../docs/01-what-is-opus.md")]
+    #[doc = include_str!("../docs/guide/01-what-is-opus.md")]
     struct WhatIsOpus;
 
-    #[doc = include_str!("../docs/02-packets.md")]
+    #[doc = include_str!("../docs/guide/02-packets.md")]
     struct Packets;
 
-    #[doc = include_str!("../docs/03-encoder.md")]
+    #[doc = include_str!("../docs/guide/03-encoder.md")]
     struct Encoder;
 
-    #[doc = include_str!("../docs/04-decoder.md")]
+    #[doc = include_str!("../docs/guide/04-decoder.md")]
     struct Decoder;
 
-    #[doc = include_str!("../docs/05-multichannel.md")]
+    #[doc = include_str!("../docs/guide/05-multichannel.md")]
     struct Multichannel;
 
-    #[doc = include_str!("../docs/06-using-the-library.md")]
+    #[doc = include_str!("../docs/guide/06-using-the-library.md")]
     struct UsingTheLibrary;
 
-    #[doc = include_str!("../docs/07-architecture.md")]
+    #[doc = include_str!("../docs/guide/07-architecture.md")]
     struct Architecture;
 
-    #[doc = include_str!("../docs/08-performance.md")]
+    #[doc = include_str!("../docs/guide/08-performance.md")]
     struct Performance;
 
-    #[doc = include_str!("../docs/09-testing.md")]
+    #[doc = include_str!("../docs/guide/09-testing.md")]
     struct Testing;
 
-    #[doc = include_str!("../docs/10-differences-from-libopus.md")]
+    #[doc = include_str!("../docs/guide/10-differences-from-libopus.md")]
     struct DifferencesFromLibopus;
 }
 

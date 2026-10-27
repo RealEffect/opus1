@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Writes the golden hashes of examples/perf_harness.rs on an Android phone
-# and copies the file back (docs/09-testing.md explains the golden file).
+# and copies the file back (docs/guide/09-testing.md explains the golden file).
 # With --check it also checks the hashes on the phone against a golden file
 # written elsewhere, for example on a Mac, and prints the differences.
 #

@@ -102,7 +102,7 @@ fn switching_packets(rate: usize, channels: usize, application: i32) -> Vec<Vec<
 /// switching streams of `perf_harness modes` agreed with libopus to 172
 /// to 192 dB.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn mode_switches_decode_like_libopus() {
     let mut to_celt = 0;
     let mut from_celt = 0;

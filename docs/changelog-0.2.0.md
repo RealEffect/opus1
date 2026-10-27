@@ -200,7 +200,7 @@ its 0.2.0 form.
     sets again, and which break the agreement between the streams.
   - The multistream decoder writes the channels in the order of its mapping
     table, the Vorbis order for mapping family 1. opus1 does not reorder or
-    downmix channels; [docs/05](05-multichannel.md#the-order-of-the-channels)
+    downmix channels; [docs/guide/05](guide/05-multichannel.md#the-order-of-the-channels)
     compares the Vorbis order with the WAV order.
 - `MultistreamEncoder` forwards the forced channel count, the prediction and
   phase inversion switches, the application and the voice ratio as libopus
@@ -256,7 +256,7 @@ its 0.2.0 form.
   encoder writes when the bitrate or the output buffer is too small to code
   a frame, names the mode of the last coded frame in its TOC byte, as in
   libopus: Hybrid before the first coded frame and after `reset_state`
-  ([docs/02](02-packets.md#packets-without-audio)). `set_application`
+  ([docs/guide/02](guide/02-packets.md#packets-without-audio)). `set_application`
   refuses to change to them or from them, as libopus does.
 - Frames of 80, 100 and 120 ms in `OpusEncoder` and `MultistreamEncoder`,
   coded as libopus 1.6.1 codes them: CELT and Hybrid as four to six 20 ms
@@ -342,7 +342,7 @@ its 0.2.0 form.
   and `InbandFec::OnUnlessMusic` for `set_inband_fec` (`OPUS_SET_INBAND_FEC`
   2, FEC that does not move music to SILK). The multistream encoder forwards
   them to every stream.
-- The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity(u8)`, `set_osce_bwe(bool)` and `osce_bwe() -> bool` (feature `osce-bwe`; without it the methods do not exist) and `set_dnn_blob(&DnnBlob) -> Result<DnnModels, Error>` with `dnn_models()` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. `DnnBlob` and `DnnModels` need the feature `deep-plc`, which `osce`, `osce-bwe` and `dred` turn on; the feature `dnn` alone adds no public API. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/10](10-differences-from-libopus.md)).
+- The neural decoder features of libopus (cargo features `deep-plc`, `osce`, `osce-bwe`, off by default): deep packet loss concealment, LACE, NoLACE and the bandwidth extension, with the decoder controls `set_complexity(u8)`, `set_osce_bwe(bool)` and `osce_bwe() -> bool` (feature `osce-bwe`; without it the methods do not exist) and `set_dnn_blob(&DnnBlob) -> Result<DnnModels, Error>` with `dnn_models()` (weights loaded at run time, like `OPUS_SET_DNN_BLOB`); `MultistreamDecoder` forwards them. `DnnBlob` and `DnnModels` need the feature `deep-plc`, which `osce`, `osce-bwe` and `dred` turn on; the feature `dnn` alone adds no public API. The shared int8 and float network kernels use the dot-product instructions of 64-bit ARM where the processor has them. libopus 1.6.1 does not decode CELT-only frames that follow frames with the bandwidth extension; opus1 applies the fix of libopus's main branch ([docs/guide/10](guide/10-differences-from-libopus.md)).
 - `OpusDecoder::last_packet_duration()` and `packet::has_lbrr()`, as libopus has them.
 - Phase inversion disabling: `set_phase_inversion_disabled` and
   `phase_inversion_disabled` on `OpusEncoder`, `OpusDecoder`,
@@ -370,7 +370,7 @@ its 0.2.0 form.
   settings, never the buffers.
 - The constants `opus1::VERSION` (the crate version) and
   `opus1::LIBOPUS_VERSION` (`"1.6.1"`, the libopus release opus1 follows).
-- Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/09](09-testing.md#evaluation-tools)).
+- Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/guide/09](guide/09-testing.md#evaluation-tools)).
 - `OpusDecoder::init(slot, sampling_rate, channels)` builds a decoder in memory that the caller provides (`&mut MaybeUninit<OpusDecoder>`, for example a `static`) and returns `&mut OpusDecoder`. Upstream opus-rs added the same function in PR #65 (by Alix ANNERAUD); opus1 implements it in its own way, because its decoder also holds the state of the neural network features. Every part of the decoder is written in place, field by field: the CELT and SILK decoders, the OSCE and BWE states, deep PLC and the model holder. A macro, `write_fields!`, checks at compile time that every field of each struct is written. `new` now goes through the same code. The tables that every decoder shares (the CELT mode and the built-in models) are also built in place, on first use. Measured in a release build for aarch64 without `heap`: `init` needs less than 16 KB of stack, also with `osce-bwe` and `dred` and on the first call of a program, where `new` needs about 192 KB (512 KB with those features). With `heap`, `init` writes the boxed parts straight into their heap memory. Tested by `tests/decoder_init.rs`, adapted from upstream: the output of a decoder from `init` equals that of one from `new` (five settings, with lost packets, at complexity 0 and 10), and `init` and decoding run on a thread with a 32 KB stack. `OpusEncoder::init(slot, SampleRate, Channels, Application) -> Result<&mut OpusEncoder, Error>` builds an encoder in the same way: the CELT and SILK encoders, the speech and music analysis and the DRED encoder are written in place, and `tests/encoder_init.rs` checks that its packets equal those of `new` and that `init` and `reset_state` run on a 32 KB stack. Without `heap` it needs less than 16 KB of stack, where `new` needs more than 256 KB. The multistream encoder and decoder have no `init` yet, but their constructors build each stream codec in place with these functions (`tests/multistream_small_stack.rs`).
 - `OpusEncoder::reset_state` writes the new state in place, as libopus `OPUS_RESET_STATE`: with `heap` into the heap memory the encoder has, so a reset allocates nothing.
 - The feature `portable-atomic`: the crate builds for targets without atomic compare-and-swap (CAS), such as `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf` (ESP32-C3), as upstream opus-rs PR #64 (by Alix ANNERAUD) does. The only compare-and-swap of the crate guards the lazily built shared tables (`compat::OnceCell`); with the feature its atomic comes from the `portable-atomic` crate. `Arc` is used only by `DnnBlob::from_bytes` (with `heap`), which such a target does not have. On such a target the application also sets portable-atomic's `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip. Checked with `cargo build --target thumbv6m-none-eabi --no-default-features --features libm,portable-atomic` (also with `analysis`, and with `osce-bwe,dred`); `scripts/check_no_std.sh` now builds it.
@@ -407,7 +407,7 @@ its 0.2.0 form.
   On 222 TSP speech files the error against the original, relative to
   libopus's, fell from between 1.21 and 3.28 to between 0.98 and 1.09
   (complexity 5, 20 ms, 6 to 64 kb/s). At 8 to 24 kHz SILK keeps the integer
-  filter ([docs/10](10-differences-from-libopus.md#paired-comparison-with-the-evaluation-harness)).
+  filter ([docs/guide/10](guide/10-differences-from-libopus.md#paired-comparison-with-the-evaluation-harness)).
 - With `Voip` at 8 to 24 kHz the integer high-pass filter in front of SILK
   runs on every frame, as in the fixed-point build of libopus. It ran only on
   frames that SILK coded, so the first SILK frame after CELT-only frames
@@ -513,7 +513,7 @@ its 0.2.0 form.
 
 ## x86-64
 
-- x86-64 was run once, on an Intel Core i7-12700, on 2026-10-21: under Linux in WSL2 and natively on Windows (`scripts/x86/test.sh` and `test.ps1`). The output is correct but not bit-exact with libopus on x86. About 40 tests that require libopus's bits are marked `ignore` on targets other than 64-bit ARM ([docs/10](10-differences-from-libopus.md#platforms)).
+- x86-64 was run once, on an Intel Core i7-12700, on 2026-10-21: under Linux in WSL2 and natively on Windows (`scripts/x86/test.sh` and `test.ps1`). The output is correct but not bit-exact with libopus on x86. About 40 tests that require libopus's bits are marked `ignore` on targets other than 64-bit ARM ([docs/guide/10](guide/10-differences-from-libopus.md#platforms)).
 - A memory error in an x86 kernel was found and fixed: the AVX2 pulse search (`pvq_search_avx2`) could add a pulse past the end of its output when every score was 0 (an all-zero band or NaN input). The x86 kernels now check their slice lengths at entry.
 - The AVX2 version of `haar1` computed `(a+b)*s` where libopus computes `s*a + s*b`. It now follows libopus.
 
@@ -521,10 +521,10 @@ its 0.2.0 form.
 
 - SILK stereo with a constant bitrate at 12 kHz can lose its stereo image on
   tones, as the fixed-point build of libopus does; the float build keeps it
-  ([docs/10](10-differences-from-libopus.md#silk)).
+  ([docs/guide/10](guide/10-differences-from-libopus.md#silk)).
 - aarch64 targets without NEON, such as `aarch64-unknown-none-softfloat`,
   are not supported: the build stops with a `compile_error!`
-  ([docs/10](10-differences-from-libopus.md#platforms)).
+  ([docs/guide/10](guide/10-differences-from-libopus.md#platforms)).
 
 ## Fixes made after 0.1.37, before the rename
 

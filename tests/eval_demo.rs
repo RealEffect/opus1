@@ -7,7 +7,7 @@
 //! (`eval_common::libopus_demo`), on CELT, SILK, Hybrid and mode-switching
 //! streams with lost packets, FEC and bursts of losses, decoded at several
 //! rates. All of them give the same 16-bit output against the libopus the
-//! tests link on 64-bit ARM macOS. (docs/10, "Decoder", names two other FEC
+//! tests link on 64-bit ARM macOS. (docs/guide/10, "Decoder", names two other FEC
 //! streams that agree with libopus to about 185 dB only; a stream like those
 //! would show up here as samples one step apart.) Elsewhere, streams with
 //! losses are only reported: a libopus built at -O2 conceals with other
@@ -128,7 +128,7 @@ fn differences(a: &[i16], b: &[i16]) -> (usize, i32) {
 }
 
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn loop_gives_the_same_output_for_opus1_and_libopus() {
     for stream in streams() {
         let mut configs = vec![(stream.rate as u32, stream.channels)];
@@ -170,7 +170,7 @@ fn loop_gives_the_same_output_for_opus1_and_libopus() {
                 // libopus the tests link on 64-bit ARM macOS (Homebrew,
                 // without vector loops). A libopus built at -O2, as on the
                 // phone, conceals CELT frames with other last bits
-                // (docs/09-testing.md, "Results on the phone").
+                // (docs/guide/09-testing.md, "Results on the phone").
                 if !lossy || eval_common::exact_platform() {
                     assert_eq!(count, 0, "{label}: output differs (largest difference {max})");
                 }

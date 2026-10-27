@@ -14,7 +14,7 @@
 //! Two deliberate differences are left out: packets of more than 20 ms with
 //! a variable bitrate (see `OpusEncoder::encode_multiframe`), and the
 //! automatic and the maximum bitrate in surround mode, where opus1 chooses
-//! the bandwidth from the allocated bitrate (docs/10, D1). The packets depend on the
+//! the bandwidth from the allocated bitrate (docs/guide/10, D1). The packets depend on the
 //! rounding of the analysis, which is libopus's on 64-bit ARM; elsewhere the
 //! test only prints what it finds.
 #![cfg(all(feature = "std", feature = "analysis"))]

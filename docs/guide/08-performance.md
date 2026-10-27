@@ -950,4 +950,4 @@ The README also keeps an older measurement on AMD Ryzen 7 5700X with the earlier
 - [Differences from libopus](10-differences-from-libopus.md): what opus1 does not do, and where its output differs.
 - [Architecture](07-architecture.md): where the code of each part lives.
 - [Glossary](glossary.md): the terms used in these documents.
-- The documentation index: [README.md](README.md).
+- The documentation index: [README.md](../README.md).

@@ -77,7 +77,7 @@ fn low_delay_input_is_dc_rejected_like_libopus() {
 /// causes were the `EPSILON` terms of `intensity_stereo` and of the
 /// transient analysis, and the rounding of the gain in `stereo_fade`.
 #[test]
-#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/10, Platforms)")]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
 fn the_decaying_output_of_the_dc_filter_is_coded_as_libopus_codes_it() {
     let mut seed = 0x6c07_8965_d1b5_4a32u64;
     let mut pick = move |n: usize| {

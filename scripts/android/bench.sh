@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Times opus1 against libopus on an Android phone with the `bench` command
-# of examples/perf_harness.rs (docs/08-performance.md explains it). Each
+# of examples/perf_harness.rs (docs/guide/08-performance.md explains it). Each
 # run is pinned with taskset to one CPU, so a phone with big and little
 # cores gets one table per core type.
 #

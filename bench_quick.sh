@@ -1,6 +1,6 @@
 #!/bin/bash
 # Quick timing of opus1 against C libopus with the `bench` command of
-# examples/perf_harness.rs (docs/08-performance.md describes it).
+# examples/perf_harness.rs (docs/guide/08-performance.md describes it).
 #
 # Usage: ./bench_quick.sh [label] [filter]
 #

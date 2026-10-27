@@ -42,7 +42,7 @@
 # ANDROID_OUT, ...).
 # CARGO_FEATURES: cargo features for the build, for example
 #   CARGO_FEATURES=test-libopus-dnn,osce-bwe with LIBOPUS_PREFIX set to a
-#   libopus built with --dnn (docs/09-testing.md).
+#   libopus built with --dnn (docs/guide/09-testing.md).
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 

@@ -157,7 +157,7 @@
 # enhance with other last bits, and the networks turn these into large
 # differences. The builds without vector loops gave the same bits on both,
 # with deep PLC, LACE, NoLACE and BWE, on the phone's Cortex-A76 and
-# Cortex-A55 (docs/09-testing.md, "Builds with the neural network
+# Cortex-A55 (docs/guide/09-testing.md, "Builds with the neural network
 # features").
 # OPUS_EXTRA_CFLAGS applies to every file, also to celt/ and silk/, because
 # the network code calls celt_fir, opus_fft and silk_burg_analysis.
@@ -203,7 +203,7 @@
 # it into its records and into the header of a golden file.
 #
 # Notes on comparing against the Homebrew library at the bit level,
-# checked with the release 1.6.1 (docs/09-testing.md, "Which libopus
+# checked with the release 1.6.1 (docs/guide/09-testing.md, "Which libopus
 # source to build" and "Results on the phone"):
 #   - The Homebrew library behaves like a build at -Os. Built at -Os on a
 #     Mac, the release has nearly the same machine code size (231,660 bytes
@@ -228,7 +228,7 @@
 # computer, such as a Mac with Apple silicon, with its own compiler `cc` and
 # archiver `ar`. It then serves as a fair C reference on that computer: the
 # Homebrew libopus behaves like a build at -Os, while libopus's own build
-# uses -O2 (docs/08-performance.md, "The C reference"). The library goes
+# uses -O2 (docs/guide/08-performance.md, "The C reference"). The library goes
 # to $ANDROID_OUT/libopus-host unless LIBOPUS_PREFIX is set. Link the
 # harness against it in a cargo directory of its own:
 #

@@ -1,6 +1,6 @@
 # Glossary
 
-This glossary defines, in alphabetical order, the terms that these documents use for Opus and for this library, `opus1`. Each entry gives a short, plain definition. Where it helps, it also names the related item in opus1 or in libopus. All terms are established names from RFC 6716 (the Opus standard), RFC 7845 (Ogg Opus), libopus (the reference implementation in C) or general signal processing. An abbreviation used inside a definition is written out in its own entry. [What Opus is](01-what-is-opus.md) introduces most of these terms in context, and the [documentation index](README.md) lists the other documents.
+This glossary defines, in alphabetical order, the terms that these documents use for Opus and for this library, `opus1`. Each entry gives a short, plain definition. Where it helps, it also names the related item in opus1 or in libopus. All terms are established names from RFC 6716 (the Opus standard), RFC 7845 (Ogg Opus), libopus (the reference implementation in C) or general signal processing. An abbreviation used inside a definition is written out in its own entry. [What Opus is](01-what-is-opus.md) introduces most of these terms in context, and the [documentation index](../README.md) lists the other documents.
 
 ## A
 
