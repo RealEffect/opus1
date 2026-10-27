@@ -141,8 +141,8 @@ fn bits2pulses_count(row: &[u8; 48], bits: i32) -> Option<i32> {
     // The vector code stays in this always-inlined function: a function
     // with `#[target_feature]` cannot be `#[inline(always)]`, and the
     // compiler did not inline one here.
-    // SAFETY: NEON is part of the baseline of every aarch64 target. The
-    // block calls only NEON intrinsics and the load helpers of
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. The block calls only NEON intrinsics and the load helpers of
     // `simd_mem`.
     let count = unsafe {
         let (vb, vk) = (vdupq_n_u8(b8), vdupq_n_u8(k));
@@ -554,7 +554,8 @@ pub fn clt_compute_allocation(
         );
         bisect_vectors(last, total, |mid| {
             let row = &m.alloc_vectors[mid as usize * m.alloc_stride..];
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe { search.vector_bits(&row[start..end], &w, &t, &o, end - start, floor) }
         })
     } else {
@@ -680,7 +681,8 @@ fn interp_bits2pulses(
     let lo = if len >= NEON_MIN_BANDS {
         let search = SearchLanes::new(bands_thresh, bands_cap);
         let (b1, b2) = (band_lanes(bands_bits1, 0), band_lanes(bands_bits2, 0));
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         bisect_interp(total, |mid| unsafe {
             search.interp_bits(&b1, &b2, mid, alloc_floor)
         })
@@ -984,7 +986,8 @@ mod tests {
             let trim: std::vec::Vec<i32> = (0..len).map(|_| v(&mut rng)).collect();
             let offsets: std::vec::Vec<i32> = (0..len).map(|_| rng.below(scale)).collect();
             let want = vector_bits(&row, &width, &trim, &offsets, &thresh, &cap, floor);
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             let got = unsafe {
                 search.vector_bits(
                     &row,

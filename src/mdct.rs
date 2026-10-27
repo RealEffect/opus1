@@ -912,17 +912,18 @@ fn forward_neon(
     let mut f2_buf: Work = [MaybeUninit::uninit(); MAX_N4];
     let f2 = &mut f2_buf[..n4];
 
-    // SAFETY: NEON is part of the baseline of every aarch64 target. The
-    // bit-reversal table of a plan is a permutation of `0..n4`:
-    // `KissFftState::build` checks it, and `MdctLookup` never changes its
-    // plans. So each of its entries is below `n4`, as the step requires.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. The bit-reversal table of a plan is a permutation of
+    // `0..n4`: `KissFftState::build` checks it, and `MdctLookup` never changes
+    // its plans. So each of its entries is below `n4`, as the step requires.
     unsafe { neon::forward_fold_rotate(input, window, p.trig, &p.st.bitrev, f2, q, p.st.scale()) };
     // SAFETY: the fold step wrote entry `bitrev[i]` of `f2` for every
     // butterfly `i` in `0..n4`. The bit-reversal table of a plan is a
     // permutation of `0..n4` (see above). So every entry was written.
     let f2 = unsafe { f2.assume_init_mut() };
     opus_fft_impl(p.st, f2);
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe { neon::forward_post_rotate(f2, p.trig, output, stride) };
 }
 
@@ -954,10 +955,10 @@ fn backward_neon(
     let mut f2_buf: Work = [MaybeUninit::uninit(); MAX_N4];
     let f2 = &mut f2_buf[..n4];
 
-    // SAFETY: NEON is part of the baseline of every aarch64 target. The
-    // bit-reversal table of a plan is a permutation of `0..n4`:
-    // `KissFftState::build` checks it, and `MdctLookup` never changes its
-    // plans. So each of its entries is below `n4`, as the step requires.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. The bit-reversal table of a plan is a permutation of
+    // `0..n4`: `KissFftState::build` checks it, and `MdctLookup` never changes
+    // its plans. So each of its entries is below `n4`, as the step requires.
     unsafe { neon::backward_pre_rotate(input, p.trig, &p.st.bitrev, f2, stride) };
     // SAFETY: the rotation wrote entry `bitrev[i]` of `f2` for every
     // butterfly `i` in `0..n4`. The bit-reversal table of a plan is a
@@ -965,9 +966,11 @@ fn backward_neon(
     let f2 = unsafe { f2.assume_init_mut() };
     opus_fft_impl(p.st, f2);
     let overlap2 = overlap / 2;
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe { neon::backward_post_rotate(f2, p.trig, &mut output[overlap2..overlap2 + p.n2]) };
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe { neon::tdac(&mut output[..overlap], window) };
 }
 
@@ -2048,9 +2051,9 @@ mod bit_exact_tests {
             fill(&mut rng, &mut coeffs, 0);
             let mut f2 = unwritten(n4);
             time(&format!("pre-rotation {n4}"), &mut || {
-                // SAFETY: NEON is part of the baseline of every aarch64
-                // target, and the bit-reversal table of a plan has `n4`
-                // entries below `n4`.
+                // SAFETY: NEON is available: src/lib.rs refuses to build for
+                // aarch64 without it, and the bit-reversal table of a plan has
+                // `n4` entries below `n4`.
                 unsafe { neon::backward_pre_rotate(&coeffs, p.trig, &p.st.bitrev, &mut f2, 1) };
                 std::hint::black_box(&mut f2);
             });
@@ -2058,16 +2061,16 @@ mod bit_exact_tests {
                 (0..n4).map(|_| KissCpx::new(rng.unit(), rng.unit())).collect();
             let mut out = vec![0f32; 2 * n4];
             time(&format!("post-rotation {n4}"), &mut || {
-                // SAFETY: NEON is part of the baseline of every aarch64
-                // target.
+                // SAFETY: NEON is available: src/lib.rs refuses to build for
+                // aarch64 without it.
                 unsafe { neon::backward_post_rotate(&spectrum, p.trig, &mut out) };
                 std::hint::black_box(&mut out);
             });
             let mut out = vec![0f32; 120];
             fill(&mut rng, &mut out, 0);
             time("tdac 120", &mut || {
-                // SAFETY: NEON is part of the baseline of every aarch64
-                // target.
+                // SAFETY: NEON is available: src/lib.rs refuses to build for
+                // aarch64 without it.
                 unsafe { neon::tdac(&mut out, &window) };
                 std::hint::black_box(&mut out);
             });
@@ -2677,9 +2680,9 @@ mod bit_exact_tests {
                     for at_end in PLACEMENTS {
                         let [a, b, c, d, e] = &mut regions;
                         let got = e.place(&unwritten(n4), at_end);
-                        // SAFETY: NEON is part of the baseline of every
-                        // aarch64 target, and `bitrev` is a permutation of
-                        // `0..n4`.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it, and `bitrev` is a
+                        // permutation of `0..n4`.
                         unsafe {
                             neon::forward_fold_rotate(
                                 a.place(&input, at_end),
@@ -2720,8 +2723,8 @@ mod bit_exact_tests {
                     for at_end in PLACEMENTS {
                         let [a, b, c] = &mut regions;
                         let got = c.place(&before, at_end);
-                        // SAFETY: NEON is part of the baseline of every
-                        // aarch64 target.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it.
                         unsafe {
                             neon::forward_post_rotate(
                                 a.place(&f2, at_end),
@@ -2763,9 +2766,9 @@ mod bit_exact_tests {
                     for at_end in PLACEMENTS {
                         let [a, b, c, d] = &mut regions;
                         let got = d.place(&unwritten(n4), at_end);
-                        // SAFETY: NEON is part of the baseline of every
-                        // aarch64 target, and `bitrev` is a permutation of
-                        // `0..n4`.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it, and `bitrev` is a
+                        // permutation of `0..n4`.
                         unsafe {
                             neon::backward_pre_rotate(
                                 a.place(&input, at_end),
@@ -2802,8 +2805,8 @@ mod bit_exact_tests {
                 for at_end in PLACEMENTS {
                     let [a, b, c] = &mut regions;
                     let got = c.place(&vec![0f32; 2 * n4], at_end);
-                    // SAFETY: NEON is part of the baseline of every aarch64
-                    // target.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     unsafe {
                         neon::backward_post_rotate(a.place(&f2, at_end), b.place(&trig, at_end), got)
                     };
@@ -2831,8 +2834,8 @@ mod bit_exact_tests {
                 for at_end in PLACEMENTS {
                     let [a, b] = &mut regions;
                     let got = a.place(&before, at_end);
-                    // SAFETY: NEON is part of the baseline of every aarch64
-                    // target.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     unsafe { neon::tdac(got, b.place(&window, at_end)) };
                     assert_eq!(first_difference(got, &want), None, "overlap {overlap} class {class}");
                 }

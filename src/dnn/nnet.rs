@@ -177,7 +177,8 @@ impl Kernels {
         assert!(stride >= rows && need.is_some_and(|n| w.len() >= n), "float weights shorter than the layer");
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe {
                 super::vec_neon::sgemv(out, w, rows, cols, stride, x)
             },
@@ -196,7 +197,8 @@ impl Kernels {
         assert!(out.len() >= rows);
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe {
                 super::vec_neon::sparse_sgemv8x4(out, w, idx, rows, x)
             },
@@ -222,7 +224,8 @@ impl Kernels {
         assert!(rows.checked_mul(cols).is_some_and(|n| w.len() >= n), "int8 weights shorter than the layer");
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             DnnArch::Neon => unsafe { super::vec_neon::cgemv8x4(out, w, scale, rows, cols, x) },
             #[cfg(target_arch = "aarch64")]
             // SAFETY: as above; `Kernels::new` keeps `NeonDotprod` only on a
@@ -266,7 +269,8 @@ impl Kernels {
         assert!(out.len() >= rows && x.len() >= cols && scale.len() >= rows);
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             DnnArch::Neon => unsafe {
                 super::vec_neon::sparse_cgemv8x4(out, w, idx, scale, rows, cols, x)
             },
@@ -305,7 +309,8 @@ impl Kernels {
     fn vec_exp(self, buf: &mut [f32]) {
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe { super::vec_neon::vec_exp(buf) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: `Kernels::new` keeps these variants only on a
@@ -321,7 +326,8 @@ impl Kernels {
     fn vec_tanh(self, buf: &mut [f32]) {
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe { super::vec_neon::vec_tanh(buf) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: `Kernels::new` keeps these variants only on a
@@ -337,7 +343,8 @@ impl Kernels {
     fn vec_sigmoid(self, buf: &mut [f32]) {
         match self.0 {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             DnnArch::Neon | DnnArch::NeonDotprod => unsafe { super::vec_neon::vec_sigmoid(buf) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: `Kernels::new` keeps these variants only on a

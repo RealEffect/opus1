@@ -440,7 +440,8 @@ fn short_prediction_neon(
     use core::arch::aarch64::*;
     // Window positions 0 to 3, 4 to 7 and 8 to 11, then 11 to 14.
     let (w, _) = window.as_chunks::<4>();
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     let sum = unsafe {
         let t0 = vqdmulhq_s32(load_i32x4(&w[0]), load_i32x4(&c.older[0]));
         let t1 = vqdmulhq_s32(load_i32x4(&w[1]), load_i32x4(&c.older[1]));
@@ -494,7 +495,8 @@ impl FeedbackNeon {
             }
         }
         let (rows, _) = lanes.as_chunks::<4>();
-        // SAFETY: NEON is part of the aarch64 baseline.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         let state = unsafe { core::array::from_fn(|v| load_i32x4(&rows[v])) };
         Self {
             state,
@@ -511,7 +513,8 @@ impl FeedbackNeon {
         use crate::simd_mem::neon::load_i32x4;
         use core::arch::aarch64::*;
         let s = &mut self.state;
-        // SAFETY: NEON is part of the aarch64 baseline.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         let sum = unsafe {
             let c = &self.coef;
             let t0 = vqdmulhq_s32(s[0], load_i32x4(&c[0]));
@@ -521,7 +524,8 @@ impl FeedbackNeon {
             vaddvq_s32(vaddq_s32(vaddq_s32(t0, t1), vaddq_s32(t2, t3)))
         };
         // Every entry moves up by one place and `newest` enters at place 0.
-        // SAFETY: NEON is part of the aarch64 baseline.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe {
             s[3] = vextq_s32::<3>(s[2], s[3]);
             s[2] = vextq_s32::<3>(s[1], s[2]);
@@ -537,7 +541,8 @@ impl FeedbackNeon {
         let mut lanes = [0i32; FEEDBACK_NEON_MAX_ORDER];
         let (rows, _) = lanes.as_chunks_mut::<4>();
         for (dst, &row) in rows.iter_mut().zip(&self.state) {
-            // SAFETY: NEON is part of the aarch64 baseline.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe { store_i32x4(dst, row) };
         }
         let order = state.len().min(FEEDBACK_NEON_MAX_ORDER);

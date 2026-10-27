@@ -143,7 +143,8 @@ pub fn silk_biquad_alt_stride2(
     let s: &mut [i32; 4] = (&mut s[..4]).try_into().unwrap();
 
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe {
         silk_biquad_alt_stride2_neon(input_output, b_q28, a_q28, s);
     }
@@ -593,9 +594,9 @@ fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
     let ptr1 = &ptr1[..len];
     let ptr2 = &ptr2[..len];
 
-    // SAFETY: NEON is part of the aarch64 baseline. Both slices hold `len`
-    // elements (sliced above), and every load reads 8 elements at an offset
-    // `i` with `i + 8 <= len`.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. Both slices hold `len` elements (sliced above), and every
+    // load reads 8 elements at an offset `i` with `i + 8 <= len`.
     let (mut result, mut i) = unsafe {
         let mut acc0 = vdupq_n_s32(0i32);
         let mut acc1 = vdupq_n_s32(0i32);

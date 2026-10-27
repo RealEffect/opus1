@@ -189,7 +189,8 @@ pub fn compute_dense(layer: &DenseLayer, output: &mut [f32], input: &[f32]) {
     let output = &mut output[..n];
     output.copy_from_slice(&layer.bias[..n]);
     gemm_accum(output, layer.input_weights, n, &input[..m]);
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     let output = unsafe { super::neon::scale_and_activate(output, layer.sigmoid) };
     // SAFETY: SSE2 is part of this target (see the `cfg`).
@@ -216,7 +217,8 @@ pub fn compute_gru(gru: &GruLayer, state: &mut [f32], input: &[f32]) {
     #[cfg(target_arch = "aarch64")]
     if gru.nb_inputs == super::neon::GRU_INPUTS && gru.nb_neurons == super::neon::GRU_NEURONS {
         let state = (&mut state[..super::neon::GRU_NEURONS]).try_into().expect("24 values");
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe { super::neon::gru(gru, state, input) };
         return;
     }

@@ -522,6 +522,9 @@ its 0.2.0 form.
 - SILK stereo with a constant bitrate at 12 kHz can lose its stereo image on
   tones, as the fixed-point build of libopus does; the float build keeps it
   ([docs/10](10-differences-from-libopus.md#silk)).
+- aarch64 targets without NEON, such as `aarch64-unknown-none-softfloat`,
+  are not supported: the build stops with a `compile_error!`
+  ([docs/10](10-differences-from-libopus.md#platforms)).
 
 ## Fixes made after 0.1.37, before the rename
 
