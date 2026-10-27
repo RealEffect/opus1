@@ -725,7 +725,7 @@ now runs libopus's stereo pitch pre-filter and `theta_rdo`.
 
 ## License
 
-opus1 is released under the BSD-3-Clause license; the full text is in [COPYING](COPYING). It is a port of libopus, so the copyright of the libopus authors (Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon) applies together with that of restsend.com (opus-rs) and gaojiangjie (opus1). The neural network weights in `dnn-weights/` come from libopus 1.6.1 under the same license ([dnn-weights/COPYING](dnn-weights/COPYING)).
+opus1 is released under the BSD-3-Clause license; the full text is in [COPYING](COPYING). It is a port of libopus, so the copyright of the libopus authors (Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon, and for some of the files opus1 ports Koen Vos, Cisco Systems, Vidyo, Google, David Rowe and Arm Limited) applies together with that of restsend.com (opus-rs) and gaojiangjie (opus1). The neural network weights in `dnn-weights/` come from libopus 1.6.1 under the same license ([dnn-weights/COPYING](dnn-weights/COPYING)). The function `cos_fdlibm` in `src/pvq.rs` is translated from fdlibm, the math library of Sun Microsystems, whose notice is kept in [COPYING](COPYING).
 
 ## Links
 
