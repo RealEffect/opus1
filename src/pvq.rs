@@ -2497,6 +2497,29 @@ fn celt_cos_norm(x: f32) -> f32 {
     cos_fdlibm(a) as f32
 }
 
+// Translated from fdlibm: FreeBSD msun k_cos.c, k_sin.c and e_rem_pio2.c.
+// k_cos.c and k_sin.c carry this notice:
+//
+// ====================================================
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//
+// Developed at SunSoft, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
+// ====================================================
+//
+// e_rem_pio2.c carries this one:
+//
+// ====================================================
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//
+// Developed at SunPro, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
+// ====================================================
+
 /// `cos(a)` for `a` from 0 to below pi/2 (a high word below 0x3ff921fb), as
 /// fdlibm computes it (see `celt_cos_norm`).
 #[inline(always)]

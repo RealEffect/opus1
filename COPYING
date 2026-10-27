@@ -6,6 +6,12 @@ Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
                     Jean-Marc Valin, Timothy B. Terriberry,
                     CSIRO, Gregory Maxwell, Mark Borgerding,
                     Erik de Castro Lopo, Mozilla, Amazon
+Copyright 2013 Koen Vos
+Copyright 2014-2020 Cisco Systems, Inc.
+Copyright 2014-2015 Vidyo
+Copyright 2017, 2021 Google Inc.
+Copyright 2018 David Rowe
+Copyright 2024 Arm Limited
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions
@@ -34,6 +40,30 @@ PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
 LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
 NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The function cos_fdlibm in src/pvq.rs is translated from fdlibm
+(FreeBSD msun k_cos.c, k_sin.c and e_rem_pio2.c). k_cos.c and k_sin.c
+carry this notice:
+
+====================================================
+Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+
+Developed at SunSoft, a Sun Microsystems, Inc. business.
+Permission to use, copy, modify, and distribute this
+software is freely granted, provided that this notice
+is preserved.
+====================================================
+
+e_rem_pio2.c carries this one:
+
+====================================================
+Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+
+Developed at SunPro, a Sun Microsystems, Inc. business.
+Permission to use, copy, modify, and distribute this
+software is freely granted, provided that this notice
+is preserved.
+====================================================
 
 Opus is subject to the royalty-free patent licenses which are
 specified at:
