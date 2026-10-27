@@ -126,6 +126,7 @@ mod osce_args;
 /// each stream codec in place in that memory, so they need little stack,
 /// also without `heap`. The single-stream codec stays `no_std` without
 /// `alloc`.
+///
 #[cfg(feature = "alloc")]
 pub mod multistream;
 pub mod extensions;

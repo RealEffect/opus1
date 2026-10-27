@@ -373,7 +373,7 @@ its 0.2.0 form.
 - Evaluation tools for the repository (not public API): exact ports of libopus's `opus_compare` and of the MOC distance of the OSCE draft, the RFC 8251 conformance check (all 12 test vectors pass at every rate), and a paired comparison of opus1 with libopus (`examples/eval`, see [docs/guide/09](guide/09-testing.md#evaluation-tools)).
 - `OpusDecoder::init(slot, sampling_rate, channels)` builds a decoder in memory that the caller provides (`&mut MaybeUninit<OpusDecoder>`, for example a `static`) and returns `&mut OpusDecoder`. Upstream opus-rs added the same function in PR #65 (by Alix ANNERAUD); opus1 implements it in its own way, because its decoder also holds the state of the neural network features. Every part of the decoder is written in place, field by field: the CELT and SILK decoders, the OSCE and BWE states, deep PLC and the model holder. A macro, `write_fields!`, checks at compile time that every field of each struct is written. `new` now goes through the same code. The tables that every decoder shares (the CELT mode and the built-in models) are also built in place, on first use. Measured in a release build for aarch64 without `heap`: `init` needs less than 16 KB of stack, also with `osce-bwe` and `dred` and on the first call of a program, where `new` needs about 192 KB (512 KB with those features). With `heap`, `init` writes the boxed parts straight into their heap memory. Tested by `tests/decoder_init.rs`, adapted from upstream: the output of a decoder from `init` equals that of one from `new` (five settings, with lost packets, at complexity 0 and 10), and `init` and decoding run on a thread with a 32 KB stack. `OpusEncoder::init(slot, SampleRate, Channels, Application) -> Result<&mut OpusEncoder, Error>` builds an encoder in the same way: the CELT and SILK encoders, the speech and music analysis and the DRED encoder are written in place, and `tests/encoder_init.rs` checks that its packets equal those of `new` and that `init` and `reset_state` run on a 32 KB stack. Without `heap` it needs less than 16 KB of stack, where `new` needs more than 256 KB. The multistream encoder and decoder have no `init` yet, but their constructors build each stream codec in place with these functions (`tests/multistream_small_stack.rs`).
 - `OpusEncoder::reset_state` writes the new state in place, as libopus `OPUS_RESET_STATE`: with `heap` into the heap memory the encoder has, so a reset allocates nothing.
-- The feature `portable-atomic`: the crate builds for targets without atomic compare-and-swap (CAS), such as `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf` (ESP32-C3), as upstream opus-rs PR #64 (by Alix ANNERAUD) does. The only compare-and-swap of the crate guards the lazily built shared tables (`compat::OnceCell`); with the feature its atomic comes from the `portable-atomic` crate. `Arc` is used only by `DnnBlob::from_bytes` (with `heap`), which such a target does not have. On such a target the application also sets portable-atomic's `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip. Checked with `cargo build --target thumbv6m-none-eabi --no-default-features --features libm,portable-atomic` (also with `analysis`, and with `osce-bwe,dred`); `scripts/check_no_std.sh` now builds it.
+- The feature `portable-atomic`: the crate builds for targets without atomic compare-and-swap (CAS), such as `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf` (ESP32-C3), as upstream opus-rs PR #64 (by Alix ANNERAUD) does. The only compare-and-swap of the crate guards the lazily built shared tables (`compat::OnceCell`); with the feature its atomic comes from the `portable-atomic` crate. `Arc` is used only by `DnnBlob::from_bytes` (with `heap`), which such a target does not have. On such a target the application also sets portable-atomic's `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core` on a single-core chip. Checked with `RUSTFLAGS="--cfg portable_atomic_unsafe_assume_single_core" cargo build --target thumbv6m-none-eabi --no-default-features --features libm,portable-atomic` (also with `analysis`, and with `osce-bwe,dred`); `scripts/check_no_std.sh` now builds it.
 - The feature `heap` also works in a `no_std` build with a global allocator
   (`default-features = false, features = ["heap", "libm"]`). There
   `DnnBlob::from_bytes` needs a target with atomic compare-and-swap.
@@ -513,7 +513,7 @@ its 0.2.0 form.
 
 ## x86-64
 
-- x86-64 was run once, on an Intel Core i7-12700, on 2026-10-21: under Linux in WSL2 and natively on Windows (`scripts/x86/test.sh` and `test.ps1`). The output is correct but not bit-exact with libopus on x86. About 40 tests that require libopus's bits are marked `ignore` on targets other than 64-bit ARM ([docs/guide/10](guide/10-differences-from-libopus.md#platforms)).
+- x86-64 was run once, on an Intel Core i7-12700, on 2026-10-21: under Linux in WSL2 and natively on Windows (`scripts/x86/test.sh` and `test.ps1`). The output is correct but not bit-exact with libopus on x86. 54 tests that require libopus's bits are marked `ignore` on targets other than 64-bit ARM ([docs/guide/10](guide/10-differences-from-libopus.md#platforms)).
 - A memory error in an x86 kernel was found and fixed: the AVX2 pulse search (`pvq_search_avx2`) could add a pulse past the end of its output when every score was 0 (an all-zero band or NaN input). The x86 kernels now check their slice lengths at entry.
 - The AVX2 version of `haar1` computed `(a+b)*s` where libopus computes `s*a + s*b`. It now follows libopus.
 
@@ -528,8 +528,21 @@ its 0.2.0 form.
 
 ## Fixes made after 0.1.37, before the rename
 
-These fixes were listed in the README as "Unreleased" while the crate was still named opus-rs.
+These fixes were listed in the README as "Unreleased" while the crate was still named opus-rs. The fix of issue #54 came after the release of 0.1.37 (2026-10-07) but was listed under 0.1.37 by mistake.
 
+- **Fix: CELT from 24 kHz input stuck at ~20 dB SNR (issue #54).** When
+  `run_prefilter` cancelled the pitch pre-filter for a frame (libopus 1.6's
+  `cancel_pitch`), it restored the unfiltered input over the whole frame.
+  libopus still fades the previous frame's comb filter out over the overlap
+  (celt_encoder.c:1572-1584), and the decoder's post-filter always applies
+  that fade. So every cancel right after an "on" frame left 120 samples the
+  decoder post-filtered but the encoder never pre-filtered. From 24 kHz the
+  zero-stuffed input is dominated by its image above 12 kHz, so the filter
+  was cancelled whenever the pitch period was odd, in 18 of 66 frames on the
+  issue's chirp. The SNR was 20.1 / 20.9 / 21.1 dB at 32 / 64 / 128 kbps and
+  is now 29.4 / 36.2 / 41.9 dB. libopus 1.6.1 scores 38.8 / 41.9 dB at 64 /
+  128 kbps (35.2 / 41.1 with its tonality analysis off, which opus-rs 0.1.37
+  did not port). The 48 kHz chirp packets are byte-identical.
 - **Fix: SILK CBR with in-band FEC busted packets into concealed frames
   (issue #51).** SILK's frame target now leaves room for the packet's LBRR
   section, as libopus's does. This ports `enc_API.c`'s per-frame target, for

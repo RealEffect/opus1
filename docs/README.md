@@ -184,7 +184,7 @@ Run tests with `--release`: they encode and decode seconds of audio per case.
 | Run the document examples | `cargo test --release --doc` |
 | Run an ignored report test | `cargo test --release --test <name> -- --ignored --nocapture` |
 | Lint | `cargo clippy --all-targets -- -D warnings` |
-| Build the API documentation as docs.rs does | `cargo doc --no-deps --features dred,osce-bwe` |
+| Build the API documentation with the features docs.rs uses (docs.rs also passes `--cfg docsrs`, which adds the labels of the features each item needs; on a stable compiler `RUSTC_BOOTSTRAP=1 RUSTDOCFLAGS="--cfg docsrs"` before the command shows them) | `cargo doc --no-deps --features dred,osce-bwe` |
 | Check the `no_std` builds | `scripts/check_no_std.sh` |
 | Time against libopus | `cargo run --release --example perf_harness -- bench` |
 | Short timing run | `./bench_quick.sh <label> [filter]` |
