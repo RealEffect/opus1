@@ -511,7 +511,8 @@ impl<'a> BurgSignal<'a> {
         #[cfg(target_arch = "aarch64")]
         if nb_subfr <= 4 && subfr_length <= BURG_MAX_SUBFR_LENGTH {
             let mut side_by_side = [[0i16; 4]; BURG_MAX_SUBFR_LENGTH];
-            // SAFETY: NEON is part of the aarch64 baseline.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe {
                 burg_neon::lay_side_by_side(
                     &mut side_by_side[..subfr_length],
@@ -567,7 +568,8 @@ impl<'a> BurgSignal<'a> {
                 ref side_by_side,
                 subfr_length,
             } => {
-                // SAFETY: NEON is part of the aarch64 baseline.
+                // SAFETY: NEON is available: src/lib.rs refuses to build for
+                // aarch64 without it.
                 unsafe {
                     burg_neon::add_subframes(
                         c_first_row,
@@ -1479,7 +1481,8 @@ mod burg_tests {
                 })
                 .collect();
             let mut side_by_side = [[0x5a5ai16; 4]; BURG_MAX_SUBFR_LENGTH];
-            // SAFETY: NEON is part of the aarch64 baseline.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe {
                 burg_neon::lay_side_by_side(&mut side_by_side[..subfr_length], &x, nb_subfr);
             }
@@ -1517,7 +1520,8 @@ mod burg_tests {
                     n,
                     rshifts,
                 );
-                // SAFETY: NEON is part of the aarch64 baseline.
+                // SAFETY: NEON is available: src/lib.rs refuses to build for
+                // aarch64 without it.
                 unsafe {
                     burg_neon::add_subframes(
                         &mut neon.0,

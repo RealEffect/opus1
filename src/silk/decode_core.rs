@@ -366,10 +366,10 @@ fn rewhiten_neon<const ORDER: usize>(
     assert!(input.len() == n + ORDER);
     let n4 = n & !3;
 
-    // SAFETY: NEON is part of the aarch64 baseline. A step at `m` has
-    // `m + 4 <= n`. It reads `input[m + j..m + j + 4]` for `j <= ORDER`; the
-    // last index is `m + ORDER + 3 < n + ORDER`, the length of `input`
-    // (checked above). It writes `out[m..m + 4]`.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. A step at `m` has `m + 4 <= n`. It reads `input[m + j..m + j
+    // + 4]` for `j <= ORDER`; the last index is `m + ORDER + 3 < n + ORDER`,
+    // the length of `input` (checked above). It writes `out[m..m + 4]`.
     unsafe {
         let gain = vdupq_n_s32(inv_gain_q31);
         let mut m = 0;
@@ -512,11 +512,12 @@ fn ltp_block_neon(
     assert!(taps.len() == n + LTP_ORDER - 1 && res_q14.len() == n && new_state.len() == n);
     let n4 = n & !3;
 
-    // SAFETY: NEON is part of the aarch64 baseline. A step at `i` has
-    // `i + 4 <= n`. It reads `taps[i + k..i + k + 4]` for `k <= 4`; the last
-    // index is `i + 7 < n + 4`, the length of `taps` (checked above). It
-    // reads `exc_q14[i..i + 4]` and writes `res_q14[i..i + 4]` and
-    // `new_state[i..i + 4]`, which all have `n` elements.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. A step at `i` has `i + 4 <= n`. It reads `taps[i + k..i + k
+    // + 4]` for `k <= 4`; the last index is `i + 7 < n + 4`, the length of
+    // `taps` (checked above). It reads `exc_q14[i..i + 4]` and writes
+    // `res_q14[i..i + 4]` and `new_state[i..i + 4]`, which all have `n`
+    // elements.
     unsafe {
         let b0 = vdupq_n_s32(smulwb_operand(b_q14[0]));
         let b1 = vdupq_n_s32(smulwb_operand(b_q14[1]));
@@ -690,7 +691,8 @@ fn lpc_synthesis_neon<const ORDER: usize>(
     for k in MAX_LPC_ORDER - ORDER..IN_VECTORS {
         c_vec[k] = smulwb_operand(a_q12[MAX_LPC_ORDER - 1 - k]);
     }
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     let (c0, c1, c2, mut h0, mut h1, mut h2) = unsafe {
         (
             load_i32x4(array_at(&c_vec, 0)),
@@ -725,7 +727,8 @@ fn lpc_synthesis_neon<const ORDER: usize>(
         }
 
         // Prepare the next step. Nothing here depends on `sample`.
-        // SAFETY: NEON is part of the aarch64 baseline; no memory is accessed.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it; no memory is accessed.
         let vec_sum = unsafe {
             // The oldest sample leaves, `q[NEWEST - 1]` enters.
             if ORDER == MAX_LPC_ORDER {

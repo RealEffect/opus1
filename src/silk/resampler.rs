@@ -675,7 +675,8 @@ fn down_fir_interpolated(
     taps: &DownFirTaps,
 ) {
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe {
         down_fir_interpolated_neon(out, buf, index_increment_q16, fracs, taps);
     }
@@ -850,7 +851,8 @@ fn down_fir_symmetric<const HALF: usize>(
     coefs: &[i16; HALF],
 ) {
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe {
         down_fir_symmetric_neon(out, buf, index_increment_q16, coefs);
     }
@@ -1007,7 +1009,8 @@ fn iir_fir_interpol(
     let n = steps.min(out.len());
 
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe {
         iir_fir_interpol_neon(&mut out[..n], buf, 0, index_increment_q16);
     }
@@ -1165,7 +1168,8 @@ pub fn silk_resampler_private_up2_hq(s: &mut [i32], out: &mut [i16], input: &[i1
 #[inline(always)]
 fn up2_hq(s: &mut [i32; 6], out: &mut [MaybeUninit<i16>], input: &[i16]) {
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     unsafe {
         up2_hq_neon(s, out, input);
     }
@@ -1883,7 +1887,8 @@ mod tests {
                 {
                     let mut s = state;
                     let mut out = vec![0x5555i16; 2 * n];
-                    // SAFETY: NEON is part of the aarch64 baseline.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     unsafe { up2_hq_neon(&mut s, uninit(&mut out), &input) };
                     assert_eq!((&out, s), (&expect, expect_state), "NEON: n={n} trial={trial}");
                 }
@@ -1948,7 +1953,8 @@ mod tests {
                     #[cfg(target_arch = "aarch64")]
                     {
                         let mut out = vec![0x5555i16; n];
-                        // SAFETY: NEON is part of the aarch64 baseline.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it.
                         unsafe { iir_fir_interpol_neon(&mut out, &buf, 0, inc) };
                         assert_eq!(out, expect, "NEON: inc={inc} n={n} trial={trial}");
                     }
@@ -2087,7 +2093,8 @@ mod tests {
                         #[cfg(target_arch = "aarch64")]
                         {
                             let mut out = vec![0x5555i16; n];
-                            // SAFETY: NEON is part of the aarch64 baseline.
+                            // SAFETY: NEON is available: src/lib.rs refuses to
+                            // build for aarch64 without it.
                             unsafe { down_fir_interpolated_neon(&mut out, &buf, inc, fracs, taps) };
                             assert_eq!(out, expect, "NEON: fracs={fracs} inc={inc} n={n} trial={trial}");
                         }
@@ -2122,7 +2129,8 @@ mod tests {
                     #[cfg(target_arch = "aarch64")]
                     {
                         let mut out = vec![0x5555i16; n];
-                        // SAFETY: NEON is part of the aarch64 baseline.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it.
                         unsafe { down_fir_symmetric_neon(&mut out, &buf, inc, half) };
                         assert_eq!(out, expect, "NEON: taps={} inc={inc} n={n} trial={trial}", 2 * HALF);
                     }
@@ -2204,7 +2212,8 @@ mod tests {
                         panics(|| {
                             let mut out = vec![0i16; n];
                             #[cfg(target_arch = "aarch64")]
-                            // SAFETY: NEON is part of the aarch64 baseline.
+                            // SAFETY: NEON is available: src/lib.rs refuses to
+                            // build for aarch64 without it.
                             unsafe {
                                 iir_fir_interpol_neon(&mut out, &buf, 0, inc);
                             }
@@ -2276,7 +2285,8 @@ mod tests {
 
         let up = |out: &mut [i16], inc: i32| {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of the aarch64 baseline.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe {
                 iir_fir_interpol_neon(out, &up_buf, 0, inc);
             }

@@ -235,7 +235,8 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     // The only bounds check. Every kernel below works on this slice, whose
     // length is a multiple of `2 * stride`.
     let x = &mut x[..2 * (n0 >> 1) * stride];
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         haar1_neon(x, stride);
@@ -898,13 +899,16 @@ fn fold_with_noise_neon(x: &mut [f32], lb: &[f32], seed: u32) -> u32 {
     let lb = &lb[..x.len()];
     let (x8, x_tail) = x.as_chunks_mut::<8>();
     let (lb8, lb_tail) = lb.as_chunks::<8>();
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     let mut vseed = unsafe { vdupq_n_u32(seed) };
     for (xo, l) in x8.iter_mut().zip(lb8) {
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         vseed = unsafe { fold_with_noise8_neon(xo, l, vseed) };
     }
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     let seed = unsafe { vgetq_lane_u32::<0>(vseed) };
     fold_with_noise_scalar(x_tail, lb_tail, seed)
 }
@@ -945,13 +949,16 @@ fn fill_with_noise_neon(x: &mut [f32], seed: u32) -> u32 {
     use core::arch::aarch64::*;
 
     let (x8, x_tail) = x.as_chunks_mut::<8>();
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     let mut vseed = unsafe { vdupq_n_u32(seed) };
     for xo in x8.iter_mut() {
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         vseed = unsafe { fill_with_noise8_neon(xo, vseed) };
     }
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     let seed = unsafe { vgetq_lane_u32::<0>(vseed) };
     fill_with_noise_scalar(x_tail, seed)
 }
@@ -2909,9 +2916,9 @@ fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
 fn scale_slice_neon(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
     use core::arch::aarch64::*;
     let (src, dst) = (&src[..n], &mut dst[..n]);
-    // SAFETY: NEON is part of the baseline of every aarch64 target. `src`
-    // and `dst` hold `n` values (sliced above), and every load and store
-    // covers `[i..i + 4]` with `i + 4 <= n`.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. `src` and `dst` hold `n` values (sliced above), and every
+    // load and store covers `[i..i + 4]` with `i + 4 <= n`.
     let i = unsafe {
         let vscale = vdupq_n_f32(scale);
         let mut i = 0;
@@ -3287,8 +3294,8 @@ mod tests {
                     #[cfg(target_arch = "aarch64")]
                     {
                         let mut got = input.clone();
-                        // SAFETY: NEON is part of the baseline of every
-                        // aarch64 target.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it.
                         unsafe { haar1_neon(&mut got[..used], stride) };
                         assert_same_bits(&got, &want, &format!("haar1_neon, {what}"));
                     }

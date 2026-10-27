@@ -1638,9 +1638,9 @@ fn pvq_place_pulses<const IN_ADVANCE: bool>(
 /// The position where the next pulse goes. See `pvq_best_position_scalar`.
 #[inline(always)]
 fn pvq_best_position<const SQUARE: bool>(abs_x: &[f32], y2f: &[f32], xy: f32, yy: f32) -> usize {
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
-    // On aarch64 the search places the pulses of bands of 8 to 64 values
-    // with `pvq_place_pulses`; the other bands come here.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. On aarch64 the search places the pulses of bands of 8 to 64
+    // values with `pvq_place_pulses`; the other bands come here.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         pvq_best_position_neon::<SQUARE>(abs_x, y2f, xy, yy)
@@ -1701,7 +1701,8 @@ fn pvq_search_libopus_form<'a, const IN_ADVANCE: bool, Y: PulseSlot>(
 ) -> (&'a mut [i32], f32) {
     pvq_search_libopus_place(x, y, k, n, |abs_x, y2f, y, xy, yy, pulses| {
         if (8..=64).contains(&abs_x.len()) {
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe { pvq_place_pulses::<IN_ADVANCE>(abs_x, y2f, y, xy, yy, pulses) }
         } else {
             place_pulses_one_by_one(abs_x, y2f, y, xy, yy, pulses, pvq_best_position::<true>)
@@ -2199,7 +2200,8 @@ fn exp_rotation1(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
         2 => exp_rotation1_carry::<2>(x, len, c, s),
         3 => exp_rotation1_carry::<3>(x, len, c, s),
         _ => {
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 exp_rotation1_neon(x, len, stride, c, s);
@@ -2738,7 +2740,8 @@ fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
         let mut any_nonzero = false;
         let (quads, tail) = slice.as_chunks::<4>();
         for q in quads {
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             let any = unsafe { quad_max_neon(q) };
             if any != 0 {
                 any_nonzero = true;
@@ -3058,7 +3061,8 @@ fn scale_pulses(y: &[i32], x: &mut [f32], g: f32) {
     {
         let (y4, y_tail) = y.as_chunks::<4>();
         let (x4, x_tail) = x.as_chunks_mut::<4>();
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe { scale_pulses_neon(y4, x4, g) };
         for (xv, &yv) in x_tail.iter_mut().zip(y_tail) {
             *xv = yv as f32 * g;
@@ -3095,7 +3099,8 @@ fn scale_pulses_neon(y4: &[[i32; 4]], x4: &mut [[f32; 4]], g: f32) {
 fn alg_quant_resynth(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
     let y = &y[..n];
     let x = &mut x[..n];
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     unsafe { alg_quant_resynth_neon(y, x, gain) };
     #[cfg(target_arch = "x86_64")]
@@ -3382,8 +3387,8 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             if square {
                 for m in 0..abs_x.len() {
-                    // SAFETY: NEON is part of the baseline of every aarch64
-                    // target.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     let accepted = unsafe { pvq_candidate_is_scan_result(abs_x, y2f, xy, yy, m) };
                     assert!(
                         !accepted || m == want,
@@ -3874,7 +3879,8 @@ mod tests {
                         let mut want = input.clone();
                         exp_rotation1_scalar(&mut want, len, stride, c, s);
                         let mut got = input.clone();
-                        // SAFETY: NEON is part of the aarch64 baseline.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it.
                         unsafe { exp_rotation1_neon(&mut got, len, stride, c, s) };
                         assert_eq!(
                             bits(&got),
@@ -4007,7 +4013,8 @@ mod tests {
                     let mut y_long = y.clone();
                     y_long.extend([1000, -1000, 5]);
                     let mut got = vec![7.0f32; n];
-                    // SAFETY: NEON is part of the aarch64 baseline.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     unsafe { alg_quant_resynth_neon(&y_long, &mut got, gain) };
                     assert_eq!(bits(&got), bits(&want), "neon, {what}");
                 }
@@ -4307,7 +4314,8 @@ mod tests {
                 #[cfg(target_arch = "aarch64")]
                 assert_eq!(
                     got.to_bits(),
-                    // SAFETY: NEON is part of the aarch64 baseline.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     unsafe { magnitude_sum_old_kernel(&abs_x) }.to_bits(),
                     "old kernel, n {n}"
                 );

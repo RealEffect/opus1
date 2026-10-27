@@ -6,11 +6,10 @@
 //! scalar code does in a chain of its own (one sample, one FFT bin). So the
 //! results are the same bits as the scalar code, which matches libopus. The
 //! tests at the end of this file compare the two on random and real input.
-//!
-//! The kernels are safe functions compiled with `#[target_feature(enable =
+//!  The kernels are safe functions compiled with `#[target_feature(enable =
 //! "neon")]`. Their loads and stores go through `crate::simd_mem`. A caller
-//! without that feature calls them in an `unsafe` block; NEON is part of
-//! the baseline of every aarch64 target.
+//! without that feature calls them in an `unsafe` block; NEON is available:
+//! src/lib.rs refuses to build for aarch64 without it.
 
 use core::arch::aarch64::*;
 
@@ -452,8 +451,8 @@ mod tests {
                         let p = AnalysisPcm { pcm, channels, c1, c2, frame_size: n };
                         let mut a = vec![7.0f32; n];
                         let mut b = vec![7.0f32; n];
-                        // SAFETY: NEON is part of the baseline of every
-                        // aarch64 target.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it.
                         assert_eq!(unsafe { downmix(&p, &mut a, offset) }, covered);
                         downmix_scalar(&p, &mut b, offset);
                         if covered {
@@ -480,7 +479,8 @@ mod tests {
         {
             let [angle, d_angle, d2_angle] = &mut a;
             let mut phase = Phase { angle, d_angle, d2_angle };
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             let first = unsafe { tonality_bins(out, &mut phase, &mut ra) };
             assert_eq!(first, 237);
             tonality_bins_scalar(out, first, &mut phase, &mut ra);
@@ -570,7 +570,8 @@ mod tests {
             });
             let mut a = [KissCpx::new(7.0, 7.0); N];
             let mut b = a;
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe { window_for_fft(&inmem, fft_state(), &mut a) };
             window_for_fft_scalar(&inmem, fft_state(), &mut b);
             let flat = |v: &[KissCpx; N]| v.iter().flat_map(|c| [c.r, c.i]).collect::<Vec<_>>();
@@ -600,8 +601,8 @@ mod tests {
             // Activations after the scaling by 1/128, on 4 lanes.
             for sig in [false, true] {
                 let mut a = x;
-                // SAFETY: NEON is part of the baseline of every aarch64
-                // target.
+                // SAFETY: NEON is available: src/lib.rs refuses to build for
+                // aarch64 without it.
                 let rest = unsafe { scale_and_activate(&mut a[..30], sig) }.len();
                 assert_eq!(rest, 2);
                 for (k, (&got, &inp)) in a[..28].iter().zip(&x[..28]).enumerate() {
@@ -613,7 +614,8 @@ mod tests {
             // The recurrent layer, from a random state.
             let state0: [f32; GRU_NEURONS] = core::array::from_fn(|_| next());
             let (mut a, mut b) = (state0, state0);
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe { gru(&LAYER1, &mut a, &x) };
             compute_gru_scalar(&LAYER1, &mut b, &x);
             assert!(same(&a, &b), "case {case}");
@@ -624,7 +626,8 @@ mod tests {
             let feat: [f32; 25] = core::array::from_fn(|_| next() * 3.0);
             let mut hidden = [0.0f32; 32];
             crate::analysis::mlp::compute_dense(&LAYER0, &mut hidden, &feat);
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe { gru(&LAYER1, (&mut a[..24]).try_into().unwrap(), &hidden) };
             compute_gru_scalar(&LAYER1, &mut b, &hidden);
             assert!(same(&a, &b), "step {step}");

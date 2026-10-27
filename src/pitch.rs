@@ -1080,7 +1080,8 @@ fn pitch_xcorr_neon(x: &[f32], y: &[f32], xcorr: &mut [f32]) {
 
     if lags == 5 {
         // The autocorrelation of `pitch_downsample`.
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe { xcorr5_neon(x, y, xcorr) };
         return;
     }
@@ -1670,7 +1671,8 @@ pub fn pitch_downsample(x: &[&[f32]], x_lp: &mut [f32], len: usize, c: usize, fa
         && x[..c].iter().all(|x_k| x_k.len() >= 2 * len)
     {
         let mut ac = [0.0f32; 5];
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe {
             if c == 1 {
                 decimate2_autocorr5_neon([x[0]], &mut x_lp[..len], &mut ac);
@@ -1792,7 +1794,8 @@ fn flatten_with(x_lp: &mut [f32], mut ac: [f32; 5]) {
 /// before `x[0]` taken as zero and the old values of `x` on the right. The
 /// products are added in that order, each with `mac`.
 fn celt_fir5(x: &mut [f32], num: &[f32; 5]) {
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         celt_fir5_neon(x, num);
@@ -1908,7 +1911,8 @@ fn celt_fir5_neon(x: &mut [f32], num: &[f32; 5]) {
 /// `2 * out.len()` samples.
 #[inline(always)]
 fn decimate2<const C: usize>(x: [&[f32]; C], out: &mut [f32]) {
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         decimate2_neon(x, out);
@@ -2186,7 +2190,8 @@ fn best_pitch_from(xcorr: &[f32], syy: &[f32], best_pitch: &mut [usize; 2]) {
     let syy = &syy[..n];
     let mut best = BestPitch::new();
     // The lags that the vector code has taken.
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     let i = unsafe { best_pitch_neon(xcorr, syy, &mut best) };
     #[cfg(not(target_arch = "aarch64"))]
@@ -2318,7 +2323,8 @@ impl<'a> WindowEnergies<'a> {
         let (old, new) = (&self.leaving[range.clone()], &self.entering[range.clone()]);
         let out = &mut self.table[range];
         // The entries that the vector code has written.
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         #[cfg(target_arch = "aarch64")]
         let done = unsafe { increments_neon(old, new, out) };
         #[cfg(not(target_arch = "aarch64"))]
@@ -4222,8 +4228,8 @@ pub(crate) mod tests {
                     let x1 = samples(&mut rng, 2 * n, kind);
 
                     let mut got = vec![f32::NAN; n];
-                    // SAFETY: NEON is part of the baseline of every aarch64
-                    // target.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     unsafe { decimate2_neon([&x0[..]], &mut got) };
                     let mut want = vec![f32::NAN; n];
                     decimate2_scalar([&x0[..]], &mut want);
@@ -4254,8 +4260,8 @@ pub(crate) mod tests {
                         let mut got_ac = [f32::NAN; 5];
                         let mut want = vec![f32::NAN; n];
                         if stereo {
-                            // SAFETY: NEON is part of the baseline of every
-                            // aarch64 target.
+                            // SAFETY: NEON is available: src/lib.rs refuses to
+                            // build for aarch64 without it.
                             unsafe {
                                 decimate2_autocorr5_neon([&x0[..], &x1[..]], &mut got, &mut got_ac)
                             };
@@ -4285,8 +4291,8 @@ pub(crate) mod tests {
                     let x = samples(&mut rng, len, kind);
                     let y = samples(&mut rng, len + 4, kind);
                     let mut got = [f32::NAN; 5];
-                    // SAFETY: NEON is part of the baseline of every aarch64
-                    // target.
+                    // SAFETY: NEON is available: src/lib.rs refuses to build
+                    // for aarch64 without it.
                     unsafe { xcorr5_neon(&x, &y, &mut got) };
                     let mut want = [f32::NAN; 5];
                     xcorr_by_sample_scalar(&x, &y, &mut want[..4], len);

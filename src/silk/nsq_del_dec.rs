@@ -313,7 +313,8 @@ fn short_prediction_neon(
 ) -> i32 {
     use core::arch::aarch64::*;
 
-    // SAFETY: NEON is part of the aarch64 baseline.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     let sum = unsafe { vaddvq_s32(short_prediction_products_neon(window, reversed_q27)) };
     ((order as i32) >> 1).wrapping_add(sum)
 }
@@ -1367,7 +1368,8 @@ mod neon {
         shape_q14: [i32; 4],
         seed: [i32; 4],
     ) -> [CandidateLanes; 2] {
-        // SAFETY: NEON is part of the aarch64 baseline.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe {
             let c = quantize_sample_neon(
                 &LevelVectors::new(lv),
@@ -1771,7 +1773,8 @@ mod neon {
         both: bool,
         keep_lanes: bool,
     ) -> [i32; N] {
-        // SAFETY: NEON is part of the aarch64 baseline.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe {
             let c = ShapingCoefs::new(ar_shp_q13, warping_q16, keep_lanes);
             let mut rows = [[0i32; 4]; MAX_SHAPE_LPC_ORDER];
@@ -3895,7 +3898,8 @@ fn quantize_subframe_dispatch(
     #[cfg(target_arch = "aarch64")]
     macro_rules! fastest {
         ($n:literal, $order:literal) => {
-            // SAFETY: NEON is part of the aarch64 baseline.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             unsafe {
                 neon::quantize_subframe_neon::<$n, $order>(
                     nsq,
@@ -5038,9 +5042,10 @@ mod tests {
                 let world = |w: &mut World, order: usize, wide: bool| {
                     macro_rules! call {
                         ($loop:ident, $order:literal) => {
-                            // SAFETY: NEON is part of the aarch64 baseline;
-                            // on x86-64 the test runs only with SSE4.1, and
-                            // with `wide` only with AVX2.
+                            // SAFETY: NEON is available: src/lib.rs refuses to
+                            // build for aarch64 without it; on x86-64 the test
+                            // runs only with SSE4.1, and with `wide` only with
+                            // AVX2.
                             unsafe {
                                 $loop::<N, $order>(
                                     &mut w.nsq,

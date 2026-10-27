@@ -1172,7 +1172,8 @@ fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
         if n >= 16 {
-            // SAFETY: NEON is part of the baseline of every aarch64 target.
+            // SAFETY: NEON is available: src/lib.rs refuses to build for
+            // aarch64 without it.
             return unsafe { l1_metric_neon(tmp, n, lm, bias) };
         }
     }
@@ -1660,7 +1661,8 @@ fn comb_filter_const(
         t >= 2 && x_idx >= t + 2 && x_idx + n <= x.len() && y_idx + n <= y.len(),
         "comb_filter_const: range outside its buffers"
     );
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         comb_filter_const_neon(y, x, y_idx, x_idx, t, n, g10, g11, g12);

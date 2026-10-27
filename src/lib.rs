@@ -58,6 +58,17 @@
 // the like) are unused. They stay in every build, so that every build
 // compiles them; the linker drops them.
 #![cfg_attr(not(feature = "__internals"), allow(dead_code, unused_imports))]
+
+// The aarch64 kernels use NEON (Advanced SIMD) without a run-time check, and
+// their `unsafe` calls rely on it. Almost every aarch64 target enables NEON;
+// a few, such as aarch64-unknown-none-softfloat (for kernels and firmware
+// that must not touch the vector registers), do not. opus1 does not support
+// those, so it stops the build there instead of running NEON code.
+#[cfg(all(target_arch = "aarch64", not(target_feature = "neon")))]
+compile_error!(
+    "opus1 needs NEON (Advanced SIMD) on aarch64; targets without it, such as \
+     aarch64-unknown-none-softfloat, are not supported"
+);
 #[cfg(all(test, not(feature = "std")))]
 #[macro_use]
 extern crate std;
@@ -6716,7 +6727,8 @@ pub(crate) fn celt_float2int16(input: &[f32], output: &mut [i16]) {
         all(target_arch = "x86_64", target_feature = "sse2")
     )))]
     let blocks = 0;
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         celt_float2int16_blocks_neon(&input[..blocks], &mut output[..blocks]);

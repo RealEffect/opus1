@@ -1513,10 +1513,11 @@ fn fft_stages_neon(st: &KissFftState, fout: &mut [KissCpx]) {
     debug_assert!(fout.len() == st.nfft);
     if has_fcma() {
         // SAFETY: the processor has FEAT_FCMA (`has_fcma`), and NEON is
-        // part of the baseline of every aarch64 target.
+        // available: src/lib.rs refuses to build for aarch64 without it.
         unsafe { fused::fcma::stages(st, fout) }
     } else {
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         unsafe { fused::fma::stages(st, fout) }
     }
 }
@@ -2685,8 +2686,8 @@ mod tests {
                 let mut a = want.clone();
                 let mut b = want.clone();
                 opus_fft_impl_fused(st, &mut want);
-                // SAFETY: NEON is part of the baseline of every aarch64
-                // target.
+                // SAFETY: NEON is available: src/lib.rs refuses to build for
+                // aarch64 without it.
                 unsafe { fused::fma::stages(st, &mut a) };
                 assert_eq!(first_difference(&a, &want), None, "fma, nfft {nfft} class {class}");
                 if has_fcma() {
@@ -2741,8 +2742,8 @@ mod tests {
                             let what = format!("radix {radix} m {m} groups {groups} class {class}");
                             let b = samples.place(&input, at_end);
                             let tw = twiddles.place(tw, at_end);
-                            // SAFETY: NEON is part of the baseline of every
-                            // aarch64 target.
+                            // SAFETY: NEON is available: src/lib.rs refuses to
+                            // build for aarch64 without it.
                             unsafe {
                                 match radix {
                                     3 => fused::fma::bfly3(b, tw, m, groups),
@@ -2780,8 +2781,8 @@ mod tests {
                     }
                     for at_end in PLACEMENTS {
                         let b = samples.place(&input, at_end);
-                        // SAFETY: NEON is part of the baseline of every
-                        // aarch64 target.
+                        // SAFETY: NEON is available: src/lib.rs refuses to
+                        // build for aarch64 without it.
                         unsafe {
                             match (radix, m) {
                                 (2, 1) => neon::bfly2_m1(b, groups),

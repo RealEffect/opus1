@@ -403,7 +403,7 @@ The measured sizes of both builds are in [Using the library](06-using-the-librar
 The loops that take most of the run time have several versions. The rule is the same in every file:
 
 1. A safe function is the only entry point, for example `pitch::inner_prod`. It checks the slice lengths, usually by slicing to the exact length (`&x[..n]`), so a short slice panics before any vector code runs.
-2. On aarch64 it calls the NEON version. NEON is part of every aarch64 target, so there is no run-time check. These functions use `core::arch::aarch64` intrinsics; some carry `#[target_feature(enable = "neon")]`.
+2. On aarch64 it calls the NEON version, with no run-time check. opus1 requires NEON on aarch64: a `compile_error!` at the crate root stops the build for aarch64 targets without it, such as `aarch64-unknown-none-softfloat`. These functions use `core::arch::aarch64` intrinsics; some carry `#[target_feature(enable = "neon")]`.
 3. On x86 and x86-64 it checks for SSE4.1, AVX or AVX2 (Advanced Vector Extensions) and FMA (fused multiply-add):
    - It asks `crate::compat::x86_has_sse41()`, `x86_has_avx()`, `x86_has_avx2()`, `x86_has_avx_fma()` or `x86_has_avx2_fma()`.
    - When the answer is yes, it calls a kernel marked `#[target_feature(enable = "avx,fma")]` (or `"sse4.1"`, `"avx"`, `"avx2"`, `"avx2,fma"`). The kernel is a safe function. The call is an `unsafe` block, whose comment names the check (see [Unsafe code](#unsafe-code)).

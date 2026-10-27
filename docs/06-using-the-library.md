@@ -901,7 +901,7 @@ The neural network features work in all five builds. Without `heap`, `DnnBlob::f
 
 Leave out `analysis` to save its code and tables and the 26 KB of its state, for example on a small processor that encodes at complexity 6 or below anyway.
 
-Without `std`, the x86-64 code uses SSE4.1, AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"` (AVX2 includes SSE4.1). NEON, the vector instruction set of 64-bit ARM, is part of every aarch64 target and needs no check. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown` and `thumbv6m-none-eabi` (Cortex-M0, with `portable-atomic`) when those targets are installed, then runs the tests without `std`.
+Without `std`, the x86-64 code uses SSE4.1, AVX, AVX2 and FMA only when the build enables them, for example with `RUSTFLAGS="-C target-feature=+avx2,+fma"` (AVX2 includes SSE4.1). NEON, the vector instruction set of 64-bit ARM, needs no check: opus1 requires it on aarch64 and does not build for aarch64 targets without it, such as `aarch64-unknown-none-softfloat`. `scripts/check_no_std.sh` builds the `no_std` crate for `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown` and `thumbv6m-none-eabi` (Cortex-M0, with `portable-atomic`) when those targets are installed, then runs the tests without `std`.
 
 ### Building the encoder and the decoder in place
 

@@ -221,9 +221,9 @@ fn max_abs_without_nan(pcm: &[f32]) -> Option<f32> {
     // The loop stays in this plain function: in a `#[target_feature]`
     // function, the compiler laid out the encoder, into which this is
     // inlined, differently, and a scalar loop of the analysis got longer.
-    // SAFETY: NEON is part of the baseline of every aarch64 target. The
-    // block calls only NEON intrinsics and the load helpers of `simd_mem`.
-    // Each block holds 8 values, read as two vectors of 4.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. The block calls only NEON intrinsics and the load helpers of
+    // `simd_mem`. Each block holds 8 values, read as two vectors of 4.
     let (mut max, mut min) = unsafe {
         let zero = vdupq_n_f32(0.0);
         let (mut max0, mut max1, mut min0, mut min1) = (zero, zero, zero, zero);

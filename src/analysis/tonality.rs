@@ -673,7 +673,8 @@ impl TonalityAnalysisState {
 
         let sc = &mut self.scratch;
         let fft = fft_state();
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         #[cfg(target_arch = "aarch64")]
         unsafe { super::neon::window_for_fft(&self.inmem, fft, &mut sc.fft) };
         // SAFETY: SSE2 is part of this target (see the `cfg`).
@@ -710,7 +711,8 @@ impl TonalityAnalysisState {
         // Phase-based tonality of each bin (C 570-608), and the energy of
         // each bin.
         let mut phase = Phase { angle: &mut self.angle, d_angle: &mut self.d_angle, d2_angle: &mut self.d2_angle };
-        // SAFETY: NEON is part of the baseline of every aarch64 target.
+        // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+        // without it.
         #[cfg(target_arch = "aarch64")]
         let first_scalar_bin = unsafe { super::neon::tonality_bins(out, &mut phase, &mut sc.bins) };
         // SAFETY: SSE2 is part of this target (see the `cfg`).
@@ -1325,7 +1327,8 @@ fn downmix_and_resample(
 /// `y.len()` samples from sample `offset` on, channel `c1` plus the
 /// channels that `c2` names.
 fn downmix(pcm: &AnalysisPcm<'_>, y: &mut [f32], offset: usize) {
-    // SAFETY: NEON is part of the baseline of every aarch64 target.
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
     #[cfg(target_arch = "aarch64")]
     if unsafe { super::neon::downmix(pcm, y, offset) } {
         return;
