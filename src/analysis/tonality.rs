@@ -21,7 +21,7 @@ use super::tables::{ANALYSIS_WINDOW, DCT_TABLE, STD_FEATURE_BIAS, TBANDS};
 use super::{AnalysisInfo, AnalysisPcm, LEAK_BANDS, PcmRef, SecondChannel, is_digital_silence};
 use crate::kiss_fft::{KissCpx, KissFftState, opus_fft_impl};
 use crate::in_place::{write_fields, write_zero};
-use crate::mathops::mac;
+use crate::mathops::{float2int, mac};
 
 /// libopus `NB_FRAMES`: frames of band energies kept for the stationarity
 /// and the spectral variability.
@@ -74,40 +74,6 @@ fn min(a: f32, b: f32) -> f32 {
 #[inline(always)]
 fn max(a: f32, b: f32) -> f32 {
     if a > b { a } else { b }
-}
-
-/// libopus `float2int` (celt/float_cast.h): round to the nearest integer,
-/// a value halfway between two goes to the even one.
-///
-/// 64-bit ARM uses `vcvtns_s32_f32`, as libopus does, which also limits
-/// the result to the `i32` range and gives 0 for a NaN. Elsewhere the
-/// rounding is done in `f32` (as `lrintf` does in the default rounding
-/// mode) and `as i32` limits the range. The analysis only rounds small
-/// phase differences, far inside the range.
-#[inline(always)]
-fn float2int(x: f32) -> i32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is part of every 64-bit ARM processor.
-        unsafe { core::arch::aarch64::vcvtns_s32_f32(x) }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        // A float at or beyond 2^23 has no fraction bits. Below, adding
-        // 2^23 leaves no fraction bits either, so the sum rounds to an
-        // integer, to nearest and ties to even.
-        const TWO_23: f32 = 8_388_608.0;
-        // NaN must take this branch, so the comparison is negated.
-        #[allow(clippy::neg_cmp_op_on_partial_ord)]
-        let r = if !(x.abs() < TWO_23) {
-            x
-        } else if x >= 0.0 {
-            (x + TWO_23) - TWO_23
-        } else {
-            (x - TWO_23) + TWO_23
-        };
-        r as i32
-    }
 }
 
 /// The constants of libopus `fast_atan2f` (celt/mathops.h:55-59), with the

@@ -293,9 +293,10 @@ impl<T: Sample> ChannelSource for Interleaved<'_, T> {
 /// libopus calls this `opus_copy_channel_out_func`.
 pub(crate) trait ChannelSink {
     /// Writes `frame_size` samples to output channel `dst_channel`.
-    /// `src` is `Some((samples, stride))`: sample `i` is `samples[i * stride]`.
-    /// `None` writes silence.
-    fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize)>, frame_size: usize);
+    /// `src` is `Some((samples, stride, channel))`: the samples of a stream
+    /// with `stride` channels, interleaved, and the channel to copy. Sample
+    /// `i` is `samples[i * stride + channel]`. `None` writes silence.
+    fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize, usize)>, frame_size: usize);
 }
 
 /// The channel mapping table of an Ogg Opus header (RFC 7845 section 5.1.1):

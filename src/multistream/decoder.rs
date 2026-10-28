@@ -54,20 +54,31 @@ struct InterleavedSink<'a, T> {
 
 impl<T: Sample> ChannelSink for InterleavedSink<'_, T> {
     #[inline]
-    fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize)>, frame_size: usize) {
-        let Some(out) = self.out.get_mut(dst_channel..) else {
+    fn put(&mut self, dst_channel: usize, src: Option<(&[f32], usize, usize)>, frame_size: usize) {
+        let channels = self.channels.max(1);
+        if dst_channel >= channels {
             return;
-        };
-        let dst = out.iter_mut().step_by(self.channels.max(1)).take(frame_size);
+        }
+        // Row `i` of the output holds sample `i` of every channel, and so
+        // does row `i` of the stream's samples. The decoder checked that
+        // `out` has `frame_size` whole rows. Both sides of the `zip` below
+        // are whole rows, and both channel indices are checked before the
+        // loop, so the loop runs on one counter, without index checks.
+        let len = frame_size.saturating_mul(channels).min(self.out.len());
+        let rows = self.out[..len].chunks_exact_mut(channels);
         match src {
-            Some((samples, stride)) => {
-                for (d, &s) in dst.zip(samples.iter().step_by(stride.max(1))) {
-                    *d = T::from_f32(s);
+            Some((samples, stride, channel)) => {
+                let stride = stride.max(1);
+                if channel >= stride {
+                    return;
+                }
+                for (row, frame) in rows.zip(samples.chunks_exact(stride)) {
+                    row[dst_channel] = T::from_f32(frame[channel]);
                 }
             }
             None => {
-                for d in dst {
-                    *d = T::ZERO;
+                for row in rows {
+                    row[dst_channel] = T::ZERO;
                 }
             }
         }
@@ -497,14 +508,14 @@ impl MultistreamDecoder {
             // the one channel of a mono stream.
             if s < coupled_streams {
                 for &chan in outputs.with_entry(2 * s) {
-                    sink.put(chan as usize, Some((stream_buf, 2)), frame_size);
+                    sink.put(chan as usize, Some((stream_buf, 2, 0)), frame_size);
                 }
                 for &chan in outputs.with_entry(2 * s + 1) {
-                    sink.put(chan as usize, Some((&stream_buf[1..], 2)), frame_size);
+                    sink.put(chan as usize, Some((stream_buf, 2, 1)), frame_size);
                 }
             } else {
                 for &chan in outputs.with_entry(s + coupled_streams) {
-                    sink.put(chan as usize, Some((stream_buf, 1)), frame_size);
+                    sink.put(chan as usize, Some((stream_buf, 1, 0)), frame_size);
                 }
             }
         }
@@ -617,18 +628,18 @@ mod tests {
         let mut out = [9.0f32; 9];
         let mut sink = InterleavedSink { out: &mut out, channels: 3 };
         // Every second sample of `src`, to channel 1.
-        sink.put(1, Some((&src, 2)), 3);
+        sink.put(1, Some((&src, 2, 0)), 3);
         assert_eq!(out, [9.0, 1.0, 9.0, 9.0, 3.0, 9.0, 9.0, 5.0, 9.0]);
         let mut sink = InterleavedSink { out: &mut out, channels: 3 };
-        // The same samples starting at the second one, to channel 2.
-        sink.put(2, Some((&src[1..], 2)), 3);
+        // The other channel of the same pairs, to channel 2.
+        sink.put(2, Some((&src, 2, 1)), 3);
         sink.put(0, None, 2);
         assert_eq!(out, [0.0, 1.0, 2.0, 0.0, 3.0, 4.0, 9.0, 5.0, 6.0]);
 
         let src = [0.5f32, -0.5, 2.0, -2.0];
         let mut out = [7i16; 8];
         let mut sink = InterleavedSink { out: &mut out, channels: 2 };
-        sink.put(0, Some((&src, 1)), 4);
+        sink.put(0, Some((&src, 1, 0)), 4);
         assert_eq!(out, [16384, 7, -16384, 7, 32767, 7, -32768, 7]);
         let mut sink = InterleavedSink { out: &mut out, channels: 2 };
         sink.put(1, None, 3);
@@ -640,15 +651,20 @@ mod tests {
         let src = [1.0f32; 4];
         let mut out = [0.0f32; 4];
         let mut sink = InterleavedSink { out: &mut out, channels: 2 };
-        // A channel beyond the output, more samples than there are, stride 0.
-        sink.put(9, Some((&src, 1)), 4);
-        sink.put(1, Some((&src, 1)), 100);
-        sink.put(0, Some((&src, 0)), 2);
-        sink.put(0, Some((&[], 1)), 2);
+        // A channel beyond the output.
+        sink.put(9, Some((&src, 1, 0)), 4);
+        // More samples than there are.
+        sink.put(1, Some((&src, 1, 0)), 100);
+        // Stride 0.
+        sink.put(0, Some((&src, 0, 0)), 2);
+        // A source channel beyond the stride.
+        sink.put(0, Some((&src, 2, 2)), 2);
+        // No samples.
+        sink.put(0, Some((&[], 1, 0)), 2);
         let mut out = [0i16; 4];
         let mut sink = InterleavedSink { out: &mut out, channels: 0 };
         sink.put(9, None, 4);
-        sink.put(0, Some((&src, 0)), 100);
+        sink.put(0, Some((&src, 0, 0)), 100);
     }
 
     #[test]
