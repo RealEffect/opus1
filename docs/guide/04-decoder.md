@@ -445,6 +445,7 @@ An `OpusDred` is 11,236 bytes and decoding does not change it, so one parsed pac
 
 1. The packet is decoded to float into a buffer for the whole packet (`decode_native` with `soft_clip` set). The buffer holds 120 ms, the longest packet. A longer loss is concealed 60 ms at a time. This gives the same samples as concealing it in one call.
 2. A decoded packet is soft-clipped (`pcm_soft_clip`, the port of `opus_pcm_soft_clip`):
+   - First every sample is limited to ±2, the range of the curve below. On 64-bit ARM, as in libopus, a vector pass reads the samples first and writes them only when one is beyond ±2. When every sample is within ±1, the search for stretches beyond ±1 is skipped. As in libopus, a NaN (not a number) anywhere in the whole blocks of 16 samples keeps those blocks from being limited to ±2 or counted as beyond ±1. The decoder gives no NaN.
    - Where the signal goes beyond ±1, the samples between the zero crossings around that place are replaced by `x + a * x * x`. As in the libopus build on 64-bit ARM, `a * x` is rounded and the second product is fused into the sum, so the output is libopus's bit for bit.
    - The value `a` is chosen so that the peak lands on ±1.
    - When such a stretch reaches the end of the packet, a value per channel (`softclip_mem`) keeps its `a`. The next packet applies the same curve to its first samples, up to the first zero crossing. So packets join without a step.

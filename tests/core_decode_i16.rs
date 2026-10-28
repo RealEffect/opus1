@@ -242,6 +242,16 @@ fn c_soft_clip(pcm: &[f32], frame_size: usize, channels: usize, mem: &mut [f32])
     out
 }
 
+/// Whether opus1's value `b` is libopus's `a`: the same bits on 64-bit ARM,
+/// where opus1 fuses the multiply-adds as clang does, and within `tol` on
+/// other targets. Two NaNs count as the same.
+fn same_as_libopus(a: f32, b: f32, tol: f32) -> bool {
+    if a.is_nan() && b.is_nan() {
+        return true;
+    }
+    if cfg!(target_arch = "aarch64") { a.to_bits() == b.to_bits() } else { (a - b).abs() <= tol }
+}
+
 /// `pcm_soft_clip` gives the output of `opus_pcm_soft_clip`, buffer after
 /// buffer with the memory carried along, for buffers of many lengths. On
 /// 64-bit ARM, where opus1 fuses the multiply-adds as clang does, the bits
@@ -273,16 +283,14 @@ fn pcm_soft_clip_matches_libopus() {
                 let expected = c_soft_clip(&pcm, n, channels, &mut c_mem);
                 let mut ours = pcm.clone();
                 pcm_soft_clip(&mut ours, channels, &mut rs_mem).unwrap();
-                let exact = cfg!(target_arch = "aarch64");
-                for (i, (a, b)) in expected.iter().zip(&ours).enumerate() {
+                for (i, (&a, &b)) in expected.iter().zip(&ours).enumerate() {
                     worst = worst.max((a - b).abs());
-                    let ok = if exact { a.to_bits() == b.to_bits() } else { (a - b).abs() <= 2e-6 };
+                    let ok = same_as_libopus(a, b, 2e-6);
                     assert!(ok, "gain {gain}, offset {offset}, {channels} ch, round {round}, sample {i}: libopus {a}, opus1 {b}");
                     assert!(b.abs() <= 1.0, "sample {i} is {b}");
                 }
-                for (a, b) in c_mem.iter().zip(&rs_mem) {
-                    let ok = if exact { a.to_bits() == b.to_bits() } else { (a - b).abs() <= 1e-6 * a.abs().max(1.0) };
-                    assert!(ok, "memory: libopus {a}, opus1 {b}");
+                for (&a, &b) in c_mem.iter().zip(&rs_mem) {
+                    assert!(same_as_libopus(a, b, 1e-6 * a.abs().max(1.0)), "memory: libopus {a}, opus1 {b}");
                 }
                 clipped_buffers += (expected != pcm) as usize;
             }
@@ -309,4 +317,55 @@ fn pcm_soft_clip_matches_libopus() {
     let mut pcm = [0.5f32, f32::NAN, 1.7, f32::INFINITY, -0.3];
     pcm_soft_clip(&mut pcm, 1, &mut [0.0]).unwrap();
     assert!(pcm[1].is_nan());
+}
+
+/// `pcm_soft_clip` on input that the decoder never produces: a NaN together
+/// with samples beyond ±1, and memory beyond ±2.
+///
+/// libopus built to presume NEON (as the Homebrew build on 64-bit ARM is)
+/// checks the range with NEON first (`opus_limit2_checkwithin1_neon`). A
+/// NaN anywhere in the whole blocks of 16 samples hides all of those blocks
+/// from the check. When the check finds every sample within ±1, the soft
+/// clipper skips its search, even if memory beyond ±2 then bends a sample
+/// beyond ±1. On 64-bit ARM opus1 gives the same bits. On other targets
+/// opus1 runs the C version of the check, as other libopus builds do.
+#[test]
+fn pcm_soft_clip_matches_libopus_on_nan_and_large_memory() {
+    let tone = |n: usize, peak: f32| (0..n).map(|i| peak * (i as f32 * 0.37).sin()).collect::<Vec<f32>>();
+    let mut cases: Vec<(&str, usize, Vec<f32>, Vec<f32>)> = Vec::new();
+    for (where_, index) in [("in the first block", 3), ("in the second block", 20), ("after the blocks", 37)] {
+        let mut pcm = tone(40, 2.5);
+        pcm[index] = f32::NAN;
+        cases.push((where_, 1, pcm, vec![0.0]));
+    }
+    let mut pcm = tone(64, 1.6);
+    pcm[10] = f32::NAN;
+    cases.push(("stereo, NaN in the left channel", 2, pcm, vec![0.0, 0.0]));
+    // Samples within ±1. The first ones have the sign opposite to the
+    // memory, so the curve from the memory goes on and bends them beyond ±1.
+    for a in [5.0f32, -5.0, 2.5] {
+        let start = [-0.95f32, -0.8, -0.7, -0.6, -0.5].map(|v| v * a.signum());
+        let pcm: Vec<f32> = start.iter().copied().chain(tone(43, 0.9).iter().map(|v| v.abs() * a.signum())).collect();
+        cases.push(("memory beyond 2", 1, pcm, vec![a]));
+    }
+    let exact = cfg!(target_arch = "aarch64");
+    for (name, channels, pcm, mem) in cases {
+        let mut c_mem = mem.clone();
+        let expected = c_soft_clip(&pcm, pcm.len() / channels, channels, &mut c_mem);
+        let mut ours = pcm.clone();
+        let mut rs_mem = mem.clone();
+        pcm_soft_clip(&mut ours, channels, &mut rs_mem).unwrap();
+        for (i, (&a, &b)) in expected.iter().zip(&ours).enumerate() {
+            assert!(same_as_libopus(a, b, 2e-6), "{name}, sample {i}: libopus {a}, opus1 {b}");
+        }
+        for (&a, &b) in c_mem.iter().zip(&rs_mem) {
+            assert!(same_as_libopus(a, b, 2e-6), "{name}, memory: libopus {a}, opus1 {b}");
+        }
+        // With NEON, libopus skips the search and leaves the bent samples
+        // beyond ±1, so the case reaches the code it is meant for.
+        if exact && name == "memory beyond 2" {
+            assert!(expected.iter().any(|v| v.abs() > 1.0), "{name}: nothing beyond ±1");
+        }
+        println!("{name}: {} of {} samples changed", expected.iter().zip(&pcm).filter(|(a, b)| a.to_bits() != b.to_bits()).count(), pcm.len());
+    }
 }
