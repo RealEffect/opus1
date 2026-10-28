@@ -164,7 +164,7 @@ fn silk_plc_energy(
     subfr_length: i32,
     nb_subfr: i32,
 ) {
-    let mut exc_buf = [0i16; 2 * 320];
+    let mut exc_buf = [0i16; 2 * MAX_SUB_FRAME_LENGTH];
     let subfr = subfr_length as usize;
     for k in 0..2usize {
         let offset = (k + (nb_subfr - 2) as usize) * subfr;

@@ -74,7 +74,7 @@ pub fn silk_decode_frame(
         silk_decode_core(ps_dec, &mut ps_dec_ctrl, p_out, &pulses);
 
         let mv_len = ps_dec.ltp_mem_length - ps_dec.frame_length;
-        ps_dec.out_buf.rotate_left(ps_dec.frame_length as usize);
+        ps_dec.out_buf.copy_within(ps_dec.frame_length as usize..ps_dec.ltp_mem_length as usize, 0);
         ps_dec.out_buf[mv_len as usize..mv_len as usize + l].copy_from_slice(&p_out[..l]);
 
         // libopus decode_frame.c:109-114: the enhancement, in every build
@@ -104,7 +104,7 @@ pub fn silk_decode_frame(
         }
 
         let mv_len = ps_dec.ltp_mem_length - ps_dec.frame_length;
-        ps_dec.out_buf.rotate_left(ps_dec.frame_length as usize);
+        ps_dec.out_buf.copy_within(ps_dec.frame_length as usize..ps_dec.ltp_mem_length as usize, 0);
         ps_dec.out_buf[mv_len as usize..mv_len as usize + l].copy_from_slice(&p_out[..l]);
     }
 
