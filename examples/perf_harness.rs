@@ -23,6 +23,9 @@
 //! * `pairs` compares two builds that ran in turns.
 //! * `analysis` times the speech and music analysis alone, opus1 against
 //!   libopus.
+//! * `output` times the decoder with float, 16-bit and 24-bit output,
+//!   alone and inside a multistream decoder, opus1 against libopus.
+//! * `plc` times the concealment of lost packets, opus1 against libopus.
 //!
 //! The C side is libopus, linked through `audiopus_sys`. Both encoders are
 //! forced to the coding mode, the audio bandwidth and the channel count
@@ -1545,6 +1548,30 @@ impl Drop for CEncoder {
     }
 }
 
+/// One call of a libopus decoder function with the signature of
+/// `opus_decode`: `decode(state, data, len, pcm, frame_size, decode_fec)`.
+/// Returns the samples per channel, or a negative libopus error code.
+///
+/// # Safety
+///
+/// `state` must be a live decoder of `channels` channels, made by the
+/// libopus constructor that matches `decode`.
+#[inline]
+unsafe fn c_decode<S, T>(
+    decode: unsafe extern "C" fn(*mut S, *const u8, i32, *mut T, c_int, c_int) -> c_int,
+    state: *mut S,
+    channels: usize,
+    packet: &[u8],
+    frame: usize,
+    out: &mut [T],
+) -> i32 {
+    assert!(out.len() >= frame * channels);
+    // SAFETY: `state` is as the caller promises; `out` has room for
+    // `frame * channels` samples (checked above); `packet` is readable for
+    // its length.
+    unsafe { decode(state, packet.as_ptr(), packet.len() as i32, out.as_mut_ptr(), frame as c_int, 0) }
+}
+
 /// C libopus decoder.
 struct CDecoder {
     state: *mut ffi::OpusDecoder,
@@ -1569,19 +1596,9 @@ impl CDecoder {
     /// Returns the samples per channel, or a negative libopus error code.
     #[inline]
     fn decode(&mut self, packet: &[u8], frame: usize, out: &mut [f32]) -> i32 {
-        assert!(out.len() >= frame * self.channels);
-        // SAFETY: `out` has room for `frame * channels` samples (checked
-        // above); `packet` is readable for its length.
-        unsafe {
-            ffi::opus_decode_float(
-                self.state,
-                packet.as_ptr(),
-                packet.len() as i32,
-                out.as_mut_ptr(),
-                frame as c_int,
-                0,
-            )
-        }
+        // SAFETY: `state` was made by the matching constructor in `new`,
+        // with `channels` channels, and is freed only in `drop`.
+        unsafe { c_decode(ffi::opus_decode_float, self.state, self.channels, packet, frame, out) }
     }
 }
 
@@ -3168,6 +3185,558 @@ fn cmd_analysis(opts: &Opts) -> Result<i32, String> {
 }
 
 // ---------------------------------------------------------------------------
+// output: the decoder with each output form
+// ---------------------------------------------------------------------------
+
+/// `--seconds` and `--reps` of `output` and `plc`: at least one repetition,
+/// and more than 0.1 s and at most 600 s per pass.
+fn timing_args(opts: &Opts) -> Result<(f64, usize), String> {
+    let seconds: f64 = opts.number("--seconds", 6.0)?;
+    let reps: usize = opts.number("--reps", 15)?;
+    // Written so that a NaN fails too.
+    if reps == 0 || !(seconds > 0.1 && seconds <= 600.0) {
+        return Err("--reps must be at least 1, and --seconds more than 0.1 and at most 600".to_string());
+    }
+    Ok((seconds, reps))
+}
+
+/// Stops the program when a timed pass failed or returned the wrong number
+/// of samples.
+fn check_pass(what: &str, sc: &Scenario, packets: &Packets, samples: usize, failures: usize) {
+    let frame = sc.dec_frame_samples();
+    assert!(failures == 0, "{what} failed {failures} times while it was timed");
+    assert!(
+        samples == frame * packets.len(),
+        "{what} returned {samples} samples for {} packets of {frame}",
+        packets.len()
+    );
+}
+
+/// The command `output` and what only it uses. It needs the feature
+/// `alloc`, as the multistream module does.
+#[cfg(feature = "alloc")]
+mod output {
+    use super::*;
+    use opus1::multistream::MultistreamDecoder;
+
+    /// opus1 multistream decoder with the one-stream layout of `CMsDecoder`.
+    fn rust_ms_decoder(sc: &Scenario) -> Result<MultistreamDecoder, String> {
+        let rate = SampleRate::try_from(sc.dec_rate).map_err(|e| format!("rate {}: {e}", sc.dec_rate))?;
+        let coupled = usize::from(sc.channels == 2);
+        MultistreamDecoder::new(rate, sc.channels, 1, coupled, &[0, 1])
+            .map_err(|e| format!("MultistreamDecoder::new: {e}"))
+    }
+
+    impl CDecoder {
+        /// `decode` with 16-bit output (`opus_decode`).
+        #[inline]
+        fn decode_i16(&mut self, packet: &[u8], frame: usize, out: &mut [i16]) -> i32 {
+            // SAFETY: `state` was made by the matching constructor in `new`,
+            // with `channels` channels, and is freed only in `drop`.
+            unsafe { c_decode(ffi::opus_decode, self.state, self.channels, packet, frame, out) }
+        }
+
+        /// `decode` with 24-bit output in 32-bit integers (`opus_decode24`).
+        #[inline]
+        fn decode24(&mut self, packet: &[u8], frame: usize, out: &mut [i32]) -> i32 {
+            // SAFETY: `state` was made by the matching constructor in `new`,
+            // with `channels` channels, and is freed only in `drop`.
+            unsafe { c_decode(c_decode24::opus_decode24, self.state, self.channels, packet, frame, out) }
+        }
+    }
+
+    /// The 24-bit decoders of libopus 1.6.1, which `audiopus_sys` (written for
+    /// libopus 1.3) does not declare.
+    mod c_decode24 {
+        use audiopus_sys as ffi;
+        use std::os::raw::c_int;
+
+        unsafe extern "C" {
+            pub fn opus_decode24(
+                st: *mut ffi::OpusDecoder,
+                data: *const u8,
+                len: i32,
+                pcm: *mut i32,
+                frame_size: c_int,
+                decode_fec: c_int,
+            ) -> c_int;
+            pub fn opus_multistream_decode24(
+                st: *mut ffi::OpusMSDecoder,
+                data: *const u8,
+                len: i32,
+                pcm: *mut i32,
+                frame_size: c_int,
+                decode_fec: c_int,
+            ) -> c_int;
+        }
+    }
+
+    /// C libopus multistream decoder with one stream: one coupled stream for a
+    /// stereo scenario, one mono stream for a mono one. The last stream of a
+    /// multistream packet is an ordinary packet, so the packets of the scenario
+    /// are multistream packets for this layout.
+    struct CMsDecoder {
+        state: *mut ffi::OpusMSDecoder,
+        channels: usize,
+    }
+
+    impl CMsDecoder {
+        fn new(sc: &Scenario) -> Result<Self, String> {
+            let mapping = [0u8, 1];
+            let coupled = c_int::from(sc.channels == 2);
+            let mut error: c_int = 0;
+            // SAFETY: plain C constructor; `mapping` has an entry for each of
+            // the at most 2 channels, and `error` is a valid out pointer.
+            let state = unsafe {
+                ffi::opus_multistream_decoder_create(
+                    sc.dec_rate as i32,
+                    sc.channels as c_int,
+                    1,
+                    coupled,
+                    mapping.as_ptr(),
+                    &mut error,
+                )
+            };
+            if state.is_null() || error != ffi::OPUS_OK {
+                return Err(format!("opus_multistream_decoder_create failed with {error}"));
+            }
+            Ok(Self {
+                state,
+                channels: sc.channels,
+            })
+        }
+
+        /// Returns the samples per channel, or a negative libopus error code.
+        #[inline]
+        fn decode(&mut self, packet: &[u8], frame: usize, out: &mut [f32]) -> i32 {
+            // SAFETY: `state` was made by the matching constructor in `new`,
+            // with `channels` channels, and is freed only in `drop`.
+            unsafe { c_decode(ffi::opus_multistream_decode_float, self.state, self.channels, packet, frame, out) }
+        }
+
+        /// `decode` with 16-bit output (`opus_multistream_decode`).
+        #[inline]
+        fn decode_i16(&mut self, packet: &[u8], frame: usize, out: &mut [i16]) -> i32 {
+            // SAFETY: `state` was made by the matching constructor in `new`,
+            // with `channels` channels, and is freed only in `drop`.
+            unsafe { c_decode(ffi::opus_multistream_decode, self.state, self.channels, packet, frame, out) }
+        }
+
+        /// `decode` with 24-bit output (`opus_multistream_decode24`).
+        #[inline]
+        fn decode24(&mut self, packet: &[u8], frame: usize, out: &mut [i32]) -> i32 {
+            // SAFETY: `state` was made by the matching constructor in `new`,
+            // with `channels` channels, and is freed only in `drop`.
+            unsafe { c_decode(c_decode24::opus_multistream_decode24, self.state, self.channels, packet, frame, out) }
+        }
+    }
+
+    impl Drop for CMsDecoder {
+        fn drop(&mut self) {
+            // SAFETY: `state` came from `opus_multistream_decoder_create` and is
+            // freed once.
+            unsafe { ffi::opus_multistream_decoder_destroy(self.state) }
+        }
+    }
+
+    /// The output forms that `output` times.
+    #[derive(Clone, Copy)]
+    enum Output {
+        /// `OpusDecoder::decode` (C `opus_decode_float`).
+        F32,
+        /// `OpusDecoder::decode_i16` (C `opus_decode`): the float output, soft
+        /// clipped and rounded to 16 bits.
+        I16,
+        /// `MultistreamDecoder::decode` with one stream (C
+        /// `opus_multistream_decode_float`): the packet check of the
+        /// multistream decoder and the copy into the interleaved output.
+        MsF32,
+        /// `MultistreamDecoder::decode_i16` with one stream (C
+        /// `opus_multistream_decode`).
+        MsI16,
+        /// `OpusDecoder::decode24` (C `opus_decode24`): the float output scaled
+        /// by 2^23 and rounded into 32-bit integers.
+        I24,
+        /// `MultistreamDecoder::decode24` with one stream (C
+        /// `opus_multistream_decode24`).
+        MsI24,
+    }
+
+    const OUTPUTS: [Output; 6] = [Output::F32, Output::I16, Output::MsF32, Output::MsI16, Output::I24, Output::MsI24];
+
+    impl Output {
+        fn label(self) -> &'static str {
+            match self {
+                Output::F32 => "f32",
+                Output::I16 => "i16",
+                Output::MsF32 => "ms f32",
+                Output::MsI16 => "ms i16",
+                Output::I24 => "i24",
+                Output::MsI24 => "ms i24",
+            }
+        }
+    }
+
+    /// The output buffers of `output`, one per sample type, each with room for
+    /// one packet.
+    struct OutputBuffers {
+        pcm: Vec<f32>,
+        pcm16: Vec<i16>,
+        pcm24: Vec<i32>,
+    }
+
+    impl OutputBuffers {
+        fn new(sc: &Scenario) -> Self {
+            let n = sc.dec_frame_samples() * sc.channels;
+            Self { pcm: vec![0.0; n], pcm16: vec![0; n], pcm24: vec![0; n] }
+        }
+    }
+
+    /// One pass of `decode` over the packets, timed as in `time_rust_decode`.
+    /// `decode` returns the samples per channel, or `None` when it failed.
+    /// Returns the time, the samples and the failures.
+    #[inline(always)]
+    fn time_pass(packets: &Packets, mut decode: impl FnMut(&[u8]) -> Option<usize>) -> (Duration, usize, usize) {
+        let (mut samples, mut failures) = (0usize, 0usize);
+        let start = Instant::now();
+        for packet in packets.iter() {
+            match decode(black_box(packet)) {
+                Some(n) => samples += n,
+                None => failures += 1,
+            }
+        }
+        (start.elapsed(), samples, failures)
+    }
+
+    /// Times opus1 decoding the packets into `output`, from a fresh decoder.
+    #[inline(never)]
+    fn time_rust_output(sc: &Scenario, packets: &Packets, output: Output, bufs: &mut OutputBuffers) -> Duration {
+        let frame = sc.dec_frame_samples();
+        let OutputBuffers { pcm, pcm16, pcm24 } = bufs;
+        let (elapsed, samples, failures) = match output {
+            Output::F32 => {
+                let mut decoder = rust_decoder(sc).expect("Rust decoder");
+                time_pass(packets, |p| decoder.decode(p, frame, pcm).ok())
+            }
+            Output::I16 => {
+                let mut decoder = rust_decoder(sc).expect("Rust decoder");
+                time_pass(packets, |p| decoder.decode_i16(p, frame, pcm16).ok())
+            }
+            Output::MsF32 => {
+                let mut decoder = rust_ms_decoder(sc).expect("Rust multistream decoder");
+                time_pass(packets, |p| decoder.decode(p, frame, pcm).ok())
+            }
+            Output::MsI16 => {
+                let mut decoder = rust_ms_decoder(sc).expect("Rust multistream decoder");
+                time_pass(packets, |p| decoder.decode_i16(p, frame, pcm16).ok())
+            }
+            Output::I24 => {
+                let mut decoder = rust_decoder(sc).expect("Rust decoder");
+                time_pass(packets, |p| decoder.decode24(p, frame, pcm24).ok())
+            }
+            Output::MsI24 => {
+                let mut decoder = rust_ms_decoder(sc).expect("Rust multistream decoder");
+                time_pass(packets, |p| decoder.decode24(p, frame, pcm24).ok())
+            }
+        };
+        black_box((&*pcm, &*pcm16, &*pcm24));
+        check_pass(&format!("Rust decode ({})", output.label()), sc, packets, samples, failures);
+        elapsed
+    }
+
+    /// Times libopus decoding the packets into `output`, from a fresh decoder.
+    #[inline(never)]
+    fn time_c_output(sc: &Scenario, packets: &Packets, output: Output, bufs: &mut OutputBuffers) -> Duration {
+        let frame = sc.dec_frame_samples();
+        let OutputBuffers { pcm, pcm16, pcm24 } = bufs;
+        // A negative count is a libopus error.
+        let count = |n: i32| usize::try_from(n).ok();
+        let (elapsed, samples, failures) = match output {
+            Output::F32 => {
+                let mut decoder = CDecoder::new(sc).expect("C decoder");
+                time_pass(packets, |p| count(decoder.decode(p, frame, pcm)))
+            }
+            Output::I16 => {
+                let mut decoder = CDecoder::new(sc).expect("C decoder");
+                time_pass(packets, |p| count(decoder.decode_i16(p, frame, pcm16)))
+            }
+            Output::MsF32 => {
+                let mut decoder = CMsDecoder::new(sc).expect("C multistream decoder");
+                time_pass(packets, |p| count(decoder.decode(p, frame, pcm)))
+            }
+            Output::MsI16 => {
+                let mut decoder = CMsDecoder::new(sc).expect("C multistream decoder");
+                time_pass(packets, |p| count(decoder.decode_i16(p, frame, pcm16)))
+            }
+            Output::I24 => {
+                let mut decoder = CDecoder::new(sc).expect("C decoder");
+                time_pass(packets, |p| count(decoder.decode24(p, frame, pcm24)))
+            }
+            Output::MsI24 => {
+                let mut decoder = CMsDecoder::new(sc).expect("C multistream decoder");
+                time_pass(packets, |p| count(decoder.decode24(p, frame, pcm24)))
+            }
+        };
+        black_box((&*pcm, &*pcm16, &*pcm24));
+        check_pass(&format!("C decode ({})", output.label()), sc, packets, samples, failures);
+        elapsed
+    }
+
+    /// `output`: times the decoder of each library with each output form, on
+    /// the C packets of a scenario. The 16-bit forms add the soft clipper and
+    /// the rounding to the float decode, and the 24-bit forms the rounding.
+    /// The multistream forms add the packet check of the multistream decoder
+    /// and the copy into the interleaved output. The columns "over f32" give
+    /// these additions.
+    ///
+    /// Each repetition decodes the clip once per form and library, each time
+    /// from a fresh decoder. Rust and C alternate, and the order within each
+    /// pair flips on every repetition, as in `bench`. The first form moves by
+    /// one place every second counted repetition. So with 12 repetitions or
+    /// more (the default is 15) each form runs first once with each library
+    /// first.
+    pub(super) fn cmd_output(opts: &Opts) -> Result<i32, String> {
+        let (seconds, reps) = timing_args(opts)?;
+        let filter = opts.get("--filter");
+        let all = opts.flag("--all");
+        let raised = raise_thread_priority();
+        let mut signals = Signals::load()?;
+        println!(
+            "decoder output forms, {seconds} s per pass, {reps} passes, {}{}",
+            libopus_version(),
+            if raised { "" } else { " (thread priority not raised)" }
+        );
+        println!(
+            "| Scenario | Output | opus1 min µs | opus1 median µs | libopus min µs | libopus median µs | Ratio of medians | opus1 over f32 | libopus over f32 |"
+        );
+        println!("|---|---|---:|---:|---:|---:|---:|---:|---:|");
+        let mut json = String::new();
+        for sc in scenarios().iter().filter(|sc| (all || sc.bench) && name_matches(&sc.name(), filter)) {
+            let clip = signals.clip(sc, seconds, 0);
+            let packets = c_encode_all(sc, &clip, true)?;
+            let mut bufs = OutputBuffers::new(sc);
+            let mut rust: [Vec<Duration>; OUTPUTS.len()] = Default::default();
+            let mut c: [Vec<Duration>; OUTPUTS.len()] = Default::default();
+            // Repetition 0 is a warm-up and is dropped. Repetitions 1 and 2 have
+            // the same first form, one with C first and one with Rust first.
+            for rep in 0..=reps {
+                let lead = rep.saturating_sub(1) / 2;
+                for k in 0..OUTPUTS.len() {
+                    let index = (k + lead) % OUTPUTS.len();
+                    let output = OUTPUTS[index];
+                    let (r, cd);
+                    if rep % 2 == 0 {
+                        r = time_rust_output(sc, &packets, output, &mut bufs);
+                        cd = time_c_output(sc, &packets, output, &mut bufs);
+                    } else {
+                        cd = time_c_output(sc, &packets, output, &mut bufs);
+                        r = time_rust_output(sc, &packets, output, &mut bufs);
+                    }
+                    if rep > 0 {
+                        rust[index].push(r);
+                        c[index].push(cd);
+                    }
+                }
+            }
+            let rust: Vec<Stat> = rust.iter().map(|t| stat(t, packets.len())).collect();
+            let c: Vec<Stat> = c.iter().map(|t| stat(t, packets.len())).collect();
+            // The change of the median against the float decode of the same
+            // library.
+            let over = |s: &[Stat], index: usize| s[index].median_ns / s[0].median_ns - 1.0;
+            for (index, output) in OUTPUTS.iter().enumerate() {
+                let (r, cs) = (rust[index], c[index]);
+                let percent = |s: &[Stat]| {
+                    if index == 0 { "-".to_string() } else { format!("{:+.1} %", 100.0 * over(s, index)) }
+                };
+                println!(
+                    "| {} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {} | {} |",
+                    sc.name(),
+                    output.label(),
+                    r.min_ns / 1e3,
+                    r.median_ns / 1e3,
+                    cs.min_ns / 1e3,
+                    cs.median_ns / 1e3,
+                    r.median_ns / cs.median_ns,
+                    percent(&rust),
+                    percent(&c)
+                );
+                let _ = writeln!(
+                    json,
+                    "{{\"scenario\": {}, \"output\": {}, \"rust_min_ns\": {:.1}, \"rust_median_ns\": {:.1}, \"c_min_ns\": {:.1}, \"c_median_ns\": {:.1}}}",
+                    json_string(&sc.name()),
+                    json_string(output.label()),
+                    r.min_ns,
+                    r.median_ns,
+                    cs.min_ns,
+                    cs.median_ns
+                );
+            }
+        }
+        if let Some(path) = opts.get("--json") {
+            write_file(path, &json)?;
+        }
+        Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// plc: the concealment of lost packets
+// ---------------------------------------------------------------------------
+
+/// The time of the lost packets of one pass with the losses of
+/// `Loss::Bursts`, in two groups: a lost packet whose packet before it
+/// arrived (the first of a run), and a lost packet after another lost one.
+/// A decoder conceals the two differently. Only the calls for lost packets
+/// are timed, each on its own.
+#[derive(Clone, Copy, Default)]
+struct LossTimes {
+    first: Duration,
+    later: Duration,
+}
+
+/// For packet `index` with the losses of `Loss::Bursts`: `None` when it
+/// arrives, `Some(false)` when it is the first lost packet of a run, and
+/// `Some(true)` when the packet before it was lost too.
+fn loss_after_loss(index: usize) -> Option<bool> {
+    Loss::Bursts.is_lost(index).then(|| index > 0 && Loss::Bursts.is_lost(index - 1))
+}
+
+/// One pass of `decode` over the packets, each packet that `Loss::Bursts`
+/// marks as lost replaced by an empty one. `decode` returns the samples per
+/// channel, or `None` when it failed.
+#[inline(always)]
+fn time_loss_pass(packets: &Packets, mut decode: impl FnMut(&[u8]) -> Option<usize>) -> (LossTimes, usize, usize) {
+    let mut times = LossTimes::default();
+    let (mut samples, mut failures) = (0usize, 0usize);
+    for (index, packet) in packets.iter().enumerate() {
+        let loss = loss_after_loss(index);
+        let input: &[u8] = if loss.is_some() { &[] } else { packet };
+        let start = Instant::now();
+        let result = decode(black_box(input));
+        let elapsed = start.elapsed();
+        match result {
+            Some(n) => samples += n,
+            None => failures += 1,
+        }
+        match loss {
+            Some(false) => times.first += elapsed,
+            Some(true) => times.later += elapsed,
+            None => {}
+        }
+    }
+    (times, samples, failures)
+}
+
+/// Times opus1 concealing the lost packets of one pass, from a fresh
+/// decoder.
+#[inline(never)]
+fn time_rust_losses(sc: &Scenario, packets: &Packets, pcm: &mut [f32]) -> LossTimes {
+    let frame = sc.dec_frame_samples();
+    let mut decoder = rust_decoder(sc).expect("Rust decoder");
+    let (times, samples, failures) = time_loss_pass(packets, |p| decoder.decode(p, frame, pcm).ok());
+    black_box(&*pcm);
+    check_pass("Rust decode with losses", sc, packets, samples, failures);
+    times
+}
+
+/// Times libopus concealing the same lost packets, from a fresh decoder.
+#[inline(never)]
+fn time_c_losses(sc: &Scenario, packets: &Packets, pcm: &mut [f32]) -> LossTimes {
+    let frame = sc.dec_frame_samples();
+    let mut decoder = CDecoder::new(sc).expect("C decoder");
+    let (times, samples, failures) =
+        time_loss_pass(packets, |p| usize::try_from(decoder.decode(p, frame, pcm)).ok());
+    black_box(&*pcm);
+    check_pass("C decode with losses", sc, packets, samples, failures);
+    times
+}
+
+/// `plc`: times the concealment of lost packets in both decoders, on the C
+/// packets of a scenario with the losses of `Loss::Bursts`: one packet in
+/// ten, and three in a row out of every 25. The first lost packet of a run
+/// and the later ones are timed apart.
+///
+/// Each repetition decodes the clip once with each library, from a fresh
+/// decoder. Rust and C alternate, and the order flips on every repetition,
+/// as in `bench`.
+fn cmd_plc(opts: &Opts) -> Result<i32, String> {
+    let (seconds, reps) = timing_args(opts)?;
+    let filter = opts.get("--filter");
+    let all = opts.flag("--all");
+    let raised = raise_thread_priority();
+    let mut signals = Signals::load()?;
+    println!(
+        "concealment of lost packets, {seconds} s per pass, {reps} passes, {}{}",
+        libopus_version(),
+        if raised { "" } else { " (thread priority not raised)" }
+    );
+    println!(
+        "| Scenario | Lost packet | Count per pass | opus1 min µs | opus1 median µs | libopus min µs | libopus median µs | Ratio of medians |"
+    );
+    println!("|---|---|---:|---:|---:|---:|---:|---:|");
+    let mut json = String::new();
+    for sc in scenarios().iter().filter(|sc| (all || sc.bench) && name_matches(&sc.name(), filter)) {
+        let clip = signals.clip(sc, seconds, 0);
+        let packets = c_encode_all(sc, &clip, true)?;
+        let mut pcm = vec![0.0f32; sc.dec_frame_samples() * sc.channels];
+        let (mut rust, mut c) = (Vec::new(), Vec::new());
+        // Repetition 0 is a warm-up and is dropped.
+        for rep in 0..=reps {
+            let (r, cd);
+            if rep % 2 == 0 {
+                r = time_rust_losses(sc, &packets, &mut pcm);
+                cd = time_c_losses(sc, &packets, &mut pcm);
+            } else {
+                cd = time_c_losses(sc, &packets, &mut pcm);
+                r = time_rust_losses(sc, &packets, &mut pcm);
+            }
+            if rep > 0 {
+                rust.push(r);
+                c.push(cd);
+            }
+        }
+        // The calls of each kind in one pass; every pass has the same.
+        let calls = |later: bool| (0..packets.len()).filter(|&i| loss_after_loss(i) == Some(later)).count();
+        for (label, later) in [("first", false), ("later", true)] {
+            let count = calls(later);
+            if count == 0 {
+                // A short clip may have no lost packet of this kind.
+                println!("| {} | {label} | 0 | - | - | - | - | - |", sc.name());
+                continue;
+            }
+            // Minimum and median over the passes of the mean time per call.
+            let pick = |passes: &[LossTimes]| -> Vec<Duration> {
+                passes.iter().map(|t| if later { t.later } else { t.first }).collect()
+            };
+            let (r, cs) = (stat(&pick(&rust), count), stat(&pick(&c), count));
+            println!(
+                "| {} | {label} | {count} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
+                sc.name(),
+                r.min_ns / 1e3,
+                r.median_ns / 1e3,
+                cs.min_ns / 1e3,
+                cs.median_ns / 1e3,
+                r.median_ns / cs.median_ns
+            );
+            let _ = writeln!(
+                json,
+                "{{\"scenario\": {}, \"lost\": {}, \"count\": {count}, \"rust_min_ns\": {:.1}, \"rust_median_ns\": {:.1}, \"c_min_ns\": {:.1}, \"c_median_ns\": {:.1}}}",
+                json_string(&sc.name()),
+                json_string(label),
+                r.min_ns,
+                r.median_ns,
+                cs.min_ns,
+                cs.median_ns
+            );
+        }
+    }
+    if let Some(path) = opts.get("--json") {
+        write_file(path, &json)?;
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
 // golden: hashes of the codec output
 // ---------------------------------------------------------------------------
 
@@ -4592,6 +5161,20 @@ const USAGE: &str = "usage: perf_harness <command> [options]
       alone. Defaults: 15 passes of 10 s. Needs the cargo feature
       `analysis`.
 
+  output [--filter SUBSTR] [--reps N] [--seconds S] [--json PATH] [--all]
+      Time the decoders on the C packets with each output form: float,
+      16-bit (soft clipping and rounding) and 24-bit samples (rounding), from
+      the decoder and from a multistream decoder with one stream (packet
+      check and copy into the interleaved output). Prints, per library, how
+      much each form adds to the float decode. Defaults: 15 passes of 6 s,
+      the bench set. Needs the cargo feature `alloc` (on by default).
+
+  plc [--filter SUBSTR] [--reps N] [--seconds S] [--json PATH] [--all]
+      Time the concealment of lost packets in both decoders, on the C packets
+      with one packet in ten lost and three in a row out of every 25. The
+      first lost packet of a run and the later ones are timed apart, each
+      call on its own. Defaults: 15 passes of 6 s, the bench set.
+
 Code placement: the speed of some functions depends on where the linker puts
 them (up to about 2 % per scenario on Apple M4 Pro and on a Cortex-A76, 4 %
 for libopus on the A76). Build with PERF_HARNESS_PAD=<bytes>
@@ -4650,6 +5233,11 @@ fn main() {
         #[cfg(feature = "analysis")]
         "analysis" => Opts::parse(rest, &["--seconds", "--reps", "--filter", "--json"], &[])
             .and_then(|opts| cmd_analysis(&opts)),
+        #[cfg(feature = "alloc")]
+        "output" => Opts::parse(rest, &["--seconds", "--reps", "--filter", "--json"], &["--all"])
+            .and_then(|opts| output::cmd_output(&opts)),
+        "plc" => Opts::parse(rest, &["--seconds", "--reps", "--filter", "--json"], &["--all"])
+            .and_then(|opts| cmd_plc(&opts)),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(0)

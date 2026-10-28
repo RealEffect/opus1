@@ -545,7 +545,7 @@ Unit tests also live inside the source files, in `#[cfg(test)]` modules. Many of
   - `conformance.rs`: the RFC 8251 table of `eval conformance`.
   - `tier2.rs`: the bridge to external quality metrics (`--write-wav`, `merge`).
 - `opus_compare.rs`: libopus's test program `opus_compare`, with its command line and messages, on top of `src/eval/compare.rs`.
-- `perf_harness.rs`: the timing and comparison tool against libopus. Its commands are `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler`, `spread`, `pairs` and `analysis` (the speech and music analysis alone). `cargo run --release --example perf_harness -- bench` produces the timings in the README.
+- `perf_harness.rs`: the timing and comparison tool against libopus. Its commands are `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler`, `spread`, `pairs`, `analysis` (the speech and music analysis alone), `output` (the decoders with 16-bit, 24-bit and multistream output) and `plc` (the concealment of lost packets). `cargo run --release --example perf_harness -- bench` produces the timings in the README.
 
 ### `benches/`
 
