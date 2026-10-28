@@ -324,11 +324,13 @@ fn pcm_soft_clip_matches_libopus() {
 ///
 /// libopus built to presume NEON (as the Homebrew build on 64-bit ARM is)
 /// checks the range with NEON first (`opus_limit2_checkwithin1_neon`). A
-/// NaN anywhere in the whole blocks of 16 samples hides all of those blocks
-/// from the check. When the check finds every sample within ±1, the soft
-/// clipper skips its search, even if memory beyond ±2 then bends a sample
-/// beyond ±1. On 64-bit ARM opus1 gives the same bits. On other targets
-/// opus1 runs the C version of the check, as other libopus builds do.
+/// NaN anywhere in the whole blocks of 16 samples keeps all of those blocks
+/// from being limited to ±2 or counted as beyond ±1. When the check finds
+/// every sample within ±1, the soft clipper skips its search, even if
+/// memory beyond ±2 then bends a sample beyond ±1. On 64-bit ARM opus1
+/// gives the same bits. On other targets opus1 gives the output of the C
+/// version of the check: it skips the search only when no sample is beyond
+/// ±1 after the bend, also with memory beyond ±2.
 #[test]
 fn pcm_soft_clip_matches_libopus_on_nan_and_large_memory() {
     let tone = |n: usize, peak: f32| (0..n).map(|i| peak * (i as f32 * 0.37).sin()).collect::<Vec<f32>>();
@@ -348,6 +350,12 @@ fn pcm_soft_clip_matches_libopus_on_nan_and_large_memory() {
         let pcm: Vec<f32> = start.iter().copied().chain(tone(43, 0.9).iter().map(|v| v.abs() * a.signum())).collect();
         cases.push(("memory beyond 2", 1, pcm, vec![a]));
     }
+    // Memory beyond ±2 whose bend keeps the first samples within ±1. Every
+    // target may skip the search here, and the output must still be the C
+    // version's. (The output cannot show whether the search ran.)
+    let start = [-0.01f32, -0.02, -0.03];
+    let pcm: Vec<f32> = start.iter().copied().chain(tone(45, 0.9).iter().map(|v| v.abs())).collect();
+    cases.push(("memory beyond 2, bend within 1", 1, pcm, vec![5.0]));
     let exact = cfg!(target_arch = "aarch64");
     for (name, channels, pcm, mem) in cases {
         let mut c_mem = mem.clone();
