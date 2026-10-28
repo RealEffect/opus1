@@ -4553,8 +4553,10 @@ impl OpusEncoder {
     /// - Otherwise a constant bitrate pads the packet to its full size.
     fn finish_frame(&mut self, output: &mut [u8], ret: usize, first_frame: bool) -> Result<usize, Error> {
         let orig_max_data_bytes = output.len();
+        // C 2606: only with DRED on. The buffer below is 1,000 bytes that
+        // would otherwise be set to zero for every packet.
         #[cfg(feature = "dred")]
-        if first_frame {
+        if first_frame && self.dred_on() {
             use crate::dnn::dred::{DRED_EXTENSION_ID, DRED_MAX_DATA_SIZE};
             let mut buf = [0u8; DRED_MAX_DATA_SIZE];
             // "Remaining space for DRED, accounting for cost the 3 extra
