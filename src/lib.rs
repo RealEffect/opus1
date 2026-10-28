@@ -6855,6 +6855,20 @@ fn float2int16_neon_arm32(x: f32) -> i16 {
 /// around that place is bent by `x + a * x * x`. `a` is chosen so that the
 /// peak of the stretch lands on ±1. Samples beyond ±2 are cut to ±2 first.
 ///
+/// On 64-bit ARM two kinds of input change this, as in libopus there. The
+/// decoder gives neither.
+/// - A NaN (not a number) anywhere in the whole blocks of 16 samples,
+///   counted over all channels from the start of `pcm`. These blocks are
+///   then not cut to ±2. The search for stretches beyond ±1 is skipped,
+///   unless a sample after the last whole block is beyond ±1.
+/// - A value of `declip_mem` beyond ±2. The bend it carries over can take
+///   the first samples beyond ±1. When every sample was within ±1 before,
+///   the search that would bring them back is skipped.
+///
+/// Output samples can then lie beyond ±1, and also beyond ±2. On other
+/// targets the cut and the bend work as described above. A NaN itself stays
+/// a NaN on every target.
+///
 /// - `pcm`: interleaved samples of `channels` channels. The number of
 ///   samples per channel (libopus `frame_size`) is `pcm.len() / channels`.
 /// - `declip_mem`: at least one value per channel, all 0 at the start of a
@@ -6898,12 +6912,10 @@ fn soft_clip(pcm: &mut [f32], frame_size: usize, channels: usize, declip_mem: &m
     if nc < 1 || n < 1 || !fits || declip_mem.len() < nc {
         return;
     }
-    // Clamp everything to [-2, 2], the domain of the non-linearity
-    // (`opus_limit2_checkwithin1`). Beyond it the derivative is zero, so
-    // this adds no discontinuity.
-    for v in pcm[..n * nc].iter_mut() {
-        *v = v.clamp(-2.0, 2.0);
-    }
+    // Clamp everything to [-2, 2], the domain of the non-linearity. Beyond
+    // it the derivative is zero, so this adds no discontinuity. The check
+    // may also tell that every sample is within [-1, 1].
+    let all_within_neg1pos1 = limit2_checkwithin1(&mut pcm[..n * nc]);
     for c in 0..nc {
         // Channel `c`: sample `i` is `x[i * nc]`.
         let x = &mut pcm[c..];
@@ -6925,12 +6937,18 @@ fn soft_clip(pcm: &mut [f32], frame_size: usize, channels: usize, declip_mem: &m
         let x0 = x[0];
         loop {
             let mut i = curr;
-            while i < n {
-                let v = x[i * nc];
-                if v > 1.0 || v < -1.0 {
-                    break;
+            // The search for a sample beyond ±1 is skipped when
+            // `all_within_neg1pos1` says there is none.
+            if all_within_neg1pos1 {
+                i = n;
+            } else {
+                while i < n {
+                    let v = x[i * nc];
+                    if v > 1.0 || v < -1.0 {
+                        break;
+                    }
+                    i += 1;
                 }
-                i += 1;
             }
             if i == n {
                 a = 0.0;
@@ -6991,6 +7009,85 @@ fn soft_clip(pcm: &mut [f32], frame_size: usize, channels: usize, declip_mem: &m
         }
         declip_mem[c] = a;
     }
+}
+
+/// libopus `opus_limit2_checkwithin1` (celt/mathops.h): limit every sample
+/// to [-2, 2], and return whether every sample was within [-1, 1] already.
+/// Then the soft clipper has nothing to search for.
+///
+/// - **64-bit ARM:** `opus_limit2_checkwithin1_neon`
+///   (celt/arm/celt_neon_intr.c). libopus calls it when it is built to
+///   presume NEON, as the reference build of the tests is. (A build with
+///   run-time CPU detection that does not presume NEON calls it from the
+///   decoder only, and the C version from `opus_pcm_soft_clip`.) It reads
+///   whole blocks of 16 samples first and finds their largest and smallest
+///   value. It writes the blocks only when one of these is beyond ±2. The
+///   samples after the last whole block are limited and checked one at a
+///   time. A NaN anywhere in the blocks makes the largest and the smallest
+///   value NaN: the FMAX and FMIN instructions keep a NaN (FMAXNM and
+///   FMINNM would not). Then none of the blocks is limited or counted as
+///   beyond ±1.
+/// - **Every other target:** `opus_limit2_checkwithin1_c`. It limits every
+///   sample and always returns `false`, so the soft clipper always
+///   searches. On 32-bit ARM libopus chooses as on 64-bit ARM; this crate
+///   uses the C version there.
+///
+/// The two versions give a different soft clipper output in two cases
+/// only. One is a NaN in the whole blocks together with a sample beyond
+/// ±1. The other is memory of the soft clipper beyond ±2. The decoder gives
+/// neither.
+#[cfg(target_arch = "aarch64")]
+fn limit2_checkwithin1(samples: &mut [f32]) -> bool {
+    use crate::simd_mem::{array_at, neon::load_f32x4};
+    use core::arch::aarch64::*;
+    let (blocks, tail) = samples.as_chunks_mut::<16>();
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it. The block calls only NEON intrinsics and the load helper
+    // of `simd_mem`. Each block holds 16 values, read as four vectors of 4.
+    let (max, min) = unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let (mut max0, mut max1, mut min0, mut min1) = (zero, zero, zero, zero);
+        for b in blocks.iter() {
+            let x0 = load_f32x4(array_at(b, 0));
+            let x1 = load_f32x4(array_at(b, 4));
+            let x2 = load_f32x4(array_at(b, 8));
+            let x3 = load_f32x4(array_at(b, 12));
+            // The FMAX and FMIN instructions give a NaN when either input
+            // is a NaN.
+            max0 = vmaxq_f32(max0, vmaxq_f32(x0, x1));
+            max1 = vmaxq_f32(max1, vmaxq_f32(x2, x3));
+            min0 = vminq_f32(min0, vminq_f32(x0, x1));
+            min1 = vminq_f32(min1, vminq_f32(x2, x3));
+        }
+        (vmaxvq_f32(vmaxq_f32(max0, max1)), vminvq_f32(vminq_f32(min0, min1)))
+    };
+    // Both comparisons are false when the blocks hold a NaN.
+    if min < -2.0 || max > 2.0 {
+        // The blocks hold no NaN here, so `clamp` gives the result of
+        // `vminq_f32(2, vmaxq_f32(x, -2))`.
+        for v in blocks.as_flattened_mut() {
+            *v = v.clamp(-2.0, 2.0);
+        }
+    }
+    let mut exceeding1 = max > 1.0 || min < -1.0;
+    for v in tail {
+        let orig = *v;
+        // `clamp` keeps a NaN, as `MAX16` and `MIN16` do.
+        *v = orig.clamp(-2.0, 2.0);
+        exceeding1 |= orig > 1.0 || orig < -1.0;
+    }
+    !exceeding1
+}
+
+/// See the 64-bit ARM version above.
+#[cfg(not(target_arch = "aarch64"))]
+fn limit2_checkwithin1(samples: &mut [f32]) -> bool {
+    for v in samples.iter_mut() {
+        // `clamp` keeps a NaN, as `FMAX` and `FMIN` (celt/arch.h) do.
+        *v = v.clamp(-2.0, 2.0);
+    }
+    // The C version cannot tell quickly whether a sample is beyond ±1.
+    false
 }
 
 /// Whether `frame_size` samples at `fs` samples per second are a whole number
