@@ -862,13 +862,11 @@ impl<'a> Repacketizer<'a> {
     /// nothing, when the packet is not valid, its TOC byte does not match that
     /// of the frames already added (apart from the frame-count code), or the
     /// frames would last more than 120 ms.
+    ///
+    /// libopus implements it in `opus_repacketizer_cat_impl`, which also
+    /// takes self-delimited packets for `opus_multistream_packet_unpad`.
+    /// This crate's `multistream_unpad` parses those itself.
     pub fn cat(&mut self, data: &'a [u8]) -> Result<(), Error> {
-        self.cat_impl(data, false)
-    }
-
-    /// libopus `opus_repacketizer_cat_impl`: `cat` for a self-delimited
-    /// packet too.
-    pub(crate) fn cat_impl(&mut self, data: &'a [u8], self_delimited: bool) -> Result<(), Error> {
         let Some(&toc) = data.first() else {
             return Err(Error::INVALID_PACKET);
         };
@@ -885,7 +883,7 @@ impl<'a> Repacketizer<'a> {
         if (curr_nb_frames + self.nb_frames) * samples_per_frame(self.toc, SampleRate::Hz8000) > 960 {
             return Err(Error::INVALID_PACKET);
         }
-        let packet = parse(data, Framing::from_flag(self_delimited))?;
+        let packet = parse(data, Framing::Normal)?;
         let n = self.nb_frames;
         for (k, frame) in packet.frames(data).enumerate() {
             self.frames[n + k] = frame;
@@ -1187,6 +1185,10 @@ pub fn multistream_pad(
 /// multistream packet `data[..len]` of `nb_streams` streams, in place.
 /// Returns the new length. libopus `opus_multistream_packet_unpad`
 /// (repacketizer.c).
+///
+/// The streams are rewritten one after the other. When a stream is not
+/// valid, the function returns an error and the streams before it stay
+/// rewritten, as in libopus.
 pub fn multistream_unpad(data: &mut [u8], len: usize, nb_streams: usize) -> Result<usize, Error> {
     if len < 1 || len > data.len() {
         return Err(Error::BAD_ARG);
@@ -1198,10 +1200,11 @@ pub fn multistream_unpad(data: &mut [u8], len: usize, nb_streams: usize) -> Resu
         if src >= len {
             return Err(Error::INVALID_PACKET);
         }
+        // The parse makes every check of libopus's opus_repacketizer_cat_impl
+        // on a fresh repacketizer: at least one frame, at most 120 ms, and
+        // the same parse of the stream. libopus copies the frames into a
+        // repacketizer to write them out; here they move in place.
         let packet = parse(&data[src..len], Framing::from_flag(self_delimited))?;
-        // The checks of opus_repacketizer_cat_impl on this stream.
-        let mut rp = Repacketizer::new();
-        rp.cat_impl(&data[src..src + packet.packet_offset], self_delimited)?;
         let sizes = &packet.sizes[..packet.count];
         let start = src - dst + packet.payload_offset;
         let payload: usize = sizes.iter().map(|&s| s as usize).sum();
