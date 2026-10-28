@@ -148,7 +148,7 @@ Many test files start with a comment that says what they compare and which libop
 
 | Path | What it is |
 |---|---|
-| `examples/perf_harness.rs` | The timing and comparison tool against libopus. Commands: `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler`, `spread`, `pairs`, `analysis`. `golden` checks output hashes. |
+| `examples/perf_harness.rs` | The timing and comparison tool against libopus. Commands: `list`, `bench`, `run`, `golden`, `modes`, `settings`, `signals`, `resampler`, `spread`, `pairs`, `analysis`, `output`, `plc`. `golden` checks output hashes. |
 | `examples/eval/` | The paired-comparison harness: `opus1` and libopus code the same items, and `opus_compare` and MOC score both. Also the RFC 8251 conformance check and a self-test. |
 | `examples/opus_compare.rs` | libopus's `opus_compare` program, on top of `src/eval/compare.rs`. |
 | `examples/wav_test.rs` | Encodes and decodes a WAV file (default `fixtures/answer_16k.wav`). |

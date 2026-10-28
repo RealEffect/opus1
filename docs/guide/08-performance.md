@@ -41,6 +41,8 @@ The commands are:
 | `signals` | Prints the level and the spectrum of every test signal. `--dump DIR` writes them as WAV (Waveform Audio File Format) files. |
 | `resampler` | Checks the resampler that makes the speech signals, using sine tones. |
 | `spread` | Compares several `bench --json` files. |
+| `output` | Times both decoders with float, 16-bit and 24-bit output, alone and inside a multistream decoder with one stream. |
+| `plc` | Times the concealment of lost packets in both decoders: the first lost packet of a run and the later ones apart. |
 
 `cargo run --release --example perf_harness -- help` prints every option.
 
