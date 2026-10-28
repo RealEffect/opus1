@@ -141,7 +141,7 @@ impl MultistreamDecoder {
     /// the [`layout`](super::MultistreamEncoder::layout) of an encoder.
     pub fn from_layout(sampling_rate: SampleRate, layout: &ChannelLayout) -> Result<Self, Error> {
         // Each stream decoder is built in place, in the memory of the `Vec`
-        // (`OpusDecoder::init`). Without `heap` a decoder is 60 KB or more,
+        // (`OpusDecoder::init`). Without `heap` a decoder is 52 KB or more,
         // and `OpusDecoder::new` would build it on the stack first.
         let mut decoders: Vec<OpusDecoder> = Vec::with_capacity(layout.streams());
         for s in 0..layout.streams() {

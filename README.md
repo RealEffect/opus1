@@ -187,7 +187,7 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 - **Large structs:** without `heap`, every working buffer is inline, so
   `OpusEncoder` and `OpusDecoder` are large: on aarch64 the encoder takes
   about 154 KB with the `analysis` feature and 128 KB without it, and the
-  decoder about 60 KB. Place them in a
+  decoder about 52 KB. Place them in a
   `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather
   than on the stack. `OpusEncoder::new` and `OpusDecoder::new` return the codec
   through the stack; `OpusEncoder::init` and `OpusDecoder::init` build it

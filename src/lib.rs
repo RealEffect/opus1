@@ -221,8 +221,8 @@ const OPUS_MAX_FRAME: usize = packet::MAX_PACKET_SAMPLES;
 const OPUS_MAX_SUBFRAME: usize = 2880;
 /// High-pass filter state memory (`channels * 2`).
 const OPUS_HP_MEM: usize = OPUS_MAX_CHANNELS * 2;
-/// Decoder `w_pcm_i16` and `w_silk_out` cap (`960 * max_channels`): one
-/// SILK frame of 20 ms at 48 kHz, interleaved.
+/// Decoder `w_pcm_i16` cap (`960 * max_channels`): one SILK frame of 20 ms
+/// at 48 kHz, interleaved.
 const OPUS_PCM_I16: usize = 960 * OPUS_MAX_CHANNELS;
 /// Largest packet of interleaved samples: 120 ms at 48 kHz, stereo. The
 /// decoder's output and `encode_i16`'s converted input have this size.
@@ -4946,7 +4946,7 @@ use dnn::osce::OsceExtMode;
 /// ```
 ///
 /// Without the `heap` feature the decoder holds all of its state inline,
-/// about 60 KB; see [`init`](Self::init).
+/// about 52 KB; see [`init`](Self::init).
 pub struct OpusDecoder {
     #[cfg(not(feature = "heap"))]
     celt_dec: CeltDecoder,
@@ -5004,12 +5004,6 @@ pub struct OpusDecoder {
     w_pcm_i16: FixedVec<i16, OPUS_PCM_I16>,
     #[cfg(feature = "heap")]
     w_pcm_i16: Box<FixedVec<i16, OPUS_PCM_I16>>,
-    /// SILK output of one concealed piece, interleaved. SILK conceals at
-    /// least 10 ms, also for a shorter piece, and at most 20 ms.
-    #[cfg(not(feature = "heap"))]
-    w_silk_out: FixedVec<f32, OPUS_PCM_I16>,
-    #[cfg(feature = "heap")]
-    w_silk_out: Box<FixedVec<f32, OPUS_PCM_I16>>,
     /// Float output of one packet for `decode_i16`. It is allocated in
     /// `new`, so that no decode call allocates, and filled at first use.
     /// `None` while a call uses it.
@@ -5088,7 +5082,7 @@ impl OpusDecoder {
     /// Like `new`, it cannot fail at present.
     ///
     /// Without the `heap` feature a decoder holds all of its state inline:
-    /// about 60 KB, and 160 KB with the neural network features. `new`
+    /// about 52 KB, and 153 KB with the neural network features. `new`
     /// returns it through the stack, which needs about three times that.
     /// `init` writes the decoder straight into `slot`, so building it needs
     /// only a little stack. With `heap` it writes the large parts straight
@@ -5181,12 +5175,6 @@ impl OpusDecoder {
                     p.write(in_place::boxed(|q| FixedVec::write_from_value(q, 0i16, 960 * channels)))
                 },
 
-                #[cfg(not(feature = "heap"))]
-                w_silk_out = |p| FixedVec::write_from_value(p, 0.0f32, 960 * channels),
-                #[cfg(feature = "heap")]
-                w_silk_out = |p: *mut Box<FixedVec<f32, OPUS_PCM_I16>>| {
-                    p.write(in_place::boxed(|q| FixedVec::write_from_value(q, 0.0f32, 960 * channels)))
-                },
                 #[cfg(feature = "heap")]
                 w_pcm_float: Some(in_place::boxed(|q| FixedVec::write_new(q))),
 
@@ -6162,7 +6150,7 @@ impl OpusDecoder {
             } else {
                 silk::decode_frame::FLAG_DECODE_NORMAL
             };
-            self.decode_silk(&mut rc, lost_flag, frame_size, mode, Some(&mut *out))?;
+            self.decode_silk(&mut rc, lost_flag, frame_size, mode, out)?;
         }
 
         // Redundancy frame: present if enough bits are left after SILK.
@@ -6420,8 +6408,7 @@ impl OpusDecoder {
                     // shorter piece is the head of 10 ms.
                     let mut rc = RangeCoder::new_decoder(&[]);
                     let lost = silk::decode_frame::FLAG_PACKET_LOST;
-                    self.decode_silk(&mut rc, lost, piece, plc_mode, None)?;
-                    dst.copy_from_slice(&self.w_silk_out[..piece * channels]);
+                    self.decode_silk(&mut rc, lost, piece, plc_mode, dst)?;
                     if plc_mode == OpusMode::Hybrid && self.silk_bwe_replaces_celt() {
                         // C 595-627: when the bandwidth extension makes the
                         // whole band, CELT does not conceal. As after any
@@ -6491,7 +6478,6 @@ impl OpusDecoder {
     /// `frame_size` samples per channel into `out`, interleaved at the
     /// output rate with the decoder's channel count (libopus
     /// `opus_decode_frame`, "SILK processing", opus_decoder.c:402-497).
-    /// `None` stands for `w_silk_out`, which concealment uses.
     ///
     /// SILK itself works in frames of 10 or 20 ms. A 40 or 60 ms Opus frame
     /// holds 2 or 3 of them in one range-coded stream, so `silk_Decode` is
@@ -6518,7 +6504,7 @@ impl OpusDecoder {
         lost_flag: i32,
         frame_size: usize,
         mode: OpusMode,
-        out: Option<&mut [f32]>,
+        out: &mut [f32],
     ) -> Result<(), Error> {
         // C 444-466: the OSCE method follows the complexity. The extended
         // mode says whether the bandwidth extension makes the output.
@@ -6545,10 +6531,6 @@ impl OpusDecoder {
         let _ = mode;
         let channels = self.channels;
         let f10 = self.sampling_rate as usize / 100;
-        let out = match out {
-            Some(out) => out,
-            None => &mut self.w_silk_out[..],
-        };
         let control = silk::decoder_structs::SilkDecControl {
             n_channels_api: channels as i32,
             n_channels_internal: self.silk_channels_internal as i32,
@@ -6561,9 +6543,11 @@ impl OpusDecoder {
         // C 443: `DecControl.enable_deep_plc = complexity >= 5`, for every
         // SILK call.
         let enable_deep_plc = self.complexity >= 5;
-        // C 409-416: a piece shorter than 10 ms is the head of a 10 ms
-        // frame. Only concealment asks for such a piece, and `w_silk_out`
-        // has room for 10 ms. A frame with data lasts 10 ms or more.
+        // C 409-416 and 494-496 (`pcm_too_small`): a piece shorter than
+        // 10 ms is the head of a 10 ms frame. Only concealment asks for
+        // such a piece; a frame with data lasts 10 ms or more. libopus
+        // decodes the 10 ms into a buffer of its own and copies the head.
+        // Here only the samples of the piece are converted into `out`.
         let room = frame_size.max(f10);
         let mut done = 0usize;
         while done < frame_size {
@@ -6589,7 +6573,8 @@ impl OpusDecoder {
                     // lag after each frame.
                     self.silk_prev_pitch_lag = self.silk_dec.prev_pitch_lag();
                     // C `INT16TORES`: SILK's 16-bit samples as floats.
-                    let silk_out = &mut out[done * channels..(done + n) * channels];
+                    let end = (done + n).min(frame_size);
+                    let silk_out = &mut out[done * channels..end * channels];
                     for (o, &v) in silk_out.iter_mut().zip(self.w_pcm_i16.iter()) {
                         *o = int16_to_res(v);
                     }
@@ -6598,7 +6583,7 @@ impl OpusDecoder {
                 _ if lost_flag != silk::decode_frame::FLAG_DECODE_NORMAL => {
                     // C 480-485: "PLC failure should not be fatal". The
                     // rest of the frame is silence.
-                    out[done * channels..room * channels].fill(0.0);
+                    out[done * channels..frame_size * channels].fill(0.0);
                     done = frame_size;
                 }
                 _ => return Err(Error::internal("SILK decoding failed")),

@@ -56,7 +56,7 @@ alloc = []
 #
 # Without `heap` (i.e. `default-features = false`), every working buffer is an
 # inline fixed-size array, so `OpusEncoder`/`OpusDecoder`
-# are large (on aarch64 about 154 KB with `analysis` and 60 KB) and must be
+# are large (on aarch64 about 154 KB with `analysis` and 52 KB) and must be
 # placed in a `static` or on a large stack by the caller (`init` builds them
 # in place). Without `std` and `alloc` as well, the crate is `#![no_std]`
 # with **no `alloc`** (fully heap-free — no global allocator required).

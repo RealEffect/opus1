@@ -1,7 +1,7 @@
 //! The multistream encoder and decoder build each stream codec in place,
 //! in the memory of their `Vec` (`OpusEncoder::init`, `OpusDecoder::init`).
 //! So building them needs only a little stack, also without the `heap`
-//! feature, where each stream codec holds 60 KB to 210 KB inline.
+//! feature, where each stream codec holds 52 KB to 210 KB inline.
 //!
 //! These tests build them on a thread with a 32 KB stack (in a release
 //! build), then use them on the main thread: they must code exactly like

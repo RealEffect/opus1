@@ -1,7 +1,7 @@
 //! Building large structs directly in their final memory.
 //!
 //! Without the `heap` feature an `OpusDecoder` holds all of its state
-//! inline: 60 KB, or 160 KB with the neural network features. An
+//! inline: 52 KB, or 153 KB with the neural network features. An
 //! `OpusEncoder` holds 150 KB, or 210 KB with `dred`. A constructor that
 //! returns such a struct by value builds it on the stack and copies it out,
 //! often more than once. `OpusDecoder::init` and `OpusEncoder::init`

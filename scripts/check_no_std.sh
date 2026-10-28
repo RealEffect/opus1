@@ -37,7 +37,7 @@ for features in "${FEATURE_SETS[@]}"; do
     cargo build --no-default-features --features "$features" || fail=1
 
     # Host no_std test run. Without the `heap` feature the codec structs are
-    # large inline objects (about 135 KB encoder, 67 KB decoder, plus about
+    # large inline objects (about 128 KB encoder, 52 KB decoder, plus about
     # 26 KB for the analysis), so the test threads need a big stack.
     echo ":: testing opus1 (no_std, features $features) for host"
     RUST_MIN_STACK=${RUST_MIN_STACK:-33554432} cargo test --no-default-features --features "$features" || fail=1

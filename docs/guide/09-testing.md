@@ -648,7 +648,7 @@ It does each step three times: with `--features libm`, with `--features libm,ana
 
 1. It builds with `--no-default-features` and those features for `thumbv7em-none-eabi` (ARM Cortex-M) and `wasm32-unknown-unknown` (WebAssembly). A target that is not installed is skipped with a message. Add it with `rustup target add <target>`.
 2. It builds the same configuration for the host.
-3. It runs `cargo test --no-default-features` with those features on the host with `RUST_MIN_STACK=33554432` (32 mebibytes). Without the `heap` feature, the encoder and decoder hold all their buffers inline: 127,936 bytes (153,904 with `analysis`) and 59,728 bytes on aarch64 (see [Size of the encoder and the decoder](06-using-the-library.md#size-of-the-encoder-and-the-decoder)). So test threads need a large stack.
+3. It runs `cargo test --no-default-features` with those features on the host with `RUST_MIN_STACK=33554432` (32 mebibytes). Without the `heap` feature, the encoder and decoder hold all their buffers inline: 127,936 bytes (153,904 with `analysis`) and 52,072 bytes on aarch64 (see [Size of the encoder and the decoder](06-using-the-library.md#size-of-the-encoder-and-the-decoder)). So test threads need a large stack.
 
 Then it builds `--features heap,libm` (the codec state on the heap, without `std`) for the same targets. It runs the tests of building in place in a release build: `multistream_small_stack`, `encoder_init`, `decoder_init` and `encoder_reset`, with `alloc,libm`, `alloc,libm,analysis` and `heap,libm,analysis`. They build the codecs on a thread with a 32 KB stack, which only an optimized build can check (a debug build gives those threads 1 MiB), and check that a reset allocates nothing.
 

@@ -905,7 +905,7 @@ Without `std`, the x86-64 code uses SSE4.1, AVX, AVX2 and FMA only when the buil
 
 ### Building the encoder and the decoder in place
 
-Without `heap`, `OpusEncoder` and `OpusDecoder` hold all of their state inline. The encoder takes 153,904 bytes (210,176 bytes with `dred`), the decoder 59,752 bytes, and up to 160,752 bytes with the neural network features (see below). `OpusEncoder::new` and `OpusDecoder::new` return the codec by value, so they build it on the stack and copy it out. In a release build for aarch64 that takes more than 256 KB of stack for the encoder, and about 192 KB for the decoder, or 512 KB with `osce-bwe` and `dred`.
+Without `heap`, `OpusEncoder` and `OpusDecoder` hold all of their state inline. The encoder takes 153,904 bytes (210,176 bytes with `dred`), the decoder 52,072 bytes, and up to 153,080 bytes with the neural network features (see below). `OpusEncoder::new` and `OpusDecoder::new` return the codec by value, so they build it on the stack and copy it out. In a release build for aarch64 that takes more than 256 KB of stack for the encoder, and about 145 KB for the decoder, or 449 KB with `osce-bwe` and `dred` (the smallest thread stack that works, measured on 2026-10-29; record `target/perf/decoder-size/`).
 
 `OpusEncoder::init` and `OpusDecoder::init` build the codec directly in memory that the caller provides, a `MaybeUninit<OpusEncoder>` or `MaybeUninit<OpusDecoder>`, for example in a `static`. They write every field in place, so no large value is put on the stack. Each returns a reference to the codec, which is the same as the one of `new`. Upstream opus-rs added `OpusDecoder::init` in its PR #65.
 
@@ -944,7 +944,7 @@ The multistream encoder and decoder have no `init` yet: they allocate their memo
 | `new_surround` for 5.1, then `reset_state` | 16 KiB was enough | 16 KiB was enough |
 | `MultistreamDecoder::new` for stereo, 5.1 and 7.1 | 16 KiB was enough | 16 KiB was enough |
 
-16 KiB is the smallest stack that macOS gives a thread, so the real need is at most that. The same held with the features `osce-bwe` and `dred`, where a stream encoder holds 210 KB and a stream decoder 160 KB without `heap`. Before the constructors built the streams in place, a build without `heap` needed more than 256 KB to build a 5.1 encoder and more than 128 KB for a 5.1 decoder. `tests/multistream_small_stack.rs` builds every constructor on a thread with a 32 KB stack and checks that the codecs code exactly like codecs built on the main thread; `scripts/check_no_std.sh` runs it in a release build without `heap`.
+16 KiB is the smallest stack that macOS gives a thread, so the real need is at most that. The same held with the features `osce-bwe` and `dred`, where a stream encoder holds 210 KB and a stream decoder 153 KB without `heap`. Before the constructors built the streams in place, a build without `heap` needed more than 256 KB to build a 5.1 encoder and more than 128 KB for a 5.1 decoder. `tests/multistream_small_stack.rs` builds every constructor on a thread with a 32 KB stack and checks that the codecs code exactly like codecs built on the main thread; `scripts/check_no_std.sh` runs it in a release build without `heap`.
 
 ### Targets without compare-and-swap
 
@@ -968,7 +968,7 @@ Without one of these, portable-atomic stops the build with an error that says so
 
 ### Size of the encoder and the decoder
 
-The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of the speech and music analysis), the decoder sizes on the branch that connects deep PLC and OSCE (`next-wave2`). Both use `size_of` and a counting allocator, a release build, and Rust 1.98 on aarch64-apple-darwin. The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
+The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of the speech and music analysis), the decoder sizes on 2026-10-29 at the commit `perf(opus): let SILK conceal straight into the output` (record `target/perf/decoder-size/`). Both use `size_of` and a counting allocator, a release build, and Rust 1.98 on aarch64-apple-darwin. The sizes do not depend on the sampling rate, because every buffer is sized for the largest case (48 kHz stereo). With `heap`, the heap use of an encoder depends on its channel count: a mono encoder has no SILK state for the side channel.
 
 | Build | `OpusEncoder` |
 |---|---|
@@ -981,14 +981,14 @@ The encoder sizes were measured on 2026-10-18 at commit `1856a50` (the branch of
 
 | Build | `OpusDecoder` |
 |---|---|
-| Default (`heap`) | 112 bytes, plus 105,768 bytes on the heap in 5 allocations |
-| Default with `deep-plc` | 128 bytes, plus 149,228 bytes on the heap in 7 allocations |
-| Default with `osce` | 128 bytes, plus 178,236 bytes on the heap in 9 allocations |
-| Default with `osce-bwe` | 128 bytes, plus 194,844 bytes on the heap in 11 allocations |
-| Without `heap` (with or without `std`) | 59,752 bytes |
-| Without `heap`, with `deep-plc` | 107,288 bytes |
-| Without `heap`, with `osce` | 142,136 bytes |
-| Without `heap`, with `osce-bwe` | 160,752 bytes |
+| Default (`heap`) | 112 bytes, plus 98,080 bytes on the heap in 4 allocations |
+| Default with `deep-plc` | 128 bytes, plus 141,540 bytes on the heap in 6 allocations |
+| Default with `osce` | 128 bytes, plus 170,548 bytes on the heap in 8 allocations |
+| Default with `osce-bwe` | 128 bytes, plus 187,156 bytes on the heap in 10 allocations |
+| Without `heap` (with or without `std`) | 52,072 bytes |
+| Without `heap`, with `deep-plc` | 99,616 bytes |
+| Without `heap`, with `osce` | 134,464 bytes |
+| Without `heap`, with `osce-bwe` | 153,080 bytes |
 
 With `dred`, the encoder holds the state of the DRED encoder. With `heap` it is one allocation of 52,424 bytes. 31,200 bytes of it are the latent vectors and initial states of the last 104 steps of 20 ms; the rest is the 16 kHz input, the feature analysis and the state of the RDOVAE encoder. Without `heap` it takes 56,248 bytes inline, which include room for the layer tables of models loaded from a blob. On the same day the default encoder measured 2,664 bytes plus 141,392 bytes (mono) or 151,336 bytes (stereo), and 153,928 bytes without `heap`.
 
