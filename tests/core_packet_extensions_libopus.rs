@@ -860,6 +860,53 @@ fn multistream_pad_and_unpad_like_libopus() {
     assert!(kept > 1_900, "{kept} packets padded");
 }
 
+/// A packet whose padding holds one extension, padded further: the
+/// extension is kept, and the bytes are libopus's. A padding of up to 1,275
+/// bytes is copied on the stack; a longer one is copied to the heap, and
+/// without the feature `alloc` `pad` refuses it. The paddings are of 1,100,
+/// 1,275, 1,276 and 1,600 bytes, so both sides of the limit are taken.
+#[test]
+fn padding_with_an_extension_keeps_it_when_padded() {
+    let mut rng = Rng(0x5EED_0007);
+    let frame = rng.bytes(30);
+    let payload = rng.bytes(1000);
+    let ext = [Extension::new(40, 0, &payload)];
+    for padding in [1100usize, 1275, 1276, 1600] {
+        // The packet length that gives a padding of exactly `padding`
+        // bytes: the frame, the TOC and count bytes and the padding length
+        // come on top.
+        let mut packet = vec![0u8; 4000];
+        let n = packet::write(0xE0, &[&frame], &mut packet, Framing::Normal, Padding::Shortest).unwrap();
+        let len = (padding..padding + 50)
+            .map(|p| p + n + 1 + p / 255 + 1)
+            .find(|&len| {
+                let mut p = packet.clone();
+                packet::pad_with_extensions(&mut p, n, len, Padding::FillBuffer, &ext).is_ok()
+                    && packet::parse(&p[..len], Framing::Normal).unwrap().padding(&p[..len]).len() == padding
+            })
+            .expect("a packet length for the padding");
+        packet::pad_with_extensions(&mut packet, n, len, Padding::FillBuffer, &ext).unwrap();
+        for new_len in [len + 1, len + 300, 3000] {
+            let what = format!("padding of {padding} bytes, pad to {new_len}");
+            let mut c_buf = packet.clone();
+            let mut buf = packet.clone();
+            let c_ret = unsafe { sys::opus_packet_pad(c_buf.as_mut_ptr(), len as i32, new_len as i32) };
+            let result = packet::pad(&mut buf, len, new_len);
+            if cfg!(not(feature = "alloc")) && padding > 1275 {
+                assert!(result.is_err_and(allocation_refused), "{what}: {result:?}");
+                continue;
+            }
+            result.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(c_ret, 0, "{what}");
+            assert_eq!(buf[..new_len], c_buf[..new_len], "{what}");
+            let parsed = packet::parse(&buf[..new_len], Framing::Normal).unwrap();
+            let kept: Vec<Extension> =
+                ExtensionIterator::new(parsed.padding(&buf[..new_len]), 1).collect::<Result<_, _>>().unwrap();
+            assert_eq!(kept, ext, "{what}");
+        }
+    }
+}
+
 /// Malformed packets give libopus's errors in pad, unpad and the
 /// repacketizer, and leave nothing half-done where libopus fails first.
 #[test]
