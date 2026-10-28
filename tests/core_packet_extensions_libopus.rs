@@ -192,7 +192,14 @@ fn random_padding(rng: &mut Rng, nb_frames: usize) -> Vec<u8> {
     for _ in 0..entries {
         match rng.below(10) {
             0 => v.push(rng.next() as u8),
-            1 => v.push(rng.below(2) as u8),       // padding
+            1 => {
+                // Padding: one byte, now and then a run of 0x01 bytes.
+                let b = rng.below(2) as u8;
+                v.push(b);
+                if b == 1 && rng.chance(4) {
+                    v.extend(std::iter::repeat_n(1u8, rng.below(300)));
+                }
+            }
             2 => v.push(0x02),                     // next frame
             3 => {
                 v.push(0x03);                      // frame increment
