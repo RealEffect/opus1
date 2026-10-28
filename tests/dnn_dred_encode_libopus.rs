@@ -5,10 +5,14 @@
 //! The DRED encoder against libopus 1.6.1 built with DRED, without loop
 //! vectorization (`libopus-host-1.6.1-dred-novec`, a float build).
 //!
-//! - CELT-only streams at 48 kHz, mono and stereo, 2.5 to 60 ms, VBR and
+//! - CELT-only streams at 48 kHz, mono and stereo, 2.5 to 120 ms, VBR and
 //!   CBR, with and without FEC, at several bitrates, losses and DRED
 //!   durations: every packet is libopus's, byte for byte, DRED data and
-//!   padding included.
+//!   padding included. Packets of several frames with VBR can differ on
+//!   purpose, because opus1 does not limit a frame to its share of the
+//!   bitrate. At 40 and 60 ms at ordinary bitrates a report test prints how
+//!   often their DRED data is equal. At the largest bitrate, 120 ms packets
+//!   into a buffer of more than 6 x 1276 bytes are checked to be valid.
 //! - Hybrid streams at 48 kHz: the DRED data equals libopus's where its
 //!   inputs are libopus's (the `Audio` application with VBR). The SILK
 //!   layer is opus1's fixed-point one, so the rest of the packet differs.
@@ -178,7 +182,12 @@ impl CEnc {
     }
 
     fn encode(&mut self, pcm: &[i16], frame: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; 1500];
+        self.encode_into(pcm, frame, 1500)
+    }
+
+    /// `encode` into a buffer of `room` bytes.
+    fn encode_into(&mut self, pcm: &[i16], frame: usize, room: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; room];
         let n = unsafe { sys::opus_encode(self.0, pcm.as_ptr(), frame as c_int, buf.as_mut_ptr(), buf.len() as i32) };
         assert!(n > 0, "libopus: {n}");
         buf.truncate(n as usize);
@@ -215,7 +224,12 @@ fn opus1_encoder(cfg: &Cfg) -> OpusEncoder {
 }
 
 fn encode_opus1(enc: &mut OpusEncoder, pcm: &[i16], frame: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; 1500];
+    encode_opus1_into(enc, pcm, frame, 1500)
+}
+
+/// `encode_opus1` into a buffer of `room` bytes.
+fn encode_opus1_into(enc: &mut OpusEncoder, pcm: &[i16], frame: usize, room: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; room];
     let n = enc.encode_i16(pcm, frame, &mut buf).unwrap();
     buf.truncate(n);
     buf
@@ -242,6 +256,22 @@ struct Counts {
     dred_bytes: usize,
 }
 
+impl Counts {
+    /// Counts libopus's packet `a` and opus1's packet `b`, and returns
+    /// their DRED extensions.
+    #[allow(clippy::type_complexity)]
+    fn add(&mut self, a: &[u8], b: &[u8]) -> (Option<(usize, Vec<u8>)>, Option<(usize, Vec<u8>)>) {
+        let (da, db) = (dred_of(a), dred_of(b));
+        self.packets += 1;
+        self.same_packets += (a == b) as usize;
+        self.dred_c += da.is_some() as usize;
+        self.dred_r += db.is_some() as usize;
+        self.same_dred += (da == db) as usize;
+        self.dred_bytes += db.as_ref().map_or(0, |d| d.1.len());
+        (da, db)
+    }
+}
+
 /// Encodes `seconds` of input with both encoders and counts.
 fn compare(cfg: &Cfg, seconds: usize) -> Counts {
     let pcm = input(cfg.fs, cfg.channels, seconds);
@@ -251,13 +281,7 @@ fn compare(cfg: &Cfg, seconds: usize) -> Counts {
     for (i, frame) in pcm.chunks_exact(cfg.frame * cfg.channels).enumerate() {
         let a = c.encode(frame, cfg.frame);
         let b = encode_opus1(&mut r, frame, cfg.frame);
-        let (da, db) = (dred_of(&a), dred_of(&b));
-        counts.packets += 1;
-        counts.same_packets += (a == b) as usize;
-        counts.dred_c += da.is_some() as usize;
-        counts.dred_r += db.is_some() as usize;
-        counts.same_dred += (da == db) as usize;
-        counts.dred_bytes += db.as_ref().map_or(0, |d| d.1.len());
+        counts.add(&a, &b);
         if i == 0 {
             assert_eq!(i32::from(r.dred_duration()), cfg.dred);
         }
@@ -394,6 +418,178 @@ fn celt_only_packets_of_several_frames_with_dred_equal_libopus() {
         println!("{cfg:?}: {n:?}");
         assert!(n.dred_r >= 10, "{cfg:?}: {n:?}");
     }
+}
+
+/// Packets of several frames at high bitrates, written into large buffers.
+/// The first coded frame of such a packet may get more than 1276 bytes: its
+/// share of the packet plus the DRED bytes. libopus codes the frame in at
+/// most 1276 bytes and lets the DRED data fill the rest of that room
+/// (`opus_encode_frame_native`: `orig_max_data_bytes`).
+///
+/// The streams:
+/// - CBR at 510 kb/s, stereo, 40, 60 and 120 ms;
+/// - CBR at the largest bitrate (`Bitrate::Max`), stereo, 100 ms, into
+///   20,000 bytes;
+/// - VBR at the largest bitrate, mono, 40 ms, and 80 and 120 ms with DTX.
+///   In the DTX streams some packets start with frames that DTX left out.
+///   In at least one of them the first coded frame after those carries the
+///   DRED data.
+/// - VBR at the largest bitrate, stereo, 60, 80 and 100 ms, into 20,000
+///   bytes.
+///
+/// With VBR opus1 leaves out libopus's limit of each frame to its share of
+/// the bitrate on purpose (`encode_multiframe`). At the largest bitrate
+/// libopus sets the bitrate from the buffer, at most 6 x 1276 bytes, and at
+/// most 1.5 Mb/s. It takes DRED's bitrate off that bitrate, and DRED's
+/// bytes off the buffer, so each frame's two shares lose the same part. In
+/// a buffer of at most 6 x 1276 bytes the share of the bitrate is then not
+/// below the share of the buffer, and the limit changes nothing. (At 40 ms
+/// the cap at 1.5 Mb/s can put it a little below the share of the buffer,
+/// but it stays far above what a frame takes.) In a larger buffer the share
+/// of the bitrate is the smaller one. For 40 to 100 ms it is still more
+/// than the 1,276 bytes a frame can take, so these packets are libopus's.
+/// For 120 ms it is less. It then limits every frame in libopus, and the
+/// packets differ (`celt_only_120_ms_vbr_packets_with_dred_in_a_large_buffer`).
+#[test]
+fn celt_only_packets_of_several_frames_with_dred_at_high_bitrates_equal_libopus() {
+    // Packets whose DRED data goes with a frame after frame 0, in all DTX
+    // streams together.
+    let mut dred_after_left_out = 0usize;
+    // Channels, samples per channel of a packet, bitrate (`None`: the
+    // largest), VBR, DTX, output buffer size.
+    for (k, &(channels, frame, bitrate, vbr, dtx, buf)) in [
+        (2usize, 1920usize, Some(510000), false, false, 6 * 1276),
+        (2, 2880, Some(510000), false, false, 6 * 1276),
+        (2, 5760, Some(510000), false, false, 6 * 1276),
+        (2, 4800, None, false, false, 20000),
+        (1, 5760, None, true, true, 6 * 1276),
+        (1, 3840, None, true, true, 6 * 1276),
+        (1, 1920, None, true, false, 6 * 1276),
+        (2, 2880, None, true, false, 20000),
+        (2, 3840, None, true, false, 20000),
+        (2, 4800, None, true, false, 20000),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let cfg = Cfg {
+            fs: FS,
+            channels,
+            application: Application::Audio,
+            bitrate: bitrate.unwrap_or(510000),
+            vbr,
+            complexity: [5, 0, 3, 6, 4, 10, 2, 7, 1, 8][k],
+            loss: 30,
+            fec: false,
+            dred: 104,
+            frame,
+            mode: ForcedMode::CeltOnly,
+        };
+        // The DTX streams take 12 s, so that some packet starts with
+        // frames DTX left out and then carries DRED data.
+        let pcm = input(cfg.fs, cfg.channels, if dtx { 12 } else { 6 });
+        let mut c = CEnc::new(&cfg);
+        let mut r = opus1_encoder(&cfg);
+        if bitrate.is_none() {
+            r.set_bitrate(Bitrate::Max);
+            assert_eq!(unsafe { sys::opus_encoder_ctl(c.0, OPUS_SET_BITRATE, sys::OPUS_BITRATE_MAX) }, 0);
+        }
+        r.set_dtx(dtx);
+        assert_eq!(unsafe { sys::opus_encoder_ctl(c.0, sys::OPUS_SET_DTX_REQUEST, dtx as c_int) }, 0);
+        let mut n = Counts::default();
+        let mut first_difference = None;
+        // Frames that DTX left out (0 bytes in libopus's packet), and
+        // packets whose first frames DTX left out before a coded one.
+        let (mut dtx_frames, mut starts_left_out) = (0usize, 0usize);
+        for (i, f) in pcm.chunks_exact(frame * channels).enumerate() {
+            let a = c.encode_into(f, frame, buf);
+            let b = encode_opus1_into(&mut r, f, frame, buf);
+            let (da, db) = n.add(&a, &b);
+            let sizes = packet::parse(&a, Framing::Normal).unwrap().frame_sizes().to_vec();
+            dtx_frames += sizes.iter().filter(|&&s| s == 0).count();
+            starts_left_out += (sizes[0] == 0 && sizes.iter().any(|&s| s > 0)) as usize;
+            // The DRED extension names the frame it goes with.
+            dred_after_left_out += da.as_ref().is_some_and(|d| d.0 > 0) as usize;
+            if a != b && first_difference.is_none() {
+                let size = |d: &Option<(usize, Vec<u8>)>| d.as_ref().map_or(0, |d| d.1.len());
+                first_difference = Some(format!(
+                    "packet {i}: libopus {} bytes with {} bytes of DRED data, opus1 {} bytes with {}",
+                    a.len(),
+                    size(&da),
+                    b.len(),
+                    size(&db)
+                ));
+            }
+        }
+        let what = format!("{cfg:?}, bitrate {bitrate:?}, DTX {dtx}, buffer {buf}");
+        println!("{what}: {n:?}, {dtx_frames} frames left out by DTX, {starts_left_out} packets start with them");
+        if dtx {
+            assert!(starts_left_out > 0, "{what}: DTX left out {dtx_frames} frames, none before a coded frame");
+        }
+        if let Some(text) = &first_difference {
+            println!("  first difference: {text}");
+        }
+        assert!(n.dred_c >= 10, "{what}: {n:?}");
+        assert_eq!(n.same_packets, n.packets, "{what}: {n:?}, first difference: {first_difference:?}");
+    }
+    // `encode_multiframe` gives the DRED room to the first coded frame
+    // (`first_frame`), not to frame 0.
+    assert!(dred_after_left_out > 0, "no packet carries its DRED data after frames DTX left out");
+}
+
+/// 120 ms VBR packets at the largest bitrate into a buffer of 20,000 bytes,
+/// stereo. Here libopus limits every frame to its share of the bitrate,
+/// which is below 1,276 bytes once the DRED bytes are taken off, and opus1
+/// does not (see the test above). So the frames can differ, and the first
+/// coded frame gets more room for its DRED data. The packets must still be
+/// valid: libopus decodes every one of them. Some are longer than 6 x 1276
+/// bytes by more than the few bytes the joined packet's header adds; the
+/// room for that is the DRED part of `MULTIFRAME_BYTES`. libopus's packets
+/// stay within 6 x 1276 bytes.
+#[test]
+fn celt_only_120_ms_vbr_packets_with_dred_in_a_large_buffer() {
+    let (channels, frame, buf) = (2usize, 5760usize, 20000usize);
+    let cfg = Cfg {
+        fs: FS,
+        channels,
+        application: Application::Audio,
+        bitrate: 510000,
+        vbr: true,
+        complexity: 4,
+        loss: 30,
+        fec: false,
+        dred: 104,
+        frame,
+        mode: ForcedMode::CeltOnly,
+    };
+    let pcm = input(cfg.fs, channels, 6);
+    let mut c = CEnc::new(&cfg);
+    let mut r = opus1_encoder(&cfg);
+    r.set_bitrate(Bitrate::Max);
+    assert_eq!(unsafe { sys::opus_encoder_ctl(c.0, OPUS_SET_BITRATE, sys::OPUS_BITRATE_MAX) }, 0);
+    let mut err: c_int = 0;
+    let dec = unsafe { sys::opus_decoder_create(FS, channels as c_int, &mut err) };
+    assert!(!dec.is_null() && err == 0, "opus_decoder_create: {err}");
+    let mut out = vec![0i16; frame * channels];
+    let (mut dred, mut longest, mut longest_c, mut over) = (0usize, 0usize, 0usize, 0usize);
+    for f in pcm.chunks_exact(frame * channels) {
+        longest_c = longest_c.max(c.encode_into(f, frame, buf).len());
+        let b = encode_opus1_into(&mut r, f, frame, buf);
+        let len = b.len();
+        dred += dred_of(&b).is_some() as usize;
+        longest = longest.max(len);
+        over += (len > 6 * 1276) as usize;
+        let n = unsafe { sys::opus_decode(dec, b.as_ptr(), len as i32, out.as_mut_ptr(), frame as c_int, 0) };
+        assert_eq!(n, frame as c_int, "libopus decodes opus1's packet of {len} bytes");
+    }
+    unsafe { sys::opus_decoder_destroy(dec) };
+    println!("{dred} packets with DRED data, {over} longer than 6 x 1276 bytes, the longest {longest} bytes; libopus's longest {longest_c}");
+    assert!(dred >= 10, "{dred} packets with DRED data");
+    assert!(over > 0, "no packet longer than 6 x 1276 bytes: the case is not reached");
+    // Joining six frames into one packet can add a few bytes of header, so
+    // only a longer packet needs the DRED part of `MULTIFRAME_BYTES`.
+    assert!(longest > 6 * 1276 + 10, "the longest packet has {longest} bytes");
+    assert!(longest_c <= 6 * 1276, "libopus wrote {longest_c} bytes");
 }
 
 /// CELT-only packets at 8, 12, 16 and 24 kHz, where DRED brings the input

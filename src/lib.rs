@@ -237,6 +237,25 @@ const CELT_PREFILL: usize = 120 * OPUS_MAX_CHANNELS;
 /// The largest packet of one frame: the TOC byte and a frame of
 /// `packet::MAX_FRAME_BYTES` bytes (RFC 6716 §3.1).
 pub(crate) const OPUS_MAX_PACKET_BYTES: usize = 1 + packet::MAX_FRAME_BYTES;
+
+/// Room for the frames of one packet of several frames
+/// (`OpusEncoder::encode_multiframe`, C `tmp_data`).
+///
+/// - With VBR each frame takes at most [`OPUS_MAX_PACKET_BYTES`]. With
+///   DRED, one of them also carries the DRED data in its padding: at most
+///   `DRED_MAX_DATA_SIZE` bytes, the extension ID byte, the frame count
+///   byte of a code 3 packet and at most 4 bytes for the padding length.
+/// - With CBR each frame is padded to all of its room. A room is at most
+///   the frame's share of the CBR size (`nominal_part`). The first coded
+///   frame also gets the DRED bytes, which are first taken from every
+///   share. So the rooms add up to at most the CBR size (`cbr_bytes`),
+///   which `encode_impl` keeps within `6 * OPUS_MAX_PACKET_BYTES`. (With
+///   `Bitrate::Max` the joined packet is then padded to the whole buffer,
+///   which can be longer; that padding is not in this buffer.)
+#[cfg(feature = "dred")]
+const MULTIFRAME_BYTES: usize = 6 * OPUS_MAX_PACKET_BYTES + dnn::dred::DRED_MAX_DATA_SIZE + 6;
+#[cfg(not(feature = "dred"))]
+const MULTIFRAME_BYTES: usize = 6 * OPUS_MAX_PACKET_BYTES;
 /// C `OpusEncoder.delay_buffer[MAX_ENCODER_BUFFER*2]` (480 samples * 2 ch).
 /// Holds the delay-compensation ring feeding the CELT encoder.
 const OPUS_DELAY_BUF: usize = 480 * OPUS_MAX_CHANNELS;
@@ -4770,7 +4789,11 @@ impl OpusEncoder {
         let nominal_part =
             (bitrate_to_bits(self.packet_bitrate_bps, fs, enc_frame) / 8).max(0) as usize;
 
-        let mut sub = [[0u8; OPUS_MAX_PACKET_BYTES]; MAX_SUB];
+        // C `tmp_data`: the frames one after the other. A frame may take
+        // all of the room it is given (`curr_max`), beyond 1276 bytes: CBR
+        // pads it to that size, and the first coded frame carries the DRED
+        // data in its padding. `MULTIFRAME_BYTES` says why they fit.
+        let mut tmp = [0u8; MULTIFRAME_BYTES];
         let mut lens = [0usize; MAX_SUB];
         let mut tot_size = 0usize;
         // C `dtx_count`: the frames DTX left out, which are 1 byte long.
@@ -4835,11 +4858,20 @@ impl OpusEncoder {
                     curr_max += dred_bytes;
                 }
             }
-            let curr_max = curr_max.min(max_len_sum.saturating_sub(tot_size)).min(OPUS_MAX_PACKET_BYTES);
+            let curr_max = curr_max.min(max_len_sum.saturating_sub(tot_size));
+            // Under CBR the rooms add up to at most the CBR size, so the
+            // limit below applies only with VBR (`MULTIFRAME_BYTES`). A CBR
+            // room cut short would change the packet, so it is an error.
+            let room = tmp.len() - tot_size;
+            if self.use_cbr && curr_max > room {
+                result = Err(Error::internal("a CBR frame does not fit the multi-frame buffer"));
+                break;
+            }
+            let curr_max = curr_max.min(room);
             match self.encode_frame(
                 sub_input,
                 enc_frame,
-                &mut sub[i][..curr_max],
+                &mut tmp[tot_size..tot_size + curr_max],
                 frame_decisions,
                 frame_analysis,
                 first_frame,
@@ -4867,11 +4899,14 @@ impl OpusEncoder {
         // As in libopus, a frame the repacketizer refuses, or a packet it
         // cannot write, is an internal error.
         let mut rp = packet::Repacketizer::new();
-        for (part, &len) in sub.iter().zip(&lens).take(nb) {
-            if packet::nb_frames(&part[..len]) != Ok(1) {
+        let mut start = 0;
+        for &len in lens.iter().take(nb) {
+            let part = &tmp[start..start + len];
+            start += len;
+            if packet::nb_frames(part) != Ok(1) {
                 return Err(Error::internal("unexpected frame count in a part of a packet"));
             }
-            rp.cat(&part[..len]).map_err(|_| Error::INTERNAL_ERROR)?;
+            rp.cat(part).map_err(|_| Error::INTERNAL_ERROR)?;
         }
         rp.out_range_ext(
             0,
