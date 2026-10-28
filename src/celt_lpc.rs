@@ -136,41 +136,70 @@ pub(crate) fn celt_fir(x: &[f32], at: usize, num: &[f32], y: &mut [f32]) {
 /// libopus `celt_iir` (all-pole filter, celt/celt_lpc.c), run in place over
 /// `buf[at..at + n]`: `buf[at + i] -= sum over j of den[j] * buf[at + i - 1 - j]`.
 ///
-/// The `den.len()` samples before `buf[at]` are the filter's memory.
-/// libopus computes four outputs at a time: each one first adds the
-/// products with the samples before the group, oldest first, then the
+/// The `ORD` samples before `buf[at]` are the filter's memory.
+/// libopus computes the outputs in groups of four. Each output first adds
+/// the products with the samples before its group, oldest first, then the
 /// products with the outputs of its own group, newest first. The same order
 /// is kept here so that rounding matches.
-pub(crate) fn celt_iir(buf: &mut [f32], at: usize, n: usize, den: &[f32]) {
-    let ord = den.len();
+///
+/// As in libopus (`xcorr_kernel`), one pass over the taps updates all four
+/// sums of a group. There libopus also adds the products with the outputs
+/// of the group, which are still zero at that point. They are left out
+/// here. That can change only the sign of a sum that is exactly zero
+/// (-0.0 where libopus gives +0.0), and such a zero reaches no output
+/// sample: the de-emphasis adds `VERY_SMALL` first.
+///
+/// The order is a constant, so the taps stay in registers. The last four
+/// outputs stay in registers for the next group: reading them back from
+/// `buf` would put a store and a load on the path from one group to the
+/// next.
+pub(crate) fn celt_iir<const ORD: usize>(buf: &mut [f32], at: usize, n: usize, den: &[f32; ORD]) {
+    const { assert!(ORD >= 4) };
+    // `buf[i + ORD]` is now output `i`, and the `ORD` samples before it are
+    // its history.
+    let buf = &mut buf[at - ORD..at + n];
+    // `s - d * y` is `s + (-d) * y` exactly, so the corrections use the
+    // negated taps, and no negation waits for the output before.
+    let neg = [-den[0], -den[1], -den[2]];
+    let mut last = [buf[ORD - 4], buf[ORD - 3], buf[ORD - 2], buf[ORD - 1]];
     let mut i = 0;
     while i + 4 <= n {
-        let p = at + i;
-        let mut sum = [buf[p], buf[p + 1], buf[p + 2], buf[p + 3]];
-        for (k, s) in sum.iter_mut().enumerate() {
-            for j in 0..ord - k {
-                *s = mac(*s, den[ord - 1 - j], -buf[p - ord + j + k]);
-            }
+        let mut sum: [f32; 4] = buf[i + ORD..i + ORD + 4].try_into().unwrap();
+        // The history of the group. Its last four samples are the outputs
+        // of the group before, taken from `last`.
+        let mut h: [f32; ORD] = buf[i..i + ORD].try_into().unwrap();
+        h[ORD - 4..].copy_from_slice(&last);
+        // Taps whose sample lies before the group for all four sums.
+        for j in 0..ORD - 3 {
+            let d = den[ORD - 1 - j];
+            sum[0] = mac(sum[0], d, -h[j]);
+            sum[1] = mac(sum[1], d, -h[j + 1]);
+            sum[2] = mac(sum[2], d, -h[j + 2]);
+            sum[3] = mac(sum[3], d, -h[j + 3]);
         }
-        buf[p] = sum[0];
-        sum[1] = mac(sum[1], -buf[p], den[0]);
-        buf[p + 1] = sum[1];
-        sum[2] = mac(sum[2], -buf[p + 1], den[0]);
-        sum[2] = mac(sum[2], -buf[p], den[1]);
-        buf[p + 2] = sum[2];
-        sum[3] = mac(sum[3], -buf[p + 2], den[0]);
-        sum[3] = mac(sum[3], -buf[p + 1], den[1]);
-        sum[3] = mac(sum[3], -buf[p], den[2]);
-        buf[p + 3] = sum[3];
+        // The last three taps reach into the group for sums 1 to 3.
+        sum[0] = mac(sum[0], den[2], -h[ORD - 3]);
+        sum[1] = mac(sum[1], den[2], -h[ORD - 2]);
+        sum[2] = mac(sum[2], den[2], -h[ORD - 1]);
+        sum[0] = mac(sum[0], den[1], -h[ORD - 2]);
+        sum[1] = mac(sum[1], den[1], -h[ORD - 1]);
+        sum[0] = mac(sum[0], den[0], -h[ORD - 1]);
+        // The products with the outputs of the group, newest first.
+        let y0 = sum[0];
+        let y1 = mac(sum[1], y0, neg[0]);
+        let y2 = mac(mac(sum[2], y1, neg[0]), y0, neg[1]);
+        let y3 = mac(mac(mac(sum[3], y2, neg[0]), y1, neg[1]), y0, neg[2]);
+        last = [y0, y1, y2, y3];
+        buf[i + ORD..i + ORD + 4].copy_from_slice(&last);
         i += 4;
     }
     // The concealment always filters a multiple of four samples. This loop
     // covers any other length.
     while i < n {
-        let p = at + i;
+        let p = ORD + i;
         let mut sum = buf[p];
-        for j in 0..ord {
-            sum = mac(sum, den[ord - 1 - j], -buf[p - ord + j]);
+        for j in 0..ORD {
+            sum = mac(sum, den[ORD - 1 - j], -buf[p - ORD + j]);
         }
         buf[p] = sum;
         i += 1;
@@ -180,7 +209,7 @@ pub(crate) fn celt_iir(buf: &mut [f32], at: usize, n: usize, den: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pitch::tests::{KINDS, Rng, assert_same, samples};
+    use crate::pitch::tests::{KINDS, Kind, Rng, assert_same, samples};
     #[cfg(not(feature = "std"))]
     use std::vec::Vec;
 
@@ -245,6 +274,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `celt_iir` as it was before one pass updated all four sums of a
+    /// group: the sums one after another, each over the samples before the
+    /// group, oldest first, then the corrections through the group.
+    fn celt_iir_plain(buf: &mut [f32], at: usize, n: usize, den: &[f32]) {
+        let ord = den.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let p = at + i;
+            let mut sum = [buf[p], buf[p + 1], buf[p + 2], buf[p + 3]];
+            for (k, s) in sum.iter_mut().enumerate() {
+                for j in 0..ord - k {
+                    *s = mac(*s, den[ord - 1 - j], -buf[p - ord + j + k]);
+                }
+            }
+            buf[p] = sum[0];
+            sum[1] = mac(sum[1], -buf[p], den[0]);
+            buf[p + 1] = sum[1];
+            sum[2] = mac(sum[2], -buf[p + 1], den[0]);
+            sum[2] = mac(sum[2], -buf[p], den[1]);
+            buf[p + 2] = sum[2];
+            sum[3] = mac(sum[3], -buf[p + 2], den[0]);
+            sum[3] = mac(sum[3], -buf[p + 1], den[1]);
+            sum[3] = mac(sum[3], -buf[p], den[2]);
+            buf[p + 3] = sum[3];
+            i += 4;
+        }
+        while i < n {
+            let p = at + i;
+            let mut sum = buf[p];
+            for j in 0..ord {
+                sum = mac(sum, den[ord - 1 - j], -buf[p - ord + j]);
+            }
+            buf[p] = sum;
+            i += 1;
+        }
+    }
+
+    /// Predictor taps of order `ORD` as the concealment computes them: the
+    /// LPC of a signal of two tones and some noise. The filter is stable,
+    /// so the output of `Kind::Audio` stays finite over the 1080 samples of
+    /// a lost 20 ms frame.
+    fn predictor<const ORD: usize>(rng: &mut Rng) -> [f32; ORD] {
+        let x: Vec<f32> = (0..1024)
+            .map(|i| {
+                let t = i as f32;
+                8000.0 * (0.05 * t).sin() + 3000.0 * (0.31 * t).sin() + 300.0 * rng.unit()
+            })
+            .collect();
+        let mut ac = [0.0f32; 25];
+        autocorr(&x, &mut ac[..=ORD], None, 0, ORD, x.len());
+        let mut den = [0.0f32; ORD];
+        lpc(&mut den, &ac[..=ORD], ORD);
+        den
+    }
+
+    /// One order of `iir_matches_the_plain_version`.
+    fn check_iir<const ORD: usize>(rng: &mut Rng) {
+        for kind in KINDS {
+            for (k, n) in [0usize, 1, 3, 4, 5, 7, 8, 120, 601, 1080].into_iter().enumerate() {
+                let den = predictor::<ORD>(rng);
+                // Some samples before the history, which must stay; the
+                // history; the samples to filter; and 3 more that must stay.
+                let at = ORD + 5 * (k % 2);
+                // Huge and non-finite input: audio with one such value,
+                // three quarters into the filtered samples. The value takes
+                // turns: the largest finite values for `Huge`, and plus and
+                // minus infinity and NaN for `NonFinite`. It overflows or
+                // spreads through the outputs after it.
+                let one_special = match kind {
+                    Kind::Huge => Some([f32::MAX, -f32::MAX][k % 2]),
+                    Kind::NonFinite => Some([f32::INFINITY, f32::NEG_INFINITY, f32::NAN][k % 3]),
+                    _ => None,
+                };
+                let mut start = samples(rng, at + n + 3, if one_special.is_some() { Kind::Audio } else { kind });
+                let special = one_special.filter(|_| n > 0).map(|v| (at + 3 * n / 4, v));
+                if let Some((p, v)) = special {
+                    start[p] = v;
+                }
+                let mut got = start.clone();
+                celt_iir(&mut got, at, n, &den);
+                let mut want = start.clone();
+                celt_iir_plain(&mut want, at, n, &den);
+                assert_same(&got, &want, &format!("order {ORD}, {kind:?}, n {n}, at {at}"));
+                // The outputs before the special value are finite, so that
+                // each of them is a real comparison.
+                let finite = special.map_or(got.len(), |(p, _)| p);
+                assert!(got[..finite].iter().all(|v| v.is_finite()), "order {ORD}, {kind:?}, n {n}: not finite");
+            }
+        }
+    }
+
+    #[test]
+    fn iir_matches_the_plain_version() {
+        let mut rng = Rng::new(30);
+        check_iir::<24>(&mut rng);
+        check_iir::<4>(&mut rng);
+        check_iir::<8>(&mut rng);
     }
 
     /// `lpc` stops at 30 dB of prediction gain and leaves the higher orders

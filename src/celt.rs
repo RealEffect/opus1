@@ -9671,7 +9671,7 @@ impl CeltDecoder {
                 let (exc_all, tmp) = self.w_x[..2 * PLC_MAX_PERIOD + PLC_LPC_ORDER]
                     .split_at_mut(PLC_MAX_PERIOD + PLC_LPC_ORDER);
                 exc_all.copy_from_slice(&buf[at - PLC_MAX_PERIOD - PLC_LPC_ORDER..at]);
-                let lpc = &mut self.plc_lpc[ch * PLC_LPC_ORDER..(ch + 1) * PLC_LPC_ORDER];
+                let lpc = &mut self.plc_lpc.as_chunks_mut::<PLC_LPC_ORDER>().0[ch];
 
                 if first_loss {
                     // Predictor for the last PLC_MAX_PERIOD samples before
