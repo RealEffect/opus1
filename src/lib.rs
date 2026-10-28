@@ -4300,7 +4300,15 @@ impl OpusEncoder {
         }
         // C 2386-2413: the bytes of the main frame.
         let mut nb_compr_bytes = if mode == OpusMode::SilkOnly {
-            (((self.rc.tell() + 7) >> 3).max(0) as usize).min(n_bytes - 1 - redundancy_bytes)
+            // Only the first ceil(tell/8) bytes go into the packet, and
+            // `done` below writes no byte past them. So the coder ends
+            // there, and `done` does not clear the unused rest of the
+            // buffer, about 1.2 kB, which libopus clears (C 2389).
+            let used = ((self.rc.tell() + 7) >> 3).max(0) as u32;
+            if used < self.rc.storage {
+                self.rc.shrink(used);
+            }
+            (used as usize).min(n_bytes - 1 - redundancy_bytes)
         } else {
             #[allow(unused_mut)]
             let mut nb = n_bytes - 1 - redundancy_bytes;
