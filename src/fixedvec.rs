@@ -292,6 +292,19 @@ impl<T, const N: usize> FixedVec<T, N> {
         write_clones(&mut self.buf[self.len..new_len], src);
         self.len = new_len;
     }
+
+    /// Append `f(x)` for every element `x` of `src`. Each new slot is
+    /// written once, so a conversion into a fresh buffer needs no fill
+    /// first.
+    #[inline]
+    pub fn extend_map<S: Copy>(&mut self, src: &[S], mut f: impl FnMut(S) -> T) {
+        assert!(src.len() <= N - self.len, "FixedVec capacity exceeded");
+        let new_len = self.len + src.len();
+        for (slot, &x) in self.buf[self.len..new_len].iter_mut().zip(src) {
+            slot.write(f(x));
+        }
+        self.len = new_len;
+    }
 }
 
 /// Writes a clone of `value` to every slot.
@@ -468,6 +481,22 @@ mod tests {
     fn extend_past_capacity_panics() {
         let mut f = FixedVec::<u8, 600>::from_value(0u8, 599);
         f.extend_from_slice(&[1, 2]);
+    }
+
+    #[test]
+    fn extend_map_appends_the_mapped_values() {
+        let mut f = FixedVec::<i32, 8>::from_slice(&[7]);
+        f.extend_map(&[1i16, -2, 3], |x| 10 * x as i32);
+        assert_eq!(f.as_slice(), &[7, 10, -20, 30]);
+        f.extend_map(&[], |x: i16| x as i32);
+        assert_eq!(f.len(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "FixedVec capacity exceeded")]
+    fn extend_map_past_capacity_panics() {
+        let mut f = FixedVec::<u8, 600>::from_value(0u8, 599);
+        f.extend_map(&[1u8, 2], |x| x);
     }
 
     #[test]

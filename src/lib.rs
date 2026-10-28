@@ -3297,10 +3297,8 @@ impl OpusEncoder {
         // `Voip` application rounds the float samples back to the same
         // 16-bit values.
         let n = frame_size * self.channels;
-        let mut pcm: FixedVec<f32, OPUS_PCM_PACKET> = FixedVec::from_value(0.0, n);
-        for (dst, &src) in pcm.iter_mut().zip(&input[..n]) {
-            *dst = int16_to_res(src);
-        }
+        let mut pcm: FixedVec<f32, OPUS_PCM_PACKET> = FixedVec::new();
+        pcm.extend_map(&input[..n], int16_to_res);
         // The analysis reads the caller's 16-bit samples (`downmix_int`).
         let analysis_pcm = AnalysisPcm {
             pcm: PcmRef::I16(input),
@@ -3331,10 +3329,8 @@ impl OpusEncoder {
         let analysis_frame_size = frame_size;
         let frame_size = self.select_frame_size(input.len(), frame_size)?;
         let n = frame_size * self.channels;
-        let mut pcm: FixedVec<f32, OPUS_PCM_PACKET> = FixedVec::from_value(0.0, n);
-        for (dst, &src) in pcm.iter_mut().zip(&input[..n]) {
-            *dst = int24_to_res(src);
-        }
+        let mut pcm: FixedVec<f32, OPUS_PCM_PACKET> = FixedVec::new();
+        pcm.extend_map(&input[..n], int24_to_res);
         let analysis_pcm = AnalysisPcm {
             pcm: PcmRef::I32(input),
             channels: self.channels,
