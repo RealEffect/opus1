@@ -4796,8 +4796,12 @@ impl OpusEncoder {
         // C `tmp_data`: the frames one after the other. A frame may take
         // all of the room it is given (`curr_max`), beyond 1276 bytes: CBR
         // pads it to that size, and the first coded frame carries the DRED
-        // data in its padding. `MULTIFRAME_BYTES` says why they fit.
-        let mut tmp = [0u8; MULTIFRAME_BYTES];
+        // data in its padding. `MULTIFRAME_BYTES` says why they fit. The
+        // buffer grows, set to zero, as far as the rooms reach, so each
+        // byte is cleared once. A room may start inside the room of the
+        // frame before. That does not matter: a frame writes each byte of
+        // the packet it returns before it reads it.
+        let mut tmp: FixedVec<u8, MULTIFRAME_BYTES> = FixedVec::new();
         let mut lens = [0usize; MAX_SUB];
         let mut tot_size = 0usize;
         // C `dtx_count`: the frames DTX left out, which are 1 byte long.
@@ -4866,12 +4870,15 @@ impl OpusEncoder {
             // Under CBR the rooms add up to at most the CBR size, so the
             // limit below applies only with VBR (`MULTIFRAME_BYTES`). A CBR
             // room cut short would change the packet, so it is an error.
-            let room = tmp.len() - tot_size;
+            let room = MULTIFRAME_BYTES - tot_size;
             if self.use_cbr && curr_max > room {
                 result = Err(Error::internal("a CBR frame does not fit the multi-frame buffer"));
                 break;
             }
             let curr_max = curr_max.min(room);
+            if tmp.len() < tot_size + curr_max {
+                tmp.resize(tot_size + curr_max, 0);
+            }
             match self.encode_frame(
                 sub_input,
                 enc_frame,
