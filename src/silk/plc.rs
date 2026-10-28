@@ -6,6 +6,8 @@
 #[cfg(all(feature = "deep-plc", not(feature = "std")))]
 use crate::compat::Math;
 use crate::deep_plc::DeepPlcArgs;
+use crate::fixedvec::FixedVec;
+use crate::silk::decode_core::{lpc_synthesis_of_order, scale_output};
 use crate::silk::decoder_structs::{SilkDecoderControl, SilkDecoderState};
 use crate::silk::define::*;
 use crate::silk::lpc_analysis::silk_lpc_inverse_pred_gain;
@@ -345,30 +347,15 @@ fn silk_plc_conceal(
     let lpc_mem_start = ltp_mem_length - MAX_LPC_ORDER;
     s_ltp_q14[lpc_mem_start..lpc_mem_start + MAX_LPC_ORDER].copy_from_slice(&ps_dec.s_lpc_q14_buf);
 
-    let order = ps_dec.lpc_order as usize;
-    for i in 0..frame_length {
-        let mut lpc_pred_q10 = silk_rshift(order as i32, 1);
-        for j in 0..order {
-            lpc_pred_q10 = silk_smlawb(
-                lpc_pred_q10,
-                s_ltp_q14[lpc_mem_start + MAX_LPC_ORDER + i - j - 1],
-                a_q12[j] as i32,
-            );
-        }
-        // Add prediction to LPC excitation.
-        s_ltp_q14[lpc_mem_start + MAX_LPC_ORDER + i] = silk_add_sat32(
-            s_ltp_q14[lpc_mem_start + MAX_LPC_ORDER + i],
-            silk_lshift_sat32(lpc_pred_q10, 4),
-        );
-        // Scale with gain.
-        frame[i] = silk_sat16(silk_sat16(silk_rshift_round(
-            silk_smulww(
-                s_ltp_q14[lpc_mem_start + MAX_LPC_ORDER + i],
-                prev_gain_q10[1],
-            ),
-            8,
-        ))) as i16;
-    }
+    // C filters the excitation where it is, behind the state. The
+    // decoder's synthesis kernel reads it from a buffer of its own and
+    // computes the same samples.
+    let new = ltp_mem_length..ltp_mem_length + frame_length;
+    let exc_q14 = FixedVec::<i32, MAX_FRAME_LENGTH>::from_slice(&s_ltp_q14[new.clone()]);
+    let s_lpc = &mut s_ltp_q14[lpc_mem_start..new.end];
+    lpc_synthesis_of_order(ps_dec.lpc_order as usize, s_lpc, &exc_q14, &a_q12);
+    // Scale with gain. C limits to 16 bits twice; once gives the same.
+    scale_output(&mut frame[..frame_length], &s_ltp_q14[new], prev_gain_q10[1]);
 
     #[cfg(feature = "deep-plc")]
     if let Some(p) = deep_plc
