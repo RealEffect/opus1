@@ -127,6 +127,41 @@ pub(crate) fn celt_exp2(x: f32) -> f32 {
     f32::from_bits(bits)
 }
 
+/// libopus `float2int` (celt/float_cast.h): round to the nearest integer,
+/// a value halfway between two goes to the even one. The speech and music
+/// analysis and the 16-bit output use it.
+///
+/// 64-bit ARM uses `vcvtns_s32_f32`, as libopus does, which also limits
+/// the result to the `i32` range and gives 0 for a NaN. Elsewhere the
+/// rounding is done in `f32` (as `lrintf` does in the default rounding
+/// mode) and `as i32` limits the range and gives 0 for a NaN.
+#[inline(always)]
+pub(crate) fn float2int(x: f32) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is available: src/lib.rs refuses to build for
+        // aarch64 without it.
+        unsafe { core::arch::aarch64::vcvtns_s32_f32(x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // A float at or beyond 2^23 has no fraction bits. Below, adding
+        // 2^23 leaves no fraction bits either, so the sum rounds to an
+        // integer, to nearest and ties to even.
+        const TWO_23: f32 = 8_388_608.0;
+        // NaN must take this branch, so the comparison is negated.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let r = if !(x.abs() < TWO_23) {
+            x
+        } else if x >= 0.0 {
+            (x + TWO_23) - TWO_23
+        } else {
+            (x - TWO_23) + TWO_23
+        };
+        r as i32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

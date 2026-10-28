@@ -6674,11 +6674,8 @@ pub(crate) fn float2int16(x: f32) -> i16 {
     // The comparisons are written as in C, so that a NaN gives -32768.
     let x = if x > -32768.0 { x } else { -32768.0 };
     let x = if x < 32767.0 { x } else { 32767.0 };
-    // C `lrintf`. A float at or beyond 2^23 has no fraction bits, so adding
-    // 2^23 rounds to an integer, to nearest and ties to even.
-    const TWO_23: f32 = 8_388_608.0;
-    let rounded = if x >= 0.0 { (x + TWO_23) - TWO_23 } else { (x - TWO_23) + TWO_23 };
-    rounded as i16
+    // `x` is within the 16-bit range here, so the rounded value is too.
+    mathops::float2int(x) as i16
 }
 
 /// [`float2int24`] over a buffer, for [`OpusDecoder::decode24`].
