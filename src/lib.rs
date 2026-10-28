@@ -6678,10 +6678,43 @@ pub(crate) fn float2int16(x: f32) -> i16 {
     mathops::float2int(x) as i16
 }
 
-/// [`float2int24`] over a buffer, for [`OpusDecoder::decode24`].
+/// [`float2int24`] over a buffer, for [`OpusDecoder::decode24`]. `input`
+/// and `output` should have the same length; the shorter one sets how
+/// many values are converted.
+///
+/// On 64-bit ARM whole blocks of 4 values go through `vcvtnq_s32_f32`, the
+/// vector form of `vcvtns_s32_f32`: the same rounding, the same limit to
+/// the 32-bit range and 0 for a NaN. The scaling by 2^23 is the same
+/// multiplication. So every value is the one `float2int24` gives.
 fn res_to_int24(input: &[f32], output: &mut [i32]) {
-    for (o, &x) in output.iter_mut().zip(input) {
+    let n = input.len().min(output.len());
+    let (input, output) = (&input[..n], &mut output[..n]);
+    #[cfg(target_arch = "aarch64")]
+    let blocks = n / 4 * 4;
+    #[cfg(not(target_arch = "aarch64"))]
+    let blocks = 0;
+    // SAFETY: NEON is available: src/lib.rs refuses to build for aarch64
+    // without it.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        res_to_int24_blocks_neon(&input[..blocks], &mut output[..blocks]);
+    }
+    for (o, &x) in output[blocks..].iter_mut().zip(&input[blocks..]) {
         *o = float2int24(x);
+    }
+}
+
+/// The blocks of `res_to_int24` on 64-bit ARM, four values at a time.
+/// Converts as many values as `input` and `output` both hold, in whole
+/// blocks of 4.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn res_to_int24_blocks_neon(input: &[f32], output: &mut [i32]) {
+    use crate::simd_mem::neon::{load_f32x4, store_i32x4};
+    use core::arch::aarch64::{vcvtnq_s32_f32, vmulq_n_f32};
+    for (src, dst) in input.as_chunks::<4>().0.iter().zip(output.as_chunks_mut::<4>().0) {
+        store_i32x4(dst, vcvtnq_s32_f32(vmulq_n_f32(load_f32x4(src), 32768.0 * 256.0)));
     }
 }
 
@@ -6701,16 +6734,7 @@ pub(crate) fn int24_to_res(x: i32) -> f32 {
 /// `vcvtns_s32_f32` does on 64-bit ARM; libopus on x86 gives -2^31 for
 /// both.
 pub(crate) fn float2int24(x: f32) -> i32 {
-    let x = 32768.0f32 * 256.0 * x;
-    const TWO_23: f32 = 8_388_608.0;
-    let rounded = if (0.0..TWO_23).contains(&x) {
-        (x + TWO_23) - TWO_23
-    } else if x < 0.0 && x > -TWO_23 {
-        (x - TWO_23) + TWO_23
-    } else {
-        x
-    };
-    rounded as i32
+    mathops::float2int(32768.0f32 * 256.0 * x)
 }
 
 /// libopus `celt_float2int16` (celt/mathops.h), as the float build of
