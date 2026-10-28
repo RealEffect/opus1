@@ -337,6 +337,16 @@ impl<'a> ExtensionIterator<'a> {
         }
         while self.curr_len > 0 {
             let curr0 = self.curr;
+            // A byte 0x01 is one byte of padding (ID 0, L = 1): it only
+            // moves the position. A run of them, which a padded packet
+            // holds in front of its extensions, is skipped in one step.
+            if self.data[curr0] == 0x01 {
+                let rest = &self.data[curr0..curr0 + self.curr_len];
+                let run = rest.iter().position(|&b| b != 0x01).unwrap_or(rest.len());
+                self.curr += run;
+                self.curr_len -= run;
+                continue;
+            }
             let id = self.data[curr0] >> 1;
             let l = self.data[curr0] & 1;
             let Some((curr, curr_len, header_size)) = skip_extension(self.data, self.curr, self.curr_len) else {
