@@ -48,6 +48,7 @@
 
 use crate::{Bandwidth, Channels, Error, SampleRate};
 use crate::extensions::{self, Extension, ExtensionIterator, ExtensionList};
+use crate::fixedvec::FixedVec;
 
 /// The most frames a packet can hold: 120 ms of 2.5 ms frames.
 pub const MAX_FRAMES: usize = 48;
@@ -1084,10 +1085,9 @@ fn pad_in_place(
     })
 }
 
-/// The most bytes of padding with extensions that `pad_with_extensions`
-/// copies without the feature `alloc`.
-#[cfg(not(feature = "alloc"))]
-const NO_STD_PADDING_COPY: usize = MAX_FRAME_BYTES;
+/// The most bytes of padding with extensions that `pad_keeping_extensions`
+/// copies on the stack. A longer padding needs the feature `alloc`.
+const PADDING_COPY: usize = MAX_FRAME_BYTES;
 
 /// `pad_in_place` for a packet whose padding holds `found` extensions:
 /// they go into the new padding after `extensions`. They are read from a
@@ -1102,21 +1102,25 @@ fn pad_keeping_extensions(
     found: usize,
 ) -> Result<usize, Error> {
     let old = packet.padding(data);
+    // A padding of up to `PADDING_COPY` (1,275) bytes is copied to the
+    // stack. A longer one, which is rare, is copied to the heap.
+    let mut buf: FixedVec<u8, PADDING_COPY> = FixedVec::new();
     #[cfg(feature = "alloc")]
-    let owned = old.to_vec();
-    #[cfg(feature = "alloc")]
-    let copy: &[u8] = &owned;
-    #[cfg(not(feature = "alloc"))]
-    let mut buf = [0u8; NO_STD_PADDING_COPY];
-    #[cfg(not(feature = "alloc"))]
-    let copy = {
-        let n = old.len();
-        let room = buf.get_mut(..n).ok_or(Error::new(
+    let owned;
+    let copy: &[u8] = if old.len() <= PADDING_COPY {
+        buf.extend_from_slice(old);
+        &buf
+    } else {
+        #[cfg(feature = "alloc")]
+        {
+            owned = old.to_vec();
+            &owned
+        }
+        #[cfg(not(feature = "alloc"))]
+        return Err(Error::new(
             crate::ErrorKind::AllocFail,
             "more than 1275 bytes of padding need the alloc feature",
-        ))?;
-        room.copy_from_slice(old);
-        &buf[..n]
+        ));
     };
     let mut all = ExtensionList::with_capacity(extensions.len() + found)?;
     for &ext in extensions {
