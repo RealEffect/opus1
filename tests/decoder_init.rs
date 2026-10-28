@@ -94,7 +94,7 @@ fn invalid_settings_do_not_convert() {
 
 /// Builds a decoder with `init` and decodes on a thread with a 32 KB stack
 /// (in a release build). Without `heap` that stack is smaller than the
-/// decoder itself (60 KB, 160 KB with the neural network features), so
+/// decoder itself (52 KB, 153 KB with the neural network features), so
 /// `new`, which returns the decoder through the stack, would overflow it;
 /// it needs 256 KB there (512 KB with the neural network features).
 ///
