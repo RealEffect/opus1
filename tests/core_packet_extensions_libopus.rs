@@ -789,6 +789,7 @@ fn multistream_pad_and_unpad_like_libopus() {
     let mut rng = Rng(0x5EED_0005);
     let pool = rng.bytes(4096);
     let mut kept = 0;
+    let (mut damaged_ok, mut damaged_err) = (0, 0);
     for case in 0..2_000 {
         let streams = 1 + rng.below(4);
         let mut data = Vec::new();
@@ -825,18 +826,37 @@ fn multistream_pad_and_unpad_like_libopus() {
             Err(e) if allocation_refused(e) => {}
             Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: pad error"),
         }
-        let mut c_buf = data.clone();
-        let mut buf = data.clone();
-        let c_ret = unsafe { sys::opus_multistream_packet_unpad(c_buf.as_mut_ptr(), data.len() as i32, streams as i32) };
-        match packet::multistream_unpad(&mut buf, data.len(), streams) {
-            Ok(n) => {
-                assert_eq!(n as i32, c_ret, "{what}: unpad");
-                assert_eq!(buf[..n], c_buf[..n], "{what}: unpad bytes");
+        // Unpad the packet as it is, and damaged: one byte changed, or the
+        // end cut off.
+        let mut bad = data.clone();
+        if rng.chance(50) {
+            let i = rng.below(bad.len());
+            bad[i] = rng.next() as u8;
+        } else {
+            bad.truncate(1 + rng.below(bad.len()));
+        }
+        for (label, input) in [("unpad", &data), ("damaged unpad", &bad)] {
+            let damaged = usize::from(label != "unpad");
+            let mut c_buf = input.clone();
+            let mut buf = input.clone();
+            let c_ret = unsafe { sys::opus_multistream_packet_unpad(c_buf.as_mut_ptr(), input.len() as i32, streams as i32) };
+            match packet::multistream_unpad(&mut buf, input.len(), streams) {
+                Ok(n) => {
+                    assert_eq!(n as i32, c_ret, "{what}: {label}");
+                    assert_eq!(buf[..n], c_buf[..n], "{what}: {label} bytes");
+                    damaged_ok += damaged;
+                }
+                Err(e) => {
+                    assert_eq!(e.to_raw(), c_ret, "{what}: {label} error");
+                    // The streams before the one that is not valid are
+                    // rewritten in both.
+                    assert_eq!(buf, c_buf, "{what}: {label} bytes");
+                    damaged_err += damaged;
+                }
             }
-            Err(e) if allocation_refused(e) => {}
-            Err(e) => assert_eq!(e.to_raw(), c_ret, "{what}: unpad error"),
         }
     }
+    assert!(damaged_ok > 100 && damaged_err > 100, "{damaged_ok} damaged packets unpadded, {damaged_err} refused");
     assert!(kept > 1_900, "{kept} packets padded");
 }
 
