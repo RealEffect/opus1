@@ -1,6 +1,6 @@
 # Performance
 
-This document explains how the speed of opus1 is measured against the C library libopus. It gives the latest results and the changes that made the code fast. It also lists the ideas that did not help, the build settings an application can use, and the commands to reproduce the numbers. All numbers were measured on Apple M4 Pro (64-bit ARM), except those of [On an Android phone](#on-an-android-phone) and the phone columns of [Code placement](#code-placement), [Round 8: more work for in-order cores](#round-8-more-work-for-in-order-cores), [Round 7: work for in-order cores](#round-7-work-for-in-order-cores) and [Build settings for applications](#build-settings-for-applications). Each section names the record and the state of the code that its numbers come from. The records are in `target/perf/`, a folder of the maintainers' working tree that is not in git.
+This document explains how the speed of opus1 is measured against the C library libopus. It gives the latest results and the changes that made the code fast. It also lists the ideas that did not help, the build settings an application can use, and the commands to reproduce the numbers. All numbers were measured on Apple M4 Pro (64-bit ARM), except those of [On an Android phone](#on-an-android-phone), [On x86-64](#on-x86-64) and the phone columns of [Code placement](#code-placement), [Round 8: more work for in-order cores](#round-8-more-work-for-in-order-cores), [Round 7: work for in-order cores](#round-7-work-for-in-order-cores), [Build settings for applications](#build-settings-for-applications), the Intel Core i7-12700 part of [Other processors](#other-processors) and the i7-12700 columns of [Concealment of lost packets](#concealment-of-lost-packets). Each section names the record and the state of the code that its numbers come from. The records are in `target/perf/` and `target/x86-results/`, folders of the maintainers' working tree that are not in git.
 
 ## Terms used here
 
@@ -13,6 +13,7 @@ This document explains how the speed of opus1 is measured against the C library 
 - **Complexity** is an encoder setting from 0 to 10. Higher values spend more processor time on searches that improve quality.
 - **VBR** (variable bitrate) lets the packet size change from frame to frame. **CBR** (constant bitrate) keeps every packet the same size.
 - **NEON** is the 128-bit vector instruction set of 64-bit ARM processors. One vector instruction works on four 32-bit values at once.
+- **SSE2** (Streaming SIMD Extensions 2, where SIMD means single instruction, multiple data) is the 128-bit vector instruction set that every x86-64 processor has.
 - The MDCT is computed with a **fast Fourier transform (FFT)**.
 - A **fused multiply-add (FMA)** computes `a * b + c` with a single rounding step.
 - The **median** of a list of times is the middle value after sorting. It is less affected by a few slow runs than the mean.
@@ -395,6 +396,109 @@ opus1 took the same times in the run against the `-O2` build. A lost SILK packet
 
 These calls were not timed on the phone. From the model measurements above (two calls of `conceal` per 20 ms), the deep PLC part of a first lost 20 ms packet takes about 1.6 ms on a Cortex-A76 and 6.9 ms on a Cortex-A55, and that of each further lost 20 ms packet about 0.5 ms and 2.2 ms.
 
+### 16-bit and multistream output
+
+The command `perf_harness output` times the decoders of both libraries on the libopus packets of each scenario, with six forms of output:
+
+- float samples: `decode` (libopus `opus_decode_float`);
+- 16-bit samples: `decode_i16` (libopus `opus_decode`), the float output soft-clipped and rounded;
+- 24-bit samples in 32-bit integers: `decode24` (libopus `opus_decode24`), the float output scaled and rounded (see [24-bit output](#24-bit-output));
+- the same three from a multistream decoder with one stream: `MultistreamDecoder` (libopus `opus_multistream_decode_float`, `opus_multistream_decode` and `opus_multistream_decode24`). These add the packet check of the multistream decoder and the copy of each channel into the interleaved output.
+
+It prints, per library, how much each form adds to the float decode.
+
+Measured on 2026-10-28 on Apple M4 Pro with the Homebrew libopus 1.6.1, load average 3 to 11 from other jobs. Three builds ran six times each, in six turns of one run per build, with 11 passes of 6 s per run. Each build ran first, second and third in two of the turns. The builds are:
+
+1. the base: main (c5e607b) with the harness commit of this work, which then timed the float and 16-bit forms only, and no change to the codec;
+2. the base with the commit `perf(opus): skip the soft clip search when no sample is beyond ±1`;
+3. build 2 with the commit that copies each channel of the multistream decoder in one loop and rounds 16-bit samples with `fcvtns`.
+
+The builds were made on 2026-10-28 from the commits as they were then. The commits were edited and reordered on 2026-10-29. The timed code changed only in form: `float2int16` now calls `float2int` of `src/mathops.rs`, and the range check is one function for all targets. The golden check gives the same output.
+
+The record is `target/perf/decode-output/`. Each number is a median over the 28 scenarios of the bench set. What each form of output adds:
+
+| Output | Compared with | opus1, base | opus1, after both changes | libopus |
+|---|---|---:|---:|---:|
+| 16-bit | float | +4.6 % | +1.8 % | +0.6 % |
+| Multistream, float | float | +3.8 % | +1.7 % | +2.0 % |
+| Multistream, 16-bit | 16-bit | +6.6 % | +1.9 % | +1.8 % |
+
+How each change moved opus1's time, with the lowest and the highest turn:
+
+| Output | Soft clipper change | Multistream change |
+|---|---:|---:|
+| Float | -0.5 % (-0.7 to -0.2) | 0.0 % (-0.4 to +0.2) |
+| 16-bit | -3.4 % (-4.0 to -2.9) | +0.5 % (0.0 to +0.9) |
+| Multistream, float | -0.2 % (-0.7 to -0.1) | -2.2 % (-2.4 to -1.8) |
+| Multistream, 16-bit | -3.4 % (-3.9 to -3.0) | -4.4 % (-4.9 to -4.1) |
+
+What changed:
+
+- **The soft clipper** of the 16-bit output limited every sample to ±2 and then searched each channel for samples beyond ±1. Now it ports `opus_limit2_checkwithin1_neon`, which libopus calls on 64-bit ARM. One vector pass finds the largest and the smallest sample. The samples are written only when one is beyond ±2. The search is skipped when every sample is within ±1. 16-bit decoding took 3.4 % less time. It was faster in all six turns (median over the scenarios) and in all 28 scenarios (median over the turns); 23 of the 28 scenarios were faster in every turn. The multistream decoder soft-clips each stream, so its 16-bit decoding gained as much.
+- **The multistream decoder** copied each channel with `step_by` iterators: three branches per sample. Now the function that writes one output channel (`ChannelSink::put`) walks whole rows of the output and whole rows of the stream together. One counter runs the loop. No index is checked inside it. The compiler also unrolls the float copy. On 64-bit ARM the rounding to 16 bits is the instruction `fcvtns` (intrinsic `vcvtns_s32_f32`), as in libopus's `float2int`, instead of adding and subtracting 2^23. Multistream 16-bit decoding took 4.4 % less time. Multistream float decoding took 2.2 % less: faster in all six turns and in all 28 scenarios (medians as above), and in every turn in 17 of the 28. That is just below the 2.3 % that code placement alone can move a time ([Comparing two builds](#comparing-two-builds)).
+- The other changes are within code placement. The multistream change does not reach the single-stream 16-bit path in these scenarios. Its rounding runs there only for the samples after the last whole block of 16, and every call of the bench set converts a whole number of blocks.
+
+From the first build to the last, multistream 16-bit decoding took 7.9 % less time. The output did not change: the golden file is the same, and the 16-bit tests compare every sample with libopus.
+
+#### 24-bit output
+
+The command `output` also times `decode24` and the multistream decoder's `decode24` (libopus `opus_decode24` and `opus_multistream_decode24`). The rounding of 24-bit samples was written in plain arithmetic: branches and adding and subtracting 2^23. On 64-bit ARM it is now one `fcvtns` instruction, as libopus's `float2int`, and `decode24` converts blocks of 4 samples with the vector form. Over all 2^32 floats the old and the new conversions give the same values.
+
+Measured on 2026-10-28, the code before and after this change, three runs each in turns, load average about 10. Record: `target/perf/decode24/`.
+
+| Output | Compared with | opus1 before | opus1 after | libopus |
+|---|---|---:|---:|---:|
+| 24-bit | float | +2.4 % | +1.0 % | +1.9 % |
+| Multistream, 24-bit | float | +10.1 % | +3.4 % | +2.1 % |
+
+Multistream 24-bit decoding took 6.0 % less time (4.6 to 7.5 % per turn, faster in all 28 scenarios). `decode24` took 2.1 % less (0.7 to 2.8 % per turn), within code placement.
+
+#### Other processors
+
+On targets other than 64-bit ARM, opus1 checks the range of the samples with its own version. libopus uses its C version on x86-64, which never reports that every sample is within ±1, so its soft clipper always searches. (On 32-bit ARM libopus can use the NEON version.) opus1's version reports whether every sample is within ±1, and its soft clipper skips the search only when the search would find nothing: when every sample was within ±1, and the bend `x + a*x*x` that the last call carries over (with `a` from `declip_mem`) takes none of the first samples beyond ±1. So the output is that of the C version. On x86-64 under Rosetta 2, 6,000,000 calls with random input gave the same bits as the code that always searches (record `target/x86-results/w-decode-output-20261028/softclip/`).
+
+On x86-64 the range check uses SSE2 for whole blocks of 4 samples. Written as a plain loop, it became vector code for `x86_64-apple-darwin` but stayed one sample at a time for `x86_64-pc-windows-msvc`, where `pcm_soft_clip` then took 1.5 times as long as before. With SSE2 it takes 0.27 times as long on the Intel Core i7-12700 (stereo 20 ms: 301 against 1,107 ns), and 1.05 times when the signal needs clipping (same record). These times were taken while the skip still rested on a bound on the memory (`declip_mem` within ±2, or a NaN). Checking the bent samples instead adds two comparisons for each sample that the carried-over bend changes.
+
+Measured on the i7-12700 (Windows 11, `perf_harness output`, three runs each in turns of two builds: main (c5e607b) with the harness commit as it was on 2026-10-28 (with all forms of `output` and with `plc`), and the whole branch as it was that day, with all its speed changes but before the review of 2026-10-29; record `target/x86-results/w-decode-output-20261028/results2/`):
+
+| Output | Compared with | opus1 before | opus1 after | libopus |
+|---|---|---:|---:|---:|
+| 16-bit | float | +4.4 % | +1.7 % | +5.5 % |
+| Multistream, float | float | +2.9 % | +1.4 % | +1.2 % |
+| Multistream, 16-bit | 16-bit | +7.4 % | +4.7 % | +0.8 % |
+| 24-bit | float | +6.0 % | +5.8 % | +1.7 % |
+| Multistream, 24-bit | float | +12.3 % | +11.4 % | +2.7 % |
+
+16-bit decoding took 2.8 % less time there. On x86-64 the other changes of this work touch that path only by moving less of SILK's output history per frame, and float decoding did not move. Multistream 16-bit decoding took 5.6 % less, with the multistream change above included. The 24-bit output on x86-64 still rounds each sample with plain arithmetic, and it is the slowest output there; the change above is for 64-bit ARM only.
+
+### Concealment of lost packets
+
+The command `perf_harness plc` times both decoders on the libopus packets of each scenario with the losses of `golden`'s burst pattern: one packet in ten lost, and three in a row out of every 25. Each call for a lost packet is timed on its own. The first lost packet of a run and the later ones are reported apart: CELT runs its pitch search and its prediction analysis only for the first one.
+
+Measured on 2026-10-28 on Apple M4 Pro with the Homebrew libopus 1.6.1, load average 10 to 14 from other jobs. Three builds ran three times each in turns, 11 passes of 6 s per run. They were made from the commits as they were then:
+
+1. main (c5e607b) with the DRED fix, the harness, and the 16-bit and multistream changes;
+2. build 1 with the later changes up to and including the CELT change below: among them the 24-bit rounding, SILK writing straight into the output, and the smaller encoder and packet changes;
+3. build 2 with the SILK change.
+
+Record: `target/perf/plc/`. Each time is the median over the three runs; the table gives the time of opus1 divided by the time of libopus, lowest and highest over the scenarios of the bench set, in the first build and in the last:
+
+| Mode | Lost packet | M4 Pro before | M4 Pro after | i7-12700 before | i7-12700 after |
+|---|---|---:|---:|---:|---:|
+| CELT | first of a run | 0.47 to 0.82 | 0.37 to 0.46 | 1.38 to 1.50 | 0.99 to 1.16 |
+| CELT | later | 1.09 to 1.51 | 0.63 to 0.69 | 1.20 to 1.53 | 0.72 to 0.79 |
+| SILK | first and later | 0.93 to 1.07 | 0.35 to 0.42 | 0.87 to 0.97 | 0.51 to 0.62 |
+| Hybrid | first and later | 0.77 to 0.84 | 0.39 to 0.41 | 0.66 to 0.78 | 0.46 to 0.52 |
+
+The last two columns are the Intel Core i7-12700 under Windows 11, computed the same way from three runs each in turns of two builds: main (c5e607b) with the harness commit as it was on 2026-10-28 (with all forms of `output` and with `plc`), and the whole branch as it was that day, with all its speed changes but before the review of 2026-10-29 (record `target/x86-results/w-decode-output-20261028/`). There a first lost CELT packet still takes up to 1.16 times libopus's time. A lost SILK packet took 35 % (8 kHz) to 45 % (16 kHz) less time there, and a lost Hybrid packet 29 % less (medians over the scenarios).
+
+Two investigations of the gaps, one comparing the code with libopus line by line and one with profiles of both libraries, found these causes:
+
+- **CELT: `celt_iir`**, the all-pole filter of order 24 that turns the extrapolated excitation back into a signal, over 1,080 samples per channel at 20 ms. libopus computes the outputs in groups of four: `xcorr_kernel` updates the four sums of a group in one pass over the coefficients. opus1 computed the four sums one after another, each in a loop over a slice of unknown length. On a later loss, which skips the pitch search, this filter was the whole gap: 8.9 against 3.4 µs per channel at 20 ms for the filter alone (record `target/perf/plc/investigation-celt-later.md`). Now the order is a constant and the four sums run together; each sum adds the same products in the same order, so the bits are the same. From build 1 to build 2 a lost CELT packet took 39 % (first) and 53 % (later) less time (median over the scenarios).
+- **SILK: the synthesis filters of the comfort noise (`silk_CNG`) and of the concealment (`silk_PLC`).** Both were written as in C: one prediction per sample, summed tap by tap, each sample waiting for the whole sum of the one before. They now use the kernel of `silk_decode_core`, which computes the part of a prediction that does not depend on the newest sample one step ahead. The sums are of wrapping integers, so their order does not change them. From build 2 to build 3 a lost SILK packet took 56 % (8 kHz) to 68 % (16 kHz) less time, and a lost Hybrid packet 51 % less.
+
+In build 2, a lost 16 kHz SILK packet took 3.5 % and a lost Hybrid packet 2.7 % more time than in build 1; 8 kHz SILK did not change, and the libopus times did not move. Of the changes in that build, only SILK writing straight into the output is on this path, and it measured -1 % on its own (records `target/perf/plc/ab4_*`). So the increase is most likely code placement.
+
 ### Round 8: more work for in-order cores
 
 Round 8 is the eighth round of speed work on opus1. It made the release libopus 1.6.1 the C reference on the Mac and on the phone (see [The C reference](#the-c-reference)). It also went on with the work for in-order cores, in the SILK quantizer, the PVQ search and the bit allocation of CELT, the pitch analysis and the CELT decoder. Five parts were done separately and then merged (`git log --first-parent c96e936..b7a8b64`):
@@ -608,6 +712,17 @@ The memory review (`target/perf/prof/memory-build/report.md`) found that the dec
 - The CELT decoder keeps its output history in a larger buffer. The start of the history moves forward by one frame, and the samples are moved back to the start of the buffer only when the history reaches its end. Before, all of the history was moved for every frame (commit `938478a`). 2.5 ms stereo decode took 4.1 % to 5.7 % less time.
 - The CELT encoder keeps 120 samples of input history instead of 2168 (commit `6f155fb`). Stereo encode with 2.5 ms and 5 ms frames took 0.3 % to 3.9 % less time.
 - The decoder writes its output through slices and fills transition buffers only on a mode switch (commit `22cc99d`). Buffers that are overwritten anyway are no longer cleared first.
+- Smaller ones, each estimated at well under 1 % of a call, except SILK writing straight into the output, which measured about 1 % of a lost SILK or Hybrid packet (records `target/perf/plc/ab4_*`):
+  - `encode_i16` and `encode24` convert into a buffer that is not cleared first (`FixedVec::extend_map`).
+  - A SILK-only frame ends its range coder at its own bytes, so the rest of the 1,275-byte buffer is no longer cleared.
+  - A packet of several frames clears only each frame's room, not 7,656 bytes at once.
+  - With the feature `dred` and DRED (deep redundancy) off, no 1,000-byte buffer is cleared per packet.
+  - SILK conceals straight into the output, not into a buffer that is then copied. The decoder no longer has that buffer: 7,688 bytes less (see [Size of the encoder and the decoder](06-using-the-library.md#size-of-the-encoder-and-the-decoder)).
+  - The SILK decoder moves only the kept part of its output history.
+- Changes in the packet functions, timed on 2026-10-29 with a small program against the code of main (record `target/perf/packet-functions/`). The codec calls only some of these functions: `pad` for CBR packets, and with the feature `dred`, `pad_with_extensions` and the search for the DRED extension.
+  - `multistream_unpad` no longer builds a repacketizer that it does not use: 48 instead of 131 ns for a packet of 2 streams.
+  - `pad` of a packet whose padding holds extensions copies a padding of up to 1,275 bytes to the stack, not to the heap, without clearing a buffer first. It is not measurably faster (172 against 183 ns, while the old code itself took 173 and 183 ns in two runs), but with up to 32 extensions it allocates nothing per call.
+  - The extension parser skips a run of padding bytes in one step. Reading the extensions of a packet padded to 400 bytes takes 79 instead of 408 ns, of one padded to 1,200 bytes 281 instead of 1,809 ns.
 
 ### Removed computations whose results were not used
 

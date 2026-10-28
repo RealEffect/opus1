@@ -363,6 +363,78 @@ complexity 0).
 
 ## Release Notes
 
+### Unreleased
+
+These changes are on `main` and not yet published.
+
+**Speed** ([details](docs/guide/08-performance.md#16-bit-and-multistream-output)).
+The times are from an Apple M4 Pro, unless a line names the Intel Core
+i7-12700.
+- 16-bit decoding (`OpusDecoder::decode_i16`): the soft clipper first checks
+  with one vector pass whether any sample is beyond ±1, as libopus does on
+  64-bit ARM. When none is, it skips its search. 16-bit decoding takes 3.4 %
+  less time.
+- `MultistreamDecoder`: the copy of each channel into the output uses one
+  loop counter and checks no index inside the loop. The rounding to 16 bits
+  is one instruction on 64-bit ARM. Multistream 16-bit decoding takes 4.4 %
+  less time. Multistream float decoding takes 2.2 % less, about as much as
+  the placement of the code alone can move a time.
+- From the code before both changes to the code after them, 16-bit decoding
+  takes about 3 % less time and multistream 16-bit decoding 7.9 % less.
+- Concealment of lost packets
+  ([details](docs/guide/08-performance.md#concealment-of-lost-packets)):
+  - CELT: `celt_iir`, the filter that turns the extrapolated excitation back
+    into a signal, computes four output samples in one pass over its
+    coefficients, as libopus does. A lost CELT packet after another lost one
+    took 1.1 to 1.5 times libopus's time and now takes 0.63 to 0.69 times.
+    The first lost packet of a run takes 0.37 to 0.46 times. On the
+    i7-12700: 0.72 to 0.79 times for later losses, and 0.99 to 1.16 times
+    for the first.
+  - SILK: the synthesis filters of the comfort noise and of the concealment
+    use the faster filter of the SILK decoder. A lost SILK packet takes 56 %
+    (8 kHz) to 68 % (16 kHz) less time, and now 0.35 to 0.42 times
+    libopus's; a lost Hybrid packet takes 51 % less. On the i7-12700, with
+    both concealment changes: 35 % (8 kHz) to 45 % (16 kHz) less for SILK,
+    and 29 % less for Hybrid.
+- 24-bit output (`decode24`): the rounding is one instruction on 64-bit ARM,
+  in blocks of 4 samples. Multistream 24-bit decoding takes 6 % less time.
+- On processors other than 64-bit ARM, the soft clipper also skips its
+  search when the search would find nothing, so the output stays that of
+  libopus's C version. On x86-64 the range check uses SSE2 (Streaming SIMD
+  Extensions 2, where SIMD means single instruction, multiple data). On the
+  i7-12700, 16-bit decoding takes 2.8 % less time, and
+  multistream 16-bit decoding 5.6 % less, the multistream change above
+  included.
+- Smaller changes in the encoder, the SILK decoder and the packet functions:
+  less clearing and copying of buffers. `multistream_unpad` is 2.7 times as
+  fast, and reading the extensions of a padded packet 5.2 to 6.4 times as fast.
+  `pad` allocates nothing when it keeps up to 32 extensions in a padding of
+  up to 1,275 bytes.
+- The decoder no longer keeps a buffer for SILK's concealment of pieces
+  shorter than 10 ms: 7,688 bytes less per decoder (52,072 bytes without
+  `heap`), and one heap allocation less with `heap`.
+
+**Fixes**
+- `pcm_soft_clip` on 64-bit ARM gives the bits of libopus also for input with
+  a NaN (not a number) and for a `declip_mem` value beyond ±2. As in libopus
+  there, both can then leave samples beyond ±1.
+- With the feature `dred` (deep redundancy): packets of several frames (CELT
+  and Hybrid at 40 and 60 ms, every mode at 80 to 120 ms) at high bitrates
+  now carry the DRED data that libopus puts there. The first frame of such a
+  packet may take more than 1,276 bytes when the DRED bytes are added to its
+  share. opus1 cut it to 1,276 bytes, which shortened or dropped the DRED
+  data.
+  - At a constant bitrate, CELT-only packets are now libopus's. In Hybrid
+    and SILK-only packets the room for the DRED data changes; their SILK
+    layer is opus1's fixed-point one, so they are not libopus's anyway.
+  - At a variable bitrate the packets change when the buffer holds more than
+    about 2 × 1,276 bytes. At the largest bitrate (`Bitrate::Max`),
+    CELT-only packets of 40 to 100 ms are now libopus's, and so are 120 ms
+    packets in a buffer of at most 6 × 1,276 bytes. Other packets still
+    differ on purpose: opus1 does not limit each frame to its share of the
+    bitrate. With DRED such a packet can be a little longer than 6 × 1,276
+    bytes when the buffer allows it.
+
 ### 0.2.1 (2026-10-27)
 
 The first release of opus1. Version 0.2.0 was used only during development and
