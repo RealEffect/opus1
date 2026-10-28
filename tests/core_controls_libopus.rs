@@ -565,6 +565,36 @@ fn errors_of_the_24_bit_calls_follow_libopus() {
     assert!(rust.decode24(&bad, 960, &mut out24).is_err());
 }
 
+/// 24-bit output of calls whose sample count is not a multiple of 4: the
+/// conversion takes whole blocks of 4 and then the samples after them.
+/// 12 kHz mono, 2.5 ms CELT packets of 30 samples, and losses of 7.5 ms
+/// (90 samples).
+#[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "bit-exact with libopus only on 64-bit ARM (docs/guide/10, Platforms)")]
+fn decode24_with_a_partial_block_follows_libopus() {
+    let rate = 12000;
+    let frame = rate / 400;
+    let pcm = speech(rate, 1.0);
+    let mut enc = CEncoder::new(rate, 1, APP_AUDIO);
+    enc.force_mode(MODE_CELT);
+    let packets = enc.encode_all(&pcm, frame);
+    let mut rust = OpusDecoder::new(SampleRate::Hz12000, Channels::Mono).unwrap();
+    let mut c = CDecoder::new(rate, 1);
+    let mut out = vec![0i32; 5760];
+    for (i, p) in packets.iter().enumerate() {
+        let (n, expected) = if i % 7 == 3 {
+            (rust.decode24(&[], 3 * frame, &mut out).unwrap(), c.decode24(None, 3 * frame, false).unwrap())
+        } else {
+            (rust.decode24(p, 5760, &mut out).unwrap(), c.decode24(Some(p), 5760, false).unwrap())
+        };
+        // Every call ends with part of a block, so both the blocks and the
+        // samples after them are compared.
+        assert_ne!(n % 4, 0, "call {i}: {n} samples, a whole number of blocks");
+        assert_eq!(&out[..n], &expected[..], "call {i}");
+    }
+    assert!(packets.len() > 100, "{} packets", packets.len());
+}
+
 // --- Application change and voice ratio ---
 
 /// `set_application` before the first frame gives libopus's packets, also

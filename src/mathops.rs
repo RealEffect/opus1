@@ -129,7 +129,7 @@ pub(crate) fn celt_exp2(x: f32) -> f32 {
 
 /// libopus `float2int` (celt/float_cast.h): round to the nearest integer,
 /// a value halfway between two goes to the even one. The speech and music
-/// analysis and the 16-bit output use it.
+/// analysis, the 16-bit output and the 24-bit output use it.
 ///
 /// 64-bit ARM uses `vcvtns_s32_f32`, as libopus does, which also limits
 /// the result to the `i32` range and gives 0 for a NaN. Elsewhere the
