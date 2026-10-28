@@ -188,12 +188,7 @@ pub fn silk_decode_core(
         // Short-term prediction: the new samples go behind the 16 samples of
         // filter state.
         let s_lpc = &mut s_lpc_q14[..MAX_LPC_ORDER + subfr_length];
-        let bias = ps_dec.lpc_order >> 1;
-        if lpc_order == MAX_LPC_ORDER {
-            lpc_synthesis::<16>(s_lpc, res, &a_q12, bias);
-        } else {
-            lpc_synthesis::<10>(s_lpc, res, &a_q12, bias);
-        }
+        lpc_synthesis_of_order(lpc_order, s_lpc, res, &a_q12);
 
         // Scale with the gain.
         scale_output(
@@ -550,7 +545,9 @@ fn ltp_block_neon(
     );
 }
 
-/// Short-term (LPC) synthesis of one subframe.
+/// Short-term (LPC) synthesis of `res_q14.len()` samples: one subframe in
+/// `silk_decode_core`, a whole frame in the concealment and the comfort
+/// noise.
 ///
 /// `s_lpc_q14` holds `MAX_LPC_ORDER` samples of filter state followed by room
 /// for one output sample per sample of `res_q14`. `bias` is the rounding
@@ -559,7 +556,8 @@ fn ltp_block_neon(
 /// Each output sample is the input of the next step, so the time per sample
 /// is the time from one output to the next. In libopus (and here before)
 /// that path runs through the whole sum of `ORDER` products and two
-/// saturating operations. Both kernels shorten it in the same two ways:
+/// saturating operations. The three versions (NEON, SSE4.1 and plain)
+/// shorten it in the same two ways:
 ///
 /// 1. Everything that does not depend on the newest sample is computed one
 ///    step ahead. What is left on the path is one multiplication and the
@@ -1083,10 +1081,30 @@ fn lpc_synthesis_saturated(res_q14: i32, pred_q10: i32) -> i32 {
     silk_add_sat32(res_q14, silk_lshift_sat32(pred_q10, 4))
 }
 
+/// [`lpc_synthesis`] for the decoder's filter order, 10 or `MAX_LPC_ORDER`
+/// (`silk_decode_core`, the concealment and the comfort noise). The
+/// prediction starts from `order / 2` (C `silk_RSHIFT(LPC_order, 1)`),
+/// which offsets the downward rounding of `silk_SMLAWB`.
+#[inline(always)]
+pub(crate) fn lpc_synthesis_of_order(
+    order: usize,
+    s_lpc_q14: &mut [i32],
+    res_q14: &[i32],
+    a_q12: &[i16; MAX_LPC_ORDER],
+) {
+    debug_assert!(order == 10 || order == MAX_LPC_ORDER);
+    let bias = (order >> 1) as i32;
+    if order == MAX_LPC_ORDER {
+        lpc_synthesis::<16>(s_lpc_q14, res_q14, a_q12, bias);
+    } else {
+        lpc_synthesis::<10>(s_lpc_q14, res_q14, a_q12, bias);
+    }
+}
+
 /// Output samples from the synthesis filter state: multiply by the gain and
 /// round to 16 bits.
 #[inline(always)]
-fn scale_output(xq: &mut [i16], s_q14: &[i32], gain_q10: i32) {
+pub(crate) fn scale_output(xq: &mut [i16], s_q14: &[i32], gain_q10: i32) {
     for (out, &s) in xq.iter_mut().zip(s_q14) {
         *out = silk_sat16(silk_rshift_round(silk_smulww(s, gain_q10), 8)) as i16;
     }
@@ -1391,7 +1409,10 @@ mod tests {
     /// Returns how many output samples sit at a limit of `i32`.
     fn check_lpc_synthesis<const ORDER: usize>(rng: &mut Lcg) -> usize {
         let mut saturated = 0;
-        for &n in &LENGTHS {
+        // Concealment and comfort noise filter whole frames.
+        let mut lengths = LENGTHS.to_vec();
+        lengths.extend([120, 160, 240, 320]);
+        for &n in &lengths {
             for trial in 0..60 {
                 // Trials 0..20: a decaying filter and a moderate signal, as
                 // in speech. Trials 20..40: large coefficients, so that the

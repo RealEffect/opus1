@@ -7,6 +7,8 @@
 //! level is added to the concealed frame, so the background does not drop
 //! out.
 
+use crate::fixedvec::FixedVec;
+use crate::silk::decode_core::lpc_synthesis_of_order;
 use crate::silk::decoder_structs::{SilkDecoderControl, SilkDecoderState};
 use crate::silk::define::*;
 use crate::silk::macros::*;
@@ -22,17 +24,22 @@ const CNG_GAIN_SMTH_THRESHOLD_Q16: i32 = 46396;
 const CNG_NLSF_SMTH_Q16: i32 = 16348;
 
 /// Draw `length` excitation samples at random from the noise buffer
-/// (`silk_CNG_exc`).
-fn silk_cng_exc(exc_q14: &mut [i32], exc_buf_q14: &[i32], length: usize, rand_seed: &mut i32) {
+/// (`silk_CNG_exc`), appended to `exc_q14`.
+fn silk_cng_exc(
+    exc_q14: &mut FixedVec<i32, MAX_FRAME_LENGTH>,
+    exc_buf_q14: &[i32],
+    length: usize,
+    rand_seed: &mut i32,
+) {
     let mut exc_mask = CNG_BUF_MASK_MAX;
     while exc_mask > length as i32 {
         exc_mask >>= 1;
     }
     let mut seed = *rand_seed;
-    for v in exc_q14[..length].iter_mut() {
+    for _ in 0..length {
         seed = silk_rand(seed);
         let idx = ((seed >> 24) & exc_mask) as usize;
-        *v = exc_buf_q14[idx];
+        exc_q14.push(exc_buf_q14[idx]);
     }
     *rand_seed = seed;
 }
@@ -120,32 +127,25 @@ pub fn silk_cng(
         }
         let gain_q10 = gain_q16 >> 6;
 
-        let mut cng_sig_q14 = [0i32; MAX_FRAME_LENGTH + MAX_LPC_ORDER];
+        // C draws the excitation into `CNG_sig_Q14 + MAX_LPC_ORDER` and
+        // filters it there. The decoder's synthesis kernel reads the
+        // excitation from a buffer of its own and computes the same samples.
+        let mut exc_q14 = FixedVec::<i32, MAX_FRAME_LENGTH>::new();
         {
             let (exc_buf, seed) = (&ps_dec.s_cng.cng_exc_buf_q14, &mut ps_dec.s_cng.rand_seed);
             let mut s = *seed;
-            silk_cng_exc(&mut cng_sig_q14[MAX_LPC_ORDER..], exc_buf, length, &mut s);
+            silk_cng_exc(&mut exc_q14, exc_buf, length, &mut s);
             *seed = s;
         }
 
         // Synthesis filter from the smoothed spectrum.
         let mut a_q12 = [0i16; MAX_LPC_ORDER];
         silk_nlsf2a(&mut a_q12, &ps_dec.s_cng.cng_smth_nlsf_q15, order);
+        let mut cng_sig_q14 = [0i32; MAX_FRAME_LENGTH + MAX_LPC_ORDER];
         cng_sig_q14[..MAX_LPC_ORDER].copy_from_slice(&ps_dec.s_cng.cng_synth_state);
+        let s_lpc = &mut cng_sig_q14[..MAX_LPC_ORDER + length];
+        lpc_synthesis_of_order(order, s_lpc, &exc_q14, &a_q12);
         for i in 0..length {
-            // The bias avoids the downward rounding of silk_smlawb.
-            let mut lpc_pred_q10 = (order >> 1) as i32;
-            for j in 0..order {
-                lpc_pred_q10 = silk_smlawb(
-                    lpc_pred_q10,
-                    cng_sig_q14[MAX_LPC_ORDER + i - j - 1],
-                    a_q12[j] as i32,
-                );
-            }
-            cng_sig_q14[MAX_LPC_ORDER + i] = silk_add_sat32(
-                cng_sig_q14[MAX_LPC_ORDER + i],
-                silk_lshift_sat32(lpc_pred_q10, 4),
-            );
             // Scale and add to the concealed signal.
             let noise = silk_sat16(silk_rshift_round(
                 silk_smulww(cng_sig_q14[MAX_LPC_ORDER + i], gain_q10),
