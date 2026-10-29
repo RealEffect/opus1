@@ -148,7 +148,8 @@ features = ["dred", "osce-bwe"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-libm = { version = "0.2", optional = true, default-features = false }
+# 0.2.6 is the first version of libm with `rint` and `rintf`.
+libm = { version = "0.2.6", optional = true, default-features = false }
 portable-atomic = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
