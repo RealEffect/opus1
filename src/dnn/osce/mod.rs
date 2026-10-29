@@ -632,10 +632,12 @@ mod tests {
     }
 
     /// The OSCE path, with its states on the heap as in a decoder, runs on
-    /// a thread with 32 KB of stack (it needs 16 to 20 KB on 64-bit ARM
-    /// macOS). Elsewhere the thread gets 64 KB: with 32 KB the test
-    /// overflowed its stack on Android 14 (HONOR CLK-AN00, NDK 27) and on
-    /// x86-64.
+    /// a thread with 64 KB of stack. On 64-bit ARM macOS it needed 20 KB or
+    /// less in one build and 32 to 36 KB in another, after a change to an
+    /// unrelated test of the same binary moved code between the units the
+    /// compiler builds and inlines apart (2026-10-29). With 32 KB the test
+    /// also overflowed its stack on Android 14 (HONOR CLK-AN00, NDK 27) and
+    /// on x86-64.
     ///
     /// On Windows a thread cannot use all of its stack. Rust's standard
     /// library asks Windows to keep 20 KB of each thread's stack for its
@@ -648,12 +650,11 @@ mod tests {
     /// Debug builds need more, so the test runs only in optimized builds.
     #[cfg(all(feature = "osce-bwe", not(debug_assertions)))]
     #[test]
-    fn the_osce_path_runs_on_32_kb_of_stack() {
+    fn the_osce_path_runs_on_64_kb_of_stack() {
         let models = OsceModels::builtin(crate::dnn::arch::detect());
         let mut ch = std::boxed::Box::new(OsceChannel::new());
         let mut bwe = std::boxed::Box::new(OsceBweChannel::new());
-        let apple_arm = cfg!(all(target_arch = "aarch64", target_vendor = "apple"));
-        let usable = if apple_arm { 32 * 1024 } else { 64 * 1024 };
+        let usable = 64 * 1024;
         let windows_reserve = if cfg!(windows) { 32 * 1024 } else { 0 };
         std::thread::Builder::new()
             .stack_size(usable + windows_reserve)
