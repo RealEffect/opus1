@@ -6,7 +6,7 @@ opus1 is a hard fork of [opus-rs](https://github.com/restsend/opus-rs), taken at
 
 ```toml
 [dependencies]
-opus1 = "0.2"
+opus1 = "0.3"
 ```
 
 A systematic introduction to Opus and to this library is in [docs/](docs/README.md).
@@ -155,7 +155,7 @@ in a `static` (wrap init in your own `Once`-like guard) or a dedicated buffer.
 
 ```toml
 [dependencies.opus1]
-version = "0.2"
+version = "0.3"
 default-features = false
 features = ["libm", "analysis"]
 ```
@@ -363,10 +363,9 @@ complexity 0).
 
 ## Release Notes
 
-### Unreleased
+### 0.3.0 (2026-10-29)
 
-These changes are on `main` and not yet published. One of them breaks the
-API, so the next release will be 0.3.0.
+One change of this release breaks the API, so its version is 0.3.0.
 
 **Breaking changes**
 - The constant `opus1::LIBOPUS_VERSION` is removed. opus1 is compiled into the

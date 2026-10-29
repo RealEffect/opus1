@@ -21,7 +21,7 @@ Every `rust` example below is a complete program fragment. `cargo test --doc` co
 
 ```toml
 [dependencies]
-opus1 = "0.2"
+opus1 = "0.3"
 ```
 
 The crate was published as `opus-rs` up to version 0.1.37. Code that used `opus_rs::` now uses `opus1::`.
@@ -892,7 +892,7 @@ Five builds are possible:
 
 ```toml
 [dependencies.opus1]
-version = "0.2"
+version = "0.3"
 default-features = false
 features = ["libm", "analysis"]
 ```
@@ -952,7 +952,7 @@ The tables that all encoders and decoders share (the CELT mode and the built-in 
 
 ```toml
 [dependencies.opus1]
-version = "0.2"
+version = "0.3"
 default-features = false
 features = ["libm", "portable-atomic"]
 ```

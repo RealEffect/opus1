@@ -180,7 +180,7 @@ mod doc_examples {
     struct DifferencesFromLibopus;
 }
 
-/// The version of this crate, for example `"0.2.1"`: the `version` of its
+/// The version of this crate, for example `"0.3.0"`: the `version` of its
 /// `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
