@@ -439,6 +439,9 @@ i7-12700.
     differ on purpose: opus1 does not limit each frame to its share of the
     bitrate. With DRED such a packet can be a little longer than 6 × 1,276
     bytes when the buffer allows it.
+- Without `std`, opus1 needs `libm` 0.2.6 or later, the first version with
+  `rint` and `rintf`. `Cargo.toml` asked only for 0.2, so a project that had
+  an older `libm` locked failed to build.
 
 ### 0.2.1 (2026-10-27)
 
