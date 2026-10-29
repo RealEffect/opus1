@@ -20,7 +20,7 @@ This document describes how the source code of `opus1` is organised, for maintai
 
 The public interface is the crate root and three modules:
 
-- At the crate root: `OpusEncoder`, `OpusDecoder`, `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec`, `Error`, `ErrorKind`, `pcm_soft_clip`, `VERSION` and `LIBOPUS_VERSION`. With `deep-plc` (or a feature that turns it on) also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)), and with `dred` also `OpusDred`, `OpusDredDecoder`, `DredParse` and `DredProcessing`.
+- At the crate root: `OpusEncoder`, `OpusDecoder`, `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec`, `Error`, `ErrorKind`, `pcm_soft_clip` and `VERSION`. With `deep-plc` (or a feature that turns it on) also `DnnBlob` and `DnnModels` (see [Neural network code](#neural-network-code-srcdnn)), and with `dred` also `OpusDred`, `OpusDredDecoder`, `DredParse` and `DredProcessing`.
 - `packet`: reading, writing and padding packets.
 - `extensions`: the packet extensions stored in the padding of a packet.
 - `multistream`: the multistream encoder and decoder and their channel layouts (feature `alloc`).

@@ -29,7 +29,7 @@
 //! # Ok::<(), opus1::Error>(())
 //! ```
 //!
-//! opus1 follows libopus [`LIBOPUS_VERSION`]. The tests of the repository
+//! opus1 follows libopus 1.6.1. The tests of the repository
 //! compare its packets and its decoded audio with that release. The `docs`
 //! folder of the repository explains the codec, the library and where
 //! opus1 differs from libopus.
@@ -183,16 +183,6 @@ mod doc_examples {
 /// The version of this crate, for example `"0.2.1"`: the `version` of its
 /// `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The libopus release that opus1 follows. A packet that opus1 encodes or
-/// decodes is compared with that release in the tests. (libopus
-/// `opus_get_version_string` gives `"libopus 1.6.1"` for it.)
-///
-/// ```
-/// assert_eq!(opus1::LIBOPUS_VERSION, "1.6.1");
-/// assert!(!opus1::VERSION.is_empty());
-/// ```
-pub const LIBOPUS_VERSION: &str = "1.6.1";
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;

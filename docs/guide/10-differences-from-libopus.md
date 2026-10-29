@@ -47,7 +47,7 @@ The interface review of opus1 0.2 added the parts that were still missing (the [
 | libopus | opus1 0.2 |
 |---|---|
 | The error codes `OPUS_BAD_ARG` to `OPUS_ALLOC_FAIL`, and `opus_strerror` | `Error`: `kind()` gives an `ErrorKind`, `to_raw()` the libopus code, `message()` and `Display` the text. |
-| `opus_get_version_string` | `LIBOPUS_VERSION`, the libopus release that opus1 follows (`"1.6.1"`), and `VERSION`, the version of the crate. |
+| `opus_get_version_string` | `VERSION`, the version of the crate. The release notes of each version name the libopus release it follows. |
 | `opus_encoder_init` | `OpusEncoder::init`, like `OpusDecoder::init` for `opus_decoder_init`. |
 | `opus_packet_get_bandwidth`, `opus_packet_get_nb_channels` | `packet::bandwidth`, `packet::nb_channels`. |
 | `opus_decoder_get_nb_samples` | `OpusDecoder::nb_samples`. |
