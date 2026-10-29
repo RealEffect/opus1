@@ -65,8 +65,8 @@ The public API is the crate root and the modules `packet`, `extensions` and
 The crate root holds the codecs `OpusEncoder` and `OpusDecoder`, the setting
 types `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`,
 `ForcedMode`, `FrameDuration`, `Signal` and `InbandFec`, the error types
-`Error` and `ErrorKind`, the function `pcm_soft_clip` and the constants
-`VERSION` and `LIBOPUS_VERSION`. The neural network features add `DnnBlob` and
+`Error` and `ErrorKind`, the function `pcm_soft_clip` and the constant
+`VERSION`. The neural network features add `DnnBlob` and
 `DnnModels`, and `dred` adds `OpusDredDecoder`, `OpusDred`, `DredParse` and
 `DredProcessing`. [docs/guide/06](docs/guide/06-using-the-library.md) shows the settings and
 recipes for calls, voice agents and music.
@@ -365,7 +365,13 @@ complexity 0).
 
 ### Unreleased
 
-These changes are on `main` and not yet published.
+These changes are on `main` and not yet published. One of them breaks the
+API, so the next release will be 0.3.0.
+
+**Breaking changes**
+- The constant `opus1::LIBOPUS_VERSION` is removed. opus1 is compiled into the
+  program, so each opus1 version follows one fixed libopus release. The release
+  notes name that release: this version, like 0.2.1, follows libopus 1.6.1.
 
 **Speed** ([details](docs/guide/08-performance.md#16-bit-and-multistream-output)).
 The times are from an Apple M4 Pro, unless a line names the Intel Core

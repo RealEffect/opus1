@@ -31,7 +31,7 @@ The public interface is the crate root and the modules `packet`, `extensions` an
 - the codecs `OpusEncoder` and `OpusDecoder`;
 - the setting types `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal` and `InbandFec`;
 - the error types `Error` and `ErrorKind`;
-- the function `pcm_soft_clip` and the constants `VERSION` and `LIBOPUS_VERSION`;
+- the function `pcm_soft_clip` and the constant `VERSION`;
 - with a neural network feature, `DnnBlob` and `DnnModels`, and with `dred` also `OpusDred`, `OpusDredDecoder`, `DredParse` and `DredProcessing`.
 
 The tests of the repository use one more module, `internals`. It exists only with the cargo feature `__internals`, which is for those tests only. That feature is outside semantic versioning: any release may change what it holds. Applications do not enable it.

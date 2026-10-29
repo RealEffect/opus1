@@ -92,7 +92,7 @@ The public interface is the crate root and three modules. Everything else is pri
   - Codecs: `OpusEncoder` and `OpusDecoder`.
   - Setting types: `SampleRate`, `Channels`, `Application`, `Bandwidth`, `Bitrate`, `ForcedMode`, `FrameDuration`, `Signal`, `InbandFec`.
   - Errors: `Error` and `ErrorKind` ([`src/error.rs`](../src/error.rs)).
-  - Other items: `pcm_soft_clip`, `VERSION`, `LIBOPUS_VERSION`.
+  - Other items: `pcm_soft_clip`, `VERSION`.
   - With `deep-plc` (or a feature that turns it on): `DnnBlob`, `DnnModels`.
   - With `dred`: `OpusDred`, `OpusDredDecoder`, `DredParse`, `DredProcessing`.
 - **`opus1::packet`** ([`src/packet.rs`](../src/packet.rs)): parse, write and pad packets; the repacketizer; self-delimited framing; multistream packet checks.
