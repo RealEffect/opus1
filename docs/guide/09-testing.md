@@ -522,7 +522,9 @@ When fuzzing finds a failure in opus1, the fix follows what libopus does. The mi
 
 Two files of the normal test suite also try many generated inputs. `tests/fuzz_toc_sequences.rs` feeds one decoder long, repeatable sequences of packets with varied TOC bytes. `tests/proptest_encode_indices.rs` uses the `proptest` crate, which generates random inputs and reduces a failing one to a small example.
 
-### Fuzzing results for this release
+### Fuzzing results before 0.2.1
+
+These runs were made in October 2026, before the release of 0.2.1. The fuzz targets were not run again for 0.3.0.
 
 The 18 targets in the table below ran on Apple M4 Pro with the build of `fuzz/fuzz.sh`, so with overflow checks and debug assertions. Several targets ran at the same time, one process each, unless the table says otherwise.
 
