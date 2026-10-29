@@ -30,6 +30,7 @@ exclude = [
     "/scripts/",
     "/bench_quick.sh",
     "/docs/opus-explained/",
+    "/.github/",
 ]
 
 [features]
